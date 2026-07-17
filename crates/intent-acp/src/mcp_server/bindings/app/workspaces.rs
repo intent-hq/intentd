@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
+use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
@@ -237,9 +237,17 @@ async fn open(
         .await
         .map_err(map_err)?;
 
-    // TODO: Emit app:workspace-open event through the event bus
-    // Event emission should happen at the services layer where the EventBus is available.
-    let _ = open_in_new_window; // Suppress unused warning
+    // Emit app:workspace-open event
+    let event_data = json!({
+        "workspaceId": id,
+        "openInNewWindow": open_in_new_window,
+    });
+    let event = PublishEvent {
+        workspace_id: workspace_id.clone(),
+        event_type: intent_core::events::APP_WORKSPACE_OPEN.to_string(),
+        data: event_data,
+    };
+    api.publish_event(event).await.map_err(map_err)?;
 
     Ok(json!({
         "ok": true,
@@ -559,9 +567,16 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct FakeApi {
-        workspaces: Mutex<Vec<Workspace>>,
+        workspaces: Arc<Mutex<Vec<Workspace>>>,
+        events: Arc<Mutex<Vec<PublishEvent>>>,
+    }
+
+    impl FakeApi {
+        fn published_events(&self) -> Vec<PublishEvent> {
+            self.events.lock().unwrap().clone()
+        }
     }
 
     impl WorkspaceApi for FakeApi {
@@ -580,6 +595,14 @@ mod tests {
                     .into_iter()
                     .find(|w| w.id == id)
                     .ok_or_else(|| Error::NotFound(format!("Workspace not found: {}", id.as_str())))
+            })
+        }
+
+        fn publish_event(&self, event: PublishEvent) -> BoxFuture<'_, Result<()>> {
+            let events = self.events.clone();
+            Box::pin(async move {
+                events.lock().unwrap().push(event);
+                Ok(())
             })
         }
     }
@@ -1117,12 +1140,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_returns_expected_shape() {
-        let fake = Arc::new(FakeApi::default());
+        let fake = FakeApi::default();
         {
             let mut workspaces = fake.workspaces.lock().unwrap();
             workspaces.push(make_workspace("ws-1", "Test Workspace"));
         }
-        let api: Arc<dyn WorkspaceApi> = fake;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
 
         let chief_id = WorkspaceId::chief();
         let result = dispatch(&api, &chief_id, "open", &json!({ "id": "ws-1" }))
@@ -1131,16 +1154,37 @@ mod tests {
 
         assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
         assert_eq!(result.get("queued").unwrap().as_bool().unwrap(), true);
+
+        // Assert event was published
+        let events = fake.published_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].event_type,
+            intent_core::events::APP_WORKSPACE_OPEN
+        );
+        assert_eq!(
+            events[0].data.get("workspaceId").unwrap().as_str().unwrap(),
+            "ws-1"
+        );
+        assert_eq!(
+            events[0]
+                .data
+                .get("openInNewWindow")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            false
+        );
     }
 
     #[tokio::test]
     async fn test_open_accepts_open_in_new_window_option() {
-        let fake = Arc::new(FakeApi::default());
+        let fake = FakeApi::default();
         {
             let mut workspaces = fake.workspaces.lock().unwrap();
             workspaces.push(make_workspace("ws-1", "Test"));
         }
-        let api: Arc<dyn WorkspaceApi> = fake;
+        let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
 
         let chief_id = WorkspaceId::chief();
         let result = dispatch(
@@ -1154,5 +1198,18 @@ mod tests {
 
         assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
         assert_eq!(result.get("queued").unwrap().as_bool().unwrap(), true);
+
+        // Assert event includes openInNewWindow
+        let events = fake.published_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .data
+                .get("openInNewWindow")
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+            true
+        );
     }
 }

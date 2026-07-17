@@ -6,8 +6,10 @@
 
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
+use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
+
+use crate::mcp_server::bindings::map_err;
 
 use crate::mcp_server::bindings::{opt_i64, opt_str};
 
@@ -75,11 +77,13 @@ async fn navigate(
             .insert("durationMs".to_string(), json!(duration));
     }
 
-    // TODO: Emit app:ui-navigate event through the event bus
-    // Event emission should happen at the services layer where the EventBus is available.
-    // For now, just return the result; the FE bridge will need to subscribe to these
-    // events once they're wired at the services layer.
-    let _ = api; // Suppress unused warning
+    // Emit app:ui-navigate event
+    let event = PublishEvent {
+        workspace_id: workspace_id.clone(),
+        event_type: intent_core::events::APP_UI_NAVIGATE.to_string(),
+        data: payload.clone(),
+    };
+    api.publish_event(event).await.map_err(map_err)?;
 
     // Return { ok: true, ...payload }
     let mut result = payload;
@@ -110,9 +114,13 @@ async fn highlight(
             .insert("durationMs".to_string(), json!(duration));
     }
 
-    // TODO: Emit app:ui-highlight event through the event bus
-    // Event emission should happen at the services layer where the EventBus is available.
-    let _ = api; // Suppress unused warning
+    // Emit app:ui-highlight event
+    let event = PublishEvent {
+        workspace_id: workspace_id.clone(),
+        event_type: intent_core::events::APP_UI_HIGHLIGHT.to_string(),
+        data: payload.clone(),
+    };
+    api.publish_event(event).await.map_err(map_err)?;
 
     // Return { ok: true, ...payload }
     let mut result = payload;
@@ -238,12 +246,22 @@ fn normalize_hash(hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{
+        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+    };
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    #[derive(Default)]
-    struct FakeApi;
+    #[derive(Clone, Default)]
+    struct FakeApi {
+        events: Arc<Mutex<Vec<PublishEvent>>>,
+    }
+
+    impl FakeApi {
+        fn published_events(&self) -> Vec<PublishEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
 
     impl WorkspaceApi for FakeApi {
         fn get_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
@@ -287,11 +305,19 @@ mod tests {
                 })
             })
         }
+
+        fn publish_event(&self, event: PublishEvent) -> BoxFuture<'_, Result<()>> {
+            let events = self.events.clone();
+            Box::pin(async move {
+                events.lock().unwrap().push(event);
+                Ok(())
+            })
+        }
     }
 
     #[tokio::test]
     async fn test_dispatch_rejects_non_chief_workspace() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let non_chief_id = WorkspaceId::from_string("amber-forest");
         let result = dispatch(&api, &non_chief_id, "navigate", &json!({"route": "/"})).await;
         assert!(result.is_err());
@@ -303,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_navigate_requires_route() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
         let result = dispatch(&api, &chief_id, "navigate", &json!({})).await;
         assert!(result.is_err());
@@ -312,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_navigate_rejects_empty_route() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
         let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "  "})).await;
         assert!(result.is_err());
@@ -321,46 +347,93 @@ mod tests {
 
     #[tokio::test]
     async fn test_navigate_duration_ms_validates_range() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
 
         // Below minimum
-        let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "/", "durationMs": 0})).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "navigate",
+            &json!({"route": "/", "durationMs": 0}),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be between 1 and"));
 
         // Above maximum
-        let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "/", "durationMs": 40000})).await;
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "navigate",
+            &json!({"route": "/", "durationMs": 40000}),
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be between 1 and"));
     }
 
     #[tokio::test]
     async fn test_navigate_returns_expected_shape() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let fake = FakeApi::default();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "/settings"})).await.unwrap();
+        let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "/settings"}))
+            .await
+            .unwrap();
 
         assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
         assert_eq!(result.get("route").unwrap().as_str().unwrap(), "/settings");
-        assert_eq!(result.get("workspaceId").unwrap().as_str().unwrap(), "__chief__");
+        assert_eq!(
+            result.get("workspaceId").unwrap().as_str().unwrap(),
+            "__chief__"
+        );
+
+        // Assert event was published
+        let events = fake.published_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, intent_core::events::APP_UI_NAVIGATE);
+        assert_eq!(events[0].workspace_id.as_str(), "__chief__");
+        assert_eq!(
+            events[0].data.get("route").unwrap().as_str().unwrap(),
+            "/settings"
+        );
     }
 
     #[tokio::test]
     async fn test_navigate_includes_highlight_id_from_option() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let fake = FakeApi::default();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "navigate", &json!({
-            "route": "/settings",
-            "highlightId": "agents"
-        })).await.unwrap();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            "navigate",
+            &json!({
+                "route": "/settings",
+                "highlightId": "agents"
+            }),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(result.get("highlightId").unwrap().as_str().unwrap(), "agents");
+        assert_eq!(
+            result.get("highlightId").unwrap().as_str().unwrap(),
+            "agents"
+        );
+
+        // Assert event includes highlightId
+        let events = fake.published_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].data.get("highlightId").unwrap().as_str().unwrap(),
+            "agents"
+        );
     }
 
     #[tokio::test]
     async fn test_highlight_requires_id() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
         let result = dispatch(&api, &chief_id, "highlight", &json!({})).await;
         assert!(result.is_err());
@@ -369,20 +442,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_highlight_returns_expected_shape() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let fake = FakeApi::default();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "highlight", &json!({"id": "agents"})).await.unwrap();
+        let result = dispatch(&api, &chief_id, "highlight", &json!({"id": "agents"}))
+            .await
+            .unwrap();
 
         assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
         assert_eq!(result.get("id").unwrap().as_str().unwrap(), "agents");
-        assert_eq!(result.get("workspaceId").unwrap().as_str().unwrap(), "__chief__");
+        assert_eq!(
+            result.get("workspaceId").unwrap().as_str().unwrap(),
+            "__chief__"
+        );
+
+        // Assert event was published
+        let events = fake.published_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, intent_core::events::APP_UI_HIGHLIGHT);
+        assert_eq!(
+            events[0].data.get("id").unwrap().as_str().unwrap(),
+            "agents"
+        );
     }
 
     #[tokio::test]
     async fn test_targets_returns_array() {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "targets", &json!({})).await.unwrap();
+        let result = dispatch(&api, &chief_id, "targets", &json!({}))
+            .await
+            .unwrap();
 
         assert!(result.is_array());
         let targets = result.as_array().unwrap();

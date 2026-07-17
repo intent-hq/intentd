@@ -7364,6 +7364,33 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn publish_event(&self, event: intent_core::PublishEvent) -> BoxFuture<'_, Result<()>> {
+        use intent_core::{now_iso, ActorType, EventActor};
+        use intent_store::NewEvent;
+
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            let new_event = NewEvent {
+                workspace_id: event.workspace_id,
+                timestamp: now_iso(),
+                event_type: event.event_type,
+                actor: EventActor {
+                    actor_type: ActorType::System,
+                    id: Some("system".to_string()),
+                    name: Some("System".to_string()),
+                    ..Default::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: event.data,
+            };
+            publish_event(&bus, new_event).await;
+            Ok(())
+        })
+    }
+
     fn get_token_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<TokenUsage>> {
         let store = self.store.clone();
         Box::pin(async move {
