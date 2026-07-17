@@ -22,13 +22,13 @@ static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
 /// on drop to prevent leakage into other tests.
 struct DebounceEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
-    prior: Option<String>,
+    prior: Option<std::ffi::OsString>,
 }
 
 impl DebounceEnvGuard {
     fn new(millis: &str) -> Self {
         let _lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
-        let prior = std::env::var("LAST_ACTIVITY_DEBOUNCE_TEST_MS").ok();
+        let prior = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", millis);
         Self { _lock, prior }
     }
