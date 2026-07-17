@@ -207,6 +207,15 @@ impl Store {
                 "agent provider is immutable once set (first real use)".to_string(),
             ));
         }
+        // Also reject provider changes in the same update that sets acp_session_id.
+        if current.acp_session_id.is_none()
+            && s.acp_session_id.is_some()
+            && s.provider != current.provider
+        {
+            return Err(Error::Internal(
+                "agent provider is immutable once set (first real use)".to_string(),
+            ));
+        }
         if current.acp_session_id.is_some() && s.acp_session_id != current.acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
