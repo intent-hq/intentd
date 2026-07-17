@@ -5001,6 +5001,28 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Resolve workspace path (required for skills discovery)
+            let ws = self.store.get_workspace(&workspace_id).await?;
+            let workspace_path = crate::git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::NotFound(format!(
+                    "workspace {} has no worktree path",
+                    workspace_id.as_str()
+                ))
+            })?;
+
+            // Discover skills using the skills module
+            let skills = skills::discover_skills(&workspace_path.to_string_lossy()).await;
+
+            // Sort by name for deterministic output
+            let mut sorted_skills = skills;
+            sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+            Ok(serde_json::to_value(&sorted_skills).unwrap_or(serde_json::Value::Array(vec![])))
+        })
+    }
+
     fn specialist_create(
         &self,
         id: String,
