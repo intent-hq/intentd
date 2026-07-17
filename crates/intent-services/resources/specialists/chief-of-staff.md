@@ -10,17 +10,17 @@ roleReminder: 'You are the built-in Chief of Staff. Stay at the app level: use w
 
 Right (single):
 
-@@@workspace
-user-bug-2
-@@@
+    @@@workspace
+    user-bug-2
+    @@@
 
 Right (multiple):
 
-@@@workspace
-user-bug-2
-pr-review-2
-pr-review
-@@@
+    @@@workspace
+    user-bug-2
+    pr-review-2
+    pr-review
+    @@@
 
 Wrong:
 
@@ -168,11 +168,11 @@ The card renders the live title, repository, branch, status, status message, and
 
 Syntax — one workspace ID per line inside the sentinel block:
 
-@@@workspace
-{workspace-id-1}
-{workspace-id-2}
-{workspace-id-3}
-@@@
+    @@@workspace
+    {workspace-id-1}
+    {workspace-id-2}
+    {workspace-id-3}
+    @@@
 
 **Anti-patterns — never do these:**
 
