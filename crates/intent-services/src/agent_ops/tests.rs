@@ -6066,3 +6066,78 @@ async fn clear_completion_report_on_turn_begin() {
         .expect("second clear");
     assert!(!cleared, "no report on second clear");
 }
+
+/// `agent.sendMessage` emits `agent:message` with the persisted row's id.
+#[tokio::test]
+async fn agent_send_message_emits_agent_message_event() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Sender").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_MESSAGE.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_send_message_op(id.clone(), "hello".into(), None, None, None)
+        .await
+        .expect("send");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["queued"], json!(false));
+    let response_message_id = r["messageId"].as_str().unwrap();
+
+    // Verify the event was published with the correct messageId.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    let event = batch
+        .iter()
+        .find(|e| e.event_type == AGENT_MESSAGE)
+        .expect("agent:message event");
+    assert_eq!(event.data["agentId"], json!(id.0));
+    assert_eq!(event.data["role"], json!("user"));
+    let event_message_id = event.data["messageId"].as_str().unwrap();
+    assert_eq!(event_message_id, response_message_id);
+
+    // Verify the messageId matches the persisted row.
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].id, event_message_id);
+}
+
+/// `agent.forceMessage` emits `agent:message` with the persisted row's id.
+#[tokio::test]
+async fn agent_force_message_emits_agent_message_event() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Forcer").await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_MESSAGE.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_force_message_op(id.clone(), "msg-123".into(), "forced content".into())
+        .await
+        .expect("force");
+    assert_eq!(r["success"], json!(true));
+    let response_message_id = r["messageId"].as_str().unwrap();
+
+    // Verify the event was published with the correct messageId.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    let event = batch
+        .iter()
+        .find(|e| e.event_type == AGENT_MESSAGE)
+        .expect("agent:message event");
+    assert_eq!(event.data["agentId"], json!(id.0));
+    assert_eq!(event.data["role"], json!("user"));
+    let event_message_id = event.data["messageId"].as_str().unwrap();
+    assert_eq!(event_message_id, response_message_id);
+
+    // Verify the messageId matches the persisted row.
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].id, event_message_id);
+}

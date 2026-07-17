@@ -1672,11 +1672,10 @@ impl Services {
         &self,
         agent_id: AgentId,
         content: String,
-        message_id: Option<String>,
+        _message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
-        let message_id = message_id.unwrap_or_else(new_message_id);
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
         match self
@@ -1684,7 +1683,7 @@ impl Services {
             .append_agent_message(&agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => {
+            Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Fetch the session to get workspace_id; best-effort (logged on error).
@@ -1700,8 +1699,16 @@ impl Services {
                     {
                         tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                     }
+                    // Publish agent:message event using the store-returned message id.
+                    self.publish_agent_mutation_event(
+                        &session.workspace_id,
+                        &agent_id,
+                        AGENT_MESSAGE,
+                        json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                    )
+                    .await;
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
                 // STAB-7: preserve image_blocks and file_blocks when auto-queueing
@@ -1724,13 +1731,14 @@ impl Services {
     pub(crate) async fn agent_force_message_op(
         &self,
         agent_id: AgentId,
-        message_id: String,
+        _message_id: String,
         content: String,
     ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
-        self.store
+        let message = self
+            .store
             .append_agent_message(&agent_id, "user", &blocks, &created_at)
             .await?;
         // Refresh agent_session.updated_at so the FE agent-card timestamp
@@ -1742,7 +1750,15 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
         }
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        // Publish agent:message event using the store-returned message id.
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
@@ -3440,28 +3456,29 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             }));
         }
-        let message_id = new_message_id();
         let blocks = json!([build_block()]);
         let created_at = now_iso();
-        if self
+        let message = match self
             .store
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
-            .is_err()
         {
-            manager.release_slot(agent_id).await;
-            let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
-            self.publish_queue_updated(agent_id).await;
-            manager
-                .clone()
-                .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                .await;
-            return Ok(json!({
-                "success": true,
-                "queued": true,
-                "queuedMessage": queued.to_value(position),
-            }));
-        }
+            Ok(msg) => msg,
+            Err(_) => {
+                manager.release_slot(agent_id).await;
+                let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+                self.publish_queue_updated(agent_id).await;
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+                return Ok(json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                }));
+            }
+        };
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -3471,13 +3488,21 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
         }
+        // Publish agent:message event using the store-returned message id.
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
             content_owned,
             crate::agent_manager::TurnOptions::default(),
         );
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// Pre-DELIV-1 store-only delivery for the read-only/test path (no
@@ -3493,7 +3518,6 @@ impl Services {
     where
         F: Fn() -> Value,
     {
-        let message_id = new_message_id();
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         match self
@@ -3501,7 +3525,7 @@ impl Services {
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => {
+            Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 if let Err(e) = self
@@ -3511,7 +3535,15 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+                // Publish agent:message event using the store-returned message id.
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_MESSAGE,
+                    json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                )
+                .await;
+                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
                 let (queued, position) =
