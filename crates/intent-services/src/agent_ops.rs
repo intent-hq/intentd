@@ -22,6 +22,10 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Maximum length for caller-supplied message IDs to prevent unbounded storage
+/// and DoS via oversized persisted IDs.
+const MAX_MESSAGE_ID_LEN: usize = 256;
+
 use crate::agent_subscriptions::CompletionWatch;
 
 /// `waitMode` value that defers the completion watch into an `after_all`
@@ -1676,6 +1680,15 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
+        // Validate message_id length to prevent unbounded storage.
+        if let Some(ref id) = message_id {
+            if id.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "messageId exceeds maximum length of {} characters",
+                    MAX_MESSAGE_ID_LEN
+                )));
+            }
+        }
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
         let message = match message_id {
@@ -1754,6 +1767,13 @@ impl Services {
         message_id: String,
         content: String,
     ) -> Result<Value> {
+        // Validate message_id length to prevent unbounded storage.
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {} characters",
+                MAX_MESSAGE_ID_LEN
+            )));
+        }
         let session = self.store.get_agent_session(&agent_id).await?;
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
