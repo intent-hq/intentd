@@ -300,6 +300,20 @@ pub struct Services {
     last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for debounce tasks (incremented on each schedule).
     last_activity_debounce_gen: Arc<Mutex<u64>>,
+    /// Per-workspace debouncers for the busy→idle `workspace:activity-changed`
+    /// event emission (§10.1). When `agent_activity_end` transitions a workspace
+    /// count to zero, the idle flip is scheduled after a debounce window (~3s,
+    /// env-configurable); a new `agent_activity_begin` within the window cancels
+    /// it (no idle/running event pair). Shared across clones so all service
+    /// handles observe the same pending timers. In-memory only (no persistence);
+    /// pending timers are dropped on daemon shutdown without flushing.
+    ///
+    /// To prevent race conditions where an old task removes a newer handle, each
+    /// entry stores a generation counter alongside the abort handle. Tasks only
+    /// remove their own entry if the generation still matches.
+    idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
+    /// Generation counter for idle debounce tasks (incremented on each schedule).
+    idle_debounce_gen: Arc<Mutex<u64>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -356,6 +370,8 @@ impl Services {
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
+            idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            idle_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
         }
@@ -514,12 +530,24 @@ impl Services {
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
-    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight.
+    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight
+    /// OR if a pending idle debounce is scheduled (grace window). During the grace
+    /// window after the last agent ends, the workspace is still considered
+    /// `AgentRunning` until the debounce fires, ensuring list/get/update responses
+    /// and the event stream agree on the derived state.
     pub(crate) fn workspace_activity(&self, workspace_id: &WorkspaceId) -> WorkspaceActivity {
         let map = self.agent_activity.lock().unwrap();
         match map.get(workspace_id) {
             Some(count) if *count > 0 => WorkspaceActivity::AgentRunning,
-            _ => WorkspaceActivity::Idle,
+            _ => {
+                // Check if there's a pending idle debounce (grace window).
+                if let Ok(debouncers) = self.idle_debouncers.lock() {
+                    if debouncers.contains_key(workspace_id) {
+                        return WorkspaceActivity::AgentRunning;
+                    }
+                }
+                WorkspaceActivity::Idle
+            }
         }
     }
 
@@ -869,7 +897,8 @@ impl Services {
 
     /// Record an agent session entering flight for `workspace_id`. On the
     /// `Idle → AgentRunning` transition (count `0 → 1`) emits a self-sufficient
-    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change).
+    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change)
+    /// and cancels any pending idle debounce.
     pub(crate) async fn agent_activity_begin(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -877,6 +906,14 @@ impl Services {
             *count += 1;
             *count == 1
         };
+
+        // Cancel any pending idle debounce (if the workspace was in grace window).
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
+                handle.abort();
+            }
+        }
+
         if transitioned {
             publish_event(
                 &self.event_bus,
@@ -887,9 +924,11 @@ impl Services {
     }
 
     /// Record an agent session leaving flight for `workspace_id`. On the
-    /// `AgentRunning → Idle` transition (count `1 → 0`) emits a self-sufficient
-    /// `workspace:activity-changed` (§10.1, only-on-change). A decrement with no
-    /// tracked session is a no-op.
+    /// `AgentRunning → Idle` transition (count `1 → 0`), schedules a debounced
+    /// `workspace:activity-changed { idle }` event emission after a configurable
+    /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
+    /// within the window cancels the idle flip. A decrement with no tracked session
+    /// is a no-op.
     pub(crate) async fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -907,11 +946,79 @@ impl Services {
             }
         };
         if transitioned {
+            self.schedule_idle_debounce(workspace_id.clone());
+        }
+    }
+
+    /// Schedule a debounced `workspace:activity-changed { idle }` event emission
+    /// for the workspace. The event is emitted only after the workspace stays idle
+    /// for the full debounce window (~3s default, env-overridable for tests). A new
+    /// `agent_activity_begin` within the window cancels the pending flip.
+    fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
+        // Increment generation counter and cancel any existing debouncer.
+        let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
+            *gen_lock = gen_lock.wrapping_add(1);
+            *gen_lock
+        } else {
+            0
+        };
+
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(&workspace_id) {
+                handle.abort();
+            }
+        }
+
+        // Clone the state we'll need in the spawned task.
+        let this = self.clone();
+        let debouncers = self.idle_debouncers.clone();
+        let ws_id = workspace_id.clone();
+
+        // Debounce window: production constant (~3s), overridable via env for tests.
+        let debounce_ms = std::env::var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(WORKSPACE_IDLE_DEBOUNCE_MS);
+
+        // Spawn a task that sleeps for the debounce window, then emits idle.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+
+            // Emit the idle event.
             publish_event(
-                &self.event_bus,
-                activity_changed_event(workspace_id, WorkspaceActivity::Idle),
+                &this.event_bus,
+                activity_changed_event(&ws_id, WorkspaceActivity::Idle),
             )
             .await;
+
+            // Remove the debouncer entry if it still matches our generation.
+            if let Ok(mut map) = debouncers.lock() {
+                if let Some((current_gen, _)) = map.get(&ws_id) {
+                    if *current_gen == gen {
+                        map.remove(&ws_id);
+                    }
+                }
+            }
+        });
+
+        // Store the abort handle with generation. Only insert if no entry exists or our
+        // generation is newer (prevents older schedules from overwriting newer ones).
+        if let Ok(mut map) = self.idle_debouncers.lock() {
+            let should_insert = map
+                .get(&workspace_id)
+                .map(|(existing_gen, _)| gen > *existing_gen)
+                .unwrap_or(true);
+
+            if should_insert {
+                if let Some((_, old_handle)) =
+                    map.insert(workspace_id, (gen, handle.abort_handle()))
+                {
+                    old_handle.abort();
+                }
+            } else {
+                // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
         }
     }
 
@@ -2328,6 +2435,14 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
 /// without event storms during agent streaming; tests override with a short
 /// window (see `LAST_ACTIVITY_DEBOUNCE_TEST_MS` env var).
 const LAST_ACTIVITY_DEBOUNCE_MS: u64 = 3000;
+
+/// Trailing-edge debounce window for busy→idle `workspace:activity-changed` event
+/// emission (§10.1). Production value (~3 seconds) stops sidebar flicker during
+/// rapid agent turns; tests override with a short window (see
+/// `WORKSPACE_IDLE_DEBOUNCE_TEST_MS` env var). When `agent_activity_end` transitions
+/// a workspace count to zero, the idle flip is scheduled after this window; a new
+/// `agent_activity_begin` within the window cancels it (no idle/running event pair).
+const WORKSPACE_IDLE_DEBOUNCE_MS: u64 = 3000;
 
 /// Conservative allowlist of remote names whose first path segment may be
 /// stripped when canonicalising a workspace `baseRef` on write. Mirrors the

@@ -14,32 +14,45 @@ use intent_store::Store;
 
 use crate::Services;
 
-/// Guard for tests that mutate the LAST_ACTIVITY_DEBOUNCE_TEST_MS env var
-/// to prevent parallel test races (env::set_var is process-global).
+/// Guard for tests that mutate debounce env vars to prevent parallel test
+/// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
+/// WORKSPACE_IDLE debounce vars.
 static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
 
-/// RAII guard for debounce env var: holds the lock, sets the var, and restores
+/// RAII guard for debounce env vars: holds the lock, sets the vars, and restores
 /// on drop to prevent leakage into other tests.
 struct DebounceEnvGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
-    prior: Option<std::ffi::OsString>,
+    prior_last_activity: Option<std::ffi::OsString>,
+    prior_workspace_idle: Option<std::ffi::OsString>,
 }
 
 impl DebounceEnvGuard {
     fn new(millis: &str) -> Self {
         let _lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
-        let prior = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        let prior_last_activity = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        let prior_workspace_idle = std::env::var_os("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
         std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", millis);
-        Self { _lock, prior }
+        std::env::set_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", millis);
+        Self {
+            _lock,
+            prior_last_activity,
+            prior_workspace_idle,
+        }
     }
 }
 
 impl Drop for DebounceEnvGuard {
     fn drop(&mut self) {
-        if let Some(val) = &self.prior {
+        if let Some(val) = &self.prior_last_activity {
             std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", val);
         } else {
             std::env::remove_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        }
+        if let Some(val) = &self.prior_workspace_idle {
+            std::env::set_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", val);
+        } else {
+            std::env::remove_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
         }
     }
 }
@@ -2601,7 +2614,7 @@ mod change_event_parity {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{note, workspace, TempDb, WorkspacesRoot};
+    use super::{note, workspace, DebounceEnvGuard, TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
@@ -3213,6 +3226,7 @@ mod change_event_parity {
     #[tokio::test]
     async fn activity_changed_only_on_change_and_derived() {
         use intent_core::{WorkspaceActivity, WorkspaceApi};
+        let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
@@ -3240,9 +3254,11 @@ mod change_event_parity {
             WorkspaceActivity::AgentRunning
         );
 
-        // Last session leaves flight: AgentRunning → Idle (emits idle). If the
-        // nested pair had emitted, this would observe agent_running instead.
+        // Last session leaves flight: AgentRunning → Idle (emits idle after debounce).
+        // If the nested pair had emitted, this would observe agent_running instead.
         h.services.agent_activity_end(&h.ws).await;
+        // Wait for debounce window to expire.
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(
@@ -3319,12 +3335,20 @@ mod change_event_parity {
             "update_workspace MUST derive activity=agent_running when agents in-flight"
         );
 
-        // End agent activity: the workspace returns to idle.
+        // End agent activity: the workspace returns to idle after debounce window.
         h.services.agent_activity_end(&h.ws).await;
+        // During grace window, workspace_activity() still reports AgentRunning.
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "during grace window, workspace_activity() still reports AgentRunning"
+        );
+        // Wait for debounce window to expire (default is 3s, but tests may override).
+        tokio::time::sleep(Duration::from_millis(3500)).await;
         assert_eq!(
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::Idle,
-            "after agent_activity_end, workspace_activity() reports idle"
+            "after debounce window, workspace_activity() reports idle"
         );
 
         // Confirm update_workspace returns activity=idle again.
@@ -3342,7 +3366,7 @@ mod change_event_parity {
         assert_eq!(
             updated_after_agent.activity,
             WorkspaceActivity::Idle,
-            "after agent ends, activity returns to idle"
+            "update_workspace reports idle after agents end and debounce expires"
         );
     }
 
@@ -13030,6 +13054,143 @@ mod last_activity_events {
         assert!(
             matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
             "no event on idempotent token scan"
+        );
+    }
+
+    /// Regression for STAB-N: busy→idle transition debounce (test a). An
+    /// `agent_activity_end` followed by `agent_activity_begin` within the
+    /// debounce window MUST NOT emit `workspace:activity-changed { idle }` — the
+    /// pending idle flip is canceled and activity stays `AgentRunning` throughout.
+    #[tokio::test]
+    async fn idle_debounce_canceled_by_re_begin() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Start agent activity → immediate AgentRunning event.
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+
+        // End agent activity → schedules idle flip after 100ms.
+        h.services.agent_activity_end(&h.ws).await;
+
+        // Re-begin within the window → cancels the pending idle flip and emits AgentRunning.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Consume the AgentRunning event from the re-begin (0→1 transition).
+        let ev_rebegin = recv_one(&mut sub).await;
+        assert_envelope(&ev_rebegin, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(
+            ev_rebegin["data"]["activity"], "agent_running",
+            "re-begin emits AgentRunning on 0→1 transition"
+        );
+
+        // Wait beyond the original debounce window.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // workspace_activity() MUST report AgentRunning (no idle event was emitted).
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "activity stays AgentRunning when re-begin cancels debounce"
+        );
+
+        // No idle event should have been emitted.
+        assert!(
+            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            "no idle event when re-begin cancels the debounce"
+        );
+
+        // Clean up.
+        h.services.agent_activity_end(&h.ws).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// Regression for STAB-N: busy→idle transition debounce (test b). An
+    /// `agent_activity_end` with no re-begin MUST emit exactly one
+    /// `workspace:activity-changed { idle }` event after the debounce window.
+    #[tokio::test]
+    async fn idle_debounce_emits_after_window() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Start agent activity → immediate AgentRunning event.
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+
+        // End agent activity → schedules idle flip after 100ms.
+        h.services.agent_activity_end(&h.ws).await;
+
+        // Before the window expires, no idle event yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            matches!(timeout(Duration::from_millis(20), sub.recv()).await, Err(_)),
+            "no idle event before debounce window expires"
+        );
+
+        // After the window expires, exactly one idle event.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let ev_idle = recv_one(&mut sub).await;
+        assert_envelope(&ev_idle, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(
+            ev_idle["data"]["activity"], "idle",
+            "idle event emitted after debounce window"
+        );
+
+        // workspace_activity() now reports Idle.
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle,
+            "activity is Idle after debounce window expires"
+        );
+
+        // No duplicate events.
+        assert!(
+            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            "no duplicate idle event"
+        );
+    }
+
+    /// Regression for STAB-N: busy→idle transition debounce (test c).
+    /// workspace_activity() MUST return AgentRunning during the grace window
+    /// (before the debounce fires) so list/get/update responses and the event
+    /// stream agree on the derived state.
+    #[tokio::test]
+    async fn idle_debounce_workspace_activity_during_grace() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "activity is AgentRunning while agent in-flight"
+        );
+
+        // End agent activity → schedules idle flip after 100ms.
+        h.services.agent_activity_end(&h.ws).await;
+
+        // During the grace window, workspace_activity() MUST still report AgentRunning.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "workspace_activity() returns AgentRunning during grace window"
+        );
+
+        // After the window expires, workspace_activity() reports Idle.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle,
+            "workspace_activity() returns Idle after grace window"
         );
     }
 }
