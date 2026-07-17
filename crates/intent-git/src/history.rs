@@ -245,16 +245,17 @@ pub fn resolve_workspace_boundary(
 ) -> Result<Option<String>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
 
+    // Get HEAD first - if unavailable, no boundary can be resolved
+    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => oid,
+        None => return Ok(None), // Detached/missing HEAD → no boundary
+    };
+
     // Try merge-base first (rebase-resilient)
     if let Some(base_ref) = base_ref {
         // Try origin/<base_ref> first, then <base_ref>
         for ref_name in [format!("origin/{}", base_ref), base_ref.to_string()] {
             if let Ok(obj) = repo.revparse_single(&ref_name) {
-                let head_oid = repo
-                    .head()
-                    .ok()
-                    .and_then(|h| h.target())
-                    .unwrap_or(git2::Oid::ZERO_SHA1);
                 if let Ok(base_oid) = repo.merge_base(head_oid, obj.id()) {
                     return Ok(Some(base_oid.to_string()));
                 }
@@ -265,12 +266,9 @@ pub fn resolve_workspace_boundary(
     // Fallback: validate base_commit_sha as ancestor of HEAD
     if let Some(base_sha) = base_commit_sha {
         if let Ok(base_obj) = repo.revparse_single(base_sha) {
-            let head_oid = repo.head().ok().and_then(|h| h.target());
-            if let Some(head) = head_oid {
-                // Check if base_sha is an ancestor of HEAD
-                if repo.merge_base(base_obj.id(), head).ok() == Some(base_obj.id()) {
-                    return Ok(Some(base_obj.id().to_string()));
-                }
+            // Check if base_sha is an ancestor of HEAD (using head_oid from above)
+            if repo.merge_base(base_obj.id(), head_oid).ok() == Some(base_obj.id()) {
+                return Ok(Some(base_obj.id().to_string()));
             }
         }
     }
