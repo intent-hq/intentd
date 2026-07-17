@@ -416,7 +416,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
         json!({
             "workspaceId": ws_id,
             "agentId": created_agent_id,
-            "message": "Start working"
+            "content": "Start working"
         }),
     )
     .await;

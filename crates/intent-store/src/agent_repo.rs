@@ -731,8 +731,9 @@ impl Store {
         .await
     }
 
-    /// Insert an interrupted agent row (idempotent). If the agent already has a
-    /// pending row, this is a no-op (second restart). Returns `true` if inserted.
+    /// Record an interrupted in-flight agent. Upserts: if a pending row exists
+    /// (daemon restarted before resumption), updates to the latest state. Returns
+    /// `true` if inserted/updated.
     pub async fn insert_interrupted_agent(
         &self,
         agent_id: &AgentId,
@@ -743,7 +744,9 @@ impl Store {
         let sql =
             "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) \
                    VALUES (?, ?, ?, ?) \
-                   ON CONFLICT(agent_id) DO NOTHING";
+                   ON CONFLICT(agent_id) DO UPDATE SET \
+                       prev_status = excluded.prev_status, \
+                       interrupted_at = excluded.interrupted_at";
         let res = sqlx::query(sql)
             .bind(&agent_id.0)
             .bind(&workspace_id.0)

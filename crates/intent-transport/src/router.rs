@@ -1350,25 +1350,43 @@ async fn dispatch(
         }
         "agent.resolveInterrupted" => {
             // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
-            // If present, both must be arrays (invalid params otherwise).
+            // If present, must be arrays of strings (reject non-array and non-string elements).
             let resume = match params.get("resume") {
                 None => None,
-                Some(Value::Array(arr)) => Some(
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect::<Vec<_>>(),
-                ),
+                Some(Value::Array(arr)) => {
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        match v.as_str() {
+                            Some(s) => ids.push(s.to_string()),
+                            None => {
+                                return Err(rpc(
+                                    INVALID_PARAMS,
+                                    format!("resume[{}] must be a string", i),
+                                ))
+                            }
+                        }
+                    }
+                    Some(ids)
+                }
                 Some(_) => return Err(rpc(INVALID_PARAMS, "resume must be an array")),
             };
             let abandon = match params.get("abandon") {
                 None => None,
-                Some(Value::Array(arr)) => Some(
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(String::from)
-                        .collect::<Vec<_>>(),
-                ),
+                Some(Value::Array(arr)) => {
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        match v.as_str() {
+                            Some(s) => ids.push(s.to_string()),
+                            None => {
+                                return Err(rpc(
+                                    INVALID_PARAMS,
+                                    format!("abandon[{}] must be a string", i),
+                                ))
+                            }
+                        }
+                    }
+                    Some(ids)
+                }
                 Some(_) => return Err(rpc(INVALID_PARAMS, "abandon must be an array")),
             };
             let result = api
