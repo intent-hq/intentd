@@ -6001,7 +6001,7 @@ mod file_tracking {
         let svc = Services::new(store);
 
         let result = svc
-            .file_tracking_load_commits(ws_id, Some(10), None)
+            .file_tracking_load_commits(ws_id, Some(10), None, None)
             .await
             .unwrap();
         let commits = result["commits"].as_array().unwrap();

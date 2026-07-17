@@ -13023,15 +13023,23 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        include_older: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
             // TA-2 / §5.5: clamp the page size to [1,200] (default 50) and walk
             // backward through the (newest-first) first-parent history via an
             // opaque skip token. `nextToken` is additive to the existing object.
+            // Boundary resolution: prefer merge-base, fallback to base_commit_sha,
+            // return boundarySha in the result for the FE workspace-start marker.
             let limit = pagination::clamp_limit(limit);
             let skip = pagination::parse_offset(page_token.as_deref());
-            let empty = serde_json::json!({ "commits": [], "nextToken": serde_json::Value::Null });
+            let include_older = include_older.unwrap_or(false);
+            let empty = serde_json::json!({
+                "commits": [],
+                "nextToken": serde_json::Value::Null,
+                "boundarySha": serde_json::Value::Null
+            });
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
@@ -13045,8 +13053,30 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
+
+            // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
+            let boundary_sha = intent_git::history::resolve_workspace_boundary(
+                &worktree,
+                ws.base_ref.as_deref(),
+                ws.base_commit_sha.as_deref(),
+            )?;
+
+            // If boundary info exists but nothing resolved, return empty (safety net
+            // to avoid showing arbitrary base-branch commits)
+            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some())
+                && boundary_sha.is_none()
+                && !include_older
+            {
+                return Ok(empty);
+            }
+
             // Fetch one past the page window to decide whether older commits remain.
-            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
+            let commits = intent_git::history::history_bounded(
+                &worktree,
+                boundary_sha.as_deref(),
+                skip + limit + 1,
+                include_older,
+            )?;
             let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()
@@ -13059,7 +13089,15 @@ impl WorkspaceApi for Services {
             } else {
                 serde_json::Value::Null
             };
-            Ok(serde_json::json!({ "commits": values, "nextToken": next_token }))
+            let boundary_value = match boundary_sha {
+                Some(sha) => serde_json::Value::String(sha),
+                None => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({
+                "commits": values,
+                "nextToken": next_token,
+                "boundarySha": boundary_value
+            }))
         })
     }
 
