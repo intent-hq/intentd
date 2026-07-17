@@ -1702,26 +1702,31 @@ impl Services {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Fetch the session to get workspace_id; best-effort (logged on error).
-                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
-                    if let Err(e) = self
-                        .store
-                        .refresh_agent_session_timestamp(
+                match self.store.get_agent_session(&agent_id).await {
+                    Ok(session) => {
+                        if let Err(e) = self
+                            .store
+                            .refresh_agent_session_timestamp(
+                                &session.workspace_id,
+                                &agent_id,
+                                &created_at,
+                            )
+                            .await
+                        {
+                            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                        }
+                        // Publish agent:message event using the store-returned message id.
+                        self.publish_agent_mutation_event(
                             &session.workspace_id,
                             &agent_id,
-                            &created_at,
+                            AGENT_MESSAGE,
+                            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
                         )
-                        .await
-                    {
-                        tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                        .await;
                     }
-                    // Publish agent:message event using the store-returned message id.
-                    self.publish_agent_mutation_event(
-                        &session.workspace_id,
-                        &agent_id,
-                        AGENT_MESSAGE,
-                        json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
-                    )
-                    .await;
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "get_agent_session failed; skipping timestamp refresh and agent:message event");
+                    }
                 }
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
