@@ -15210,6 +15210,7 @@ mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
 mod rules;
+pub mod skills;
 mod specialists;
 
 // Code Changes Review modules (§17).
