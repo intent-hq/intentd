@@ -1672,17 +1672,32 @@ impl Services {
         &self,
         agent_id: AgentId,
         content: String,
-        _message_id: Option<String>,
+        message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
-        match self
-            .store
-            .append_agent_message(&agent_id, "user", &blocks, &created_at)
-            .await
-        {
+        let message = match message_id {
+            Some(id) => {
+                self.store
+                    .append_agent_message_with_id(
+                        &agent_id,
+                        &id,
+                        "user",
+                        &blocks,
+                        None,
+                        &created_at,
+                    )
+                    .await
+            }
+            None => {
+                self.store
+                    .append_agent_message(&agent_id, "user", &blocks, &created_at)
+                    .await
+            }
+        };
+        match message {
             Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
@@ -1731,7 +1746,7 @@ impl Services {
     pub(crate) async fn agent_force_message_op(
         &self,
         agent_id: AgentId,
-        _message_id: String,
+        message_id: String,
         content: String,
     ) -> Result<Value> {
         let session = self.store.get_agent_session(&agent_id).await?;
@@ -1739,7 +1754,14 @@ impl Services {
         let created_at = now_iso();
         let message = self
             .store
-            .append_agent_message(&agent_id, "user", &blocks, &created_at)
+            .append_agent_message_with_id(
+                &agent_id,
+                &message_id,
+                "user",
+                &blocks,
+                None,
+                &created_at,
+            )
             .await?;
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).

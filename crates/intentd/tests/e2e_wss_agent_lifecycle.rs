@@ -5255,7 +5255,7 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["agent:message", "agent:stream:end"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -5267,7 +5267,7 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Sender", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "Sender", "model": "mock:default" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
@@ -5276,27 +5276,34 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "test send" }),
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "test send" }),
     )
     .await;
     assert_eq!(send_result["success"], true);
-    let send_message_id = send_result["messageId"].as_str().unwrap();
+    let send_message_id = send_result["messageId"].as_str().unwrap().to_string();
 
+    // Collect events looking for agent:message for the sendMessage.
     let mut saw_send_message_event = false;
+    let mut stream_end_count = 0;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
         let evt = &frame["params"]["event"];
-        if evt["type"] == "agent:message"
-            && evt["data"]["agentId"].as_str() == Some(agent_id.as_str())
-            && evt["data"]["role"] == "user"
-            && evt["data"]["messageId"].as_str() == Some(send_message_id)
-        {
-            saw_send_message_event = true;
-            break;
-        }
-        // Also break if we hit stream:end to avoid waiting forever.
-        if evt["type"] == "agent:stream:end" && saw_send_message_event {
-            break;
+        match evt["type"].as_str() {
+            Some("agent:message") => {
+                if evt["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && evt["data"]["role"] == "user"
+                    && evt["data"]["messageId"].as_str() == Some(send_message_id.as_str())
+                {
+                    saw_send_message_event = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                stream_end_count += 1;
+                if saw_send_message_event && stream_end_count >= 1 {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
     assert!(
@@ -5304,20 +5311,12 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         "agent:message event emitted for agent.sendMessage with correct messageId"
     );
 
-    // Wait for the turn to complete.
-    for _ in 0..80 {
-        let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:end" {
-            break;
-        }
-    }
-
     // Test 2: agent.wakeOrCreate emits agent:message.
     let marked = wss_rpc(
         &mut rpc,
         12,
         "task.markAsTask",
-        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+        json!({ "workspaceId": &ws_id, "noteId": &note_id, "status": "in_progress" }),
     )
     .await;
     assert_eq!(marked["ok"], true);
@@ -5327,8 +5326,8 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         13,
         "agent.wakeOrCreate",
         json!({
-            "workspaceId": ws_id,
-            "taskNoteId": note_id,
+            "workspaceId": &ws_id,
+            "taskNoteId": &note_id,
             "contextMessage": "test wake",
             "create": { "model": "mock:default" },
         }),
@@ -5337,18 +5336,29 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
     assert_eq!(wake_result["ok"], true);
     let task_agent_id = wake_result["agentId"].as_str().unwrap().to_string();
 
+    // Collect events looking for agent:message for the wake.
     let mut saw_wake_message_event = false;
     let mut wake_message_id: Option<String> = None;
+    let mut stream_end_count_wake = 0;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
         let evt = &frame["params"]["event"];
-        if evt["type"] == "agent:message"
-            && evt["data"]["agentId"].as_str() == Some(task_agent_id.as_str())
-            && evt["data"]["role"] == "user"
-        {
-            wake_message_id = evt["data"]["messageId"].as_str().map(String::from);
-            saw_wake_message_event = true;
-            break;
+        match evt["type"].as_str() {
+            Some("agent:message") => {
+                if evt["data"]["agentId"].as_str() == Some(task_agent_id.as_str())
+                    && evt["data"]["role"] == "user"
+                {
+                    wake_message_id = evt["data"]["messageId"].as_str().map(String::from);
+                    saw_wake_message_event = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                stream_end_count_wake += 1;
+                if saw_wake_message_event && stream_end_count_wake >= 1 {
+                    break;
+                }
+            }
+            _ => {}
         }
     }
     assert!(
@@ -5361,7 +5371,7 @@ async fn agent_message_event_emitted_for_send_and_wake_over_wss() {
         &mut rpc,
         14,
         "agent.getConversation",
-        json!({ "workspaceId": ws_id, "agentId": task_agent_id }),
+        json!({ "workspaceId": &ws_id, "agentId": &task_agent_id }),
     )
     .await;
     let messages = conv_result["messages"].as_array().unwrap();
