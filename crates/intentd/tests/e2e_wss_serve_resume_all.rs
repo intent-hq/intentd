@@ -507,6 +507,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     );
 
     // Phase 4: Verify agent.listInterrupted returns empty (all resumed)
+    // Small delay to allow set_interrupted_resolution to commit (race in CI).
+    tokio::time::sleep(Duration::from_millis(200)).await;
     eprintln!("Phase 4: Verify interrupted agents list is empty");
     let list_result = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
     let agents = list_result["agents"].as_array().expect("agents array");
