@@ -283,6 +283,11 @@ pub const APP_UI_NAVIGATE: &str = "app:ui-navigate";
 pub const APP_UI_HIGHLIGHT: &str = "app:ui-highlight";
 pub const APP_WORKSPACE_OPEN: &str = "app:workspace-open";
 
+// Skills events (new in intentd; PROTOCOL §5.33/§6.5). Emitted when the
+// discovered skill set changes for a workspace (file-watch on skill roots).
+// Payload: `{ workspaceId }`.
+pub const SKILLS_CHANGED: &str = "skills:changed";
+
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -390,6 +395,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
+    SKILLS_CHANGED,
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.

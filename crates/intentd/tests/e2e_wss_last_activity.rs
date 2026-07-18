@@ -16,12 +16,13 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::DateTime;
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -50,14 +51,6 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn scratch_dir(prefix: &str) -> PathBuf {
@@ -328,11 +321,10 @@ where
 
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = scratch_dir("data");
-    let port_s = free_port().to_string();
     // Override debounce to 200ms for fast test execution
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "200"),
         ("MOCK_AGENT_SCRIPT_PATH", mock_script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
@@ -450,8 +442,13 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         .as_str()
         .expect("lastActivity string");
     if let Some(init) = &initial_activity {
+        // Parse both as RFC3339 DateTimes to compare instants (lexicographic comparison
+        // can be wrong with differing fractional-second precision).
+        let init_dt =
+            DateTime::parse_from_rfc3339(init.as_str()).expect("parse initial lastActivity");
+        let new_dt = DateTime::parse_from_rfc3339(new_activity).expect("parse new lastActivity");
         assert!(
-            new_activity > init.as_str(),
+            new_dt > init_dt,
             "lastActivity did not advance: {} -> {}",
             init,
             new_activity

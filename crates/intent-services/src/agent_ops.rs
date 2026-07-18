@@ -982,6 +982,18 @@ impl Services {
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+        // Initialize provider from the model's compound prefix if not explicitly
+        // set. This ensures sessions created with a compound model id like
+        // "opencode:kimi-k3" have the correct provider from the start.
+        let provider = provider.or_else(|| {
+            model.as_ref().and_then(|m| {
+                if m.contains(':') {
+                    Some(intent_providers::parse_compound_model_id(m).0)
+                } else {
+                    None
+                }
+            })
+        });
         let session = AgentSession {
             id,
             workspace_id,
@@ -1084,6 +1096,10 @@ impl Services {
     }
 
     /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
+    ///
+    /// When the new model is a compound id (`provider:model`) whose provider
+    /// differs from session.provider, this updates session.provider to match,
+    /// ensuring the next spawn uses the correct binary.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -1091,6 +1107,15 @@ impl Services {
     ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
         session.model = Some(model_id.clone());
+        // Reconcile session.provider when the model carries an explicit provider
+        // prefix that differs from the current session provider. This ensures
+        // cross-provider model switches spawn the new provider's binary.
+        if model_id.contains(':') {
+            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
+            if session.provider.as_ref() != Some(&model_provider) {
+                session.provider = Some(model_provider);
+            }
+        }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
         self.store
@@ -1922,12 +1947,68 @@ impl Services {
             self.transition_linked_task_to_review_required(&workspace_id, note_id, caller.clone())
                 .await;
         }
-        // SUB-2: no immediate `deliver_parent_wake` here. The parent wake is
-        // driven by the child's terminal `agent:idle` (delivered by the
-        // completion-delivery worker armed at delegate-time), so every child
-        // completion yields exactly one wake. Grouped (`after_all`) children
-        // continue to fold their persisted `completionReport` into the group's
-        // aggregated wake via `format_group_child_line`.
+
+        // Immediate parent wake for non-grouped children: if this child is in an
+        // `after_all` delegation group, skip the immediate wake — the group's
+        // aggregated wake will fold this report in when all children settle. Otherwise,
+        // deliver the wake NOW unconditionally to the parent, then mark any oneShot
+        // watches to suppress their agent:idle delivery (report-time wake requirement).
+        let grouped = self.child_in_undelivered_group(&workspace_id, &parent, &caller);
+        if !grouped {
+            // Deliver exactly ONE wake to the parent, regardless of watch count.
+            // Format the wake message with the persisted report.
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) completed. Report: {}",
+                session.name, caller.0, report_text
+            );
+            // Build event notification metadata (mirroring deliver_completion_to_watches).
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": ["agent:reportToParent"],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": "agent:reportToParent",
+                    "timestamp": saved_at,
+                    "data": {
+                        "agentId": caller.0,
+                        "agentName": session.name.clone(),
+                        "report": report_text.clone(),
+                    },
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            // Deliver the wake to the parent unconditionally (even if no watch exists).
+            if let Err(e) = self
+                .deliver_parent_wake(&workspace_id, parent.clone(), wake_text, Some(metadata))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver reportToParent wake to parent"
+                );
+            }
+
+            // Mark any oneShot, ungrouped watches whose parent matches this parent as
+            // report_delivered, so deliver_completion_to_watches will skip agent:idle
+            // for them (suppressing the duplicate wake). Do NOT mark watches for other
+            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
+            // completion wake and should not receive the report wake.
+            let watches = self.find_watches_for_child(&workspace_id, &caller);
+            for watch in watches
+                .iter()
+                .filter(|w| w.one_shot && w.group_id.is_none() && w.parent_agent_id == parent)
+            {
+                self.mark_watch_report_delivered(&workspace_id, &watch.id);
+            }
+        }
+
         Ok(json!({
             "ok": true,
             "parentAgentId": parent,

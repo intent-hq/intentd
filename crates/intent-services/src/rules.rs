@@ -413,9 +413,26 @@ pub(crate) async fn assemble_system_prompt(
     }
     // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
     // subcommand, append the instruction line. Placed after workspace-rules,
-    // before isolation hint / specialist role.
+    // before skills / isolation hint / specialist role.
     if let Some(rtk_instruction) = build_rtk_instruction(store).await {
         parts.push(rtk_instruction);
+    }
+    // Skills catalog layer (reference layer 4.7: after specialization rules, user
+    // rules, and skills — before isolation hint / specialist role). When a
+    // workspace path is available, discover and inject the skills catalog. Empty
+    // catalog ⇒ no layer appended. Discovery failures degrade gracefully (log
+    // warn, omit layer) — never fail prompt assembly.
+    if let Some(ws) = workspace {
+        if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
+            match crate::skills::format_skills_catalog_for_prompt(&repo_path.to_string_lossy())
+                .await
+            {
+                catalog if !catalog.trim().is_empty() => {
+                    parts.push(catalog);
+                }
+                _ => {}
+            }
+        }
     }
     // Mode-dependent isolation hints (Task 6): inject context about CoW
     // sandboxing for implementors and parallel delegation safety for coordinators
@@ -599,5 +616,196 @@ impl<'a> RulesService<'a> {
         let rules = self.list(workspace_id, workspace_path).await?;
         let changed = json!({ "path": END_USER_RULES_KEY, "value": Value::Object(overrides) });
         Ok((rules, changed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use intent_core::Workspace;
+    use intent_store::Store;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("intentd-test-{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let p = PathBuf::from(format!("{}{suffix}", self.path.display()));
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    /// Helper to create a test workspace with a repository path
+    fn make_test_workspace(repo_path: PathBuf) -> Workspace {
+        let ts = intent_core::now_iso();
+        Workspace {
+            id: intent_core::WorkspaceId("test-ws".to_string()),
+            title: "Test Workspace".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: intent_core::WorkspaceStatus::Active,
+            status_message: None,
+            activity: intent_core::WorkspaceActivity::Idle,
+            attention: intent_core::WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: Some(repo_path.to_string_lossy().to_string()),
+            repository_path: Some(repo_path.to_string_lossy().to_string()),
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assemble_system_prompt_with_skills() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        let skills_dir = repo_path.join(".augment").join("skills").join("test-skill");
+        tokio::fs::create_dir_all(&skills_dir).await.unwrap();
+
+        let skill_content = r#"---
+name: test-skill
+description: A test skill for prompt assembly
+---
+
+This is a test skill.
+"#;
+        tokio::fs::write(skills_dir.join("SKILL.md"), skill_content)
+            .await
+            .unwrap();
+
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = make_test_workspace(repo_path.to_path_buf());
+
+        let prompt = assemble_system_prompt(
+            &store,
+            Some(repo_path),
+            "workspace",
+            None,
+            false,
+            false,
+            Some(&workspace),
+            None,
+        )
+        .await;
+
+        assert!(prompt.is_some());
+        let prompt_text = prompt.unwrap();
+
+        // Assert the skills catalog is present
+        assert!(
+            prompt_text.contains("<available_skills>"),
+            "Skills catalog block should be present"
+        );
+        assert!(
+            prompt_text.contains("<skill>"),
+            "Skills catalog should contain skill entries"
+        );
+        assert!(
+            prompt_text.contains("<name>test-skill</name>"),
+            "Skills catalog should contain the test skill name"
+        );
+        assert!(
+            prompt_text.contains("<description>A test skill for prompt assembly</description>"),
+            "Skills catalog should contain the test skill description"
+        );
+
+        // Assert layer ordering: skills should come after user rules but before
+        // specialist role (if present)
+        let skills_pos = prompt_text.find("<available_skills>").unwrap();
+        let specialist_pos = prompt_text.find("<specialist_role>");
+
+        // If specialist role is present, skills should come before it
+        if let Some(sp_pos) = specialist_pos {
+            assert!(
+                skills_pos < sp_pos,
+                "Skills catalog should come before specialist role"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_assemble_system_prompt_without_skills() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = make_test_workspace(repo_path.to_path_buf());
+
+        let prompt = assemble_system_prompt(
+            &store,
+            Some(repo_path),
+            "workspace",
+            None,
+            false,
+            false,
+            Some(&workspace),
+            None,
+        )
+        .await;
+
+        assert!(prompt.is_some());
+        let prompt_text = prompt.unwrap();
+
+        // Assert the skills catalog is NOT present when no skills exist
+        assert!(
+            !prompt_text.contains("<available_skills>"),
+            "Skills catalog block should be absent when no skills exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assemble_system_prompt_no_workspace() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let prompt =
+            assemble_system_prompt(&store, None, "workspace", None, false, false, None, None).await;
+
+        assert!(prompt.is_some());
+        let prompt_text = prompt.unwrap();
+
+        // Assert the skills catalog is NOT present when no workspace is provided
+        assert!(
+            !prompt_text.contains("<available_skills>"),
+            "Skills catalog block should be absent when no workspace provided"
+        );
     }
 }

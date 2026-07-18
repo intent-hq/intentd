@@ -779,6 +779,76 @@ async fn rename_and_set_model_persist() {
     assert_eq!(got.model.as_deref(), Some("auggie:opus4.7"));
 }
 
+/// `agent.setModel` reconciles session.provider when the new model is a
+/// compound id whose provider differs from the current session provider.
+/// This ensures cross-provider model switches spawn the new provider's binary.
+#[tokio::test]
+async fn set_model_reconciles_provider_on_cross_provider_switch() {
+    let (_t, svc, ws) = setup().await;
+    // Create an agent with an explicit auggie provider.
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Switch".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // Initial state: auggie provider, auggie model.
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    // Provider is inferred from the compound model on creation.
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    // Set a compound model for a different provider.
+    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into())
+        .await
+        .expect("setModel");
+    // session.provider should now match the compound prefix.
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after");
+    assert_eq!(
+        session.model.as_deref(),
+        Some("opencode:opencode-go/kimi-k3")
+    );
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
+}
+
+/// `agent.setModel` leaves session.provider unchanged when the new model is
+/// a bare id (no `:` prefix) or a compound id for the same provider.
+#[tokio::test]
+async fn set_model_preserves_provider_for_bare_or_same_provider() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Same").await;
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let orig_provider = session.provider.clone();
+    // Bare model → provider unchanged.
+    svc.agent_set_model_op(id.clone(), "opus4.7".into())
+        .await
+        .expect("setModel bare");
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after bare");
+    assert_eq!(session.provider, orig_provider);
+    // Same-provider compound → provider unchanged (or set to match if None).
+    svc.agent_set_model_op(id.clone(), "auggie:sonnet4.5".into())
+        .await
+        .expect("setModel same provider");
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after same");
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+}
+
 #[tokio::test]
 async fn rename_missing_agent_is_internal() {
     let (_t, svc, _ws) = setup().await;
@@ -1602,7 +1672,7 @@ async fn watch_completion_dedupe() {
 }
 
 #[tokio::test]
-async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one() {
+async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     // Immediate-mode delegation arms a oneShot completion watch on the child.
@@ -1627,13 +1697,17 @@ async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one
     svc.agent_report_to_parent_op(ws.clone(), json!(report), Some(child.clone()))
         .await
         .expect("report");
-    // SUB-2: zero immediate wakes.
-    assert_eq!(parent_message_count(&svc, &parent).await, baseline);
+    // Report-time wake: parent receives the wake immediately.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains(&format!("Report: {report}")),
+        "wake text must carry the report at reportToParent time: {text}"
+    );
 
     // Drive the child's `agent:idle` (mirrors the turn worker's
-    // stream-complete branch, which enriches the payload with `report` from
-    // the persisted `completionReport`). Exactly one wake fires, carrying
-    // `Report:` text.
+    // stream-complete branch). The wake is suppressed because the watch is
+    // marked as report_delivered.
     svc.handle_completion_event(&completion_event(
         &ws,
         AGENT_IDLE,
@@ -1641,13 +1715,9 @@ async fn report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one
         json!({ "agentId": child.0, "report": report }),
     ))
     .await;
+    // No second wake fires — idle suppression working.
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
-    let text = parent_messages_text(&svc, &parent).await;
-    assert!(
-        text.contains(&format!("Report: {report}")),
-        "wake text must carry the persisted completion report: {text}"
-    );
-    // The oneShot watch is consumed after delivery.
+    // The oneShot watch is consumed after the idle suppression.
     assert!(svc.find_watches_for_child(&ws, &child).is_empty());
 }
 
@@ -2533,12 +2603,12 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
-/// SUB-2: a delegated caller's `reportToParent` is now metadata-only — the
-/// report is persisted on the child session (`completion_report`) and the
-/// TS-shaped result is returned, but no immediate parent wake is issued. The
-/// single parent wake is delivered later by the child's terminal
-/// `agent:idle` (via the still-armed completion watch), which is asserted by
-/// the sibling `report_to_parent_metadata_only_no_immediate_wake_then_idle_delivers_one`
+/// Report-time wake: a delegated caller's `reportToParent` delivers an
+/// immediate parent wake containing the report. The report is persisted on the
+/// child session (`completion_report`) and the TS-shaped result is returned.
+/// The watch is marked as report_delivered, so the child's subsequent
+/// `agent:idle` does NOT deliver a second wake (suppressed), which is asserted
+/// by the sibling `report_to_parent_delivers_immediate_wake_then_idle_suppressed`
 /// test.
 #[tokio::test]
 async fn report_to_parent_delivers_for_delegated_caller() {
@@ -2570,14 +2640,18 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     assert_eq!(result["reportLength"], json!(report.chars().count() as i64));
     assert!(result["savedAt"].is_string());
 
-    // SUB-2: no immediate wake to the parent — reportToParent is
-    // metadata-only. The report is persisted on the child session.
+    // Report-time wake: reportToParent now delivers an immediate wake to the parent.
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 0);
+    assert_eq!(parent_session.messages.len(), 1);
+    let wake_text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        wake_text.contains(&format!("Report: {report}")),
+        "wake must contain the report: {wake_text}"
+    );
     let child_session = svc
         .store()
         .get_agent_session(&child)
@@ -2787,10 +2861,10 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
 /// child (caller set, so the child's `parentAgentId` == parent), then the child
 /// reports back via `report_to_parent` (caller-aware; the registry/dispatch name
 /// is bare — agents still see `report_to_parent_workspace-mcp` because the
-/// provider appends the server suffix). SUB-2: reportToParent is metadata-only
-/// (no immediate parent wake); the report is persisted on the child session
-/// and reaches the parent later through the child's terminal `agent:idle`. The
-/// same report tool through a caller-less server (the RPC / no-caller path)
+/// provider appends the server suffix). Report-time wake: reportToParent
+/// delivers an immediate parent wake; the report is persisted on the child
+/// session and the parent receives the wake containing the report immediately.
+/// The same report tool through a caller-less server (the RPC / no-caller path)
 /// yields an `isError: true` workspace_api tool result. This is the
 /// service-level integration coverage chosen over a node-gated UDS E2E so the
 /// full loop is exercised deterministically without an external `node`
@@ -2865,16 +2939,19 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
         Some(parent.0.as_str())
     );
 
-    // SUB-2: reportToParent is metadata-only — the parent transcript stays
-    // empty at report-time. The report is persisted on the child session and
-    // reaches the parent later via the child's `agent:idle` (covered by the
-    // sibling `handle_completion_event`-driven tests).
+    // Report-time wake: the parent receives an immediate wake containing the
+    // report. The report is persisted on the child session.
     let parent_session = svc
         .store()
         .get_agent_session(&parent)
         .await
         .expect("parent session");
-    assert_eq!(parent_session.messages.len(), 0);
+    assert_eq!(parent_session.messages.len(), 1);
+    let wake_text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        wake_text.contains(&format!("Report: {report}")),
+        "wake must contain the report: {wake_text}"
+    );
     let child_session = svc
         .store()
         .get_agent_session(&child)
@@ -4525,9 +4602,10 @@ async fn report_to_parent_immediate_after_group_delivery() {
         .await
         .expect("late report");
     assert_eq!(r["ok"], json!(true));
-    // SUB-2: metadata-only — no additional immediate parent wake. The report
-    // is persisted on the child session and would ride the next agent:idle.
-    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    // Report-time wake: a late reportToParent (after group delivery) still delivers
+    // an immediate wake because the child is no longer in an undelivered group.
+    // The message count goes from 1 (group wake) to 2 (group wake + late report wake).
+    assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let child_session = svc
         .store()
         .get_agent_session(&c1)

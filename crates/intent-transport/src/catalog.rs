@@ -226,6 +226,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "settings.list",
     "settings.reset",
     "settings.update",
+    "skill.list",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",

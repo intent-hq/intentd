@@ -15,7 +15,7 @@ use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_AGENT_LINKED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
@@ -109,7 +109,7 @@ pub use agent_manager::{
 };
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
+pub use events::{EventBus, FileWatcher, SkillsWatcher, Subscription, SubscriptionFilter};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
@@ -300,6 +300,20 @@ pub struct Services {
     last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for debounce tasks (incremented on each schedule).
     last_activity_debounce_gen: Arc<Mutex<u64>>,
+    /// Per-workspace debouncers for the busy→idle `workspace:activity-changed`
+    /// event emission (§10.1). When `agent_activity_end` transitions a workspace
+    /// count to zero, the idle flip is scheduled after a debounce window (~3s,
+    /// env-configurable); a new `agent_activity_begin` within the window cancels
+    /// it (no idle/running event pair). Shared across clones so all service
+    /// handles observe the same pending timers. In-memory only (no persistence);
+    /// pending timers are dropped on daemon shutdown without flushing.
+    ///
+    /// To prevent race conditions where an old task removes a newer handle, each
+    /// entry stores a generation counter alongside the abort handle. Tasks only
+    /// remove their own entry if the generation still matches.
+    idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
+    /// Generation counter for idle debounce tasks (incremented on each schedule).
+    idle_debounce_gen: Arc<Mutex<u64>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -356,6 +370,8 @@ impl Services {
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
+            idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            idle_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
         }
@@ -514,12 +530,24 @@ impl Services {
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
-    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight.
+    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight
+    /// OR if a pending idle debounce is scheduled (grace window). During the grace
+    /// window after the last agent ends, the workspace is still considered
+    /// `AgentRunning` until the debounce fires, ensuring list/get/update responses
+    /// and the event stream agree on the derived state.
     pub(crate) fn workspace_activity(&self, workspace_id: &WorkspaceId) -> WorkspaceActivity {
         let map = self.agent_activity.lock().unwrap();
         match map.get(workspace_id) {
             Some(count) if *count > 0 => WorkspaceActivity::AgentRunning,
-            _ => WorkspaceActivity::Idle,
+            _ => {
+                // Check if there's a pending idle debounce (grace window).
+                if let Ok(debouncers) = self.idle_debouncers.lock() {
+                    if debouncers.contains_key(workspace_id) {
+                        return WorkspaceActivity::AgentRunning;
+                    }
+                }
+                WorkspaceActivity::Idle
+            }
         }
     }
 
@@ -633,9 +661,24 @@ impl Services {
             }
         });
 
-        // Store the abort handle with generation so a fresh schedule can cancel this one.
+        // Store the abort handle with generation. Only insert if no entry exists or our
+        // generation is newer (prevents older schedules from overwriting newer ones).
         if let Ok(mut map) = self.last_activity_debouncers.lock() {
-            map.insert(workspace_id, (gen, handle.abort_handle()));
+            let should_insert = map
+                .get(&workspace_id)
+                .map(|(existing_gen, _)| gen > *existing_gen)
+                .unwrap_or(true);
+
+            if should_insert {
+                if let Some((_, old_handle)) =
+                    map.insert(workspace_id, (gen, handle.abort_handle()))
+                {
+                    old_handle.abort();
+                }
+            } else {
+                // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
         }
     }
 
@@ -854,7 +897,8 @@ impl Services {
 
     /// Record an agent session entering flight for `workspace_id`. On the
     /// `Idle → AgentRunning` transition (count `0 → 1`) emits a self-sufficient
-    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change).
+    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change)
+    /// and cancels any pending idle debounce.
     pub(crate) async fn agent_activity_begin(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -862,6 +906,14 @@ impl Services {
             *count += 1;
             *count == 1
         };
+
+        // Cancel any pending idle debounce (if the workspace was in grace window).
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
+                handle.abort();
+            }
+        }
+
         if transitioned {
             publish_event(
                 &self.event_bus,
@@ -872,9 +924,11 @@ impl Services {
     }
 
     /// Record an agent session leaving flight for `workspace_id`. On the
-    /// `AgentRunning → Idle` transition (count `1 → 0`) emits a self-sufficient
-    /// `workspace:activity-changed` (§10.1, only-on-change). A decrement with no
-    /// tracked session is a no-op.
+    /// `AgentRunning → Idle` transition (count `1 → 0`), schedules a debounced
+    /// `workspace:activity-changed { idle }` event emission after a configurable
+    /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
+    /// within the window cancels the idle flip. A decrement with no tracked session
+    /// is a no-op.
     pub(crate) async fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -892,11 +946,97 @@ impl Services {
             }
         };
         if transitioned {
-            publish_event(
-                &self.event_bus,
-                activity_changed_event(workspace_id, WorkspaceActivity::Idle),
-            )
-            .await;
+            self.schedule_idle_debounce(workspace_id.clone());
+        }
+    }
+
+    /// Schedule a debounced `workspace:activity-changed { idle }` event emission
+    /// for the workspace. The event is emitted only after the workspace stays idle
+    /// for the full debounce window (~3s default, env-overridable for tests). A new
+    /// `agent_activity_begin` within the window cancels the pending flip.
+    fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
+        // Increment generation counter and cancel any existing debouncer.
+        let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
+            *gen_lock = gen_lock.wrapping_add(1);
+            *gen_lock
+        } else {
+            0
+        };
+
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(&workspace_id) {
+                handle.abort();
+            }
+        }
+
+        // Clone the state we'll need in the spawned task.
+        let this = self.clone();
+        let debouncers = self.idle_debouncers.clone();
+        let ws_id = workspace_id.clone();
+
+        // Debounce window: production constant (~3s), overridable via env for tests.
+        let debounce_ms = std::env::var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(WORKSPACE_IDLE_DEBOUNCE_MS);
+
+        // Spawn a task that sleeps for the debounce window, then emits idle.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+
+            // Guard emission: verify debouncer still current AND count still zero.
+            let should_emit = {
+                let gen_valid = if let Ok(map) = debouncers.lock() {
+                    map.get(&ws_id)
+                        .map(|(current_gen, _)| *current_gen == gen)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let count_zero = if let Ok(activity) = this.agent_activity.lock() {
+                    activity.get(&ws_id).copied().unwrap_or(0) == 0
+                } else {
+                    false
+                };
+                gen_valid && count_zero
+            };
+
+            if should_emit {
+                // Remove debouncer entry before emitting so reads stop reporting grace.
+                if let Ok(mut map) = debouncers.lock() {
+                    if let Some((current_gen, _)) = map.get(&ws_id) {
+                        if *current_gen == gen {
+                            map.remove(&ws_id);
+                        }
+                    }
+                }
+
+                publish_event(
+                    &this.event_bus,
+                    activity_changed_event(&ws_id, WorkspaceActivity::Idle),
+                )
+                .await;
+            }
+        });
+
+        // Store the abort handle with generation. Only insert if no entry exists or our
+        // generation is newer (prevents older schedules from overwriting newer ones).
+        if let Ok(mut map) = self.idle_debouncers.lock() {
+            let should_insert = map
+                .get(&workspace_id)
+                .map(|(existing_gen, _)| gen > *existing_gen)
+                .unwrap_or(true);
+
+            if should_insert {
+                if let Some((_, old_handle)) =
+                    map.insert(workspace_id, (gen, handle.abort_handle()))
+                {
+                    old_handle.abort();
+                }
+            } else {
+                // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
         }
     }
 
@@ -1609,6 +1749,24 @@ impl Services {
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
+            // Report-time wake suppression: if the watch has already delivered the
+            // report wake (via agent.reportToParent), skip delivery ONLY for
+            // agent:idle. agent:failed / agent:deleted still deliver (failure after
+            // reporting is a new signal, not a duplicate).
+            if watch.report_delivered && event.event_type == intent_core::events::AGENT_IDLE {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "skipping agent:idle wake — report already delivered at reportToParent time"
+                );
+                // Remove the oneShot watch now that the completion cycle is done.
+                if watch.one_shot {
+                    self.remove_watch(workspace_id, &watch.id);
+                    self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                        .await;
+                }
+                continue;
+            }
             // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
@@ -2313,6 +2471,14 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
 /// without event storms during agent streaming; tests override with a short
 /// window (see `LAST_ACTIVITY_DEBOUNCE_TEST_MS` env var).
 const LAST_ACTIVITY_DEBOUNCE_MS: u64 = 3000;
+
+/// Trailing-edge debounce window for busy→idle `workspace:activity-changed` event
+/// emission (§10.1). Production value (~3 seconds) stops sidebar flicker during
+/// rapid agent turns; tests override with a short window (see
+/// `WORKSPACE_IDLE_DEBOUNCE_TEST_MS` env var). When `agent_activity_end` transitions
+/// a workspace count to zero, the idle flip is scheduled after this window; a new
+/// `agent_activity_begin` within the window cancels it (no idle/running event pair).
+const WORKSPACE_IDLE_DEBOUNCE_MS: u64 = 3000;
 
 /// Conservative allowlist of remote names whose first path segment may be
 /// stripped when canonicalising a workspace `baseRef` on write. Mirrors the
@@ -3622,6 +3788,22 @@ fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
         parent_event_id: None,
         metadata: None,
         data: serde_json::json!({ "changes": changes }),
+    }
+}
+
+/// Build a `skills:changed` event (PROTOCOL §6.5). Emitted when the discovered
+/// skill set changes for a workspace (file-watch on the five scan roots).
+fn skills_changed_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: SKILLS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
     }
 }
 
@@ -4986,6 +5168,32 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Resolve workspace path (required for skills discovery)
+            let ws = self.store.get_workspace(&workspace_id).await?;
+            let workspace_path = crate::git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::NotFound(format!(
+                    "workspace {} has no worktree path",
+                    workspace_id.as_str()
+                ))
+            })?;
+
+            // Check if skills changed and emit event if they did
+            let (skills, changed) =
+                skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+            if changed {
+                publish_event(&self.event_bus, skills_changed_event(&workspace_id)).await;
+            }
+
+            // Sort by name for deterministic output
+            let mut sorted_skills = skills;
+            sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+            Ok(serde_json::to_value(&sorted_skills).unwrap_or(serde_json::Value::Array(vec![])))
+        })
+    }
+
     fn specialist_create(
         &self,
         id: String,
@@ -5919,7 +6127,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
-            with_idempotency(
+            let result = with_idempotency(
                 &store,
                 "",
                 idempotency_key,
@@ -6136,26 +6344,17 @@ impl WorkspaceApi for Services {
                         .title
                         .map(|t| t.trim().to_string())
                         .unwrap_or_default();
-                    // Setup script fallback: request > repo config > none
-                    // (FE parity: workspace.service.ts L1788-1791).
-                    let setup_script = match input.setup_script.clone().filter(|s| !s.is_empty()) {
-                        Some(explicit) => Some(setup_scripts::user_script(explicit)),
-                        None => {
-                            if let Some(repo_path) = input
-                                .repository_path
-                                .as_deref()
-                                .filter(|p| !p.is_empty())
-                                .map(PathBuf::from)
-                            {
-                                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
-                                repo_config.setup_script
-                                    .filter(|s| !s.is_empty())
-                                    .map(setup_scripts::user_script)
-                            } else {
-                                None
-                            }
-                        }
-                    };
+                    // Setup script write (§5.25 repo-config sole source of truth):
+                    // when an explicit non-empty `setupScript` is provided, write it
+                    // into the repo config; otherwise leave the repo config alone
+                    // (the existing `setupScript` key, if any, remains readable).
+                    // The workspace DB row's `setup_script` column is retired from
+                    // the write path — it stays NULL (wire compat) and the read path
+                    // (§5.25) routes through the repo config with a legacy fallback.
+                    // Stash explicit setupScript for write AFTER worktree provisioning
+                    // (must land in the workspace's worktree, not the repo root, to be
+                    // visible as a committable change in the workspace).
+                    let explicit_setup_script = input.setup_script.clone().filter(|s| !s.is_empty());
                     let mut ws = Workspace {
                         id,
                         title,
@@ -6185,7 +6384,7 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_worktree.unwrap_or(false),
-                        setup_script,
+                        setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         pr_number: None,
@@ -6271,6 +6470,41 @@ impl WorkspaceApi for Services {
                         }
                     }
                     store.insert_workspace(&ws).await?;
+                    // Write explicit setupScript to the workspace's worktree (AFTER provisioning
+                    // so git_ops::worktree_path resolves correctly). Must land as a committable
+                    // change in the workspace, visible in the workspace's diff view.
+                    // Best-effort — a failure warns and continues (matches post-insert pattern
+                    // for other filesystem operations like .workspace/workspace.json).
+                    if let Some(explicit) = explicit_setup_script {
+                        // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+                        // to match getSetupScript/saveSetupScript and other repoConfig.* methods.
+                        match git_ops::worktree_path(&ws) {
+                            Some(repo_path) => {
+                                let mut repo_config =
+                                    crate::repo_config::read_repo_config(&repo_path).await;
+                                // Only write if the script differs (no-op when identical).
+                                if repo_config.setup_script.as_deref() != Some(explicit.as_str()) {
+                                    repo_config.setup_script = Some(explicit.clone());
+                                    if let Err(e) =
+                                        crate::repo_config::write_repo_config(&repo_path, repo_config)
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            workspace = %ws.id.as_str(),
+                                            error = %e,
+                                            "workspace.create: failed to write explicit setupScript to repo config"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::warn!(
+                                    workspace = %ws.id.as_str(),
+                                    "workspace.create: cannot persist setupScript; worktreePath and repositoryPath both empty"
+                                );
+                            }
+                        }
+                    }
                     // Write the legacy `<root>/<id>/.workspace/workspace.json`
                     // file so renderer paths (FE `FileSystemWorkspaceRepository`)
                     // find their per-workspace metadata without ENOENT spam.
@@ -6471,13 +6705,166 @@ impl WorkspaceApi for Services {
                         }
                         initial_agent = created.get("agent").cloned();
                     }
+                    // Execute the workspace setup script (fire-and-forget): after worktree
+                    // provisioning and repo-config write, read the effective setup script
+                    // (explicit request param > repo config) and run it in a "Setup" terminal.
+                    // Execution is non-blocking (tokio::spawn) and must never fail the create.
+                    // Skipped when skipWorktree or no worktree was provisioned.
+                    // Lives inside the idempotency closure so a cached response (same idempotencyKey)
+                    // returns immediately without re-executing the script.
+                    let pty_for_setup = self.pty.clone();
+                    let bus_for_setup = self.event_bus.clone();
+                    if !ws.skip_worktree {
+                    if let Some(worktree_path_buf) =
+                        crate::git_ops::worktree_path(&ws)
+                    {
+                        // Spawn background task to read + execute setup script (fire-and-forget).
+                        // Move config IO into the task so workspace.create doesn't block on it.
+                        let workspace_id = ws.id.clone();
+                        let worktree_path = worktree_path_buf.to_string_lossy().to_string();
+                        let repo_path = ws
+                            .repository_path
+                            .clone()
+                            .unwrap_or_default();
+                        let branch_name = ws.branch.clone();
+                        let source_branch = ws
+                            .base_ref
+                            .clone()
+                            .unwrap_or_default();
+                        let legacy_script = ws.setup_script.clone();
+                        let worktree_for_read = worktree_path_buf.clone();
+                        tokio::spawn(async move {
+                            // Read effective setup script (repo config with legacy DB fallback).
+                            let repo_config =
+                                crate::repo_config::read_repo_config(&worktree_for_read).await;
+                            let effective_script = repo_config
+                                .setup_script
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    legacy_script.as_ref().and_then(|ss| {
+                                        let script = ss.script.trim();
+                                        if script.is_empty() {
+                                            None
+                                        } else {
+                                            Some(script.to_string())
+                                        }
+                                    })
+                                });
+                            let script = match effective_script {
+                                Some(s) => s,
+                                None => return, // No script to execute
+                            };
+                            tracing::info!(
+                                workspace = %workspace_id.as_str(),
+                                script_length = script.len(),
+                                worktree = %worktree_path,
+                                "executing setup script in background"
+                            );
+                            // Write script to a private file under worktree .intent/ directory
+                            // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
+                            let script_id = uuid::Uuid::new_v4();
+                            let intent_dir = worktree_for_read.join(".intent");
+                            // Security: refuse if .intent exists as a symlink (prevents writing
+                            // script outside the worktree via a repo-committed symlink attack).
+                            if let Ok(meta) = tokio::fs::symlink_metadata(&intent_dir).await {
+                                if !meta.is_dir() {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        "setup script execution skipped: .intent is not a real directory (symlink or file)"
+                                    );
+                                    return;
+                                }
+                            } else {
+                                // .intent doesn't exist, create it with restrictive permissions
+                                if let Err(e) = tokio::fs::create_dir_all(&intent_dir).await {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        error = %e,
+                                        "failed to create .intent directory for setup script"
+                                    );
+                                    return;
+                                }
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    if let Err(e) = tokio::fs::set_permissions(
+                                        &intent_dir,
+                                        std::fs::Permissions::from_mode(0o700),
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            workspace = %workspace_id.as_str(),
+                                            error = %e,
+                                            "failed to set .intent directory permissions"
+                                        );
+                                    }
+                                }
+                            }
+                            let script_path =
+                                intent_dir.join(format!("setup-{}.sh", script_id.simple()));
+                            if let Err(e) = write_private_script(&script_path, &script).await {
+                                tracing::warn!(
+                                    workspace = %workspace_id.as_str(),
+                                    error = %e,
+                                    "failed to write setup script to private file"
+                                );
+                                return;
+                            }
+                            // Spawn via absolute /bin/sh (matching codebase fallback pattern)
+                            let mut spec =
+                                intent_pty::SpawnSpec::new(workspace_id.as_str(), "/bin/sh");
+                            spec.args = vec![script_path.to_string_lossy().to_string()];
+                            spec.size = intent_pty::PtySize { rows: 24, cols: 80 };
+                            spec.cwd = Some(worktree_for_read.clone());
+                            spec.env = vec![
+                                ("MAIN_CHECKOUT".to_string(), repo_path),
+                                ("WORKTREE_PATH".to_string(), worktree_path.clone()),
+                                ("BRANCH_NAME".to_string(), branch_name),
+                                ("SOURCE_BRANCH".to_string(), source_branch),
+                            ];
+                            match pty_for_setup.spawn(spec) {
+                                Ok(pty_id) => {
+                                    let terminal_id = pty_id.to_string();
+                                    tracing::info!(
+                                        workspace = %workspace_id.as_str(),
+                                        terminal_id = %terminal_id,
+                                        "setup script terminal spawned"
+                                    );
+                                    // Spawn output stream to fan setup script output to event bus
+                                    crate::terminal_ops::spawn_output_stream(
+                                        pty_for_setup.clone(),
+                                        bus_for_setup,
+                                        workspace_id.clone(),
+                                        pty_id,
+                                        terminal_id,
+                                    );
+                                    // Wait for the script to actually complete before cleanup
+                                    let _ = pty_for_setup.wait(pty_id).await;
+                                    // Best-effort cleanup of the script file (after exit)
+                                    let _ = tokio::fs::remove_file(&script_path).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        workspace = %workspace_id.as_str(),
+                                        error = %e,
+                                        "failed to spawn setup script terminal"
+                                    );
+                                    // Cleanup on spawn failure
+                                    let _ = tokio::fs::remove_file(&script_path).await;
+                                }
+                            }
+                        });
+                    }
+                    }
                     Ok(WorkspaceCreateResult {
                         workspace: ws,
                         initial_agent,
                     })
                 },
             )
-            .await
+            .await;
+            result
         })
     }
 
@@ -6612,6 +6999,10 @@ impl WorkspaceApi for Services {
                 ws.created_at = pinned.created_at;
                 ws.updated_at = pinned.updated_at;
                 ws.last_activity = pinned.last_activity;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the synthesized row.
+                ws.activity = this.workspace_activity(&ws.id);
             } else {
                 store.update_workspace(&ws).await?;
                 // Derive `lastActivity` (§9.1) on the returned record so
@@ -6619,6 +7010,10 @@ impl WorkspaceApi for Services {
                 // without a follow-up `workspace.get`. Chief is skipped: its
                 // timestamps are pinned above.
                 this.derive_last_activity(&mut ws).await;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the persisted row.
+                ws.activity = this.workspace_activity(&ws.id);
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
@@ -6834,6 +7229,10 @@ impl WorkspaceApi for Services {
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             // §6.5 has no `workspace:archived`; mirror the reference emitter and
             // publish `workspace:updated` with the applied `{ archived }` delta
             // so subscribers flip state without a re-read.
@@ -6861,6 +7260,10 @@ impl WorkspaceApi for Services {
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             publish_event(
                 &bus,
                 workspace_updated_event(&ws.id, serde_json::json!({ "archived": false })),
@@ -6957,7 +7360,7 @@ impl WorkspaceApi for Services {
                 worktree_path: None,
                 scope: source.scope.clone(),
                 skip_worktree: source.skip_worktree,
-                setup_script: source.setup_script.clone(),
+                setup_script: None,
                 is_remote: source.is_remote,
                 default_model: source.default_model.clone(),
                 pr_number: None,
@@ -7189,6 +7592,10 @@ impl WorkspaceApi for Services {
             // matches what `workspace.list`/`workspace.get` would compute for
             // the new row (§9.1, mutation-path parity).
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) for consistency
+            // with other mutation paths. For a fresh workspace with no agents,
+            // activity naturally remains `idle`.
+            ws.activity = this.workspace_activity(&ws.id);
             Ok(ws)
         })
     }
@@ -7331,6 +7738,10 @@ impl WorkspaceApi for Services {
             ws.attention = WorkspaceAttention::None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             // Self-sufficient `workspace:attention-changed` so every client clears
             // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
             if changed {
@@ -7360,6 +7771,10 @@ impl WorkspaceApi for Services {
                 // Schedule debounced lastActivity event (§10.1).
                 this.schedule_last_activity_event(id.clone());
             }
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             Ok(ws)
         })
     }
@@ -7405,9 +7820,34 @@ impl WorkspaceApi for Services {
     fn get_setup_script(&self, id: WorkspaceId) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            // Surface a default (empty `script`, `updatedAt: 0`) record before the
-            // first save; `NotFound` propagates so the router maps it to `-32602`.
             let ws = store.get_workspace(&id).await?;
+            // Read from repo config (§5.25 sole source of truth); synthesize the
+            // SetupScript record from the string. Legacy fallback: if repo config
+            // is empty but the workspace DB row still has a setupScript (pre-change
+            // data), return it read-only — never write it back to the DB.
+            // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+            // to match workspace.create and saveSetupScript (§5.25 + §5.33 consistency).
+            if let Some(repo_path) = git_ops::worktree_path(&ws) {
+                let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                if let Some(script_str) = repo_config.setup_script.filter(|s| !s.is_empty()) {
+                    // Repo config has a script — derive updatedAt from file mtime (epoch ms).
+                    let config_path = crate::repo_config::get_config_file_path(&repo_path);
+                    let updated_at = tokio::fs::metadata(&config_path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    return Ok(SetupScript {
+                        script: script_str,
+                        project_type: None,
+                        updated_at,
+                        generated_by: Some(intent_core::SetupScriptGeneratedBy::User),
+                    });
+                }
+            }
+            // Legacy fallback: return the DB value if present, else the default.
             Ok(ws.setup_script.unwrap_or_else(|| SetupScript {
                 script: String::new(),
                 project_type: None,
@@ -7424,12 +7864,30 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<SetupScript>> {
         let store = self.store.clone();
         Box::pin(async move {
-            let mut ws = store.get_workspace(&id).await?;
-            let record = setup_scripts::user_script(script);
-            ws.setup_script = Some(record.clone());
-            ws.updated_at = now_iso();
-            store.update_workspace(&ws).await?;
-            Ok(record)
+            // Write to repo config instead of the DB row (§5.25 sole source of truth).
+            let ws = store.get_workspace(&id).await?;
+            // Use git_ops::worktree_path (worktreePath first, repositoryPath fallback)
+            // to match workspace.create and getSetupScript (§5.25 + §5.33 consistency).
+            let repo_path_buf = git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::InvalidParams(
+                    "workspace has no worktreePath or repositoryPath; cannot persist setup script"
+                        .to_string(),
+                )
+            })?;
+            let mut repo_config = crate::repo_config::read_repo_config(&repo_path_buf).await;
+            repo_config.setup_script = if script.is_empty() {
+                None
+            } else {
+                Some(script)
+            };
+            let written_script = repo_config
+                .setup_script
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+            crate::repo_config::write_repo_config(&repo_path_buf, repo_config).await?;
+            // Return the §5.25 SetupScript wire shape (synthesized from the written string).
+            Ok(setup_scripts::user_script(written_script))
         })
     }
 
@@ -13162,15 +13620,23 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        include_older: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
             // TA-2 / §5.5: clamp the page size to [1,200] (default 50) and walk
             // backward through the (newest-first) first-parent history via an
             // opaque skip token. `nextToken` is additive to the existing object.
+            // Boundary resolution: prefer merge-base, fallback to base_commit_sha,
+            // return boundarySha in the result for the FE workspace-start marker.
             let limit = pagination::clamp_limit(limit);
             let skip = pagination::parse_offset(page_token.as_deref());
-            let empty = serde_json::json!({ "commits": [], "nextToken": serde_json::Value::Null });
+            let include_older = include_older.unwrap_or(false);
+            let empty = serde_json::json!({
+                "commits": [],
+                "nextToken": serde_json::Value::Null,
+                "boundarySha": serde_json::Value::Null
+            });
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
@@ -13184,8 +13650,28 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
+
+            // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
+            let boundary_sha = intent_git::history::resolve_workspace_boundary(
+                &worktree,
+                ws.base_ref.as_deref(),
+                ws.base_commit_sha.as_deref(),
+            )?;
+
+            // If boundary info exists but nothing resolved, return empty (safety net
+            // to avoid showing arbitrary base-branch commits). This holds regardless
+            // of includeOlder to prevent leaking arbitrary base-branch history.
+            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary_sha.is_none() {
+                return Ok(empty);
+            }
+
             // Fetch one past the page window to decide whether older commits remain.
-            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
+            let commits = intent_git::history::history_bounded(
+                &worktree,
+                boundary_sha.as_deref(),
+                skip + limit + 1,
+                include_older,
+            )?;
             let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()
@@ -13198,7 +13684,15 @@ impl WorkspaceApi for Services {
             } else {
                 serde_json::Value::Null
             };
-            Ok(serde_json::json!({ "commits": values, "nextToken": next_token }))
+            let boundary_value = match boundary_sha {
+                Some(sha) => serde_json::Value::String(sha),
+                None => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({
+                "commits": values,
+                "nextToken": next_token,
+                "boundarySha": boundary_value
+            }))
         })
     }
 
@@ -15000,6 +15494,7 @@ mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
 mod rules;
+pub mod skills;
 mod specialists;
 
 // Code Changes Review modules (§17).
@@ -15319,4 +15814,25 @@ fn parse_npx_version_ok(version_str: &str) -> bool {
         .next()
         .and_then(|major| major.parse::<u32>().ok())
         .is_some_and(|maj| maj >= 7)
+}
+
+/// Write `contents` to a fresh file created with mode `0600` on unix (plain
+/// write elsewhere), so the script file is never exposed with world-readable
+/// permissions (parallel to secrets.rs `write_private`).
+#[cfg(unix)]
+async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    f.write_all(contents.as_bytes()).await?;
+    f.sync_all().await
+}
+
+#[cfg(not(unix))]
+async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
+    tokio::fs::write(path, contents).await
 }

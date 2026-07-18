@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -35,14 +35,6 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -351,8 +343,6 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     };
 
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
 
     // Simple mock behavior: just respond with a message
     let behavior = json!({
@@ -362,7 +352,7 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
 
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
