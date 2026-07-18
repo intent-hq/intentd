@@ -71,7 +71,7 @@ async fn boot() -> Fixture {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure_with_reverse(api.clone(), bus, opts, registry.clone());
+    let ws = WsApiServer::new_insecure_with_reverse(api.clone(), bus, opts, registry.clone(), None);
     let port = ws.start().await.expect("start");
     Fixture {
         ws,
