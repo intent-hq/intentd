@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, AgentStatus, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str};
@@ -77,9 +77,10 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         let agents = api.agent_list(ws.id.clone()).await.map_err(map_err)?;
         for agent in agents {
             // Filter by completion status if requested
-            let status_str = format!("{:?}", agent.status).to_lowercase();
-            let is_terminal = ["completed", "complete", "failed", "cancelled", "canceled"]
-                .contains(&status_str.as_str());
+            let is_terminal = matches!(
+                agent.status,
+                AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+            );
             if !include_completed && is_terminal {
                 continue;
             }
