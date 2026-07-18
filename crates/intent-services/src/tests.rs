@@ -3287,7 +3287,7 @@ mod change_event_parity {
     /// events when agents come back in-flight during the grace window.
     #[tokio::test]
     async fn idle_debounce_guards_emission_against_race() {
-        use intent_core::{WorkspaceActivity, WorkspaceApi};
+        use intent_core::WorkspaceActivity;
         let h = harness().await;
         let _guard = DebounceEnvGuard::new("50");
         let mut sub = subscribe(&h);
@@ -13024,7 +13024,9 @@ mod last_activity_events {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no event on idempotent dismiss"
         );
     }
@@ -13067,10 +13069,9 @@ mod last_activity_events {
 
         // No second event (coalesced).
         assert!(
-            matches!(
-                timeout(Duration::from_millis(100), sub.recv()).await,
-                Err(_)
-            ),
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
             "burst coalesced into one event"
         );
 
@@ -13112,7 +13113,9 @@ mod last_activity_events {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no event on idempotent token scan"
         );
     }
@@ -13345,7 +13348,9 @@ mod last_activity_events {
 
         // No idle event should have been emitted.
         assert!(
-            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no idle event when re-begin cancels the debounce"
         );
 
@@ -13375,7 +13380,9 @@ mod last_activity_events {
         // Before the window expires, no idle event yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            matches!(timeout(Duration::from_millis(20), sub.recv()).await, Err(_)),
+            timeout(Duration::from_millis(20), sub.recv())
+                .await
+                .is_err(),
             "no idle event before debounce window expires"
         );
 
@@ -13397,7 +13404,9 @@ mod last_activity_events {
 
         // No duplicate events.
         assert!(
-            matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no duplicate idle event"
         );
     }

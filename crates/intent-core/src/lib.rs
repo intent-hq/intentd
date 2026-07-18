@@ -60,6 +60,6 @@ pub use model::{
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use traits::{
-    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability,
+    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
 };

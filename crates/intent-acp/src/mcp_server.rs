@@ -35,11 +35,16 @@ pub struct WorkspaceMcpServer {
     /// `delegate_task`) attribute their actions to this id so children can be
     /// stamped with their spawning parent. `None` for the FE/RPC front door.
     caller_agent_id: Option<AgentId>,
+    /// Whether this server serves the chief workspace. Used to select between
+    /// the base tool description (which omits most `ws.app.*`) and the chief
+    /// variant (which advertises the full `ws.app.*` surface).
+    is_chief: bool,
 }
 
 impl WorkspaceMcpServer {
     /// Build a server with no tool restrictions (interactive/foreground agents).
     pub fn new(api: Arc<dyn WorkspaceApi>, workspace_id: WorkspaceId) -> Self {
+        let is_chief = workspace_id.is_chief();
         Self {
             api,
             workspace_id,
@@ -47,6 +52,7 @@ impl WorkspaceMcpServer {
             name: "workspace-mcp".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             caller_agent_id: None,
+            is_chief,
         }
     }
 
@@ -91,7 +97,7 @@ impl WorkspaceMcpServer {
 
     /// The tool definitions exposed to this agent (full registry minus denylist).
     pub fn available_tools(&self) -> Vec<&'static ToolDef> {
-        tools::all_tools()
+        tools::all_tools(self.is_chief)
             .iter()
             .filter(|t| !self.denylist.contains(t.name))
             .collect()
