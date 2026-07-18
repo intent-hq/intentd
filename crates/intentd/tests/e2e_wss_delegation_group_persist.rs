@@ -821,4 +821,9 @@ async fn baseline_plus_aggregated_wake() {
     eprintln!("✓ Exactly ONE wake fired after both children settled (pre+post restart)");
     eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_A);
     eprintln!("✓ Wake payload contains BOTH child reports: {}", REPORT_B);
+    eprintln!("✓ STAB-108: conservative reconciliation predicate prevented premature group firing");
+    eprintln!("✓ STAB-108: startup rehydration sweep loaded the undelivered group");
+    eprintln!(
+        "✓ STAB-108: interrupted child (RuntimeIdle + interrupted_agent row) was NOT reconciled"
+    );
 }

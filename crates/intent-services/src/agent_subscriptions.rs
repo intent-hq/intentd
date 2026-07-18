@@ -820,14 +820,39 @@ impl Services {
             match agent_result {
                 Ok(session) => {
                     use intent_core::AgentStatus;
-                    // Check if agent is in a terminal/idle state
-                    let is_complete = matches!(
-                        session.status,
-                        AgentStatus::Completed | AgentStatus::RuntimeIdle
-                    );
-                    let is_deleted = matches!(session.status, AgentStatus::Deleted);
 
-                    if is_complete || is_deleted {
+                    // Conservative completion predicate (STAB-108):
+                    // - If status is Completed, child is done
+                    // - If status is Deleted, child is done
+                    // - If status is RuntimeIdle:
+                    //   * AND completion_report is present
+                    //   * AND there is NO interrupted_agent row
+                    //   → then the child is genuinely complete
+                    // - Otherwise, skip (child may be interrupted/healing)
+
+                    let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    let is_explicitly_completed = matches!(session.status, AgentStatus::Completed);
+
+                    let is_idle_and_genuinely_complete =
+                        if matches!(session.status, AgentStatus::RuntimeIdle) {
+                            // Check if there's a completion report and no interrupted row
+                            let has_completion_report = session.completion_report.is_some();
+                            let has_interrupted_row = self
+                                .store
+                                .get_interrupted_agent(&child_id)
+                                .await
+                                .unwrap_or(None)
+                                .is_some();
+
+                            has_completion_report && !has_interrupted_row
+                        } else {
+                            false
+                        };
+
+                    let should_record =
+                        is_deleted || is_explicitly_completed || is_idle_and_genuinely_complete;
+
+                    if should_record {
                         // Build a synthetic agent:idle or agent:deleted event
                         // Prefer the child's persisted completion_report when present
                         let report = session.completion_report;
