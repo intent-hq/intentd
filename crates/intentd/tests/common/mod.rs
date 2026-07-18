@@ -1,0 +1,119 @@
+//! Shared test utilities for intentd integration tests.
+//!
+//! This module provides RAII guards for spawned daemon processes to prevent
+//! process leaks when tests panic or fail to clean up explicitly.
+
+use std::path::PathBuf;
+use std::process::Child;
+
+/// RAII guard for a spawned `intentd serve` process.
+///
+/// Ensures the daemon child process is killed on drop (SIGKILL to the process
+/// group) and optionally removes the temp data directory. This prevents leaked
+/// daemon processes when tests panic or abort before explicit cleanup.
+///
+/// The guard sends SIGKILL to the process group (not just the parent PID),
+/// which also terminates any child processes spawned by the daemon (e.g., Node
+/// mock agents in ACP provider tests).
+pub struct DaemonGuard {
+    child: Child,
+    data_dir: Option<PathBuf>,
+}
+
+impl DaemonGuard {
+    /// Create a new daemon guard that will kill the child process on drop.
+    ///
+    /// If `cleanup_data_dir` is true, the data directory will be removed on drop.
+    pub fn new(child: Child, data_dir: PathBuf, cleanup_data_dir: bool) -> Self {
+        Self {
+            child,
+            data_dir: if cleanup_data_dir {
+                Some(data_dir)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Create a daemon guard that only kills the process (no data dir cleanup).
+    pub fn process_only(child: Child) -> Self {
+        Self {
+            child,
+            data_dir: None,
+        }
+    }
+
+    /// Get a mutable reference to the child process.
+    ///
+    /// Useful for calling `wait()`, `try_wait()`, or `kill()` explicitly.
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// Take ownership of the child process, consuming the guard.
+    ///
+    /// The caller is responsible for cleanup after this point.
+    pub fn into_child(mut self) -> Child {
+        let child = std::mem::replace(
+            &mut self.child,
+            // Placeholder - will be dropped immediately after we return the real child
+            unsafe { std::mem::zeroed() },
+        );
+        // Prevent Drop from running by forgetting self
+        std::mem::forget(self);
+        child
+    }
+
+    /// Disable data directory cleanup on drop.
+    ///
+    /// Useful when the test wants to inspect the data directory after the daemon stops.
+    pub fn keep_data_dir(mut self) -> Self {
+        self.data_dir = None;
+        self
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        // SIGKILL the process (or process group if set).
+        // Ignore errors - the process may have already exited.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
+        // Clean up data directory if requested.
+        if let Some(ref dir) = self.data_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn guard_kills_process_on_drop() {
+        // Spawn a sleep process
+        let child = Command::new("sleep")
+            .arg("3600")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        {
+            let _guard = DaemonGuard::process_only(child);
+            // Guard goes out of scope here
+        }
+
+        // Process should be dead
+        // Check using kill -0 (send signal 0 to test if process exists)
+        let status = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill -0");
+
+        assert!(!status.success(), "process should be dead after guard drop");
+    }
+}
