@@ -921,13 +921,15 @@ mod tests {
             "verifier.md must mention update_note_task_status tool"
         );
 
-        // Assert the prompt uses object-style call syntax, not positional args.
+        // Assert the prompt uses object-style call syntax with placeholder noteId value.
         assert!(
-            body.contains("update_note_task_status({ noteId"),
-            "verifier.md must show object-style call, not positional args"
+            body.contains(
+                r#"update_note_task_status({ noteId: "<task-note-id>", status: "complete" })"#
+            ),
+            "verifier.md must show complete object-style call with placeholder noteId"
         );
 
-        // Assert the prompt instructs marking verified tasks complete.
+        // Assert the prompt instructs marking verified tasks complete with the exact phrase.
         assert!(
             body.contains("mark each verified task note `complete`"),
             "verifier.md must instruct marking verified tasks complete"
