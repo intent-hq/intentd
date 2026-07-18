@@ -108,8 +108,8 @@ fn proposal_resource_uri(proposal: &Value) -> String {
         })
         .unwrap_or("untitled");
 
-    // URL-encode the id portion (simplified - production would use proper URL encoding)
-    let encoded_id = id.replace('/', "%2F").replace(' ', "%20");
+    // RFC3986 percent-encode the id portion for URI path segment use
+    let encoded_id = super::proposal::percent_encode_path_segment(id);
     format!("intent-proposal://{}/{}", kind, encoded_id)
 }
 

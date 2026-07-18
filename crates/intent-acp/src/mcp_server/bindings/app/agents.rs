@@ -180,7 +180,7 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
             // Turn-based slicing (1-based, inclusive)
             let start = start_turn.unwrap_or(1).max(1) as usize - 1; // convert to 0-based
             let end = end_turn
-                .map(|e| e as usize)
+                .map(|e| (e as usize).min(total_messages)) // clamp to total_messages
                 .unwrap_or(total_messages)
                 .min(start + MAX_READ_LIMIT as usize);
             if end < start + 1 {
