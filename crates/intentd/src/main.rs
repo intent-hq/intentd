@@ -606,15 +606,33 @@ async fn cmd_serve(
         }),
     });
 
+    // System control surface (§5.7 + §5.12): exposes `system.status` /
+    // `system.shutdown` to local UDS clients plus runtime WSS listener control.
+    // The `Notify` lets the `system.shutdown` RPC trigger the same graceful
+    // teardown as an OS signal, so `stop` can ask politely before escalating.
+    // Must be built BEFORE the WSS server so it can be passed to the constructor.
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let control = Arc::new(DaemonControl {
+        listen_mode: listen.to_string(),
+        uds: serve_uds_enabled,
+        tcp: serve_tcp_enabled,
+        manager: manager.clone(),
+        shutdown: shutdown_notify.clone(),
+        ws_runtime: runtime.clone(),
+        start_time: std::time::Instant::now(),
+    });
+
     // Boot-time auto-start of the listener ONLY when --listen tcp/both
     // (CLI --listen wins over persisted settings)
     let (_ws_server, _ws_port) = if serve_tcp_enabled {
+        let system_control: Arc<dyn SystemControl> = control.clone();
         let mut server = if insecure {
             WsApiServer::new_insecure_with_reverse(
                 api.clone(),
                 bus.clone(),
                 ws_options.clone(),
                 reverse_registry.clone(),
+                Some(system_control.clone()),
             )
         } else {
             WsApiServer::new_with_reverse(
@@ -624,6 +642,7 @@ async fn cmd_serve(
                 token_store.clone().unwrap(),
                 ws_options.clone(),
                 reverse_registry.clone(),
+                Some(system_control.clone()),
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };
@@ -655,20 +674,6 @@ async fn cmd_serve(
     } else {
         (None, None)
     };
-
-    // System control surface (§5.7 + §5.12): exposes `system.status` /
-    // `system.shutdown` to local UDS clients plus runtime WSS listener control.
-    // The `Notify` lets the `system.shutdown` RPC trigger the same graceful
-    // teardown as an OS signal, so `stop` can ask politely before escalating.
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let control = Arc::new(DaemonControl {
-        listen_mode: listen.to_string(),
-        uds: serve_uds_enabled,
-        tcp: serve_tcp_enabled,
-        manager: manager.clone(),
-        shutdown: shutdown_notify.clone(),
-        ws_runtime: runtime.clone(),
-    });
 
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
     // The control is attached after the api Arc is built via the `OnceLock` seam.
@@ -817,6 +822,8 @@ struct DaemonControl {
     /// server when toggled on. Always present (constructed regardless of --listen
     /// mode so runtime toggle works for all modes, including --listen uds).
     ws_runtime: Arc<WsRuntimeControl>,
+    /// Daemon start time (Instant) for uptime calculation.
+    start_time: std::time::Instant,
 }
 
 /// Runtime control for the WSS listener, shared between DaemonControl and
@@ -905,6 +912,9 @@ impl SystemControl for DaemonControl {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
+            max_agents: self.manager.registry().cap(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
         }
     }
 
@@ -968,7 +978,12 @@ impl intent_core::ServerControl for DaemonControl {
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
 
-            // Build a fresh WsApiServer and start it
+            // Build a fresh WsApiServer and start it. We don't have an Arc<Self> here,
+            // but we can construct a temporary control stub that delegates to the runtime's
+            // shared data. For now, pass None and accept that system.status won't work over
+            // runtime-toggled WSS (boot-time WSS will have control). Fixing this properly
+            // requires refactoring the ownership model to avoid the circular Arc dependency.
+            let system_control: Option<Arc<dyn SystemControl>> = None;
             let mut server = if let Some(ref tls) = runtime.tls_cert {
                 // Secure mode
                 let token_store = runtime
@@ -987,6 +1002,7 @@ impl intent_core::ServerControl for DaemonControl {
                     token_store.clone(),
                     ws_options,
                     runtime.reverse_registry.clone(),
+                    system_control.clone(),
                 )
                 .map_err(|e| intent_core::Error::Internal(e.to_string()))?
             } else {
@@ -996,6 +1012,7 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.bus.clone(),
                     ws_options,
                     runtime.reverse_registry.clone(),
+                    system_control.clone(),
                 )
             };
 

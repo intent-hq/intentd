@@ -463,3 +463,40 @@ async fn batch_hook_ordering_port_before_enable() {
         "events.subscribe over WSS after reverse-order batch should work: {ping_resp}"
     );
 }
+
+#[tokio::test]
+async fn wss_system_status_includes_capacity_version_uptime() {
+    // system.status over WSS reports maxAgents, version, uptimeSeconds alongside
+    // existing fields (additive change for FE health menu).
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Get status over UDS to find WSS port + fingerprint
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Connect over WSS and verify system.status returns the new fields
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+    let resp = wss_rpc(&mut ws, 7, "system.status", json!({})).await;
+    let r = &resp["result"];
+    assert_eq!(resp["id"], 7);
+    assert_eq!(r["running"], true, "response: {resp}");
+    assert!(r["host"]["locality"].is_string(), "locality present");
+    assert!(r["host"]["os"].is_string(), "os present");
+    assert!(r["host"]["arch"].is_string(), "arch present");
+    // New fields: maxAgents, version, uptimeSeconds.
+    assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
+    assert!(r["version"].is_string(), "version is string: {r}");
+    assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
+}

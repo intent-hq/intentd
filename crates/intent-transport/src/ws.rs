@@ -132,6 +132,11 @@ pub(crate) struct WsInner {
     /// Server pairing info provider for `server.pairingInfo` / `server.rotateToken`
     /// fast-path (§5.2). `None` means the methods are unavailable on this listener.
     pub server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
+    /// System control surface (§5.7) for `system.status`/`system.shutdown`. When
+    /// present, fast-path `system.*` RPCs are handled inline on the connection
+    /// loop. Shared with the UDS listener; `None` in test harnesses that don't
+    /// wire a daemon control surface.
+    pub control: Option<Arc<dyn crate::control::SystemControl>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -151,6 +156,7 @@ impl WsApiServer {
         tls: &TlsCertificate,
         token_store: Arc<AsyncTokenStore>,
         options: WsOptions,
+        control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Result<Self> {
         let acceptor = build_acceptor(tls)?;
         let inner = WsInner {
@@ -174,6 +180,7 @@ impl WsApiServer {
             state: tokio::sync::Mutex::new(StartState::default()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
+            control,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -184,7 +191,12 @@ impl WsApiServer {
     /// no bearer-token enforcement. Intended for the local dev seat (`make
     /// run-intentd` / `intentd serve --insecure`), never for production.
     /// `WsOptions::auth_enabled` is ignored.
-    pub fn new_insecure(api: Arc<dyn WorkspaceApi>, bus: EventBus, options: WsOptions) -> Self {
+    pub fn new_insecure(
+        api: Arc<dyn WorkspaceApi>,
+        bus: EventBus,
+        options: WsOptions,
+        control: Option<Arc<dyn crate::control::SystemControl>>,
+    ) -> Self {
         let inner = WsInner {
             api,
             bus,
@@ -204,6 +216,7 @@ impl WsApiServer {
             state: tokio::sync::Mutex::new(StartState::default()),
             reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
             server_pairing_info: None,
+            control,
         };
         Self {
             inner: Arc::new(inner),
@@ -222,8 +235,9 @@ impl WsApiServer {
         token_store: Arc<AsyncTokenStore>,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
+        control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Result<Self> {
-        let mut server = Self::new(api, bus, tls, token_store, options)?;
+        let mut server = Self::new(api, bus, tls, token_store, options, control)?;
         Self::install_registry(&mut server, reverse_registry);
         Ok(server)
     }
@@ -235,8 +249,9 @@ impl WsApiServer {
         bus: EventBus,
         options: WsOptions,
         reverse_registry: Arc<PrimaryReverseRegistry>,
+        control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Self {
-        let mut server = Self::new_insecure(api, bus, options);
+        let mut server = Self::new_insecure(api, bus, options, control);
         Self::install_registry(&mut server, reverse_registry);
         server
     }
@@ -530,7 +545,7 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2).
                         let frame_ok = crate::context::with_connection_context(true, async {
-                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, None, self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await
+                            conn::process_frame(&text, &self.api, &self.bus, &app_tx, &mut subs, &mut forwards, &reverse, self.control.as_ref(), self.server_pairing_info.as_ref(), &mut client_id, self.locality_is_local).await
                         }).await;
                         if !frame_ok {
                             break;
