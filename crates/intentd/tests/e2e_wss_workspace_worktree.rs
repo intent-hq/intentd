@@ -458,6 +458,15 @@ async fn workspace_delete_cleans_worktree_and_branch_over_wss() {
 
     let deleted = wss_rpc(&mut ws, 3, "workspace.delete", json!({ "workspaceId": id })).await;
     assert_eq!(deleted, json!({ "success": true }));
+    // Fast-ack: the response returns immediately while the worktree cleanup
+    // runs in the background. Poll for the expected final state.
+    for _ in 0..30 {
+        let branches = run_git(&["branch", "--list", &branch], &repo);
+        if !wt.exists() && !root.join(&id).exists() && branches.is_empty() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     assert!(!wt.exists(), "worktree directory removed");
     assert!(
         !root.join(&id).exists(),
@@ -492,6 +501,13 @@ async fn workspace_delete_cleans_worktree_and_branch_over_wss() {
     );
     let deleted = wss_rpc(&mut ws, 5, "workspace.delete", json!({ "workspaceId": id })).await;
     assert_eq!(deleted, json!({ "success": true }));
+    // Fast-ack: poll for worktree removal.
+    for _ in 0..30 {
+        if !wt.exists() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     assert!(!wt.exists(), "worktree directory removed");
     let branches = run_git(&["branch", "--list", "keep-me"], &repo);
     assert!(
@@ -535,6 +551,13 @@ async fn workspace_delete_is_idempotent_over_wss() {
 
     let first = wss_rpc(&mut ws, 3, "workspace.delete", json!({ "workspaceId": id })).await;
     assert_eq!(first, json!({ "success": true }));
+    // Fast-ack: poll for background cleanup to complete.
+    for _ in 0..30 {
+        if !root.join(&id).exists() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     assert!(!root.join(&id).exists(), "workspace directory removed");
 
     // Row is gone; a repeat delete must still succeed.
@@ -584,6 +607,13 @@ async fn workspace_delete_sweeps_residual_workspace_directory_over_wss() {
 
     let deleted = wss_rpc(&mut ws, 3, "workspace.delete", json!({ "workspaceId": id })).await;
     assert_eq!(deleted, json!({ "success": true }));
+    // Fast-ack: poll for background cleanup to complete.
+    for _ in 0..30 {
+        if !ws_dir.exists() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     assert!(
         !ws_dir.exists(),
         "<root>/<id>/ (with residual content) fully removed"
@@ -616,6 +646,13 @@ async fn workspace_delete_cleans_orphan_directory_over_wss() {
 
     let deleted = wss_rpc(&mut ws, 2, "workspace.delete", json!({ "workspaceId": id })).await;
     assert_eq!(deleted, json!({ "success": true }));
+    // Fast-ack: poll for background cleanup to complete.
+    for _ in 0..30 {
+        if !orphan.exists() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
     assert!(!orphan.exists(), "orphan workspace directory removed");
 
     let _ = std::fs::remove_dir_all(&root);
