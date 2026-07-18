@@ -299,6 +299,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -334,6 +335,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -383,6 +385,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -461,6 +464,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -1133,6 +1137,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     };
     mgr.services
         .store
@@ -2053,6 +2058,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     }
 }
 
@@ -2303,6 +2309,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     };
     mgr.services
         .store

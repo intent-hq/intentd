@@ -1742,9 +1742,10 @@ impl AgentManager {
     /// already running. On a successful claim the agent's workspace is recorded
     /// and the workspace's derived `WorkspaceActivity` is recomputed (§9.9),
     /// emitting `workspace:activity-changed` on the `Idle → AgentRunning` edge.
-    /// Also persists the `agent_session.status` transition to `Active` and
-    /// emits `agent:status-changed` (PROTOCOL §6.5/§6.7) so a hydrated chat
-    /// reflects the live runtime rather than the stored `Pending` placeholder.
+    /// Also persists the `agent_session.status` transition to `Active` (and clears
+    /// any persisted `stop_reason`) and emits `agent:status-changed` (PROTOCOL
+    /// §6.5/§6.7) so a hydrated chat reflects the live runtime rather than the
+    /// stored `Pending` placeholder.
     async fn try_begin(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) -> bool {
         let claimed = self.busy.lock().unwrap().insert(agent_id.clone());
         if claimed {
@@ -1753,8 +1754,15 @@ impl AgentManager {
                 .unwrap()
                 .insert(agent_id.clone(), workspace_id.clone());
             self.services.agent_activity_begin(workspace_id).await;
-            self.persist_status(agent_id, workspace_id, AgentStatus::Active, true)
-                .await;
+            // Clear stop_reason when starting a new turn: successful turns leave it cleared.
+            self.persist_status_with_stop_reason(
+                agent_id,
+                workspace_id,
+                AgentStatus::Active,
+                true,
+                Some(None),
+            )
+            .await;
         }
         claimed
     }
@@ -1883,6 +1891,73 @@ impl AgentManager {
                 "status": serialized_status,
                 "isActive": is_active,
             }),
+        };
+        crate::publish_event(&self.services.event_bus, event).await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.services
+            .schedule_last_activity_event(workspace_id.clone());
+    }
+
+    /// Persist `agent_session.status` + `is_active` + optional `stop_reason` and
+    /// publish the `agent:status-changed` self-sufficient event (PROTOCOL §6.5/§6.7).
+    /// Companion to [`persist_status`]; add `stop_reason` control: `None` leaves it
+    /// untouched, `Some(None)` clears it, `Some(Some(reason))` sets it. All failures
+    /// are logged and swallowed: the runtime turn is the source of truth and a
+    /// transient store/bus error must not abort the in-flight slot transition.
+    async fn persist_status_with_stop_reason(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        status: AgentStatus,
+        is_active: bool,
+        stop_reason: Option<Option<String>>,
+    ) {
+        let ts = now_iso();
+        // Clone stop_reason for event emission (we need it after the store call moves it).
+        let stop_reason_for_event = stop_reason.clone();
+        if let Err(e) = self
+            .services
+            .store
+            .set_agent_session_status(workspace_id, agent_id, status, is_active, &ts, stop_reason)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "failed to persist agent status + stop_reason");
+            return;
+        }
+        let serialized_status = match serde_json::to_value(status) {
+            Ok(Value::String(s)) => s,
+            _ => return,
+        };
+        // Build the event data. When stop_reason is Some(_) — i.e. the call sets or
+        // clears the persisted value — include "stopReason" in the event: the string
+        // when setting (Some(Some(x))), JSON null when clearing (Some(None)). When the
+        // parameter is None (unchanged), omit the field so unrelated status changes
+        // don't clobber the FE's canonical session state (cloudlands-fe#147).
+        let mut data = json!({
+            "agentId": agent_id.0,
+            "status": serialized_status,
+            "isActive": is_active,
+        });
+        if let Some(reason) = &stop_reason_for_event {
+            data["stopReason"] = match reason {
+                Some(r) => Value::String(r.clone()),
+                None => Value::Null,
+            };
+        }
+        let event = NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: ts,
+            event_type: AGENT_STATUS_CHANGED.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
         };
         crate::publish_event(&self.services.event_bus, event).await;
         // Schedule debounced lastActivity event (§10.1).
@@ -2270,10 +2345,11 @@ impl AgentManager {
         Ok(json!({ "ok": true, "redriven": redriven }))
     }
 
-    /// Persist an `agent.retry` status transition and publish the matching
-    /// `agent:status-changed` event. Shared by the initial Error-clear flip
-    /// and the post-flip re-check that promotes Idle → Pending when a message
-    /// slipped into the queue during the retry (see [`AgentManager::agent_retry`]).
+    /// Persist an `agent.retry` status transition (clearing any persisted
+    /// `stop_reason`) and publish the matching `agent:status-changed` event.
+    /// Shared by the initial Error-clear flip and the post-flip re-check that
+    /// promotes Idle → Pending when a message slipped into the queue during the
+    /// retry (see [`AgentManager::agent_retry`]).
     async fn persist_retry_status(
         self: &Arc<Self>,
         agent_id: &AgentId,
@@ -2285,9 +2361,10 @@ impl AgentManager {
             _ => "idle",
         };
         let ts = now_iso();
+        // Clear stop_reason on retry: the agent is starting fresh, not stuck in an error.
         self.services
             .store
-            .set_agent_session_status(workspace_id, agent_id, status, false, &ts, None)
+            .set_agent_session_status(workspace_id, agent_id, status, false, &ts, Some(None))
             .await?;
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
@@ -3274,25 +3351,37 @@ async fn publish_terminal_failure_events(
 /// Persist `AgentStatus::Error` (emitting `agent:status-changed`) and requeue
 /// the failed message to the front of the queue so `agent.retry` — or a future
 /// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
-/// turn-failure paths.
+/// turn-failure paths. The `error_text` argument is persisted into
+/// `agent_session.stop_reason` and included in the `agent:status-changed` event's
+/// `stopReason` field (durable-before-observable).
 async fn persist_error_and_requeue(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     content: &str,
     options: &TurnOptions,
+    error_text: &str,
 ) {
-    // Persist agent status as Error and emit agent:status-changed
+    // Persist agent status as Error WITH stop_reason and emit agent:status-changed.
+    // Durable-before-observable: the store write completes BEFORE the event is published,
+    // so subscribers see the canonical field immediately via agent.get/getSession.
     let ts = now_iso();
     if let Err(e) = mgr
         .services
         .store
-        .set_agent_session_status(workspace_id, agent_id, AgentStatus::Error, false, &ts, None)
+        .set_agent_session_status(
+            workspace_id,
+            agent_id,
+            AgentStatus::Error,
+            false,
+            &ts,
+            Some(Some(error_text.to_string())),
+        )
         .await
     {
-        tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status");
+        tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
     } else {
-        // Emit agent:status-changed
+        // Emit agent:status-changed with stopReason so live subscribers get the canonical field.
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: ts,
@@ -3306,6 +3395,7 @@ async fn persist_error_and_requeue(
                 "agentId": agent_id.0,
                 "status": "error",
                 "isActive": false,
+                "stopReason": error_text,
             }),
         };
         crate::publish_event(&mgr.services.event_bus, event).await;
@@ -3338,8 +3428,8 @@ async fn persist_error_and_requeue(
 
 /// Handle terminal spawn failure after all retries are exhausted. Publishes
 /// terminal `agent:failed` and `agent:stream:end` events, persists the agent
-/// status as `Error`, requeues the failed message to the front of the queue,
-/// and stops draining further messages.
+/// status as `Error` with the error text into `stop_reason`, requeues the
+/// failed message to the front of the queue, and stops draining further messages.
 async fn handle_terminal_spawn_failure(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -3348,8 +3438,9 @@ async fn handle_terminal_spawn_failure(
     options: &TurnOptions,
     error: &Error,
 ) {
-    publish_terminal_failure_events(mgr, agent_id, workspace_id, &error.to_string()).await;
-    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options).await;
+    let error_text = error.to_string();
+    publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
+    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options, &error_text).await;
 }
 
 /// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
@@ -3427,10 +3518,10 @@ fn turn_failure_events_already_emitted(err: &Error) -> bool {
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
 /// cancel): tear down the dead child, ensure the terminal `agent:failed` +
-/// `agent:stream:end` pair reached the bus, persist `AgentStatus::Error`, and
-/// requeue the message for `agent.retry`. Mirrors
-/// [`handle_terminal_spawn_failure`] but does NOT auto-retry inline — the
-/// prompt may have been partially processed, so redriving it is a user
+/// `agent:stream:end` pair reached the bus, persist `AgentStatus::Error` with
+/// the error text into `stop_reason`, and requeue the message for `agent.retry`.
+/// Mirrors [`handle_terminal_spawn_failure`] but does NOT auto-retry inline —
+/// the prompt may have been partially processed, so redriving it is a user
 /// decision (the STAB-6 Retry surface).
 async fn handle_terminal_turn_failure(
     mgr: &AgentManager,
@@ -3444,10 +3535,11 @@ async fn handle_terminal_turn_failure(
     // from within the worker: only kills child/handle, no worker/busy touch.
     mgr.kill_child_only(agent_id).await;
 
+    let error_text = error.to_string();
     if !turn_failure_events_already_emitted(error) {
-        publish_terminal_failure_events(mgr, agent_id, workspace_id, &error.to_string()).await;
+        publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
     }
-    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options).await;
+    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options, &error_text).await;
 }
 
 #[cfg(test)]
@@ -3547,6 +3639,7 @@ mod role_reminder_tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         }
     }
 
@@ -4017,6 +4110,7 @@ mod agent_retry_tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         }
     }
 

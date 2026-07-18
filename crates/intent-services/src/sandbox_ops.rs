@@ -801,6 +801,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
@@ -923,6 +924,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1068,6 +1070,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1195,6 +1198,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1291,6 +1295,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1365,6 +1370,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

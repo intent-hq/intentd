@@ -828,6 +828,17 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         session["session"]["status"], "error",
         "session status is error after exhaustion"
     );
+    // STAB-STOP-REASON: the persisted stopReason must match the exhaustion error.
+    let stop_reason = session["session"]["stopReason"]
+        .as_str()
+        .expect("stopReason should be present after spawn exhaustion");
+    assert!(
+        stop_reason.contains("session/new failed")
+            || stop_reason.contains("retries exhausted")
+            || stop_reason.contains("handshake failed")
+            || stop_reason.contains("agent stdout closed"),
+        "stopReason persisted and describes the spawn exhaustion, got: {stop_reason}"
+    );
 
     // Reset the attempt counter so the next spawn (from agent.retry) will succeed
     std::fs::write(&attempt_file, "1000").expect("reset attempt counter");
@@ -883,6 +894,12 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
     assert_ne!(
         final_session["session"]["status"], "error",
         "session status recovered from error after agent.retry"
+    );
+    // STAB-STOP-REASON: the retry cleared the stopReason (successful turn leaves it null).
+    assert!(
+        final_session["session"]["stopReason"].is_null(),
+        "stopReason cleared after successful retry: {:?}",
+        final_session["session"]["stopReason"]
     );
 
     // Test rejection: retry again on the same agent (now active/idle) should return ok:false
