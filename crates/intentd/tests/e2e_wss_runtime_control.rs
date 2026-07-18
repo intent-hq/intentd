@@ -500,3 +500,75 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     assert!(r["version"].is_string(), "version is string: {r}");
     assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
 }
+
+#[tokio::test]
+async fn runtime_toggled_wss_serves_system_status() {
+    // Daemon starts with --listen uds, then toggles WSS on at runtime via
+    // settings.update. Verify system.status works over the runtime-started
+    // WSS listener (tests OnceLock control population, §5.7).
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    // Start daemon with ONLY UDS (--listen uds)
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "uds", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Verify no WSS port initially
+    let status_before = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    assert_eq!(
+        status_before["result"]["port"],
+        json!(null),
+        "WSS should not be running"
+    );
+
+    // Toggle WSS on at runtime via settings.update
+    let port = free_port();
+    let enable_resp = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.wsApi.enabled", "value": true },
+                { "path": "server.wsApi.port", "value": port }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        enable_resp.get("error").is_none(),
+        "settings.update should succeed: {enable_resp}"
+    );
+
+    // Wait a moment for the listener to start
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Verify WSS is now running
+    let status_after = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let runtime_port = status_after["result"]["port"]
+        .as_u64()
+        .expect("port after toggle") as u16;
+    assert_eq!(runtime_port, port, "WSS should bind to configured port");
+
+    // Connect over WSS and verify system.status works
+    let fingerprint = status_after["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(runtime_port, cfg).await;
+    let resp = wss_rpc(&mut ws, 4, "system.status", json!({})).await;
+    let r = &resp["result"];
+    assert_eq!(resp["id"], 4);
+    assert_eq!(
+        r["running"], true,
+        "system.status over runtime-toggled WSS: {resp}"
+    );
+    // Verify the new fields are present (proving control is wired)
+    assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
+    assert!(r["version"].is_string(), "version is string: {r}");
+    assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
+}

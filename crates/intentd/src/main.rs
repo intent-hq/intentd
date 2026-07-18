@@ -604,6 +604,7 @@ async fn cmd_serve(
             ws_server: None,
             port: None,
         }),
+        control: std::sync::OnceLock::new(),
     });
 
     // System control surface (§5.7 + §5.12): exposes `system.status` /
@@ -621,6 +622,13 @@ async fn cmd_serve(
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
     });
+
+    // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
+    // serve system.status (§5.7). This breaks the circular Arc dependency between
+    // DaemonControl and WsRuntimeControl.
+    if runtime.control.set(control.clone()).is_err() {
+        panic!("control OnceLock should only be set once");
+    }
 
     // Boot-time auto-start of the listener ONLY when --listen tcp/both
     // (CLI --listen wins over persisted settings)
@@ -840,6 +848,9 @@ struct WsRuntimeControl {
     data_dir: PathBuf,
     /// Mutable runtime state: the live WsApiServer (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
+    /// System control surface (§5.7) for system.status/shutdown over WSS. Set via
+    /// OnceLock after DaemonControl construction to break circular Arc dependency.
+    control: std::sync::OnceLock<Arc<dyn SystemControl>>,
 }
 
 struct WsRuntimeState {
@@ -978,12 +989,9 @@ impl intent_core::ServerControl for DaemonControl {
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
 
-            // Build a fresh WsApiServer and start it. We don't have an Arc<Self> here,
-            // but we can construct a temporary control stub that delegates to the runtime's
-            // shared data. For now, pass None and accept that system.status won't work over
-            // runtime-toggled WSS (boot-time WSS will have control). Fixing this properly
-            // requires refactoring the ownership model to avoid the circular Arc dependency.
-            let system_control: Option<Arc<dyn SystemControl>> = None;
+            // Build a fresh WsApiServer and start it. The control is populated via
+            // OnceLock after DaemonControl construction (breaking the circular Arc).
+            let system_control: Option<Arc<dyn SystemControl>> = runtime.control.get().cloned();
             let mut server = if let Some(ref tls) = runtime.tls_cert {
                 // Secure mode
                 let token_store = runtime
