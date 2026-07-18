@@ -22,6 +22,10 @@ use intent_core::{
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
+/// Maximum length for caller-supplied message IDs to prevent unbounded storage
+/// and DoS via oversized persisted IDs.
+const MAX_MESSAGE_ID_LEN: usize = 256;
+
 use crate::agent_subscriptions::CompletionWatch;
 
 /// `waitMode` value that defers the completion watch into an `after_all`
@@ -1708,32 +1712,68 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
-        let message_id = message_id.unwrap_or_else(new_message_id);
+        // Validate message_id length to prevent unbounded storage.
+        if let Some(ref id) = message_id {
+            if id.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "messageId exceeds maximum length of {} bytes",
+                    MAX_MESSAGE_ID_LEN
+                )));
+            }
+        }
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
-        match self
-            .store
-            .append_agent_message(&agent_id, "user", &blocks, &created_at)
-            .await
-        {
-            Ok(_) => {
+        let message = match message_id {
+            Some(id) => {
+                self.store
+                    .append_agent_message_with_id(
+                        &agent_id,
+                        &id,
+                        "user",
+                        &blocks,
+                        None,
+                        &created_at,
+                    )
+                    .await
+            }
+            None => {
+                self.store
+                    .append_agent_message(&agent_id, "user", &blocks, &created_at)
+                    .await
+            }
+        };
+        match message {
+            Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Fetch the session to get workspace_id; best-effort (logged on error).
-                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
-                    if let Err(e) = self
-                        .store
-                        .refresh_agent_session_timestamp(
+                match self.store.get_agent_session(&agent_id).await {
+                    Ok(session) => {
+                        if let Err(e) = self
+                            .store
+                            .refresh_agent_session_timestamp(
+                                &session.workspace_id,
+                                &agent_id,
+                                &created_at,
+                            )
+                            .await
+                        {
+                            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                        }
+                        // Publish agent:message event using the store-returned message id.
+                        self.publish_agent_mutation_event(
                             &session.workspace_id,
                             &agent_id,
-                            &created_at,
+                            AGENT_MESSAGE,
+                            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
                         )
-                        .await
-                    {
-                        tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "get_agent_session failed; skipping timestamp refresh and agent:message event");
                     }
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
                 // STAB-7: preserve image_blocks and file_blocks when auto-queueing
@@ -1759,11 +1799,26 @@ impl Services {
         message_id: String,
         content: String,
     ) -> Result<Value> {
+        // Validate message_id length to prevent unbounded storage.
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {} bytes",
+                MAX_MESSAGE_ID_LEN
+            )));
+        }
         let session = self.store.get_agent_session(&agent_id).await?;
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
-        self.store
-            .append_agent_message(&agent_id, "user", &blocks, &created_at)
+        let message = self
+            .store
+            .append_agent_message_with_id(
+                &agent_id,
+                &message_id,
+                "user",
+                &blocks,
+                None,
+                &created_at,
+            )
             .await?;
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
@@ -1777,7 +1832,15 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(session.workspace_id.clone());
         }
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        // Publish agent:message event using the store-returned message id.
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
@@ -3533,28 +3596,29 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             }));
         }
-        let message_id = new_message_id();
         let blocks = json!([build_block()]);
         let created_at = now_iso();
-        if self
+        let message = match self
             .store
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
-            .is_err()
         {
-            manager.release_slot(agent_id).await;
-            let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
-            self.publish_queue_updated(agent_id).await;
-            manager
-                .clone()
-                .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                .await;
-            return Ok(json!({
-                "success": true,
-                "queued": true,
-                "queuedMessage": queued.to_value(position),
-            }));
-        }
+            Ok(msg) => msg,
+            Err(_) => {
+                manager.release_slot(agent_id).await;
+                let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+                self.publish_queue_updated(agent_id).await;
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+                return Ok(json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                }));
+            }
+        };
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -3567,13 +3631,21 @@ impl Services {
             // Schedule debounced lastActivity event (§10.1).
             self.schedule_last_activity_event(workspace_id.clone());
         }
+        // Publish agent:message event using the store-returned message id.
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
             content_owned,
             crate::agent_manager::TurnOptions::default(),
         );
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// Pre-DELIV-1 store-only delivery for the read-only/test path (no
@@ -3589,7 +3661,6 @@ impl Services {
     where
         F: Fn() -> Value,
     {
-        let message_id = new_message_id();
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         match self
@@ -3597,7 +3668,7 @@ impl Services {
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => {
+            Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 if let Err(e) = self
@@ -3607,7 +3678,15 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+                // Publish agent:message event using the store-returned message id.
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_MESSAGE,
+                    json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                )
+                .await;
+                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
                 let (queued, position) =
