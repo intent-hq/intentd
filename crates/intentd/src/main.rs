@@ -9,6 +9,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus, FileWatcher,
@@ -523,9 +525,10 @@ async fn cmd_serve(
     // configured TTL, killing each one's whole process group. Disabled entirely
     // when `agents.idleReapMinutes == 0`.
     let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
-    // Event retention/compaction (§10.2): periodically delete `agent:stream:*`
-    // chunk events older than the configured TTL, preserving every other event
-    // family. Disabled entirely when `events.streamRetentionHours == 0`.
+    // Event retention/compaction (§10.2 / finding F4): periodically delete
+    // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
+    // `host:exec:*`) older than the configured TTL, preserving lifecycle/tool/
+    // note/task/workspace events. Disabled when `events.streamRetentionHours == 0`.
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
@@ -1349,12 +1352,13 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
-/// Spawn the periodic event-retention/compaction sweep (§10.2), or `None` when
-/// disabled (`stream_retention_hours == 0`). Each tick deletes `agent:stream:*`
-/// chunk events older than the TTL while preserving every other event family.
-/// The sweep interval is derived from the TTL (≈4×/TTL), clamped so long TTLs
-/// still sweep periodically and short ones do not busy-loop. A failed sweep is
-/// logged and retried on the next tick (never aborts the loop).
+/// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
+/// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
+/// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
+/// `host:exec:*`) older than the TTL while preserving lifecycle/tool/note/task/
+/// workspace events. The sweep interval is derived from the TTL (≈4×/TTL),
+/// clamped so long TTLs still sweep periodically and short ones do not busy-loop.
+/// A failed sweep is logged and retried on the next tick (never aborts the loop).
 fn spawn_stream_retention_loop(
     store: Store,
     stream_retention_hours: u32,
@@ -1368,7 +1372,7 @@ fn spawn_stream_retention_loop(
     tracing::info!(
         ttl_hours = stream_retention_hours,
         interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:* only)"
+        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*)"
     );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -1376,12 +1380,12 @@ fn spawn_stream_retention_loop(
         loop {
             ticker.tick().await;
             let cutoff = intent_core::iso_minutes_ago(stream_retention_hours as i64 * 60);
-            match store.delete_stream_events_before(&cutoff).await {
+            match store.delete_ephemeral_events_before(&cutoff).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(
                         removed,
                         cutoff,
-                        "event retention sweep trimmed stream events"
+                        "event retention sweep trimmed ephemeral events"
                     );
                 }
                 Ok(_) => {}
@@ -2179,7 +2183,7 @@ mod tests {
             socket_path: short_socket_path(&id),
             pid_path: dir.join("intentd.pid"),
             idle_reap_minutes: 30,
-            stream_retention_hours: 0,
+            stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
             data_dir: dir,
         }
     }

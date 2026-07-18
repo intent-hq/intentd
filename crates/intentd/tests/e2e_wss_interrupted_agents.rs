@@ -13,10 +13,12 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -267,7 +269,8 @@ async fn interrupted_agents_persisted_across_restart() {
     // Spawn in its own process group to prevent ACP mock process leaks
     #[cfg(unix)]
     cmd1.process_group(0);
-    let mut daemon = cmd1.spawn().expect("spawn intentd serve");
+    let child1 = cmd1.spawn().expect("spawn intentd serve");
+    let mut guard1 = DaemonGuard::new(child1, data_dir.clone(), false);
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -331,8 +334,9 @@ async fn interrupted_agents_persisted_across_restart() {
     }
 
     // Kill daemon to simulate restart.
-    daemon.kill().expect("kill daemon");
-    daemon.wait().expect("wait daemon");
+    guard1.child_mut().kill().expect("kill daemon");
+    guard1.child_mut().wait().expect("wait daemon");
+    drop(guard1);
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
@@ -348,7 +352,8 @@ async fn interrupted_agents_persisted_across_restart() {
         ));
     #[cfg(unix)]
     cmd2.process_group(0);
-    daemon = cmd2.spawn().expect("spawn intentd serve 2");
+    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let mut guard2 = DaemonGuard::new(child2, data_dir.clone(), false);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     // Fetch fingerprint and port for TLS cert pinning.
@@ -381,8 +386,9 @@ async fn interrupted_agents_persisted_across_restart() {
     assert!(interrupted["interruptedAt"].is_string());
 
     // Phase 4: Restart again — idempotent insert should not duplicate.
-    daemon.kill().expect("kill daemon 2");
-    daemon.wait().expect("wait daemon 2");
+    guard2.child_mut().kill().expect("kill daemon 2");
+    guard2.child_mut().wait().expect("wait daemon 2");
+    drop(guard2);
     let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd3.arg("serve")
         .arg("--listen")
@@ -396,10 +402,8 @@ async fn interrupted_agents_persisted_across_restart() {
         ));
     #[cfg(unix)]
     cmd3.process_group(0);
-    #[allow(unused_assignments)]
-    {
-        daemon = cmd3.spawn().expect("spawn intentd serve 3");
-    }
+    let child3 = cmd3.spawn().expect("spawn intentd serve 3");
+    let _guard3 = DaemonGuard::new(child3, data_dir.clone(), true);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
@@ -435,19 +439,8 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Live `intentd serve` process; killed on drop. Prevents daemon + Node mock
-/// leaks if the test panics before shutdown. Does not clean up data_dir — the test
-/// should do that explicitly at the very end (or rely on temp-dir auto-cleanup).
-struct Daemon {
-    child: Child,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+// Re-export the DaemonGuard from common module for use in this file
+use common::DaemonGuard;
 
 #[tokio::test]
 async fn graceful_shutdown_captures_interrupted_agents() {
@@ -496,7 +489,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     #[cfg(unix)]
     cmd1.process_group(0);
     let child = cmd1.spawn().expect("spawn intentd serve");
-    let mut daemon = Daemon { child };
+    let mut daemon = DaemonGuard::new(child, data_dir.clone(), false);
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -573,10 +566,10 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     );
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
-    // daemon.child.wait() is blocking, so we poll for process death.
+    // daemon.child_mut().wait() is blocking, so we poll for process death.
     let exit_ok = timeout(Duration::from_secs(10), async {
         loop {
-            match daemon.child.try_wait() {
+            match daemon.child_mut().try_wait() {
                 Ok(Some(status)) => return status.success(),
                 Ok(None) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -607,7 +600,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     #[cfg(unix)]
     cmd2.process_group(0);
     let child2 = cmd2.spawn().expect("spawn intentd serve 2");
-    let _daemon2 = Daemon { child: child2 };
+    let _daemon2 = DaemonGuard::new(child2, data_dir.clone(), true);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
@@ -640,8 +633,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     );
     assert!(interrupted["interruptedAt"].is_string());
 
-    // Daemon Drop guard will kill the process. Clean up data_dir explicitly.
-    std::fs::remove_dir_all(&data_dir).ok();
+    // Daemon Drop guard will kill the process and clean up data_dir.
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {

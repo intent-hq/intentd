@@ -195,3 +195,158 @@ async fn modifying_pre_existing_file_emits_changed_event() {
     assert_eq!(ev.data["path"], "bar.txt");
     assert_eq!(ev.data["relativePath"], "bar.txt");
 }
+
+#[tokio::test]
+async fn burst_above_threshold_collapses_to_directory_summaries() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("burst");
+    let ws = WorkspaceId::from("ws-burst");
+    let _watcher =
+        FileWatcher::start(bus.clone(), ws.clone(), dir.path.clone()).expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Create 150 files rapidly (all within a few ms) so they accumulate in the
+    // pending map before the debounce timer fires, ensuring they all flush together.
+    let files: Vec<_> = (0..150)
+        .map(|i| dir.path.join(format!("file{i:03}.txt")))
+        .collect();
+    for file in &files {
+        std::fs::write(file, b"burst").expect("write file");
+    }
+
+    // Wait for debounce + flush (300ms debounce + margin).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Drain all file:* events from the subscription.
+    let mut events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if ev.event_type.starts_with("file:") {
+                        events.push(ev);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // Should have emitted fewer events than the 150 individual files.
+    // When burst threshold is exceeded, we emit per-directory summaries instead.
+    // Under load, the debounce timer may fire multiple times (creating multiple
+    // batches), but the total should still be much less than 150.
+    assert!(
+        events.len() < 80,
+        "Expected burst collapse to <80 events, got {} events (should be << 150)",
+        events.len()
+    );
+
+    // At least one event should have burst=true indicating coalescing occurred.
+    let burst_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.data.get("burst").and_then(|v| v.as_bool()) == Some(true))
+        .collect();
+    assert!(
+        !burst_events.is_empty(),
+        "expected at least one burst event, got {} normal events",
+        events.len()
+    );
+
+    // Verify burst events report the files they collapsed.
+    let total_affected: u64 = burst_events
+        .iter()
+        .filter_map(|e| e.data.get("affectedCount").and_then(|v| v.as_u64()))
+        .sum();
+    assert!(
+        total_affected >= 50,
+        "burst events should cover significant files, got {total_affected}"
+    );
+}
+
+#[tokio::test]
+async fn normal_single_file_edit_still_emits_individual_event() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("single");
+    let ws = WorkspaceId::from("ws-single");
+    let _watcher =
+        FileWatcher::start(bus.clone(), ws.clone(), dir.path.clone()).expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let file = dir.path.join("single.txt");
+    std::fs::write(&file, b"content").expect("write file");
+
+    let ev = next_for(&mut sub, "single.txt", None, Duration::from_secs(5))
+        .await
+        .expect("single-file event");
+    // Should be a normal individual event, not a burst summary.
+    assert!(
+        ev.data.get("burst").is_none() || ev.data["burst"] == false,
+        "normal edit should not be a burst event"
+    );
+    assert_eq!(ev.data["relativePath"], "single.txt");
+}
+
+#[tokio::test]
+async fn dedupe_within_window_emits_one_event_per_path() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let dir = TempDir::new("dedupe");
+    let ws = WorkspaceId::from("ws-dedupe");
+    let _watcher =
+        FileWatcher::start(bus.clone(), ws.clone(), dir.path.clone()).expect("start watcher");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let file = dir.path.join("dedupe.txt");
+    // Rapidly write to the same file multiple times within the debounce window.
+    for i in 0..5 {
+        std::fs::write(&file, format!("v{i}")).expect("write file");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Wait for debounce to flush.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Collect all file:* events for "dedupe.txt".
+    let mut count = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, sub.recv()).await {
+            Ok(Some(batch)) => {
+                for ev in batch {
+                    if ev.event_type.starts_with("file:") && ev.data["relativePath"] == "dedupe.txt"
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // Should emit exactly one event for the path (debounce coalesces the 5 writes).
+    assert_eq!(
+        count, 1,
+        "Expected 1 coalesced event, got {count} for rapid writes"
+    );
+}

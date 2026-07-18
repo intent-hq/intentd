@@ -1202,6 +1202,123 @@ async fn event_metadata_round_trips_through_store() {
     );
 }
 
+/// Finding F4: extended ephemeral-event retention sweep deletes high-volume
+/// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`) older
+/// than the cutoff while preserving lifecycle/tool/note/task/workspace events
+/// regardless of age. The sweep is idempotent and the legacy
+/// `delete_stream_events_before` alias still works.
+#[tokio::test]
+async fn ephemeral_event_retention_sweep_extended_families() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Mixed families across ages. Old = 2026-01-01, new = 2026-06-01.
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let seed = vec![
+        // Old ephemeral families (should be deleted by the sweep).
+        typed_event(&ws, old, events::AGENT_STREAM_START, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, old, events::AGENT_STREAM_END, agent.clone()),
+        typed_event(&ws, old, events::FILE_CHANGED, agent.clone()),
+        typed_event(&ws, old, events::FILE_CREATED, agent.clone()),
+        typed_event(&ws, old, events::FILE_DELETED, agent.clone()),
+        typed_event(&ws, old, events::TERMINAL_DATA, agent.clone()),
+        typed_event(&ws, old, events::HOST_EXEC_STDOUT, agent.clone()),
+        typed_event(&ws, old, events::HOST_EXEC_STDERR, agent.clone()),
+        typed_event(&ws, old, events::HOST_EXEC_EXIT, agent.clone()),
+        // New ephemeral events (within TTL — must survive).
+        typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
+        typed_event(&ws, new, events::FILE_CHANGED, agent.clone()),
+        typed_event(&ws, new, events::TERMINAL_DATA, agent.clone()),
+        typed_event(&ws, new, events::HOST_EXEC_STDOUT, agent.clone()),
+        // Old non-ephemeral families (must NEVER be deleted regardless of age).
+        typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
+        typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
+        typed_event(&ws, old, events::NOTE_UPDATED, agent.clone()),
+        typed_event(&ws, old, events::TASK_STATUS_CHANGED, agent.clone()),
+        typed_event(&ws, old, events::TERMINAL_EXIT, agent.clone()), // not terminal:data
+        typed_event(&ws, old, events::GIT_COMMIT, agent.clone()),
+    ];
+    for ev in &seed {
+        store.insert_event(ev).await.expect("insert seed event");
+    }
+
+    // Cutoff between old and new: old ephemeral families are eligible.
+    let cutoff = "2026-03-01T00:00:00Z";
+    let removed = store
+        .delete_ephemeral_events_before(cutoff)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        removed, 10,
+        "10 old ephemeral events removed (3 stream + 3 file + 1 terminal + 3 host:exec)"
+    );
+
+    let remaining = store
+        .events_by_workspace(&ws, 100)
+        .await
+        .expect("remaining");
+    assert_eq!(
+        remaining.len(),
+        10,
+        "4 new ephemeral + 6 preserved families"
+    );
+
+    // New ephemeral events survive.
+    for t in [
+        events::AGENT_STREAM_CHUNK,
+        events::FILE_CHANGED,
+        events::TERMINAL_DATA,
+        events::HOST_EXEC_STDOUT,
+    ] {
+        assert!(
+            remaining
+                .iter()
+                .any(|e| e.event_type == t && e.timestamp == new),
+            "new ephemeral {t} missing"
+        );
+    }
+
+    // Non-ephemeral families survive, including old ones.
+    for t in [
+        events::AGENT_STARTED,
+        events::AGENT_TOOL_CALL,
+        events::NOTE_UPDATED,
+        events::TASK_STATUS_CHANGED,
+        events::TERMINAL_EXIT,
+        events::GIT_COMMIT,
+    ] {
+        assert!(
+            remaining.iter().any(|e| e.event_type == t),
+            "preserved family {t} missing"
+        );
+    }
+
+    // Idempotent: a re-run with the same cutoff removes nothing more.
+    let removed_again = store
+        .delete_ephemeral_events_before(cutoff)
+        .await
+        .expect("sweep re-run");
+    assert_eq!(removed_again, 0);
+
+    // Legacy alias still works (for backward compat during transition).
+    let removed_via_alias = store
+        .delete_stream_events_before(cutoff)
+        .await
+        .expect("legacy alias");
+    assert_eq!(removed_via_alias, 0, "idempotent via alias too");
+}
+
+/// Earlier test retained for coverage of the legacy behavior (stream-only sweep);
+/// the new `ephemeral_event_retention_sweep_extended_families` above covers the
+/// extended scope (finding F4).
 #[tokio::test]
 async fn stream_retention_sweep_trims_only_old_stream_events() {
     let tmp = TempDb::new();
@@ -1240,13 +1357,18 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
         .delete_stream_events_before(cutoff)
         .await
         .expect("sweep");
-    assert_eq!(removed, 3, "exactly the three old stream events removed");
+    // NOTE: this test predates the finding F4 extension; after the extension
+    // landed, `delete_stream_events_before` became an alias for
+    // `delete_ephemeral_events_before`, so the old FILE_CHANGED event is now
+    // also removed. The assertion below reflects the new behavior (4 removed:
+    // 3 stream + 1 file). The legacy name is preserved for backward compat.
+    assert_eq!(removed, 4, "extended sweep includes file:* (finding F4)");
 
     let remaining = store
         .events_by_workspace(&ws, 100)
         .await
         .expect("remaining");
-    assert_eq!(remaining.len(), 6);
+    assert_eq!(remaining.len(), 5);
     // The surviving stream event is the new one; no old stream events remain.
     let stream_types: Vec<&str> = remaining
         .iter()
@@ -1254,11 +1376,11 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
         .map(|e| e.timestamp.as_str())
         .collect();
     assert_eq!(stream_types, vec![new]);
-    // Every non-stream family survives, including the old ones.
+    // Every non-ephemeral family survives, including the old ones (file:* is
+    // now ephemeral so the old FILE_CHANGED was removed).
     for t in [
         events::AGENT_STARTED,
         events::AGENT_TOOL_CALL,
-        events::FILE_CHANGED,
         events::NOTE_UPDATED,
         events::TASK_STATUS_CHANGED,
     ] {
@@ -1274,6 +1396,30 @@ async fn stream_retention_sweep_trims_only_old_stream_events() {
         .await
         .expect("sweep re-run");
     assert_eq!(removed_again, 0);
+}
+
+/// Finding F4 (fsync half): `connect()` sets `PRAGMA synchronous = NORMAL`
+/// (safe under WAL) to cut fsync load on high-write workloads. This test
+/// asserts that a fresh pool has `synchronous = NORMAL` (2 in SQLite's integer
+/// encoding: 0=OFF, 1=NORMAL, 2=FULL).
+#[tokio::test]
+async fn connect_sets_synchronous_normal_under_wal() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    // Query the PRAGMA value. SQLite returns the integer code: 0=OFF, 1=NORMAL, 2=FULL.
+    let row: (i64,) = sqlx::query_as("PRAGMA synchronous")
+        .fetch_one(store.pool())
+        .await
+        .expect("query pragma");
+    assert_eq!(row.0, 1, "synchronous should be NORMAL (1) under WAL");
+
+    // Verify WAL mode is also set (journal_mode).
+    let jm: (String,) = sqlx::query_as("PRAGMA journal_mode")
+        .fetch_one(store.pool())
+        .await
+        .expect("query journal_mode");
+    assert_eq!(jm.0.to_lowercase(), "wal", "journal_mode should be WAL");
 }
 
 #[tokio::test]

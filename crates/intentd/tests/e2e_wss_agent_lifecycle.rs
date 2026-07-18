@@ -5182,3 +5182,243 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         "completion report timestamp cleared after new turn begins"
     );
 }
+
+/// Emit `agent:message` on daemon-side user-row appends: verify that the
+/// queue-drain (persist_user) and wake-delivery (deliver_wake_message runtime)
+/// paths both publish `agent:message` with the persisted row's id. When an
+/// AgentManager is attached, plain agent.sendMessage routes through the manager
+/// and does NOT emit (FE optimistic rendering). This test covers the two runtime
+/// paths that DO emit: (1) dequeued message after a busy turn, (2) wake delivery
+/// to an idle agent.
+#[tokio::test]
+async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
+    let Some(script) = gate("WSS agent:message queue+wake E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // Slow first turn to keep agent busy while we queue the second message.
+    let behavior = json!({
+        "response": "reply",
+        "firstTurnDelayMs": 2000
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Subscribe to agent:message + stream:end events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:message", "agent:stream:end"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Part 1: Queue-drain path (persist_user in agent_manager.rs).
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Send first message — agent will be busy for 2000ms.
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
+
+    // Give the agent a moment to start processing.
+    sleep(Duration::from_millis(200)).await;
+
+    // Send second message while busy — this will queue.
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "queued" }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second message should queue");
+
+    // Collect events: wait for agent:message role=user for the dequeued message.
+    let mut saw_dequeued_user_message = false;
+    let mut dequeued_message_id: Option<String> = None;
+    let mut stream_end_count = 0;
+    for _ in 0..30 {
+        let frame_opt = wss_event_opt(&mut sub, 5).await;
+        let frame = frame_opt.unwrap_or_else(|| {
+            panic!(
+                "event timeout waiting for dequeued message (saw_dequeued={}, stream_end_count={})",
+                saw_dequeued_user_message, stream_end_count
+            )
+        });
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:message") => {
+                if evt["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && evt["data"]["role"] == "user"
+                {
+                    // The first turn's user message won't have an event (optimistic render).
+                    // The dequeued message (second) will emit after the first turn completes.
+                    dequeued_message_id = evt["data"]["messageId"].as_str().map(String::from);
+                    saw_dequeued_user_message = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                stream_end_count += 1;
+                // After 2 turns and we saw the dequeued message event, we're done.
+                if stream_end_count >= 2 && saw_dequeued_user_message {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_dequeued_user_message,
+        "agent:message event emitted for dequeued user message (persist_user path)"
+    );
+
+    // Verify the messageId matches the second (queued) user message in the transcript.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().unwrap();
+    // Count user messages - we expect the dequeued message to be the second one.
+    let user_messages: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
+    assert!(
+        user_messages.len() >= 2,
+        "should have at least 2 user messages (first + queued)"
+    );
+    // The event messageId should match the second user message (the queued one).
+    let second_user_id = user_messages[1]["id"].as_str();
+    assert_eq!(
+        dequeued_message_id.as_deref(),
+        second_user_id,
+        "dequeued agent:message event ID matches the second (queued) user message"
+    );
+
+    // Part 2: Wake delivery path (deliver_wake_message runtime).
+    let marked = wss_rpc(
+        &mut rpc,
+        14,
+        "task.markAsTask",
+        json!({ "workspaceId": &ws_id, "noteId": &note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true);
+
+    let wake_result = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": &ws_id,
+            "taskNoteId": &note_id,
+            "contextMessage": "wake test",
+            "create": { "model": "mock:default" },
+        }),
+    )
+    .await;
+    assert_eq!(wake_result["ok"], true);
+    let task_agent_id = wake_result["agentId"].as_str().unwrap().to_string();
+
+    // Collect events: wait for agent:message role=user for the wake delivery.
+    let mut saw_wake_message_event = false;
+    let mut wake_message_id: Option<String> = None;
+    let mut wake_stream_end_count = 0;
+    for _ in 0..30 {
+        let frame_opt = wss_event_opt(&mut sub, 5).await;
+        let frame = frame_opt.unwrap_or_else(|| {
+            panic!(
+                "event timeout waiting for wake message (saw_wake={}, wake_stream_end_count={})",
+                saw_wake_message_event, wake_stream_end_count
+            )
+        });
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:message") => {
+                if evt["data"]["agentId"].as_str() == Some(task_agent_id.as_str())
+                    && evt["data"]["role"] == "user"
+                {
+                    wake_message_id = evt["data"]["messageId"].as_str().map(String::from);
+                    saw_wake_message_event = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                wake_stream_end_count += 1;
+                if saw_wake_message_event && wake_stream_end_count >= 1 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_wake_message_event,
+        "agent:message event emitted for wake delivery (deliver_wake_message path)"
+    );
+
+    // Verify the wake messageId matches the first (and only) user message in the task agent's transcript.
+    let wake_conv = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &task_agent_id }),
+    )
+    .await;
+    let wake_messages = wake_conv["messages"].as_array().unwrap();
+    // The wake-delivery agent should have exactly one user message (the wake contextMessage).
+    let wake_user_messages: Vec<_> = wake_messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert!(
+        !wake_user_messages.is_empty(),
+        "wake agent should have at least one user message"
+    );
+    // The event messageId should match the first user message.
+    let first_wake_user_id = wake_user_messages[0]["id"].as_str();
+    assert_eq!(
+        wake_message_id.as_deref(),
+        first_wake_user_id,
+        "wake agent:message event ID matches the first user message (wake contextMessage)"
+    );
+}

@@ -75,6 +75,28 @@ pub fn session_token_tally(session: &AgentSession) -> AgentTokenTally {
     }
 }
 
+/// Lightweight token tally from extracted usage data (finding F2: avoid full
+/// AgentSession hydration). Takes an agent_id, model, and the message content
+/// JSON list (usage metadata is embedded in each content block). This is the
+/// incremental-scan counterpart to [`session_token_tally`].
+pub fn agent_token_tally_from_contents(
+    agent_id: &str,
+    model: Option<&str>,
+    contents: &[serde_json::Value],
+) -> AgentTokenTally {
+    let mut totals = TokenUsageTotals::default();
+    for content in contents {
+        if let Some(usage) = extract_message_usage(content) {
+            add_totals(&mut totals, &usage);
+        }
+    }
+    AgentTokenTally {
+        agent_id: agent_id.to_string(),
+        model: model.unwrap_or("").to_string(),
+        totals,
+    }
+}
+
 /// Extract a `TokenUsageTotals` from a message content block's optional `usage`
 /// object (top-level or under `_meta`). Returns `None` when neither carries a
 /// usage object, so messages without usage metadata contribute nothing.
@@ -141,5 +163,23 @@ mod tests {
             extract_message_usage(&serde_json::json!({ "content": "hi" })),
             None
         );
+    }
+
+    #[test]
+    fn lightweight_tally_from_contents_matches_session_tally() {
+        // Fixture: 3 message contents with usage metadata
+        let contents = vec![
+            serde_json::json!({ "usage": { "inputTokens": 10, "outputTokens": 2 } }),
+            serde_json::json!({ "_meta": { "usage": { "cacheReadTokens": 5 } } }),
+            serde_json::json!({ "text": "no usage here" }),
+        ];
+        let tally = agent_token_tally_from_contents("agent-test", Some("sonnet-5"), &contents);
+        assert_eq!(tally.agent_id, "agent-test");
+        assert_eq!(tally.model, "sonnet-5");
+        assert_eq!(tally.totals, totals(10, 2, 5, 0));
+
+        // Empty model fallback
+        let tally2 = agent_token_tally_from_contents("agent-2", None, &contents);
+        assert_eq!(tally2.model, "");
     }
 }
