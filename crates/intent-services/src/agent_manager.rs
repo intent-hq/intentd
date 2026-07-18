@@ -2356,32 +2356,12 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         status: AgentStatus,
     ) -> Result<()> {
-        let status_str = match status {
-            AgentStatus::Pending => "pending",
-            _ => "idle",
-        };
-        let ts = now_iso();
+        let is_active = false;
         // Clear stop_reason on retry: the agent is starting fresh, not stuck in an error.
-        self.services
-            .store
-            .set_agent_session_status(workspace_id, agent_id, status, false, &ts, Some(None))
-            .await?;
-        let event = NewEvent {
-            workspace_id: workspace_id.clone(),
-            timestamp: ts,
-            event_type: AGENT_STATUS_CHANGED.to_string(),
-            actor: agent_actor(agent_id),
-            session_id: Some(agent_id.0.clone()),
-            correlation_id: None,
-            parent_event_id: None,
-            metadata: None,
-            data: json!({
-                "agentId": agent_id.0,
-                "status": status_str,
-                "isActive": false,
-            }),
-        };
-        crate::publish_event(&self.services.event_bus, event).await;
+        // Route through persist_status_with_stop_reason to ensure the agent:status-changed
+        // event carries stopReason: null.
+        self.persist_status_with_stop_reason(agent_id, workspace_id, status, is_active, Some(None))
+            .await;
         Ok(())
     }
 
