@@ -7827,7 +7827,7 @@ impl WorkspaceApi for Services {
     }
 
     fn publish_event(&self, event: intent_core::PublishEvent) -> BoxFuture<'_, Result<()>> {
-        use intent_core::{now_iso, ActorType, EventActor};
+        use intent_core::now_iso;
         use intent_store::NewEvent;
 
         let bus = self.event_bus.clone();
@@ -7836,12 +7836,7 @@ impl WorkspaceApi for Services {
                 workspace_id: event.workspace_id,
                 timestamp: now_iso(),
                 event_type: event.event_type,
-                actor: EventActor {
-                    actor_type: ActorType::System,
-                    id: Some("system".to_string()),
-                    name: Some("System".to_string()),
-                    ..Default::default()
-                },
+                actor: system_actor(),
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,

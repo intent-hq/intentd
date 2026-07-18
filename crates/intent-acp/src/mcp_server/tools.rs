@@ -272,9 +272,9 @@ API:
   ws.app.specialists.list() → specialists[]  // List app-level specialists with id, name, description, model, prompt, and source metadata.
   ws.app.specialists.get(id) → specialist  // Get one app-level specialist by ID; throws a clear not-found error when missing.
   ws.app.specialists.propose({ action: "create"|"edit"|"delete", id?, name?, description?, model?, prompt?, scope? }) → ProposalCard  // Render a specialist-edit proposal with editable name/description/model/prompt fields.
-  ws.app.ui.navigate(route, { highlightId?, durationMs? }?) → { ok, route, highlightId?, durationMs? }  // Navigate the app UI via the renderer router. If highlightId is omitted, the URL hash is used when present.
-  ws.app.ui.highlight(id, { durationMs? }?) → { ok, id, durationMs? }  // Pulse a registered highlight target using the UI highlight system.
-  ws.app.ui.targets() → [{ id, label, route, highlightId?, category, description, dynamic?, idPattern? }]  // Discover typed app UI targets and highlight ID patterns.
+  ws.app.ui.navigate(route, { highlightId?, durationMs? }?) → { ok, route, workspaceId, highlightId?, durationMs? }  // Navigate the app UI via the renderer router. If highlightId is omitted, the URL hash is used when present.
+  ws.app.ui.highlight(id, { durationMs? }?) → { ok, id, workspaceId, durationMs? }  // Pulse a registered highlight target using the UI highlight system.
+  ws.app.ui.targets() → [{ id, label, route, tab, category, description, dynamic?, idPattern?, hashAliases?, scrollSelector?, highlightSelector? }]  // Discover typed app UI targets and highlight ID patterns.
   ws.app.workspaces.archive(id) → ProposalCard  // Chief workspace only. Proposes archive of a single workspace via ws.app.proposal.show; the user confirms before applying.
   ws.app.workspaces.bulkArchive(ids) → ProposalCard  // Chief workspace only. Proposes bulk archive via ws.app.proposal.show.
   ws.app.workspaces.bulkDelete(ids) → ProposalCard  // Chief workspace only. Proposes bulk delete via ws.app.proposal.show.

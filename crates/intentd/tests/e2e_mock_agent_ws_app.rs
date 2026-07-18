@@ -140,7 +140,7 @@ async fn chief_agent_ws_app_workspaces_list() {
     // Call ws.app.workspaces.list via MCP
     let js = r#"
         const result = await ws.app.workspaces.list({});
-        return { workspaces: result.workspaces };
+        return { workspaces: result };
     "#;
 
     let behavior = json!({
@@ -186,8 +186,42 @@ async fn chief_agent_ws_app_workspaces_list() {
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
-    // Tool call succeeded: the mock agent reached end_turn without failing/refusing,
-    // proving ws.app.workspaces.list executed through the MCP path.
+    // Assert the persisted tool output contains the seeded workspaces and __chief__ is excluded
+    let transcript = services
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .await
+        .expect("get conversation");
+    let messages = transcript["messages"].as_array().expect("messages array");
+    let tool_outputs: Vec<_> = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter_map(|b| {
+            if b["type"] == "tool_result" {
+                b["output"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !tool_outputs.is_empty(),
+        "Expected tool result blocks in transcript"
+    );
+    let last_output = tool_outputs.last().expect("tool outputs");
+    let output_json: serde_json::Value =
+        serde_json::from_str(last_output).expect("tool output should be JSON");
+    let workspaces = output_json["workspaces"]
+        .as_array()
+        .expect("workspaces array");
+    assert!(
+        workspaces.iter().any(|w| w["id"] == json!("spec")),
+        "Expected seeded spec workspace"
+    );
+    assert!(
+        !workspaces.iter().any(|w| w["id"] == json!("__chief__")),
+        "Expected __chief__ to be excluded from list"
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
@@ -446,9 +480,44 @@ async fn non_chief_agent_ws_app_gating_error() {
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
-    // Tool call completed: the mock agent's JS try/catch caught the gating error and
-    // returned {success: false, error: ...}, allowing the turn to reach end_turn cleanly.
-    // This proves ws.app.* gating works through the MCP path.
+    // Assert the persisted tool output contains success: false and the gating error string
+    let transcript = services
+        .agent_get_conversation(agent_id.clone(), None, Some(ws.clone()), None)
+        .await
+        .expect("get conversation");
+    let messages = transcript["messages"].as_array().expect("messages array");
+    let tool_outputs: Vec<_> = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter_map(|b| {
+            if b["type"] == "tool_result" {
+                b["output"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        !tool_outputs.is_empty(),
+        "Expected tool result blocks in transcript"
+    );
+    let last_output = tool_outputs.last().expect("tool outputs");
+    let output_json: serde_json::Value =
+        serde_json::from_str(last_output).expect("tool output should be JSON");
+    assert_eq!(
+        output_json["success"],
+        json!(false),
+        "Expected success: false in gating error"
+    );
+    let error_msg = output_json["error"]
+        .as_str()
+        .expect("error should be a string");
+    assert!(
+        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        "Expected gating error message in tool output, got: {}",
+        error_msg
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {

@@ -258,10 +258,19 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
                 .get("label")
                 .and_then(Value::as_str)
                 .unwrap_or("Setting");
-            let value_str = format!("{}", change.get("value").unwrap());
+            let new_value = change.get("value").unwrap();
+            let value_str = new_value
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| serde_json::to_string(new_value).unwrap());
             let before_str = current_value
                 .as_ref()
-                .map(|v| format!("{}", v))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .or_else(|| {
+                    current_value
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap())
+                })
                 .unwrap_or_else(|| "null".to_string());
 
             let is_multiline = matches!(
