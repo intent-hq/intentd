@@ -210,13 +210,13 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         }
 
         // Get setting definition to validate
-        let setting_result = api.settings_get(path.to_string()).await.map_err(|e| {
-            if e.to_string().contains("not found") {
-                format!("Unknown app setting path: {}", path)
-            } else {
-                format!("settings.get failed: {}", e)
-            }
-        })?;
+        let setting_result = api
+            .settings_get(path.to_string())
+            .await
+            .map_err(|e| match e {
+                intent_core::Error::NotFound(_) => format!("Unknown app setting path: {}", path),
+                _ => format!("settings.get failed: {}", e),
+            })?;
 
         let definition = setting_result
             .get("definition")

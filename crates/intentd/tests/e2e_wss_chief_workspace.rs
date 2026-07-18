@@ -464,8 +464,7 @@ async fn chief_workspace_over_wss() {
 #[tokio::test]
 async fn ws_app_surface_events_and_gating_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -620,14 +619,4 @@ async fn ws_app_surface_events_and_gating_over_wss() {
 
     drop(ws);
     drop(event_sub);
-}
-
-/// Helper to obtain an ephemeral port by bind-then-release.
-fn free_port() -> u16 {
-    use std::net::TcpListener;
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
 }

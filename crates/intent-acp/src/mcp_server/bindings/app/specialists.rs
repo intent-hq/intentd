@@ -69,13 +69,9 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
     let result = api
         .specialist_get(id.to_string(), None)
         .await
-        .map_err(|e| {
-            // Map NotFound to a clear error message
-            if e.to_string().contains("not found") {
-                format!("Specialist not found: {id}")
-            } else {
-                format!("specialist.get failed: {e}")
-            }
+        .map_err(|e| match e {
+            intent_core::Error::NotFound(_) => format!("Specialist not found: {id}"),
+            _ => format!("specialist.get failed: {e}"),
         })?;
 
     // The daemon returns { specialist: SpecialistDef }
