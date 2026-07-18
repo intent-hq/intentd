@@ -435,6 +435,7 @@ mod tests {
                 initial_message: None,
                 sandbox_id: None,
                 sandbox_branch: None,
+                stop_reason: None,
                 sandbox_path: None,
             },
         }
