@@ -279,6 +279,13 @@ mod tests {
     }
 
     #[test]
+    fn percent_encode_path_segment_handles_multibyte_utf8() {
+        assert_eq!(percent_encode_path_segment("héllo"), "h%C3%A9llo");
+        assert_eq!(percent_encode_path_segment("日本"), "%E6%97%A5%E6%9C%AC");
+        assert_eq!(percent_encode_path_segment("a-b_c.~"), "a-b_c.~");
+    }
+
+    #[test]
     fn proposal_resource_uri_falls_back_to_title() {
         let proposal = json!({
             "kind": "bulk-op",
