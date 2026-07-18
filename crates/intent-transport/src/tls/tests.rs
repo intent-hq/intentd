@@ -130,10 +130,16 @@ fn persisted_file_modes_are_0644_and_0600() {
 
 #[test]
 fn ensure_caches_and_exposes_fingerprint() {
+    // Clear cache before test to ensure isolation from parallel tests.
+    clear_cert_cache();
+
     let dir = unique_dir("ensure");
     let cert = ensure_tls_certificate(&dir).unwrap();
     assert_eq!(cert_fingerprint(), Some(cert.fingerprint256.clone()));
 
     let again = ensure_tls_certificate(&dir).unwrap();
     assert_eq!(cert.fingerprint256, again.fingerprint256);
+
+    // Clear cache after test to avoid polluting other tests.
+    clear_cert_cache();
 }
