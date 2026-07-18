@@ -2584,7 +2584,7 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
         .store
-        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso())
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
         .await
         .expect("park session in error");
     // A ready-to-send message is waiting (the terminal-failure requeue).

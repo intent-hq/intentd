@@ -1852,7 +1852,7 @@ impl AgentManager {
         if let Err(e) = self
             .services
             .store
-            .set_agent_session_status(workspace_id, agent_id, status, is_active, &ts)
+            .set_agent_session_status(workspace_id, agent_id, status, is_active, &ts, None)
             .await
         {
             // Sessions are persisted before the runtime path opens (see
@@ -2287,7 +2287,7 @@ impl AgentManager {
         let ts = now_iso();
         self.services
             .store
-            .set_agent_session_status(workspace_id, agent_id, status, false, &ts)
+            .set_agent_session_status(workspace_id, agent_id, status, false, &ts, None)
             .await?;
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
@@ -3287,7 +3287,7 @@ async fn persist_error_and_requeue(
     if let Err(e) = mgr
         .services
         .store
-        .set_agent_session_status(workspace_id, agent_id, AgentStatus::Error, false, &ts)
+        .set_agent_session_status(workspace_id, agent_id, AgentStatus::Error, false, &ts, None)
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status");

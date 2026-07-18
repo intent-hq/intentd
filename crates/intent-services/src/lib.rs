@@ -1194,6 +1194,7 @@ impl Services {
                     intent_core::AgentStatus::RuntimeIdle,
                     false,
                     &now,
+                    None,
                 )
                 .await?;
             healed += 1;

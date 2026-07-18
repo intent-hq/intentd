@@ -6048,6 +6048,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
             intent_core::AgentStatus::RuntimeIdle,
             false,
             &now_iso(),
+            None,
         )
         .await
         .expect_err("cross-ws status write must not mutate");

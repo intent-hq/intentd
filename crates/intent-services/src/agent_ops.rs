@@ -1044,6 +1044,7 @@ impl Services {
             image_blocks,
             is_background,
             metadata,
+            stop_reason: None,
             created_at: now.clone(),
             updated_at: now,
             sandbox_id: None,
