@@ -620,3 +620,13 @@ async fn ws_app_surface_events_and_gating_over_wss() {
     drop(ws);
     drop(event_sub);
 }
+
+/// Helper to obtain an ephemeral port by bind-then-release.
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
