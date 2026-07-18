@@ -149,6 +149,7 @@ async fn chief_agent_ws_app_workspaces_list() {
             "arguments": { "code": js, "summary": "ws.app.workspaces.list e2e" }
         },
         "response": "list workspaces",
+        "emitToolBlocks": true,
     })
     .to_string();
 
@@ -198,7 +199,11 @@ async fn chief_agent_ws_app_workspaces_list() {
         .flatten()
         .filter_map(|b| {
             if b["type"] == "tool_result" {
-                b["output"].as_str()
+                // output is an array of MCP content blocks; extract the first text block
+                b["output"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|item| item["text"].as_str())
             } else {
                 None
             }
@@ -215,11 +220,21 @@ async fn chief_agent_ws_app_workspaces_list() {
         .as_array()
         .expect("workspaces array");
     assert!(
-        workspaces.iter().any(|w| w["id"] == json!("spec")),
-        "Expected seeded spec workspace"
+        workspaces
+            .iter()
+            .any(|w| w["title"] == json!("Amber Forest")),
+        "Expected seeded 'Amber Forest' workspace"
     );
     assert!(
-        !workspaces.iter().any(|w| w["id"] == json!("__chief__")),
+        workspaces
+            .iter()
+            .any(|w| w["title"] == json!("Indigo Valley")),
+        "Expected seeded 'Indigo Valley' workspace"
+    );
+    assert!(
+        !workspaces
+            .iter()
+            .any(|w| w["id"] == json!(CHIEF_WORKSPACE_ID)),
         "Expected __chief__ to be excluded from list"
     );
 
@@ -443,6 +458,7 @@ async fn non_chief_agent_ws_app_gating_error() {
             "arguments": { "code": js, "summary": "ws.app gating e2e" }
         },
         "response": "gating check",
+        "emitToolBlocks": true,
     })
     .to_string();
 
@@ -492,7 +508,11 @@ async fn non_chief_agent_ws_app_gating_error() {
         .flatten()
         .filter_map(|b| {
             if b["type"] == "tool_result" {
-                b["output"].as_str()
+                // output is an array of MCP content blocks; extract the first text block
+                b["output"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|item| item["text"].as_str())
             } else {
                 None
             }
