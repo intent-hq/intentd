@@ -7158,81 +7158,16 @@ impl WorkspaceApi for Services {
                 )
                 .await;
             }
-            // Port the TS `deleteWorkspace` worktree cleanup: under the per-repo
-            // worktree lock, remove the linked worktree (+ the now-empty
-            // `<root>/<workspaceId>` parent) and delete the workspace branch —
-            // but only when it is the branch the daemon auto-generated at
-            // create time (guard parity with `removeGitWorktree`'s
-            // `branchName === workspaceId`). Cleanup is best-effort throughout:
-            // a git failure never blocks the row deletion (TS parity).
-            if let Ok(ws) = store.get_workspace(&id).await {
-                let repo_dir = ws
-                    .repository_path
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                    .map(PathBuf::from);
-                let wt = ws
-                    .worktree_path
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                    .map(PathBuf::from);
-                if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
-                    if !ws.skip_worktree && !ws.is_remote {
-                        let branch_auto_generated = store
-                            .workspace_branch_auto_generated(&id)
-                            .await
-                            .unwrap_or(false);
-                        let branch = ws.branch.clone();
-                        let repo = repo_dir.clone();
-                        worktree_locks
-                            .with_lock(&repo_dir, move || async move {
-                                let task = tokio::task::spawn_blocking(move || {
-                                    cleanup_workspace_worktree(
-                                        &repo,
-                                        &wt,
-                                        &branch,
-                                        branch_auto_generated,
-                                    );
-                                })
-                                .await;
-                                if let Err(e) = task {
-                                    tracing::warn!(error = %e, "worktree cleanup task failed");
-                                }
-                            })
-                            .await;
-                    }
-                }
-            }
-            // Final sweep of the daemon-owned workspace directory
-            // (`<workspaces_root>/<id>/`, matching FE
-            // `WorkspaceConfig.WORKSPACES_BASE`): the worktree cleanup's
-            // best-effort `remove_dir` (empty-only) leaves any residual
-            // content behind, and legacy pre-daemon workspaces have a
-            // directory but no worktree path at all. Recursive best-effort
-            // removal keeps the FE `FileSystemWorkspaceRepository.findAll`
-            // scan from re-surfacing the deleted id (ENOENT WARN spam) and
-            // makes the delete idempotent for orphaned directories.
-            let dir = workspaces_root.join(id.as_str());
-            let cleanup =
-                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                })
-                .await;
-            match cleanup {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    workspace = %id.as_str(),
-                    error = %e,
-                    "workspace.delete: failed to remove workspace directory"
-                ),
-                Err(join_err) => tracing::warn!(
-                    workspace = %id.as_str(),
-                    error = %join_err,
-                    "workspace.delete: workspace-dir cleanup task failed"
-                ),
-            }
+            // Capture workspace state for the async cleanup below (before the
+            // row delete). Best-effort: when the workspace is already gone or
+            // the read fails, the background task simply skips the worktree
+            // step — the orphaned directory sweep can still unlink
+            // `<workspaces_root>/<id>/` on a retry, per the idempotent delete.
+            let ws_for_cleanup = store.get_workspace(&id).await.ok();
+            let branch_auto_generated = store
+                .workspace_branch_auto_generated(&id)
+                .await
+                .unwrap_or(false);
             // Idempotent DB delete: swallow `NotFound` so retries and
             // orphan-dir-only cleanups don't surface as `"Failed to delete
             // space"` on the FE. Any other error still propagates. Publish
@@ -7251,6 +7186,127 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             }
+            // Fast-ack: the client receives `{ success: true }` here while the
+            // worktree and workspace-directory cleanup proceeds asynchronously
+            // in the background. Bounded latency regardless of checkout size
+            // (no multi-GB `remove_dir_all` blocking the response).
+            //
+            // Same-slug-recreate race guard: the `create` path already takes
+            // the per-repo worktree lock before provisioning, so a recreate
+            // cannot run its `add_worktree` while this cleanup's
+            // `remove_worktree` is still in progress for the same repo.
+            // Residual risk: if a recreate runs *before* the background task
+            // fires (row is deleted, event is sent, response is ACKed, but the
+            // spawn hasn't yet grabbed the worktree lock), the recreate could
+            // complete and then this cleanup might delete its brand-new
+            // worktree. Mitigation: we re-check the workspace row inside the
+            // background task and skip cleanup if it exists again. This is
+            // best-effort; the cleanup is naturally idempotent, and
+            // `workspace.delete` of the recreated workspace will clean up any
+            // mismatched leftovers.
+            let workspaces_root_bg = workspaces_root.clone();
+            let id_bg = id.clone();
+            let store_bg = store.clone();
+            let worktree_locks_bg = worktree_locks.clone();
+            let branch_auto_generated_bg = branch_auto_generated;
+            tokio::spawn(async move {
+                // Re-check that the workspace is actually deleted. If it
+                // exists now (same-slug recreate landed before this task ran),
+                // skip the worktree cleanup entirely — the new workspace owns
+                // the branch and directory now. Still sweep the
+                // `<workspaces_root>/<id>/` directory if it doesn't match the
+                // recreated workspace's path, for orphan-cleanup parity.
+                let recreated = store_bg.get_workspace(&id_bg).await.ok();
+                if let Some(ws_cleanup) = ws_for_cleanup {
+                    // Only run the worktree cleanup if the workspace is still
+                    // deleted (no recreate) or the recreate has a different
+                    // worktree path (the old worktree is now orphaned).
+                    let skip_worktree = recreated
+                        .as_ref()
+                        .map(|r| r.worktree_path == ws_cleanup.worktree_path)
+                        .unwrap_or(false);
+                    if !skip_worktree {
+                        let repo_dir = ws_cleanup
+                            .repository_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from);
+                        let wt = ws_cleanup
+                            .worktree_path
+                            .as_deref()
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from);
+                        if let (Some(repo_dir), Some(wt)) = (repo_dir, wt) {
+                            if !ws_cleanup.skip_worktree && !ws_cleanup.is_remote {
+                                let branch = ws_cleanup.branch.clone();
+                                let repo = repo_dir.clone();
+                                let branch_flag = branch_auto_generated_bg;
+                                worktree_locks_bg
+                                    .with_lock(&repo_dir, move || async move {
+                                        let task = tokio::task::spawn_blocking(move || {
+                                            cleanup_workspace_worktree(
+                                                &repo,
+                                                &wt,
+                                                &branch,
+                                                branch_flag,
+                                            );
+                                        })
+                                        .await;
+                                        if let Err(e) = task {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "background worktree cleanup task failed"
+                                            );
+                                        }
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                // Final sweep of the daemon-owned workspace directory
+                // (`<workspaces_root>/<id>/`). The worktree cleanup's
+                // best-effort `remove_dir` (empty-only) leaves any residual
+                // content behind, and legacy pre-daemon workspaces have a
+                // directory but no worktree path at all. Recursive best-effort
+                // removal keeps the FE `FileSystemWorkspaceRepository.findAll`
+                // scan from re-surfacing the deleted id (ENOENT WARN spam) and
+                // makes the delete idempotent for orphaned directories.
+                //
+                // If a same-slug recreate happened and uses the same
+                // `<workspaces_root>/<id>/` parent, skip the removal so we
+                // don't destroy the recreated workspace's directory tree.
+                let skip_dir = recreated
+                    .as_ref()
+                    .and_then(|r| r.worktree_path.as_deref())
+                    .filter(|p| !p.is_empty())
+                    .and_then(|wt_path| Path::new(wt_path).parent())
+                    .map(|parent| parent == workspaces_root_bg.join(id_bg.as_str()))
+                    .unwrap_or(false);
+                if !skip_dir {
+                    let dir = workspaces_root_bg.join(id_bg.as_str());
+                    let cleanup =
+                        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&dir) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e),
+                        })
+                        .await;
+                    match cleanup {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            workspace = %id_bg.as_str(),
+                            error = %e,
+                            "background cleanup: failed to remove workspace directory"
+                        ),
+                        Err(join_err) => tracing::warn!(
+                            workspace = %id_bg.as_str(),
+                            error = %join_err,
+                            "background cleanup: workspace-dir task failed"
+                        ),
+                    }
+                }
+            });
             Ok(())
         })
     }
