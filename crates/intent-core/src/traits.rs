@@ -143,6 +143,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Publish an event onto the event bus (§10). The bindings layer can call
+    /// this to emit app:*/workspace:*/note:* events that live subscribers will
+    /// receive. When no bus is wired (test/minimal configs), this is a no-op.
+    /// The default impl returns `Ok(())` so bindings can call it unconditionally.
+    fn publish_event(&self, event: PublishEvent) -> BoxFuture<'_, Result<()>> {
+        let _ = event;
+        Box::pin(async { Ok(()) })
+    }
+
     /// Read the durable token/credit usage snapshot for a workspace (§5.23). The
     /// scan job itself is daemon-internal (no RPC); this is the wire **read** and
     /// returns a default (empty, `lastScanAt: null`) snapshot before the first
@@ -4981,4 +4990,13 @@ pub trait AgentReverseDispatch: Send + Sync {
         method: &'a str,
         params: serde_json::Value,
     ) -> BoxFuture<'a, std::result::Result<serde_json::Value, ReverseDispatchError>>;
+}
+
+/// Minimal event structure for `WorkspaceApi::publish_event` (used by bindings
+/// that don't import `intent_store::NewEvent`).
+#[derive(Debug, Clone)]
+pub struct PublishEvent {
+    pub workspace_id: crate::ids::WorkspaceId,
+    pub event_type: String,
+    pub data: serde_json::Value,
 }

@@ -55,6 +55,18 @@ impl WorkspaceMcpServer {
                 Some("u") => workspace_api_success("(no return value)"),
                 Some("v") => {
                     let value = v.get("__v").cloned().unwrap_or(Value::Null);
+
+                    // Check for __mcpContentItems (parity with FE workspace-js-api-tool line 281)
+                    if let Some(content_items) =
+                        value.get("__mcpContentItems").and_then(Value::as_array)
+                    {
+                        // Return MCP content items directly
+                        return json!({
+                            "content": content_items,
+                            "isError": false,
+                        });
+                    }
+
                     let pretty = serde_json::to_string_pretty(&value)
                         .unwrap_or_else(|_| "(unserializable)".into());
                     workspace_api_success(&pretty)

@@ -17,6 +17,7 @@ use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 pub(crate) mod agent;
+pub(crate) mod app;
 pub(crate) mod browser;
 pub(crate) mod comment;
 pub(crate) mod cross_workspace;
@@ -38,7 +39,7 @@ pub(crate) mod workspace;
 /// literals.
 pub(crate) fn prelude() -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         workspace::PRELUDE,
         note::PRELUDE,
         task::PRELUDE,
@@ -53,6 +54,7 @@ pub(crate) fn prelude() -> String {
         script::PRELUDE,
         terminal::PRELUDE,
         file::PRELUDE,
+        app::prelude(),
     )
 }
 
@@ -138,6 +140,9 @@ pub(crate) async fn try_dispatch(
         return file::dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("app.") {
+        return app::try_dispatch(api, workspace_id, rest, args).await;
     }
     Ok(None)
 }
