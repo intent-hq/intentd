@@ -929,7 +929,7 @@ mod tests {
 
         // Assert the prompt instructs marking verified tasks complete.
         assert!(
-            body.contains("mark") && body.contains("complete"),
+            body.contains("mark each verified task note `complete`"),
             "verifier.md must instruct marking verified tasks complete"
         );
 
