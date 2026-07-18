@@ -5204,10 +5204,9 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "firstTurnDelayMs": 2000
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
