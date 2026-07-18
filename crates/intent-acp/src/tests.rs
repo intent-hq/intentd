@@ -5488,6 +5488,7 @@ mod wsapi4_bindings_tests {
             last_user_message: None,
             context_references: None,
             image_blocks: None,
+            stop_reason: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -5500,7 +5501,6 @@ mod wsapi4_bindings_tests {
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,
-                stop_reason: None,
             },
         }
     }

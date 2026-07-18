@@ -424,6 +424,7 @@ mod tests {
             last_user_message: None,
             context_references: None,
             image_blocks: None,
+            stop_reason: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -435,7 +436,6 @@ mod tests {
                 initial_message: None,
                 sandbox_id: None,
                 sandbox_branch: None,
-                stop_reason: None,
                 sandbox_path: None,
             },
         }
