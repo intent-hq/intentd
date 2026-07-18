@@ -110,6 +110,28 @@ impl Store {
             .map_err(|e| Error::Internal(format!("delete delegation_group failed: {e}")))?;
         Ok(())
     }
+
+    /// STAB-108: Get distinct workspace IDs that have undelivered delegation groups.
+    /// Used for startup rehydration sweep.
+    pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
+        let rows =
+            sqlx::query("SELECT DISTINCT workspace_id FROM delegation_group WHERE delivered = 0")
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("list workspaces with undelivered groups: {e}"))
+                })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let ws_id: String = row
+                    .try_get("workspace_id")
+                    .unwrap_or_else(|_| String::new());
+                WorkspaceId::from(ws_id.as_str())
+            })
+            .collect())
+    }
 }
 
 fn decode_group_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedDelegationGroup> {

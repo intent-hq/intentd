@@ -1212,6 +1212,37 @@ impl Services {
         Ok(healed)
     }
 
+    /// STAB-108: Rehydrate undelivered delegation groups across all workspaces at daemon startup.
+    /// Best-effort: errors are logged but never fatal. Returns the total number of groups rehydrated.
+    pub async fn heal_delegation_groups_on_startup(&self) -> Result<usize> {
+        let workspace_ids = self.store.list_workspaces_with_undelivered_groups().await?;
+        let mut total_loaded = 0usize;
+
+        for workspace_id in workspace_ids {
+            match self.rehydrate_delegation_groups(&workspace_id).await {
+                Ok(loaded) => {
+                    if loaded > 0 {
+                        tracing::info!(
+                            workspace_id = %workspace_id.0,
+                            loaded,
+                            "rehydrated undelivered delegation groups on startup"
+                        );
+                        total_loaded += loaded;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workspace_id = %workspace_id.0,
+                        error = %e,
+                        "failed to rehydrate delegation groups for workspace on startup"
+                    );
+                }
+            }
+        }
+
+        Ok(total_loaded)
+    }
+
     /// Configure the note-asset root directory (for `note.readAsset`).
     /// Resolve `noteIds` (PROTOCOL §5.5) to ACP `image` content-block
     /// payloads. Port of the FE extraction in

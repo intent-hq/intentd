@@ -489,6 +489,19 @@ async fn cmd_serve(
         Ok(healed) => tracing::info!(healed, "healed stale in-flight agent sessions on startup"),
         Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
     }
+    // STAB-108: Rehydrate undelivered delegation groups on startup so groups
+    // survive daemon restarts without requiring the resume path. Groups are
+    // reconciled against current agent state (already-completed children are
+    // recorded) and ready groups fire immediately. Best-effort: a failure is
+    // logged but never aborts startup.
+    match services.heal_delegation_groups_on_startup().await {
+        Ok(0) => {}
+        Ok(loaded) => tracing::info!(
+            loaded,
+            "rehydrated undelivered delegation groups on startup"
+        ),
+        Err(e) => tracing::warn!(error = %e, "delegation group startup rehydration failed"),
+    }
     // Hydrate the script registry from the persisted definitions (§5.8) so
     // `script.*` survives daemon restarts. Best-effort: a failure is logged
     // but never aborts startup (scripts can still be re-created live).

@@ -740,33 +740,171 @@ impl Services {
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
     /// Idempotent: skips groups already present in memory (by group_id).
+    ///
+    /// STAB-108 FIX: Reconciles each rehydrated group against current agent state.
+    /// If an expected child is already idle/completed (or deleted/missing), records
+    /// its completion using the persisted completion_report, then fires ready groups.
     pub(crate) async fn rehydrate_delegation_groups(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<usize> {
         let persisted = self.store.list_undelivered_groups(workspace_id).await?;
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let entry = guard.entry(workspace_id.clone()).or_default();
-        let mut loaded = 0;
-        for p in persisted {
-            // Skip if this group is already in memory (idempotent rehydration).
-            if entry
-                .delegation_groups
-                .iter()
-                .any(|g| g.group_id == p.group_id)
-            {
-                continue;
+        let (loaded, groups_to_reconcile) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let entry = guard.entry(workspace_id.clone()).or_default();
+            let mut loaded = 0;
+            let mut groups_to_reconcile = Vec::new();
+            for p in persisted {
+                // Skip if this group is already in memory (idempotent rehydration).
+                if entry
+                    .delegation_groups
+                    .iter()
+                    .any(|g| g.group_id == p.group_id)
+                {
+                    continue;
+                }
+                // Groups are sealed on rehydration (original parent turn is gone).
+                let mut group = persisted_to_delegation_group(&p)?;
+                group.sealed = true;
+                groups_to_reconcile.push(group.group_id.clone());
+                entry.delegation_groups.push(group);
+                loaded += 1;
             }
-            // Groups are sealed on rehydration (original parent turn is gone).
-            let mut group = persisted_to_delegation_group(&p)?;
-            group.sealed = true;
-            entry.delegation_groups.push(group);
-            loaded += 1;
+            (loaded, groups_to_reconcile)
+        }; // guard dropped here
+
+        // STAB-108 reconciliation: check each rehydrated group for already-completed children
+        for group_id in groups_to_reconcile {
+            self.reconcile_group_on_rehydration(workspace_id, &group_id)
+                .await;
+            // Fire the group if it's now ready (all children completed/deleted)
+            self.try_fire_group(workspace_id, &group_id).await;
         }
         Ok(loaded)
+    }
+
+    /// STAB-108: Reconcile a delegation group against current agent state after rehydration.
+    /// For each expected child not already in completed_agent_ids or deleted_agent_ids,
+    /// check if the agent session is idle/completed (or deleted/missing). If so, record
+    /// its completion using the persisted completion_report.
+    async fn reconcile_group_on_rehydration(&self, workspace_id: &WorkspaceId, group_id: &str) {
+        // Get the list of agents to check (expected but not yet recorded as complete/deleted)
+        let agents_to_check = {
+            let guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(w) = guard.get(workspace_id) else {
+                return;
+            };
+            let Some(g) = w.delegation_groups.iter().find(|g| g.group_id == group_id) else {
+                return;
+            };
+            g.expected_agent_ids
+                .iter()
+                .filter(|id| {
+                    !g.completed_agent_ids.contains(id) && !g.deleted_agent_ids.contains(id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // For each unrecorded child, check its status and record if complete/deleted
+        for child_id in agents_to_check {
+            // Check agent status
+            let agent_result = self.store.get_agent_session(&child_id).await;
+
+            match agent_result {
+                Ok(session) => {
+                    use intent_core::AgentStatus;
+                    // Check if agent is in a terminal/idle state
+                    let is_complete = matches!(
+                        session.status,
+                        AgentStatus::Completed | AgentStatus::RuntimeIdle
+                    );
+                    let is_deleted = matches!(session.status, AgentStatus::Deleted);
+
+                    if is_complete || is_deleted {
+                        // Build a synthetic agent:idle or agent:deleted event
+                        // Prefer the child's persisted completion_report when present
+                        let report = session.completion_report;
+                        let event_type = if is_deleted {
+                            intent_core::events::AGENT_DELETED
+                        } else {
+                            intent_core::events::AGENT_IDLE
+                        };
+                        let event = Event {
+                            id: String::new(),
+                            workspace_id: workspace_id.clone(),
+                            timestamp: now_iso(),
+                            event_type: event_type.to_string(),
+                            actor: intent_core::EventActor {
+                                actor_type: intent_core::ActorType::Agent,
+                                id: Some(child_id.0.clone()),
+                                ..Default::default()
+                            },
+                            session_id: Some(child_id.0.clone()),
+                            correlation_id: None,
+                            parent_event_id: None,
+                            metadata: None,
+                            data: serde_json::json!({
+                                "agentId": child_id.0,
+                                "status": serde_json::to_value(session.status).unwrap_or_default(),
+                            }),
+                        };
+                        let summary =
+                            crate::format_group_child_line(&child_id, &event, report.as_deref());
+
+                        // Record the completion
+                        self.record_group_child_completion(
+                            workspace_id,
+                            group_id,
+                            &child_id,
+                            is_deleted,
+                            summary,
+                            event,
+                        )
+                        .await;
+                    }
+                }
+                Err(_) => {
+                    // Agent session not found or error - treat as deleted
+                    let event = Event {
+                        id: String::new(),
+                        workspace_id: workspace_id.clone(),
+                        timestamp: now_iso(),
+                        event_type: intent_core::events::AGENT_DELETED.to_string(),
+                        actor: intent_core::EventActor {
+                            actor_type: intent_core::ActorType::Agent,
+                            id: Some(child_id.0.clone()),
+                            ..Default::default()
+                        },
+                        session_id: Some(child_id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({
+                            "agentId": child_id.0,
+                            "status": "deleted",
+                        }),
+                    };
+                    let summary = crate::format_group_child_line(&child_id, &event, None);
+
+                    self.record_group_child_completion(
+                        workspace_id,
+                        group_id,
+                        &child_id,
+                        true, // deleted
+                        summary,
+                        event,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     /// DURABLE-BEFORE-OBSERVABLE helper: if `agent_id` is in a delegation group,
