@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -49,14 +49,6 @@ impl Drop for Daemon {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -362,11 +354,10 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
         "response": "retry succeeded",
     })
     .to_string();
-    let port_s = free_port().to_string();
     // Fast retry: 500ms timeout + 100ms,200ms backoff for fast e2e
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -484,10 +475,9 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
         "response": "retry succeeded after exit",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -598,10 +588,9 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         "ignoreSessionNewAttempts": 999,
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -723,10 +712,9 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         "response": "retry recovery succeeded",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),

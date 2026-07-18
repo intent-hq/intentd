@@ -15,7 +15,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
@@ -91,14 +91,6 @@ impl Drop for Daemon {
             }
         }
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Child {
@@ -481,10 +473,9 @@ async fn baseline_plus_aggregated_wake() {
         &delegate_a_js,
         &delegate_b_js,
     );
-    let port_s = free_port().to_string();
     let env_daemon1: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior_daemon1),
         ("RUST_LOG", "intent_services=info"),
@@ -666,7 +657,7 @@ async fn baseline_plus_aggregated_wake() {
     );
     let env_daemon2: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior_daemon2),
         ("RUST_LOG", "intent_services=info"),

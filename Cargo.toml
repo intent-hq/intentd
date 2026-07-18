@@ -39,3 +39,42 @@ portable-pty = "0.8"
 grep = "0.3"
 ignore = "0.4"
 globset = "0.4"
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Preserve line-tables-only for workspace crates (panic backtraces)
+[profile.dev.package.intent-acp]
+debug = "line-tables-only"
+[profile.dev.package.intent-context]
+debug = "line-tables-only"
+[profile.dev.package.intent-core]
+debug = "line-tables-only"
+[profile.dev.package.intent-git]
+debug = "line-tables-only"
+[profile.dev.package.intent-js]
+debug = "line-tables-only"
+[profile.dev.package.intent-linear]
+debug = "line-tables-only"
+[profile.dev.package.intent-providers]
+debug = "line-tables-only"
+[profile.dev.package.intent-pty]
+debug = "line-tables-only"
+[profile.dev.package.intent-search]
+debug = "line-tables-only"
+[profile.dev.package.intent-sentry]
+debug = "line-tables-only"
+[profile.dev.package.intent-services]
+debug = "line-tables-only"
+[profile.dev.package.intent-sourcecontrol]
+debug = "line-tables-only"
+[profile.dev.package.intent-store]
+debug = "line-tables-only"
+[profile.dev.package.intent-transport]
+debug = "line-tables-only"
+[profile.dev.package.intentd]
+debug = "line-tables-only"
+
+# Strip debug symbols from all external dependencies
+[profile.dev.package."*"]
+debug = false
