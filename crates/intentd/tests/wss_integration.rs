@@ -186,7 +186,8 @@ async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::Pa
         opts.base_port = 0;
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts).expect("server");
+    let ws =
+        WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -1162,7 +1163,7 @@ async fn bind_fails_fast_on_occupied_port() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api, bus, &tls, token_store, opts).expect("server");
+    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
     let err = ws
         .start()
         .await
@@ -1192,7 +1193,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure(api, bus, opts);
+    let ws = WsApiServer::new_insecure(api, bus, opts, None);
     assert!(ws.is_insecure(), "constructor selects insecure posture");
     assert!(ws.fingerprint().is_none(), "no TLS cert ⇒ no fingerprint");
     let port = ws.start().await.expect("start");
