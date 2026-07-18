@@ -14,8 +14,12 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
+
+use common::DaemonGuard;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -278,7 +282,8 @@ async fn resolve_interrupted_resume_and_abandon() {
     // Spawn in its own process group to prevent ACP mock process leaks
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut daemon = cmd.spawn().expect("spawn intentd serve");
+    let child = cmd.spawn().expect("spawn intentd serve");
+    let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
     if !await_uds(&socket).await {
         panic!("daemon did not start");
     }
@@ -478,8 +483,9 @@ async fn resolve_interrupted_resume_and_abandon() {
     assert_eq!(resumed2.len(), 0, "already resolved should not resume");
     assert_eq!(failed2.len(), 1, "already resolved should be in failed");
 
-    daemon.kill().expect("kill daemon");
-    daemon.wait().expect("wait daemon");
+    guard.child_mut().kill().expect("kill daemon");
+    guard.child_mut().wait().expect("wait daemon");
+    drop(guard);
 }
 
 #[tokio::test]
@@ -502,7 +508,8 @@ async fn resolve_interrupted_invalid_params_validation() {
         ));
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut daemon = cmd.spawn().expect("spawn intentd serve");
+    let child = cmd.spawn().expect("spawn intentd serve");
+    let mut guard = DaemonGuard::new(child, data_dir.clone(), true);
     if !await_uds(&socket).await {
         panic!("daemon did not start");
     }
@@ -633,6 +640,7 @@ async fn resolve_interrupted_invalid_params_validation() {
     assert!(v.get("result").is_some(), "valid params should succeed");
     assert!(v.get("error").is_none(), "valid params should not error");
 
-    daemon.kill().expect("kill daemon");
-    daemon.wait().expect("wait daemon");
+    guard.child_mut().kill().expect("kill daemon");
+    guard.child_mut().wait().expect("wait daemon");
+    drop(guard);
 }

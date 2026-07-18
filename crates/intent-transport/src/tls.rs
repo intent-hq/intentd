@@ -69,6 +69,12 @@ pub fn cert_fingerprint() -> Option<String> {
         .map(|c| c.fingerprint256.clone())
 }
 
+/// Clear the in-memory cache. Used in tests to ensure hermetic test isolation.
+#[cfg(test)]
+pub fn clear_cert_cache() {
+    *CACHE.lock().expect("tls cache poisoned") = None;
+}
+
 fn cert_paths(data_dir: &Path) -> (PathBuf, PathBuf) {
     (data_dir.join(CERT_FILENAME), data_dir.join(KEY_FILENAME))
 }
