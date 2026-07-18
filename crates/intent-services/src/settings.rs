@@ -1108,6 +1108,16 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             Some(json!({})),
         ),
+        // --- Group A: workspace initializer form state ------------------------
+        // Persisted home-screen workspace-initializer form state: last selected
+        // repository, recent repositories, branch-by-repo, form drafts.
+        object(
+            "workspaceInitializer.state",
+            "Workspace initializer state",
+            "Persisted home-screen workspace-initializer form state (last selected repo, recent repos, branch-by-repo, form drafts)",
+            "workspace",
+            Some(json!({})),
+        ),
         // --- Group B: context engine ----------------------------------------
         boolean(
             "context.enabled",
@@ -1540,6 +1550,7 @@ mod tests {
             "workspaceRules",
             "repos.known",
             "workspace.changeHistory",
+            "workspaceInitializer.state",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
