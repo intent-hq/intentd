@@ -129,7 +129,7 @@ If the implementor proposes changing acceptance criteria, redirect them to the C
 
 ## Completion (REQUIRED)
 
-When your verdict is ✅ APPROVED, **mark each verified task note `complete`** via `update_note_task_status(noteId, "complete")` BEFORE calling `report_to_parent`. Tasks with ⚠️ DEVIATION or ❌ MISSING criteria stay `review_required`. Never mark a task complete without evidence.
+When your verdict is ✅ APPROVED, **mark each verified task note `complete`** via `update_note_task_status({ noteId, status: "complete" })` BEFORE calling `report_to_parent`. Tasks with ⚠️ DEVIATION or ❌ MISSING criteria stay `review_required`. Never mark a task complete without evidence.
 
 Call `report_to_parent` with:
 - verdict + confidence
