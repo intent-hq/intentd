@@ -2413,13 +2413,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     // - parent goes idle after the delegating turn;
     // - child streams (chunk/end) → child agent:idle (report already persisted);
     // - THEN the parent's wake turn runs (chunk/end) → parent idles again.
-    // If `reportToParent` had emitted an immediate wake, the parent's second
-    // `stream:chunk` would fire BEFORE the child's `agent:idle` here.
     let mut child_id: Option<String> = None;
     let mut parent_idle_after_delegate = false;
-    let mut child_first_chunk_seen = false;
     let mut child_idle = false;
-    let mut parent_wake_chunk_before_child_idle = false;
     let mut parent_wake_ends = 0u32;
     let mut parent_idle_after_wake = false;
     for _ in 0..400 {
@@ -2441,23 +2437,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
             continue;
         }
         if let Some(cid) = child_id.as_deref() {
-            if ev_agent == cid && ev_type == "agent:stream:chunk" {
-                child_first_chunk_seen = true;
-            }
             if ev_agent == cid && ev_type == "agent:idle" {
                 child_idle = true;
             }
-        }
-        // Report-time wake: once the child is identified, the parent MUST
-        // stream a wake turn BEFORE the child goes idle — that proves
-        // `reportToParent` delivered an immediate wake (may fire even before
-        // the child's first stream chunk if reportToParent is called early).
-        if ev_agent == parent_id
-            && ev_type == "agent:stream:chunk"
-            && child_id.is_some()
-            && !child_idle
-        {
-            parent_wake_chunk_before_child_idle = true;
         }
         if ev_agent == parent_id && ev_type == "agent:stream:end" && child_idle {
             parent_wake_ends += 1;
@@ -2475,9 +2457,6 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
     assert!(child_id.is_some(), "child agent id observed on the wire");
     assert!(child_idle, "child emitted agent:idle after reportToParent");
-    // Note: we observe parent_wake_chunk_before_child_idle in the happy path,
-    // but event ordering over WebSocket can vary under load, so we don't assert
-    // it here. The critical check is the final state below: exactly one wake.
     assert_eq!(
         parent_wake_ends, 1,
         "exactly one wake-turn stream:end on the parent (single wake driven by reportToParent, idle suppressed)"
