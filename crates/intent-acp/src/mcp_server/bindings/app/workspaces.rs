@@ -218,7 +218,7 @@ fn summarize_workspace(ws: &intent_core::Workspace) -> Value {
 
 async fn open(
     api: &Arc<dyn WorkspaceApi>,
-    _caller_workspace_id: &WorkspaceId,
+    caller_workspace_id: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
     let id = args
@@ -237,13 +237,16 @@ async fn open(
         .await
         .map_err(map_err)?;
 
-    // Emit app:workspace-open event
+    // Emit app:workspace-open event scoped to the caller (chief) workspace,
+    // not the target workspace. App-level UI events are subscribed to via
+    // the chief workspace context so subscribers can observe all workspace
+    // navigation.
     let event_data = json!({
         "workspaceId": id,
         "openInNewWindow": open_in_new_window,
     });
     let event = PublishEvent {
-        workspace_id: workspace_id.clone(),
+        workspace_id: caller_workspace_id.clone(),
         event_type: intent_core::events::APP_WORKSPACE_OPEN.to_string(),
         data: event_data,
     };
@@ -372,6 +375,13 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         .ok_or_else(|| format!("Workspace not found: {id}"))?;
 
     // Build bulk-op proposal with single item
+    let summary = workspace
+        .repository_name
+        .as_deref()
+        .or(workspace.repository_path.as_deref())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{:?}", workspace.status));
+
     let proposal = json!({
         "kind": "bulk-op",
         "payload": {
@@ -385,9 +395,7 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             "bulkItems": [{
                 "id": id,
                 "title": if workspace.title.is_empty() { id } else { &workspace.title },
-                "summary": workspace.repository_name.as_deref()
-                    .or(workspace.repository_path.as_deref())
-                    .or(Some(format!("{:?}", workspace.status).as_str())),
+                "summary": summary,
                 "selected": true,
                 "metadata": summarize_workspace(workspace)
             }]
@@ -413,6 +421,13 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         .ok_or_else(|| format!("Workspace not found: {id}"))?;
 
     // Build bulk-op proposal with single item
+    let summary = workspace
+        .repository_name
+        .as_deref()
+        .or(workspace.repository_path.as_deref())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{:?}", workspace.status));
+
     let proposal = json!({
         "kind": "bulk-op",
         "payload": {
@@ -426,9 +441,7 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
             "bulkItems": [{
                 "id": id,
                 "title": if workspace.title.is_empty() { id } else { &workspace.title },
-                "summary": workspace.repository_name.as_deref()
-                    .or(workspace.repository_path.as_deref())
-                    .or(Some(format!("{:?}", workspace.status).as_str())),
+                "summary": summary,
                 "selected": true,
                 "metadata": summarize_workspace(workspace)
             }],
@@ -469,12 +482,17 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
             .find(|w| w.id.as_str() == id)
             .ok_or_else(|| format!("Workspace not found: {id}"))?;
 
+        let summary = workspace
+            .repository_name
+            .as_deref()
+            .or(workspace.repository_path.as_deref())
+            .map(String::from)
+            .unwrap_or_else(|| format!("{:?}", workspace.status));
+
         bulk_items.push(json!({
             "id": id,
             "title": if workspace.title.is_empty() { id } else { &workspace.title },
-            "summary": workspace.repository_name.as_deref()
-                .or(workspace.repository_path.as_deref())
-                .or(Some(format!("{:?}", workspace.status).as_str())),
+            "summary": summary,
             "selected": true,
             "metadata": summarize_workspace(workspace)
         }));
@@ -528,12 +546,17 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
             .find(|w| w.id.as_str() == id)
             .ok_or_else(|| format!("Workspace not found: {id}"))?;
 
+        let summary = workspace
+            .repository_name
+            .as_deref()
+            .or(workspace.repository_path.as_deref())
+            .map(String::from)
+            .unwrap_or_else(|| format!("{:?}", workspace.status));
+
         bulk_items.push(json!({
             "id": id,
             "title": if workspace.title.is_empty() { id } else { &workspace.title },
-            "summary": workspace.repository_name.as_deref()
-                .or(workspace.repository_path.as_deref())
-                .or(Some(format!("{:?}", workspace.status).as_str())),
+            "summary": summary,
             "selected": true,
             "metadata": summarize_workspace(workspace)
         }));

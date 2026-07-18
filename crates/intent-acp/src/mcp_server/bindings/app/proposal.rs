@@ -92,9 +92,20 @@ fn proposal_resource_uri(proposal: &Value) -> String {
         })
         .unwrap_or("untitled");
 
-    // URL-encode the id portion (simplified - production would use proper URL encoding)
-    let encoded_id = id.replace('/', "%2F").replace(' ', "%20");
+    // RFC3986 percent-encode the id portion for URI path segment use
+    let encoded_id = percent_encode_path_segment(id);
     format!("intent-proposal://{}/{}", kind, encoded_id)
+}
+
+/// RFC3986 percent-encoding for URI path segments.
+/// Encodes all characters except unreserved (A-Z a-z 0-9 - _ . ~).
+fn percent_encode_path_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u8),
+        })
+        .collect()
 }
 
 /// `ws.app.proposal.show(proposal)` — validate and return dual text+resource content items.
@@ -247,6 +258,21 @@ mod tests {
         });
         let uri = proposal_resource_uri(&proposal);
         assert_eq!(uri, "intent-proposal://settings-change/tool-123");
+    }
+
+    #[test]
+    fn proposal_resource_uri_encodes_special_characters() {
+        let proposal = json!({
+            "kind": "workspace-create",
+            "preview": {"title": "Test / Workspace : New?"},
+            "payload": {}
+        });
+        let uri = proposal_resource_uri(&proposal);
+        // Verify that special characters (/, :, ?, space) are percent-encoded
+        assert_eq!(
+            uri,
+            "intent-proposal://workspace-create/Test%20%2F%20Workspace%20%3A%20New%3F"
+        );
     }
 
     #[test]

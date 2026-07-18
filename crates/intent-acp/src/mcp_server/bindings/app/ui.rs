@@ -190,10 +190,6 @@ fn targets() -> Value {
     ])
 }
 
-// NOTE: Event emission is deferred to the services layer where EventBus is available.
-// The bindings layer (intent-acp) only validates and shapes results; actual event
-// publication will happen when these methods are implemented in intent-services.
-
 /// Normalize a required string field (trim, non-empty check)
 fn normalize_required_string(args: &Value, field: &str) -> Result<String, String> {
     let value = args

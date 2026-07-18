@@ -70,10 +70,10 @@ pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
 /// `workspace-js-api-tool.ts`, restricted to the surface actually bound in
 /// `super::bindings::*`. Exclusions vs the reference:
 ///
-/// * Most of the `ws.app.*` namespace (chief-workspace app APIs) is only
+/// * The entire `ws.app.*` namespace (chief-workspace app APIs) is only
 ///   advertised to chief-workspace agents via [`WORKSPACE_API_DESCRIPTION_CHIEF`].
-///   Non-chief agents see [`WORKSPACE_API_DESCRIPTION`] which includes only
-///   `ws.app.proposal.*`.
+///   Non-chief agents see [`WORKSPACE_API_DESCRIPTION`] which contains no
+///   `ws.app.*` references at all.
 /// * `ws.workspace.context`, `ws.workspace.timeline`,
 ///   `ws.workspace.referenceDocs`, `ws.workspace.emitNotification` — deferred
 ///   per the WSAPI-5 report; the bindings surface a clear
