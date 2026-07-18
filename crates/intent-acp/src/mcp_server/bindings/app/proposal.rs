@@ -100,10 +100,13 @@ fn proposal_resource_uri(proposal: &Value) -> String {
 /// RFC3986 percent-encoding for URI path segments.
 /// Encodes all characters except unreserved (A-Z a-z 0-9 - _ . ~).
 pub(super) fn percent_encode_path_segment(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u8),
+    s.as_bytes()
+        .iter()
+        .flat_map(|&b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{:02X}", b).chars().collect(),
         })
         .collect()
 }

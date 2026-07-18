@@ -222,16 +222,7 @@ async fn propose(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
             .get("definition")
             .ok_or_else(|| "settings.get returned invalid shape".to_string())?;
 
-        // Check if setting is read-only or sensitive
-        if let Some(apply) = definition.get("apply").and_then(Value::as_object) {
-            if apply.get("kind") == Some(&json!("read-only")) {
-                return Err(format!(
-                    "Invalid app setting change: {} setting is read-only",
-                    path
-                ));
-            }
-        }
-
+        // Check if setting is sensitive
         if definition.get("sensitive") == Some(&json!(true)) {
             return Err(format!(
                 "Invalid app setting change: {} setting is sensitive and cannot be changed via MCP proposals",
