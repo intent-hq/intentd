@@ -2639,7 +2639,17 @@ impl Services {
         let now = now_iso();
         let now_ms = iso_ms(&now);
 
-        let sessions = self.store.list_agent_sessions(&workspace_id).await?;
+        // Finding F1/F3: use message-free summaries + lightweight stats for diagnostics.
+        // Diagnostics needs session metadata and message counts/assistant-message presence,
+        // but never needs full message bodies.
+        let sessions = self
+            .store
+            .list_agent_session_summaries(&workspace_id)
+            .await?;
+        let message_stats = self
+            .store
+            .get_agent_session_message_stats(&workspace_id)
+            .await?;
         let watches = self.all_watches(&workspace_id);
         let groups = self.all_groups(&workspace_id);
 
@@ -2786,7 +2796,14 @@ impl Services {
             let status = session
                 .and_then(|s| agent_status_wire(s.status))
                 .unwrap_or("unknown");
-            let message_count = session.map(|s| s.messages.len() as u64);
+            // Use lightweight message stats instead of full hydration
+            let (message_count_val, has_assistant) =
+                message_stats.get(id).copied().unwrap_or((0, false));
+            let message_count = if message_count_val > 0 {
+                Some(message_count_val)
+            } else {
+                None
+            };
             let last_activity = session.map(|s| s.updated_at.clone());
             let last_activity_age = last_activity.as_deref().map(|t| age_ms(now_ms, t));
             let stale_responding = status == "responding"
@@ -2797,9 +2814,7 @@ impl Services {
             let pending_initial_response = session.is_some()
                 && status.eq_ignore_ascii_case("idle")
                 && message_count == Some(1)
-                && !session
-                    .map(|s| has_assistant_message(&s.messages))
-                    .unwrap_or(false);
+                && !has_assistant;
             let subscription_count = watches
                 .iter()
                 .filter(|w| &w.parent_agent_id.0 == id)
@@ -3760,11 +3775,6 @@ fn iso_ms(ts: &str) -> i64 {
 /// Non-negative age in milliseconds of `ts` relative to `now_ms`.
 fn age_ms(now_ms: i64, ts: &str) -> i64 {
     (now_ms - iso_ms(ts)).max(0)
-}
-
-/// Whether any message in the transcript was authored by the assistant.
-fn has_assistant_message(messages: &[AgentMessage]) -> bool {
-    messages.iter().any(|m| m.role == "assistant")
 }
 
 fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {

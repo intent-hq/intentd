@@ -166,6 +166,139 @@ impl Store {
         Ok(sessions)
     }
 
+    /// List a workspace's sessions WITHOUT message logs, oldest first. Used by hot
+    /// paths (`derive_last_activity`, `enrich_workspace_aggregates`) that only need
+    /// session metadata (name, status, updated_at, etc.) and never read the message
+    /// bodies (finding F1: eliminates full agent-message-log hydration from
+    /// `workspace.list` / `workspace.get` emit). Reuses the `list_all_agent_sessions`
+    /// row-mapping pattern (§9.1).
+    pub async fn list_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list agent session summaries failed: {e}")))?;
+        rows.iter().map(map_session_row).collect()
+    }
+
+    /// Get message count and whether any assistant message exists for each session in
+    /// a workspace, without hydrating message bodies (finding F1/F3: lightweight
+    /// alternative to full message-log fetch for `agent.diagnostics`). Returns a map
+    /// keyed by agent_id with `(message_count, has_assistant)` tuples.
+    pub async fn get_agent_session_message_stats(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<std::collections::HashMap<String, (u64, bool)>> {
+        // First, get all session IDs for this workspace
+        let sql = "SELECT id FROM agent_session WHERE workspace_id = ?";
+        let rows = sqlx::query(sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session message stats failed: {e}")))?;
+
+        let mut stats = std::collections::HashMap::new();
+
+        for row in rows {
+            let agent_id: String = row.get("id");
+
+            // Count total messages
+            let count_row =
+                sqlx::query("SELECT COUNT(*) as count FROM agent_message WHERE agent_id = ?")
+                    .bind(&agent_id)
+                    .fetch_one(self.pool())
+                    .await
+                    .map_err(|e| Error::Internal(format!("count messages failed: {e}")))?;
+            let message_count: i64 = count_row.get("count");
+
+            // Check if any assistant message exists
+            let assistant_row = sqlx::query(
+                "SELECT EXISTS(SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant') as has_assistant"
+            )
+            .bind(&agent_id)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("check assistant message failed: {e}")))?;
+            let has_assistant: i64 = assistant_row.get("has_assistant");
+
+            stats.insert(agent_id, (message_count as u64, has_assistant != 0));
+        }
+
+        Ok(stats)
+    }
+
+    /// Get the agent_message watermark for a workspace: the count of messages
+    /// across all agents. This is used by the token-usage scan loop to skip
+    /// workspaces that have not changed since the last scan (finding F2).
+    /// Returns 0 for workspaces with no agents or no messages.
+    pub async fn get_workspace_message_watermark(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        let sql = r#"
+            SELECT COUNT(*) as count
+            FROM agent_message
+            WHERE agent_id IN (
+                SELECT id FROM agent_session WHERE workspace_id = ?
+            )
+        "#;
+        let row = sqlx::query(sql)
+            .bind(&workspace_id.0)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get workspace message watermark failed: {e}")))?;
+        let count: i64 = row.get("count");
+        Ok(count as u64)
+    }
+
+    /// Get lightweight usage data for all agents in a workspace: for each agent,
+    /// returns the agent_id, model, and all message content JSON (for tallying
+    /// without full AgentSession hydration; finding F2). Used by the token-usage
+    /// scan to avoid reading full message logs when only the usage metadata is needed.
+    pub async fn get_workspace_agent_usage_data(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Option<String>, Vec<serde_json::Value>)>> {
+        // First get all sessions for this workspace with their models
+        let session_sql = "SELECT id, model FROM agent_session WHERE workspace_id = ?";
+        let session_rows = sqlx::query(session_sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent sessions for usage failed: {e}")))?;
+
+        let mut result = Vec::new();
+        for session_row in session_rows {
+            let agent_id: String = session_row.get("id");
+            let model: Option<String> = session_row.get("model");
+
+            // Get all message content for this agent
+            let message_sql =
+                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
+            let message_rows = sqlx::query(message_sql)
+                .bind(&agent_id)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("get agent messages for usage failed: {e}"))
+                })?;
+
+            let contents: Vec<serde_json::Value> = message_rows
+                .iter()
+                .map(|row| {
+                    let content_str: String = row.get("content");
+                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+
+            result.push((agent_id, model, contents));
+        }
+        Ok(result)
+    }
+
     /// List every persisted session across workspaces, oldest first. Backs the
     /// daemon-startup stale-session heal: a session left non-terminal across a
     /// crash has no live worker after restart, so the heal sweeps the whole
@@ -191,16 +324,30 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        let current = self.get_agent_session(&s.id).await?;
-        if current.workspace_id != *workspace_id {
+        // Lightweight invariant check: read only workspace_id, provider,
+        // acp_session_id (finding F3: no message fetch). Workspace mismatch →
+        // NotFound, provider immutable, acp_session_id write-once (§9.5).
+        let row = sqlx::query(
+            "SELECT workspace_id, provider, acp_session_id FROM agent_session WHERE id = ?",
+        )
+        .bind(&s.id.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update agent session invariant check failed: {e}")))?
+        .ok_or_else(|| Error::NotFound(format!("agent session {}", s.id)))?;
+
+        let current_workspace_id = WorkspaceId(row.get::<String, _>("workspace_id"));
+        if current_workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
-        if current.provider.is_some() && s.provider != current.provider {
+        let current_provider = row.get::<Option<String>, _>("provider");
+        if current_provider.is_some() && s.provider != current_provider {
             return Err(Error::Internal(
                 "agent provider is immutable once set".to_string(),
             ));
         }
-        if current.acp_session_id.is_some() && s.acp_session_id != current.acp_session_id {
+        let current_acp_session_id = row.get::<Option<String>, _>("acp_session_id");
+        if current_acp_session_id.is_some() && s.acp_session_id != current_acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
         let rows = sqlx::query(
@@ -1149,6 +1296,422 @@ mod tests {
             .await
             .expect("second claim");
         assert!(!claim2, "second claim should fail (already resolved)");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn list_agent_session_summaries_excludes_messages() {
+        use intent_core::{
+            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+            WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let tmp = PathBuf::from("/tmp").join(format!("test-summaries-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-summaries".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Insert agent session
+        let agent_id = AgentId("agent-summary-test".to_string());
+        let session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            messages: vec![],
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            stats: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        // Insert message
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "hello"}]),
+                &ts,
+            )
+            .await
+            .expect("append message");
+
+        // list_agent_sessions should include messages
+        let full = store
+            .list_agent_sessions(&ws_id)
+            .await
+            .expect("list_agent_sessions");
+        assert_eq!(full.len(), 1, "should have one session");
+        assert_eq!(
+            full[0].messages.len(),
+            1,
+            "list_agent_sessions should include messages"
+        );
+
+        // list_agent_session_summaries should exclude messages
+        let summaries = store
+            .list_agent_session_summaries(&ws_id)
+            .await
+            .expect("list_agent_session_summaries");
+        assert_eq!(summaries.len(), 1, "should have one session");
+        assert_eq!(
+            summaries[0].messages.len(),
+            0,
+            "summaries should exclude messages"
+        );
+        assert_eq!(summaries[0].id, agent_id, "id should match");
+        assert_eq!(summaries[0].name, "Test Agent", "name should match");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn update_agent_session_invariants_without_messages() {
+        use intent_core::{
+            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+            WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let tmp = PathBuf::from("/tmp").join(format!("test-update-inv-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-update-inv".to_string());
+        let wrong_ws_id = WorkspaceId("ws-wrong".to_string());
+
+        // Seed workspaces
+        let ts = now_iso();
+        for id in [&ws_id, &wrong_ws_id] {
+            let workspace = Workspace {
+                id: id.clone(),
+                title: "Test".to_string(),
+                branch: "main".to_string(),
+                base_ref: None,
+                base_commit_sha: None,
+                status: WorkspaceStatus::Active,
+                status_message: None,
+                activity: WorkspaceActivity::Idle,
+                attention: WorkspaceAttention::None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                last_activity: None,
+                tags: vec![],
+                path: None,
+                repository_path: None,
+                repository_owner: None,
+                repository_name: None,
+                worktree_path: None,
+                scope: None,
+                skip_worktree: false,
+                setup_script: None,
+                is_remote: false,
+                default_model: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                active_pull_request: None,
+                pull_requests: None,
+                archived: false,
+                archived_at: None,
+                task_stats: None,
+                agent_summary: None,
+                diff_summary: None,
+                token_usage: None,
+                cow_supported: None,
+            };
+            store.insert_workspace(&workspace).await.expect("insert");
+        }
+
+        // Insert agent session with provider and acp_session_id
+        let agent_id = AgentId("agent-inv-test".to_string());
+        let mut session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            backend_session_id: None,
+            acp_session_id: Some("acp-123".to_string()),
+            name: "Test Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: Some("auggie".to_string()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            messages: vec![],
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            stats: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        };
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Insert messages (to verify invariant check doesn't fetch them)
+        for _ in 0..10 {
+            store
+                .append_agent_message(
+                    &agent_id,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": "msg"}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        // Test workspace mismatch → NotFound
+        session.name = "Updated".to_string();
+        let result = store.update_agent_session(&wrong_ws_id, &session).await;
+        assert!(result.is_err(), "workspace mismatch should fail");
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "should be NotFound"
+        );
+
+        // Test provider immutability
+        session.provider = Some("different".to_string());
+        let result2 = store.update_agent_session(&ws_id, &session).await;
+        assert!(result2.is_err(), "provider change should fail");
+        assert!(
+            matches!(result2, Err(Error::Internal(_))),
+            "should be Internal"
+        );
+
+        // Test acp_session_id write-once
+        session.provider = Some("auggie".to_string()); // restore
+        session.acp_session_id = Some("different-acp".to_string());
+        let result3 = store.update_agent_session(&ws_id, &session).await;
+        assert!(result3.is_err(), "acp_session_id change should fail");
+        assert!(
+            matches!(result3, Err(Error::Internal(_))),
+            "should be Internal"
+        );
+
+        // Test successful update (name change OK)
+        session.acp_session_id = Some("acp-123".to_string()); // restore
+        session.name = "New Name".to_string();
+        let result4 = store.update_agent_session(&ws_id, &session).await;
+        assert!(result4.is_ok(), "name change should succeed");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn get_agent_session_message_stats() {
+        use intent_core::{
+            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+            WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let tmp = PathBuf::from("/tmp").join(format!("test-msg-stats-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-stats".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store.insert_workspace(&workspace).await.expect("insert");
+
+        // Create two agents
+        let agent1 = AgentId("agent-stats-1".to_string());
+        let agent2 = AgentId("agent-stats-2".to_string());
+
+        for agent_id in [&agent1, &agent2] {
+            let session = AgentSession {
+                id: agent_id.clone(),
+                workspace_id: ws_id.clone(),
+                backend_session_id: None,
+                acp_session_id: None,
+                name: format!("Agent {}", agent_id.0),
+                name_explicitly_set: false,
+                model: None,
+                provider: None,
+                status: AgentStatus::Idle,
+                is_active: false,
+                system_prompt: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                messages: vec![],
+                parent_agent_id: None,
+                specialist: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                stats: None,
+                completion_report: None,
+                completion_report_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                is_background: false,
+                metadata: None,
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+            };
+            store.insert_agent_session(&session).await.expect("insert");
+        }
+
+        // agent1: 1 user message only (no assistant)
+        store
+            .append_agent_message(
+                &agent1,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "hello"}]),
+                &ts,
+            )
+            .await
+            .expect("append user");
+
+        // agent2: 3 messages (user, assistant, user)
+        for (role, text) in [("user", "q1"), ("assistant", "a1"), ("user", "q2")] {
+            store
+                .append_agent_message(
+                    &agent2,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        // Get stats
+        let stats = store
+            .get_agent_session_message_stats(&ws_id)
+            .await
+            .expect("get_agent_session_message_stats");
+
+        assert_eq!(stats.len(), 2, "should have stats for both agents");
+
+        let (count1, has_assistant1) = stats.get(&agent1.0).expect("agent1 stats");
+        assert_eq!(*count1, 1, "agent1 should have 1 message");
+        assert!(!has_assistant1, "agent1 should have no assistant message");
+
+        let (count2, has_assistant2) = stats.get(&agent2.0).expect("agent2 stats");
+        assert_eq!(*count2, 3, "agent2 should have 3 messages");
+        assert!(has_assistant2, "agent2 should have assistant message");
 
         let _ = std::fs::remove_file(&tmp);
     }

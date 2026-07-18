@@ -317,6 +317,11 @@ pub struct Services {
     /// Held as `Arc<OnceLock>` so the control can be attached after the `api`
     /// Arc is built (composition-root wiring, §5.12). Shared across clones.
     server_control: Arc<OnceLock<Arc<dyn intent_core::ServerControl>>>,
+    /// In-memory watermark cache for incremental token-usage scanning (finding F2).
+    /// Maps workspace_id → agent_message count. When the watermark is unchanged
+    /// since the last scan, the workspace is skipped. A restart rescans once.
+    /// Shared across clones so every scan tick observes the same watermark state.
+    token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
 }
 
 impl Services {
@@ -358,6 +363,7 @@ impl Services {
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
+            token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -545,7 +551,9 @@ impl Services {
                     latest_activity_candidate(&[activity_max.as_deref(), Some(&note.updated_at)]);
             }
         }
-        if let Ok(sessions) = self.store.list_agent_sessions(&ws.id).await {
+        // Finding F1: message-free session read for hot paths. Only `updated_at`
+        // matters for lastActivity derivation, so skip message hydration.
+        if let Ok(sessions) = self.store.list_agent_session_summaries(&ws.id).await {
             for session in &sessions {
                 activity_max = latest_activity_candidate(&[
                     activity_max.as_deref(),
@@ -676,7 +684,10 @@ impl Services {
             }
             ws.task_stats = Some(compute_task_stats(&notes));
         }
-        if let Ok(sessions) = self.store.list_agent_sessions(&ws.id).await {
+        // Finding F1: message-free session read for hot paths. `build_agent_summary`
+        // only needs session metadata (id, name, status, specialist, updated_at),
+        // never message bodies, so skip hydration.
+        if let Ok(sessions) = self.store.list_agent_session_summaries(&ws.id).await {
             for session in &sessions {
                 activity_max = latest_activity_candidate(&[
                     activity_max.as_deref(),
@@ -1424,12 +1435,38 @@ impl Services {
     /// and emitting `workspace:tokenUsage-changed` only when the materialized
     /// tally (ignoring `lastScanAt`) actually changed. Daemon-internal — there is
     /// no scan RPC. Returns whether a change was written. `NotFound` if the
-    /// workspace is absent.
+    /// workspace is absent. **Incremental** (finding F2): skips when the
+    /// agent_message watermark is unchanged since the last scan, and hydrates
+    /// only usage metadata (not full message logs) when a scan does run.
     pub async fn scan_workspace_token_usage(&self, workspace_id: &WorkspaceId) -> Result<bool> {
-        let sessions = self.store.list_agent_sessions(workspace_id).await?;
-        let tallies: Vec<token_usage::AgentTokenTally> = sessions
+        // Cheap change detection: skip when the watermark is unchanged (finding F2).
+        let current_watermark = self
+            .store
+            .get_workspace_message_watermark(workspace_id)
+            .await?;
+        let last_watermark = self
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(workspace_id)
+            .copied();
+        if let Some(last) = last_watermark {
+            if last == current_watermark {
+                // No messages added/removed since last scan — skip tallying.
+                return Ok(false);
+            }
+        }
+
+        // Watermark changed or first scan: tally usage without hydrating full message logs.
+        let usage_data = self
+            .store
+            .get_workspace_agent_usage_data(workspace_id)
+            .await?;
+        let tallies: Vec<token_usage::AgentTokenTally> = usage_data
             .iter()
-            .map(token_usage::session_token_tally)
+            .map(|(agent_id, model, contents)| {
+                token_usage::agent_token_tally_from_contents(agent_id, model.as_deref(), contents)
+            })
             .collect();
         let mut usage = token_usage::aggregate_token_usage(&tallies);
         usage.last_scan_at = Some(now_iso());
@@ -1444,6 +1481,11 @@ impl Services {
             None => true,
         };
         if !changed {
+            // Tally unchanged — update watermark and skip write.
+            self.token_usage_watermarks
+                .lock()
+                .unwrap()
+                .insert(workspace_id.clone(), current_watermark);
             return Ok(false);
         }
         ws.token_usage = Some(usage.clone());
@@ -1456,6 +1498,11 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
+        // Update watermark after successful scan.
+        self.token_usage_watermarks
+            .lock()
+            .unwrap()
+            .insert(workspace_id.clone(), current_watermark);
         Ok(true)
     }
 

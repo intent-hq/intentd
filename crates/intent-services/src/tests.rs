@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, ContentType, Error, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
-    NoteId, NoteMetadata, NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Note, NoteAddInput,
+    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteUpdateInput,
+    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use intent_store::Store;
 
@@ -12839,5 +12840,190 @@ mod last_activity_events {
             matches!(timeout(Duration::from_millis(50), sub.recv()).await, Err(_)),
             "no event on idempotent token scan"
         );
+    }
+
+    /// Finding F2: incremental token scan skips when watermark unchanged.
+    #[tokio::test]
+    async fn incremental_token_scan_skip_when_unchanged() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let usage = serde_json::json!({ "usage": { "inputTokens": 10, "outputTokens": 5 } });
+        h.store
+            .append_agent_message(&agent_id, "user", &usage, &now_iso())
+            .await
+            .expect("append message");
+
+        let changed1 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("first scan");
+        assert!(changed1, "first scan should detect change");
+
+        let watermark1 = h
+            .services
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(&h.ws)
+            .copied()
+            .expect("watermark set after first scan");
+        assert_eq!(watermark1, 1, "watermark should be 1 after one message");
+
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("second scan");
+        assert!(!changed2, "second scan should skip (unchanged watermark)");
+    }
+
+    /// Finding F2: rescan when the agent_message watermark changes.
+    #[tokio::test]
+    async fn incremental_token_scan_rescan_on_append() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let usage1 = serde_json::json!({ "usage": { "inputTokens": 10, "outputTokens": 5 } });
+        h.store
+            .append_agent_message(&agent_id, "user", &usage1, &now_iso())
+            .await
+            .expect("append message 1");
+
+        let changed1 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("first scan");
+        assert!(changed1, "first scan should detect change");
+
+        let watermark1 = h
+            .services
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(&h.ws)
+            .copied()
+            .expect("watermark 1");
+        assert_eq!(watermark1, 1, "one message");
+
+        let usage2 = serde_json::json!({ "usage": { "inputTokens": 20, "outputTokens": 10 } });
+        h.store
+            .append_agent_message(&agent_id, "assistant", &usage2, &now_iso())
+            .await
+            .expect("append message 2");
+
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("second scan");
+        assert!(changed2, "second scan should detect change (new message)");
+
+        let watermark2 = h
+            .services
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(&h.ws)
+            .copied()
+            .expect("watermark 2");
+        assert_eq!(watermark2, 2, "two messages");
+
+        let ws = h.store.get_workspace(&h.ws).await.unwrap();
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 30, "10 + 20");
+        assert_eq!(usage.totals.output_tokens, 15, "5 + 10");
+    }
+
+    /// Finding F2: lightweight tally matches expected aggregation.
+    #[tokio::test]
+    async fn incremental_token_scan_tally_parity() {
+        let h = harness().await;
+        let agent1 = AgentId::new();
+        let agent2 = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent1, &h.ws))
+            .await
+            .expect("insert agent 1");
+        h.store
+            .insert_agent_session(&agent_session(&agent2, &h.ws))
+            .await
+            .expect("insert agent 2");
+
+        let u1 = serde_json::json!({ "usage": { "inputTokens": 100, "outputTokens": 20 } });
+        let u2 = serde_json::json!({ "_meta": { "usage": { "cacheReadTokens": 50 } } });
+        h.store
+            .append_agent_message(&agent1, "user", &u1, &now_iso())
+            .await
+            .expect("append 1");
+        h.store
+            .append_agent_message(&agent1, "assistant", &u2, &now_iso())
+            .await
+            .expect("append 2");
+        h.store
+            .append_agent_message(&agent2, "user", &u1, &now_iso())
+            .await
+            .expect("append 3");
+
+        let changed = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan");
+        assert!(changed, "scan should detect change");
+
+        let ws = h.store.get_workspace(&h.ws).await.unwrap();
+        let usage = ws.token_usage.expect("usage persisted");
+
+        assert_eq!(usage.totals.input_tokens, 200, "100 + 100");
+        assert_eq!(usage.totals.output_tokens, 40, "20 + 20");
+        assert_eq!(usage.totals.cache_read_tokens, 50, "50 from agent 1");
+        assert_eq!(usage.by_agent_id.len(), 2, "two agents");
+        assert!(usage.last_scan_at.is_some(), "scan timestamp set");
+    }
+
+    fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("test-{}", agent_id.0),
+            name_explicitly_set: false,
+            model: Some("test-model".into()),
+            provider: Some("test".into()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        }
     }
 }
