@@ -1721,6 +1721,92 @@ async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
     assert!(svc.find_watches_for_child(&ws, &child).is_empty());
 }
 
+/// Regression for PR #237: after a child calls reportToParent (which marks the
+/// watch as report_delivered and delivers an immediate wake), `agent:failed` and
+/// `agent:deleted` events STILL deliver their completion wake to the parent.
+/// Only `agent:idle` is suppressed by the report_delivered flag.
+#[tokio::test]
+async fn report_to_parent_then_failed_or_deleted_still_wakes_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // Scenario 1: reportToParent → agent:failed
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("do the thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate child1");
+    let child1 = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline1 = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("partial report"), Some(child1.clone()))
+        .await
+        .expect("report child1");
+    // Report wake delivered immediately.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline1 + 1);
+
+    // Child fails after reporting. This is a NEW signal (not a duplicate).
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child1,
+        json!({ "agentId": child1.0, "error": "crashed" }),
+    ))
+    .await;
+    // Parent MUST receive the failed wake (report_delivered suppresses ONLY idle).
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline1 + 2,
+        "parent must receive both report wake AND failed wake"
+    );
+    let text = parent_messages_text(&svc, &parent).await;
+    assert!(
+        text.contains("failed") || text.contains("crashed"),
+        "parent must see failure notification in wake: {text}"
+    );
+
+    // Scenario 2: reportToParent → agent:deleted
+    let resp = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("another thing".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate child2");
+    let child2 = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let baseline2 = parent_message_count(&svc, &parent).await;
+
+    svc.agent_report_to_parent_op(ws.clone(), json!("another report"), Some(child2.clone()))
+        .await
+        .expect("report child2");
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline2 + 1);
+
+    // Child is deleted after reporting.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_DELETED,
+        &child2,
+        json!({ "agentId": child2.0 }),
+    ))
+    .await;
+    // Parent MUST receive the deleted wake.
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        baseline2 + 2,
+        "parent must receive both report wake AND deleted wake"
+    );
+}
+
 /// SUB-2: repeated `agent.wakeOrCreate` for the same caller/target reuses the
 /// live ungrouped watch instead of stacking duplicates. A single terminal
 /// `agent:idle` then produces exactly one parent wake.
