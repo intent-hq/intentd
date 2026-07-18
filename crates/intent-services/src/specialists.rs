@@ -898,6 +898,45 @@ mod tests {
         assert_eq!(imp["source"], "user", "user tier wins in list too");
     }
 
+    /// Rot-check regression test: the bundled `verifier.md` prompt must instruct
+    /// the verifier to mark verified tasks complete with `update_note_task_status`
+    /// and explain the completion policy (only APPROVED tasks, DEVIATION/MISSING
+    /// stay in review_required). This prevents future prompt rewrites from
+    /// silently dropping the workflow instruction and leaving tasks stuck in
+    /// `review_required`.
+    #[test]
+    fn verifier_prompt_mentions_update_note_task_status_and_marking_complete() {
+        let dir = TempSpecialistsDir::new();
+        let svc = service_over(&dir);
+        let got = svc
+            .get("verifier", None)
+            .expect("embedded verifier resolves");
+        let body = got["specialist"]["behaviorPrompt"]
+            .as_str()
+            .expect("prompt body");
+
+        // Assert the prompt contains the `update_note_task_status` tool.
+        assert!(
+            body.contains("update_note_task_status"),
+            "verifier.md must mention update_note_task_status tool"
+        );
+
+        // Assert the prompt instructs marking verified tasks complete.
+        assert!(
+            body.contains("mark") && body.contains("complete"),
+            "verifier.md must instruct marking verified tasks complete"
+        );
+
+        // Assert the prompt specifies the APPROVED → complete policy and that
+        // tasks with DEVIATION/MISSING stay in review_required.
+        assert!(
+            (body.contains("APPROVED") || body.contains("✅ APPROVED"))
+                && (body.contains("DEVIATION") || body.contains("⚠️ DEVIATION"))
+                && (body.contains("MISSING") || body.contains("❌ MISSING")),
+            "verifier.md must specify APPROVED/DEVIATION/MISSING completion policy"
+        );
+    }
+
     #[test]
     fn bundled_dir_file_overrides_embedded_copy() {
         // An on-disk bundled file (env override / packaged resources) with the
