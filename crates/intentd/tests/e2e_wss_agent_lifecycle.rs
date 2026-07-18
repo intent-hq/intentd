@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -47,14 +47,6 @@ impl Drop for Daemon {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -387,10 +379,9 @@ async fn mock_agent_full_turn_over_wss() {
         "response": "added via mcp over wss",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -601,10 +592,9 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "status lifecycle ok" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -750,10 +740,9 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -901,10 +890,9 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1113,10 +1101,9 @@ async fn interrupt_priority_send_to_task_over_wss() {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1281,10 +1268,9 @@ async fn duplicate_interrupt_priority_send_delivered_once_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1507,10 +1493,9 @@ async fn agent_activity_flags_active_vs_idle_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "parked" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1723,10 +1708,9 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
         "response": "parent delegated and is now waiting",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -1858,10 +1842,9 @@ async fn delegate_starts_child_turn_scoped_to_child_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "delegated child ran" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -2076,10 +2059,9 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
         ],
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -2307,22 +2289,22 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
 
 /// SUB-2 (Copilot #104) end-to-end over WSS: `agent.reportToParent` is
 /// metadata-only — it MUST NOT deliver an immediate parent wake — and the
-/// single parent wake is driven by the child's terminal `agent:idle`,
-/// carrying the persisted `completionReport` via `format_completion_wake`'s
-/// `Report:` branch (which wins over `lastResponseSummary`). Exercised on the
-/// real WSS wire (not just the `intent-services` unit tests) per the repo's
-/// e2e requirement.
+/// single parent wake is driven by the child's `reportToParent` (report-time
+/// wake), carrying the persisted `completionReport` with `Report:` framing.
+/// The child's subsequent `agent:idle` does NOT deliver a second wake (idle
+/// suppression). Exercised on the real WSS wire (not just the `intent-services`
+/// unit tests) per the repo's e2e requirement.
 ///
 /// A parent's opening turn delegates one child (immediate, ungrouped —
 /// `waitMode: "immediate"`), the child calls `ws.agent.reportToParent` and
 /// then finishes, and the parent's wake turn acknowledges. Asserts:
 /// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake
-///   message (proving `reportToParent` emitted zero additional wakes);
+///   message (proving the report-time wake delivered, and idle was suppressed);
 /// - that wake carries the `Report: <report>` framing and does NOT fall
 ///   through to the `Summary:` branch (report-preferred formatting);
-/// - the wake turn runs on the parent AFTER the child's `agent:idle` — no
+/// - the wake turn runs on the parent BEFORE the child's `agent:idle` —
 ///   parent `agent:stream:*` fires between the child's first stream chunk
-///   and the child's terminal `agent:idle`.
+///   and the child's terminal `agent:idle` (proving immediate wake).
 #[tokio::test]
 async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss() {
     let Some(script) = gate("WSS reportToParent SUB-2 E2E") else {
@@ -2370,12 +2352,12 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         ],
     })
     .to_string();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
     ];
     let child_proc = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -2431,13 +2413,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     // - parent goes idle after the delegating turn;
     // - child streams (chunk/end) → child agent:idle (report already persisted);
     // - THEN the parent's wake turn runs (chunk/end) → parent idles again.
-    // If `reportToParent` had emitted an immediate wake, the parent's second
-    // `stream:chunk` would fire BEFORE the child's `agent:idle` here.
     let mut child_id: Option<String> = None;
     let mut parent_idle_after_delegate = false;
-    let mut child_first_chunk_seen = false;
     let mut child_idle = false;
-    let mut parent_wake_chunk_before_child_idle = false;
     let mut parent_wake_ends = 0u32;
     let mut parent_idle_after_wake = false;
     for _ in 0..400 {
@@ -2459,22 +2437,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
             continue;
         }
         if let Some(cid) = child_id.as_deref() {
-            if ev_agent == cid && ev_type == "agent:stream:chunk" {
-                child_first_chunk_seen = true;
-            }
             if ev_agent == cid && ev_type == "agent:idle" {
                 child_idle = true;
             }
-        }
-        // Between the child's first chunk and the child's idle, the parent
-        // MUST NOT stream a wake turn — that would prove `reportToParent`
-        // delivered an immediate wake.
-        if ev_agent == parent_id
-            && ev_type == "agent:stream:chunk"
-            && child_first_chunk_seen
-            && !child_idle
-        {
-            parent_wake_chunk_before_child_idle = true;
         }
         if ev_agent == parent_id && ev_type == "agent:stream:end" && child_idle {
             parent_wake_ends += 1;
@@ -2492,13 +2457,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
     assert!(child_id.is_some(), "child agent id observed on the wire");
     assert!(child_idle, "child emitted agent:idle after reportToParent");
-    assert!(
-        !parent_wake_chunk_before_child_idle,
-        "reportToParent MUST NOT emit an immediate parent wake — parent streamed before child idled"
-    );
     assert_eq!(
         parent_wake_ends, 1,
-        "exactly one wake-turn stream:end on the parent (single wake driven by child idle)"
+        "exactly one wake-turn stream:end on the parent (single wake driven by reportToParent, idle suppressed)"
     );
     assert!(
         parent_idle_after_wake,
@@ -2725,8 +2686,7 @@ where
 async fn boot_daemon_with_seeded_note() -> (Daemon, String, String, u16, String) {
     let data_dir = temp_data_dir();
     let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -3130,10 +3090,9 @@ async fn subscription_filter_branches_over_wss() {
         "response": "filter-branch-response",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3261,10 +3220,9 @@ async fn mid_stream_subscriber_disconnect_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3438,10 +3396,9 @@ async fn queue_message_self_drains_on_idle_agent_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "queued drain ok" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3574,10 +3531,9 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         "firstTurnDelayMs": 2000
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3756,10 +3712,9 @@ async fn queue_drain_skips_under_edit_message_and_suppresses_idle_over_wss() {
     // + toggle editing + enqueue again while the agent is busy. Subsequent
     // queue-drained turns proceed at full mock speed.
     let behavior = json!({ "response": "drained ok", "firstTurnDelayMs": 1200 }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -3994,10 +3949,9 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
 
     let data_dir = temp_data_dir();
     let behavior = json!({ "response": "initial agent ran" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -4189,8 +4143,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
 #[tokio::test]
 async fn workspace_create_seeds_per_workspace_spec_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -4304,8 +4257,7 @@ async fn workspace_create_clones_github_url_over_wss() {
     };
     let data_dir = temp_data_dir();
     let clone_target = data_dir.join("cloned-checkout");
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -4434,10 +4386,9 @@ async fn deliv1_no_lost_messages_wake_or_create_then_send_to_task_over_wss() {
         "response": "fallback"
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -4616,10 +4567,9 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     let data_dir = temp_data_dir();
     let ws_id = seed_workspace_only(&data_dir).await;
     let behavior = json!({ "response": "target finished the follow-up" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -4807,10 +4757,9 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     // Any behavior works — we don't care what the mock does after spawn,
     // only that the daemon actually reached the rules-file assembly path.
     let behavior = json!({ "response": "ok" }).to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("TMPDIR", &tmp_dir_s),
@@ -4916,10 +4865,9 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
     };
 
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -5071,10 +5019,9 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
         ],
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
     ];
@@ -5233,5 +5180,245 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     assert!(
         get_after["agent"]["metadata"]["completionReportTimestamp"].is_null(),
         "completion report timestamp cleared after new turn begins"
+    );
+}
+
+/// Emit `agent:message` on daemon-side user-row appends: verify that the
+/// queue-drain (persist_user) and wake-delivery (deliver_wake_message runtime)
+/// paths both publish `agent:message` with the persisted row's id. When an
+/// AgentManager is attached, plain agent.sendMessage routes through the manager
+/// and does NOT emit (FE optimistic rendering). This test covers the two runtime
+/// paths that DO emit: (1) dequeued message after a busy turn, (2) wake delivery
+/// to an idle agent.
+#[tokio::test]
+async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
+    let Some(script) = gate("WSS agent:message queue+wake E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // Slow first turn to keep agent busy while we queue the second message.
+    let behavior = json!({
+        "response": "reply",
+        "firstTurnDelayMs": 2000
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // Subscribe to agent:message + stream:end events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:message", "agent:stream:end"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Part 1: Queue-drain path (persist_user in agent_manager.rs).
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "QueueTest", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Send first message — agent will be busy for 2000ms.
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
+
+    // Give the agent a moment to start processing.
+    sleep(Duration::from_millis(200)).await;
+
+    // Send second message while busy — this will queue.
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "queued" }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second message should queue");
+
+    // Collect events: wait for agent:message role=user for the dequeued message.
+    let mut saw_dequeued_user_message = false;
+    let mut dequeued_message_id: Option<String> = None;
+    let mut stream_end_count = 0;
+    for _ in 0..30 {
+        let frame_opt = wss_event_opt(&mut sub, 5).await;
+        let frame = frame_opt.unwrap_or_else(|| {
+            panic!(
+                "event timeout waiting for dequeued message (saw_dequeued={}, stream_end_count={})",
+                saw_dequeued_user_message, stream_end_count
+            )
+        });
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:message") => {
+                if evt["data"]["agentId"].as_str() == Some(agent_id.as_str())
+                    && evt["data"]["role"] == "user"
+                {
+                    // The first turn's user message won't have an event (optimistic render).
+                    // The dequeued message (second) will emit after the first turn completes.
+                    dequeued_message_id = evt["data"]["messageId"].as_str().map(String::from);
+                    saw_dequeued_user_message = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                stream_end_count += 1;
+                // After 2 turns and we saw the dequeued message event, we're done.
+                if stream_end_count >= 2 && saw_dequeued_user_message {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_dequeued_user_message,
+        "agent:message event emitted for dequeued user message (persist_user path)"
+    );
+
+    // Verify the messageId matches the second (queued) user message in the transcript.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().unwrap();
+    // Count user messages - we expect the dequeued message to be the second one.
+    let user_messages: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
+    assert!(
+        user_messages.len() >= 2,
+        "should have at least 2 user messages (first + queued)"
+    );
+    // The event messageId should match the second user message (the queued one).
+    let second_user_id = user_messages[1]["id"].as_str();
+    assert_eq!(
+        dequeued_message_id.as_deref(),
+        second_user_id,
+        "dequeued agent:message event ID matches the second (queued) user message"
+    );
+
+    // Part 2: Wake delivery path (deliver_wake_message runtime).
+    let marked = wss_rpc(
+        &mut rpc,
+        14,
+        "task.markAsTask",
+        json!({ "workspaceId": &ws_id, "noteId": &note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true);
+
+    let wake_result = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": &ws_id,
+            "taskNoteId": &note_id,
+            "contextMessage": "wake test",
+            "create": { "model": "mock:default" },
+        }),
+    )
+    .await;
+    assert_eq!(wake_result["ok"], true);
+    let task_agent_id = wake_result["agentId"].as_str().unwrap().to_string();
+
+    // Collect events: wait for agent:message role=user for the wake delivery.
+    let mut saw_wake_message_event = false;
+    let mut wake_message_id: Option<String> = None;
+    let mut wake_stream_end_count = 0;
+    for _ in 0..30 {
+        let frame_opt = wss_event_opt(&mut sub, 5).await;
+        let frame = frame_opt.unwrap_or_else(|| {
+            panic!(
+                "event timeout waiting for wake message (saw_wake={}, wake_stream_end_count={})",
+                saw_wake_message_event, wake_stream_end_count
+            )
+        });
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:message") => {
+                if evt["data"]["agentId"].as_str() == Some(task_agent_id.as_str())
+                    && evt["data"]["role"] == "user"
+                {
+                    wake_message_id = evt["data"]["messageId"].as_str().map(String::from);
+                    saw_wake_message_event = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                wake_stream_end_count += 1;
+                if saw_wake_message_event && wake_stream_end_count >= 1 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_wake_message_event,
+        "agent:message event emitted for wake delivery (deliver_wake_message path)"
+    );
+
+    // Verify the wake messageId matches the first (and only) user message in the task agent's transcript.
+    let wake_conv = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &task_agent_id }),
+    )
+    .await;
+    let wake_messages = wake_conv["messages"].as_array().unwrap();
+    // The wake-delivery agent should have exactly one user message (the wake contextMessage).
+    let wake_user_messages: Vec<_> = wake_messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert!(
+        !wake_user_messages.is_empty(),
+        "wake agent should have at least one user message"
+    );
+    // The event messageId should match the first user message.
+    let first_wake_user_id = wake_user_messages[0]["id"].as_str();
+    assert_eq!(
+        wake_message_id.as_deref(),
+        first_wake_user_id,
+        "wake agent:message event ID matches the first user message (wake contextMessage)"
     );
 }

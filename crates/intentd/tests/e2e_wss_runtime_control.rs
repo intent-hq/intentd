@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -28,6 +28,15 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
@@ -43,14 +52,6 @@ impl Drop for Daemon {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -243,8 +244,7 @@ where
 #[tokio::test]
 async fn runtime_ws_listener_toggle_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     // Start daemon with both UDS and TCP (--listen both)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -254,8 +254,11 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // Get the actual bound port from system.status
+    let status = uds_rpc(&socket, 999, "system.status", json!({})).await;
+    let port_value = status["result"]["port"].as_u64().expect("port");
+
     // Persist the ephemeral port to the setting so re-enable uses the same port
-    let port_value: u64 = port_s.parse().unwrap();
     let set_port = uds_rpc(
         &socket,
         1,
@@ -352,6 +355,10 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
+    assert_eq!(
+        new_port, initial_port,
+        "re-enable should bind the same port (persisted in server.wsApi.port)"
+    );
 
     // Connect over WSS again and verify RPCs work
     let mut ws2 = connect_ws(new_port, cfg.clone()).await;
@@ -382,8 +389,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
 #[tokio::test]
 async fn batch_hook_ordering_port_before_enable() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -409,7 +415,8 @@ async fn batch_hook_ordering_port_before_enable() {
     // Batch update: provide changes in REVERSE dependency order (wsApi.enabled
     // before wsApi.port in the input array). The hook ordering ensures the port
     // value (priority 0) applies before wsApi.enabled (priority 10), so the
-    // listener starts directly on the NEW port.
+    // listener starts directly on the NEW port. Pick a dynamically-available port
+    // to avoid hard-coded collisions.
     let new_port = free_port();
     let batch_reverse = uds_rpc(
         &socket,

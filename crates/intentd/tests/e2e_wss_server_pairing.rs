@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -46,14 +46,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-server-{}", &id[..8]));
@@ -61,7 +53,7 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-fn spawn_serve(data_dir: &Path, port: u16) -> Child {
+fn spawn_serve(data_dir: &Path) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -71,7 +63,7 @@ fn spawn_serve(data_dir: &Path, port: u16) -> Child {
         .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", port.to_string())
+        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -229,7 +221,7 @@ async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
     }
 }
 
-async fn boot(data_dir: &Path, _port: u16) -> (u16, String) {
+async fn boot(data_dir: &Path) -> (u16, String) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
@@ -244,12 +236,11 @@ async fn boot(data_dir: &Path, _port: u16) -> (u16, String) {
 #[tokio::test]
 async fn server_pairing_info_over_uds() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
-    let (port, fp) = boot(&data_dir, port_hint).await;
+    let (port, fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
 
     // server.pairingInfo over UDS (local) returns credentials
@@ -269,12 +260,11 @@ async fn server_pairing_info_over_uds() {
 #[tokio::test]
 async fn server_rotate_token_env_fixed_rejects() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
-    let (_port, _fp) = boot(&data_dir, port_hint).await;
+    let (_port, _fp) = boot(&data_dir).await;
     let socket = data_dir.join("intentd.sock");
 
     // INTENTD_AUTH_TOKEN is set in spawn_serve, so rotation should reject over UDS
@@ -293,12 +283,11 @@ async fn server_rotate_token_env_fixed_rejects() {
 #[tokio::test]
 async fn server_pairing_info_over_wss_rejects() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
-    let (port, fp) = boot(&data_dir, port_hint).await;
+    let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
 
     // server.pairingInfo over WSS (TCP) is rejected with -32001
@@ -316,12 +305,11 @@ async fn server_pairing_info_over_wss_rejects() {
 #[tokio::test]
 async fn server_rotate_token_over_wss_rejects() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
-    let (port, fp) = boot(&data_dir, port_hint).await;
+    let (port, fp) = boot(&data_dir).await;
     let cfg = client_config(&fp);
 
     // server.rotateToken over WSS (TCP) is rejected with -32001

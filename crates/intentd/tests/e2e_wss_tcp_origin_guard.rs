@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -54,14 +54,6 @@ impl Drop for Daemon {
     }
 }
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-tcp-guard-{}", &id[..8]));
@@ -69,7 +61,7 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-fn spawn_serve(data_dir: &Path, port: u16) -> Child {
+fn spawn_serve(data_dir: &Path) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -79,7 +71,7 @@ fn spawn_serve(data_dir: &Path, port: u16) -> Child {
         .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", port.to_string())
+        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("MOCK_ACP_HOST", "localhost:0")
@@ -268,9 +260,8 @@ async fn boot(data_dir: &Path) -> (u16, String) {
 #[tokio::test]
 async fn tcp_client_refused_server_rotate_token_fast_path() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -301,9 +292,8 @@ async fn tcp_client_refused_server_rotate_token_fast_path() {
 #[tokio::test]
 async fn tcp_client_refused_settings_disable_wss_slow_path() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
     let (port, fp) = boot(&data_dir).await;
@@ -341,9 +331,8 @@ async fn tcp_client_refused_settings_disable_wss_slow_path() {
 #[tokio::test]
 async fn uds_client_allowed_settings_disable_wss() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
     let mut daemon = Daemon {
-        child: spawn_serve(&data_dir, port_hint),
+        child: spawn_serve(&data_dir),
         data_dir: data_dir.clone(),
     };
     let (_port, _fp) = boot(&data_dir).await;
@@ -378,7 +367,6 @@ async fn uds_client_allowed_settings_disable_wss() {
 #[tokio::test]
 async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
     let data_dir = temp_data_dir();
-    let port_hint = free_port();
 
     // Spawn daemon with --mode local
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
@@ -392,7 +380,7 @@ async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
         .arg("local")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_TCP_PORT", port_hint.to_string())
+        .env("INTENTD_TCP_PORT", "0")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("MOCK_ACP_HOST", "localhost:0")

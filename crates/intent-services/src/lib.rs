@@ -15,7 +15,7 @@ use intent_core::events::{
     AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, CHANGES_GIT_STATUS, CHANGES_METRICS_CHANGED,
     COMMENT_ADDED, COMMENT_RESOLVED, GIT_BRANCH, GIT_COMMIT, GIT_PULL, GIT_PUSH,
     LINE_ATTRIBUTION_UPDATED, NOTE_CREATED, NOTE_DELETED, NOTE_UPDATED, PR_LINKED, PR_UNLINKED,
-    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, TASK_AGENT_LINKED,
+    PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
     WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
@@ -109,7 +109,7 @@ pub use agent_manager::{
 };
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-pub use events::{EventBus, FileWatcher, Subscription, SubscriptionFilter};
+pub use events::{EventBus, FileWatcher, SkillsWatcher, Subscription, SubscriptionFilter};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
@@ -300,6 +300,20 @@ pub struct Services {
     last_activity_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for debounce tasks (incremented on each schedule).
     last_activity_debounce_gen: Arc<Mutex<u64>>,
+    /// Per-workspace debouncers for the busy→idle `workspace:activity-changed`
+    /// event emission (§10.1). When `agent_activity_end` transitions a workspace
+    /// count to zero, the idle flip is scheduled after a debounce window (~3s,
+    /// env-configurable); a new `agent_activity_begin` within the window cancels
+    /// it (no idle/running event pair). Shared across clones so all service
+    /// handles observe the same pending timers. In-memory only (no persistence);
+    /// pending timers are dropped on daemon shutdown without flushing.
+    ///
+    /// To prevent race conditions where an old task removes a newer handle, each
+    /// entry stores a generation counter alongside the abort handle. Tasks only
+    /// remove their own entry if the generation still matches.
+    idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
+    /// Generation counter for idle debounce tasks (incremented on each schedule).
+    idle_debounce_gen: Arc<Mutex<u64>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -361,6 +375,8 @@ impl Services {
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
+            idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
+            idle_debounce_gen: Arc::new(Mutex::new(0)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -520,12 +536,24 @@ impl Services {
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
-    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight.
+    /// in-flight agent count (§9.9): `AgentRunning` iff any session is in flight
+    /// OR if a pending idle debounce is scheduled (grace window). During the grace
+    /// window after the last agent ends, the workspace is still considered
+    /// `AgentRunning` until the debounce fires, ensuring list/get/update responses
+    /// and the event stream agree on the derived state.
     pub(crate) fn workspace_activity(&self, workspace_id: &WorkspaceId) -> WorkspaceActivity {
         let map = self.agent_activity.lock().unwrap();
         match map.get(workspace_id) {
             Some(count) if *count > 0 => WorkspaceActivity::AgentRunning,
-            _ => WorkspaceActivity::Idle,
+            _ => {
+                // Check if there's a pending idle debounce (grace window).
+                if let Ok(debouncers) = self.idle_debouncers.lock() {
+                    if debouncers.contains_key(workspace_id) {
+                        return WorkspaceActivity::AgentRunning;
+                    }
+                }
+                WorkspaceActivity::Idle
+            }
         }
     }
 
@@ -880,7 +908,8 @@ impl Services {
 
     /// Record an agent session entering flight for `workspace_id`. On the
     /// `Idle → AgentRunning` transition (count `0 → 1`) emits a self-sufficient
-    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change).
+    /// `workspace:activity-changed { workspaceId, activity }` (§10.1, only-on-change)
+    /// and cancels any pending idle debounce.
     pub(crate) async fn agent_activity_begin(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -888,6 +917,14 @@ impl Services {
             *count += 1;
             *count == 1
         };
+
+        // Cancel any pending idle debounce (if the workspace was in grace window).
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(workspace_id) {
+                handle.abort();
+            }
+        }
+
         if transitioned {
             publish_event(
                 &self.event_bus,
@@ -898,9 +935,11 @@ impl Services {
     }
 
     /// Record an agent session leaving flight for `workspace_id`. On the
-    /// `AgentRunning → Idle` transition (count `1 → 0`) emits a self-sufficient
-    /// `workspace:activity-changed` (§10.1, only-on-change). A decrement with no
-    /// tracked session is a no-op.
+    /// `AgentRunning → Idle` transition (count `1 → 0`), schedules a debounced
+    /// `workspace:activity-changed { idle }` event emission after a configurable
+    /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
+    /// within the window cancels the idle flip. A decrement with no tracked session
+    /// is a no-op.
     pub(crate) async fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
         let transitioned = {
             let mut map = self.agent_activity.lock().unwrap();
@@ -918,11 +957,97 @@ impl Services {
             }
         };
         if transitioned {
-            publish_event(
-                &self.event_bus,
-                activity_changed_event(workspace_id, WorkspaceActivity::Idle),
-            )
-            .await;
+            self.schedule_idle_debounce(workspace_id.clone());
+        }
+    }
+
+    /// Schedule a debounced `workspace:activity-changed { idle }` event emission
+    /// for the workspace. The event is emitted only after the workspace stays idle
+    /// for the full debounce window (~3s default, env-overridable for tests). A new
+    /// `agent_activity_begin` within the window cancels the pending flip.
+    fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
+        // Increment generation counter and cancel any existing debouncer.
+        let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
+            *gen_lock = gen_lock.wrapping_add(1);
+            *gen_lock
+        } else {
+            0
+        };
+
+        if let Ok(mut debouncers) = self.idle_debouncers.lock() {
+            if let Some((_, handle)) = debouncers.remove(&workspace_id) {
+                handle.abort();
+            }
+        }
+
+        // Clone the state we'll need in the spawned task.
+        let this = self.clone();
+        let debouncers = self.idle_debouncers.clone();
+        let ws_id = workspace_id.clone();
+
+        // Debounce window: production constant (~3s), overridable via env for tests.
+        let debounce_ms = std::env::var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(WORKSPACE_IDLE_DEBOUNCE_MS);
+
+        // Spawn a task that sleeps for the debounce window, then emits idle.
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+
+            // Guard emission: verify debouncer still current AND count still zero.
+            let should_emit = {
+                let gen_valid = if let Ok(map) = debouncers.lock() {
+                    map.get(&ws_id)
+                        .map(|(current_gen, _)| *current_gen == gen)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let count_zero = if let Ok(activity) = this.agent_activity.lock() {
+                    activity.get(&ws_id).copied().unwrap_or(0) == 0
+                } else {
+                    false
+                };
+                gen_valid && count_zero
+            };
+
+            if should_emit {
+                // Remove debouncer entry before emitting so reads stop reporting grace.
+                if let Ok(mut map) = debouncers.lock() {
+                    if let Some((current_gen, _)) = map.get(&ws_id) {
+                        if *current_gen == gen {
+                            map.remove(&ws_id);
+                        }
+                    }
+                }
+
+                publish_event(
+                    &this.event_bus,
+                    activity_changed_event(&ws_id, WorkspaceActivity::Idle),
+                )
+                .await;
+            }
+        });
+
+        // Store the abort handle with generation. Only insert if no entry exists or our
+        // generation is newer (prevents older schedules from overwriting newer ones).
+        if let Ok(mut map) = self.idle_debouncers.lock() {
+            let should_insert = map
+                .get(&workspace_id)
+                .map(|(existing_gen, _)| gen > *existing_gen)
+                .unwrap_or(true);
+
+            if should_insert {
+                if let Some((_, old_handle)) =
+                    map.insert(workspace_id, (gen, handle.abort_handle()))
+                {
+                    old_handle.abort();
+                }
+            } else {
+                // Our generation is older; abort this task immediately.
+                handle.abort();
+            }
         }
     }
 
@@ -1671,6 +1796,24 @@ impl Services {
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
+            // Report-time wake suppression: if the watch has already delivered the
+            // report wake (via agent.reportToParent), skip delivery ONLY for
+            // agent:idle. agent:failed / agent:deleted still deliver (failure after
+            // reporting is a new signal, not a duplicate).
+            if watch.report_delivered && event.event_type == intent_core::events::AGENT_IDLE {
+                tracing::debug!(
+                    child = %child_id.0,
+                    parent = %watch.parent_agent_id.0,
+                    "skipping agent:idle wake — report already delivered at reportToParent time"
+                );
+                // Remove the oneShot watch now that the completion cycle is done.
+                if watch.one_shot {
+                    self.remove_watch(workspace_id, &watch.id);
+                    self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                        .await;
+                }
+                continue;
+            }
             // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
@@ -2375,6 +2518,14 @@ fn latest_activity_candidate(candidates: &[Option<&str>]) -> Option<String> {
 /// without event storms during agent streaming; tests override with a short
 /// window (see `LAST_ACTIVITY_DEBOUNCE_TEST_MS` env var).
 const LAST_ACTIVITY_DEBOUNCE_MS: u64 = 3000;
+
+/// Trailing-edge debounce window for busy→idle `workspace:activity-changed` event
+/// emission (§10.1). Production value (~3 seconds) stops sidebar flicker during
+/// rapid agent turns; tests override with a short window (see
+/// `WORKSPACE_IDLE_DEBOUNCE_TEST_MS` env var). When `agent_activity_end` transitions
+/// a workspace count to zero, the idle flip is scheduled after this window; a new
+/// `agent_activity_begin` within the window cancels it (no idle/running event pair).
+const WORKSPACE_IDLE_DEBOUNCE_MS: u64 = 3000;
 
 /// Conservative allowlist of remote names whose first path segment may be
 /// stripped when canonicalising a workspace `baseRef` on write. Mirrors the
@@ -3684,6 +3835,22 @@ fn settings_changed_event(changes: Vec<serde_json::Value>) -> NewEvent {
         parent_event_id: None,
         metadata: None,
         data: serde_json::json!({ "changes": changes }),
+    }
+}
+
+/// Build a `skills:changed` event (PROTOCOL §6.5). Emitted when the discovered
+/// skill set changes for a workspace (file-watch on the five scan roots).
+fn skills_changed_event(workspace_id: &WorkspaceId) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: SKILLS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
     }
 }
 
@@ -5045,6 +5212,32 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.specialists_service()
                 .get(&id, workspace_path.as_deref().map(Path::new))
+        })
+    }
+
+    fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Resolve workspace path (required for skills discovery)
+            let ws = self.store.get_workspace(&workspace_id).await?;
+            let workspace_path = crate::git_ops::worktree_path(&ws).ok_or_else(|| {
+                Error::NotFound(format!(
+                    "workspace {} has no worktree path",
+                    workspace_id.as_str()
+                ))
+            })?;
+
+            // Check if skills changed and emit event if they did
+            let (skills, changed) =
+                skills::check_skills_changed(&workspace_path.to_string_lossy()).await;
+            if changed {
+                publish_event(&self.event_bus, skills_changed_event(&workspace_id)).await;
+            }
+
+            // Sort by name for deterministic output
+            let mut sorted_skills = skills;
+            sorted_skills.sort_by(|a, b| a.name.cmp(&b.name));
+
+            Ok(serde_json::to_value(&sorted_skills).unwrap_or(serde_json::Value::Array(vec![])))
         })
     }
 
@@ -6853,6 +7046,10 @@ impl WorkspaceApi for Services {
                 ws.created_at = pinned.created_at;
                 ws.updated_at = pinned.updated_at;
                 ws.last_activity = pinned.last_activity;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the synthesized row.
+                ws.activity = this.workspace_activity(&ws.id);
             } else {
                 store.update_workspace(&ws).await?;
                 // Derive `lastActivity` (§9.1) on the returned record so
@@ -6860,6 +7057,10 @@ impl WorkspaceApi for Services {
                 // without a follow-up `workspace.get`. Chief is skipped: its
                 // timestamps are pinned above.
                 this.derive_last_activity(&mut ws).await;
+                // Derive `activity` from live agent state (§9.9) so the mutation
+                // response carries `agent_running` when agents are in-flight,
+                // not the stale default `idle` from the persisted row.
+                ws.activity = this.workspace_activity(&ws.id);
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
@@ -7075,6 +7276,10 @@ impl WorkspaceApi for Services {
             // Derive `lastActivity` (§9.1) so archive callers get the
             // authoritative wire shape without a follow-up `workspace.get`.
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             // §6.5 has no `workspace:archived`; mirror the reference emitter and
             // publish `workspace:updated` with the applied `{ archived }` delta
             // so subscribers flip state without a re-read.
@@ -7102,6 +7307,10 @@ impl WorkspaceApi for Services {
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             publish_event(
                 &bus,
                 workspace_updated_event(&ws.id, serde_json::json!({ "archived": false })),
@@ -7430,6 +7639,10 @@ impl WorkspaceApi for Services {
             // matches what `workspace.list`/`workspace.get` would compute for
             // the new row (§9.1, mutation-path parity).
             this.derive_last_activity(&mut ws).await;
+            // Derive `activity` from live agent state (§9.9) for consistency
+            // with other mutation paths. For a fresh workspace with no agents,
+            // activity naturally remains `idle`.
+            ws.activity = this.workspace_activity(&ws.id);
             Ok(ws)
         })
     }
@@ -7572,6 +7785,10 @@ impl WorkspaceApi for Services {
             ws.attention = WorkspaceAttention::None;
             ws.updated_at = now_iso();
             store.update_workspace(&ws).await?;
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             // Self-sufficient `workspace:attention-changed` so every client clears
             // the blue dot together (PROTOCOL §6.5); emit only on an actual change.
             if changed {
@@ -7601,6 +7818,10 @@ impl WorkspaceApi for Services {
                 // Schedule debounced lastActivity event (§10.1).
                 this.schedule_last_activity_event(id.clone());
             }
+            // Derive `activity` from live agent state (§9.9) so the mutation
+            // response carries `agent_running` when agents are in-flight,
+            // not the stale default `idle` from the persisted row.
+            ws.activity = this.workspace_activity(&ws.id);
             Ok(ws)
         })
     }
@@ -13419,15 +13640,23 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        include_older: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
             // TA-2 / §5.5: clamp the page size to [1,200] (default 50) and walk
             // backward through the (newest-first) first-parent history via an
             // opaque skip token. `nextToken` is additive to the existing object.
+            // Boundary resolution: prefer merge-base, fallback to base_commit_sha,
+            // return boundarySha in the result for the FE workspace-start marker.
             let limit = pagination::clamp_limit(limit);
             let skip = pagination::parse_offset(page_token.as_deref());
-            let empty = serde_json::json!({ "commits": [], "nextToken": serde_json::Value::Null });
+            let include_older = include_older.unwrap_or(false);
+            let empty = serde_json::json!({
+                "commits": [],
+                "nextToken": serde_json::Value::Null,
+                "boundarySha": serde_json::Value::Null
+            });
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
@@ -13441,8 +13670,28 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
+
+            // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
+            let boundary_sha = intent_git::history::resolve_workspace_boundary(
+                &worktree,
+                ws.base_ref.as_deref(),
+                ws.base_commit_sha.as_deref(),
+            )?;
+
+            // If boundary info exists but nothing resolved, return empty (safety net
+            // to avoid showing arbitrary base-branch commits). This holds regardless
+            // of includeOlder to prevent leaking arbitrary base-branch history.
+            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary_sha.is_none() {
+                return Ok(empty);
+            }
+
             // Fetch one past the page window to decide whether older commits remain.
-            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
+            let commits = intent_git::history::history_bounded(
+                &worktree,
+                boundary_sha.as_deref(),
+                skip + limit + 1,
+                include_older,
+            )?;
             let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()
@@ -13455,7 +13704,15 @@ impl WorkspaceApi for Services {
             } else {
                 serde_json::Value::Null
             };
-            Ok(serde_json::json!({ "commits": values, "nextToken": next_token }))
+            let boundary_value = match boundary_sha {
+                Some(sha) => serde_json::Value::String(sha),
+                None => serde_json::Value::Null,
+            };
+            Ok(serde_json::json!({
+                "commits": values,
+                "nextToken": next_token,
+                "boundarySha": boundary_value
+            }))
         })
     }
 
@@ -15257,6 +15514,7 @@ mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
 mod rules;
+pub mod skills;
 mod specialists;
 
 // Code Changes Review modules (§17).

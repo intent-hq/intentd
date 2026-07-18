@@ -4,7 +4,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -42,14 +42,6 @@ impl Drop for Daemon {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -242,8 +234,7 @@ where
 #[tokio::test]
 async fn mixed_batch_rollback_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     // Start daemon with both UDS and TCP (--listen both)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {

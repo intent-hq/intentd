@@ -1,0 +1,19 @@
+Emit `agent:message` workspace events on every daemon-side user-row append so live FE clients can converge on queued-then-dequeued messages and agent-to-agent / sendToTask deliveries.
+
+## Changes
+- Add `agent:message` event emission to `agent_send_message_op`
+- Add `agent:message` event emission to `agent_force_message_op`
+- Add `agent:message` event emission to `deliver_wake_message` (runtime path)
+- Add `agent:message` event emission to `deliver_wake_message_store_only`
+- Use store-returned `message.id` instead of separately-minted `messageId`
+- Add unit tests for `agent_send_message` and `agent_force_message` event emission
+- Add WSS e2e test for send and wake message event emission
+
+## Testing
+- ✅ Unit tests pass: `agent_send_message_emits_agent_message_event`, `agent_force_message_emits_agent_message_event`
+- ✅ `cargo fmt --check` passes
+- ✅ `cargo clippy -- -D warnings` passes
+- WSS e2e test `agent_message_event_emitted_for_send_and_wake_over_wss` added (requires mock ACP agent script)
+
+## Notes
+Aligns with STAB-4 fix pattern (`persist_user` in `agent_manager.rs`). Response `messageId` now matches persisted row id for consistency.

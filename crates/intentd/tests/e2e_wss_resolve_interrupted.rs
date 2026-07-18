@@ -16,7 +16,7 @@
 
 mod common;
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 
 use common::DaemonGuard;
@@ -40,14 +40,6 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -272,8 +264,6 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 #[tokio::test]
 async fn resolve_interrupted_resume_and_abandon() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -284,7 +274,7 @@ async fn resolve_interrupted_resume_and_abandon() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -409,12 +399,13 @@ async fn resolve_interrupted_resume_and_abandon() {
             .expect("insert interrupted 2");
     }
 
-    // Fetch fingerprint
+    // Fetch fingerprint and port
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open WSS connection
     let cfg = client_config(&fp);
@@ -500,8 +491,6 @@ async fn resolve_interrupted_resume_and_abandon() {
 #[tokio::test]
 async fn resolve_interrupted_invalid_params_validation() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -512,7 +501,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -525,12 +514,13 @@ async fn resolve_interrupted_invalid_params_validation() {
         panic!("daemon did not start");
     }
 
-    // Fetch fingerprint
+    // Fetch fingerprint and port
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open WSS connection
     let cfg = client_config(&fp);

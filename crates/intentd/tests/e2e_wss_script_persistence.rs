@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -29,14 +29,6 @@ use uuid::Uuid;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn scratch_dir(prefix: &str) -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
     let dir = PathBuf::from("/tmp").join(format!("itd-wss-scr-{prefix}-{}", &id[..8]));
@@ -44,7 +36,7 @@ fn scratch_dir(prefix: &str) -> PathBuf {
     dir
 }
 
-fn spawn_serve(data_dir: &Path, port: u16) -> Child {
+fn spawn_serve(data_dir: &Path) -> Child {
     let log = std::fs::File::options()
         .create(true)
         .append(true)
@@ -60,7 +52,7 @@ fn spawn_serve(data_dir: &Path, port: u16) -> Child {
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", port.to_string())
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
@@ -223,7 +215,7 @@ where
 /// Boot (or re-boot) a daemon over an existing data dir, returning the child
 /// and a pinned-TLS WSS client config for its live port.
 async fn boot(data_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
-    let child = spawn_serve(data_dir, free_port());
+    let child = spawn_serve(data_dir);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;

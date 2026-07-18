@@ -15,7 +15,7 @@
 
 mod common;
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,14 +37,6 @@ use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
@@ -259,8 +251,6 @@ where
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
 
@@ -271,7 +261,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -355,7 +345,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -366,12 +356,13 @@ async fn interrupted_agents_persisted_across_restart() {
     let mut guard2 = DaemonGuard::new(child2, data_dir.clone(), false);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
-    // Fetch fingerprint for TLS cert pinning.
+    // Fetch fingerprint and port for TLS cert pinning.
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open WSS connection.
     let cfg = client_config(&fp);
@@ -404,7 +395,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
@@ -420,6 +411,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .as_str()
         .expect("fingerprint 2")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port 2") as u16;
     let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
 
@@ -457,8 +449,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     };
 
     let data_dir = temp_data_dir();
-    let port = free_port();
-    let port_s = port.to_string();
     let listen = "both";
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-graceful-test";
@@ -489,7 +479,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .env("MOCK_AGENT_SCRIPT_PATH", &script)
         .env("MOCK_AGENT_BEHAVIOR", &behavior)
         .stdout(Stdio::null())
@@ -508,12 +498,13 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         panic!("daemon did not start");
     }
 
-    // Fetch fingerprint for TLS cert pinning.
+    // Fetch fingerprint and actual bound port for TLS cert pinning.
     let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
         .to_string();
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
 
     // Open event subscriber BEFORE creating the agent so we miss no events.
     let cfg = client_config(&fp);
@@ -601,7 +592,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("INTENTD_TCP_PORT", &port_s)
+        .env("INTENTD_TCP_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
@@ -617,8 +608,9 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .as_str()
         .expect("fingerprint 2")
         .to_string();
+    let port2 = status["result"]["port"].as_u64().expect("port 2") as u16;
     let cfg = client_config(&fp);
-    let mut ws = connect_ws(port, cfg).await;
+    let mut ws = connect_ws(port2, cfg).await;
 
     // Phase 3: Call agent.listInterrupted over WSS.
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;

@@ -2003,9 +2003,81 @@ async fn agent_provider_is_immutable_once_set() {
         .await
         .expect("set provider");
 
-    // Changing the provider afterwards is rejected.
+    // Provider can still be changed before first real use (before acp_session_id is set).
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.provider = Some("opencode".to_string());
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("change provider before first use");
+
+    // Once acp_session_id is set (first real use), provider becomes immutable.
+    store
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
+        .await
+        .expect("set acp session id");
+
+    // Now changing the provider is rejected.
     let mut s = store.get_agent_session(&agent_id).await.expect("get");
     s.provider = Some("claude-code".to_string());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
+}
+
+#[tokio::test]
+async fn agent_provider_immutable_after_acp_session_even_from_none() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Provider starts None, and we set acp_session_id while provider is still None.
+    store
+        .set_acp_session_id(&ws, &agent_id, "acp-1")
+        .await
+        .expect("set acp session id");
+
+    // Now trying to set provider from None→Some should be rejected.
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(s.provider, None);
+    s.provider = Some("auggie".to_string());
+    assert!(store.update_agent_session(&ws, &s).await.is_err());
+}
+
+#[tokio::test]
+async fn agent_provider_change_rejected_when_setting_acp_session_id() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws))
+        .await
+        .expect("insert session");
+
+    // Set provider first
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.provider = Some("auggie".to_string());
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("set provider");
+
+    // Trying to change provider in the same update that sets acp_session_id should be rejected.
+    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    s.provider = Some("opencode".to_string());
+    s.acp_session_id = Some("acp-1".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
 

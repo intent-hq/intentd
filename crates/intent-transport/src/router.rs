@@ -2290,8 +2290,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let limit = opt_int(params, "limit");
             let page_token = opt_str(params, "nextToken");
+            let include_older = params.get("includeOlder").and_then(Value::as_bool);
             let r = api
-                .file_tracking_load_commits(ws, limit, page_token)
+                .file_tracking_load_commits(ws, limit, page_token, include_older)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2811,6 +2812,14 @@ async fn dispatch(
                 Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
                     Err(rpc(INVALID_PARAMS, m))
                 }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "skill.list" => {
+            let ws_id = require_workspace_id(params)?;
+            match api.skill_list(ws_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
