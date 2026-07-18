@@ -10291,6 +10291,18 @@ mod worktree_provisioning {
 
         svc.delete_workspace(ws.id.clone()).await.expect("delete");
 
+        // Fast-ack: the response returns immediately while the worktree cleanup
+        // runs in the background. Poll for the expected final state.
+        for _ in 0..100 {
+            let repo = git2::Repository::open(&repo_dir.0).unwrap();
+            let branch_gone = repo
+                .find_branch(&ws.branch, git2::BranchType::Local)
+                .is_err();
+            if !wt.exists() && !root.0.join(&ws.id.0).exists() && branch_gone {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
         assert!(!wt.exists(), "worktree directory removed");
         assert!(
             !root.0.join(&ws.id.0).exists(),
@@ -10343,6 +10355,13 @@ mod worktree_provisioning {
 
         svc.delete_workspace(ws.id).await.expect("delete");
 
+        // Fast-ack: poll for worktree removal.
+        for _ in 0..100 {
+            if !wt.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
         assert!(!wt.exists(), "worktree directory still removed");
         let repo = git2::Repository::open(&repo_dir.0).unwrap();
         assert!(
