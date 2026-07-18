@@ -1538,10 +1538,10 @@ mod tests {
         }
     }
 
-    /// The five non-secret gap entries live in the catalog as opaque `Object`
+    /// The six non-secret gap entries live in the catalog as opaque `Object`
     /// settings with a documented default. Each is validated by shape only;
     /// downstream consumers own the internal schema (permission rules, prompt
-    /// rules, known repos, change-history bags).
+    /// rules, known repos, change-history bags, workspace-initializer state).
     #[test]
     fn non_secret_object_gap_entries_have_defaults() {
         for path in [
