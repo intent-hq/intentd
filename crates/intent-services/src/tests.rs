@@ -3287,7 +3287,7 @@ mod change_event_parity {
     /// events when agents come back in-flight during the grace window.
     #[tokio::test]
     async fn idle_debounce_guards_emission_against_race() {
-        use intent_core::{WorkspaceActivity, WorkspaceApi};
+        use intent_core::WorkspaceActivity;
         let h = harness().await;
         let _guard = DebounceEnvGuard::new("50");
         let mut sub = subscribe(&h);
