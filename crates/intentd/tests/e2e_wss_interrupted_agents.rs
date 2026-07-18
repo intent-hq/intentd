@@ -326,6 +326,7 @@ async fn interrupted_agents_persisted_across_restart() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store
             .insert_agent_session(&session)
