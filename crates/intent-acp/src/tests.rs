@@ -344,7 +344,7 @@ mod session_tests {
     #[tokio::test]
     async fn new_session_returns_acp_session_id() {
         let (conn, _responder) = connect_session();
-        let resp = session::new_session(&conn, "/tmp/ws", Vec::new())
+        let resp = session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
             .await
             .expect("session/new succeeds");
         assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
@@ -357,7 +357,7 @@ mod session_tests {
         let handshake = crate::handshake::handshake(&conn, provider).await.unwrap();
         assert!(session::supports_load_session(&handshake.initialize));
 
-        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new())
+        session::load_session(&conn, "auggie", "acp-session-1", "/tmp/ws", Vec::new())
             .await
             .expect("session/load succeeds when capability present");
 
@@ -382,7 +382,7 @@ mod session_tests {
         // Await a follow-up request: the single FIFO writer guarantees the
         // cancel line was flushed before this response arrives (avoids racing
         // the writer task against the drop below).
-        session::new_session(&conn, "/tmp/ws", Vec::new())
+        session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
             .await
             .expect("follow-up request flushes the cancel line");
         // Drop the connection to close the agent read side, then inspect frames.

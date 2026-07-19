@@ -283,14 +283,18 @@ fn env_assembly_quirks() {
     // With model: permission.task=deny is merged with the model key.
     let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"));
     assert_eq!(
-        oc_with_model.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        oc_with_model
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
         Some(r#"{"model":"claude-sonnet-4","permission":{"task":"deny"}}"#)
     );
     // No model: permission.task=deny is still emitted (change from prior behavior
     // where no config was set without a model).
     let oc_no_model = build_provider_env(opencode, None);
     assert_eq!(
-        oc_no_model.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        oc_no_model
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
         Some(r#"{"permission":{"task":"deny"}}"#)
     );
 }
