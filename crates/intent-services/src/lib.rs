@@ -1183,10 +1183,14 @@ impl Services {
             }
 
             // Narrow write: `set_agent_session_status` persists only
-            // (status, is_active, updated_at) without loading the full
+            // (status, is_active, updated_at, stop_reason) without loading the full
             // message log, keeping the startup sweep O(rows). The write-once
             // `acpSessionId` and immutable `provider` invariants (§9.5) are
             // untouched because those columns are not written here.
+            let stop_reason = format!(
+                "daemon restarted while the agent was responding (previous status: {})",
+                prev_str
+            );
             self.store
                 .set_agent_session_status(
                     &session.workspace_id,
@@ -1194,6 +1198,7 @@ impl Services {
                     intent_core::AgentStatus::RuntimeIdle,
                     false,
                     &now,
+                    Some(Some(stop_reason)),
                 )
                 .await?;
             healed += 1;

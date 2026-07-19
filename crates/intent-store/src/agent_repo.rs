@@ -20,7 +20,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch";
+    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason";
 
 /// Interrupted agent record (INT-41). Returned by
 /// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
@@ -60,7 +60,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -91,6 +91,7 @@ impl Store {
             .bind(&s.sandbox_id)
             .bind(&s.sandbox_path)
             .bind(&s.sandbox_branch)
+            .bind(&s.stop_reason)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -372,7 +373,7 @@ impl Store {
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=? \
+             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -400,6 +401,7 @@ impl Store {
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
+        .bind(&s.stop_reason)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.pool())
@@ -420,6 +422,10 @@ impl Store {
     /// Scoped to `workspace_id` (defense-in-depth). `updated_at` is refreshed to
     /// the supplied timestamp. `NotFound` if the session is absent or the
     /// workspace does not match.
+    ///
+    /// `stop_reason`: `None` leaves the column untouched; `Some(None)` clears it
+    /// to NULL; `Some(Some(reason))` sets the new value. This three-way encoding
+    /// allows callers to set, clear, or leave unchanged across a status update.
     pub async fn set_agent_session_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -427,20 +433,43 @@ impl Store {
         status: AgentStatus,
         is_active: bool,
         updated_at: &str,
+        stop_reason: Option<Option<String>>,
     ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET status=?, is_active=?, updated_at=? \
-             WHERE id=? AND workspace_id=?",
-        )
-        .bind(enum_to_db(&status)?)
-        .bind(is_active as i64)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.pool())
-        .await
-        .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
-        .rows_affected();
+        let rows = match stop_reason {
+            None => {
+                // Leave stop_reason untouched.
+                sqlx::query(
+                    "UPDATE agent_session SET status=?, is_active=?, updated_at=? \
+                     WHERE id=? AND workspace_id=?",
+                )
+                .bind(enum_to_db(&status)?)
+                .bind(is_active as i64)
+                .bind(updated_at)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+                .rows_affected()
+            }
+            Some(reason) => {
+                // Set or clear stop_reason: Some(None) → NULL, Some(Some(x)) → x.
+                sqlx::query(
+                    "UPDATE agent_session SET status=?, is_active=?, updated_at=?, stop_reason=? \
+                     WHERE id=? AND workspace_id=?",
+                )
+                .bind(enum_to_db(&status)?)
+                .bind(is_active as i64)
+                .bind(updated_at)
+                .bind(reason)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+                .rows_affected()
+            }
+        };
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -691,6 +720,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,
+        stop_reason: col(row, "stop_reason")?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         sandbox_id: col(row, "sandbox_id")?,
@@ -1406,6 +1436,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store
             .insert_agent_session(&session)
@@ -1542,6 +1573,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -1685,6 +1717,7 @@ mod tests {
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,
+                stop_reason: None,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }

@@ -89,14 +89,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
         ]
     );
 }
@@ -1480,6 +1480,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         image_blocks: None,
         is_background: false,
         metadata: None,
+        stop_reason: None,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -1583,7 +1584,7 @@ async fn agent_session_status_only_lookup() {
     assert_eq!(status, AgentStatus::Pending);
 
     store
-        .set_agent_session_status(&ws, &agent_id, AgentStatus::Error, false, "t1")
+        .set_agent_session_status(&ws, &agent_id, AgentStatus::Error, false, "t1", None)
         .await
         .expect("set status");
     let status = store
@@ -1597,6 +1598,100 @@ async fn agent_session_status_only_lookup() {
         store.get_agent_session_status(&missing).await,
         Err(intent_core::Error::NotFound(_))
     ));
+}
+
+/// `set_agent_session_status` stop_reason parameter: `None` leaves the column
+/// untouched; `Some(None)` clears it to NULL; `Some(Some(reason))` sets the
+/// new value. Exercises the three-way encoding for set/clear/leave-unchanged
+/// across a status update.
+#[tokio::test]
+async fn agent_session_stop_reason_set_clear_unchanged() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-1111-2222-3333-444444444444");
+    let mut session = sample_agent_session(&agent_id, &ws);
+    session.stop_reason = None;
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    // Verify initial state: stop_reason is None.
+    let loaded = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get session");
+    assert_eq!(loaded.stop_reason, None);
+
+    // Set a stop reason via set_agent_session_status with Some(Some("error")).
+    store
+        .set_agent_session_status(
+            &ws,
+            &agent_id,
+            AgentStatus::Error,
+            false,
+            "t1",
+            Some(Some("error".to_string())),
+        )
+        .await
+        .expect("set status with stop_reason");
+    let loaded = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get after set");
+    assert_eq!(loaded.stop_reason, Some("error".to_string()));
+    assert_eq!(loaded.status, AgentStatus::Error);
+
+    // Leave stop_reason untouched (pass None) when updating status.
+    store
+        .set_agent_session_status(&ws, &agent_id, AgentStatus::RuntimeIdle, false, "t2", None)
+        .await
+        .expect("set status without touching stop_reason");
+    let loaded = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get after unchanged");
+    assert_eq!(loaded.stop_reason, Some("error".to_string()));
+    assert_eq!(loaded.status, AgentStatus::RuntimeIdle);
+
+    // Clear stop_reason via Some(None).
+    store
+        .set_agent_session_status(
+            &ws,
+            &agent_id,
+            AgentStatus::Pending,
+            false,
+            "t3",
+            Some(None),
+        )
+        .await
+        .expect("clear stop_reason");
+    let loaded = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get after clear");
+    assert_eq!(loaded.stop_reason, None);
+    assert_eq!(loaded.status, AgentStatus::Pending);
+
+    // update_agent_session also persists stop_reason.
+    let mut updated = loaded.clone();
+    updated.stop_reason = Some("max_turns".to_string());
+    updated.status = AgentStatus::Completed;
+    store
+        .update_agent_session(&ws, &updated)
+        .await
+        .expect("update with stop_reason");
+    let loaded = store
+        .get_agent_session(&agent_id)
+        .await
+        .expect("get after update");
+    assert_eq!(loaded.stop_reason, Some("max_turns".to_string()));
+    assert_eq!(loaded.status, AgentStatus::Completed);
 }
 
 /// `append_agent_message_with_metadata` persists the opaque per-message
