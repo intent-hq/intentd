@@ -189,9 +189,14 @@ async function handlePrompt(id, params) {
       process.exit(1);
     }
   }
-  // STAB-114: Park BEFORE streaming any output, so tests can interrupt with
-  // zero output. This validates the zero-output requeue path.
+  // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
+  // with zero output. Send a session/status to establish the session, then park
+  // without emitting any chunks. This validates the zero-output requeue path.
   if (behavior.parkBeforeFirstChunk && promptCount === 1) {
+    note('session/status', {
+      sessionId: SESSION_ID,
+      status: { type: 'in_progress', message: 'parked before any chunks' },
+    });
     pendingPromptIds.push(id);
     return;
   }

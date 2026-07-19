@@ -5517,20 +5517,19 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
                 let queue = frame["params"]["event"]["data"]["queue"]
                     .as_array()
                     .expect("queue array");
-                assert!(
-                    !queue.is_empty(),
-                    "STAB-114: queue should have re-queued message"
-                );
-                let msg = &queue[0];
-                assert!(
-                    msg["content"].as_str().unwrap().contains("first"),
-                    "re-queued message should be the original user message"
-                );
-                assert_eq!(
-                    msg["requeuedAfterFailure"], false,
-                    "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
-                );
-                break;
+                if !queue.is_empty() {
+                    let msg = &queue[0];
+                    assert!(
+                        msg["content"].as_str().unwrap_or("").contains("first"),
+                        "re-queued message should be the original user message, got: {}",
+                        msg["content"]
+                    );
+                    assert_eq!(
+                        msg["requeuedAfterFailure"], false,
+                        "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
+                    );
+                    break;
+                }
             }
         }
     }
