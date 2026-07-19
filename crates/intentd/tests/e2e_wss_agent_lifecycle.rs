@@ -4885,7 +4885,10 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         }
     }
     assert!(parent_idle, "parent went idle after delegation");
-    assert!(child_a_idle && child_b_idle, "both children completed first turn");
+    assert!(
+        child_a_idle && child_b_idle,
+        "both children completed first turn"
+    );
     let child_a = child_a_id.expect("child A id");
     let child_b = child_b_id.expect("child B id");
 
