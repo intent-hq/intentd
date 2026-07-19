@@ -2229,33 +2229,48 @@ impl AgentManager {
                     .is_some();
             if cancellable {
                 // STAB-114: Before interrupting, check if the current turn has
-                // produced zero output (no assistant messages after the last user
-                // message). If so, re-queue the preempted user message so it gets
-                // processed after the interrupt completes.
-                // Fetch last 10 messages to check for zero-output (avoid O(n) on long transcripts)
-                if let Ok(messages) = self
+                // produced zero output (no assistant content chunks). If so,
+                // re-queue the preempted user message so it gets processed after
+                // the interrupt completes. Use the live-turn slot (not persisted
+                // transcript) to detect zero output: assistant rows are only
+                // persisted at turn END, so an interrupted mid-stream turn would
+                // incorrectly look like zero output if we checked the transcript.
+                let has_output = self
                     .services
-                    .store
-                    .get_agent_messages(&agent_id, Some(10))
-                    .await
-                {
-                    // Walk backwards to find the last user message
-                    if let Some(last_user_msg) = messages.iter().rev().find(|m| m.role == "user") {
-                        // Check if any assistant messages exist after it
-                        let last_user_idx = messages
-                            .iter()
-                            .rposition(|m| m.id == last_user_msg.id)
-                            .unwrap();
-                        let has_output_after = messages
-                            .iter()
-                            .skip(last_user_idx + 1)
-                            .any(|m| m.role == "assistant");
+                    .live_turn(&agent_id)
+                    .map(|live| !live.blocks.is_empty())
+                    .unwrap_or(false);
 
-                        if !has_output_after {
-                            // Zero-output condition: re-queue the preempted message.
-                            // Extract text from content blocks (JSON array).
-                            let text_content =
-                                if let Some(blocks) = last_user_msg.content.as_array() {
+                if !has_output {
+                    // Zero-output condition: re-queue the preempted message.
+                    // Fetch last 10 transcript messages (bounded work) to find the
+                    // user message + its attachments. If any non-user messages
+                    // (assistant/tool/system) exist after the last user message, the
+                    // turn has already progressed and we should NOT re-queue (avoids
+                    // duplicate tool calls or re-running side effects).
+                    if let Ok(messages) = self
+                        .services
+                        .store
+                        .get_agent_messages(&agent_id, Some(10))
+                        .await
+                    {
+                        if let Some(last_user_msg) =
+                            messages.iter().rev().find(|m| m.role == "user")
+                        {
+                            let last_user_idx = messages
+                                .iter()
+                                .rposition(|m| m.id == last_user_msg.id)
+                                .unwrap();
+                            let has_non_user_after = messages
+                                .iter()
+                                .skip(last_user_idx + 1)
+                                .any(|m| m.role != "user");
+
+                            if !has_non_user_after {
+                                // Extract text from content blocks (JSON array).
+                                let text_content = if let Some(blocks) =
+                                    last_user_msg.content.as_array()
+                                {
                                     blocks
                                         .iter()
                                         .filter(|b| {
@@ -2268,26 +2283,65 @@ impl AgentManager {
                                     String::new()
                                 };
 
-                            // `persisted: true` prevents duplicate transcript append.
-                            let queued = crate::agent_ops::QueuedMessage {
-                                id: crate::agent_ops::new_message_id(),
-                                content: text_content,
-                                image_blocks: None,
-                                file_blocks: None,
-                                queued_at: crate::now_iso(),
-                                editing: false,
-                                persisted: true,
-                            };
-                            self.services.requeue_front(&agent_id, queued);
+                                // Extract image_blocks and file_blocks from content.
+                                let image_blocks =
+                                    last_user_msg.content.as_array().and_then(|blocks| {
+                                        let imgs: Vec<Value> = blocks
+                                            .iter()
+                                            .filter(|b| {
+                                                b.get("type").and_then(Value::as_str)
+                                                    == Some("image")
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        if imgs.is_empty() {
+                                            None
+                                        } else {
+                                            Some(Value::Array(imgs))
+                                        }
+                                    });
 
-                            // Publish queue updated so FE reflects the re-queued message
-                            self.services
-                                .publish_queue_updated_for(
-                                    &agent_id,
-                                    &workspace_id,
-                                    self.services.queue_snapshot(&agent_id),
-                                )
-                                .await;
+                                let file_blocks =
+                                    last_user_msg.content.as_array().and_then(|blocks| {
+                                        let files: Vec<Value> = blocks
+                                            .iter()
+                                            .filter(|b| {
+                                                b.get("type").and_then(Value::as_str)
+                                                    == Some("file")
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        if files.is_empty() {
+                                            None
+                                        } else {
+                                            Some(Value::Array(files))
+                                        }
+                                    });
+
+                                // `persisted: true` prevents duplicate transcript append;
+                                // `requeued_after_failure: false` so the FE does not show
+                                // "failed — will retry" (interrupt ≠ failure, STAB-114).
+                                let queued = crate::agent_ops::QueuedMessage {
+                                    id: crate::agent_ops::new_message_id(),
+                                    content: text_content,
+                                    image_blocks,
+                                    file_blocks,
+                                    queued_at: crate::now_iso(),
+                                    editing: false,
+                                    persisted: true,
+                                    requeued_after_failure: false,
+                                };
+                                self.services.requeue_front(&agent_id, queued);
+
+                                // Publish queue updated so FE reflects the re-queued message
+                                self.services
+                                    .publish_queue_updated_for(
+                                        &agent_id,
+                                        &workspace_id,
+                                        self.services.queue_snapshot(&agent_id),
+                                    )
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -3456,7 +3510,8 @@ async fn persist_error_and_requeue(
     // Requeue the failed message to the front of the queue. `persisted` is
     // set: the user row already reached the transcript before the failed
     // turn began (send_message / drain persist before spawn_worker), so the
-    // retry drain must not append a duplicate.
+    // retry drain must not append a duplicate. `requeued_after_failure` is
+    // set so the wire emits `requeuedAfterFailure: true` (STAB-112).
     let queued = crate::agent_ops::QueuedMessage {
         id: new_message_id(),
         content: content.to_string(),
@@ -3465,6 +3520,7 @@ async fn persist_error_and_requeue(
         queued_at: now_iso(),
         editing: false,
         persisted: true,
+        requeued_after_failure: true,
     };
     mgr.services.requeue_front(agent_id, queued);
 
