@@ -130,3 +130,15 @@ fn unknown_provider_returns_none() {
         "unknown provider id → no _meta (fallback to first-turn prepend)"
     );
 }
+
+#[test]
+fn blank_prompt_returns_none() {
+    let meta = build_session_meta(Some("claude-code"), Some(""));
+    assert!(meta.is_none(), "empty prompt → no _meta");
+}
+
+#[test]
+fn whitespace_prompt_returns_none() {
+    let meta = build_session_meta(Some("codex"), Some("   \n\t  "));
+    assert!(meta.is_none(), "whitespace-only prompt → no _meta");
+}

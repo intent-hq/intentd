@@ -284,7 +284,10 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// - claude-code: `{ "systemPrompt": { "append": "<prompt>" } }` (append to base)
 /// - codex: `{ "developerInstructions": "<prompt>" }` (bare top-level key)
 fn build_session_meta(provider_id: Option<&str>, system_prompt: Option<&str>) -> Option<Meta> {
-    let prompt = system_prompt?;
+    let prompt = system_prompt?.trim();
+    if prompt.is_empty() {
+        return None;
+    }
     let provider = provider_id?;
     match provider {
         "claude-code" => {
