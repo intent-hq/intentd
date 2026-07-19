@@ -190,12 +190,16 @@ async function handlePrompt(id, params) {
     }
   }
   // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
-  // with zero output. Send a session/status to establish the session, then park
-  // without emitting any chunks. This validates the zero-output requeue path.
+  // with zero output. Send session/update with agent_status (thinking) to establish
+  // the session without emitting assistant content, then park. The live-turn will
+  // have zero assistant blocks, triggering the requeue path.
   if (behavior.parkBeforeFirstChunk && promptCount === 1) {
-    note('session/status', {
+    note('session/update', {
       sessionId: SESSION_ID,
-      status: { type: 'in_progress', message: 'parked before any chunks' },
+      update: {
+        sessionUpdate: 'agent_status',
+        status: { type: 'in_progress', message: 'Thinking...' },
+      },
     });
     pendingPromptIds.push(id);
     return;

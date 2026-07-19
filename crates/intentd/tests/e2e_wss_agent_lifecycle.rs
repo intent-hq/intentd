@@ -5426,12 +5426,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
 /// STAB-114 regression: When an interrupt lands BEFORE any assistant output,
 /// the preempted user message is re-queued at the front (with persisted:true,
 /// requeued_after_failure:false, and attachments preserved).
-///
-/// NOTE: This test is currently #[ignore]d because it's hard to write with the mock provider.
-/// The mock parks BEFORE establishing an ACP session, so cancellable=false and the re-queue
-/// logic doesn't run. The after-streaming test below verifies the opposite case works correctly.
 #[tokio::test]
-#[ignore]
 async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     let Some(script) = gate("STAB-114 zero-output requeue E2E") else {
         return;
@@ -5467,7 +5462,7 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
         &mut sub,
         1,
         "events.subscribe",
-        json!({ "eventTypes": ["agent:queue:updated"], "workspaceId": &ws_id }),
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
     )
     .await;
     assert!(sub_resp["subscriptionId"].is_string());
@@ -5492,9 +5487,29 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     .await;
     assert_eq!(sent["success"], true);
 
-    // Give agent time to park (without streaming chunks). The mock agent with
-    // parkBeforeFirstChunk parks immediately without emitting any chunks.
-    sleep(Duration::from_millis(500)).await;
+    // Deterministic wait: poll agent.get until isResponding=true.
+    // The mock's parkBeforeFirstChunk sends session/status to establish the session,
+    // then parks without emitting chunks. isResponding=true proves the turn is in
+    // progress and the session is established (cancellable=true).
+    let mut is_responding = false;
+    for _ in 0..50 {
+        let get_resp = wss_rpc(
+            &mut rpc,
+            100,
+            "agent.get",
+            json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+        )
+        .await;
+        if get_resp["agent"]["isResponding"].as_bool().unwrap_or(false) {
+            is_responding = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        is_responding,
+        "STAB-114: agent must be responding (turn in progress) before interrupt"
+    );
 
     // Interrupt before any output
     let interrupted = wss_rpc(
@@ -5510,37 +5525,35 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     )
     .await;
     assert_eq!(interrupted["success"], true);
-    // Note: interrupted["queued"] may be true if the agent hasn't fully started yet.
-    // What matters is that the message gets re-queued on the wire.
 
-    // Wait for queue-updated event
-    let mut saw_queue_updated = false;
+    // Wait for queue-updated event showing the original message re-queued
+    let mut saw_requeue = false;
     for _ in 0..20 {
         if let Some(frame) = wss_event_opt(&mut sub, 3).await {
             if frame["params"]["event"]["type"] == "agent:queue:updated" {
-                saw_queue_updated = true;
                 let queue = frame["params"]["event"]["data"]["queue"]
                     .as_array()
                     .expect("queue array");
                 if !queue.is_empty() {
                     let msg = &queue[0];
-                    assert!(
-                        msg["content"].as_str().unwrap_or("").contains("first"),
-                        "re-queued message should be the original user message, got: {}",
-                        msg["content"]
-                    );
-                    assert_eq!(
-                        msg["requeuedAfterFailure"], false,
-                        "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
-                    );
-                    break;
+                    if msg["content"].as_str().unwrap_or("").contains("first") {
+                        saw_requeue = true;
+                        // Wire omits requeuedAfterFailure unless true, so check it's absent or false
+                        let requeued_after_failure =
+                            msg["requeuedAfterFailure"].as_bool().unwrap_or(false);
+                        assert!(
+                            !requeued_after_failure,
+                            "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
+                        );
+                        break;
+                    }
                 }
             }
         }
     }
     assert!(
-        saw_queue_updated,
-        "STAB-114: agent:queue:updated event should be emitted after zero-output interrupt"
+        saw_requeue,
+        "STAB-114: original message should be re-queued after zero-output interrupt"
     );
 }
 

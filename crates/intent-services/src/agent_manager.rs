@@ -2241,7 +2241,8 @@ impl AgentManager {
                 // slot (not persisted transcript) to detect zero output: assistant
                 // rows are only persisted at turn END, so an interrupted mid-stream
                 // turn would incorrectly look like zero output if we checked the
-                // transcript.
+                // transcript. The LiveTurn.blocks are assistant blocks by construction
+                // (see Transcript::snapshot_blocks), so non-empty means output exists.
                 let has_output = self
                     .services
                     .live_turn(&agent_id)
