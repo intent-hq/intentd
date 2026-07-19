@@ -53,7 +53,7 @@ impl Store {
         .bind(deletions)
         .bind(files_changed)
         .bind(now_iso())
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert workspace metrics failed: {e}")))?;
         Ok(())
@@ -69,7 +69,7 @@ impl Store {
              FROM workspace_metrics WHERE workspace_id = ?",
         )
         .bind(&workspace_id.0)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("get workspace metrics failed: {e}")))?;
         row.as_ref().map(map_workspace_metrics_row).transpose()
@@ -81,7 +81,7 @@ impl Store {
             "SELECT workspace_id, additions, deletions, files_changed, updated_at \
              FROM workspace_metrics ORDER BY workspace_id",
         )
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list workspace metrics failed: {e}")))?;
         rows.iter().map(map_workspace_metrics_row).collect()
@@ -91,7 +91,7 @@ impl Store {
     pub async fn delete_workspace_metrics(&self, workspace_id: &WorkspaceId) -> Result<()> {
         sqlx::query("DELETE FROM workspace_metrics WHERE workspace_id = ?")
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete workspace metrics failed: {e}")))?;
         Ok(())
@@ -120,7 +120,7 @@ impl Store {
         .bind(deletions)
         .bind(files_changed)
         .bind(now_iso())
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert agent metrics failed: {e}")))?;
         Ok(())
@@ -136,7 +136,7 @@ impl Store {
              FROM agent_metrics WHERE workspace_id = ? ORDER BY agent_id",
         )
         .bind(&workspace_id.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list agent metrics failed: {e}")))?;
         rows.iter().map(map_agent_metrics_row).collect()
@@ -150,7 +150,7 @@ impl Store {
              FROM agent_metrics WHERE agent_id = ? ORDER BY workspace_id",
         )
         .bind(agent_id)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list agent metrics by id failed: {e}")))?;
         rows.iter().map(map_agent_metrics_row).collect()
@@ -164,7 +164,7 @@ impl Store {
     ) -> Result<()> {
         sqlx::query("DELETE FROM agent_metrics WHERE workspace_id = ?")
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete workspace agent metrics failed: {e}")))?;
         Ok(())
@@ -175,7 +175,7 @@ impl Store {
     pub async fn delete_agent_metrics(&self, agent_id: &str) -> Result<u64> {
         let result = sqlx::query("DELETE FROM agent_metrics WHERE agent_id = ?")
             .bind(agent_id)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete agent metrics failed: {e}")))?;
         Ok(result.rows_affected())

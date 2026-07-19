@@ -31,7 +31,7 @@ impl Store {
         // path is outside `busy_timeout`'s retry scope; IMMEDIATE acquisition
         // is retried by the handler.
         let mut conn = self
-            .pool()
+            .write_pool()
             .acquire()
             .await
             .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
@@ -117,7 +117,7 @@ impl Store {
         )
         .bind(&note_id.0)
         .bind(&workspace_id.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list note_versions failed: {e}")))?;
         rows.iter().map(map_summary_row).collect()
@@ -138,7 +138,7 @@ impl Store {
         .bind(&note_id.0)
         .bind(&workspace_id.0)
         .bind(v)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("get note_version failed: {e}")))?;
         match row {

@@ -91,7 +91,7 @@ impl Store {
             .bind(s.retry_count)
             .bind(&s.created_at)
             .bind(&s.updated_at)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("insert sandbox failed: {e}")))?;
         Ok(())
@@ -107,7 +107,7 @@ impl Store {
         let row = sqlx::query(&sql)
             .bind(&workspace_id.0)
             .bind(&agent_id.0)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("get sandbox failed: {e}")))?;
         row.map(|r| sandbox_from_row(&r)).transpose()
@@ -128,7 +128,7 @@ impl Store {
         .bind(updated_at)
         .bind(&workspace_id.0)
         .bind(&agent_id.0)
-        .execute(&self.pool)
+        .execute(self.write_pool())
         .await
         .map_err(|e| intent_core::Error::Internal(format!("update sandbox status failed: {e}")))?;
         Ok(())
@@ -143,7 +143,7 @@ impl Store {
         sqlx::query("DELETE FROM sandbox WHERE workspace_id = ? AND agent_id = ?")
             .bind(&workspace_id.0)
             .bind(&agent_id.0)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("delete sandbox failed: {e}")))?;
         Ok(())
@@ -154,7 +154,7 @@ impl Store {
         let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE workspace_id = ?");
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(&self.pool)
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("list sandboxes failed: {e}")))?;
         rows.iter().map(sandbox_from_row).collect()
@@ -164,7 +164,7 @@ impl Store {
     pub async fn list_all_sandboxes(&self) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox");
         let rows = sqlx::query(&sql)
-            .fetch_all(&self.pool)
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("list all sandboxes failed: {e}")))?;
         rows.iter().map(sandbox_from_row).collect()
@@ -180,7 +180,7 @@ impl Store {
             sqlx::query("SELECT retry_count FROM sandbox WHERE workspace_id = ? AND agent_id = ?")
                 .bind(&workspace_id.0)
                 .bind(&agent_id.0)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.read_pool())
                 .await
                 .map_err(|e| {
                     intent_core::Error::Internal(format!("get sandbox retry count failed: {e}"))
@@ -200,7 +200,7 @@ impl Store {
         sqlx::query("UPDATE sandbox SET retry_count = retry_count + 1 WHERE workspace_id = ? AND agent_id = ?")
             .bind(&workspace_id.0)
             .bind(&agent_id.0)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("increment sandbox retry count failed: {e}")))?;
         Ok(())
@@ -215,7 +215,7 @@ impl Store {
         sqlx::query("UPDATE sandbox SET retry_count = 0 WHERE workspace_id = ? AND agent_id = ?")
             .bind(&workspace_id.0)
             .bind(&agent_id.0)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| {
                 intent_core::Error::Internal(format!("clear sandbox retry count failed: {e}"))

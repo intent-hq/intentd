@@ -37,7 +37,7 @@ impl Store {
         .bind(&caps)
         .bind(&now)
         .bind(&now)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert client failed: {e}")))?;
         Ok(())
@@ -49,7 +49,7 @@ impl Store {
             "SELECT id, name, capabilities, first_seen, last_seen FROM client WHERE id = ?",
         )
         .bind(&id.0)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("get client failed: {e}")))?;
         row.as_ref().map(map_client_row).transpose()
