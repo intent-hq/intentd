@@ -120,6 +120,14 @@ impl Store {
         &self.pool
     }
 
+    /// Close the pool gracefully, checkpointing the WAL and freeing resources.
+    /// Call this during daemon shutdown to ensure WAL changes are visible to
+    /// subsequent daemon instances (regression: persisted settings must survive
+    /// app relaunches in sidecar mode).
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     /// Compare the migrations embedded in the binary against the versions
     /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
     pub async fn migration_status(&self) -> Result<MigrationStatus> {

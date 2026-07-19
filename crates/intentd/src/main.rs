@@ -402,6 +402,8 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // Hold a store handle for the §5.4 idempotency reaper (same lifecycle root
     // as the retention sweep) before the store is moved into the services below.
     let idempotency_store = store.clone();
+    // Hold a store handle for reading persisted server.wsApi.enabled at boot.
+    let boot_settings_store = store.clone();
     // REV-1: build the shared first-client-sticky reverse-dispatch registry
     // BEFORE the services surface + listeners so both sides observe the same
     // live-client set. Every accepted UDS/WSS connection registers its
@@ -544,13 +546,11 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS (regardless of --listen mode) so settings can
-    // toggle the listener on/off at runtime. Boot-time auto-start of the listener
-    // remains ONLY for --listen tcp/both (CLI/env win over persisted settings).
-    // With --listen uds: listener does NOT auto-start at boot (regardless of
-    // persisted server.wsApi.enabled), but settings.update server.wsApi.enabled=true
-    // can start it at runtime (TLS + bearer auth on, same as any TCP listener unless
-    // --insecure). Note: persisted settings are NOT honored at boot for any mode —
-    // only CLI --listen and env (INTENTD_TCP_PORT) matter.
+    // toggle the listener on/off at runtime. Boot-time auto-start of the listener:
+    // CLI --listen tcp/both → always starts; CLI --listen uds → starts ONLY if
+    // persisted server.wsApi.enabled=true (sidecar/packaged posture honors user
+    // toggle state across app relaunches). CLI flags and env (INTENTD_TCP_PORT)
+    // take precedence over persisted settings. With --insecure: no TLS/auth.
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
 
@@ -658,6 +658,38 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
     services.attach_server_control(server_control);
 
+    // Boot-time WSS listener auto-start when persisted server.wsApi.enabled=true
+    // AND --listen uds (sidecar/packaged posture). CLI --listen tcp/both already
+    // started the listener above, so this only fires when !serve_tcp_enabled.
+    // A bind failure at boot (port in use) is non-fatal: UDS stays up, setting
+    // stays true, warning logged (UI shows "not running" via pairingInfo.port=null).
+    if !serve_tcp_enabled && !insecure {
+        if let Ok(Some(raw)) = boot_settings_store
+            .get_setting("server.wsApi.enabled")
+            .await
+        {
+            if let Ok(enabled) = serde_json::from_str::<bool>(&raw) {
+                if enabled {
+                    match control.start_ws_listener().await {
+                        Ok(port) => {
+                            tracing::info!(
+                                port,
+                                "WSS listener auto-started at boot (persisted server.wsApi.enabled=true)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to auto-start WSS listener at boot (persisted enabled=true); \
+                                 UDS still serving, setting remains true, toggle OFF→ON to retry"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Build pairing info provider for `server.pairingInfo` / `server.rotateToken` (§5.2).
     // Only built when there's a token store (secure mode); `None` in insecure mode.
     // Available to UDS clients even when TCP is disabled (they can still call the RPCs).
@@ -727,6 +759,12 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
     manager.shutdown().await;
+
+    // Close the store pool gracefully, checkpointing the WAL so settings and
+    // other persisted data are visible to the next daemon instance (regression:
+    // persisted server.wsApi.enabled must survive app relaunches in sidecar mode).
+    boot_settings_store.close().await;
+
     Ok(())
 }
 
