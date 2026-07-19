@@ -2232,10 +2232,11 @@ impl AgentManager {
                 // produced zero output (no assistant messages after the last user
                 // message). If so, re-queue the preempted user message so it gets
                 // processed after the interrupt completes.
+                // Fetch last 10 messages to check for zero-output (avoid O(n) on long transcripts)
                 if let Ok(messages) = self
                     .services
                     .store
-                    .get_agent_messages(&agent_id, None)
+                    .get_agent_messages(&agent_id, Some(10))
                     .await
                 {
                     // Walk backwards to find the last user message
