@@ -78,10 +78,12 @@ pub(crate) struct QueuedMessage {
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
-    /// imageBlocks?, fileBlocks?, editing?}`). `position` is the entry's 0-based
-    /// index in the queue (0 = next to be sent) and is supplied by the caller
-    /// since it is positional. `editing` is only present when `true` (a client
-    /// that hasn't migrated still sees the legacy shape unchanged).
+    /// imageBlocks?, fileBlocks?, editing?, requeuedAfterFailure?}`). `position` is
+    /// the entry's 0-based index in the queue (0 = next to be sent) and is supplied
+    /// by the caller since it is positional. `editing` is only present when `true`
+    /// (a client that hasn't migrated still sees the legacy shape unchanged).
+    /// `requeuedAfterFailure` is only present when `true` (STAB-112: backward-compatible
+    /// marker for terminal-failure requeues).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -97,6 +99,9 @@ impl QueuedMessage {
         }
         if self.editing {
             v["editing"] = Value::Bool(true);
+        }
+        if self.persisted {
+            v["requeuedAfterFailure"] = Value::Bool(true);
         }
         v
     }
