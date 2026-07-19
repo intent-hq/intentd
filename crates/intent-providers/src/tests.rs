@@ -854,7 +854,9 @@ fn opencode_env_includes_instructions_with_model() {
     let env = build_provider_env(opencode, Some("claude-sonnet-4"), Some("/tmp/rules.md"));
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4","instructions":["/tmp/rules.md"]}"#)
+        Some(
+            r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4","instructions":["/tmp/rules.md"]}"#
+        )
     );
 }
 
