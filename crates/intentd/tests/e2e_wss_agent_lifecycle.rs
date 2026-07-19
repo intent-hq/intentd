@@ -5427,17 +5427,16 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
 /// the preempted user message is re-queued at the front (with persisted:true,
 /// requeued_after_failure:false, and attachments preserved).
 ///
-/// NOTE: Currently #[ignore]d due to mock provider limitations. The mock's
-/// `parkBeforeFirstChunk` directive parks the turn without emitting assistant
-/// content, but the requeue event isn't reaching the test subscriber. The zero-
-/// output detection logic IS tested via the inverse case (after-streaming test
-/// below), which proves the has_output check works correctly.
+/// Uses `parkBeforeFirstChunk` mock behavior + deterministic wait for
+/// agent:stream:status phase="prompt" to ensure the ACP session is established
+/// (making the turn cancellable) before sending the interrupt.
 #[tokio::test]
-#[ignore]
 async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     let Some(script) = gate("STAB-114 zero-output requeue E2E") else {
+        eprintln!("[STAB114-TEST] Gate returned None, test skipped");
         return;
     };
+    eprintln!("[STAB114-TEST] Test body running");
 
     let data_dir = temp_data_dir();
     let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
@@ -5494,28 +5493,27 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     .await;
     assert_eq!(sent["success"], true);
 
-    // Deterministic wait: poll agent.get until isResponding=true.
-    // The mock's parkBeforeFirstChunk sends session/status to establish the session,
-    // then parks without emitting chunks. isResponding=true proves the turn is in
-    // progress and the session is established (cancellable=true).
-    let mut is_responding = false;
+    // Deterministic wait: wait for agent:stream:status with phase="prompt".
+    // This ensures the ACP session is established and acp_session_id is persisted,
+    // making the turn cancellable. Waiting for isResponding alone is insufficient
+    // because it becomes true when the worker starts, before acp_session_id is set.
+    let mut saw_prompt_phase = false;
     for _ in 0..50 {
-        let get_resp = wss_rpc(
-            &mut rpc,
-            100,
-            "agent.get",
-            json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
-        )
-        .await;
-        if get_resp["agent"]["isResponding"].as_bool().unwrap_or(false) {
-            is_responding = true;
-            break;
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:stream:status" {
+                let phase = frame["params"]["event"]["data"]["phase"]
+                    .as_str()
+                    .unwrap_or("");
+                if phase == "prompt" {
+                    saw_prompt_phase = true;
+                    break;
+                }
+            }
         }
-        sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        is_responding,
-        "STAB-114: agent must be responding (turn in progress) before interrupt"
+        saw_prompt_phase,
+        "STAB-114: must see prompt phase before interrupt (ensures session established)"
     );
 
     // Interrupt before any output
