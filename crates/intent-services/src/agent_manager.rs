@@ -1284,7 +1284,6 @@ impl AgentManager {
             .services
             .resume_acp_session(
                 conn.as_ref(),
-                provider.id,
                 &handshake.initialize,
                 agent_id,
                 cwd.clone(),
@@ -1337,7 +1336,6 @@ impl AgentManager {
                 .services
                 .recreate_acp_session(
                     conn.as_ref(),
-                    provider.id,
                     agent_id,
                     &expected_old,
                     cwd,
@@ -1358,7 +1356,7 @@ impl AgentManager {
         // 3) Brand-new agent → open and persist the first session (write-once).
         let opened = self
             .services
-            .open_acp_session(conn.as_ref(), provider.id, agent_id, cwd, Vec::new())
+            .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
             .await?;
         self.maybe_bypass_permissions(
             conn.as_ref(),
