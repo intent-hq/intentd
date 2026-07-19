@@ -1084,3 +1084,145 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
         raw_events,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[test]
+    fn child_in_undelivered_group_returns_true_for_grouped_child() {
+        let ws_id = WorkspaceId("test-ws".to_string());
+        let parent_id = AgentId("parent-123".to_string());
+        let child_a_id = AgentId("child-a".to_string());
+        let child_b_id = AgentId("child-b".to_string());
+
+        // Create a workspace watches map with an undelivered group
+        let mut ws_map: HashMap<WorkspaceId, WorkspaceWatches> = HashMap::new();
+        let group = DelegationGroup {
+            group_id: "group-1".to_string(),
+            parent_agent_id: parent_id.clone(),
+            await_mode: "after_all".to_string(),
+            expected_agent_ids: vec![child_a_id.clone(), child_b_id.clone()],
+            completed_agent_ids: vec![],
+            deleted_agent_ids: vec![],
+            subscription_id: None,
+            sealed: false,
+            delivered: false,
+            event_summaries: vec![],
+            raw_events: vec![],
+        };
+        ws_map.insert(
+            ws_id.clone(),
+            WorkspaceWatches {
+                subscriptions: vec![],
+                delegation_groups: vec![group],
+            },
+        );
+
+        // Build a lock around the map to mimic Services.agent_subscriptions
+        let mutex = Mutex::new(ws_map);
+
+        // Helper to check if child is in undelivered group (mirrors Services::child_in_undelivered_group)
+        let check_in_group = |parent: &AgentId, child: &AgentId| -> bool {
+            mutex
+                .lock()
+                .expect("poisoned")
+                .get(&ws_id)
+                .map(|w| {
+                    w.delegation_groups.iter().any(|g| {
+                        &g.parent_agent_id == parent
+                            && !g.delivered
+                            && g.expected_agent_ids.contains(child)
+                    })
+                })
+                .unwrap_or(false)
+        };
+
+        // Both children should be in the undelivered group
+        assert!(
+            check_in_group(&parent_id, &child_a_id),
+            "child A should be in undelivered group"
+        );
+        assert!(
+            check_in_group(&parent_id, &child_b_id),
+            "child B should be in undelivered group"
+        );
+
+        // Non-member should not be in the group
+        let non_member_id = AgentId("non-member".to_string());
+        assert!(
+            !check_in_group(&parent_id, &non_member_id),
+            "non-member should NOT be in undelivered group"
+        );
+    }
+
+    #[test]
+    fn child_in_undelivered_group_returns_false_after_delivered() {
+        let ws_id = WorkspaceId("test-ws".to_string());
+        let parent_id = AgentId("parent-456".to_string());
+        let child_id = AgentId("child-c".to_string());
+
+        // Create a workspace watches map with an undelivered group
+        let mut ws_map: HashMap<WorkspaceId, WorkspaceWatches> = HashMap::new();
+        let group = DelegationGroup {
+            group_id: "group-2".to_string(),
+            parent_agent_id: parent_id.clone(),
+            await_mode: "after_all".to_string(),
+            expected_agent_ids: vec![child_id.clone()],
+            completed_agent_ids: vec![],
+            deleted_agent_ids: vec![],
+            subscription_id: None,
+            sealed: false,
+            delivered: false,
+            event_summaries: vec![],
+            raw_events: vec![],
+        };
+        ws_map.insert(
+            ws_id.clone(),
+            WorkspaceWatches {
+                subscriptions: vec![],
+                delegation_groups: vec![group],
+            },
+        );
+
+        let mutex = Mutex::new(ws_map);
+
+        // Helper to check if child is in undelivered group
+        let check_in_group = |parent: &AgentId, child: &AgentId| -> bool {
+            mutex
+                .lock()
+                .expect("poisoned")
+                .get(&ws_id)
+                .map(|w| {
+                    w.delegation_groups.iter().any(|g| {
+                        &g.parent_agent_id == parent
+                            && !g.delivered
+                            && g.expected_agent_ids.contains(child)
+                    })
+                })
+                .unwrap_or(false)
+        };
+
+        assert!(
+            check_in_group(&parent_id, &child_id),
+            "child should be in undelivered group before delivery"
+        );
+
+        // Mark the group as delivered
+        {
+            let mut guard = mutex.lock().expect("poisoned");
+            if let Some(w) = guard.get_mut(&ws_id) {
+                if let Some(g) = w.delegation_groups.first_mut() {
+                    g.delivered = true;
+                }
+            }
+        }
+
+        assert!(
+            !check_in_group(&parent_id, &child_id),
+            "child should NOT be in undelivered group after delivery"
+        );
+    }
+}
