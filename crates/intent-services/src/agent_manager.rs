@@ -653,6 +653,10 @@ impl Drop for TempConfigFile {
 /// request loop, the owned child (its process group is killed on teardown via
 /// [`kill_child_tree`], with `kill_on_drop` as a direct-child safety net), and
 /// the per-agent MCP bridge + generated config that back the agent→BE tool loop.
+///
+/// `spawned_model` and `spawned_provider` track the model/provider the child was
+/// spawned with, enabling `ensure_started` to detect model changes (via `agent.setModel`)
+/// and respawn the child with the new model before the next turn.
 struct AgentHandle {
     connection: Arc<Connection>,
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
@@ -661,6 +665,8 @@ struct AgentHandle {
     _mcp_bridge: Option<McpBridge>,
     _mcp_config: Option<TempConfigFile>,
     _rules_config: Option<TempConfigFile>,
+    spawned_model: Option<String>,
+    spawned_provider: String,
 }
 
 impl Drop for AgentHandle {
@@ -1035,6 +1041,8 @@ impl AgentManager {
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
             _rules_config: rules_config,
+            spawned_model: opts.model.map(|s| s.to_string()),
+            spawned_provider: opts.provider.command.to_string(),
         };
         // Concurrency safety: fully reap any stale handle + child for this agent
         // BEFORE installing the new one, reusing the process-group teardown.
@@ -2391,20 +2399,47 @@ impl AgentManager {
 
     /// Ensure the agent's child process + ACP session exist, spawning lazily on
     /// first turn (the TS spawn-on-first-message semantics) and reusing the live
-    /// session otherwise. Returns the `acpSessionId` to drive the turn.
+    /// session otherwise. When the session's model/provider has changed (via
+    /// `agent.setModel`), tears down the existing child and respawns with the
+    /// new model before the next turn. Returns the `acpSessionId` to drive the turn.
     async fn ensure_started(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
         let session = self.services.store.get_agent_session(agent_id).await?;
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let resolved = resolve_spawn(&session, workspace.as_ref(), &self.services.store).await?;
+
+        // Check if the agent's model/provider has changed (via agent.setModel).
+        // If so, tear down the existing child and force a respawn with the new model.
         if self.contains(agent_id) {
-            if let Some(acp) = session.acp_session_id.clone() {
+            let needs_respawn = {
+                let handles = self.handles.lock().unwrap();
+                if let Some(handle) = handles.get(agent_id) {
+                    // Compare the session's currently-resolved model/provider against
+                    // the values the child was spawned with. A mismatch means
+                    // agent.setModel was called while the child was live.
+                    let model_changed =
+                        handle.spawned_model.as_deref() != resolved.model.as_deref();
+                    let provider_changed = handle.spawned_provider != resolved.provider.command;
+                    model_changed || provider_changed
+                } else {
+                    false
+                }
+            };
+
+            if needs_respawn {
+                // Tear down the existing child (preserving the acpSessionId so
+                // start_session can try session/load for providers that support it).
+                // This is narrower than stop() — only kills the child/handle, no
+                // worker/busy-flag touch, matching the retry-spawn teardown path.
+                self.kill_child_only(agent_id).await;
+            } else if let Some(acp) = session.acp_session_id.clone() {
+                // Model unchanged and child is live — reuse the existing session.
                 return Ok(acp);
             }
         }
-        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
-        let resolved = resolve_spawn(&session, workspace.as_ref(), &self.services.store).await?;
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
