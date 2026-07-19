@@ -18,6 +18,22 @@ pub enum ProviderRuntime {
     Native,
 }
 
+/// How a provider receives the assembled system prompt (base override,
+/// specialist role, user rules, workspace rules, skills, isolation hints).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionMechanism {
+    /// CLI flag pointing to a rules file (e.g. `--rules`, `--append-system-prompt-file`).
+    RulesFileFlag,
+    /// ACP `session/new` / `session/load` `_meta` field (claude-code, codex).
+    SessionMeta,
+    /// Environment variable config (opencode: `OPENCODE_CONFIG_CONTENT` with `instructions`).
+    EnvConfig,
+    /// First-turn prepend in a `<system>` block (cortex, mock — fallback).
+    FirstTurnPrepend,
+    /// No injection mechanism (provider doesn't support system prompts).
+    None,
+}
+
 /// Configuration for an ACP provider (port of `ACPProviderConfig`).
 ///
 /// UI-only fields from the TS interface (`ipcChannelPrefix`, `iconPath`) are
@@ -50,6 +66,8 @@ pub struct ProviderConfig {
     pub supports_rules_file: bool,
     /// Flag for the rules file (e.g., `--rules`).
     pub rules_flag: Option<&'static str>,
+    /// How the provider receives the assembled system prompt.
+    pub injection_mechanism: InjectionMechanism,
     /// Flag for the MCP config file (e.g., `--mcp-config`).
     pub mcp_config_flag: Option<&'static str>,
     /// Flag for quiet mode (e.g., `--quiet`).
@@ -102,6 +120,7 @@ impl ProviderConfig {
             supports_mcp_config: false,
             supports_rules_file: false,
             rules_flag: None,
+            injection_mechanism: InjectionMechanism::None,
             mcp_config_flag: None,
             quiet_flag: None,
             remove_tool_flag: None,
@@ -141,6 +160,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_mcp_config: true,
         supports_rules_file: true,
         rules_flag: Some("--rules"),
+        injection_mechanism: InjectionMechanism::RulesFileFlag,
         mcp_config_flag: Some("--mcp-config"),
         quiet_flag: Some("--quiet"),
         remove_tool_flag: Some("--remove-tool"),
@@ -156,6 +176,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
+        injection_mechanism: InjectionMechanism::SessionMeta,
         auth_check_args: Some(&["auth", "status"]),
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
@@ -166,6 +187,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
         can_be_disabled: true,
+        injection_mechanism: InjectionMechanism::SessionMeta,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some("@agentclientprotocol/codex-acp"),
@@ -176,6 +198,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // gets the NODE_OPTIONS heap cap like plain Node providers (STAB-50).
         runtime: ProviderRuntime::Electron,
         can_be_disabled: true,
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         requires_feature_code: Some("cortex"),
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
@@ -183,6 +206,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Node,
         base_args: &["acp"],
         can_be_disabled: true,
+        injection_mechanism: InjectionMechanism::EnvConfig,
         auth_check_args: Some(&["models"]),
         login_docs_url: Some("https://opencode.ai/docs#configure"),
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
@@ -192,6 +216,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         base_args: &["exec", "--output-format", "acp"],
         model_flag: Some("--model"),
         can_be_disabled: true,
+        supports_rules_file: true,
+        rules_flag: Some("--append-system-prompt-file"),
+        injection_mechanism: InjectionMechanism::RulesFileFlag,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
@@ -199,6 +226,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Node,
         supports_authenticate: true,
         can_be_disabled: true,
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         requires_env_var: Some("MOCK_AGENT_SCRIPT_PATH"),
         ..ProviderConfig::empty("mock", "Mock (E2E)", "node")
     },

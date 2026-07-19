@@ -1351,7 +1351,7 @@ mod mcp_tests {
 
         // Build opencode's env with permission.task=deny (with model set)
         let opencode = find_provider("opencode").unwrap();
-        let env = build_provider_env(opencode, Some("claude-sonnet-4"));
+        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
         let config_content = env
             .get("OPENCODE_CONFIG_CONTENT")
             .expect("OPENCODE_CONFIG_CONTENT must be set");
