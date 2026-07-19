@@ -459,9 +459,12 @@ mod session_tests {
             .iter()
             .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
             .expect("agent received session/new");
-        // Assert _meta is absent for non-claude-code providers
+        // Assert _meta is absent for non-claude-code providers (check key absence explicitly)
+        let params = new_req["params"]
+            .as_object()
+            .expect("params must be an object");
         assert!(
-            new_req["params"]["_meta"].is_null(),
+            !params.contains_key("_meta"),
             "session/new for non-claude-code provider must not inject _meta"
         );
     }

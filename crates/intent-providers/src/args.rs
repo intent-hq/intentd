@@ -197,9 +197,9 @@ pub fn build_provider_env(
         "opencode" => {
             // Always emit OPENCODE_CONFIG_CONTENT with permission.task = deny to
             // disallow the provider-native task tool (subagent spawning). Merge
-            // with the model key when a model is set. The permission key survives
-            // MCP merge (to_opencode_mcp_config parses and re-serializes without
-            // clobbering top-level keys).
+            // with the model key when a model is set. The permission key is preserved
+            // when workspace MCP servers are merged into the config at spawn time
+            // (see opencode_permission_survives_mcp_merge test in intent-acp).
             let config_content = if let Some(m) = model {
                 format!(
                     "{{\"model\":\"{}\",\"permission\":{{\"task\":\"deny\"}}}}",
