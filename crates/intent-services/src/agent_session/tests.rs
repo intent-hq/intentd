@@ -726,13 +726,7 @@ async fn resume_requires_capability_and_stored_id() {
 
     // No stored acpSessionId yet → None even with the capability.
     assert!(services
-        .resume_acp_session(
-            &conn,
-            &init_caps(true),
-            &agent_id,
-            "/tmp/ws",
-            Vec::new()
-        )
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
         .await
         .unwrap()
         .is_none());
@@ -744,26 +738,14 @@ async fn resume_requires_capability_and_stored_id() {
 
     // Stored id but the agent lacks loadSession → None.
     assert!(services
-        .resume_acp_session(
-            &conn,
-            &init_caps(false),
-            &agent_id,
-            "/tmp/ws",
-            Vec::new()
-        )
+        .resume_acp_session(&conn, &init_caps(false), &agent_id, "/tmp/ws", Vec::new())
         .await
         .unwrap()
         .is_none());
 
     // Stored id + capability → resumes.
     let opened = services
-        .resume_acp_session(
-            &conn,
-            &init_caps(true),
-            &agent_id,
-            "/tmp/ws",
-            Vec::new(),
-        )
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
         .await
         .unwrap()
         .expect("resume yields opened session");
@@ -787,13 +769,7 @@ async fn recreate_acp_session_replaces_stored_id() {
 
     // recreate opens a fresh session and CAS-swaps the lost id for the new one.
     let opened = services
-        .recreate_acp_session(
-            &conn,
-            &agent_id,
-            "stale-id",
-            "/tmp/ws",
-            Vec::new(),
-        )
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
         .await
         .expect("recreate session");
     assert_eq!(opened.session_id, ACP_SID);
@@ -804,13 +780,7 @@ async fn recreate_acp_session_replaces_stored_id() {
     // canonical id rather than overwriting it (a second session/new is opened
     // but the CAS declines to swap).
     let opened = services
-        .recreate_acp_session(
-            &conn,
-            &agent_id,
-            "stale-id",
-            "/tmp/ws",
-            Vec::new(),
-        )
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
         .await
         .expect("recreate session");
     assert_eq!(
@@ -841,13 +811,7 @@ async fn resume_acp_session_emits_session_load_status() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let opened = services
-        .resume_acp_session(
-            &conn,
-            &init_caps(true),
-            &agent_id,
-            "/tmp/ws",
-            Vec::new(),
-        )
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
         .await
         .unwrap()
         .expect("resume yields opened session");
@@ -882,13 +846,7 @@ async fn recreate_acp_session_emits_session_create_status() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
 
     let opened = services
-        .recreate_acp_session(
-            &conn,
-            &agent_id,
-            "stale-id",
-            "/tmp/ws",
-            Vec::new(),
-        )
+        .recreate_acp_session(&conn, &agent_id, "stale-id", "/tmp/ws", Vec::new())
         .await
         .expect("recreate session");
     assert_eq!(opened.session_id, ACP_SID);

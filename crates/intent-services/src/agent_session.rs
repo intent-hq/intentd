@@ -307,7 +307,8 @@ fn build_session_meta(provider_id: Option<&str>, system_prompt: Option<&str>) ->
                 let prompt = prompt.trim();
                 if !prompt.is_empty() {
                     let mut system_prompt_obj = serde_json::Map::new();
-                    system_prompt_obj.insert("append".to_string(), Value::String(prompt.to_string()));
+                    system_prompt_obj
+                        .insert("append".to_string(), Value::String(prompt.to_string()));
                     meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
                 }
             }

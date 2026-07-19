@@ -10,9 +10,27 @@ fn claude_code_meta_appends_system_prompt() {
     let meta_map = meta.unwrap();
     assert_eq!(
         meta_map.len(),
-        1,
-        "claude-code _meta has exactly one top-level key"
+        2,
+        "claude-code _meta has two top-level keys (claudeCode + systemPrompt)"
     );
+
+    // Check claudeCode.options.disallowedTools
+    let claude_code_value = meta_map.get("claudeCode");
+    assert!(
+        claude_code_value.is_some(),
+        "claude-code _meta contains claudeCode"
+    );
+    let claude_code_obj = claude_code_value.unwrap().as_object().unwrap();
+    let options_obj = claude_code_obj.get("options").unwrap().as_object().unwrap();
+    let disallowed = options_obj
+        .get("disallowedTools")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(disallowed.len(), 1);
+    assert_eq!(disallowed[0].as_str(), Some("Task"));
+
+    // Check systemPrompt.append
     let system_prompt_value = meta_map.get("systemPrompt");
     assert!(
         system_prompt_value.is_some(),
@@ -111,9 +129,49 @@ fn no_provider_returns_none() {
 }
 
 #[test]
-fn no_prompt_returns_none() {
+fn codex_no_prompt_returns_none() {
+    let meta = build_session_meta(Some("codex"), None);
+    assert!(meta.is_none(), "codex with no prompt → no _meta");
+}
+
+#[test]
+fn codex_blank_prompt_returns_none() {
+    let meta = build_session_meta(Some("codex"), Some(""));
+    assert!(meta.is_none(), "codex with blank prompt → no _meta");
+}
+
+#[test]
+fn claude_code_no_prompt_still_injects_disallowed_tools() {
     let meta = build_session_meta(Some("claude-code"), None);
-    assert!(meta.is_none(), "no system prompt → no _meta");
+    assert!(
+        meta.is_some(),
+        "claude-code always gets _meta (disallowedTools)"
+    );
+    let meta_map = meta.unwrap();
+    assert_eq!(
+        meta_map.len(),
+        1,
+        "claude-code _meta with no prompt has only claudeCode key"
+    );
+
+    // Check claudeCode.options.disallowedTools
+    let claude_code_value = meta_map.get("claudeCode");
+    assert!(
+        claude_code_value.is_some(),
+        "claude-code _meta contains claudeCode"
+    );
+    let claude_code_obj = claude_code_value.unwrap().as_object().unwrap();
+    let options_obj = claude_code_obj.get("options").unwrap().as_object().unwrap();
+    let disallowed = options_obj
+        .get("disallowedTools")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(disallowed.len(), 1);
+    assert_eq!(disallowed[0].as_str(), Some("Task"));
+
+    // No systemPrompt key
+    assert!(meta_map.get("systemPrompt").is_none());
 }
 
 #[test]
@@ -132,9 +190,37 @@ fn unknown_provider_returns_none() {
 }
 
 #[test]
-fn blank_prompt_returns_none() {
+fn claude_code_blank_prompt_still_injects_disallowed_tools() {
     let meta = build_session_meta(Some("claude-code"), Some(""));
-    assert!(meta.is_none(), "empty prompt → no _meta");
+    assert!(
+        meta.is_some(),
+        "claude-code always gets _meta (disallowedTools)"
+    );
+    let meta_map = meta.unwrap();
+    assert_eq!(
+        meta_map.len(),
+        1,
+        "claude-code _meta with blank prompt has only claudeCode key"
+    );
+
+    // Check claudeCode.options.disallowedTools
+    let claude_code_value = meta_map.get("claudeCode");
+    assert!(
+        claude_code_value.is_some(),
+        "claude-code _meta contains claudeCode"
+    );
+    let claude_code_obj = claude_code_value.unwrap().as_object().unwrap();
+    let options_obj = claude_code_obj.get("options").unwrap().as_object().unwrap();
+    let disallowed = options_obj
+        .get("disallowedTools")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(disallowed.len(), 1);
+    assert_eq!(disallowed[0].as_str(), Some("Task"));
+
+    // No systemPrompt key (blank filtered)
+    assert!(meta_map.get("systemPrompt").is_none());
 }
 
 #[test]

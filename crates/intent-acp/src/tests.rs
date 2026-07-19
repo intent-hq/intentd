@@ -352,8 +352,8 @@ mod session_tests {
 
     #[tokio::test]
     async fn new_session_serializes_meta_with_correct_wire_name() {
-        use serde_json::json;
         use crate::session::Meta;
+        use serde_json::json;
         let (conn, responder) = connect_session();
 
         let mut meta = Meta::new();
@@ -373,7 +373,10 @@ mod session_tests {
         );
         let meta_payload = params["_meta"].as_object().expect("_meta is object");
         assert_eq!(
-            meta_payload.get("systemPrompt").and_then(|v| v.get("append")).and_then(|v| v.as_str()),
+            meta_payload
+                .get("systemPrompt")
+                .and_then(|v| v.get("append"))
+                .and_then(|v| v.as_str()),
             Some("test prompt"),
             "_meta payload preserved"
         );
@@ -381,8 +384,8 @@ mod session_tests {
 
     #[tokio::test]
     async fn claude_code_new_session_injects_disallowed_tools_and_system_prompt() {
-        use serde_json::json;
         use crate::session::Meta;
+        use serde_json::json;
         let (conn, responder) = connect_session();
 
         // Build meta with both disallowedTools and systemPrompt (as build_session_meta does)
@@ -423,8 +426,8 @@ mod session_tests {
 
     #[tokio::test]
     async fn claude_code_load_session_injects_disallowed_tools() {
-        use serde_json::json;
         use crate::session::Meta;
+        use serde_json::json;
         let (conn, responder) = connect_session();
 
         // Build meta with disallowedTools only (no system prompt on load)

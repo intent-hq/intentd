@@ -1334,13 +1334,7 @@ impl AgentManager {
         if let Some(expected_old) = stored_id {
             let opened = self
                 .services
-                .recreate_acp_session(
-                    conn.as_ref(),
-                    agent_id,
-                    &expected_old,
-                    cwd,
-                    Vec::new(),
-                )
+                .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
             self.recreated.lock().unwrap().insert(agent_id.clone());
             self.maybe_bypass_permissions(
