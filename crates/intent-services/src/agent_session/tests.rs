@@ -694,7 +694,7 @@ async fn open_acp_session_persists_id() {
     let (conn, _rx, _agent) = connect();
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let opened = services
-        .open_acp_session(&conn, "auggie", &agent_id, "/tmp/ws", Vec::new())
+        .open_acp_session(&conn, &agent_id, "/tmp/ws", Vec::new())
         .await
         .expect("open session");
     assert_eq!(opened.session_id, ACP_SID);
@@ -728,7 +728,6 @@ async fn resume_requires_capability_and_stored_id() {
     assert!(services
         .resume_acp_session(
             &conn,
-            "auggie",
             &init_caps(true),
             &agent_id,
             "/tmp/ws",
@@ -747,7 +746,6 @@ async fn resume_requires_capability_and_stored_id() {
     assert!(services
         .resume_acp_session(
             &conn,
-            "auggie",
             &init_caps(false),
             &agent_id,
             "/tmp/ws",
@@ -761,7 +759,6 @@ async fn resume_requires_capability_and_stored_id() {
     let opened = services
         .resume_acp_session(
             &conn,
-            "auggie",
             &init_caps(true),
             &agent_id,
             "/tmp/ws",
@@ -792,7 +789,6 @@ async fn recreate_acp_session_replaces_stored_id() {
     let opened = services
         .recreate_acp_session(
             &conn,
-            "auggie",
             &agent_id,
             "stale-id",
             "/tmp/ws",
@@ -810,7 +806,6 @@ async fn recreate_acp_session_replaces_stored_id() {
     let opened = services
         .recreate_acp_session(
             &conn,
-            "auggie",
             &agent_id,
             "stale-id",
             "/tmp/ws",
@@ -848,7 +843,6 @@ async fn resume_acp_session_emits_session_load_status() {
     let opened = services
         .resume_acp_session(
             &conn,
-            "auggie",
             &init_caps(true),
             &agent_id,
             "/tmp/ws",
@@ -890,7 +884,6 @@ async fn recreate_acp_session_emits_session_create_status() {
     let opened = services
         .recreate_acp_session(
             &conn,
-            "auggie",
             &agent_id,
             "stale-id",
             "/tmp/ws",
