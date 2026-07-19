@@ -557,8 +557,9 @@ async fn db_read_error_during_capture_fails_batch() {
     .await;
     assert_eq!(v2["value"], true);
 
-    // Close the DB pool to inject failures into subsequent get_setting calls
-    store.pool().close().await;
+    // Close both DB pools to inject failures into subsequent get_setting calls
+    store.write_pool().close().await;
+    store.read_pool().close().await;
 
     // Attempt a batch update - should fail during capture before applying anything
     let resp = call(

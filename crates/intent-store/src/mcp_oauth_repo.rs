@@ -14,7 +14,7 @@ impl Store {
     pub async fn get_mcp_oauth_token(&self, server_id: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT token_bag FROM mcp_oauth_tokens WHERE server_id = ?")
             .bind(server_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get mcp oauth token failed: {e}")))?;
         Ok(row.map(|r| r.get::<String, _>("token_bag")))
@@ -37,7 +37,7 @@ impl Store {
         .bind(server_id)
         .bind(token_bag)
         .bind(updated_at)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("set mcp oauth token failed: {e}")))?;
         Ok(())
@@ -48,7 +48,7 @@ impl Store {
     pub async fn delete_mcp_oauth_token(&self, server_id: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM mcp_oauth_tokens WHERE server_id = ?")
             .bind(server_id)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete mcp oauth token failed: {e}")))?;
         Ok(res.rows_affected() > 0)
@@ -59,7 +59,7 @@ impl Store {
     /// internal (server-side) reads.
     pub async fn list_mcp_oauth_server_ids(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT server_id FROM mcp_oauth_tokens ORDER BY server_id")
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list mcp oauth tokens failed: {e}")))?;
         Ok(rows

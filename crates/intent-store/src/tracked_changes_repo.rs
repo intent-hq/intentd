@@ -66,7 +66,7 @@ impl Store {
         .bind(&c.workspace_id.0)
         .bind(&c.path)
         .bind(&c.stage)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("lookup tracked change failed: {e}")))?
         .map(|r| r.get::<String, _>("id"));
@@ -89,7 +89,7 @@ impl Store {
                 .bind(c.deletions)
                 .bind(&now)
                 .bind(&id)
-                .execute(self.pool())
+                .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("update tracked change failed: {e}")))?;
             }
@@ -115,7 +115,7 @@ impl Store {
                     .bind(c.deletions)
                     .bind(&now)
                     .bind(&now)
-                    .execute(self.pool())
+                    .execute(self.write_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("insert tracked change failed: {e}")))?;
             }
@@ -146,7 +146,7 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(path)
         .bind(from_stage)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("transition tracked change failed: {e}")))?;
         Ok(result.rows_affected())
@@ -164,7 +164,7 @@ impl Store {
         );
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list tracked changes failed: {e}")))?;
         rows.iter().map(map_tracked_change_row).collect()

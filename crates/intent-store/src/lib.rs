@@ -94,43 +94,93 @@ mod tests;
 /// Embedded schema migrations (§9.4).
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
-/// SQLite-backed persistence handle. Cheaply cloneable (the pool is `Arc`-ed).
+/// SQLite-backed persistence handle. Cheaply cloneable (the pools are `Arc`-ed).
+///
+/// Holds two pools over the same DB file: a single-connection **write pool**
+/// (max_connections=1) to serialize all mutations and eliminate in-process
+/// writer-vs-writer busy_timeout contention, and a **read pool** (16 connections)
+/// for concurrent SELECT-only queries. See `connect` for pool configuration.
 #[derive(Clone)]
 pub struct Store {
-    pool: SqlitePool,
+    write_pool: SqlitePool,
+    read_pool: SqlitePool,
 }
 
 impl Store {
     /// Open (creating if needed) the database at `db_path` and run migrations.
+    /// Builds two pools: a single-connection write pool and a 16-connection read pool.
     pub async fn open(db_path: &Path) -> Result<Self> {
-        let pool = connect(db_path).await?;
+        let write_pool = connect_write(db_path).await?;
+        let read_pool = connect_read(db_path).await?;
+        // Run migrations on the write pool (migrations are write operations).
         MIGRATOR
-            .run(&pool)
+            .run(&write_pool)
             .await
             .map_err(|e| Error::Internal(format!("migrations failed: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self {
+            write_pool,
+            read_pool,
+        })
     }
 
     /// Wrap an already-configured pool (e.g. for tests or shared composition).
+    /// The single pool is used for both reads and writes in test scenarios.
     pub fn from_pool(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            write_pool: pool.clone(),
+            read_pool: pool,
+        }
     }
 
-    /// Borrow the underlying connection pool.
+    /// Borrow the write pool (single connection, for INSERT/UPDATE/DELETE/BEGIN).
+    pub fn write_pool(&self) -> &SqlitePool {
+        &self.write_pool
+    }
+
+    /// Borrow the read pool (16 connections, for SELECT-only queries).
+    pub fn read_pool(&self) -> &SqlitePool {
+        &self.read_pool
+    }
+
+    /// Deprecated alias for `read_pool()`. External callers should migrate to
+    /// explicit `read_pool()` / `write_pool()` usage.
+    #[deprecated(since = "0.1.0", note = "use read_pool() or write_pool() explicitly")]
     pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+        &self.read_pool
     }
 
-    /// Close the pool gracefully, checkpointing the WAL and freeing resources.
-    /// Call this during daemon shutdown to checkpoint the WAL and close the pool.
+    /// Spawn a background task that periodically runs PRAGMA wal_checkpoint(PASSIVE)
+    /// to prevent unbounded WAL growth when continuous readers hold long-lived
+    /// transactions. Returns a handle that can be aborted to stop the task.
+    ///
+    /// Call this after `open()` in the daemon composition root; the task will run
+    /// every ~60s until the returned handle is dropped or aborted.
+    pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
+        let write_pool = self.write_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                // Best-effort PASSIVE checkpoint (does not block writers/readers).
+                let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                    .execute(&write_pool)
+                    .await;
+            }
+        })
+    }
+
+    /// Close both pools gracefully, checkpointing the WAL and freeing resources.
+    /// Call this during daemon shutdown to checkpoint the WAL and close the pools.
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
-        // Best-effort WAL checkpoint before closing the pool
+        // Best-effort WAL checkpoint before closing the pools (via write pool).
         let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await;
-        self.pool.close().await;
+        self.write_pool.close().await;
+        self.read_pool.close().await;
     }
 
     /// Compare the migrations embedded in the binary against the versions
@@ -139,7 +189,7 @@ impl Store {
         let expected: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
         let applied: Vec<i64> =
             sqlx::query("SELECT version FROM _sqlx_migrations ORDER BY version")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.read_pool)
                 .await
                 .map_err(|e| Error::Internal(format!("query migrations failed: {e}")))?
                 .iter()
@@ -164,8 +214,9 @@ impl MigrationStatus {
     }
 }
 
-/// Open a WAL-mode SQLite pool with the required PRAGMAs (§9.4): `journal_mode
-/// = WAL`, `foreign_keys = ON`, `busy_timeout = 5000`, `synchronous = NORMAL`.
+/// Open a WAL-mode SQLite **write pool** with `max_connections=1` (§9.4).
+/// The single-connection write pool serializes all mutations (INSERT/UPDATE/DELETE)
+/// and eliminates in-process writer-vs-writer busy_timeout contention.
 ///
 /// **WAL + synchronous=NORMAL pairing** (finding F4, fsync half): WAL mode
 /// ensures crash safety with only periodic WAL checkpoints needing full fsyncs;
@@ -177,13 +228,65 @@ impl MigrationStatus {
 /// <https://sqlite.org/pragma.html#pragma_synchronous> and
 /// <https://sqlite.org/wal.html#performance_considerations>.
 ///
-/// Pool sizing: SQLite WAL mode supports many concurrent readers but only one
-/// writer (serialized inside SQLite). We set `max_connections=20` so the
-/// client-driven startup burst (FE rehydrating several workspaces at once) no
-/// longer saturates the pool and trips sqlx's `slow_acquire_threshold`
-/// warnings; `acquire_timeout=10s` ensures pool exhaustion surfaces a clear
-/// error instead of silently queueing for 30s, which would exceed the sidecar
-/// health probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
+/// `busy_timeout=5000` is kept to protect against cross-process access (e.g.,
+/// manual sqlite3 CLI probes during development), though in-process contention
+/// is eliminated by the single-writer design.
+pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_millis(5000))
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(opts)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => {
+                Error::Internal("write pool exhausted (acquire timeout exceeded)".to_string())
+            }
+            _ => Error::Internal(format!("failed to open write pool: {e}")),
+        })
+}
+
+/// Open a WAL-mode SQLite **read pool** with `max_connections=16` (§9.4).
+/// The read pool serves SELECT-only queries and supports concurrent readers
+/// without contention (SQLite WAL mode allows many simultaneous readers).
+///
+/// The PRAGMAs match the write pool: `journal_mode = WAL`, `foreign_keys = ON`,
+/// `busy_timeout = 5000`, `synchronous = NORMAL`. The read pool size (16) is
+/// sized to absorb the client-driven startup burst (FE rehydrating several
+/// workspaces at once) without saturating the pool and tripping sqlx's
+/// `slow_acquire_threshold` warnings (STAB-6, STAB-46).
+pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_millis(5000))
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
+
+    SqlitePoolOptions::new()
+        .max_connections(16)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(opts)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => {
+                Error::Internal("read pool exhausted (acquire timeout exceeded)".to_string())
+            }
+            _ => Error::Internal(format!("failed to open read pool: {e}")),
+        })
+}
+
+/// Legacy test helper: builds a single pool (max_connections=20) for tests
+/// that predate the write/read pool split. New tests should use `Store::open`.
+#[cfg(test)]
 pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
@@ -191,9 +294,6 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(5000))
-        // PRAGMA synchronous = NORMAL: safe under WAL, cuts fsync load (finding F4).
-        // WAL's crash recovery makes the extra per-commit fsync unnecessary; at worst
-        // a crash loses the last uncommitted transaction (never corrupts the DB).
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
@@ -201,18 +301,11 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await
-        .map_err(|e| {
-            // Match on the structured error variant for precision.
-            // NOTE: This mapping applies only to initial pool creation. Runtime pool
-            // exhaustion (pool.begin()/queries) will surface as the default sqlx error
-            // message unless mapped at the point of acquisition. Consider adding a
-            // shared error-mapping helper if runtime exhaustion diagnostics are needed.
-            match e {
-                sqlx::Error::PoolTimedOut => Error::Internal(
-                    "database pool exhausted (acquire timeout exceeded)".to_string(),
-                ),
-                _ => Error::Internal(format!("failed to open database: {e}")),
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => {
+                Error::Internal("database pool exhausted (acquire timeout exceeded)".to_string())
             }
+            _ => Error::Internal(format!("failed to open database: {e}")),
         })
 }
 

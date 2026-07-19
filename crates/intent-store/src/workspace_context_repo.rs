@@ -22,7 +22,7 @@ impl Store {
              WHERE workspace_id = ? ORDER BY ordinal",
         )
         .bind(&workspace_id.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list workspace context items failed: {e}")))?;
         rows.iter().map(map_context_row).collect()
@@ -42,7 +42,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         items: &[ContextItem],
     ) -> Result<Vec<ContextItem>> {
-        let pool = self.pool();
+        let pool = self.write_pool();
         let workspace_id = workspace_id.clone();
         let items = items.to_vec();
 

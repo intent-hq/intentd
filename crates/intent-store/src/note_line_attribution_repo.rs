@@ -28,7 +28,7 @@ impl Store {
         .bind(data.workspace_id.as_str())
         .bind(&data.computed_at)
         .bind(&attributions_json)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert note_line_attribution failed: {e}")))?;
         Ok(())
@@ -48,7 +48,7 @@ impl Store {
         )
         .bind(note_id.as_str())
         .bind(workspace_id.as_str())
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("get note_line_attribution failed: {e}")))?;
         let Some(row) = row else { return Ok(None) };

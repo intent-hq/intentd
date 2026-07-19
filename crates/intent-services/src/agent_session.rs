@@ -755,7 +755,9 @@ impl Services {
     /// Build and publish an agent streaming event onto the bus (§6.6/§10).
     /// `pub(crate)` so the [`AgentManager`] stop path can emit the terminal
     /// `agent:stream:end` when it interrupts a turn (the worker that would
-    /// otherwise emit it is aborted).
+    /// otherwise emit it is aborted). Routes `agent:stream:chunk` through the
+    /// transient (broadcast-only, never persisted) path; all other event types
+    /// persist durably.
     pub(crate) async fn publish_agent_event(
         &self,
         workspace_id: &WorkspaceId,
@@ -774,6 +776,13 @@ impl Services {
             metadata: None,
             data,
         };
-        crate::publish_event(&self.event_bus, event).await;
+        // Route stream chunks through the transient path (broadcast-only);
+        // persist all other agent events (stream:status, stream:end, tool:call,
+        // lifecycle, etc.) for durable audit trail.
+        if event_type == AGENT_STREAM_CHUNK {
+            crate::publish_event_transient(&self.event_bus, event);
+        } else {
+            crate::publish_event(&self.event_bus, event).await;
+        }
     }
 }

@@ -53,7 +53,7 @@ impl Store {
             .bind(&ws.last_activity)
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
         Ok(())
@@ -64,7 +64,7 @@ impl Store {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get workspace failed: {e}")))?;
         match row {
@@ -115,7 +115,7 @@ impl Store {
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
         .bind(&ws.id.0)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
         if res.rows_affected() == 0 {
@@ -132,7 +132,7 @@ impl Store {
     /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
     pub async fn delete_workspace(&self, id: &WorkspaceId) -> Result<()> {
-        let pool = self.pool();
+        let pool = self.write_pool();
         let id = id.clone();
 
         crate::with_write_txn_retry(|| async {
@@ -174,7 +174,7 @@ impl Store {
         )
         .bind(&id.0)
         .bind(&id.0)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("workspace id lookup failed: {e}")))?;
         Ok(col::<i64>(&row, "used")? != 0)
@@ -193,7 +193,7 @@ impl Store {
         let res = sqlx::query("UPDATE workspace SET branch_auto_generated = ? WHERE id = ?")
             .bind(auto_generated as i64)
             .bind(&id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set branch_auto_generated failed: {e}")))?;
         if res.rows_affected() == 0 {
@@ -207,7 +207,7 @@ impl Store {
     pub async fn workspace_branch_auto_generated(&self, id: &WorkspaceId) -> Result<bool> {
         let row = sqlx::query("SELECT branch_auto_generated FROM workspace WHERE id = ?")
             .bind(&id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get branch_auto_generated failed: {e}")))?;
         match row {
@@ -230,7 +230,7 @@ impl Store {
         };
         let rows = sqlx::query(&sql)
             .bind(CHIEF_WORKSPACE_ID)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list workspaces failed: {e}")))?;
         rows.iter().map(map_workspace_row).collect()
