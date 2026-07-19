@@ -4897,7 +4897,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         &mut rpc,
         20,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": child_a, "content": FOLLOWUP_A }),
+        json!({ "workspaceId": ws_id, "agentId": child_a.clone(), "content": FOLLOWUP_A }),
     )
     .await;
     assert_eq!(sent_a["success"], true, "sendMessage A ok: {sent_a}");
@@ -4905,7 +4905,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         &mut rpc,
         21,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": child_b, "content": FOLLOWUP_B }),
+        json!({ "workspaceId": ws_id, "agentId": child_b.clone(), "content": FOLLOWUP_B }),
     )
     .await;
     assert_eq!(sent_b["success"], true, "sendMessage B ok: {sent_b}");
@@ -4951,11 +4951,18 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
             json!({ "agentId": parent_id }),
         )
         .await;
-        let text = serde_json::to_string(&conv["messages"]).unwrap_or_default();
-        if text.contains("[WORKSPACE EVENTS]") && text.contains(&child_a) && text.contains(&child_b)
-        {
-            aggregated_wake_seen = true;
-            break;
+        // Check per-message contentBlocks (not substring of the entire messages array).
+        if let Some(messages) = conv["messages"].as_array() {
+            let has_aggregated = messages.iter().any(|m| {
+                let blocks_text = serde_json::to_string(&m["contentBlocks"]).unwrap_or_default();
+                blocks_text.contains("[WORKSPACE EVENTS]")
+                    && blocks_text.contains(&child_a)
+                    && blocks_text.contains(&child_b)
+            });
+            if has_aggregated {
+                aggregated_wake_seen = true;
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -4975,6 +4982,9 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
     }
 
     // Final assertion: count wake messages in the parent's transcript.
+    // Use per-message contentBlocks scanning (consistent with the pattern at
+    // line 2211-2230) to avoid over/under-counting if the marker appears
+    // multiple times in a single message's metadata.
     let final_conv = wss_rpc(
         &mut rpc,
         200,
@@ -4982,13 +4992,18 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
         json!({ "agentId": parent_id }),
     )
     .await;
-    let final_text = serde_json::to_string(&final_conv["messages"]).unwrap_or_default();
-    let wake_count = final_text.matches("[WORKSPACE EVENTS]").count();
+    let final_messages = final_conv["messages"].as_array().expect("messages array");
+    let wake_messages: Vec<String> = final_messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+        .collect();
     assert_eq!(
-        wake_count, 1,
+        wake_messages.len(),
+        1,
         "parent transcript MUST have exactly ONE aggregated wake (after_all group), not {} — \
          the SUB-1 auto-watch from sendMessage MUST NOT fire duplicate individual wakes",
-        wake_count
+        wake_messages.len()
     );
 
     // Let the parent's wake turn wind down before teardown.
