@@ -195,12 +195,20 @@ pub fn build_provider_env(
             env.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
         }
         "opencode" => {
-            if let Some(model) = model {
-                env.insert(
-                    "OPENCODE_CONFIG_CONTENT".to_string(),
-                    format!("{{\"model\":\"{}\"}}", json_escape(model)),
-                );
-            }
+            // Always emit OPENCODE_CONFIG_CONTENT with permission.task = deny to
+            // disallow the provider-native task tool (subagent spawning). Merge
+            // with the model key when a model is set. The permission key is preserved
+            // when workspace MCP servers are merged into the config at spawn time
+            // (see opencode_permission_survives_mcp_merge test in intent-acp).
+            let config_content = if let Some(m) = model {
+                format!(
+                    "{{\"model\":\"{}\",\"permission\":{{\"task\":\"deny\"}}}}",
+                    json_escape(m)
+                )
+            } else {
+                r#"{"permission":{"task":"deny"}}"#.to_string()
+            };
+            env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config_content);
         }
         _ => {}
     }
