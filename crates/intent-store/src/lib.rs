@@ -224,13 +224,11 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await
-        .map_err(|e| {
-            match e {
-                sqlx::Error::PoolTimedOut => Error::Internal(
-                    "write pool exhausted (acquire timeout exceeded)".to_string(),
-                ),
-                _ => Error::Internal(format!("failed to open write pool: {e}")),
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => {
+                Error::Internal("write pool exhausted (acquire timeout exceeded)".to_string())
             }
+            _ => Error::Internal(format!("failed to open write pool: {e}")),
         })
 }
 
@@ -257,13 +255,11 @@ pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await
-        .map_err(|e| {
-            match e {
-                sqlx::Error::PoolTimedOut => Error::Internal(
-                    "read pool exhausted (acquire timeout exceeded)".to_string(),
-                ),
-                _ => Error::Internal(format!("failed to open read pool: {e}")),
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => {
+                Error::Internal("read pool exhausted (acquire timeout exceeded)".to_string())
             }
+            _ => Error::Internal(format!("failed to open read pool: {e}")),
         })
 }
 
@@ -284,13 +280,11 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await
-        .map_err(|e| {
-            match e {
-                sqlx::Error::PoolTimedOut => Error::Internal(
-                    "database pool exhausted (acquire timeout exceeded)".to_string(),
-                ),
-                _ => Error::Internal(format!("failed to open database: {e}")),
+        .map_err(|e| match e {
+            sqlx::Error::PoolTimedOut => {
+                Error::Internal("database pool exhausted (acquire timeout exceeded)".to_string())
             }
+            _ => Error::Internal(format!("failed to open database: {e}")),
         })
 }
 

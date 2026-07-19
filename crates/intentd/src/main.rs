@@ -2147,7 +2147,7 @@ async fn report_db_health(store: &Store) {
     // Can return multiple rows if issues are found; treat anything other
     // than a single "ok" row as a warning.
     match sqlx::query("PRAGMA integrity_check")
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await
     {
         Ok(rows) => {
@@ -2177,7 +2177,7 @@ async fn report_db_health(store: &Store) {
     // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
     // checkpoint couldn't complete.
     match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-        .fetch_one(store.pool())
+        .fetch_one(store.write_pool())
         .await
     {
         Ok(row) => {
@@ -2214,11 +2214,17 @@ async fn report_db_health(store: &Store) {
         }
     }
 
-    // Connection pool stats: report size and idle connections
-    let pool = store.pool();
-    let size = pool.size();
-    let idle = pool.num_idle();
-    println!("  [ok] pool: size={}, idle={}", size, idle);
+    // Connection pool stats: report size and idle connections for both pools
+    let write_pool = store.write_pool();
+    let write_size = write_pool.size();
+    let write_idle = write_pool.num_idle();
+    let read_pool = store.read_pool();
+    let read_size = read_pool.size();
+    let read_idle = read_pool.num_idle();
+    println!(
+        "  [ok] write_pool: size={}, idle={} | read_pool: size={}, idle={}",
+        write_size, write_idle, read_size, read_idle
+    );
 }
 
 #[cfg(unix)]

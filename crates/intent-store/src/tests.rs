@@ -132,7 +132,7 @@ async fn backfill_repository_name_from_path_basename() {
     sqlx::raw_sql(include_str!(
         "../migrations/0031_workspace_repository_name_backfill.sql"
     ))
-    .execute(store.pool())
+    .execute(store.read_pool())
     .await
     .expect("re-run backfill");
 
@@ -199,7 +199,7 @@ async fn heal_slug_seeded_titles_clears_only_matching_rows() {
     sqlx::raw_sql(include_str!(
         "../migrations/0034_workspace_title_untitled_heal.sql"
     ))
-    .execute(store.pool())
+    .execute(store.read_pool())
     .await
     .expect("re-run heal");
 
@@ -1409,14 +1409,14 @@ async fn connect_sets_synchronous_normal_under_wal() {
 
     // Query the PRAGMA value. SQLite returns the integer code: 0=OFF, 1=NORMAL, 2=FULL.
     let row: (i64,) = sqlx::query_as("PRAGMA synchronous")
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .expect("query pragma");
     assert_eq!(row.0, 1, "synchronous should be NORMAL (1) under WAL");
 
     // Verify WAL mode is also set (journal_mode).
     let jm: (String,) = sqlx::query_as("PRAGMA journal_mode")
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .expect("query journal_mode");
     assert_eq!(jm.0.to_lowercase(), "wal", "journal_mode should be WAL");
@@ -1832,7 +1832,7 @@ async fn transient_streaming_flags_are_never_persisted() {
 
     // Schema guard: no transient-flag column exists on agent_session.
     let cols: Vec<String> = sqlx::query("PRAGMA table_info(agent_session)")
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await
         .expect("pragma")
         .iter()
@@ -2511,7 +2511,7 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
     .bind("note.create")
     .bind("{\"id\":\"old\"}")
     .bind(&old_ts)
-    .execute(store.pool())
+    .execute(store.write_pool())
     .await
     .expect("seed old row");
     store
@@ -2533,36 +2533,40 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
     assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
 }
 
-/// Smoke test: verify the pool opens successfully with explicit configuration
-/// (max_connections=20, acquire_timeout=10s per STAB-6) and supports basic
-/// queries and concurrent access.
-///
-/// This does NOT directly assert acquire timeout behavior (saturating the pool
-/// and confirming PoolTimedOut). That would require holding 20+ connections
-/// and timing a failure, which risks test flakiness. The configuration itself
-/// (lib.rs `connect()`) ensures pool exhaustion fails within 10s instead of
-/// silently queueing for the sqlx default 30s, which would exceed the sidecar
-/// health probe's 3s timeout and risk a false-positive daemon kill (STAB-6).
+/// Smoke test: verify the two-pool split sizing (write pool max_connections=1,
+/// read pool max_connections=16) and that both pools support basic queries.
+/// The write pool is single-connection to serialize all mutations and eliminate
+/// in-process writer-vs-writer busy_timeout contention. The read pool size (16)
+/// is sized to absorb the client-driven startup read burst without slow-acquire
+/// warnings (STAB-6, STAB-46).
 #[tokio::test]
 async fn pool_smoke_test_with_explicit_config() {
     let tmp = TempDb::new();
-    let pool = crate::connect(&tmp.path).await.expect("connect");
+    let store = Store::open(&tmp.path).await.expect("open store");
 
-    // Verify the pool is usable and the configuration doesn't break basic ops.
+    // Verify the write pool is single-connection.
+    assert_eq!(store.write_pool().options().get_max_connections(), 1);
+
+    // Verify the read pool is 16 connections.
+    assert_eq!(store.read_pool().options().get_max_connections(), 16);
+
+    // Verify both pools are usable and the configuration doesn't break basic ops.
     let row: (i64,) = sqlx::query_as("SELECT 1")
-        .fetch_one(&pool)
+        .fetch_one(store.read_pool())
         .await
-        .expect("basic query works");
+        .expect("basic query works on read pool");
     assert_eq!(row.0, 1);
 
-    // Verify the configured pool size (STAB-46: raised from 10 to 20 to absorb
-    // the client-driven startup read burst without slow-acquire warnings).
-    assert_eq!(pool.options().get_max_connections(), 20);
+    let row2: (i64,) = sqlx::query_as("SELECT 1")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("basic query works on write pool");
+    assert_eq!(row2.0, 1);
 
-    // Verify multiple concurrent acquires work (pool has max_connections=20).
+    // Verify multiple concurrent acquires work on the read pool (max_connections=16).
     let mut handles = Vec::new();
     for _ in 0..5 {
-        let p = pool.clone();
+        let p = store.read_pool().clone();
         handles.push(tokio::spawn(async move {
             let row: (i64,) = sqlx::query_as("SELECT 1").fetch_one(&p).await?;
             Ok::<_, sqlx::Error>(row.0)
@@ -2572,7 +2576,7 @@ async fn pool_smoke_test_with_explicit_config() {
         assert_eq!(h.await.expect("task completes").expect("query"), 1);
     }
 
-    pool.close().await;
+    store.close().await;
 }
 
 /// Regression test for STAB-19: appending a message to an agent session
