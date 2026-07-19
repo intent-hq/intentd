@@ -121,6 +121,18 @@ impl Store {
         &self.pool
     }
 
+    /// Close the pool gracefully, checkpointing the WAL and freeing resources.
+    /// Call this during daemon shutdown to checkpoint the WAL and close the pool.
+    /// This ensures WAL changes are visible to subsequent daemon instances
+    /// (regression: persisted settings must survive app relaunches in sidecar mode).
+    pub async fn close(&self) {
+        // Best-effort WAL checkpoint before closing the pool
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
+        self.pool.close().await;
+    }
+
     /// Compare the migrations embedded in the binary against the versions
     /// recorded as applied in `_sqlx_migrations`, for `intentd doctor` (§5.7).
     pub async fn migration_status(&self) -> Result<MigrationStatus> {

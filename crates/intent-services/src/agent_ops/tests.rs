@@ -6308,3 +6308,55 @@ async fn agent_force_message_emits_agent_message_event() {
     assert_eq!(session.messages.len(), 1);
     assert_eq!(session.messages[0].id, event_message_id);
 }
+
+/// STAB-112: `persist_error_and_requeue` must surface the `requeuedAfterFailure`
+/// marker in `queue_snapshot` and `agent:queue:updated` payloads so the FE can
+/// distinguish terminal-failure requeues from normal queued messages.
+#[tokio::test]
+async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
+    use crate::agent_ops::{new_message_id, QueuedMessage};
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "RQF").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    // Simulate a terminal-failure requeue by directly calling requeue_front with
+    // persisted=true (matching persist_error_and_requeue's behavior).
+    let queued = QueuedMessage {
+        id: new_message_id(),
+        content: "failed message".to_string(),
+        image_blocks: None,
+        file_blocks: None,
+        queued_at: now_iso(),
+        editing: false,
+        persisted: true, // Terminal-failure requeue marker
+    };
+
+    svc.requeue_front(&id, queued);
+    svc.publish_queue_updated(&id).await;
+
+    // Verify queue_snapshot includes requeuedAfterFailure marker
+    let snapshot = svc.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["content"], "failed message");
+    assert_eq!(
+        snapshot[0]["requeuedAfterFailure"], true,
+        "marker must be present"
+    );
+
+    // Verify agent:queue:updated event carries the marker
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated event");
+    assert_eq!(evt.data["queue"].as_array().unwrap().len(), 1);
+    assert_eq!(evt.data["queue"][0]["requeuedAfterFailure"], true);
+}

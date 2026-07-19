@@ -71,17 +71,20 @@ pub(crate) struct QueuedMessage {
     /// this entry was (re)queued — set by the terminal-failure requeue, whose
     /// message was persisted before its turn started. Drain paths skip
     /// `persist_user` for such entries so a retry does not duplicate the user
-    /// message in chat history. Internal only — not part of the wire shape.
+    /// message in chat history. The field itself is internal, but when `true`,
+    /// `to_value` emits `requeuedAfterFailure: true` on the wire (STAB-112).
     pub persisted: bool,
 }
 
 impl QueuedMessage {
     /// The camelCase wire shape for `agent.getQueue` / queue results, matching the
     /// TS `QueuedMessage` and the iOS decoder (`{id, content, queuedAt, position,
-    /// imageBlocks?, fileBlocks?, editing?}`). `position` is the entry's 0-based
-    /// index in the queue (0 = next to be sent) and is supplied by the caller
-    /// since it is positional. `editing` is only present when `true` (a client
-    /// that hasn't migrated still sees the legacy shape unchanged).
+    /// imageBlocks?, fileBlocks?, editing?, requeuedAfterFailure?}`). `position` is
+    /// the entry's 0-based index in the queue (0 = next to be sent) and is supplied
+    /// by the caller since it is positional. `editing` is only present when `true`
+    /// (a client that hasn't migrated still sees the legacy shape unchanged).
+    /// `requeuedAfterFailure` is only present when `true` (STAB-112: backward-compatible
+    /// marker for terminal-failure requeues).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -97,6 +100,9 @@ impl QueuedMessage {
         }
         if self.editing {
             v["editing"] = Value::Bool(true);
+        }
+        if self.persisted {
+            v["requeuedAfterFailure"] = Value::Bool(true);
         }
         v
     }

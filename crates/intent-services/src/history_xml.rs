@@ -109,8 +109,44 @@ struct Msg {
 
 /// Drop malformed persisted blocks before rendering (TS
 /// `sanitizeMessagesForHistory`): empty assistant turns, tool_results with
-/// missing/duplicate ids, and empty non-error tool_results.
+/// missing/duplicate ids, empty non-error tool_results, and dangling tool_use
+/// blocks (STAB-108: tool_use without a corresponding tool_result causes
+/// provider rejection on session resume).
 fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
+    // First pass: collect valid tool_result IDs to identify dangling tool_use blocks.
+    let mut valid_tool_result_ids: HashSet<String> = HashSet::new();
+
+    for m in messages {
+        if let Some(blocks) = m.content.as_array() {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !tool_use_id.is_empty() {
+                        // Check if this tool_result is valid (has output or is_error).
+                        let output = match block.get("output") {
+                            Some(v) if !v.is_null() => Some(v),
+                            _ => block.get("content"),
+                        };
+                        let has_output =
+                            matches!(
+                                output,
+                                Some(Value::String(s)) if !s.is_empty()
+                            ) || matches!(output, Some(Value::Object(_)) | Some(Value::Array(_)));
+                        if has_output || bool_field(block, &["is_error", "isError"]) {
+                            valid_tool_result_ids.insert(tool_use_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Second pass: sanitize messages, dropping dangling tool_use blocks.
     let mut seen_tool_result_ids: HashSet<String> = HashSet::new();
     let mut sanitized = Vec::new();
     for m in messages {
@@ -128,33 +164,43 @@ fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
         };
         let mut clean: Vec<Value> = Vec::new();
         for block in blocks {
-            if block.get("type").and_then(Value::as_str) == Some("tool_result") {
-                let tool_use_id = block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if tool_use_id.is_empty() || seen_tool_result_ids.contains(&tool_use_id) {
-                    continue;
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    // Drop tool_use blocks that don't have a valid tool_result.
+                    let id = str_field(block, &["tool_use_id", "id"]);
+                    if !id.is_empty() && valid_tool_result_ids.contains(&id) {
+                        clean.push(block.clone());
+                    }
                 }
-                // `??` (nullish): "" output is kept, not coalesced to content.
-                let output = match block.get("output") {
-                    Some(v) if !v.is_null() => Some(v),
-                    _ => block.get("content"),
-                };
-                let has_output =
-                    matches!(
-                        output,
-                        Some(Value::String(s)) if !s.is_empty()
-                    ) || matches!(output, Some(Value::Object(_)) | Some(Value::Array(_)));
-                if !has_output && !bool_field(block, &["is_error", "isError"]) {
-                    continue;
+                Some("tool_result") => {
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if tool_use_id.is_empty() || seen_tool_result_ids.contains(&tool_use_id) {
+                        continue;
+                    }
+                    // `??` (nullish): "" output is kept, not coalesced to content.
+                    let output = match block.get("output") {
+                        Some(v) if !v.is_null() => Some(v),
+                        _ => block.get("content"),
+                    };
+                    let has_output =
+                        matches!(
+                            output,
+                            Some(Value::String(s)) if !s.is_empty()
+                        ) || matches!(output, Some(Value::Object(_)) | Some(Value::Array(_)));
+                    if !has_output && !bool_field(block, &["is_error", "isError"]) {
+                        continue;
+                    }
+                    seen_tool_result_ids.insert(tool_use_id);
+                    clean.push(block.clone());
                 }
-                seen_tool_result_ids.insert(tool_use_id);
-                clean.push(block.clone());
-            } else {
-                clean.push(block.clone());
+                _ => {
+                    clean.push(block.clone());
+                }
             }
         }
         if clean.is_empty() && m.role == "assistant" {
