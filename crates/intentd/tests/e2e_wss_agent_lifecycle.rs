@@ -5514,14 +5514,14 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
         if let Some(frame) = wss_event_opt(&mut sub, 3).await {
             if frame["params"]["event"]["type"] == "agent:queue:updated" {
                 saw_queue_updated = true;
-                let messages = frame["params"]["event"]["data"]["messages"]
+                let queue = frame["params"]["event"]["data"]["queue"]
                     .as_array()
-                    .expect("messages array");
+                    .expect("queue array");
                 assert!(
-                    !messages.is_empty(),
+                    !queue.is_empty(),
                     "STAB-114: queue should have re-queued message"
                 );
-                let msg = &messages[0];
+                let msg = &queue[0];
                 assert!(
                     msg["content"].as_str().unwrap().contains("first"),
                     "re-queued message should be the original user message"
