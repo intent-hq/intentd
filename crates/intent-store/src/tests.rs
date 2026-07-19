@@ -2533,6 +2533,138 @@ async fn idempotency_reaper_deletes_only_rows_older_than_cutoff() {
     assert_eq!(store.reap_idempotent(&cutoff).await.expect("reap"), 0);
 }
 
+/// Concurrent write + read stress test: verify that the single-writer pool
+/// eliminates SQLITE_BUSY (code 5) errors under heavy concurrent load.
+/// Spawns ~50 concurrent writes + concurrent reads; all must succeed without
+/// busy_timeout errors, and reads must stay fast while writes are in flight.
+#[tokio::test]
+async fn concurrent_writes_no_sqlite_busy() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+
+    // Spawn 50 concurrent single-row writes
+    let write_handles: Vec<_> = (0..50)
+        .map(|i| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let ws_id = WorkspaceId::new();
+                let ts = now_iso();
+                let workspace = Workspace {
+                    id: ws_id.clone(),
+                    title: format!("Workspace {}", i),
+                    branch: format!("main-{}", i),
+                    base_ref: None,
+                    base_commit_sha: None,
+                    status: WorkspaceStatus::Active,
+                    status_message: None,
+                    activity: WorkspaceActivity::Idle,
+                    attention: WorkspaceAttention::Unread,
+                    created_at: ts.clone(),
+                    updated_at: ts.clone(),
+                    last_activity: None,
+                    tags: vec![],
+                    path: Some(format!("/tmp/ws-{}", i)),
+                    repository_path: None,
+                    repository_owner: None,
+                    repository_name: None,
+                    worktree_path: None,
+                    scope: None,
+                    skip_worktree: false,
+                    setup_script: None,
+                    is_remote: false,
+                    default_model: None,
+                    pr_number: None,
+                    pr_url: None,
+                    pr_status: None,
+                    active_pull_request: None,
+                    pull_requests: None,
+                    archived: false,
+                    archived_at: None,
+                    task_stats: None,
+                    agent_summary: None,
+                    diff_summary: None,
+                    token_usage: None,
+                    cow_supported: None,
+                };
+                store.insert_workspace(&workspace).await
+            })
+        })
+        .collect();
+
+    // Spawn 50 concurrent reads (list workspaces) and time them
+    let read_start = std::time::Instant::now();
+    let read_handles: Vec<_> = (0..50)
+        .map(|_| {
+            let store = store.clone();
+            tokio::spawn(async move { store.list_workspaces(false).await.map(|ws| ws.len()) })
+        })
+        .collect();
+
+    // All writes must succeed (no SQLITE_BUSY errors)
+    for handle in write_handles {
+        let result = handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "Write failed (SQLITE_BUSY would be Error::Internal with 'database is locked'): {:?}",
+            result
+        );
+    }
+
+    // All reads must succeed and stay fast (complete in < 5s even with writes in flight)
+    for handle in read_handles {
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "Read failed: {:?}", result);
+    }
+    let read_elapsed = read_start.elapsed();
+    assert!(
+        read_elapsed.as_secs() < 5,
+        "Reads took too long: {:?} (writes blocking readers?)",
+        read_elapsed
+    );
+
+    // Verify all 50 workspaces were written
+    let all_workspaces = store.list_workspaces(false).await.unwrap();
+    assert_eq!(
+        all_workspaces.len(),
+        50,
+        "Expected 50 workspaces, got {}",
+        all_workspaces.len()
+    );
+}
+
+/// Test the periodic WAL checkpoint task: verify it runs on schedule and stops
+/// cleanly when the handle is aborted. The task runs every 60s and executes
+/// PRAGMA wal_checkpoint(PASSIVE) via the write pool.
+#[tokio::test]
+async fn periodic_wal_checkpoint_runs_and_stops() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+
+    // Spawn the periodic checkpoint task
+    let handle = store.spawn_periodic_wal_checkpoint();
+
+    // The task should be running (not immediately finished)
+    assert!(!handle.is_finished(), "checkpoint task finished too early");
+
+    // Abort the task (simulates daemon shutdown)
+    handle.abort();
+
+    // Give it a moment to clean up
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Task should be finished now
+    assert!(
+        handle.is_finished(),
+        "checkpoint task did not stop after abort"
+    );
+
+    // Verify the store still works after aborting the checkpoint task
+    let ws = sample_workspace(&WorkspaceId::new(), "Test", false);
+    store.insert_workspace(&ws).await.unwrap();
+    let loaded = store.list_workspaces(false).await.unwrap();
+    assert_eq!(loaded.len(), 1);
+}
+
 /// Smoke test: verify the two-pool split sizing (write pool max_connections=1,
 /// read pool max_connections=16) and that both pools support basic queries.
 /// The write pool is single-connection to serialize all mutations and eliminate

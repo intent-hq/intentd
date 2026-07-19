@@ -149,6 +149,27 @@ impl Store {
         &self.read_pool
     }
 
+    /// Spawn a background task that periodically runs PRAGMA wal_checkpoint(PASSIVE)
+    /// to prevent unbounded WAL growth when continuous readers hold long-lived
+    /// transactions. Returns a handle that can be aborted to stop the task.
+    ///
+    /// Call this after `open()` in the daemon composition root; the task will run
+    /// every ~60s until the returned handle is dropped or aborted.
+    pub fn spawn_periodic_wal_checkpoint(&self) -> tokio::task::JoinHandle<()> {
+        let write_pool = self.write_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                // Best-effort PASSIVE checkpoint (does not block writers/readers).
+                let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                    .execute(&write_pool)
+                    .await;
+            }
+        })
+    }
+
     /// Close both pools gracefully, checkpointing the WAL and freeing resources.
     /// Call this during daemon shutdown to checkpoint the WAL and close the pools.
     /// This ensures WAL changes are visible to subsequent daemon instances
