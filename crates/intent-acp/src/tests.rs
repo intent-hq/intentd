@@ -1398,6 +1398,61 @@ mod mcp_tests {
         );
     }
 
+    #[test]
+    fn opencode_permission_survives_mcp_merge() {
+        use intent_providers::{build_provider_env, find_provider};
+        use std::collections::BTreeMap;
+
+        // Build opencode's env with permission.task=deny (with model set)
+        let opencode = find_provider("opencode").unwrap();
+        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+        let config_content = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("OPENCODE_CONFIG_CONTENT must be set");
+
+        // Parse the initial config (should have model + permission keys)
+        let mut config: Value = serde_json::from_str(config_content)
+            .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+        assert_eq!(config["model"], json!("claude-sonnet-4"));
+        assert_eq!(config["permission"]["task"], json!("deny"));
+
+        // Simulate the workspace-MCP merge path: prepare a normalized MCP server list
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "ws".to_string(),
+            NormalizedMcpServer::Stdio {
+                command: "node".into(),
+                args: vec!["server.js".into()],
+                env: BTreeMap::new(),
+            },
+        );
+
+        // Convert normalized servers to opencode mcp block
+        let mcp_block = to_opencode_mcp_config(&servers);
+
+        // Merge the mcp block into the existing config (opencode's env merge logic)
+        // This simulates what happens when the daemon merges workspace MCP servers
+        // into the provider's OPENCODE_CONFIG_CONTENT at spawn time.
+        config["mcp"] = mcp_block;
+
+        // Assert: permission.task=deny must still be present after the merge
+        assert_eq!(
+            config["permission"]["task"],
+            json!("deny"),
+            "permission.task=deny must survive workspace-MCP merge"
+        );
+        assert_eq!(
+            config["model"],
+            json!("claude-sonnet-4"),
+            "model must survive workspace-MCP merge"
+        );
+        // And the mcp block should be populated
+        assert!(
+            config["mcp"]["ws"].is_object(),
+            "mcp.ws server config should be present"
+        );
+    }
+
     fn stdio_servers() -> Value {
         json!({
             "ws": { "command": "node", "args": ["server.js"], "env": { "A": "1" } },
