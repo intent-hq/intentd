@@ -43,7 +43,7 @@ use crate::IncomingNotification;
 // service layer can consume them without depending on `agent-client-protocol`
 // directly (§3.2 keeps that crate an `intent-acp` implementation detail).
 pub use agent_client_protocol::schema::{
-    ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, NewSessionResponse,
+    ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, Meta, NewSessionResponse,
     SessionMode, SessionModeState, SessionUpdate, StopReason,
 };
 
@@ -120,15 +120,18 @@ fn elapsed_ms() -> u64 {
     start.elapsed().as_millis() as u64
 }
 
-/// `session/new` with `{ cwd, mcpServers }` → the agent's session id and initial
+/// `session/new` with `{ cwd, mcpServers, _meta? }` → the agent's session id and initial
 /// state. The caller persists `response.session_id` as `AgentSession.acpSessionId`
-/// (write-once) for later resume (§6.5).
+/// (write-once) for later resume (§6.5). `meta` (if present) is provider-specific
+/// metadata for system-prompt injection or other extensions.
 pub async fn new_session(
     conn: &Connection,
     cwd: impl Into<PathBuf>,
     mcp_servers: Vec<McpServer>,
+    meta: Option<Meta>,
 ) -> AcpResult<NewSessionResponse> {
-    let request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
+    let mut request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
+    request.meta = meta;
     let params = serde_json::to_value(&request)?;
     let result = conn
         .request_timeout("session/new", params, session_setup_timeout())
@@ -139,14 +142,18 @@ pub async fn new_session(
 
 /// `session/load` to resume an existing `acpSessionId` after a restart. Only
 /// valid when the agent advertised the `loadSession` capability — check with
-/// [`supports_load_session`] first (§6.5).
+/// [`supports_load_session`] first (§6.5). `meta` (if present) is provider-specific
+/// metadata for system-prompt injection or other extensions.
 pub async fn load_session(
     conn: &Connection,
     session_id: &str,
     cwd: impl Into<PathBuf>,
     mcp_servers: Vec<McpServer>,
+    meta: Option<Meta>,
 ) -> AcpResult<LoadSessionResponse> {
-    let request = LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
+    let mut request =
+        LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
+    request.meta = meta;
     let params = serde_json::to_value(&request)?;
     let result = conn
         .request_timeout("session/load", params, session_setup_timeout())
