@@ -197,16 +197,22 @@ pub fn build_provider_env(
         }
         "opencode" if model.is_some() || rules_file.is_some() => {
             let mut parts = Vec::new();
+            // Filter out the sentinel model id ("default") per build_provider_args.
             if let Some(model) = model {
-                parts.push(format!("\"model\":\"{}\"", json_escape(model)));
+                if !model.is_empty() && model != MODEL_SENTINEL_DEFAULT {
+                    parts.push(format!("\"model\":\"{}\"", json_escape(model)));
+                }
             }
             if let Some(path) = rules_file {
                 parts.push(format!("\"instructions\":[\"{}\"]", json_escape(path)));
             }
-            env.insert(
-                "OPENCODE_CONFIG_CONTENT".to_string(),
-                format!("{{{}}}", parts.join(",")),
-            );
+            // Only emit OPENCODE_CONFIG_CONTENT when at least one field is set.
+            if !parts.is_empty() {
+                env.insert(
+                    "OPENCODE_CONFIG_CONTENT".to_string(),
+                    format!("{{{}}}", parts.join(",")),
+                );
+            }
         }
         _ => {}
     }
@@ -254,10 +260,14 @@ pub(crate) fn node_options_with_heap_cap(parent: Option<&str>, mb: u32) -> Optio
     }
 }
 
-/// Minimal JSON string escaping for the small `OPENCODE_CONFIG_CONTENT` value
+/// Minimal JSON string escaping for the small `OPENCODE_CONFIG_CONTENT` value.
+/// Handles the subset needed for model ids and file paths: double-quote, backslash,
+/// common whitespace escapes (`\n`, `\r`, `\t`), backspace (`\b`), form feed (`\f`),
+/// and other control characters via `\uXXXX` escapes.
+///
 /// (avoids pulling a serializer in to keep deps minimal — `intent-core` plus
 /// `tracing` for the heap-cap parse-failure WARN).
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -266,6 +276,12 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"), // backspace
+            '\x0C' => out.push_str("\\f"), // form feed
+            c if c.is_control() => {
+                // Escape other control characters as \uXXXX.
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             _ => out.push(c),
         }
     }

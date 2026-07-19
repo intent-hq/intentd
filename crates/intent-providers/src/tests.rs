@@ -287,8 +287,71 @@ fn env_assembly_quirks() {
         oc.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"model":"claude-sonnet-4"}"#)
     );
-    // No model → no OPENCODE_CONFIG_CONTENT.
+    // No model and no rules file → no OPENCODE_CONFIG_CONTENT.
     assert!(!build_provider_env(opencode, None, None).contains_key("OPENCODE_CONFIG_CONTENT"));
+}
+
+#[test]
+fn opencode_model_sentinel_filtered_from_env() {
+    let opencode = find_provider("opencode").unwrap();
+
+    // Model sentinel "default" alone → no OPENCODE_CONFIG_CONTENT.
+    assert!(!build_provider_env(opencode, Some("default"), None)
+        .contains_key("OPENCODE_CONFIG_CONTENT"));
+
+    // Rules file alone (no model) → instructions only.
+    let rules_only = build_provider_env(opencode, None, Some("/tmp/rules.md"));
+    assert_eq!(
+        rules_only
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"instructions":["/tmp/rules.md"]}"#)
+    );
+
+    // Real model + rules file → both fields.
+    let both = build_provider_env(opencode, Some("gpt-4"), Some("/tmp/rules.md"));
+    assert_eq!(
+        both.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"model":"gpt-4","instructions":["/tmp/rules.md"]}"#)
+    );
+
+    // Sentinel model + rules file → instructions only (model filtered).
+    let sentinel_with_rules = build_provider_env(opencode, Some("default"), Some("/tmp/rules.md"));
+    assert_eq!(
+        sentinel_with_rules
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"instructions":["/tmp/rules.md"]}"#)
+    );
+}
+
+#[test]
+fn json_escape_handles_control_characters() {
+    use crate::args::json_escape;
+
+    // Basic escaping.
+    assert_eq!(json_escape(r#"foo"bar"#), r#"foo\"bar"#);
+    assert_eq!(json_escape(r"foo\bar"), r"foo\\bar");
+    assert_eq!(json_escape("foo\nbar"), r"foo\nbar");
+    assert_eq!(json_escape("foo\rbar"), r"foo\rbar");
+    assert_eq!(json_escape("foo\tbar"), r"foo\tbar");
+
+    // Backspace and form feed.
+    assert_eq!(json_escape("foo\x08bar"), r"foo\bbar");
+    assert_eq!(json_escape("foo\x0Cbar"), r"foo\fbar");
+
+    // Other control characters → \uXXXX.
+    assert_eq!(json_escape("foo\x01bar"), r"foo\u0001bar");
+    assert_eq!(json_escape("foo\x1Fbar"), r"foo\u001fbar");
+
+    // Round-trip safety: a path with control chars produces valid JSON.
+    let weird_path = "/tmp/rules\x08\x0C\x01.md";
+    let escaped = json_escape(weird_path);
+    // Verify the expected escaping.
+    assert_eq!(escaped, r"/tmp/rules\b\f\u0001.md");
+    // The escaped value can be embedded in a JSON string.
+    let json = format!(r#"{{"path":"{}"}}"#, escaped);
+    assert_eq!(json, r#"{"path":"/tmp/rules\b\f\u0001.md"}"#);
 }
 
 /// Serializes env-var mutation across tests in this binary: the vars are
