@@ -2253,16 +2253,19 @@ impl AgentManager {
                         if !has_output_after {
                             // Zero-output condition: re-queue the preempted message.
                             // Extract text from content blocks (JSON array).
-                            let text_content = if let Some(blocks) = last_user_msg.content.as_array() {
-                                blocks
-                                    .iter()
-                                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                    .collect::<Vec<&str>>()
-                                    .join("\n")
-                            } else {
-                                String::new()
-                            };
+                            let text_content =
+                                if let Some(blocks) = last_user_msg.content.as_array() {
+                                    blocks
+                                        .iter()
+                                        .filter(|b| {
+                                            b.get("type").and_then(Value::as_str) == Some("text")
+                                        })
+                                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<&str>>()
+                                        .join("\n")
+                                } else {
+                                    String::new()
+                                };
 
                             // `persisted: true` prevents duplicate transcript append.
                             let queued = crate::agent_ops::QueuedMessage {
