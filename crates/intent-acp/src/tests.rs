@@ -398,7 +398,7 @@ mod session_tests {
         use serde_json::json;
         let (conn, responder) = connect_session();
 
-        // Build meta with disallowedTools only (no system prompt on load)
+        // Build meta with disallowedTools only (this test omits systemPrompt)
         let mut meta = Meta::new();
         meta.insert(
             "claudeCode".to_string(),
@@ -445,6 +445,82 @@ mod session_tests {
         assert!(
             !params.contains_key("_meta"),
             "session/new for non-claude-code provider must not inject _meta"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_load_session_with_prompt_injects_both_disallowed_tools_and_system_prompt()
+    {
+        use crate::session::Meta;
+        use serde_json::json;
+        let (conn, responder) = connect_session();
+
+        // Build meta with both disallowedTools and systemPrompt (as build_session_meta does on resume)
+        let mut meta = Meta::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            json!({
+                "options": {
+                    "disallowedTools": ["Task"]
+                }
+            }),
+        );
+        let mut system_prompt_obj = serde_json::Map::new();
+        system_prompt_obj.insert("append".to_string(), json!("Resumed prompt"));
+        meta.insert(
+            "systemPrompt".to_string(),
+            serde_json::Value::Object(system_prompt_obj),
+        );
+
+        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/load succeeds");
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let load_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/load"))
+            .expect("agent received session/load");
+        let meta_payload = &load_req["params"]["_meta"];
+        assert_eq!(
+            meta_payload["claudeCode"]["options"]["disallowedTools"],
+            json!(["Task"]),
+            "session/load for claude-code must inject disallowedTools"
+        );
+        assert_eq!(
+            meta_payload["systemPrompt"]["append"],
+            json!("Resumed prompt"),
+            "session/load for claude-code must inject systemPrompt.append when provided"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_new_session_injects_developer_instructions() {
+        use crate::session::Meta;
+        use serde_json::json;
+        let (conn, responder) = connect_session();
+
+        // Build meta with developerInstructions (as build_session_meta does for codex)
+        let mut meta = Meta::new();
+        meta.insert(
+            "developerInstructions".to_string(),
+            json!("Codex test prompt"),
+        );
+
+        session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/new succeeds");
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let new_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/new"))
+            .expect("agent received session/new");
+        let meta_payload = &new_req["params"]["_meta"];
+        assert_eq!(
+            meta_payload["developerInstructions"],
+            json!("Codex test prompt"),
+            "session/new for codex must inject developerInstructions under _meta"
         );
     }
 
