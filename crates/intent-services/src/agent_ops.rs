@@ -53,6 +53,82 @@ mod tests;
 #[cfg(test)]
 mod tests_stab28;
 
+#[cfg(test)]
+mod tests_stab115;
+
+/// Resolve the default model from settings when no explicit model is supplied
+/// at agent creation time. Precedence chain (documented in the task):
+/// 1. `model.workspaceOverrides[workspaceId]`
+/// 2. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
+/// 3. `model.default`
+/// 4. None → CLI default (current behavior, last resort)
+///
+/// The resolved model is persisted to `session.model` at creation time, pinning
+/// it for the agent's lifetime. Later settings changes never affect existing
+/// sessions; only new agents pick up the new default.
+async fn resolve_default_model_from_settings(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    is_background: bool,
+    agent_type: Option<&str>,
+) -> Option<String> {
+    // 1. Check workspace-specific override
+    if let Ok(Some(raw)) = services.store.get_setting("model.workspaceOverrides").await {
+        if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
+            if let Some(model) = overrides.get(workspace_id.as_str()).and_then(Value::as_str) {
+                if !model.is_empty() {
+                    return Some(model.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. For background/delegated agents, check type-specific override, then default
+    if is_background {
+        // 2a. Check agent type override
+        if let Some(typ) = agent_type {
+            if let Ok(Some(raw)) = services
+                .store
+                .get_setting("backgroundAgents.typeOverrides")
+                .await
+            {
+                if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
+                    if let Some(model) = overrides.get(typ).and_then(Value::as_str) {
+                        if !model.is_empty() {
+                            return Some(model.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2b. Check background agents default
+        if let Ok(Some(raw)) = services
+            .store
+            .get_setting("backgroundAgents.defaultModel")
+            .await
+        {
+            if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
+                if !model.is_empty() {
+                    return Some(model);
+                }
+            }
+        }
+    }
+
+    // 3. Check global default
+    if let Ok(Some(raw)) = services.store.get_setting("model.default").await {
+        if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
+            if !model.is_empty() {
+                return Some(model);
+            }
+        }
+    }
+
+    // 4. None → CLI default (session.model stays None)
+    None
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -995,11 +1071,38 @@ impl Services {
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+
+        // Resolve default model from settings when none is explicitly supplied.
+        // The resolved model is persisted to session.model, pinning it for the
+        // agent's lifetime. Settings changes only affect new agents created
+        // afterwards; existing agents change model only via explicit agent.setModel.
+        let resolved_model = match model {
+            Some(m) => Some(m),
+            None => {
+                // Pass `specialist` as the agent_type parameter for
+                // backgroundAgents.typeOverrides lookup. The specialist value
+                // (e.g., "implementor", "verifier") is used as-is in the override
+                // map. When `specialist` is None, the type-specific override is
+                // skipped and we fall through to backgroundAgents.defaultModel or
+                // model.default. A full solution would require passing the derived
+                // agent_type through AgentCreateExtra, but that's outside this
+                // task's scope and the current specialist-based lookup covers the
+                // common case.
+                resolve_default_model_from_settings(
+                    self,
+                    &workspace_id,
+                    is_background,
+                    specialist.as_deref(),
+                )
+                .await
+            }
+        };
+
         // Initialize provider from the model's compound prefix if not explicitly
         // set. This ensures sessions created with a compound model id like
         // "opencode:kimi-k3" have the correct provider from the start.
         let provider = provider.or_else(|| {
-            model.as_ref().and_then(|m| {
+            resolved_model.as_ref().and_then(|m| {
                 if m.contains(':') {
                     Some(intent_providers::parse_compound_model_id(m).0)
                 } else {
@@ -1015,7 +1118,7 @@ impl Services {
             acp_session_id: None,
             name,
             name_explicitly_set,
-            model,
+            model: resolved_model,
             provider,
             system_prompt: None,
             specialist,

@@ -62,6 +62,8 @@ fn registry_field_parity() {
     let droid = find_provider("droid").unwrap();
     assert_eq!(droid.base_args, &["exec", "--output-format", "acp"]);
     assert_eq!(droid.model_flag, Some("--model"));
+    assert!(droid.supports_rules_file);
+    assert_eq!(droid.rules_flag, Some("--append-system-prompt-file"));
 
     let mock = find_provider("mock").unwrap();
     assert_eq!(mock.command, "node");
@@ -273,7 +275,7 @@ fn provider_runtimes() {
 
 #[test]
 fn env_assembly_quirks() {
-    let cortex = build_provider_env(find_provider("cortex").unwrap(), None);
+    let cortex = build_provider_env(find_provider("cortex").unwrap(), None, None);
     assert_eq!(
         cortex.get("ELECTRON_RUN_AS_NODE").map(String::as_str),
         Some("1")
@@ -281,22 +283,89 @@ fn env_assembly_quirks() {
 
     let opencode = find_provider("opencode").unwrap();
     // With model: permission.task=deny is merged with the model key.
-    let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"));
+    let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"), None);
     assert_eq!(
         oc_with_model
             .get("OPENCODE_CONFIG_CONTENT")
             .map(String::as_str),
-        Some(r#"{"model":"claude-sonnet-4","permission":{"task":"deny"}}"#)
+        Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4"}"#)
     );
-    // No model: permission.task=deny is still emitted (change from prior behavior
-    // where no config was set without a model).
-    let oc_no_model = build_provider_env(opencode, None);
+    // No model, no rules file: permission.task=deny is still emitted.
+    let oc_no_model_no_rules = build_provider_env(opencode, None, None);
     assert_eq!(
-        oc_no_model
+        oc_no_model_no_rules
             .get("OPENCODE_CONFIG_CONTENT")
             .map(String::as_str),
         Some(r#"{"permission":{"task":"deny"}}"#)
     );
+}
+
+#[test]
+fn opencode_model_sentinel_filtered_from_env() {
+    let opencode = find_provider("opencode").unwrap();
+
+    // Model sentinel "default" alone → permission.task=deny only (model filtered).
+    let sentinel_only = build_provider_env(opencode, Some("default"), None);
+    assert_eq!(
+        sentinel_only
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"}}"#)
+    );
+
+    // Rules file alone (no model) → permission + instructions.
+    let rules_only = build_provider_env(opencode, None, Some("/tmp/rules.md"));
+    assert_eq!(
+        rules_only
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
+    );
+
+    // Real model + rules file → all three fields.
+    let both = build_provider_env(opencode, Some("gpt-4"), Some("/tmp/rules.md"));
+    assert_eq!(
+        both.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"model":"gpt-4","instructions":["/tmp/rules.md"]}"#)
+    );
+
+    // Sentinel model + rules file → permission + instructions (model filtered).
+    let sentinel_with_rules = build_provider_env(opencode, Some("default"), Some("/tmp/rules.md"));
+    assert_eq!(
+        sentinel_with_rules
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
+    );
+}
+
+#[test]
+fn json_escape_handles_control_characters() {
+    use crate::args::json_escape;
+
+    // Basic escaping.
+    assert_eq!(json_escape(r#"foo"bar"#), r#"foo\"bar"#);
+    assert_eq!(json_escape(r"foo\bar"), r"foo\\bar");
+    assert_eq!(json_escape("foo\nbar"), r"foo\nbar");
+    assert_eq!(json_escape("foo\rbar"), r"foo\rbar");
+    assert_eq!(json_escape("foo\tbar"), r"foo\tbar");
+
+    // Backspace and form feed.
+    assert_eq!(json_escape("foo\x08bar"), r"foo\bbar");
+    assert_eq!(json_escape("foo\x0Cbar"), r"foo\fbar");
+
+    // Other control characters → \uXXXX.
+    assert_eq!(json_escape("foo\x01bar"), r"foo\u0001bar");
+    assert_eq!(json_escape("foo\x1Fbar"), r"foo\u001fbar");
+
+    // Round-trip safety: a path with control chars produces valid JSON.
+    let weird_path = "/tmp/rules\x08\x0C\x01.md";
+    let escaped = json_escape(weird_path);
+    // Verify the expected escaping.
+    assert_eq!(escaped, r"/tmp/rules\b\f\u0001.md");
+    // The escaped value can be embedded in a JSON string.
+    let json = format!(r#"{{"path":"{}"}}"#, escaped);
+    assert_eq!(json, r#"{"path":"/tmp/rules\b\f\u0001.md"}"#);
 }
 
 /// Serializes env-var mutation across tests in this binary: the vars are
@@ -366,7 +435,7 @@ fn v8_runtime_node_options_heap_cap() {
         None
     );
 
-    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None);
+    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None, None);
 
     // Env-driven scenarios (serialized within this single test).
     std::env::remove_var("NODE_OPTIONS");
@@ -719,4 +788,119 @@ fn registry_invariants() {
         assert!(!p.display_name.is_empty());
         assert!(!p.command.is_empty());
     }
+}
+
+#[test]
+fn injection_mechanism_registry() {
+    use InjectionMechanism::*;
+    assert_eq!(
+        find_provider("auggie").unwrap().injection_mechanism,
+        RulesFileFlag
+    );
+    assert_eq!(
+        find_provider("droid").unwrap().injection_mechanism,
+        RulesFileFlag
+    );
+    assert_eq!(
+        find_provider("claude-code").unwrap().injection_mechanism,
+        SessionMeta
+    );
+    assert_eq!(
+        find_provider("codex").unwrap().injection_mechanism,
+        SessionMeta
+    );
+    assert_eq!(
+        find_provider("opencode").unwrap().injection_mechanism,
+        EnvConfig
+    );
+    assert_eq!(
+        find_provider("cortex").unwrap().injection_mechanism,
+        FirstTurnPrepend
+    );
+    assert_eq!(
+        find_provider("mock").unwrap().injection_mechanism,
+        FirstTurnPrepend
+    );
+}
+
+#[test]
+fn droid_arg_assembly_includes_append_system_prompt_file() {
+    let droid = find_provider("droid").unwrap();
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            model: Some("gpt-5"),
+            rules_file: Some("/tmp/rules.md"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec![
+            "exec",
+            "--output-format",
+            "acp",
+            "--model",
+            "gpt-5",
+            "--append-system-prompt-file",
+            "/tmp/rules.md",
+        ]
+    );
+}
+
+#[test]
+fn opencode_env_includes_instructions_with_model() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, Some("claude-sonnet-4"), Some("/tmp/rules.md"));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(
+            r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4","instructions":["/tmp/rules.md"]}"#
+        )
+    );
+}
+
+#[test]
+fn opencode_env_includes_instructions_without_model() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, None, Some("/tmp/rules.md"));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
+    );
+}
+
+#[test]
+fn opencode_env_model_only_no_instructions() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4"}"#)
+    );
+}
+
+#[test]
+fn opencode_env_escapes_json_in_instructions_path() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, None, Some(r#"/tmp/"rules".md"#));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/\"rules\".md"]}"#)
+    );
+}
+
+#[test]
+fn auggie_mechanism_unchanged() {
+    // auggie still uses RulesFileFlag, not affected by opencode/droid changes
+    let auggie = find_provider("auggie").unwrap();
+    assert_eq!(
+        auggie.injection_mechanism,
+        InjectionMechanism::RulesFileFlag
+    );
+    assert_eq!(auggie.rules_flag, Some("--rules"));
+
+    // Env assembly doesn't add OPENCODE_CONFIG_CONTENT for auggie
+    let env = build_provider_env(auggie, Some("sonnet4.5"), Some("/tmp/rules.md"));
+    assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
 }
