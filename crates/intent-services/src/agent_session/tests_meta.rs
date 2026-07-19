@@ -1,11 +1,50 @@
 //! Tests for `_meta` payload construction (§18.1 system-prompt injection via
 //! ACP extensibility).
 
-use super::build_session_meta;
+use super::{build_session_meta, resolve_provider_id};
+
+#[test]
+fn resolve_provider_id_from_compound_model() {
+    // Compound model id takes precedence over provider field
+    let provider_id = resolve_provider_id(Some("opencode:kimi-k3"), Some("claude-code"));
+    assert_eq!(provider_id, "opencode", "compound model prefix wins");
+}
+
+#[test]
+fn resolve_provider_id_from_provider_field() {
+    // Bare model id (no colon) falls back to provider field
+    let provider_id = resolve_provider_id(Some("gpt-5.3-codex"), Some("codex"));
+    assert_eq!(
+        provider_id, "codex",
+        "provider field is fallback for bare model"
+    );
+}
+
+#[test]
+fn resolve_provider_id_none_uses_default() {
+    // Both None -> default provider
+    let provider_id = resolve_provider_id(None, None);
+    assert_eq!(
+        provider_id,
+        intent_providers::default_provider_id(),
+        "None model + None provider -> default"
+    );
+}
+
+#[test]
+fn resolve_provider_id_bare_model_none_provider_uses_default() {
+    // Bare model + None provider -> default provider
+    let provider_id = resolve_provider_id(Some("sonnet4.5"), None);
+    assert_eq!(
+        provider_id,
+        intent_providers::default_provider_id(),
+        "bare model + None provider -> default"
+    );
+}
 
 #[test]
 fn claude_code_meta_appends_system_prompt() {
-    let meta = build_session_meta(Some("claude-code"), Some("Test prompt"));
+    let meta = build_session_meta("claude-code", Some("Test prompt"));
     assert!(meta.is_some(), "claude-code gets _meta");
     let meta_map = meta.unwrap();
     assert_eq!(
@@ -61,7 +100,7 @@ fn claude_code_meta_appends_system_prompt() {
 
 #[test]
 fn codex_meta_has_developer_instructions() {
-    let meta = build_session_meta(Some("codex"), Some("Test prompt"));
+    let meta = build_session_meta("codex", Some("Test prompt"));
     assert!(meta.is_some(), "codex gets _meta");
     let meta_map = meta.unwrap();
     assert_eq!(meta_map.len(), 1, "codex _meta has exactly one key");
@@ -79,7 +118,7 @@ fn codex_meta_has_developer_instructions() {
 
 #[test]
 fn auggie_gets_no_meta() {
-    let meta = build_session_meta(Some("auggie"), Some("Test prompt"));
+    let meta = build_session_meta("auggie", Some("Test prompt"));
     assert!(
         meta.is_none(),
         "auggie uses --rules flag, not _meta injection"
@@ -88,7 +127,7 @@ fn auggie_gets_no_meta() {
 
 #[test]
 fn droid_gets_no_meta() {
-    let meta = build_session_meta(Some("droid"), Some("Test prompt"));
+    let meta = build_session_meta("droid", Some("Test prompt"));
     assert!(
         meta.is_none(),
         "droid uses --append-system-prompt-file flag, not _meta"
@@ -97,7 +136,7 @@ fn droid_gets_no_meta() {
 
 #[test]
 fn opencode_gets_no_meta() {
-    let meta = build_session_meta(Some("opencode"), Some("Test prompt"));
+    let meta = build_session_meta("opencode", Some("Test prompt"));
     assert!(
         meta.is_none(),
         "opencode uses OPENCODE_CONFIG_CONTENT env, not _meta"
@@ -106,7 +145,7 @@ fn opencode_gets_no_meta() {
 
 #[test]
 fn cortex_gets_no_meta() {
-    let meta = build_session_meta(Some("cortex"), Some("Test prompt"));
+    let meta = build_session_meta("cortex", Some("Test prompt"));
     assert!(
         meta.is_none(),
         "cortex uses first-turn prepend fallback, not _meta"
@@ -115,7 +154,7 @@ fn cortex_gets_no_meta() {
 
 #[test]
 fn mock_gets_no_meta() {
-    let meta = build_session_meta(Some("mock"), Some("Test prompt"));
+    let meta = build_session_meta("mock", Some("Test prompt"));
     assert!(
         meta.is_none(),
         "mock uses first-turn prepend fallback, not _meta"
@@ -123,26 +162,31 @@ fn mock_gets_no_meta() {
 }
 
 #[test]
-fn no_provider_returns_none() {
-    let meta = build_session_meta(None, Some("Test prompt"));
-    assert!(meta.is_none(), "no provider id → no _meta");
+fn resolved_provider_with_claude_code_compound_model_gets_meta() {
+    // When model is "claude-code:sonnet4.5", resolve_provider_id extracts "claude-code"
+    let provider_id = resolve_provider_id(Some("claude-code:sonnet4.5"), Some("auggie"));
+    let meta = build_session_meta(&provider_id, Some("Test prompt"));
+    assert!(
+        meta.is_some(),
+        "claude-code compound model → claude-code provider → _meta"
+    );
 }
 
 #[test]
 fn codex_no_prompt_returns_none() {
-    let meta = build_session_meta(Some("codex"), None);
+    let meta = build_session_meta("codex", None);
     assert!(meta.is_none(), "codex with no prompt → no _meta");
 }
 
 #[test]
 fn codex_blank_prompt_returns_none() {
-    let meta = build_session_meta(Some("codex"), Some(""));
+    let meta = build_session_meta("codex", Some(""));
     assert!(meta.is_none(), "codex with blank prompt → no _meta");
 }
 
 #[test]
 fn claude_code_no_prompt_still_injects_disallowed_tools() {
-    let meta = build_session_meta(Some("claude-code"), None);
+    let meta = build_session_meta("claude-code", None);
     assert!(
         meta.is_some(),
         "claude-code always gets _meta (disallowedTools)"
@@ -175,14 +219,20 @@ fn claude_code_no_prompt_still_injects_disallowed_tools() {
 }
 
 #[test]
-fn both_missing_returns_none() {
-    let meta = build_session_meta(None, None);
-    assert!(meta.is_none(), "no provider or prompt → no _meta");
+fn resolved_default_provider_with_no_model_no_provider_returns_none() {
+    // When both model and provider are None, resolve_provider_id returns default provider
+    let provider_id = resolve_provider_id(None, None);
+    // Default provider (auggie) doesn't use _meta
+    let meta = build_session_meta(&provider_id, Some("Test prompt"));
+    assert!(
+        meta.is_none(),
+        "default provider (auggie) + prompt → no _meta (uses --rules)"
+    );
 }
 
 #[test]
 fn unknown_provider_returns_none() {
-    let meta = build_session_meta(Some("unknown-provider"), Some("Test prompt"));
+    let meta = build_session_meta("unknown-provider", Some("Test prompt"));
     assert!(
         meta.is_none(),
         "unknown provider id → no _meta (fallback to first-turn prepend)"
@@ -191,7 +241,7 @@ fn unknown_provider_returns_none() {
 
 #[test]
 fn claude_code_blank_prompt_still_injects_disallowed_tools() {
-    let meta = build_session_meta(Some("claude-code"), Some(""));
+    let meta = build_session_meta("claude-code", Some(""));
     assert!(
         meta.is_some(),
         "claude-code always gets _meta (disallowedTools)"
@@ -225,6 +275,6 @@ fn claude_code_blank_prompt_still_injects_disallowed_tools() {
 
 #[test]
 fn whitespace_prompt_returns_none() {
-    let meta = build_session_meta(Some("codex"), Some("   \n\t  "));
+    let meta = build_session_meta("codex", Some("   \n\t  "));
     assert!(meta.is_none(), "whitespace-only prompt → no _meta");
 }

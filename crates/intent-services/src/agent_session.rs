@@ -277,6 +277,18 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
     }
 }
 
+/// Resolve the effective provider id for an agent session using the same precedence
+/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:`) →
+/// `provider` field → default provider. This ensures `_meta` injection, spawn args,
+/// and all provider-keyed logic use a consistent provider id.
+fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
+    model
+        .filter(|m| m.contains(':'))
+        .map(|m| intent_providers::parse_compound_model_id(m).0)
+        .or_else(|| provider.map(|p| p.to_string()))
+        .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
+}
+
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
 /// `_meta` injection (auggie, droid, opencode, cortex, mock use other mechanisms).
@@ -284,9 +296,8 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
 ///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
 /// - codex: `{ "developerInstructions": "<prompt>" }` (bare top-level key, when non-blank prompt)
-fn build_session_meta(provider_id: Option<&str>, system_prompt: Option<&str>) -> Option<Meta> {
-    let provider = provider_id?;
-    match provider {
+fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<Meta> {
+    match provider_id {
         "claude-code" => {
             let mut meta = Meta::new();
 
@@ -403,8 +414,10 @@ impl Services {
         // resolved this agent id inside a workspace-scoped path.
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
-        // Build provider-specific _meta for system-prompt injection.
-        let meta = build_session_meta(stored.provider.as_deref(), stored.system_prompt.as_deref());
+        // Resolve provider using the same precedence as spawn path (compound model
+        // prefix → provider field → default), then build provider-specific _meta.
+        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -448,9 +461,11 @@ impl Services {
         // workspace (see [`open_acp_session`]).
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
-        // Build provider-specific _meta for system-prompt injection (recreate
-        // path sends the same prompt as new/load).
-        let meta = build_session_meta(stored.provider.as_deref(), stored.system_prompt.as_deref());
+        // Resolve provider using the same precedence as spawn path, then build
+        // provider-specific _meta for system-prompt injection (recreate path sends
+        // the same prompt as new/load).
+        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -500,8 +515,10 @@ impl Services {
         if !session::supports_load_session(init) {
             return Ok(None);
         }
-        // Build provider-specific _meta for system-prompt injection.
-        let meta = build_session_meta(stored.provider.as_deref(), stored.system_prompt.as_deref());
+        // Resolve provider using the same precedence as spawn path, then build
+        // provider-specific _meta for system-prompt injection.
+        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
