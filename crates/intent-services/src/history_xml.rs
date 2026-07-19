@@ -113,47 +113,36 @@ struct Msg {
 /// blocks (STAB-108: tool_use without a corresponding tool_result causes
 /// provider rejection on session resume).
 fn sanitize_messages_for_history(messages: &[AgentMessage]) -> Vec<Msg> {
-    // First pass: collect all tool_use IDs and all tool_result IDs to identify
-    // dangling tool_use blocks.
-    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
+    // First pass: collect valid tool_result IDs to identify dangling tool_use blocks.
     let mut valid_tool_result_ids: HashSet<String> = HashSet::new();
 
     for m in messages {
         if let Some(blocks) = m.content.as_array() {
             for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("tool_use") => {
-                        let id = str_field(block, &["tool_use_id", "id"]);
-                        if !id.is_empty() {
-                            all_tool_use_ids.insert(id);
+                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !tool_use_id.is_empty() {
+                        // Check if this tool_result is valid (has output or is_error).
+                        let output = match block.get("output") {
+                            Some(v) if !v.is_null() => Some(v),
+                            _ => block.get("content"),
+                        };
+                        let has_output = matches!(
+                            output,
+                            Some(Value::String(s)) if !s.is_empty()
+                        ) || matches!(
+                            output,
+                            Some(Value::Object(_)) | Some(Value::Array(_))
+                        );
+                        if has_output || bool_field(block, &["is_error", "isError"]) {
+                            valid_tool_result_ids.insert(tool_use_id);
                         }
                     }
-                    Some("tool_result") => {
-                        let tool_use_id = block
-                            .get("tool_use_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if !tool_use_id.is_empty() {
-                            // Check if this tool_result is valid (has output or is_error).
-                            let output = match block.get("output") {
-                                Some(v) if !v.is_null() => Some(v),
-                                _ => block.get("content"),
-                            };
-                            let has_output = matches!(
-                                output,
-                                Some(Value::String(s)) if !s.is_empty()
-                            ) || matches!(
-                                output,
-                                Some(Value::Object(_)) | Some(Value::Array(_))
-                            );
-                            if has_output || bool_field(block, &["is_error", "isError"]) {
-                                valid_tool_result_ids.insert(tool_use_id);
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
