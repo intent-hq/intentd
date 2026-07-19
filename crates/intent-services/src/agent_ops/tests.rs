@@ -6333,7 +6333,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         file_blocks: None,
         queued_at: now_iso(),
         editing: false,
-        persisted: true, // Terminal-failure requeue marker
+        persisted: true,
+        requeued_after_failure: true, // Terminal-failure requeue marker
     };
 
     svc.requeue_front(&id, queued);
