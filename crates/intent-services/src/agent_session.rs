@@ -285,6 +285,7 @@ fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
+        .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
         .or_else(|| provider.map(|p| p.to_string()))
         .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
 }
