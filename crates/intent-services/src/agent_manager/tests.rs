@@ -583,6 +583,8 @@ fn mock_handle() -> AgentHandle {
         _mcp_bridge: None,
         _mcp_config: None,
         _rules_config: None,
+        spawned_model: None,
+        spawned_provider: "auggie".to_string(),
     }
 }
 
@@ -1053,6 +1055,8 @@ fn track_mock_agent_inner(
             _mcp_bridge: None,
             _mcp_config: None,
             _rules_config: None,
+            spawned_model: None,
+            spawned_provider: "auggie".to_string(),
         },
     );
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
