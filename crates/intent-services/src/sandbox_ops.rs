@@ -106,7 +106,7 @@ pub async fn provision_sandbox(
             .ok_or_else(|| Error::Internal("sandbox has no HEAD commit".to_string()))?;
 
         // Create branch sb/<agentId> in the sandbox
-        let branch_name = format!("sb/{}", &agent_id.0);
+        let branch_name = format!("sb/{}", agent_id.0);
         let head_commit = sandbox_repo
             .head()
             .map_err(|e| Error::Internal(format!("get HEAD failed: {e}")))?
@@ -801,6 +801,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
@@ -923,6 +924,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1068,6 +1070,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1195,6 +1198,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1291,6 +1295,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1365,6 +1370,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

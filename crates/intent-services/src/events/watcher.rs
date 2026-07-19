@@ -30,6 +30,11 @@ use super::bus::EventBus;
 /// event is published `DEBOUNCE` after the *last* raw change for that path.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Burst threshold: when pending events exceed this count during a flush
+/// window, collapse into per-directory summary events rather than emitting
+/// one row per file (finding F4: prevent 31,881 INSERTs from bulk churn).
+const BURST_THRESHOLD: usize = 100;
+
 /// Directory names ignored at any depth, mirroring the `IGNORE_PATTERNS` of
 /// `unified-workspace-watcher.ts` plus the `.workspace-notes` additions of
 /// `tracking.config.ts`. A path is dropped if any component matches.
@@ -148,6 +153,15 @@ fn relative_path(root: &Path, abs: &Path) -> Option<String> {
     Some(joined)
 }
 
+/// Extract the parent directory of a workspace-relative path. Root files return
+/// an empty string (workspace root), nested paths return the parent directory.
+fn parent_dir(path: &str) -> String {
+    match path.rfind('/') {
+        Some(idx) => path[..idx].to_string(),
+        None => String::new(),
+    }
+}
+
 /// A live recursive watch over one workspace path. Holds the `notify` watcher
 /// (the OS subscription ends when it drops) and the debounce task (aborted on
 /// drop), so dropping the [`FileWatcher`] tears the whole pipeline down — the
@@ -248,7 +262,8 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// Publish + remove every path whose debounce deadline has elapsed.
+/// Publish + remove every path whose debounce deadline has elapsed. When the
+/// burst exceeds [`BURST_THRESHOLD`], collapse into per-directory summaries.
 async fn flush_due(
     bus: &EventBus,
     workspace_id: &WorkspaceId,
@@ -260,10 +275,38 @@ async fn flush_due(
         .filter(|(_, (_, at))| *at <= now)
         .map(|(p, _)| p.clone())
         .collect();
-    for path in due {
-        if let Some((action, _)) = pending.remove(&path) {
-            publish(bus, workspace_id, &path, action).await;
+
+    if due.len() > BURST_THRESHOLD {
+        flush_burst(bus, workspace_id, pending, &due).await;
+    } else {
+        for path in due {
+            if let Some((action, _)) = pending.remove(&path) {
+                publish(bus, workspace_id, &path, action).await;
+            }
         }
+    }
+}
+
+/// Handle burst scenario: collapse >BURST_THRESHOLD events into bounded
+/// per-directory summary events with metadata indicating the burst.
+async fn flush_burst(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+    due: &[String],
+) {
+    // Group due paths by directory.
+    let mut by_dir: HashMap<String, Vec<(String, Action)>> = HashMap::new();
+    for path in due {
+        if let Some((action, _)) = pending.remove(path) {
+            let dir = parent_dir(path);
+            by_dir.entry(dir).or_default().push((path.clone(), action));
+        }
+    }
+
+    // Emit one summary event per directory containing the count and actions.
+    for (dir, files) in by_dir {
+        publish_burst(bus, workspace_id, &dir, &files).await;
     }
 }
 
@@ -306,6 +349,66 @@ async fn publish(bus: &EventBus, workspace_id: &WorkspaceId, relative: &str, act
     };
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, path = relative, "failed to publish file:* event");
+    }
+}
+
+/// Emit a burst summary event for a directory: a single `file:changed` event
+/// with `data.burst = true` and `data.affectedCount` indicating the number of
+/// files affected. FE consumers (event.recentFiles / directoryChanges) can
+/// recognize the burst marker and query the store for recent directory activity
+/// rather than expecting individual per-file rows.
+async fn publish_burst(
+    bus: &EventBus,
+    workspace_id: &WorkspaceId,
+    dir: &str,
+    files: &[(String, Action)],
+) {
+    let count = files.len();
+    let display_path = if dir.is_empty() {
+        ".".to_string()
+    } else {
+        dir.to_string()
+    };
+
+    // Count actions to provide summary metadata.
+    let mut creates = 0;
+    let mut deletes = 0;
+    let mut modifies = 0;
+    for (_, action) in files {
+        match action {
+            Action::Create => creates += 1,
+            Action::Delete => deletes += 1,
+            Action::Modify | Action::Rename => modifies += 1,
+        }
+    }
+
+    let event = NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: intent_core::events::FILE_CHANGED.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::System,
+            id: Some("system".to_string()),
+            name: Some("System".to_string()),
+            ..Default::default()
+        },
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: json!({
+            "path": display_path,
+            "relativePath": display_path,
+            "action": "modify",
+            "burst": true,
+            "affectedCount": count,
+            "creates": creates,
+            "deletes": deletes,
+            "modifies": modifies,
+        }),
+    };
+    if let Err(e) = bus.publish(&event).await {
+        tracing::warn!(error = %e, dir = dir, count = count, "failed to publish burst event");
     }
 }
 
@@ -374,5 +477,13 @@ mod tests {
             Some("src/main.rs")
         );
         assert_eq!(relative_path(root, Path::new("/other/x")), None);
+    }
+
+    #[test]
+    fn parent_dir_extracts_directory() {
+        assert_eq!(parent_dir("foo.txt"), "");
+        assert_eq!(parent_dir("src/main.rs"), "src");
+        assert_eq!(parent_dir("a/b/c.txt"), "a/b");
+        assert_eq!(parent_dir(""), "");
     }
 }

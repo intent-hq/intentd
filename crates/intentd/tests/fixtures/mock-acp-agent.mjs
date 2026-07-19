@@ -226,10 +226,12 @@ async function handlePrompt(id, params) {
     : active.toolCall
       ? [active.toolCall]
       : [];
+  const toolResults = [];
   for (const toolCall of toolCalls) {
     try {
       const res = await callWorkspaceTool(toolCall);
       log(`tool call ok: ${JSON.stringify(res).slice(0, 120)}`);
+      toolResults.push({ toolCall, result: res });
     } catch (err) {
       log(`tool call failed: ${err.message}`);
       return result(id, { stopReason: 'refusal' });
@@ -287,10 +289,48 @@ async function handlePrompt(id, params) {
   if (delayMs > 0 && promptCount === 1) {
     await new Promise((r) => setTimeout(r, delayMs));
   }
+
+  // Emit text response
   note('session/update', {
     sessionId: SESSION_ID,
     update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
   });
+
+  // Emit tool blocks if emitToolBlocks is enabled (opt-in for transcript persistence testing)
+  if (active.emitToolBlocks && toolResults.length > 0) {
+    for (const { toolCall, result } of toolResults) {
+      // Emit tool_call notification (creates tool_use block in transcript)
+      const toolCallId = `tc_${Math.random().toString(36).slice(2, 11)}`;
+      note('session/update', {
+        sessionId: SESSION_ID,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId,
+          title: toolCall.name,
+          name: toolCall.name,
+          kind: 'mcp',
+          status: 'in_progress',
+          rawInput: toolCall.arguments || {},
+        },
+      });
+
+      // Emit tool_call_update with output (creates tool_result block in transcript).
+      // The MCP result has { content: [...], isError?: boolean }. Each content item
+      // can be text, image, or resource. The daemon will store the full array.
+      if (result && result.content && Array.isArray(result.content)) {
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: result.isError ? 'error' : 'completed',
+            rawOutput: result.content,
+          },
+        });
+      }
+    }
+  }
+
   result(id, { stopReason: 'end_turn' });
 }
 
@@ -339,6 +379,9 @@ async function dispatch(msg) {
     }
     case 'session/load':
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
+    case 'session/set_mode':
+      // Accept any mode change request (no-op for the mock).
+      return result(msg.id, {});
     case 'session/prompt':
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':

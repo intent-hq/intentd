@@ -609,6 +609,11 @@ impl Services {
                         data["report"] = Value::String(report);
                     }
                 }
+                // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
+                // BEFORE publishing the idle event so the persisted state is
+                // correct if the daemon is killed immediately after the event.
+                self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
+                    .await;
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }

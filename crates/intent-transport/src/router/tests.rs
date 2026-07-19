@@ -1065,18 +1065,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn search_memories(
-        &self,
-        _query: String,
-        _workspace_id: Option<WorkspaceId>,
-        request_id: Option<String>,
-    ) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async move {
-            let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
-            Ok(serde_json::json!({ "requestId": request_id, "matches": [] }))
-        })
-    }
-
     fn search_notes(
         &self,
         _query: String,
@@ -3539,20 +3527,6 @@ async fn search_events_requires_query_only() {
     .await
     .unwrap();
     assert_eq!(v["result"]["requestId"], serde_json::json!("srch-e"));
-}
-
-#[tokio::test]
-async fn search_memories_requires_query_only() {
-    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"search.memories","params":{}}"#)
-        .await
-        .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"search.memories","params":{"query":"x","requestId":"srch-m"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(v["result"]["requestId"], serde_json::json!("srch-m"));
 }
 
 #[tokio::test]

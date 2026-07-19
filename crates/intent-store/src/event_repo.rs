@@ -155,24 +155,46 @@ impl Store {
         rows.iter().map(map_event_row).collect()
     }
 
-    /// Retention/compaction sweep (§10.2): delete only `agent:stream:*` chunk
-    /// events whose `timestamp` is strictly older than `cutoff` (an RFC-3339
-    /// string), and return the number of rows removed. Every other event family
-    /// (lifecycle/tool/permission/pr/task/note/file/workspace) is preserved
-    /// regardless of age. This is the sole delete path on the otherwise
-    /// append-only log; it is deliberately scoped to the high-volume
-    /// stream-chunk family so the log stays the source of truth for everything
-    /// else. Runs as a single statement (implicitly transactional) and is
-    /// idempotent — a re-run with the same cutoff removes nothing more.
-    pub async fn delete_stream_events_before(&self, cutoff: &str) -> Result<u64> {
-        let pattern = format!("{}%", intent_core::events::AGENT_STREAM_PREFIX);
-        let result = sqlx::query("DELETE FROM event WHERE event_type LIKE ? AND timestamp < ?")
-            .bind(pattern)
-            .bind(cutoff)
-            .execute(self.pool())
-            .await
-            .map_err(|e| Error::Internal(format!("stream retention sweep failed: {e}")))?;
+    /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
+    /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
+    /// `host:exec:*`) whose `timestamp` is strictly older than `cutoff` (an
+    /// RFC-3339 string), and return the number of rows removed. Lifecycle/tool/
+    /// note/task/workspace events are preserved regardless of age. This is the
+    /// sole delete path on the otherwise append-only log; it is deliberately
+    /// scoped to high-volume families that can be safely trimmed so the log stays
+    /// the source of truth for everything else. Runs as a single statement
+    /// (implicitly transactional) and is idempotent — a re-run with the same
+    /// cutoff removes nothing more.
+    pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
+        // High-volume event families eligible for retention sweep:
+        // - agent:stream:* — streaming chunks
+        // - file:* — file watcher events (finding F4: 87% of event table)
+        // - terminal:data — live PTY output
+        // - host:exec:* — streaming command output
+        let result = sqlx::query(
+            "DELETE FROM event WHERE timestamp < ? AND (
+                event_type LIKE ? OR
+                event_type LIKE ? OR
+                event_type = ? OR
+                event_type LIKE ?
+            )",
+        )
+        .bind(cutoff)
+        .bind(format!("{}%", intent_core::events::AGENT_STREAM_PREFIX))
+        .bind("file:%")
+        .bind(intent_core::events::TERMINAL_DATA)
+        .bind("host:exec:%")
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("ephemeral event retention sweep failed: {e}")))?;
         Ok(result.rows_affected())
+    }
+
+    /// Legacy alias for `delete_ephemeral_events_before`. Preserved for
+    /// backward compatibility during the transition; new callers should use
+    /// `delete_ephemeral_events_before` directly.
+    pub async fn delete_stream_events_before(&self, cutoff: &str) -> Result<u64> {
+        self.delete_ephemeral_events_before(cutoff).await
     }
 
     /// Most-recent `file:changed` events for a workspace (newest first).

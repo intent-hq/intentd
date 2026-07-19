@@ -158,6 +158,7 @@ mod tests {
             sandbox_id: None,
             sandbox_path: sandbox_path.clone(),
             sandbox_branch: sandbox_path.as_ref().map(|_| format!("sb/{}", agent_id.0)),
+            stop_reason: None,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }

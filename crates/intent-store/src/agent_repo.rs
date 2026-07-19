@@ -20,7 +20,19 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, \
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch";
+    is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason";
+
+/// Interrupted agent record (INT-41). Returned by
+/// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
+#[derive(Debug, Clone)]
+pub struct InterruptedAgent {
+    pub agent_id: AgentId,
+    pub workspace_id: WorkspaceId,
+    pub prev_status: String,
+    pub interrupted_at: String,
+    pub agent_name: Option<String>,
+    pub workspace_name: Option<String>,
+}
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
@@ -48,7 +60,7 @@ impl Store {
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&s.id.0)
@@ -79,6 +91,7 @@ impl Store {
             .bind(&s.sandbox_id)
             .bind(&s.sandbox_path)
             .bind(&s.sandbox_branch)
+            .bind(&s.stop_reason)
             .execute(self.pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -154,6 +167,139 @@ impl Store {
         Ok(sessions)
     }
 
+    /// List a workspace's sessions WITHOUT message logs, oldest first. Used by hot
+    /// paths (`derive_last_activity`, `enrich_workspace_aggregates`) that only need
+    /// session metadata (name, status, updated_at, etc.) and never read the message
+    /// bodies (finding F1: eliminates full agent-message-log hydration from
+    /// `workspace.list` / `workspace.get` emit). Reuses the `list_all_agent_sessions`
+    /// row-mapping pattern (§9.1).
+    pub async fn list_agent_session_summaries(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<AgentSession>> {
+        let sql = format!(
+            "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list agent session summaries failed: {e}")))?;
+        rows.iter().map(map_session_row).collect()
+    }
+
+    /// Get message count and whether any assistant message exists for each session in
+    /// a workspace, without hydrating message bodies (finding F1/F3: lightweight
+    /// alternative to full message-log fetch for `agent.diagnostics`). Returns a map
+    /// keyed by agent_id with `(message_count, has_assistant)` tuples.
+    pub async fn get_agent_session_message_stats(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<std::collections::HashMap<String, (u64, bool)>> {
+        // First, get all session IDs for this workspace
+        let sql = "SELECT id FROM agent_session WHERE workspace_id = ?";
+        let rows = sqlx::query(sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session message stats failed: {e}")))?;
+
+        let mut stats = std::collections::HashMap::new();
+
+        for row in rows {
+            let agent_id: String = row.get("id");
+
+            // Count total messages
+            let count_row =
+                sqlx::query("SELECT COUNT(*) as count FROM agent_message WHERE agent_id = ?")
+                    .bind(&agent_id)
+                    .fetch_one(self.pool())
+                    .await
+                    .map_err(|e| Error::Internal(format!("count messages failed: {e}")))?;
+            let message_count: i64 = count_row.get("count");
+
+            // Check if any assistant message exists
+            let assistant_row = sqlx::query(
+                "SELECT EXISTS(SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant') as has_assistant"
+            )
+            .bind(&agent_id)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("check assistant message failed: {e}")))?;
+            let has_assistant: i64 = assistant_row.get("has_assistant");
+
+            stats.insert(agent_id, (message_count as u64, has_assistant != 0));
+        }
+
+        Ok(stats)
+    }
+
+    /// Get the agent_message watermark for a workspace: the count of messages
+    /// across all agents. This is used by the token-usage scan loop to skip
+    /// workspaces that have not changed since the last scan (finding F2).
+    /// Returns 0 for workspaces with no agents or no messages.
+    pub async fn get_workspace_message_watermark(&self, workspace_id: &WorkspaceId) -> Result<u64> {
+        let sql = r#"
+            SELECT COUNT(*) as count
+            FROM agent_message
+            WHERE agent_id IN (
+                SELECT id FROM agent_session WHERE workspace_id = ?
+            )
+        "#;
+        let row = sqlx::query(sql)
+            .bind(&workspace_id.0)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get workspace message watermark failed: {e}")))?;
+        let count: i64 = row.get("count");
+        Ok(count as u64)
+    }
+
+    /// Get lightweight usage data for all agents in a workspace: for each agent,
+    /// returns the agent_id, model, and all message content JSON (for tallying
+    /// without full AgentSession hydration; finding F2). Used by the token-usage
+    /// scan to avoid reading full message logs when only the usage metadata is needed.
+    pub async fn get_workspace_agent_usage_data(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Option<String>, Vec<serde_json::Value>)>> {
+        // First get all sessions for this workspace with their models
+        let session_sql = "SELECT id, model FROM agent_session WHERE workspace_id = ?";
+        let session_rows = sqlx::query(session_sql)
+            .bind(&workspace_id.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent sessions for usage failed: {e}")))?;
+
+        let mut result = Vec::new();
+        for session_row in session_rows {
+            let agent_id: String = session_row.get("id");
+            let model: Option<String> = session_row.get("model");
+
+            // Get all message content for this agent
+            let message_sql =
+                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
+            let message_rows = sqlx::query(message_sql)
+                .bind(&agent_id)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("get agent messages for usage failed: {e}"))
+                })?;
+
+            let contents: Vec<serde_json::Value> = message_rows
+                .iter()
+                .map(|row| {
+                    let content_str: String = row.get("content");
+                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+
+            result.push((agent_id, model, contents));
+        }
+        Ok(result)
+    }
+
     /// List every persisted session across workspaces, oldest first. Backs the
     /// daemon-startup stale-session heal: a session left non-terminal across a
     /// crash has no live worker after restart, so the heal sweeps the whole
@@ -174,21 +320,51 @@ impl Store {
     /// mutate an `agent_session` row that belongs to workspace A (mirrors the
     /// post-0022 `note_repo` pattern). `NotFound` if absent or the workspace
     /// does not match.
+    ///
+    /// Provider immutability is enforced only after the first real use (once
+    /// `acp_session_id` is set), allowing cross-provider model switches before
+    /// the first turn.
     pub async fn update_agent_session(
         &self,
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        let current = self.get_agent_session(&s.id).await?;
-        if current.workspace_id != *workspace_id {
+        // Lightweight invariant check: read only workspace_id, provider,
+        // acp_session_id (finding F3: no message fetch). Workspace mismatch →
+        // NotFound, provider immutable, acp_session_id write-once (§9.5).
+        let row = sqlx::query(
+            "SELECT workspace_id, provider, acp_session_id FROM agent_session WHERE id = ?",
+        )
+        .bind(&s.id.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update agent session invariant check failed: {e}")))?
+        .ok_or_else(|| Error::NotFound(format!("agent session {}", s.id)))?;
+
+        let current_workspace_id = WorkspaceId(row.get::<String, _>("workspace_id"));
+        if current_workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
-        if current.provider.is_some() && s.provider != current.provider {
+        let current_provider = row.get::<Option<String>, _>("provider");
+        let current_acp_session_id = row.get::<Option<String>, _>("acp_session_id");
+        // Provider is immutable only after first real use (once acp_session_id
+        // is set). This allows cross-provider model switches before the first
+        // turn spawns a provider process.
+        if current_acp_session_id.is_some() && s.provider != current_provider {
             return Err(Error::Internal(
-                "agent provider is immutable once set".to_string(),
+                "agent provider is immutable once set (first real use)".to_string(),
             ));
         }
-        if current.acp_session_id.is_some() && s.acp_session_id != current.acp_session_id {
+        // Also reject provider changes in the same update that sets acp_session_id.
+        if current_acp_session_id.is_none()
+            && s.acp_session_id.is_some()
+            && s.provider != current_provider
+        {
+            return Err(Error::Internal(
+                "agent provider is immutable once set (first real use)".to_string(),
+            ));
+        }
+        if current_acp_session_id.is_some() && s.acp_session_id != current_acp_session_id {
             return Err(Error::Internal("acpSessionId is write-once".to_string()));
         }
         let rows = sqlx::query(
@@ -197,7 +373,7 @@ impl Store {
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, is_background=?, \
-             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=? \
+             metadata=?, sandbox_id=?, sandbox_path=?, sandbox_branch=?, stop_reason=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -225,6 +401,7 @@ impl Store {
         .bind(&s.sandbox_id)
         .bind(&s.sandbox_path)
         .bind(&s.sandbox_branch)
+        .bind(&s.stop_reason)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
         .execute(self.pool())
@@ -245,6 +422,10 @@ impl Store {
     /// Scoped to `workspace_id` (defense-in-depth). `updated_at` is refreshed to
     /// the supplied timestamp. `NotFound` if the session is absent or the
     /// workspace does not match.
+    ///
+    /// `stop_reason`: `None` leaves the column untouched; `Some(None)` clears it
+    /// to NULL; `Some(Some(reason))` sets the new value. This three-way encoding
+    /// allows callers to set, clear, or leave unchanged across a status update.
     pub async fn set_agent_session_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -252,20 +433,43 @@ impl Store {
         status: AgentStatus,
         is_active: bool,
         updated_at: &str,
+        stop_reason: Option<Option<String>>,
     ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET status=?, is_active=?, updated_at=? \
-             WHERE id=? AND workspace_id=?",
-        )
-        .bind(enum_to_db(&status)?)
-        .bind(is_active as i64)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.pool())
-        .await
-        .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
-        .rows_affected();
+        let rows = match stop_reason {
+            None => {
+                // Leave stop_reason untouched.
+                sqlx::query(
+                    "UPDATE agent_session SET status=?, is_active=?, updated_at=? \
+                     WHERE id=? AND workspace_id=?",
+                )
+                .bind(enum_to_db(&status)?)
+                .bind(is_active as i64)
+                .bind(updated_at)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+                .rows_affected()
+            }
+            Some(reason) => {
+                // Set or clear stop_reason: Some(None) → NULL, Some(Some(x)) → x.
+                sqlx::query(
+                    "UPDATE agent_session SET status=?, is_active=?, updated_at=?, stop_reason=? \
+                     WHERE id=? AND workspace_id=?",
+                )
+                .bind(enum_to_db(&status)?)
+                .bind(is_active as i64)
+                .bind(updated_at)
+                .bind(reason)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.pool())
+                .await
+                .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
+                .rows_affected()
+            }
+        };
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -301,6 +505,57 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(())
+    }
+
+    /// Clear `completion_report` + `completion_report_timestamp` when a new turn
+    /// begins for a delegated agent that previously called `report_to_parent`.
+    /// Returns `true` if a report was present and cleared, `false` if no report
+    /// was set (the common case — no write, no event). Scoped to `workspace_id`
+    /// (defense-in-depth). `updated_at` is refreshed to the supplied timestamp.
+    /// `NotFound` if the session is absent or the workspace does not match.
+    pub async fn clear_completion_report(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        updated_at: &str,
+    ) -> Result<bool> {
+        // Conditional UPDATE: only modify rows where completion_report IS NOT NULL.
+        // This avoids the expensive get_agent_session call (which loads the full
+        // message log) at the start of every turn. rows_affected tells us whether
+        // a report was present and cleared.
+        let rows = sqlx::query(
+            "UPDATE agent_session SET completion_report=NULL, \
+             completion_report_timestamp=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND completion_report IS NOT NULL",
+        )
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("clear completion report failed: {e}")))?
+        .rows_affected();
+        // rows_affected > 0 means a report was cleared; 0 means either no session
+        // found, workspace mismatch, or no report was set. Distinguish the error
+        // case (session not found / workspace mismatch) with a lightweight lookup.
+        if rows == 0 {
+            // Verify the session exists and workspace matches. Only SELECT id to
+            // avoid loading the full message log.
+            let exists = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+            if exists.is_none() {
+                return Err(Error::NotFound(format!("agent session {id}")));
+            }
+            // Session exists but no report was set — the common case.
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Reset all `is_active=1` rows to `is_active=0` unconditionally (Wave B
@@ -465,6 +720,7 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         image_blocks: json_col_from_db(col(row, "image_blocks")?, "image_blocks")?,
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,
+        stop_reason: col(row, "stop_reason")?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         sandbox_id: col(row, "sandbox_id")?,
@@ -718,6 +974,126 @@ impl Store {
         })
         .await
     }
+
+    /// Record an interrupted in-flight agent. Upserts: if a pending row exists
+    /// (daemon restarted before resumption), updates to the latest state. Returns
+    /// `true` if inserted/updated.
+    pub async fn insert_interrupted_agent(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        prev_status: &str,
+        interrupted_at: &str,
+    ) -> Result<bool> {
+        let sql =
+            "INSERT INTO interrupted_agent (agent_id, workspace_id, prev_status, interrupted_at) \
+                   VALUES (?, ?, ?, ?) \
+                   ON CONFLICT(agent_id) DO UPDATE SET \
+                       prev_status = excluded.prev_status, \
+                       interrupted_at = excluded.interrupted_at, \
+                       resolution = 'pending', \
+                       resolved_at = NULL";
+        let res = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .bind(&workspace_id.0)
+            .bind(prev_status)
+            .bind(interrupted_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("insert interrupted_agent failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// List pending interrupted agents, joined with agent_session (name) and
+    /// workspace (title). Sessions deleted since interruption are excluded (INNER JOIN).
+    pub async fn list_interrupted_agents(&self) -> Result<Vec<InterruptedAgent>> {
+        let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
+                          ag.name AS agent_name, w.title AS workspace_name \
+                   FROM interrupted_agent ia \
+                   INNER JOIN agent_session ag ON ia.agent_id = ag.id \
+                   LEFT JOIN workspace w ON ia.workspace_id = w.id \
+                   WHERE ia.resolution = 'pending'";
+        sqlx::query(sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("list interrupted_agent failed: {e}")))?
+            .iter()
+            .map(|row| {
+                Ok(InterruptedAgent {
+                    agent_id: AgentId(col(row, "agent_id")?),
+                    workspace_id: WorkspaceId(col(row, "workspace_id")?),
+                    prev_status: col(row, "prev_status")?,
+                    interrupted_at: col(row, "interrupted_at")?,
+                    agent_name: col(row, "agent_name")?,
+                    workspace_name: col(row, "workspace_name")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Get a single pending interrupted agent by ID. Returns None if not found or not pending.
+    pub async fn get_interrupted_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<Option<InterruptedAgent>> {
+        let sql = "SELECT ia.agent_id, ia.workspace_id, ia.prev_status, ia.interrupted_at, \
+                          ag.name AS agent_name, w.title AS workspace_name \
+                   FROM interrupted_agent ia \
+                   INNER JOIN agent_session ag ON ia.agent_id = ag.id \
+                   LEFT JOIN workspace w ON ia.workspace_id = w.id \
+                   WHERE ia.agent_id = ? AND ia.resolution = 'pending'";
+        let row = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("get interrupted_agent failed: {e}")))?;
+        match row {
+            None => Ok(None),
+            Some(ref r) => Ok(Some(InterruptedAgent {
+                agent_id: AgentId(col(r, "agent_id")?),
+                workspace_id: WorkspaceId(col(r, "workspace_id")?),
+                prev_status: col(r, "prev_status")?,
+                interrupted_at: col(r, "interrupted_at")?,
+                agent_name: col(r, "agent_name")?,
+                workspace_name: col(r, "workspace_name")?,
+            })),
+        }
+    }
+
+    /// Set the resolution (resumed|abandoned) for an interrupted agent. Returns
+    /// `true` if a pending row was updated, `false` if the agent was not found or
+    /// already resolved (caller should fail the operation).
+    pub async fn set_interrupted_resolution(
+        &self,
+        agent_id: &AgentId,
+        resolution: &str,
+        resolved_at: &str,
+    ) -> Result<bool> {
+        let sql = "UPDATE interrupted_agent SET resolution = ?, resolved_at = ? \
+                   WHERE agent_id = ? AND resolution = 'pending'";
+        let res = sqlx::query(sql)
+            .bind(resolution)
+            .bind(resolved_at)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("set interrupted resolution failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Reset an interrupted agent row back to pending (resolution=NULL, resolved_at=NULL).
+    /// Used when a resume attempt claimed the row but failed post-claim, to restore
+    /// retryability. Returns `true` if a row was updated.
+    pub async fn reset_interrupted_resolution(&self, agent_id: &AgentId) -> Result<bool> {
+        let sql = "UPDATE interrupted_agent SET resolution = 'pending', resolved_at = NULL \
+                   WHERE agent_id = ?";
+        let res = sqlx::query(sql)
+            .bind(&agent_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("reset interrupted resolution failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 /// Input row for [`Store::replace_agent_messages`]: borrowed refs to the
@@ -757,4 +1133,635 @@ where
 {
     row.try_get::<T, _>(name)
         .map_err(|e| Error::Internal(format!("column {name}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    #[tokio::test]
+    async fn re_interruption_resets_resolution() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let agent_id = AgentId("agent-test".to_string());
+        let ws_id = WorkspaceId("ws-test".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Initial interruption
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "active", "2026-01-01T00:00:00Z")
+            .await
+            .expect("initial insert");
+
+        // Verify the row exists (raw SQL check since get_interrupted_agent requires agent_session)
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count");
+        assert_eq!(count, 1, "should have one pending row");
+
+        // Resolve it (resumed)
+        let updated = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:00Z")
+            .await
+            .expect("resolve");
+        assert!(updated, "should update pending row");
+
+        // Verify no longer pending
+        let count2: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count after resolve");
+        assert_eq!(count2, 0, "resolved row should not be pending");
+
+        // Re-interrupt (daemon crash again, same agent)
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "processing", "2026-01-01T00:02:00Z")
+            .await
+            .expect("re-interrupt");
+
+        // Verify row is pending again (resolution reset)
+        let count3: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("count after re-interrupt");
+        assert_eq!(count3, 1, "re-interrupted row should be pending again");
+
+        // Verify updated fields
+        let row: (String, String) = sqlx::query_as(
+            "SELECT prev_status, interrupted_at FROM interrupted_agent WHERE agent_id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.pool())
+        .await
+        .expect("fetch row");
+        assert_eq!(row.0, "processing");
+        assert_eq!(row.1, "2026-01-01T00:02:00Z");
+
+        // Attempt to resolve a non-existent agent
+        let unknown_id = AgentId("agent-unknown".to_string());
+        let updated2 = store
+            .set_interrupted_resolution(&unknown_id, "resumed", "2026-01-01T00:03:00Z")
+            .await
+            .expect("resolve unknown");
+        assert!(!updated2, "resolving unknown agent should return false");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn double_claim_race() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let agent_id = AgentId("agent-double".to_string());
+        let ws_id = WorkspaceId("ws-double".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Interrupt the agent
+        store
+            .insert_interrupted_agent(&agent_id, &ws_id, "active", "2026-01-01T00:00:00Z")
+            .await
+            .expect("initial insert");
+
+        // First claim succeeds
+        let claim1 = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:00Z")
+            .await
+            .expect("first claim");
+        assert!(claim1, "first claim should succeed");
+
+        // Second concurrent claim fails (row already resolved)
+        let claim2 = store
+            .set_interrupted_resolution(&agent_id, "resumed", "2026-01-01T00:01:01Z")
+            .await
+            .expect("second claim");
+        assert!(!claim2, "second claim should fail (already resolved)");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn list_agent_session_summaries_excludes_messages() {
+        use intent_core::{
+            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+            WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let tmp = PathBuf::from("/tmp").join(format!("test-summaries-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-summaries".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+
+        // Insert agent session
+        let agent_id = AgentId("agent-summary-test".to_string());
+        let session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Test Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            messages: vec![],
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            stats: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+        };
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        // Insert message
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "hello"}]),
+                &ts,
+            )
+            .await
+            .expect("append message");
+
+        // list_agent_sessions should include messages
+        let full = store
+            .list_agent_sessions(&ws_id)
+            .await
+            .expect("list_agent_sessions");
+        assert_eq!(full.len(), 1, "should have one session");
+        assert_eq!(
+            full[0].messages.len(),
+            1,
+            "list_agent_sessions should include messages"
+        );
+
+        // list_agent_session_summaries should exclude messages
+        let summaries = store
+            .list_agent_session_summaries(&ws_id)
+            .await
+            .expect("list_agent_session_summaries");
+        assert_eq!(summaries.len(), 1, "should have one session");
+        assert_eq!(
+            summaries[0].messages.len(),
+            0,
+            "summaries should exclude messages"
+        );
+        assert_eq!(summaries[0].id, agent_id, "id should match");
+        assert_eq!(summaries[0].name, "Test Agent", "name should match");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn update_agent_session_invariants_without_messages() {
+        use intent_core::{
+            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+            WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let tmp = PathBuf::from("/tmp").join(format!("test-update-inv-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-update-inv".to_string());
+        let wrong_ws_id = WorkspaceId("ws-wrong".to_string());
+
+        // Seed workspaces
+        let ts = now_iso();
+        for id in [&ws_id, &wrong_ws_id] {
+            let workspace = Workspace {
+                id: id.clone(),
+                title: "Test".to_string(),
+                branch: "main".to_string(),
+                base_ref: None,
+                base_commit_sha: None,
+                status: WorkspaceStatus::Active,
+                status_message: None,
+                activity: WorkspaceActivity::Idle,
+                attention: WorkspaceAttention::None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                last_activity: None,
+                tags: vec![],
+                path: None,
+                repository_path: None,
+                repository_owner: None,
+                repository_name: None,
+                worktree_path: None,
+                scope: None,
+                skip_worktree: false,
+                setup_script: None,
+                is_remote: false,
+                default_model: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                active_pull_request: None,
+                pull_requests: None,
+                archived: false,
+                archived_at: None,
+                task_stats: None,
+                agent_summary: None,
+                diff_summary: None,
+                token_usage: None,
+                cow_supported: None,
+            };
+            store.insert_workspace(&workspace).await.expect("insert");
+        }
+
+        // Insert agent session with provider and acp_session_id
+        let agent_id = AgentId("agent-inv-test".to_string());
+        let mut session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            backend_session_id: None,
+            acp_session_id: Some("acp-123".to_string()),
+            name: "Test Agent".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: Some("auggie".to_string()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            messages: vec![],
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            stats: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+        };
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Insert messages (to verify invariant check doesn't fetch them)
+        for _ in 0..10 {
+            store
+                .append_agent_message(
+                    &agent_id,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": "msg"}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        // Test workspace mismatch → NotFound
+        session.name = "Updated".to_string();
+        let result = store.update_agent_session(&wrong_ws_id, &session).await;
+        assert!(result.is_err(), "workspace mismatch should fail");
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "should be NotFound"
+        );
+
+        // Test provider immutability
+        session.provider = Some("different".to_string());
+        let result2 = store.update_agent_session(&ws_id, &session).await;
+        assert!(result2.is_err(), "provider change should fail");
+        assert!(
+            matches!(result2, Err(Error::Internal(_))),
+            "should be Internal"
+        );
+
+        // Test acp_session_id write-once
+        session.provider = Some("auggie".to_string()); // restore
+        session.acp_session_id = Some("different-acp".to_string());
+        let result3 = store.update_agent_session(&ws_id, &session).await;
+        assert!(result3.is_err(), "acp_session_id change should fail");
+        assert!(
+            matches!(result3, Err(Error::Internal(_))),
+            "should be Internal"
+        );
+
+        // Test successful update (name change OK)
+        session.acp_session_id = Some("acp-123".to_string()); // restore
+        session.name = "New Name".to_string();
+        let result4 = store.update_agent_session(&ws_id, &session).await;
+        assert!(result4.is_ok(), "name change should succeed");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn get_agent_session_message_stats() {
+        use intent_core::{
+            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
+            WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+
+        let tmp = PathBuf::from("/tmp").join(format!("test-msg-stats-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws_id = WorkspaceId("ws-stats".to_string());
+
+        // Seed workspace
+        let ts = now_iso();
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store.insert_workspace(&workspace).await.expect("insert");
+
+        // Create two agents
+        let agent1 = AgentId("agent-stats-1".to_string());
+        let agent2 = AgentId("agent-stats-2".to_string());
+
+        for agent_id in [&agent1, &agent2] {
+            let session = AgentSession {
+                id: agent_id.clone(),
+                workspace_id: ws_id.clone(),
+                backend_session_id: None,
+                acp_session_id: None,
+                name: format!("Agent {}", agent_id.0),
+                name_explicitly_set: false,
+                model: None,
+                provider: None,
+                status: AgentStatus::Idle,
+                is_active: false,
+                system_prompt: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+                messages: vec![],
+                parent_agent_id: None,
+                specialist: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                stats: None,
+                completion_report: None,
+                completion_report_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                is_background: false,
+                metadata: None,
+                sandbox_id: None,
+                sandbox_path: None,
+                sandbox_branch: None,
+                stop_reason: None,
+            };
+            store.insert_agent_session(&session).await.expect("insert");
+        }
+
+        // agent1: 1 user message only (no assistant)
+        store
+            .append_agent_message(
+                &agent1,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "hello"}]),
+                &ts,
+            )
+            .await
+            .expect("append user");
+
+        // agent2: 3 messages (user, assistant, user)
+        for (role, text) in [("user", "q1"), ("assistant", "a1"), ("user", "q2")] {
+            store
+                .append_agent_message(
+                    &agent2,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        // Get stats
+        let stats = store
+            .get_agent_session_message_stats(&ws_id)
+            .await
+            .expect("get_agent_session_message_stats");
+
+        assert_eq!(stats.len(), 2, "should have stats for both agents");
+
+        let (count1, has_assistant1) = stats.get(&agent1.0).expect("agent1 stats");
+        assert_eq!(*count1, 1, "agent1 should have 1 message");
+        assert!(!has_assistant1, "agent1 should have no assistant message");
+
+        let (count2, has_assistant2) = stats.get(&agent2.0).expect("agent2 stats");
+        assert_eq!(*count2, 3, "agent2 should have 3 messages");
+        assert!(has_assistant2, "agent2 should have assistant message");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

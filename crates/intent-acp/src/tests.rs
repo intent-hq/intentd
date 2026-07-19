@@ -5488,6 +5488,7 @@ mod wsapi4_bindings_tests {
             last_user_message: None,
             context_references: None,
             image_blocks: None,
+            stop_reason: None,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,

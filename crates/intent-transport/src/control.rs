@@ -38,6 +38,12 @@ pub struct SystemStatus {
     pub arch: String,
     /// Whether a GUI/display is available on the host (§12.3).
     pub has_display: bool,
+    /// The AgentManager concurrency cap (resolved maxConcurrent incl. auto-detection).
+    pub max_agents: usize,
+    /// The daemon crate version (`CARGO_PKG_VERSION`).
+    pub version: String,
+    /// Uptime in seconds since daemon start.
+    pub uptime_seconds: u64,
 }
 
 /// Live daemon control surface implemented by the composition root (`intentd`).
@@ -109,6 +115,9 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "port": status.port,
         "clients": status.clients,
         "agents": status.agents,
+        "maxAgents": status.max_agents,
+        "version": status.version,
+        "uptimeSeconds": status.uptime_seconds,
         "fingerprint": status.fingerprint,
         "protocolVersion": PROTOCOL_VERSION,
         "host": {
