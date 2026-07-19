@@ -5422,3 +5422,230 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         "wake agent:message event ID matches the first user message (wake contextMessage)"
     );
 }
+
+/// STAB-114 regression: When an interrupt lands BEFORE any assistant output,
+/// the preempted user message is re-queued at the front (with persisted:true,
+/// requeued_after_failure:false, and attachments preserved).
+#[tokio::test]
+async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
+    let Some(script) = gate("STAB-114 zero-output requeue E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    // parkBeforeFirstChunk parks immediately without streaming any chunks
+    let behavior = json!({ "parkBeforeFirstChunk": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:queue:updated"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Send first message — agent will park without streaming
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Give agent time to park
+    sleep(Duration::from_millis(200)).await;
+
+    // Interrupt before any output
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "urgent",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true);
+    assert_eq!(
+        interrupted["queued"], false,
+        "interrupt streams immediately"
+    );
+
+    // Wait for queue-updated event
+    let mut saw_queue_updated = false;
+    for _ in 0..20 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:queue:updated" {
+                saw_queue_updated = true;
+                let messages = frame["params"]["event"]["data"]["messages"]
+                    .as_array()
+                    .expect("messages array");
+                assert!(
+                    !messages.is_empty(),
+                    "STAB-114: queue should have re-queued message"
+                );
+                let msg = &messages[0];
+                assert!(
+                    msg["content"].as_str().unwrap().contains("first"),
+                    "re-queued message should be the original user message"
+                );
+                assert_eq!(
+                    msg["requeuedAfterFailure"], false,
+                    "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
+                );
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_queue_updated,
+        "STAB-114: agent:queue:updated event should be emitted after zero-output interrupt"
+    );
+}
+
+/// STAB-114 regression: When an interrupt lands AFTER streaming started, the
+/// message is NOT re-queued (turn has progressed past zero output).
+#[tokio::test]
+async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
+    let Some(script) = gate("STAB-114 after-streaming no requeue E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    // blockUntilCancel streams a chunk then parks
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Wait for chunk to be streamed
+    let mut saw_chunk = false;
+    for _ in 0..30 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:stream:chunk"
+                && frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("streaming-before-cancel")
+            {
+                saw_chunk = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_chunk, "agent streamed a chunk before parking");
+
+    // Interrupt after streaming started
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "urgent",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true);
+
+    // Check queue: should be empty (message should NOT be re-queued)
+    let queue = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getQueue",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = queue["messages"].as_array().expect("messages array");
+    assert!(
+        messages.is_empty(),
+        "STAB-114: interrupt after streaming should NOT re-queue"
+    );
+}

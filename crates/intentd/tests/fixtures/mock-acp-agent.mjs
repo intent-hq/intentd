@@ -189,6 +189,12 @@ async function handlePrompt(id, params) {
       process.exit(1);
     }
   }
+  // STAB-114: Park BEFORE streaming any output, so tests can interrupt with
+  // zero output. This validates the zero-output requeue path.
+  if (behavior.parkBeforeFirstChunk && promptCount === 1) {
+    pendingPromptIds.push(id);
+    return;
+  }
   // Keep-alive interrupt test: the FIRST turn streams a chunk then parks without
   // resolving, so the daemon can issue `agent.stop` mid-turn. It is left pending
   // until a `session/cancel` arrives; the child stays alive for the follow-up.
