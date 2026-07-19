@@ -1,12 +1,15 @@
-//! Regression tests for STAB-115: model changes + settings-based default resolution.
+//! Regression tests for STAB-115: settings-based default model resolution.
 //!
-//! Covers:
-//! - Bug A: `agent.setModel` triggering a provider respawn on the next turn
-//! - Bug B: model resolution precedence (workspace > background > global defaults)
+//! Covers Bug B: model resolution precedence at creation time:
+//! - workspace override > background type override > background default > global default
+//!
+//! Bug A (agent.setModel respawn) is covered by the WSS e2e test in
+//! `crates/intentd/tests/e2e_wss_agent_set_model.rs`, which exercises the full
+//! wire path and verifies the respawn behavior end-to-end.
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::tests::{workspace, TempDb};
 use crate::Services;

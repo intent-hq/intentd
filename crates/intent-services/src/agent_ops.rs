@@ -1076,13 +1076,15 @@ impl Services {
         let resolved_model = match model {
             Some(m) => Some(m),
             None => {
-                // We need to determine the agent_type for the precedence chain,
-                // but AgentCreateExtra doesn't carry it directly. For background
-                // agents, we can infer the type from specialist if present
-                // (implementor, verifier, etc.), but for now we'll pass None
-                // and rely on the is_background flag for the basic precedence.
-                // A full solution would require passing agent_type through
-                // AgentCreateExtra, but that's outside this task's scope.
+                // Pass `specialist` as the agent_type parameter for
+                // backgroundAgents.typeOverrides lookup. The specialist value
+                // (e.g., "implementor", "verifier") is used as-is in the override
+                // map. When `specialist` is None, the type-specific override is
+                // skipped and we fall through to backgroundAgents.defaultModel or
+                // model.default. A full solution would require passing the derived
+                // agent_type through AgentCreateExtra, but that's outside this
+                // task's scope and the current specialist-based lookup covers the
+                // common case.
                 resolve_default_model_from_settings(
                     self,
                     &workspace_id,
