@@ -71,7 +71,8 @@ pub(crate) struct QueuedMessage {
     /// this entry was (re)queued — set by the terminal-failure requeue, whose
     /// message was persisted before its turn started. Drain paths skip
     /// `persist_user` for such entries so a retry does not duplicate the user
-    /// message in chat history. Internal only — not part of the wire shape.
+    /// message in chat history. The field itself is internal, but when `true`,
+    /// `to_value` emits `requeuedAfterFailure: true` on the wire (STAB-112).
     pub persisted: bool,
 }
 
