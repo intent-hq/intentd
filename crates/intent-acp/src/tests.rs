@@ -427,9 +427,9 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn non_claude_code_new_session_omits_meta() {
+    async fn no_meta_param_omits_meta_field() {
         let (conn, responder) = connect_session();
-        // Pass None meta for non-claude-code providers
+        // Passing meta=None omits the _meta field from JSON-RPC params
         session::new_session(&conn, "/tmp/ws", Vec::new(), None)
             .await
             .expect("session/new succeeds");
@@ -444,7 +444,7 @@ mod session_tests {
             .expect("params must be an object");
         assert!(
             !params.contains_key("_meta"),
-            "session/new for non-claude-code provider must not inject _meta"
+            "session/new with meta=None must not inject _meta field"
         );
     }
 
