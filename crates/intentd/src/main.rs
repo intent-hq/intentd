@@ -9,10 +9,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus, FileWatcher,
-    PermissionPolicy, Services,
+    PermissionPolicy, Services, SkillsWatcher,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -60,6 +62,10 @@ enum Command {
         /// enforcement on the TCP path. Also enabled by `INTENTD_INSECURE=1`.
         #[arg(long)]
         insecure: bool,
+        /// Headless deployment: automatically resume all interrupted agents at
+        /// startup instead of waiting for `agent.resolveInterrupted` RPC.
+        #[arg(long)]
+        resume_all: bool,
     },
     /// One-shot JSON-RPC call to a running daemon; prints the JSON result.
     Call {
@@ -141,7 +147,8 @@ async fn main() -> ExitCode {
             listen,
             mode,
             insecure,
-        } => to_exit(cmd_serve(&listen, mode.as_deref(), insecure).await),
+            resume_all,
+        } => to_exit(cmd_serve(&listen, mode.as_deref(), insecure, resume_all).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
@@ -359,7 +366,12 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::Result<()> {
+async fn cmd_serve(
+    listen: &str,
+    mode: Option<&str>,
+    insecure: bool,
+    resume_all: bool,
+) -> anyhow::Result<()> {
     let (serve_uds_enabled, serve_tcp_enabled) = match listen {
         "uds" => (true, false),
         "tcp" => (false, true),
@@ -515,9 +527,10 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // configured TTL, killing each one's whole process group. Disabled entirely
     // when `agents.idleReapMinutes == 0`.
     let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
-    // Event retention/compaction (§10.2): periodically delete `agent:stream:*`
-    // chunk events older than the configured TTL, preserving every other event
-    // family. Disabled entirely when `events.streamRetentionHours == 0`.
+    // Event retention/compaction (§10.2 / finding F4): periodically delete
+    // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
+    // `host:exec:*`) older than the configured TTL, preserving lifecycle/tool/
+    // note/task/workspace events. Disabled when `events.streamRetentionHours == 0`.
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
@@ -543,6 +556,10 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     // path; each publishes debounced `file:changed` events to the shared bus.
     // The handles are held for the lifetime of `serve` and torn down on return.
     let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
+
+    // Start skills directory watchers (user-tier + project-tier per workspace).
+    // Publishes debounced `skills:changed` events when SKILL.md files are modified.
+    let _skills_watcher = start_skills_watcher(&bus, api.as_ref()).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS (regardless of --listen mode) so settings can
@@ -587,17 +604,43 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             ws_server: None,
             port: None,
         }),
+        control: std::sync::OnceLock::new(),
     });
+
+    // System control surface (§5.7 + §5.12): exposes `system.status` /
+    // `system.shutdown` to local UDS clients plus runtime WSS listener control.
+    // The `Notify` lets the `system.shutdown` RPC trigger the same graceful
+    // teardown as an OS signal, so `stop` can ask politely before escalating.
+    // Must be built BEFORE the WSS server so it can be passed to the constructor.
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let control = Arc::new(DaemonControl {
+        listen_mode: listen.to_string(),
+        uds: serve_uds_enabled,
+        tcp: serve_tcp_enabled,
+        manager: manager.clone(),
+        shutdown: shutdown_notify.clone(),
+        ws_runtime: runtime.clone(),
+        start_time: std::time::Instant::now(),
+    });
+
+    // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
+    // serve system.status (§5.7). This breaks the circular Arc dependency between
+    // DaemonControl and WsRuntimeControl.
+    if runtime.control.set(control.clone()).is_err() {
+        panic!("control OnceLock should only be set once");
+    }
 
     // Boot-time auto-start of the listener ONLY when --listen tcp/both
     // (CLI --listen wins over persisted settings)
     let (_ws_server, _ws_port) = if serve_tcp_enabled {
+        let system_control: Arc<dyn SystemControl> = control.clone();
         let mut server = if insecure {
             WsApiServer::new_insecure_with_reverse(
                 api.clone(),
                 bus.clone(),
                 ws_options.clone(),
                 reverse_registry.clone(),
+                Some(system_control.clone()),
             )
         } else {
             WsApiServer::new_with_reverse(
@@ -607,6 +650,7 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
                 token_store.clone().unwrap(),
                 ws_options.clone(),
                 reverse_registry.clone(),
+                Some(system_control.clone()),
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
         };
@@ -638,20 +682,6 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
     } else {
         (None, None)
     };
-
-    // System control surface (§5.7 + §5.12): exposes `system.status` /
-    // `system.shutdown` to local UDS clients plus runtime WSS listener control.
-    // The `Notify` lets the `system.shutdown` RPC trigger the same graceful
-    // teardown as an OS signal, so `stop` can ask politely before escalating.
-    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let control = Arc::new(DaemonControl {
-        listen_mode: listen.to_string(),
-        uds: serve_uds_enabled,
-        tcp: serve_tcp_enabled,
-        manager: manager.clone(),
-        shutdown: shutdown_notify.clone(),
-        ws_runtime: runtime.clone(),
-    });
 
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
     // The control is attached after the api Arc is built via the `OnceLock` seam.
@@ -715,6 +745,60 @@ async fn cmd_serve(listen: &str, mode: Option<&str>, insecure: bool) -> anyhow::
             }
         }
     };
+
+    // Auto-resume interrupted agents when --resume-all is set (headless deployment).
+    // Spawn in the background so it doesn't block startup; log failures per-agent.
+    if resume_all {
+        let services_clone = services.clone();
+        tokio::spawn(async move {
+            tracing::info!("--resume-all: enumerating interrupted agents");
+            // List all pending interrupted agents
+            let rows = match services_clone.store().list_interrupted_agents().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "--resume-all: failed to list interrupted agents");
+                    return;
+                }
+            };
+            if rows.is_empty() {
+                tracing::info!("--resume-all: no interrupted agents to resume");
+                return;
+            }
+            tracing::info!(
+                count = rows.len(),
+                "--resume-all: resuming interrupted agents"
+            );
+            let mut resumed = Vec::new();
+            let mut failed = Vec::new();
+            // Resume each agent using the same service operation as agent.resolveInterrupted
+            for interrupted in rows {
+                let agent_id = interrupted.agent_id.clone();
+                match services_clone.resume_interrupted_agent(&agent_id).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            agent_id = %agent_id,
+                            workspace = %interrupted.workspace_id,
+                            "--resume-all: resumed agent"
+                        );
+                        resumed.push(agent_id.0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "--resume-all: failed to resume agent"
+                        );
+                        failed.push((agent_id.0, e.to_string()));
+                    }
+                }
+            }
+            tracing::info!(
+                resumed = resumed.len(),
+                failed = failed.len(),
+                "--resume-all: auto-resume sweep complete"
+            );
+        });
+    }
 
     if serve_uds_enabled {
         tracing::info!(socket = %config.socket_path.display(), "starting intentd");
@@ -784,6 +868,8 @@ struct DaemonControl {
     /// server when toggled on. Always present (constructed regardless of --listen
     /// mode so runtime toggle works for all modes, including --listen uds).
     ws_runtime: Arc<WsRuntimeControl>,
+    /// Daemon start time (Instant) for uptime calculation.
+    start_time: std::time::Instant,
 }
 
 /// Runtime control for the WSS listener, shared between DaemonControl and
@@ -800,6 +886,9 @@ struct WsRuntimeControl {
     data_dir: PathBuf,
     /// Mutable runtime state: the live WsApiServer (when started).
     state: tokio::sync::Mutex<WsRuntimeState>,
+    /// System control surface (§5.7) for system.status/shutdown over WSS. Set via
+    /// OnceLock after DaemonControl construction to break circular Arc dependency.
+    control: std::sync::OnceLock<Arc<dyn SystemControl>>,
 }
 
 struct WsRuntimeState {
@@ -872,6 +961,9 @@ impl SystemControl for DaemonControl {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
+            max_agents: self.manager.registry().cap(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
         }
     }
 
@@ -935,7 +1027,9 @@ impl intent_core::ServerControl for DaemonControl {
             let mut ws_options = runtime.ws_options.clone();
             ws_options.base_port = desired_port;
 
-            // Build a fresh WsApiServer and start it
+            // Build a fresh WsApiServer and start it. The control is populated via
+            // OnceLock after DaemonControl construction (breaking the circular Arc).
+            let system_control: Option<Arc<dyn SystemControl>> = runtime.control.get().cloned();
             let mut server = if let Some(ref tls) = runtime.tls_cert {
                 // Secure mode
                 let token_store = runtime
@@ -954,6 +1048,7 @@ impl intent_core::ServerControl for DaemonControl {
                     token_store.clone(),
                     ws_options,
                     runtime.reverse_registry.clone(),
+                    system_control.clone(),
                 )
                 .map_err(|e| intent_core::Error::Internal(e.to_string()))?
             } else {
@@ -963,6 +1058,7 @@ impl intent_core::ServerControl for DaemonControl {
                     runtime.bus.clone(),
                     ws_options,
                     runtime.reverse_registry.clone(),
+                    system_control.clone(),
                 )
             };
 
@@ -1319,12 +1415,13 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
-/// Spawn the periodic event-retention/compaction sweep (§10.2), or `None` when
-/// disabled (`stream_retention_hours == 0`). Each tick deletes `agent:stream:*`
-/// chunk events older than the TTL while preserving every other event family.
-/// The sweep interval is derived from the TTL (≈4×/TTL), clamped so long TTLs
-/// still sweep periodically and short ones do not busy-loop. A failed sweep is
-/// logged and retried on the next tick (never aborts the loop).
+/// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
+/// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
+/// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
+/// `host:exec:*`) older than the TTL while preserving lifecycle/tool/note/task/
+/// workspace events. The sweep interval is derived from the TTL (≈4×/TTL),
+/// clamped so long TTLs still sweep periodically and short ones do not busy-loop.
+/// A failed sweep is logged and retried on the next tick (never aborts the loop).
 fn spawn_stream_retention_loop(
     store: Store,
     stream_retention_hours: u32,
@@ -1338,7 +1435,7 @@ fn spawn_stream_retention_loop(
     tracing::info!(
         ttl_hours = stream_retention_hours,
         interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:* only)"
+        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*)"
     );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -1346,12 +1443,12 @@ fn spawn_stream_retention_loop(
         loop {
             ticker.tick().await;
             let cutoff = intent_core::iso_minutes_ago(stream_retention_hours as i64 * 60);
-            match store.delete_stream_events_before(&cutoff).await {
+            match store.delete_ephemeral_events_before(&cutoff).await {
                 Ok(removed) if removed > 0 => {
                     tracing::info!(
                         removed,
                         cutoff,
-                        "event retention sweep trimmed stream events"
+                        "event retention sweep trimmed ephemeral events"
                     );
                 }
                 Ok(_) => {}
@@ -1447,6 +1544,38 @@ async fn start_workspace_watchers(bus: &EventBus, services: &dyn WorkspaceApi) -
     }
     tracing::info!(count = watchers.len(), "file watchers started");
     watchers
+}
+
+/// Start a [`SkillsWatcher`] covering all skills directories (user-tier + project-tier
+/// per workspace). Returns the live handle; dropping it stops the watcher.
+async fn start_skills_watcher(
+    bus: &EventBus,
+    services: &dyn WorkspaceApi,
+) -> Option<SkillsWatcher> {
+    let workspaces = match services.list_workspaces(false).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list workspaces for skills watching");
+            return None;
+        }
+    };
+
+    let workspace_pairs: Vec<_> = workspaces
+        .into_iter()
+        .filter_map(|ws| {
+            let root = ws.path.clone().or_else(|| ws.worktree_path.clone())?;
+            let path = std::path::PathBuf::from(&root);
+            if path.is_dir() {
+                Some((ws.id, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let watcher = SkillsWatcher::start(bus.clone(), workspace_pairs);
+    tracing::info!("skills watcher started");
+    Some(watcher)
 }
 
 async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
@@ -2117,7 +2246,7 @@ mod tests {
             socket_path: short_socket_path(&id),
             pid_path: dir.join("intentd.pid"),
             idle_reap_minutes: 30,
-            stream_retention_hours: 0,
+            stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
             data_dir: dir,
         }
     }

@@ -15,12 +15,16 @@ use intent_core::events::{
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
-    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, EventActor,
-    NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
+    AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput, Error, Event,
+    EventActor, NoteId, Result, SessionStats, WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
 /// Default `agent.diagnostics` stale-responding threshold (10 minutes), matching
 /// the TS `DEFAULT_STALE_RESPONDING_AFTER_MS`.
 const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
+
+/// Maximum length for caller-supplied message IDs to prevent unbounded storage
+/// and DoS via oversized persisted IDs.
+const MAX_MESSAGE_ID_LEN: usize = 256;
 
 use crate::agent_subscriptions::CompletionWatch;
 
@@ -982,6 +986,18 @@ impl Services {
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
             .unwrap_or(false);
+        // Initialize provider from the model's compound prefix if not explicitly
+        // set. This ensures sessions created with a compound model id like
+        // "opencode:kimi-k3" have the correct provider from the start.
+        let provider = provider.or_else(|| {
+            model.as_ref().and_then(|m| {
+                if m.contains(':') {
+                    Some(intent_providers::parse_compound_model_id(m).0)
+                } else {
+                    None
+                }
+            })
+        });
         let session = AgentSession {
             id,
             workspace_id,
@@ -1028,6 +1044,7 @@ impl Services {
             image_blocks,
             is_background,
             metadata,
+            stop_reason: None,
             created_at: now.clone(),
             updated_at: now,
             sandbox_id: None,
@@ -1084,6 +1101,10 @@ impl Services {
     }
 
     /// `agent.setModel` (PROTOCOL §5.5). Emits `agent:updated`.
+    ///
+    /// When the new model is a compound id (`provider:model`) whose provider
+    /// differs from session.provider, this updates session.provider to match,
+    /// ensuring the next spawn uses the correct binary.
     pub(crate) async fn agent_set_model_op(
         &self,
         agent_id: AgentId,
@@ -1091,6 +1112,15 @@ impl Services {
     ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
         session.model = Some(model_id.clone());
+        // Reconcile session.provider when the model carries an explicit provider
+        // prefix that differs from the current session provider. This ensures
+        // cross-provider model switches spawn the new provider's binary.
+        if model_id.contains(':') {
+            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
+            if session.provider.as_ref() != Some(&model_provider) {
+                session.provider = Some(model_provider);
+            }
+        }
         session.updated_at = now_iso();
         let workspace_id = session.workspace_id.clone();
         self.store
@@ -1103,6 +1133,8 @@ impl Services {
             json!({ "agentId": agent_id.0, "modelId": model_id }),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         Ok(json!({ "success": true, "modelId": model_id }))
     }
 
@@ -1351,6 +1383,8 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         let lite = self.project_lite_with_flags(session);
         Ok(json!({ "success": true, "agent": lite }))
     }
@@ -1393,6 +1427,9 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else {
+            // Schedule debounced lastActivity event (§10.1).
+            self.schedule_last_activity_event(session.workspace_id.clone());
         }
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -1676,32 +1713,68 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
-        let message_id = message_id.unwrap_or_else(new_message_id);
+        // Validate message_id length to prevent unbounded storage.
+        if let Some(ref id) = message_id {
+            if id.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "messageId exceeds maximum length of {} bytes",
+                    MAX_MESSAGE_ID_LEN
+                )));
+            }
+        }
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
-        match self
-            .store
-            .append_agent_message(&agent_id, "user", &blocks, &created_at)
-            .await
-        {
-            Ok(_) => {
+        let message = match message_id {
+            Some(id) => {
+                self.store
+                    .append_agent_message_with_id(
+                        &agent_id,
+                        &id,
+                        "user",
+                        &blocks,
+                        None,
+                        &created_at,
+                    )
+                    .await
+            }
+            None => {
+                self.store
+                    .append_agent_message(&agent_id, "user", &blocks, &created_at)
+                    .await
+            }
+        };
+        match message {
+            Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 // Fetch the session to get workspace_id; best-effort (logged on error).
-                if let Ok(session) = self.store.get_agent_session(&agent_id).await {
-                    if let Err(e) = self
-                        .store
-                        .refresh_agent_session_timestamp(
+                match self.store.get_agent_session(&agent_id).await {
+                    Ok(session) => {
+                        if let Err(e) = self
+                            .store
+                            .refresh_agent_session_timestamp(
+                                &session.workspace_id,
+                                &agent_id,
+                                &created_at,
+                            )
+                            .await
+                        {
+                            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                        }
+                        // Publish agent:message event using the store-returned message id.
+                        self.publish_agent_mutation_event(
                             &session.workspace_id,
                             &agent_id,
-                            &created_at,
+                            AGENT_MESSAGE,
+                            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
                         )
-                        .await
-                    {
-                        tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent = %agent_id, error = %e, "get_agent_session failed; skipping timestamp refresh and agent:message event");
                     }
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
                 // STAB-7: preserve image_blocks and file_blocks when auto-queueing
@@ -1727,11 +1800,26 @@ impl Services {
         message_id: String,
         content: String,
     ) -> Result<Value> {
+        // Validate message_id length to prevent unbounded storage.
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {} bytes",
+                MAX_MESSAGE_ID_LEN
+            )));
+        }
         let session = self.store.get_agent_session(&agent_id).await?;
         let blocks = user_content_blocks(&content);
         let created_at = now_iso();
-        self.store
-            .append_agent_message(&agent_id, "user", &blocks, &created_at)
+        let message = self
+            .store
+            .append_agent_message_with_id(
+                &agent_id,
+                &message_id,
+                "user",
+                &blocks,
+                None,
+                &created_at,
+            )
             .await?;
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
@@ -1741,8 +1829,19 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else {
+            // Schedule debounced lastActivity event (§10.1).
+            self.schedule_last_activity_event(session.workspace_id.clone());
         }
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        // Publish agent:message event using the store-returned message id.
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).
@@ -1900,6 +1999,8 @@ impl Services {
             json!({ "agentId": caller.0, "completionReportLength": report_len }),
         )
         .await;
+        // Schedule debounced lastActivity event (§10.1).
+        self.schedule_last_activity_event(workspace_id.clone());
         // TASK-B: move the linked task note to `review_required` so the FE
         // reflects the child's completion. Terminal statuses (`complete`,
         // `cancelled`) are never overwritten; agents without a linked note are
@@ -1910,12 +2011,68 @@ impl Services {
             self.transition_linked_task_to_review_required(&workspace_id, note_id, caller.clone())
                 .await;
         }
-        // SUB-2: no immediate `deliver_parent_wake` here. The parent wake is
-        // driven by the child's terminal `agent:idle` (delivered by the
-        // completion-delivery worker armed at delegate-time), so every child
-        // completion yields exactly one wake. Grouped (`after_all`) children
-        // continue to fold their persisted `completionReport` into the group's
-        // aggregated wake via `format_group_child_line`.
+
+        // Immediate parent wake for non-grouped children: if this child is in an
+        // `after_all` delegation group, skip the immediate wake — the group's
+        // aggregated wake will fold this report in when all children settle. Otherwise,
+        // deliver the wake NOW unconditionally to the parent, then mark any oneShot
+        // watches to suppress their agent:idle delivery (report-time wake requirement).
+        let grouped = self.child_in_undelivered_group(&workspace_id, &parent, &caller);
+        if !grouped {
+            // Deliver exactly ONE wake to the parent, regardless of watch count.
+            // Format the wake message with the persisted report.
+            let wake_text = format!(
+                "[WORKSPACE EVENTS] Child agent {} ({}) completed. Report: {}",
+                session.name, caller.0, report_text
+            );
+            // Build event notification metadata (mirroring deliver_completion_to_watches).
+            let metadata = json!({
+                "type": "event_notification",
+                "eventCount": 1,
+                "eventTypes": ["agent:reportToParent"],
+                "events": [{
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": "agent:reportToParent",
+                    "timestamp": saved_at,
+                    "data": {
+                        "agentId": caller.0,
+                        "agentName": session.name.clone(),
+                        "report": report_text.clone(),
+                    },
+                    "actor": {
+                        "type": "agent",
+                        "id": caller.0,
+                        "name": session.name.clone(),
+                    }
+                }]
+            });
+            // Deliver the wake to the parent unconditionally (even if no watch exists).
+            if let Err(e) = self
+                .deliver_parent_wake(&workspace_id, parent.clone(), wake_text, Some(metadata))
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    parent = %parent.0,
+                    child = %caller.0,
+                    "failed to deliver reportToParent wake to parent"
+                );
+            }
+
+            // Mark any oneShot, ungrouped watches whose parent matches this parent as
+            // report_delivered, so deliver_completion_to_watches will skip agent:idle
+            // for them (suppressing the duplicate wake). Do NOT mark watches for other
+            // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
+            // completion wake and should not receive the report wake.
+            let watches = self.find_watches_for_child(&workspace_id, &caller);
+            for watch in watches
+                .iter()
+                .filter(|w| w.one_shot && w.group_id.is_none() && w.parent_agent_id == parent)
+            {
+                self.mark_watch_report_delivered(&workspace_id, &watch.id);
+            }
+        }
+
         Ok(json!({
             "ok": true,
             "parentAgentId": parent,
@@ -2627,7 +2784,17 @@ impl Services {
         let now = now_iso();
         let now_ms = iso_ms(&now);
 
-        let sessions = self.store.list_agent_sessions(&workspace_id).await?;
+        // Finding F1/F3: use message-free summaries + lightweight stats for diagnostics.
+        // Diagnostics needs session metadata and message counts/assistant-message presence,
+        // but never needs full message bodies.
+        let sessions = self
+            .store
+            .list_agent_session_summaries(&workspace_id)
+            .await?;
+        let message_stats = self
+            .store
+            .get_agent_session_message_stats(&workspace_id)
+            .await?;
         let watches = self.all_watches(&workspace_id);
         let groups = self.all_groups(&workspace_id);
 
@@ -2774,7 +2941,14 @@ impl Services {
             let status = session
                 .and_then(|s| agent_status_wire(s.status))
                 .unwrap_or("unknown");
-            let message_count = session.map(|s| s.messages.len() as u64);
+            // Use lightweight message stats instead of full hydration
+            let (message_count_val, has_assistant) =
+                message_stats.get(id).copied().unwrap_or((0, false));
+            let message_count = if message_count_val > 0 {
+                Some(message_count_val)
+            } else {
+                None
+            };
             let last_activity = session.map(|s| s.updated_at.clone());
             let last_activity_age = last_activity.as_deref().map(|t| age_ms(now_ms, t));
             let stale_responding = status == "responding"
@@ -2785,9 +2959,7 @@ impl Services {
             let pending_initial_response = session.is_some()
                 && status.eq_ignore_ascii_case("idle")
                 && message_count == Some(1)
-                && !session
-                    .map(|s| has_assistant_message(&s.messages))
-                    .unwrap_or(false);
+                && !has_assistant;
             let subscription_count = watches
                 .iter()
                 .filter(|w| &w.parent_agent_id.0 == id)
@@ -3440,28 +3612,29 @@ impl Services {
                 "queuedMessage": queued.to_value(position),
             }));
         }
-        let message_id = new_message_id();
         let blocks = json!([build_block()]);
         let created_at = now_iso();
-        if self
+        let message = match self
             .store
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
-            .is_err()
         {
-            manager.release_slot(agent_id).await;
-            let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
-            self.publish_queue_updated(agent_id).await;
-            manager
-                .clone()
-                .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                .await;
-            return Ok(json!({
-                "success": true,
-                "queued": true,
-                "queuedMessage": queued.to_value(position),
-            }));
-        }
+            Ok(msg) => msg,
+            Err(_) => {
+                manager.release_slot(agent_id).await;
+                let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+                self.publish_queue_updated(agent_id).await;
+                manager
+                    .clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+                return Ok(json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                }));
+            }
+        };
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -3470,14 +3643,25 @@ impl Services {
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+        } else {
+            // Schedule debounced lastActivity event (§10.1).
+            self.schedule_last_activity_event(workspace_id.clone());
         }
+        // Publish agent:message event using the store-returned message id.
+        self.publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+        )
+        .await;
         manager.clone().finish_prepersisted_turn_spawn(
             agent_id.clone(),
             workspace_id.clone(),
             content_owned,
             crate::agent_manager::TurnOptions::default(),
         );
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// Pre-DELIV-1 store-only delivery for the read-only/test path (no
@@ -3493,7 +3677,6 @@ impl Services {
     where
         F: Fn() -> Value,
     {
-        let message_id = new_message_id();
         let blocks = json!([build_block()]);
         let created_at = now_iso();
         match self
@@ -3501,7 +3684,7 @@ impl Services {
             .append_agent_message(agent_id, "user", &blocks, &created_at)
             .await
         {
-            Ok(_) => {
+            Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
                 if let Err(e) = self
@@ -3511,7 +3694,15 @@ impl Services {
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
-                Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+                // Publish agent:message event using the store-returned message id.
+                self.publish_agent_mutation_event(
+                    workspace_id,
+                    agent_id,
+                    AGENT_MESSAGE,
+                    json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                )
+                .await;
+                Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
                 let (queued, position) =
@@ -3747,11 +3938,6 @@ fn age_ms(now_ms: i64, ts: &str) -> i64 {
     (now_ms - iso_ms(ts)).max(0)
 }
 
-/// Whether any message in the transcript was authored by the assistant.
-fn has_assistant_message(messages: &[AgentMessage]) -> bool {
-    messages.iter().any(|m| m.role == "assistant")
-}
-
 fn agent_status_wire(status: AgentStatus) -> Option<&'static str> {
     match status {
         AgentStatus::Pending | AgentStatus::Waiting => Some("waiting"),
@@ -3837,5 +4023,261 @@ fn validate_message_role(role: &str) -> Result<()> {
         _ => Err(Error::InvalidParams(format!(
             "invalid message role `{role}` (expected one of user|assistant|tool|system)"
         ))),
+    }
+}
+
+impl Services {
+    /// Resume an interrupted agent (INT-41 phase 2): atomically claim the row, re-register
+    /// parent completion watch when delegated, then deliver a continuation message.
+    ///
+    /// Claim-then-act semantics prevent concurrent resume races (exactly-one-winner).
+    /// If any post-claim step fails (agent_send_message, session lookup), the row is
+    /// reset to pending (resolution=NULL) to restore retryability, and the error is
+    /// returned loudly.
+    pub async fn resume_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Verify the agent is in pending interrupted state (O(1) query)
+        let interrupted = self
+            .store
+            .get_interrupted_agent(agent_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                ))
+            })?;
+
+        let workspace_id = interrupted.workspace_id.clone();
+
+        // ATOMIC CLAIM: mark the row as resumed FIRST. If another process already claimed
+        // it, set_interrupted_resolution returns false and we bail loudly. This prevents
+        // concurrent resume races (e.g., --resume-all vs client resolveInterrupted).
+        let updated = self
+            .store
+            .set_interrupted_resolution(agent_id, "resumed", &now_iso())
+            .await?;
+        if !updated {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state (already resolved)"
+            )));
+        }
+
+        // Helper to reset the row to pending if post-claim steps fail
+        let reset_to_pending = || async {
+            if let Err(e) = self.store.reset_interrupted_resolution(agent_id).await {
+                tracing::warn!(
+                    "Failed to reset interrupted_agent row to pending for {}: {}",
+                    agent_id,
+                    e
+                );
+            }
+        };
+
+        // Rehydrate delegation groups for this workspace (idempotent, best-effort).
+        // Groups are sealed on rehydration since the original parent turn is gone.
+        // Corrupted rows are logged at warn but do NOT fail the resume: the agent can
+        // still proceed (group wake degrades to per-child) rather than failing entirely.
+        if let Err(e) = self.rehydrate_delegation_groups(&workspace_id).await {
+            tracing::warn!(
+                "rehydrate_delegation_groups failed for workspace {}: {}. \
+                 Agent will resume but after_all fan-in may degrade to per-child wakes.",
+                workspace_id.0,
+                e
+            );
+        }
+
+        // Load the session to check for delegation metadata
+        let session = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                reset_to_pending().await;
+                return Err(e);
+            }
+        };
+
+        // Re-register parent completion watch if the agent was delegated
+        if let Some(parent_id) = &session.parent_agent_id {
+            // Extract createdByAgentId from metadata if present
+            let created_by = session
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("createdByAgentId"))
+                .and_then(|v| v.as_str())
+                .map(AgentId::from);
+
+            if let Some(parent) = created_by.or_else(|| Some(parent_id.clone())) {
+                // Fetch parent session for name
+                let parent_name = self
+                    .store
+                    .get_agent_session(&parent)
+                    .await
+                    .ok()
+                    .map(|s| s.name)
+                    .unwrap_or_default();
+
+                // Check if this agent is in a rehydrated delegation group
+                let groups = self.list_groups_for_parent(&workspace_id, &parent);
+                let group_id = groups
+                    .iter()
+                    .find(|g| g.expected_agent_ids.contains(agent_id))
+                    .map(|g| g.group_id.clone());
+
+                if let Some(gid) = group_id {
+                    // Register grouped completion watch for after_all fan-in
+                    let _sub_id = self.register_completion_watch(
+                        &workspace_id,
+                        parent,
+                        parent_name,
+                        agent_id.clone(),
+                        false,
+                        Some(gid),
+                    );
+                } else {
+                    // Register ungrouped completion watch (dedupe via find_and_refresh)
+                    let _sub_id = self
+                        .find_and_refresh_ungrouped_watch(
+                            &workspace_id,
+                            &parent,
+                            agent_id,
+                            true,
+                            Some(parent_name.clone()),
+                        )
+                        .unwrap_or_else(|| {
+                            self.register_completion_watch(
+                                &workspace_id,
+                                parent,
+                                parent_name,
+                                agent_id.clone(),
+                                true,
+                                None,
+                            )
+                        });
+                }
+            }
+        }
+
+        // Deliver continuation message
+        let continuation =
+            "intentd restarted while you were working. Review your last steps and continue the task.";
+
+        // Use the agent_send_message machinery to deliver the message
+        // (lazily respawns provider and resumes via ACP session/load)
+        if let Err(e) = self
+            .agent_send_message(
+                workspace_id.clone(),
+                agent_id.clone(),
+                continuation.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            reset_to_pending().await;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Abandon an interrupted agent (INT-41 phase 2): mark row `abandoned`, append
+    /// a system interruption message to the log, emit chat/agent events for live UIs.
+    pub(crate) async fn abandon_interrupted_agent(&self, agent_id: &AgentId) -> Result<()> {
+        // Verify the agent is in pending interrupted state (O(1) lookup)
+        let interrupted = self
+            .store
+            .get_interrupted_agent(agent_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "Agent {agent_id} is not in pending interrupted state"
+                ))
+            })?;
+
+        let workspace_id = interrupted.workspace_id.clone();
+
+        // Rehydrate delegation groups for this workspace (idempotent, best-effort).
+        let _ = self.rehydrate_delegation_groups(&workspace_id).await;
+
+        // Load the session to check for delegation group membership
+        let session = self.store.get_agent_session(agent_id).await.ok();
+        if let Some(session) = &session {
+            if let Some(parent_id) = &session.parent_agent_id {
+                // Check if this agent is in a delegation group
+                let groups = self.list_groups_for_parent(&workspace_id, parent_id);
+                for group in groups {
+                    if group.expected_agent_ids.contains(agent_id) {
+                        // Record this child as deleted in the group (AS-4 abandoned child path).
+                        // Build a minimal deleted-agent event for group completeness tracking.
+                        let deleted_event = Event {
+                            id: format!("abandon-{}", agent_id.0),
+                            workspace_id: workspace_id.clone(),
+                            timestamp: now_iso(),
+                            event_type: AGENT_DELETED.to_string(),
+                            actor: EventActor {
+                                actor_type: ActorType::System,
+                                id: Some("intentd".to_string()),
+                                name: Some("intentd".to_string()),
+                                ..Default::default()
+                            },
+                            session_id: Some(agent_id.0.clone()),
+                            correlation_id: None,
+                            parent_event_id: None,
+                            metadata: None,
+                            data: json!({ "agentId": agent_id.0 }),
+                        };
+                        self.record_group_child_completion(
+                            &workspace_id,
+                            &group.group_id,
+                            agent_id,
+                            true,
+                            format!("Agent {} abandoned during restart", agent_id.0),
+                            deleted_event,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        // Build the system interruption message
+        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let content = json!([{
+            "type": "text",
+            "text": text,
+            "meta": { "kind": "interruption" }
+        }]);
+
+        // Append the system message
+        let message = self
+            .store
+            .append_agent_message(agent_id, "system", &content, &now_iso())
+            .await?;
+
+        // Mark the interrupted_agent row as resolved
+        let updated = self
+            .store
+            .set_interrupted_resolution(agent_id, "abandoned", &now_iso())
+            .await?;
+        if !updated {
+            return Err(Error::InvalidParams(format!(
+                "Agent {agent_id} is not in pending interrupted state"
+            )));
+        }
+
+        // Emit agent:message event so live UIs see the new message
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": message.id, "role": "system" }),
+        )
+        .await;
+
+        Ok(())
     }
 }

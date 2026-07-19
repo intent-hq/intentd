@@ -1826,6 +1826,12 @@ pub struct AgentSession {
     /// that omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Canonical stop/finish reason from the latest terminal stream/status event
+    /// (Phase 2 — daemon-side persistence of agent failure text). Surfaced as
+    /// top-level `stopReason` on both `AgentSession` and `AgentLite` serialization,
+    /// omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1949,6 +1955,10 @@ pub struct AgentLite {
     /// absent so pre-gap wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
+    /// Canonical stop/finish reason from the latest terminal stream/status event
+    /// (Phase 2). Top-level `stopReason`, matching the FE shared type; omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     pub metadata: AgentMetadata,
 }
 
@@ -2003,6 +2013,7 @@ impl AgentLite {
             digest,
             context_references: session.context_references,
             image_blocks: session.image_blocks,
+            stop_reason: session.stop_reason,
             metadata,
         }
     }
@@ -2346,23 +2357,6 @@ pub struct Draft {
     pub client_id: ClientId,
     pub text: String,
     pub updated_at: String,
-}
-
-/// Long-term agent memory row (§9.2, §9.12, §18.5). Persisted to the `memories`
-/// table and surfaced to agents internally (no `memories.*` RPC in v1); a `null`
-/// `workspaceId` denotes a global memory. `search.memories` (§5.15) reads this.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Memory {
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<WorkspaceId>,
-    pub content: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub created_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
 }
 
 /// A persistently-registered repository (parity with the TS `KnownRepo`). Backs
@@ -3133,6 +3127,7 @@ mod tests {
             image_blocks: None,
             is_background: true,
             metadata: None,
+            stop_reason: None,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -3197,6 +3192,7 @@ mod tests {
             image_blocks: None,
             is_background: false,
             metadata: None,
+            stop_reason: None,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

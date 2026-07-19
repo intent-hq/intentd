@@ -320,26 +320,20 @@ async fn uds_slice_end_to_end() {
     assert_eq!(s.get("projectType"), None);
     assert_eq!(s.get("generatedBy"), None);
 
-    // (f5) saveSetupScript persists the body, stamps `generatedBy:"user"` + a
-    //      fresh `updatedAt`, and returns the stored record (§5.25).
+    // (f5) saveSetupScript now requires a repository path (PR #223: repo config
+    //      sole source). Without worktreePath or repositoryPath → -32602.
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":131,"method":"workspace.saveSetupScript","params":{"workspaceId":"ws-seed","script":"echo hello"}}"#,
     )
     .await;
-    let s = &resp["result"]["setupScript"];
-    assert_eq!(s["script"], json!("echo hello"));
-    assert_eq!(s["generatedBy"], json!("user"));
-    assert!(s["updatedAt"].as_u64().expect("updatedAt") > 0);
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "saveSetupScript without repository path should return InvalidParams"
+    );
 
-    // (f6) getSetupScript now round-trips the saved body (durable persistence).
-    let resp = send(
-        &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":132,"method":"workspace.getSetupScript","params":{"workspaceId":"ws-seed"}}"#,
-    )
-    .await;
-    assert_eq!(resp["result"]["setupScript"]["script"], json!("echo hello"));
-    assert_eq!(resp["result"]["setupScript"]["generatedBy"], json!("user"));
+    // (f6) getSetupScript still returns the empty default (no repo config to read).
 
     // (f7) saveSetupScript with a missing `script` param → -32602.
     let resp = send(

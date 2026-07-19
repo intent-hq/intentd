@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -46,14 +46,6 @@ impl Drop for Daemon {
         let _ = std::fs::remove_dir_all(&self.data_dir);
         let _ = std::fs::remove_dir_all(&self.scratch);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn scratch_dir(prefix: &str) -> PathBuf {
@@ -284,11 +276,10 @@ fn make_source_repo(dir: &Path) -> PathBuf {
 async fn boot(workspaces_root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = scratch_dir("data");
     let scratch = scratch_dir("scratch");
-    let port_s = free_port().to_string();
     let root_s = workspaces_root.to_string_lossy().to_string();
     let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("INTENTD_WORKSPACES_DIR", &root_s),
     ];
     let child = spawn_serve(&data_dir, "both", &env);

@@ -1343,6 +1343,58 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.listInterrupted" => {
+            // No required params; returns pending interrupted agents across all workspaces.
+            let result = api.agent_list_interrupted().await.map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.resolveInterrupted" => {
+            // Optional resume/abandon arrays; ids must be pending interrupted_agent rows.
+            // If present, must be arrays of strings (reject non-array and non-string elements).
+            let resume = match params.get("resume") {
+                None => None,
+                Some(Value::Array(arr)) => {
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        match v.as_str() {
+                            Some(s) => ids.push(s.to_string()),
+                            None => {
+                                return Err(rpc(
+                                    INVALID_PARAMS,
+                                    format!("resume[{}] must be a string", i),
+                                ))
+                            }
+                        }
+                    }
+                    Some(ids)
+                }
+                Some(_) => return Err(rpc(INVALID_PARAMS, "resume must be an array")),
+            };
+            let abandon = match params.get("abandon") {
+                None => None,
+                Some(Value::Array(arr)) => {
+                    let mut ids = Vec::with_capacity(arr.len());
+                    for (i, v) in arr.iter().enumerate() {
+                        match v.as_str() {
+                            Some(s) => ids.push(s.to_string()),
+                            None => {
+                                return Err(rpc(
+                                    INVALID_PARAMS,
+                                    format!("abandon[{}] must be a string", i),
+                                ))
+                            }
+                        }
+                    }
+                    Some(ids)
+                }
+                Some(_) => return Err(rpc(INVALID_PARAMS, "abandon must be an array")),
+            };
+            let result = api
+                .agent_resolve_interrupted(resume, abandon)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.subscribe" => {
             let ws = require_ws_note(params)?;
             require_present(params, "eventTypes")?;
@@ -2238,8 +2290,9 @@ async fn dispatch(
             let ws = require_ws_note(params)?;
             let limit = opt_int(params, "limit");
             let page_token = opt_str(params, "nextToken");
+            let include_older = params.get("includeOlder").and_then(Value::as_bool);
             let r = api
-                .file_tracking_load_commits(ws, limit, page_token)
+                .file_tracking_load_commits(ws, limit, page_token, include_older)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2432,14 +2485,6 @@ async fn dispatch(
             let limit = opt_int(params, "limit");
             let request_id = opt_str(params, "requestId");
             api.search_events(query, workspace_id, limit, request_id)
-                .await
-                .map_err(domain_to_rpc)
-        }
-        "search.memories" => {
-            let query = require_str_param(params, "query")?;
-            let workspace_id = opt_workspace_id(params);
-            let request_id = opt_str(params, "requestId");
-            api.search_memories(query, workspace_id, request_id)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -2767,6 +2812,14 @@ async fn dispatch(
                 Err(Error::InvalidParams(m)) | Err(Error::NotFound(m)) => {
                     Err(rpc(INVALID_PARAMS, m))
                 }
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
+        "skill.list" => {
+            let ws_id = require_workspace_id(params)?;
+            match api.skill_list(ws_id).await {
+                Ok(v) => Ok(v),
+                Err(Error::NotFound(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }

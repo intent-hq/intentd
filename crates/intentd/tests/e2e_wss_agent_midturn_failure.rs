@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -48,14 +48,6 @@ impl Drop for Daemon {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -364,10 +356,9 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         "response": "recovered after mid-turn crash",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
@@ -488,6 +479,14 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         session["session"]["status"], "error",
         "session status is error after mid-turn failure"
     );
+    // STAB-STOP-REASON: the persisted stopReason must match the agent:failed event's error text.
+    let stop_reason = session["session"]["stopReason"]
+        .as_str()
+        .expect("stopReason should be present after mid-turn failure");
+    assert!(
+        stop_reason.contains("agent stdout closed"),
+        "stopReason persisted and matches the mid-turn prompt error, got: {stop_reason}"
+    );
 
     // STAB-53: the mid-turn crash left the child's stderr captured under
     // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log` — the mock logs
@@ -569,6 +568,9 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
         "agent.retry reports the requeued message is being redriven"
     );
 
+    // Wait for the clearing agent:status-changed event that must carry stopReason: null
+    // so the FE can clear its canonical session state (cloudlands-fe#147).
+    let mut saw_clearing_status_changed = false;
     let mut saw_chunk = false;
     let mut saw_retry_end = false;
     for _ in 0..200 {
@@ -578,6 +580,18 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
             continue;
         }
         match frame["params"]["event"]["type"].as_str() {
+            Some("agent:status-changed") => {
+                // The retry clears stop_reason, so the event must carry stopReason: null.
+                let data = &frame["params"]["event"]["data"];
+                if data.get("stopReason").is_some() {
+                    assert!(
+                        data["stopReason"].is_null(),
+                        "agent:status-changed from retry must carry stopReason: null, got: {:?}",
+                        data["stopReason"]
+                    );
+                    saw_clearing_status_changed = true;
+                }
+            }
             Some("agent:stream:chunk") => {
                 saw_chunk = true;
             }
@@ -591,6 +605,10 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
             _ => {}
         }
     }
+    assert!(
+        saw_clearing_status_changed,
+        "agent:status-changed with stopReason: null emitted during retry"
+    );
     assert!(saw_chunk, "agent:stream:chunk emitted after retry redrive");
     assert!(
         saw_retry_end,
@@ -608,6 +626,12 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     assert_ne!(
         final_session["session"]["status"], "error",
         "session status recovered after agent.retry"
+    );
+    // STAB-STOP-REASON: the retry cleared the stopReason (successful turn leaves it null).
+    assert!(
+        final_session["session"]["stopReason"].is_null(),
+        "stopReason cleared after successful retry: {:?}",
+        final_session["session"]["stopReason"]
     );
 
     // The retry redrive must NOT duplicate the user message: the original
@@ -652,10 +676,9 @@ async fn agent_retry_with_empty_queue_clears_to_idle_over_wss() {
         "response": "unused",
     })
     .to_string();
-    let port_s = free_port().to_string();
     let env: [(&str, &str); 7] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", &port_s),
+        ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),

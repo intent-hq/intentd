@@ -15,13 +15,13 @@ pub use intent_core::{Error, Result};
 mod agent_repo;
 mod client_repo;
 mod comment_repo;
+mod delegation_group_repo;
 mod diffs_repo;
 mod draft_repo;
 mod event_repo;
 mod idempotency_repo;
 mod known_repo_repo;
 mod mcp_oauth_repo;
-mod memories_repo;
 mod metrics_repo;
 mod note_line_attribution_repo;
 mod note_repo;
@@ -35,7 +35,8 @@ mod workspace_context_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
-pub use agent_repo::ReplaceMessage;
+pub use agent_repo::{InterruptedAgent, ReplaceMessage};
+pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
@@ -160,7 +161,17 @@ impl MigrationStatus {
 }
 
 /// Open a WAL-mode SQLite pool with the required PRAGMAs (§9.4): `journal_mode
-/// = WAL`, `foreign_keys = ON`, `busy_timeout = 5000`.
+/// = WAL`, `foreign_keys = ON`, `busy_timeout = 5000`, `synchronous = NORMAL`.
+///
+/// **WAL + synchronous=NORMAL pairing** (finding F4, fsync half): WAL mode
+/// ensures crash safety with only periodic WAL checkpoints needing full fsyncs;
+/// `synchronous = NORMAL` (vs the default `FULL`) skips the extra fsync on every
+/// transaction commit, relying on the WAL's crash-recovery guarantees instead.
+/// This cuts fsync load dramatically on high-write workloads (ephemeral events)
+/// while preserving durability — a crash may lose the last uncommitted
+/// transaction but never corrupts the database. See
+/// <https://sqlite.org/pragma.html#pragma_synchronous> and
+/// <https://sqlite.org/wal.html#performance_considerations>.
 ///
 /// Pool sizing: SQLite WAL mode supports many concurrent readers but only one
 /// writer (serialized inside SQLite). We set `max_connections=20` so the
@@ -175,7 +186,11 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(5000));
+        .busy_timeout(Duration::from_millis(5000))
+        // PRAGMA synchronous = NORMAL: safe under WAL, cuts fsync load (finding F4).
+        // WAL's crash recovery makes the extra per-commit fsync unnecessary; at worst
+        // a crash loses the last uncommitted transaction (never corrupts the DB).
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
         .max_connections(20)

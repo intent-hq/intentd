@@ -129,15 +129,6 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-/// A free localhost TCP port (bound then released to discover the number).
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Build a real `Services` API + event bus over a fresh temp SQLite store.
 /// The store is returned alongside so tests that need to seed fixtures with a
 /// fixed id (e.g. the workspace `spec` note) can `store.insert_*` directly,
@@ -192,10 +183,11 @@ async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::Pa
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     if opts.base_port == WsOptions::default().base_port {
-        opts.base_port = free_port();
+        opts.base_port = 0;
     }
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts).expect("server");
+    let ws =
+        WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);
     let port = ws.start().await.expect("start");
     Server {
@@ -1157,8 +1149,10 @@ async fn bind_fails_fast_on_occupied_port() {
     // bind error immediately — no port walking, no retry. Occupy the port for
     // the whole test so the listener has no chance to bind, then assert
     // `start()` returns an `AddrInUse` error on the SAME port it was asked for.
-    let base = free_port();
-    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, base)).unwrap();
+    // Bind the hog listener first, keep it open, and use its port for the test
+    // to avoid TOCTOU (no free_port() release-then-rebind window).
+    let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let base = _hog.local_addr().unwrap().port();
     let (api, bus, _store, dir) = make_services(None).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -1169,7 +1163,7 @@ async fn bind_fails_fast_on_occupied_port() {
         ..WsOptions::default()
     };
     opts.bind_address = Ipv4Addr::LOCALHOST.into();
-    let ws = WsApiServer::new(api, bus, &tls, token_store, opts).expect("server");
+    let ws = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
     let err = ws
         .start()
         .await
@@ -1195,11 +1189,11 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     // the real posture.
     let (api, bus, _store, _dir) = make_services(None).await;
     let opts = WsOptions {
-        base_port: free_port(),
+        base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws = WsApiServer::new_insecure(api, bus, opts);
+    let ws = WsApiServer::new_insecure(api, bus, opts, None);
     assert!(ws.is_insecure(), "constructor selects insecure posture");
     assert!(ws.fingerprint().is_none(), "no TLS cert ⇒ no fingerprint");
     let port = ws.start().await.expect("start");
@@ -1233,7 +1227,14 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
-    let srv = start(WsOptions::default()).await;
+    // NOTE: This test verifies fixed-port restart semantics (same port reclaimed
+    // after stop). Pick a dynamically-available port to avoid hard-coded collisions.
+    let fixed_port = free_port();
+    let srv = start(WsOptions {
+        base_port: fixed_port,
+        ..WsOptions::default()
+    })
+    .await;
     let port = srv.port;
     srv.ws.stop().await;
     // Re-start the SAME listener immediately; the freed port must rebind.
@@ -1709,6 +1710,204 @@ async fn wss_git_commit_details_round_trip() {
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
+/// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
+/// the `includeOlder` parameter fetches pre-boundary commits.
+#[tokio::test]
+async fn wss_file_tracking_load_commits_bounded() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a real git repo with a base commit on main + workspace commit on a branch.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssftlc-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("base.txt"), "base content\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base commit"]);
+    let base_sha = String::from_utf8(
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    git(&["checkout", "-q", "-b", "feat/test"]);
+    std::fs::write(repo.join("feature.txt"), "workspace content\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "workspace commit"]);
+
+    // Create workspace with baseRef=main and baseCommitSha set.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"File Tracking WSS","worktreePath":"{}","path":"{}","baseRef":"main","baseCommitSha":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+        base_sha,
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // (a) file-tracking.loadCommits default → bounded to workspace commits + boundarySha returned.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["commits"].is_array(),
+        "commits field: {resp}"
+    );
+    assert!(
+        resp["result"]["boundarySha"].is_string(),
+        "boundarySha field: {resp}"
+    );
+    assert!(
+        resp["result"]["nextToken"].is_null(),
+        "nextToken field: {resp}"
+    );
+
+    let commits = resp["result"]["commits"].as_array().unwrap();
+    let boundary_sha = resp["result"]["boundarySha"].as_str().unwrap();
+
+    // Should have exactly 1 commit (workspace commit), not 2.
+    assert_eq!(commits.len(), 1, "should only return workspace commits");
+    assert_eq!(commits[0]["message"], "workspace commit");
+
+    // The boundary should match the base commit.
+    assert_eq!(boundary_sha, base_sha, "boundary should be base commit SHA");
+
+    // (b) file-tracking.loadCommits with includeOlder: true → pre-boundary commits returned.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
+            ws_id
+        ),
+    )
+    .await;
+    let older_commits = resp["result"]["commits"].as_array().unwrap();
+
+    // Should return the base commit (pre-boundary history).
+    assert_eq!(
+        older_commits.len(),
+        1,
+        "should return pre-boundary commits with includeOlder"
+    );
+    assert_eq!(older_commits[0]["message"], "base commit");
+
+    // (c) Workspace without boundary info → unbounded, boundarySha null.
+    let create_unbounded = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{{"title":"Unbounded WSS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created_unbounded = wss_call(srv.port, srv.cfg.clone(), &create_unbounded).await;
+    let ws_id_unbounded = created_unbounded["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id unbounded")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id_unbounded
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["boundarySha"].is_null(),
+        "boundarySha should be null without boundary info"
+    );
+    let unbounded_commits = resp["result"]["commits"].as_array().unwrap();
+    // Should return all commits unbounded.
+    assert_eq!(
+        unbounded_commits.len(),
+        2,
+        "should return all commits without boundary"
+    );
+
+    // (d) Fail-closed safety net: workspace with boundary info but unresolvable → empty.
+    let create_unresolvable = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"workspace.create","params":{{"title":"Unresolvable WSS","worktreePath":"{}","path":"{}","baseRef":"nonexistent","baseCommitSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created_unresolvable = wss_call(srv.port, srv.cfg.clone(), &create_unresolvable).await;
+    let ws_id_unresolvable = created_unresolvable["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id unresolvable")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50}}}}"#,
+            ws_id_unresolvable
+        ),
+    )
+    .await;
+    assert!(
+        resp["result"]["boundarySha"].is_null(),
+        "boundarySha should be null when boundary is unresolvable"
+    );
+    let unresolvable_commits = resp["result"]["commits"].as_array().unwrap();
+    // Fail-closed safety net: should return empty (not arbitrary base-branch commits).
+    assert_eq!(
+        unresolvable_commits.len(),
+        0,
+        "should return empty when boundary info exists but is unresolvable (fail-closed)"
+    );
+
+    // (e) Fail-closed holds with includeOlder: boundary info exists but unresolvable + includeOlder → still empty.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"file-tracking.loadCommits","params":{{"workspaceId":"{}","limit":50,"includeOlder":true}}}}"#,
+            ws_id_unresolvable
+        ),
+    )
+    .await;
+    let unresolvable_older = resp["result"]["commits"].as_array().unwrap();
+    // Fail-closed safety net must hold even when includeOlder is true.
+    assert_eq!(
+        unresolvable_older.len(),
+        0,
+        "fail-closed safety net must hold with includeOlder=true"
+    );
 
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
@@ -2551,4 +2750,16 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     assert_eq!(init_missing["error"]["code"], -32602);
 
     srv.ws.stop().await;
+}
+
+/// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
+/// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
+/// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
 }

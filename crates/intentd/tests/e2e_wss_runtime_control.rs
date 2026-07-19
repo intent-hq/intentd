@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -28,6 +28,15 @@ use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
+fn free_port() -> u16 {
+    use std::net::TcpListener;
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port()
+}
+
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
@@ -43,14 +52,6 @@ impl Drop for Daemon {
         }
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
-}
-
-fn free_port() -> u16 {
-    StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn temp_data_dir() -> PathBuf {
@@ -244,8 +245,7 @@ where
 #[tokio::test]
 async fn runtime_ws_listener_toggle_over_wss() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     // Start daemon with both UDS and TCP (--listen both)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -255,8 +255,11 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // Get the actual bound port from system.status
+    let status = uds_rpc(&socket, 999, "system.status", json!({})).await;
+    let port_value = status["result"]["port"].as_u64().expect("port");
+
     // Persist the ephemeral port to the setting so re-enable uses the same port
-    let port_value: u64 = port_s.parse().unwrap();
     let set_port = uds_rpc(
         &socket,
         1,
@@ -353,6 +356,10 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
+    assert_eq!(
+        new_port, initial_port,
+        "re-enable should bind the same port (persisted in server.wsApi.port)"
+    );
 
     // Connect over WSS again and verify RPCs work
     let mut ws2 = connect_ws(new_port, cfg.clone()).await;
@@ -543,8 +550,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 #[tokio::test]
 async fn batch_hook_ordering_port_before_enable() {
     let data_dir = temp_data_dir();
-    let port_s = free_port().to_string();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -570,7 +576,8 @@ async fn batch_hook_ordering_port_before_enable() {
     // Batch update: provide changes in REVERSE dependency order (wsApi.enabled
     // before wsApi.port in the input array). The hook ordering ensures the port
     // value (priority 0) applies before wsApi.enabled (priority 10), so the
-    // listener starts directly on the NEW port.
+    // listener starts directly on the NEW port. Pick a dynamically-available port
+    // to avoid hard-coded collisions.
     let new_port = free_port();
     let batch_reverse = uds_rpc(
         &socket,
@@ -616,4 +623,113 @@ async fn batch_hook_ordering_port_before_enable() {
         ping_resp.get("error").is_none(),
         "events.subscribe over WSS after reverse-order batch should work: {ping_resp}"
     );
+}
+
+#[tokio::test]
+async fn wss_system_status_includes_capacity_version_uptime() {
+    // system.status over WSS reports maxAgents, version, uptimeSeconds alongside
+    // existing fields (additive change for FE health menu).
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Get status over UDS to find WSS port + fingerprint
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    // Connect over WSS and verify system.status returns the new fields
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+    let resp = wss_rpc(&mut ws, 7, "system.status", json!({})).await;
+    let r = &resp["result"];
+    assert_eq!(resp["id"], 7);
+    assert_eq!(r["running"], true, "response: {resp}");
+    assert!(r["host"]["locality"].is_string(), "locality present");
+    assert!(r["host"]["os"].is_string(), "os present");
+    assert!(r["host"]["arch"].is_string(), "arch present");
+    // New fields: maxAgents, version, uptimeSeconds.
+    assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
+    assert!(r["version"].is_string(), "version is string: {r}");
+    assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
+}
+
+#[tokio::test]
+async fn runtime_toggled_wss_serves_system_status() {
+    // Daemon starts with --listen uds, then toggles WSS on at runtime via
+    // settings.update. Verify system.status works over the runtime-started
+    // WSS listener (tests OnceLock control population, §5.7).
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    // Start daemon with ONLY UDS (--listen uds)
+    let _daemon = Daemon {
+        child: spawn_serve(&data_dir, "uds", &env),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Verify no WSS port initially
+    let status_before = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    assert_eq!(
+        status_before["result"]["port"],
+        json!(null),
+        "WSS should not be running"
+    );
+
+    // Toggle WSS on at runtime via settings.update
+    let port = free_port();
+    let enable_resp = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({
+            "changes": [
+                { "path": "server.wsApi.enabled", "value": true },
+                { "path": "server.wsApi.port", "value": port }
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        enable_resp.get("error").is_none(),
+        "settings.update should succeed: {enable_resp}"
+    );
+
+    // Wait a moment for the listener to start
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Verify WSS is now running
+    let status_after = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let runtime_port = status_after["result"]["port"]
+        .as_u64()
+        .expect("port after toggle") as u16;
+    assert_eq!(runtime_port, port, "WSS should bind to configured port");
+
+    // Connect over WSS and verify system.status works
+    let fingerprint = status_after["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(runtime_port, cfg).await;
+    let resp = wss_rpc(&mut ws, 4, "system.status", json!({})).await;
+    let r = &resp["result"];
+    assert_eq!(resp["id"], 4);
+    assert_eq!(
+        r["running"], true,
+        "system.status over runtime-toggled WSS: {resp}"
+    );
+    // Verify the new fields are present (proving control is wired)
+    assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
+    assert!(r["version"].is_string(), "version is string: {r}");
+    assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
 }

@@ -40,8 +40,8 @@ pub use model::{
     Event, EventActor, EventQueryParams, EventSubscribeResult, EventUnsubscribeResult,
     FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
     GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus, KnownRepo, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Memory, Note,
-    NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
+    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
+    NoteAddResult, NoteCreate, NoteDeleteResult, NoteEditInput, NoteEditLinesInput,
     NoteEditLinesResult, NoteEditResult, NoteMetadata, NoteRestoreVersionResult,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion,
     NoteVersionAuthor, NoteVersionSummary, NoteVisibility, ProjectType, PullRequestInfo,
@@ -60,6 +60,6 @@ pub use model::{
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
 pub use traits::{
-    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability,
+    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
 };

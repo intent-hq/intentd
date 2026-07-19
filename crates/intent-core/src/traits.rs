@@ -143,6 +143,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Publish an event onto the event bus (§10). The bindings layer can call
+    /// this to emit app:*/workspace:*/note:* events that live subscribers will
+    /// receive. When no bus is wired (test/minimal configs), this is a no-op.
+    /// The default impl returns `Ok(())` so bindings can call it unconditionally.
+    fn publish_event(&self, event: PublishEvent) -> BoxFuture<'_, Result<()>> {
+        let _ = event;
+        Box::pin(async { Ok(()) })
+    }
+
     /// Read the durable token/credit usage snapshot for a workspace (§5.23). The
     /// scan job itself is daemon-internal (no RPC); this is the wire **read** and
     /// returns a default (empty, `lastScanAt: null`) snapshot before the first
@@ -1645,6 +1654,38 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_diagnostics not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.listInterrupted`: list pending interrupted agents (INT-41,
+    /// agent-resumption phase 1). Returns joined data: agent ID, workspace info,
+    /// agent name, prev status, interrupted timestamp. Sessions deleted since
+    /// interruption are excluded. (PROTOCOL §5.5).
+    fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_list_interrupted not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.resolveInterrupted`: resume or abandon interrupted agents (INT-41,
+    /// agent-resumption phase 2). Resume: mark row `resumed`, re-register parent
+    /// completion watch if delegated, deliver continuation message. Abandon: mark
+    /// row `abandoned`, append system interruption message. Returns
+    /// `{ resumed: string[], abandoned: string[], failed: [{ agentId, error }] }`.
+    /// Ids must be pending interrupted_agent rows; unknown/already-resolved ids
+    /// land in `failed`. An id in both lists is `-32602`. (PROTOCOL §5.5).
+    fn agent_resolve_interrupted(
+        &self,
+        resume: Option<Vec<String>>,
+        abandon: Option<Vec<String>>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            let _ = (resume, abandon);
+            Err(Error::Internal(
+                "WorkspaceApi::agent_resolve_interrupted not implemented".to_string(),
             ))
         })
     }
@@ -3436,14 +3477,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `file-tracking.loadCommits`: commit history with attribution
-    /// (`{ commits: CommitWithAttribution[] }`) (PROTOCOL §5.19).
+    /// (`{ commits: CommitWithAttribution[], boundarySha, nextToken }`).
+    /// Wire shape details pending PROTOCOL.md update (see monorepo Task 3).
     fn file_tracking_load_commits(
         &self,
         workspace_id: WorkspaceId,
         limit: Option<i64>,
         page_token: Option<String>,
+        include_older: Option<bool>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, limit, page_token);
+        let _ = (workspace_id, limit, page_token, include_older);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_tracking_load_commits not implemented".to_string(),
@@ -3709,6 +3752,19 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::specialist_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `skill.list` → discovered skills for a workspace as a bare array of
+    /// `{ name, description, location, scope, allowedTools?, compatibility? }`
+    /// (name-sorted, scope: "project"|"user") (PROTOCOL §5.33).
+    /// Unknown `workspace_id` → `-32602` (not found).
+    fn skill_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::skill_list not implemented".to_string(),
             ))
         })
     }
@@ -4077,23 +4133,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::search_events not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `search.memories`: substring search over the BE memories store (§9.2).
-    /// Returns `{ requestId, matches: MemoryMatch[] }`; an empty store yields an
-    /// empty match set (parity-safe, no error) (PROTOCOL §5.15).
-    fn search_memories(
-        &self,
-        query: String,
-        workspace_id: Option<WorkspaceId>,
-        request_id: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, workspace_id, request_id);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::search_memories not implemented".to_string(),
             ))
         })
     }
@@ -4951,4 +4990,13 @@ pub trait AgentReverseDispatch: Send + Sync {
         method: &'a str,
         params: serde_json::Value,
     ) -> BoxFuture<'a, std::result::Result<serde_json::Value, ReverseDispatchError>>;
+}
+
+/// Minimal event structure for `WorkspaceApi::publish_event` (used by bindings
+/// that don't import `intent_store::NewEvent`).
+#[derive(Debug, Clone)]
+pub struct PublishEvent {
+    pub workspace_id: crate::ids::WorkspaceId,
+    pub event_type: String,
+    pub data: serde_json::Value,
 }

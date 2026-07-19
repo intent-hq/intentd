@@ -299,6 +299,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -334,6 +335,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -383,6 +385,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -461,6 +464,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         })
         .await
         .unwrap();
@@ -1133,6 +1137,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     };
     mgr.services
         .store
@@ -2053,6 +2058,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     }
 }
 
@@ -2303,6 +2309,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     };
     mgr.services
         .store
@@ -2584,7 +2591,7 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
         .store
-        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso())
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
         .await
         .expect("park session in error");
     // A ready-to-send message is waiting (the terminal-failure requeue).
@@ -2846,21 +2853,40 @@ async fn resolve_spawn_parses_compound_model_id() {
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
 }
 
-/// An explicit `session.provider` wins over the prefix encoded in the model id
-/// (the session row is authoritative).
+/// When a model carries an explicit `provider:` prefix, that prefix wins over
+/// session.provider. This is the fix for cross-provider model switches: the
+/// compound prefix is the user's latest intent.
 #[tokio::test]
-async fn resolve_spawn_session_provider_overrides_model_prefix() {
+async fn resolve_spawn_compound_prefix_wins_over_session_provider() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("store opens");
+    let mut session = session_with_specialist(None);
+    session.provider = Some("auggie".to_string());
+    session.model = Some("opencode:opencode-go/kimi-k3".to_string());
+    let resolved = resolve_spawn(&session, None, &store)
+        .await
+        .expect("compound prefix wins");
+    // The compound prefix (opencode) should win over session.provider (auggie).
+    assert_eq!(resolved.provider.id, "opencode");
+    // The model string is the bare half.
+    assert_eq!(resolved.model.as_deref(), Some("opencode-go/kimi-k3"));
+}
+
+/// Session.provider is used as a fallback for bare model ids (no `:` prefix).
+#[tokio::test]
+async fn resolve_spawn_session_provider_fallback_for_bare_model() {
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("store opens");
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
-    session.model = Some("claude-code:sonnet".to_string());
+    session.model = Some("gpt-5.3-codex/high".to_string());
     let resolved = resolve_spawn(&session, None, &store)
         .await
-        .expect("explicit provider wins");
+        .expect("session provider fallback");
+    // Bare model → session.provider is used.
     assert_eq!(resolved.provider.id, "codex");
-    // The model string is still split off the compound id (the bare half).
-    assert_eq!(resolved.model.as_deref(), Some("sonnet"));
+    // The bare model is passed through as-is.
+    assert_eq!(resolved.model.as_deref(), Some("gpt-5.3-codex/high"));
 }
 
 /// A workspace whose `path` exists on disk becomes the spawn cwd; a missing

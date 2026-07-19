@@ -5,7 +5,7 @@
 //! file-based methods (`search.inFiles`, `search.fileNames`) over a
 //! gitignore-aware worktree walk, plus the per-request cancellation registry
 //! that backs `search.cancel`. The store-backed adapters
-//! (sessions/events/memories/notes/codebase) contribute the wire match shapes
+//! (sessions/events/notes/codebase) contribute the wire match shapes
 //! and pure matching helpers in [`adapters`]; their store reads + streaming
 //! live in the services layer.
 
@@ -20,8 +20,7 @@ pub mod content;
 pub mod paths;
 
 pub use adapters::{
-    contains_ci, extract_symbol, make_preview, CodebaseMatch, EventMatch, MemoryMatch,
-    MessageMatch, NoteMatch,
+    contains_ci, extract_symbol, make_preview, CodebaseMatch, EventMatch, MessageMatch, NoteMatch,
 };
 pub use cancel::{mint_request_id, CancelRegistry, CancelToken};
 pub use content::{search_in_files, ContentSearchResult, SearchMatch, SearchOpts};

@@ -12,10 +12,11 @@ use crate::error::{Error, Result};
 /// disables the sweep entirely.
 pub const DEFAULT_IDLE_REAP_MINUTES: u32 = 30;
 
-/// Default `agent:stream:*` retention TTL in hours (`events.streamRetentionHours`,
-/// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to
-/// disabled so the append-only log is never trimmed unless an operator opts in.
-pub const DEFAULT_STREAM_RETENTION_HOURS: u32 = 0;
+/// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
+/// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h
+/// (3 days) so dev/release databases do not grow unboundedly; set to `0` to opt
+/// out and preserve all events.
+pub const DEFAULT_STREAM_RETENTION_HOURS: u32 = 72;
 
 /// Resolved filesystem locations for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,10 +34,10 @@ pub struct Config {
     /// Minutes an agent may sit idle before the reap sweep evicts it
     /// (`agents.idleReapMinutes`, §11.1); `0` disables idle reaping.
     pub idle_reap_minutes: u32,
-    /// Hours an `agent:stream:*` chunk event is retained before the
-    /// retention/compaction sweep deletes it (`events.streamRetentionHours`,
-    /// §10.2); `0` disables the sweep. Only stream events are trimmed — all
-    /// other event families are preserved regardless of age.
+    /// Hours ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
+    /// `host:exec:*`) are retained before the retention/compaction sweep deletes
+    /// them (`events.streamRetentionHours`, §10.2); `0` disables the sweep.
+    /// Lifecycle/tool/note/task/workspace events are preserved regardless of age.
     pub stream_retention_hours: u32,
 }
 
@@ -109,7 +110,7 @@ fn load_idle_reap_minutes(config_path: &Path) -> u32 {
 /// Read `events.streamRetentionHours` from `config.toml`, falling back to the
 /// `INTENTD_STREAM_RETENTION_HOURS` env override and finally
 /// [`DEFAULT_STREAM_RETENTION_HOURS`]. A missing/unparseable file or key is not
-/// an error — the daemon simply uses the default (disabled).
+/// an error — the daemon simply uses the default (72h opt-out retention).
 fn load_stream_retention_hours(config_path: &Path) -> u32 {
     if let Some(v) = std::env::var_os("INTENTD_STREAM_RETENTION_HOURS") {
         if let Ok(n) = v.to_string_lossy().trim().parse::<u32>() {
@@ -169,14 +170,14 @@ mod tests {
     }
 
     #[test]
-    fn stream_retention_hours_defaults_disabled_when_file_missing() {
+    fn stream_retention_hours_defaults_to_72h_when_file_missing() {
         let missing =
             std::env::temp_dir().join(format!("intentd-missing-{}.toml", uuid::Uuid::new_v4()));
         assert_eq!(
             load_stream_retention_hours(&missing),
             DEFAULT_STREAM_RETENTION_HOURS
         );
-        assert_eq!(DEFAULT_STREAM_RETENTION_HOURS, 0);
+        assert_eq!(DEFAULT_STREAM_RETENTION_HOURS, 72);
     }
 
     #[test]

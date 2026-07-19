@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::Config;
 use uuid::Uuid;
 
@@ -140,7 +141,7 @@ fn mk_config(data_dir: PathBuf) -> Config {
         socket_path: data_dir.join("intentd.sock"),
         pid_path: data_dir.join("intentd.pid"),
         idle_reap_minutes: 30,
-        stream_retention_hours: 0,
+        stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
         data_dir,
     }
 }

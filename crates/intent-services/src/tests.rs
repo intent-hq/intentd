@@ -3,15 +3,60 @@
 //! reduction guard, spec-title skip, workspace scoping, and error mapping.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, ContentType, Error, Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput,
-    NoteId, NoteMetadata, NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Note, NoteAddInput,
+    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteUpdateInput,
+    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use intent_store::Store;
 
 use crate::Services;
+
+/// Guard for tests that mutate debounce env vars to prevent parallel test
+/// races (env::set_var is process-global). Supports both LAST_ACTIVITY and
+/// WORKSPACE_IDLE debounce vars.
+static ENV_DEBOUNCE_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard for debounce env vars: holds the lock, sets the vars, and restores
+/// on drop to prevent leakage into other tests.
+struct DebounceEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior_last_activity: Option<std::ffi::OsString>,
+    prior_workspace_idle: Option<std::ffi::OsString>,
+}
+
+impl DebounceEnvGuard {
+    fn new(millis: &str) -> Self {
+        let _lock = ENV_DEBOUNCE_LOCK.lock().unwrap();
+        let prior_last_activity = std::env::var_os("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        let prior_workspace_idle = std::env::var_os("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
+        std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", millis);
+        std::env::set_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", millis);
+        Self {
+            _lock,
+            prior_last_activity,
+            prior_workspace_idle,
+        }
+    }
+}
+
+impl Drop for DebounceEnvGuard {
+    fn drop(&mut self) {
+        if let Some(val) = &self.prior_last_activity {
+            std::env::set_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS", val);
+        } else {
+            std::env::remove_var("LAST_ACTIVITY_DEBOUNCE_TEST_MS");
+        }
+        if let Some(val) = &self.prior_workspace_idle {
+            std::env::set_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", val);
+        } else {
+            std::env::remove_var("WORKSPACE_IDLE_DEBOUNCE_TEST_MS");
+        }
+    }
+}
 
 struct TempDb {
     path: PathBuf,
@@ -212,6 +257,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     };
     store
         .insert_agent_session(&mk_agent("agent-1", "Builder", Some("implementor")))
@@ -1375,6 +1421,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
     };
     svc.store
         .insert_agent_session(&session)
@@ -2570,7 +2617,7 @@ mod change_event_parity {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{note, workspace, TempDb, WorkspacesRoot};
+    use super::{note, workspace, DebounceEnvGuard, TempDb, WorkspacesRoot};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
@@ -2809,6 +2856,7 @@ mod change_event_parity {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         h.store
             .insert_agent_session(&session)
@@ -3182,6 +3230,7 @@ mod change_event_parity {
     #[tokio::test]
     async fn activity_changed_only_on_change_and_derived() {
         use intent_core::{WorkspaceActivity, WorkspaceApi};
+        let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
@@ -3209,9 +3258,11 @@ mod change_event_parity {
             WorkspaceActivity::AgentRunning
         );
 
-        // Last session leaves flight: AgentRunning → Idle (emits idle). If the
-        // nested pair had emitted, this would observe agent_running instead.
+        // Last session leaves flight: AgentRunning → Idle (emits idle after debounce).
+        // If the nested pair had emitted, this would observe agent_running instead.
         h.services.agent_activity_end(&h.ws).await;
+        // Wait for debounce window to expire.
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(
@@ -3231,6 +3282,246 @@ mod change_event_parity {
             h.services.workspace_activity(&h.ws),
             WorkspaceActivity::Idle
         );
+    }
+
+    /// Regression: idle debounce must guard emission against races where
+    /// `agent_activity_begin` happens after the sleep but before emission.
+    /// The generation counter + count check at fire time prevents spurious idle
+    /// events when agents come back in-flight during the grace window.
+    #[tokio::test]
+    async fn idle_debounce_guards_emission_against_race() {
+        use intent_core::WorkspaceActivity;
+        let h = harness().await;
+        let _guard = DebounceEnvGuard::new("50");
+        let mut sub = subscribe(&h);
+
+        // Begin activity, then end it to schedule a debounce.
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["data"]["activity"], "agent_running");
+
+        h.services.agent_activity_end(&h.ws).await;
+
+        // Quickly re-begin activity within the debounce window (race scenario).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Wait past the debounce window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Should receive agent_running event from re-begin, NOT an idle event.
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(
+            ev["data"]["activity"], "agent_running",
+            "race guard prevents spurious idle emission when count is non-zero"
+        );
+
+        // Workspace should still be agent_running.
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning
+        );
+    }
+
+    /// Regression for STAB-N: workspace mutation paths must derive `activity`
+    /// from live agent state before returning the `Workspace` on the wire (§9.9).
+    /// When a workspace has agents in-flight, mutations that return a `Workspace`
+    /// must set `ws.activity = workspace_activity(&id)` so the FE receives
+    /// `agent_running`, not the stale/default `idle` from the persisted row.
+    #[tokio::test]
+    async fn update_workspace_derives_activity_from_live_agent_state() {
+        use intent_core::{WorkspaceActivity, WorkspaceApi, WorkspaceUpdate};
+        let h = harness().await;
+        let _guard = DebounceEnvGuard::new("50");
+
+        // Baseline: with no agents in-flight, update_workspace returns activity=idle.
+        let updated = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed Without Agent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace");
+        assert_eq!(
+            updated.activity,
+            WorkspaceActivity::Idle,
+            "without agents in-flight, activity is idle"
+        );
+
+        // Start agent activity: the workspace now has 1 in-flight session.
+        h.services.agent_activity_begin(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "workspace_activity() reports agent_running"
+        );
+
+        // Regression: update_workspace must return activity=agent_running,
+        // not the stale default `idle` from the persisted row.
+        let updated_with_agent = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed With Agent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace with agent");
+        assert_eq!(
+            updated_with_agent.activity,
+            WorkspaceActivity::AgentRunning,
+            "update_workspace MUST derive activity=agent_running when agents in-flight"
+        );
+
+        // End agent activity: the workspace returns to idle after debounce window.
+        h.services.agent_activity_end(&h.ws).await;
+        // During grace window, workspace_activity() still reports AgentRunning.
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "during grace window, workspace_activity() still reports AgentRunning"
+        );
+        // Wait for debounce window to expire (50ms test window).
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle,
+            "after debounce window, workspace_activity() reports idle"
+        );
+
+        // Confirm update_workspace returns activity=idle again.
+        let updated_after_agent = h
+            .services
+            .update_workspace(
+                h.ws.clone(),
+                WorkspaceUpdate {
+                    title: Some("Renamed After Agent".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update workspace after agent");
+        assert_eq!(
+            updated_after_agent.activity,
+            WorkspaceActivity::Idle,
+            "update_workspace reports idle after agents end and debounce expires"
+        );
+    }
+
+    /// Regression for STAB-N: `dismiss_attention` must derive activity.
+    #[tokio::test]
+    async fn dismiss_attention_derives_activity_from_live_agent_state() {
+        use intent_core::{WorkspaceActivity, WorkspaceAttention};
+        let h = harness().await;
+
+        // Set attention so there's something to dismiss.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise attention");
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Dismiss attention — must return activity=agent_running.
+        let dismissed = h
+            .services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss attention");
+        assert_eq!(
+            dismissed.activity,
+            WorkspaceActivity::AgentRunning,
+            "dismiss_attention MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
+    /// Regression for STAB-N: `archive_workspace` must derive activity.
+    #[tokio::test]
+    async fn archive_workspace_derives_activity_from_live_agent_state() {
+        use intent_core::WorkspaceActivity;
+        let h = harness().await;
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Archive — must return activity=agent_running.
+        let archived = h
+            .services
+            .archive_workspace(h.ws.clone())
+            .await
+            .expect("archive workspace");
+        assert_eq!(
+            archived.activity,
+            WorkspaceActivity::AgentRunning,
+            "archive_workspace MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
+    /// Regression for STAB-N: `unarchive_workspace` must derive activity.
+    #[tokio::test]
+    async fn unarchive_workspace_derives_activity_from_live_agent_state() {
+        use intent_core::WorkspaceActivity;
+        let h = harness().await;
+
+        // Archive first.
+        h.services
+            .archive_workspace(h.ws.clone())
+            .await
+            .expect("archive workspace");
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Unarchive — must return activity=agent_running.
+        let unarchived = h
+            .services
+            .unarchive_workspace(h.ws.clone())
+            .await
+            .expect("unarchive workspace");
+        assert_eq!(
+            unarchived.activity,
+            WorkspaceActivity::AgentRunning,
+            "unarchive_workspace MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
+    }
+
+    /// Regression for STAB-N: `mark_seen` must derive activity.
+    #[tokio::test]
+    async fn mark_seen_derives_activity_from_live_agent_state() {
+        use intent_core::{WorkspaceActivity, WorkspaceAttention};
+        let h = harness().await;
+
+        // Set unread attention so there's something to mark seen.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise attention");
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Mark seen — must return activity=agent_running.
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("mark seen");
+        assert_eq!(
+            seen.activity,
+            WorkspaceActivity::AgentRunning,
+            "mark_seen MUST derive activity=agent_running"
+        );
+
+        h.services.agent_activity_end(&h.ws).await;
     }
 
     /// The BE raises `attention`, it persists across a store reload, the raise is
@@ -4265,6 +4556,7 @@ mod mcp_callback {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -6001,7 +6293,7 @@ mod file_tracking {
         let svc = Services::new(store);
 
         let result = svc
-            .file_tracking_load_commits(ws_id, Some(10), None)
+            .file_tracking_load_commits(ws_id, Some(10), None, None)
             .await
             .unwrap();
         let commits = result["commits"].as_array().unwrap();
@@ -6813,6 +7105,7 @@ mod search_adapters {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -6930,43 +7223,6 @@ mod search_adapters {
             .unwrap();
         assert_eq!(r["requestId"], "srch-n");
         assert_eq!(r["matches"].as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn memories_search_empty_store_returns_empty_not_error() {
-        let (_tmp, store, ws) = store_with_ws().await;
-        let svc = Services::new(store);
-        let r = svc
-            .search_memories("anything".into(), Some(ws), Some("srch-m".into()))
-            .await
-            .unwrap();
-        assert_eq!(r["requestId"], "srch-m");
-        assert_eq!(r["matches"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn memories_search_matches_seeded_row() {
-        let (_tmp, store, ws) = store_with_ws().await;
-        // Seed via the internal write path (no `memories.*` RPC, §18.5).
-        let mem = intent_core::Memory {
-            id: "mem-1".to_string(),
-            workspace_id: Some(ws.clone()),
-            content: "remember the needle here".to_string(),
-            tags: vec!["note".to_string()],
-            created_at: intent_core::now_iso(),
-            updated_at: None,
-        };
-        store.insert_memory(&mem).await.expect("insert memory");
-        let svc = Services::new(store);
-        let r = svc
-            .search_memories("needle".into(), Some(ws), Some("srch-m2".into()))
-            .await
-            .unwrap();
-        assert_eq!(r["requestId"], "srch-m2");
-        let matches = r["matches"].as_array().unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0]["memoryId"], "mem-1");
-        assert!(matches[0]["preview"].as_str().unwrap().contains("needle"));
     }
 
     /// A fake [`ContextEngine`] so the engine-available and graceful-degradation
@@ -8508,6 +8764,7 @@ mod rules {
             sandbox_id: Some("sandbox-123".into()),
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
             sandbox_branch: Some("sb/agent-1".into()),
+            stop_reason: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -8631,6 +8888,7 @@ mod rules {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -8744,6 +9002,7 @@ mod rules {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -8853,6 +9112,7 @@ mod rules {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -8962,6 +9222,7 @@ mod rules {
             sandbox_id: None,
             sandbox_path: None, // NO sandbox — explicit "shared" override!
             sandbox_branch: None,
+            stop_reason: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -9075,6 +9336,7 @@ mod rules {
             sandbox_id: Some("sandbox-explicit".into()),
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
             sandbox_branch: Some("sb/agent-1".into()),
+            stop_reason: None,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -9261,6 +9523,432 @@ mod known_repo {
         assert_eq!(
             windows.workspace.repository_name.as_deref(),
             Some("describe-workspace")
+        );
+    }
+
+    /// `workspace.create` derives `repository_owner` and `repository_name` from
+    /// the `origin` remote URL when the caller omits them (STAB-64). Caller-
+    /// supplied values always win; non-github remotes leave owner unset; missing
+    /// remotes fall back to basename for name. Strict host check rejects
+    /// github.com.evil.com and similar substring attacks.
+    #[tokio::test]
+    async fn create_workspace_derives_owner_and_name_from_origin_remote() {
+        use git2::{Repository, Signature};
+
+        struct TempRepo(PathBuf);
+        impl Drop for TempRepo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let svc = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+
+        // Helper: init a git repo with an origin remote and an initial commit.
+        let make_repo = |remote_url: &str| -> TempRepo {
+            let dir = std::env::temp_dir().join(format!("intentd-origin-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::init(&dir).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+            cfg.set_str("remote.origin.url", remote_url).unwrap();
+            // Create an initial commit
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("seed.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
+                .unwrap();
+            TempRepo(dir)
+        };
+
+        // GitHub https remote → owner and name derived.
+        let https_repo = make_repo("https://github.com/intent-hq/intentd.git");
+        let https_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(https_repo.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create https");
+        assert_eq!(
+            https_ws.workspace.repository_owner.as_deref(),
+            Some("intent-hq"),
+            "https remote derives owner"
+        );
+        assert_eq!(
+            https_ws.workspace.repository_name.as_deref(),
+            Some("intentd"),
+            "https remote derives name"
+        );
+
+        // GitHub ssh remote → owner and name derived.
+        let ssh_repo = make_repo("git@github.com:intent-hq/intentd.git");
+        let ssh_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(ssh_repo.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create ssh");
+        assert_eq!(
+            ssh_ws.workspace.repository_owner.as_deref(),
+            Some("intent-hq"),
+            "ssh remote derives owner"
+        );
+        assert_eq!(
+            ssh_ws.workspace.repository_name.as_deref(),
+            Some("intentd"),
+            "ssh remote derives name"
+        );
+
+        // Non-github remote → owner stays None, name falls back to basename.
+        let gitlab_repo = make_repo("https://gitlab.com/myorg/myrepo.git");
+        let gitlab_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(gitlab_repo.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create gitlab");
+        assert_eq!(
+            gitlab_ws.workspace.repository_owner, None,
+            "non-github remote leaves owner unset"
+        );
+        // The basename fallback still fires because the remote didn't parse.
+        assert!(
+            gitlab_ws
+                .workspace
+                .repository_name
+                .as_deref()
+                .unwrap()
+                .starts_with("intentd-origin-"),
+            "non-github remote falls back to basename for name"
+        );
+
+        // No origin remote → owner stays None, name falls back to basename.
+        let no_remote = {
+            let dir =
+                std::env::temp_dir().join(format!("intentd-noremote-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::init(&dir).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+            // Create an initial commit
+            std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("seed.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
+                .unwrap();
+            TempRepo(dir)
+        };
+        let noremote_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(no_remote.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create noremote");
+        assert_eq!(
+            noremote_ws.workspace.repository_owner, None,
+            "no remote leaves owner unset"
+        );
+        assert!(
+            noremote_ws
+                .workspace
+                .repository_name
+                .as_deref()
+                .unwrap()
+                .starts_with("intentd-noremote-"),
+            "no remote falls back to basename for name"
+        );
+
+        // Caller-supplied owner wins over remote derivation.
+        let explicit_owner_repo = make_repo("https://github.com/intent-hq/intentd.git");
+        let explicit_owner_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(explicit_owner_repo.0.to_string_lossy().to_string()),
+                    repository_owner: Some("my-override".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create explicit owner");
+        assert_eq!(
+            explicit_owner_ws.workspace.repository_owner.as_deref(),
+            Some("my-override"),
+            "caller-supplied owner wins"
+        );
+        assert_eq!(
+            explicit_owner_ws.workspace.repository_name.as_deref(),
+            Some("intentd"),
+            "derived name still applies when only owner is explicit"
+        );
+
+        // Caller-supplied name wins over remote derivation.
+        let explicit_name_repo = make_repo("https://github.com/intent-hq/intentd.git");
+        let explicit_name_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(explicit_name_repo.0.to_string_lossy().to_string()),
+                    repository_name: Some("my-repo-name".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create explicit name");
+        assert_eq!(
+            explicit_name_ws.workspace.repository_owner.as_deref(),
+            Some("intent-hq"),
+            "derived owner still applies when only name is explicit"
+        );
+        assert_eq!(
+            explicit_name_ws.workspace.repository_name.as_deref(),
+            Some("my-repo-name"),
+            "caller-supplied name wins"
+        );
+
+        // Verify known_repo registry also gets the derived owner.
+        let repos = store.list_known_repos().await.expect("list repos");
+        let https_entry = repos
+            .iter()
+            .find(|r| r.path == https_repo.0.to_string_lossy())
+            .expect("https repo registered");
+        assert_eq!(
+            https_entry.owner.as_deref(),
+            Some("intent-hq"),
+            "known_repo entry carries derived owner"
+        );
+        assert_eq!(
+            https_entry.name, "intentd",
+            "known_repo entry carries derived name"
+        );
+
+        // Negative: host substring attack (github.com.evil.com) must NOT derive.
+        let evil_https = make_repo("https://github.com.evil.com/owner/repo.git");
+        let evil_https_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(evil_https.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create evil https");
+        assert_eq!(
+            evil_https_ws.workspace.repository_owner, None,
+            "github.com.evil.com must NOT derive owner (strict host check)"
+        );
+
+        // Negative: ssh host attack (git@github.com.evil:owner/repo.git) must NOT derive.
+        let evil_ssh = make_repo("git@github.com.evil:owner/repo.git");
+        let evil_ssh_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(evil_ssh.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create evil ssh");
+        assert_eq!(
+            evil_ssh_ws.workspace.repository_owner, None,
+            "git@github.com.evil:... must NOT derive owner (strict host check)"
+        );
+    }
+
+    /// `workspace.list` backfills `repository_owner` and `repository_name` for
+    /// existing workspaces with a `repositoryPath` and missing owner/name:
+    /// derive from the `origin` remote URL (same helper as `workspace.create`),
+    /// persist, and emit `workspace:updated` with the changed fields (STAB-64
+    /// backfill).
+    #[tokio::test]
+    async fn list_workspaces_backfills_owner_and_name_from_origin_remote() {
+        use git2::{Repository, Signature};
+
+        struct TempRepo(PathBuf);
+        impl Drop for TempRepo {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws_root = WorkspacesRoot::new();
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+
+        // Manually create a workspace row with repository_path but missing owner/name
+        // (simulates old workspace created before the create derivation landed).
+        let make_repo = |url: &str| -> TempRepo {
+            let dir = std::env::temp_dir().join(format!(
+                "intentd-backfill-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = Repository::init(&dir).unwrap();
+            repo.remote("origin", url).unwrap();
+            let mut index = repo.index().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
+                .unwrap();
+            TempRepo(dir)
+        };
+
+        let repo_path = make_repo("https://github.com/octocat/hello-world.git");
+        let id = WorkspaceId::from_string("backfill-test".to_string());
+        let now = now_iso();
+        let mut ws = Workspace {
+            id: id.clone(),
+            title: "Backfill Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: Some(repo_path.0.to_string_lossy().to_string()),
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            token_usage: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            cow_supported: None,
+        };
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        // Subscribe to events to capture workspace:updated
+        let mut sub =
+            svc.event_bus
+                .as_ref()
+                .unwrap()
+                .subscribe(crate::events::filter::SubscriptionFilter {
+                    event_types: vec!["workspace:updated".to_string()],
+                    workspace_id: Some(id.0.clone()),
+                    batch_window: None,
+                    ..Default::default()
+                });
+
+        // Trigger workspace.list → spawns backfill
+        let list = svc.list_workspaces(false).await.expect("list workspaces");
+        assert!(list.iter().any(|w| w.id == id), "workspace appears in list");
+
+        // Wait for the backfill to complete and emit workspace:updated
+        let mut updated_event = None;
+        for _ in 0..100 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            // Try to receive batched events (could be empty or timeout)
+            match tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await {
+                Ok(Some(batch)) => {
+                    for evt in batch {
+                        if evt.event_type == "workspace:updated"
+                            && evt.workspace_id == id
+                            && evt
+                                .data
+                                .get("changes")
+                                .and_then(|c| c.get("repositoryOwner"))
+                                .is_some()
+                        {
+                            updated_event = Some(evt);
+                            break;
+                        }
+                    }
+                    if updated_event.is_some() {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        assert!(
+            updated_event.is_some(),
+            "workspace:updated event emitted with repositoryOwner change"
+        );
+        let evt = updated_event.unwrap();
+        assert_eq!(
+            evt.data
+                .get("changes")
+                .and_then(|c| c.get("repositoryOwner"))
+                .and_then(|v| v.as_str()),
+            Some("octocat"),
+            "event carries repositoryOwner change"
+        );
+        assert_eq!(
+            evt.data
+                .get("changes")
+                .and_then(|c| c.get("repositoryName"))
+                .and_then(|v| v.as_str()),
+            Some("hello-world"),
+            "event carries repositoryName change"
+        );
+
+        // Verify workspace row persisted the fields
+        ws = store.get_workspace(&id).await.expect("get workspace");
+        assert_eq!(
+            ws.repository_owner.as_deref(),
+            Some("octocat"),
+            "repositoryOwner persisted"
+        );
+        assert_eq!(
+            ws.repository_name.as_deref(),
+            Some("hello-world"),
+            "repositoryName persisted"
         );
     }
 }
@@ -9614,6 +10302,18 @@ mod worktree_provisioning {
 
         svc.delete_workspace(ws.id.clone()).await.expect("delete");
 
+        // Fast-ack: the response returns immediately while the worktree cleanup
+        // runs in the background. Poll for the expected final state.
+        for _ in 0..100 {
+            let repo = git2::Repository::open(&repo_dir.0).unwrap();
+            let branch_gone = repo
+                .find_branch(&ws.branch, git2::BranchType::Local)
+                .is_err();
+            if !wt.exists() && !root.0.join(&ws.id.0).exists() && branch_gone {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
         assert!(!wt.exists(), "worktree directory removed");
         assert!(
             !root.0.join(&ws.id.0).exists(),
@@ -9666,6 +10366,13 @@ mod worktree_provisioning {
 
         svc.delete_workspace(ws.id).await.expect("delete");
 
+        // Fast-ack: poll for worktree removal.
+        for _ in 0..100 {
+            if !wt.exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
         assert!(!wt.exists(), "worktree directory still removed");
         let repo = git2::Repository::open(&repo_dir.0).unwrap();
         assert!(
@@ -10194,6 +10901,7 @@ mod file_ops_service {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         };
         store
             .insert_agent_session(&agent)
@@ -11017,6 +11725,7 @@ mod heal_stale_agent_sessions {
             sandbox_id: None,
             sandbox_path: None,
             sandbox_branch: None,
+            stop_reason: None,
         }
     }
 
@@ -11954,6 +12663,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
         is_background: false,
         metadata: None,
     };
@@ -11987,6 +12697,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
         is_background: false,
         metadata: None,
     };
@@ -12098,6 +12809,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         sandbox_id: None,
         sandbox_path: None,
         sandbox_branch: None,
+        stop_reason: None,
         is_background: false,
         metadata: None,
     };
@@ -12199,4 +12911,557 @@ fn git_push_event_builds_correct_event_payload() {
     assert_eq!(forced.data["force"], true);
     assert_eq!(forced.data["branch"], "feat/test");
     assert_eq!(forced.data["commit"], "def456");
+}
+
+/// Tests for `workspace:updated { lastActivity }` event emission (§10.1).
+#[cfg(test)]
+mod last_activity_events {
+    use super::*;
+    use crate::{EventBus, Subscription, SubscriptionFilter};
+    use serde_json::Value;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    struct Harness {
+        _tmp: TempDb,
+        _ws_root: WorkspacesRoot,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let ws_root = WorkspacesRoot::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            _ws_root: ws_root,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert!(!batch.is_empty(), "expected at least one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    fn assert_envelope(ev: &Value, expected_ws: &str, expected_type: &str) {
+        assert_eq!(ev["workspaceId"], expected_ws);
+        assert_eq!(ev["type"], expected_type);
+    }
+
+    /// After `raise_attention` (which bumps workspace.updated_at), a
+    /// `workspace:updated { lastActivity }` event is emitted (after debounce).
+    #[tokio::test]
+    async fn raise_attention_emits_last_activity() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+
+        // First event: workspace:attention-changed
+        let ev1 = recv_one(&mut sub).await;
+        assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
+
+        // Second event: workspace:updated { lastActivity }
+        let ev2 = recv_one(&mut sub).await;
+        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+        assert!(ev2["data"]["changes"]["lastActivity"].is_string());
+
+        let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(
+            ev2["data"]["changes"]["lastActivity"].as_str().unwrap(),
+            ws_after.updated_at.as_str()
+        );
+    }
+
+    /// `dismiss_attention` only emits `workspace:updated { lastActivity }` when
+    /// attention actually changed (idempotent no-op on already-clear).
+    #[tokio::test]
+    async fn dismiss_attention_idempotent() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Raise first so we have something to dismiss.
+        h.services
+            .raise_attention(&h.ws, WorkspaceAttention::Unread)
+            .await
+            .expect("raise");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut sub = subscribe(&h);
+
+        // Dismiss (should emit both events).
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss");
+
+        let ev1 = recv_one(&mut sub).await;
+        assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
+
+        let ev2 = recv_one(&mut sub).await;
+        assert_envelope(&ev2, &h.ws.0, "workspace:updated");
+
+        // Dismiss again (no-op, no events).
+        h.services
+            .dismiss_attention(h.ws.clone())
+            .await
+            .expect("dismiss again");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "no event on idempotent dismiss"
+        );
+    }
+
+    /// Rapid bumps to the same workspace (e.g., multiple raise_attention calls)
+    /// coalesce into one `workspace:updated { lastActivity }` event carrying
+    /// the latest derived value.
+    #[tokio::test]
+    async fn burst_coalescing() {
+        let _guard = DebounceEnvGuard::new("200");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Raise attention multiple times (each bumps workspace.updated_at).
+        for i in 0..4 {
+            h.services
+                .raise_attention(
+                    &h.ws,
+                    if i % 2 == 0 {
+                        WorkspaceAttention::Unread
+                    } else {
+                        WorkspaceAttention::ReviewRequired
+                    },
+                )
+                .await
+                .expect("raise");
+        }
+
+        // Drain all `workspace:attention-changed` events emitted during the burst.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while timeout(Duration::from_millis(10), sub.recv()).await.is_ok() {}
+
+        // Wait for the debounce window to fire.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Should see exactly one workspace:updated { lastActivity }.
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert!(ev["data"]["changes"]["lastActivity"].is_string());
+
+        // No second event (coalesced).
+        assert!(
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
+            "burst coalesced into one event"
+        );
+
+        // The emitted lastActivity matches a fresh workspace.get.
+        let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
+        let mut ws_enriched = ws_after.clone();
+        h.services.derive_last_activity(&mut ws_enriched).await;
+        assert_eq!(
+            ev["data"]["changes"]["lastActivity"].as_str().unwrap(),
+            ws_enriched.last_activity.as_deref().unwrap()
+        );
+    }
+
+    /// `scan_workspace_token_usage` only emits `workspace:updated { lastActivity }`
+    /// when the token tallies actually changed (idempotent re-scan is silent).
+    #[tokio::test]
+    async fn token_usage_scan_only_on_change() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // First scan (no prior usage, should emit).
+        let changed1 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan 1");
+        assert!(changed1, "first scan changed (none -> zero)");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut sub = subscribe(&h);
+
+        // Second scan (tallies unchanged, no emit).
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan 2");
+        assert!(!changed2, "second scan unchanged");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "no event on idempotent token scan"
+        );
+    }
+
+    /// Finding F2: incremental token scan skips when watermark unchanged.
+    #[tokio::test]
+    async fn incremental_token_scan_skip_when_unchanged() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let usage = serde_json::json!({ "usage": { "inputTokens": 10, "outputTokens": 5 } });
+        h.store
+            .append_agent_message(&agent_id, "user", &usage, &now_iso())
+            .await
+            .expect("append message");
+
+        let changed1 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("first scan");
+        assert!(changed1, "first scan should detect change");
+
+        let watermark1 = h
+            .services
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(&h.ws)
+            .copied()
+            .expect("watermark set after first scan");
+        assert_eq!(watermark1, 1, "watermark should be 1 after one message");
+
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("second scan");
+        assert!(!changed2, "second scan should skip (unchanged watermark)");
+    }
+
+    /// Finding F2: rescan when the agent_message watermark changes.
+    #[tokio::test]
+    async fn incremental_token_scan_rescan_on_append() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent_id, &h.ws))
+            .await
+            .expect("insert session");
+
+        let usage1 = serde_json::json!({ "usage": { "inputTokens": 10, "outputTokens": 5 } });
+        h.store
+            .append_agent_message(&agent_id, "user", &usage1, &now_iso())
+            .await
+            .expect("append message 1");
+
+        let changed1 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("first scan");
+        assert!(changed1, "first scan should detect change");
+
+        let watermark1 = h
+            .services
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(&h.ws)
+            .copied()
+            .expect("watermark 1");
+        assert_eq!(watermark1, 1, "one message");
+
+        let usage2 = serde_json::json!({ "usage": { "inputTokens": 20, "outputTokens": 10 } });
+        h.store
+            .append_agent_message(&agent_id, "assistant", &usage2, &now_iso())
+            .await
+            .expect("append message 2");
+
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("second scan");
+        assert!(changed2, "second scan should detect change (new message)");
+
+        let watermark2 = h
+            .services
+            .token_usage_watermarks
+            .lock()
+            .unwrap()
+            .get(&h.ws)
+            .copied()
+            .expect("watermark 2");
+        assert_eq!(watermark2, 2, "two messages");
+
+        let ws = h.store.get_workspace(&h.ws).await.unwrap();
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 30, "10 + 20");
+        assert_eq!(usage.totals.output_tokens, 15, "5 + 10");
+    }
+
+    /// Finding F2: lightweight tally matches expected aggregation.
+    #[tokio::test]
+    async fn incremental_token_scan_tally_parity() {
+        let h = harness().await;
+        let agent1 = AgentId::new();
+        let agent2 = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent1, &h.ws))
+            .await
+            .expect("insert agent 1");
+        h.store
+            .insert_agent_session(&agent_session(&agent2, &h.ws))
+            .await
+            .expect("insert agent 2");
+
+        let u1 = serde_json::json!({ "usage": { "inputTokens": 100, "outputTokens": 20 } });
+        let u2 = serde_json::json!({ "_meta": { "usage": { "cacheReadTokens": 50 } } });
+        h.store
+            .append_agent_message(&agent1, "user", &u1, &now_iso())
+            .await
+            .expect("append 1");
+        h.store
+            .append_agent_message(&agent1, "assistant", &u2, &now_iso())
+            .await
+            .expect("append 2");
+        h.store
+            .append_agent_message(&agent2, "user", &u1, &now_iso())
+            .await
+            .expect("append 3");
+
+        let changed = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan");
+        assert!(changed, "scan should detect change");
+
+        let ws = h.store.get_workspace(&h.ws).await.unwrap();
+        let usage = ws.token_usage.expect("usage persisted");
+
+        assert_eq!(usage.totals.input_tokens, 200, "100 + 100");
+        assert_eq!(usage.totals.output_tokens, 40, "20 + 20");
+        assert_eq!(usage.totals.cache_read_tokens, 50, "50 from agent 1");
+        assert_eq!(usage.by_agent_id.len(), 2, "two agents");
+        assert!(usage.last_scan_at.is_some(), "scan timestamp set");
+    }
+
+    fn agent_session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("test-{}", agent_id.0),
+            name_explicitly_set: false,
+            model: Some("test-model".into()),
+            provider: Some("test".into()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+        }
+    }
+
+    /// Regression for STAB-N: busy→idle transition debounce (test a). An
+    /// `agent_activity_end` followed by `agent_activity_begin` within the
+    /// debounce window MUST NOT emit `workspace:activity-changed { idle }` — the
+    /// pending idle flip is canceled and activity stays `AgentRunning` throughout.
+    #[tokio::test]
+    async fn idle_debounce_canceled_by_re_begin() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Start agent activity → immediate AgentRunning event.
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+
+        // End agent activity → schedules idle flip after 100ms.
+        h.services.agent_activity_end(&h.ws).await;
+
+        // Re-begin within the window → cancels the pending idle flip and emits AgentRunning.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.services.agent_activity_begin(&h.ws).await;
+
+        // Consume the AgentRunning event from the re-begin (0→1 transition).
+        let ev_rebegin = recv_one(&mut sub).await;
+        assert_envelope(&ev_rebegin, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(
+            ev_rebegin["data"]["activity"], "agent_running",
+            "re-begin emits AgentRunning on 0→1 transition"
+        );
+
+        // Wait beyond the original debounce window.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // workspace_activity() MUST report AgentRunning (no idle event was emitted).
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "activity stays AgentRunning when re-begin cancels debounce"
+        );
+
+        // No idle event should have been emitted.
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "no idle event when re-begin cancels the debounce"
+        );
+
+        // Clean up.
+        h.services.agent_activity_end(&h.ws).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// Regression for STAB-N: busy→idle transition debounce (test b). An
+    /// `agent_activity_end` with no re-begin MUST emit exactly one
+    /// `workspace:activity-changed { idle }` event after the debounce window.
+    #[tokio::test]
+    async fn idle_debounce_emits_after_window() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        // Start agent activity → immediate AgentRunning event.
+        h.services.agent_activity_begin(&h.ws).await;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(ev["data"]["activity"], "agent_running");
+
+        // End agent activity → schedules idle flip after 100ms.
+        h.services.agent_activity_end(&h.ws).await;
+
+        // Before the window expires, no idle event yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            timeout(Duration::from_millis(20), sub.recv())
+                .await
+                .is_err(),
+            "no idle event before debounce window expires"
+        );
+
+        // After the window expires, exactly one idle event.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let ev_idle = recv_one(&mut sub).await;
+        assert_envelope(&ev_idle, &h.ws.0, "workspace:activity-changed");
+        assert_eq!(
+            ev_idle["data"]["activity"], "idle",
+            "idle event emitted after debounce window"
+        );
+
+        // workspace_activity() now reports Idle.
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle,
+            "activity is Idle after debounce window expires"
+        );
+
+        // No duplicate events.
+        assert!(
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
+            "no duplicate idle event"
+        );
+    }
+
+    /// Regression for STAB-N: busy→idle transition debounce (test c).
+    /// workspace_activity() MUST return AgentRunning during the grace window
+    /// (before the debounce fires) so list/get/update responses and the event
+    /// stream agree on the derived state.
+    #[tokio::test]
+    async fn idle_debounce_workspace_activity_during_grace() {
+        let _guard = DebounceEnvGuard::new("100");
+        let h = harness().await;
+
+        // Start agent activity.
+        h.services.agent_activity_begin(&h.ws).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "activity is AgentRunning while agent in-flight"
+        );
+
+        // End agent activity → schedules idle flip after 100ms.
+        h.services.agent_activity_end(&h.ws).await;
+
+        // During the grace window, workspace_activity() MUST still report AgentRunning.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "workspace_activity() returns AgentRunning during grace window"
+        );
+
+        // After the window expires, workspace_activity() reports Idle.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::Idle,
+            "workspace_activity() returns Idle after grace window"
+        );
+    }
 }

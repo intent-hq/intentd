@@ -90,11 +90,14 @@ pub fn rebase_with_autostash(worktree_path: &Path, trunk_ref: &str) -> Result<Re
 
 /// `git status --porcelain` non-empty: any staged/unstaged/untracked change.
 /// Shared with [`crate::pull`], whose auto-stash bookends need the same check.
+/// Excludes submodules (git CLI `git stash push` parity — submodule gitlink
+/// divergence is not treated as a dirty worktree).
 pub(crate) fn is_dirty(repo: &Repository) -> Result<bool> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false);
+        .include_ignored(false)
+        .exclude_submodules(true);
     let statuses = repo.statuses(Some(&mut opts)).map_err(map_git_err)?;
     Ok(!statuses.is_empty())
 }
