@@ -344,7 +344,7 @@ mod session_tests {
     #[tokio::test]
     async fn new_session_returns_acp_session_id() {
         let (conn, _responder) = connect_session();
-        let resp = session::new_session(&conn, "/tmp/ws", Vec::new())
+        let resp = session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
             .await
             .expect("session/new succeeds");
         assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
@@ -357,7 +357,7 @@ mod session_tests {
         let handshake = crate::handshake::handshake(&conn, provider).await.unwrap();
         assert!(session::supports_load_session(&handshake.initialize));
 
-        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new())
+        session::load_session(&conn, "auggie", "acp-session-1", "/tmp/ws", Vec::new())
             .await
             .expect("session/load succeeds when capability present");
 
@@ -382,7 +382,7 @@ mod session_tests {
         // Await a follow-up request: the single FIFO writer guarantees the
         // cancel line was flushed before this response arrives (avoids racing
         // the writer task against the drop below).
-        session::new_session(&conn, "/tmp/ws", Vec::new())
+        session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
             .await
             .expect("follow-up request flushes the cancel line");
         // Drop the connection to close the agent read side, then inspect frames.
@@ -394,6 +394,79 @@ mod session_tests {
             .expect("agent received session/cancel");
         assert!(cancel.get("id").is_none(), "cancel is a notification");
         assert_eq!(cancel["params"]["sessionId"], json!("acp-session-1"));
+    }
+
+    #[tokio::test]
+    async fn claude_code_new_session_injects_meta_disallowed_tools() {
+        let (conn, responder) = connect_session();
+        // Call new_session with provider_id = "claude-code"
+        session::new_session(&conn, "claude-code", "/tmp/ws", Vec::new())
+            .await
+            .expect("session/new succeeds");
+        // Drop the connection to inspect outbound frames
+        drop(conn);
+        let seen = responder.await.unwrap();
+        // Find the session/new request
+        let new_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
+            .expect("agent received session/new");
+        // Assert _meta.claudeCode.options.disallowedTools = ["Task"]
+        let meta = &new_req["params"]["_meta"];
+        assert_eq!(
+            meta["claudeCode"]["options"]["disallowedTools"],
+            json!(["Task"]),
+            "session/new for claude-code must inject _meta.claudeCode.options.disallowedTools=[\"Task\"]"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_load_session_injects_meta_disallowed_tools() {
+        let (conn, responder) = connect_session();
+        // Call load_session with provider_id = "claude-code"
+        session::load_session(&conn, "claude-code", "acp-session-1", "/tmp/ws", Vec::new())
+            .await
+            .expect("session/load succeeds");
+        // Drop the connection to inspect outbound frames
+        drop(conn);
+        let seen = responder.await.unwrap();
+        // Find the session/load request
+        let load_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/load"))
+            .expect("agent received session/load");
+        // Assert _meta.claudeCode.options.disallowedTools = ["Task"]
+        let meta = &load_req["params"]["_meta"];
+        assert_eq!(
+            meta["claudeCode"]["options"]["disallowedTools"],
+            json!(["Task"]),
+            "session/load for claude-code must inject _meta.claudeCode.options.disallowedTools=[\"Task\"]"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_claude_code_new_session_omits_meta() {
+        let (conn, responder) = connect_session();
+        // Call new_session with provider_id = "auggie"
+        session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
+            .await
+            .expect("session/new succeeds");
+        // Drop the connection to inspect outbound frames
+        drop(conn);
+        let seen = responder.await.unwrap();
+        // Find the session/new request
+        let new_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
+            .expect("agent received session/new");
+        // Assert _meta is absent for non-claude-code providers (check key absence explicitly)
+        let params = new_req["params"]
+            .as_object()
+            .expect("params must be an object");
+        assert!(
+            !params.contains_key("_meta"),
+            "session/new for non-claude-code provider must not inject _meta"
+        );
     }
 
     #[test]
@@ -1268,6 +1341,61 @@ mod mcp_tests {
         assert!(
             !serialized.contains("Bearer z"),
             "redacted MCP config leaked a header secret value: {serialized}"
+        );
+    }
+
+    #[test]
+    fn opencode_permission_survives_mcp_merge() {
+        use intent_providers::{build_provider_env, find_provider};
+        use std::collections::BTreeMap;
+
+        // Build opencode's env with permission.task=deny (with model set)
+        let opencode = find_provider("opencode").unwrap();
+        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+        let config_content = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("OPENCODE_CONFIG_CONTENT must be set");
+
+        // Parse the initial config (should have model + permission keys)
+        let mut config: Value = serde_json::from_str(config_content)
+            .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+        assert_eq!(config["model"], json!("claude-sonnet-4"));
+        assert_eq!(config["permission"]["task"], json!("deny"));
+
+        // Simulate the workspace-MCP merge path: prepare a normalized MCP server list
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "ws".to_string(),
+            NormalizedMcpServer::Stdio {
+                command: "node".into(),
+                args: vec!["server.js".into()],
+                env: BTreeMap::new(),
+            },
+        );
+
+        // Convert normalized servers to opencode mcp block
+        let mcp_block = to_opencode_mcp_config(&servers);
+
+        // Merge the mcp block into the existing config (opencode's env merge logic)
+        // This simulates what happens when the daemon merges workspace MCP servers
+        // into the provider's OPENCODE_CONFIG_CONTENT at spawn time.
+        config["mcp"] = mcp_block;
+
+        // Assert: permission.task=deny must still be present after the merge
+        assert_eq!(
+            config["permission"]["task"],
+            json!("deny"),
+            "permission.task=deny must survive workspace-MCP merge"
+        );
+        assert_eq!(
+            config["model"],
+            json!("claude-sonnet-4"),
+            "model must survive workspace-MCP merge"
+        );
+        // And the mcp block should be populated
+        assert!(
+            config["mcp"]["ws"].is_object(),
+            "mcp.ws server config should be present"
         );
     }
 

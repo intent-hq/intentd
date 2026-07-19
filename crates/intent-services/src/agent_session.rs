@@ -336,6 +336,7 @@ impl Services {
     pub async fn open_acp_session(
         &self,
         conn: &Connection,
+        provider_id: &str,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
@@ -353,7 +354,7 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::new_session(conn, cwd, mcp_servers)
+        let resp = session::new_session(conn, provider_id, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let acp_session_id = resp.session_id.0.to_string();
@@ -379,6 +380,7 @@ impl Services {
     pub async fn recreate_acp_session(
         &self,
         conn: &Connection,
+        provider_id: &str,
         agent_id: &AgentId,
         expected_old: &str,
         cwd: impl Into<PathBuf>,
@@ -395,7 +397,7 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::new_session(conn, cwd, mcp_servers)
+        let resp = session::new_session(conn, provider_id, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let new_acp_session_id = resp.session_id.0.to_string();
@@ -423,6 +425,7 @@ impl Services {
     pub async fn resume_acp_session(
         &self,
         conn: &Connection,
+        provider_id: &str,
         init: &InitializeResponse,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
@@ -444,7 +447,7 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers)
+        let resp = session::load_session(conn, provider_id, &acp_session_id, cwd, mcp_servers)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
         Ok(Some(AcpSessionOpened {

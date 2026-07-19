@@ -500,7 +500,7 @@ async fn open_session(s: &Scenario) -> String {
         .await
         .expect("handshake");
     assert!(hs.authenticated, "auggie authenticates");
-    let resp = session::new_session(s.conn.as_ref(), s.root.clone(), Vec::new())
+    let resp = session::new_session(s.conn.as_ref(), provider.id, s.root.clone(), Vec::new())
         .await
         .expect("session/new");
     resp.session_id.0.to_string()

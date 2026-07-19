@@ -123,13 +123,38 @@ fn elapsed_ms() -> u64 {
 /// `session/new` with `{ cwd, mcpServers }` → the agent's session id and initial
 /// state. The caller persists `response.session_id` as `AgentSession.acpSessionId`
 /// (write-once) for later resume (§6.5).
+///
+/// For `claude-code`, injects `_meta.claudeCode.options.disallowedTools: ["Task"]`
+/// to disallow the provider-native Task tool (subagent spawning), forcing all
+/// delegation through the workspace `ws.agent.*` surface. Other providers receive
+/// no `_meta` payload.
 pub async fn new_session(
     conn: &Connection,
+    provider_id: &str,
     cwd: impl Into<PathBuf>,
     mcp_servers: Vec<McpServer>,
 ) -> AcpResult<NewSessionResponse> {
     let request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
-    let params = serde_json::to_value(&request)?;
+    let mut params = serde_json::to_value(&request)?;
+
+    // Inject _meta.claudeCode.options.disallowedTools for claude-code only
+    // (verified against @agentclientprotocol/claude-agent-acp 0.59.0;
+    // disallowedTools are merged with ACP's internal deny rules).
+    if provider_id == "claude-code" {
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert(
+                "_meta".to_string(),
+                serde_json::json!({
+                    "claudeCode": {
+                        "options": {
+                            "disallowedTools": ["Task"]
+                        }
+                    }
+                }),
+            );
+        }
+    }
+
     let result = conn
         .request_timeout("session/new", params, session_setup_timeout())
         .await?;
@@ -140,14 +165,35 @@ pub async fn new_session(
 /// `session/load` to resume an existing `acpSessionId` after a restart. Only
 /// valid when the agent advertised the `loadSession` capability — check with
 /// [`supports_load_session`] first (§6.5).
+///
+/// For `claude-code`, injects `_meta.claudeCode.options.disallowedTools: ["Task"]`
+/// to disallow the provider-native Task tool, matching the `session/new` behavior.
 pub async fn load_session(
     conn: &Connection,
+    provider_id: &str,
     session_id: &str,
     cwd: impl Into<PathBuf>,
     mcp_servers: Vec<McpServer>,
 ) -> AcpResult<LoadSessionResponse> {
     let request = LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
-    let params = serde_json::to_value(&request)?;
+    let mut params = serde_json::to_value(&request)?;
+
+    // Inject _meta.claudeCode.options.disallowedTools for claude-code only
+    if provider_id == "claude-code" {
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert(
+                "_meta".to_string(),
+                serde_json::json!({
+                    "claudeCode": {
+                        "options": {
+                            "disallowedTools": ["Task"]
+                        }
+                    }
+                }),
+            );
+        }
+    }
+
     let result = conn
         .request_timeout("session/load", params, session_setup_timeout())
         .await?;

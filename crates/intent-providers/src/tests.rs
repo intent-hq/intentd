@@ -282,46 +282,60 @@ fn env_assembly_quirks() {
     );
 
     let opencode = find_provider("opencode").unwrap();
-    let oc = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+    // With model: permission.task=deny is merged with the model key.
+    let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"), None);
     assert_eq!(
-        oc.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"model":"claude-sonnet-4"}"#)
+        oc_with_model
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4"}"#)
     );
-    // No model and no rules file → no OPENCODE_CONFIG_CONTENT.
-    assert!(!build_provider_env(opencode, None, None).contains_key("OPENCODE_CONFIG_CONTENT"));
+    // No model, no rules file: permission.task=deny is still emitted.
+    let oc_no_model_no_rules = build_provider_env(opencode, None, None);
+    assert_eq!(
+        oc_no_model_no_rules
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"}}"#)
+    );
 }
 
 #[test]
 fn opencode_model_sentinel_filtered_from_env() {
     let opencode = find_provider("opencode").unwrap();
 
-    // Model sentinel "default" alone → no OPENCODE_CONFIG_CONTENT.
-    assert!(!build_provider_env(opencode, Some("default"), None)
-        .contains_key("OPENCODE_CONFIG_CONTENT"));
+    // Model sentinel "default" alone → permission.task=deny only (model filtered).
+    let sentinel_only = build_provider_env(opencode, Some("default"), None);
+    assert_eq!(
+        sentinel_only
+            .get("OPENCODE_CONFIG_CONTENT")
+            .map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"}}"#)
+    );
 
-    // Rules file alone (no model) → instructions only.
+    // Rules file alone (no model) → permission + instructions.
     let rules_only = build_provider_env(opencode, None, Some("/tmp/rules.md"));
     assert_eq!(
         rules_only
             .get("OPENCODE_CONFIG_CONTENT")
             .map(String::as_str),
-        Some(r#"{"instructions":["/tmp/rules.md"]}"#)
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
     );
 
-    // Real model + rules file → both fields.
+    // Real model + rules file → all three fields.
     let both = build_provider_env(opencode, Some("gpt-4"), Some("/tmp/rules.md"));
     assert_eq!(
         both.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"model":"gpt-4","instructions":["/tmp/rules.md"]}"#)
+        Some(r#"{"permission":{"task":"deny"},"model":"gpt-4","instructions":["/tmp/rules.md"]}"#)
     );
 
-    // Sentinel model + rules file → instructions only (model filtered).
+    // Sentinel model + rules file → permission + instructions (model filtered).
     let sentinel_with_rules = build_provider_env(opencode, Some("default"), Some("/tmp/rules.md"));
     assert_eq!(
         sentinel_with_rules
             .get("OPENCODE_CONFIG_CONTENT")
             .map(String::as_str),
-        Some(r#"{"instructions":["/tmp/rules.md"]}"#)
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
     );
 }
 
@@ -840,7 +854,7 @@ fn opencode_env_includes_instructions_with_model() {
     let env = build_provider_env(opencode, Some("claude-sonnet-4"), Some("/tmp/rules.md"));
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"model":"claude-sonnet-4","instructions":["/tmp/rules.md"]}"#)
+        Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4","instructions":["/tmp/rules.md"]}"#)
     );
 }
 
@@ -850,7 +864,7 @@ fn opencode_env_includes_instructions_without_model() {
     let env = build_provider_env(opencode, None, Some("/tmp/rules.md"));
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"instructions":["/tmp/rules.md"]}"#)
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
     );
 }
 
@@ -860,7 +874,7 @@ fn opencode_env_model_only_no_instructions() {
     let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"model":"claude-sonnet-4"}"#)
+        Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4"}"#)
     );
 }
 
@@ -870,7 +884,7 @@ fn opencode_env_escapes_json_in_instructions_path() {
     let env = build_provider_env(opencode, None, Some(r#"/tmp/"rules".md"#));
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"instructions":["/tmp/\"rules\".md"]}"#)
+        Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/\"rules\".md"]}"#)
     );
 }
 

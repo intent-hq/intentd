@@ -195,24 +195,30 @@ pub fn build_provider_env(
         "cortex" => {
             env.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
         }
-        "opencode" if model.is_some() || rules_file.is_some() => {
+        "opencode" => {
+            // Always emit OPENCODE_CONFIG_CONTENT with permission.task = deny to
+            // disallow the provider-native task tool (subagent spawning). Merge
+            // with the model key when a model is set and the instructions array
+            // when a rules file is provided. Filter out the sentinel model id
+            // ("default") per build_provider_args. The permission key is preserved
+            // when workspace MCP servers are merged into the config at spawn time
+            // (see opencode_permission_survives_mcp_merge test in intent-acp).
             let mut parts = Vec::new();
-            // Filter out the sentinel model id ("default") per build_provider_args.
-            if let Some(model) = model {
-                if !model.is_empty() && model != MODEL_SENTINEL_DEFAULT {
-                    parts.push(format!("\"model\":\"{}\"", json_escape(model)));
+            // Always include permission.task = deny first.
+            parts.push(r#""permission":{"task":"deny"}"#.to_string());
+            // Filter out the sentinel model id ("default") and empty strings.
+            if let Some(m) = model {
+                if !m.is_empty() && m != MODEL_SENTINEL_DEFAULT {
+                    parts.push(format!("\"model\":\"{}\"", json_escape(m)));
                 }
             }
             if let Some(path) = rules_file {
                 parts.push(format!("\"instructions\":[\"{}\"]", json_escape(path)));
             }
-            // Only emit OPENCODE_CONFIG_CONTENT when at least one field is set.
-            if !parts.is_empty() {
-                env.insert(
-                    "OPENCODE_CONFIG_CONTENT".to_string(),
-                    format!("{{{}}}", parts.join(",")),
-                );
-            }
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                format!("{{{}}}", parts.join(",")),
+            );
         }
         _ => {}
     }
