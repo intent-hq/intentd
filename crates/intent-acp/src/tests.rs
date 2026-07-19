@@ -350,8 +350,6 @@ mod session_tests {
         assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
     }
 
-
-
     #[tokio::test]
     async fn claude_code_new_session_injects_disallowed_tools_and_system_prompt() {
         use crate::session::Meta;
