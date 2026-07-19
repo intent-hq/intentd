@@ -172,11 +172,12 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   `--max-old-space-size`. [`ProviderRuntime::Native`] binaries are left
 ///   untouched.
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
-/// - `opencode`: `OPENCODE_CONFIG_CONTENT={"model":"<model>"}` when a model is
-///   set, because the `opencode acp` subcommand has no `--model` flag.
+/// - `opencode`: `OPENCODE_CONFIG_CONTENT` with `model` (when set) and
+///   `instructions` (when a rules file path is provided).
 pub fn build_provider_env(
     config: &ProviderConfig,
     model: Option<&str>,
+    rules_file: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     if matches!(
@@ -197,18 +198,27 @@ pub fn build_provider_env(
         "opencode" => {
             // Always emit OPENCODE_CONFIG_CONTENT with permission.task = deny to
             // disallow the provider-native task tool (subagent spawning). Merge
-            // with the model key when a model is set. The permission key is preserved
+            // with the model key when a model is set and the instructions array
+            // when a rules file is provided. Filter out the sentinel model id
+            // ("default") per build_provider_args. The permission key is preserved
             // when workspace MCP servers are merged into the config at spawn time
             // (see opencode_permission_survives_mcp_merge test in intent-acp).
-            let config_content = if let Some(m) = model {
-                format!(
-                    "{{\"model\":\"{}\",\"permission\":{{\"task\":\"deny\"}}}}",
-                    json_escape(m)
-                )
-            } else {
-                r#"{"permission":{"task":"deny"}}"#.to_string()
-            };
-            env.insert("OPENCODE_CONFIG_CONTENT".to_string(), config_content);
+            let mut parts = Vec::new();
+            // Always include permission.task = deny first.
+            parts.push(r#""permission":{"task":"deny"}"#.to_string());
+            // Filter out the sentinel model id ("default") and empty strings.
+            if let Some(m) = model {
+                if !m.is_empty() && m != MODEL_SENTINEL_DEFAULT {
+                    parts.push(format!("\"model\":\"{}\"", json_escape(m)));
+                }
+            }
+            if let Some(path) = rules_file {
+                parts.push(format!("\"instructions\":[\"{}\"]", json_escape(path)));
+            }
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                format!("{{{}}}", parts.join(",")),
+            );
         }
         _ => {}
     }
@@ -256,10 +266,14 @@ pub(crate) fn node_options_with_heap_cap(parent: Option<&str>, mb: u32) -> Optio
     }
 }
 
-/// Minimal JSON string escaping for the small `OPENCODE_CONFIG_CONTENT` value
+/// Minimal JSON string escaping for the small `OPENCODE_CONFIG_CONTENT` value.
+/// Handles the subset needed for model ids and file paths: double-quote, backslash,
+/// common whitespace escapes (`\n`, `\r`, `\t`), backspace (`\b`), form feed (`\f`),
+/// and other control characters via `\uXXXX` escapes.
+///
 /// (avoids pulling a serializer in to keep deps minimal — `intent-core` plus
 /// `tracing` for the heap-cap parse-failure WARN).
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -268,6 +282,12 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"), // backspace
+            '\x0C' => out.push_str("\\f"), // form feed
+            c if c.is_control() => {
+                // Escape other control characters as \uXXXX.
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             _ => out.push(c),
         }
     }
