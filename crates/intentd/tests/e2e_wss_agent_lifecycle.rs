@@ -4911,7 +4911,7 @@ async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
     assert_eq!(sent_b["success"], true, "sendMessage B ok: {sent_b}");
 
     // Wait for both children to complete their follow-up turns (stream:end +
-    // agent:idle after the sendToTask messages).
+    // agent:idle after the sendMessage follow-ups).
     let mut child_a_idle_again = false;
     let mut child_b_idle_again = false;
     for _ in 0..200 {
