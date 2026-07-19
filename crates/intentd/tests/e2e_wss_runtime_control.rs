@@ -40,17 +40,21 @@ fn free_port() -> u16 {
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
+    /// If false, skip data_dir cleanup in Drop (for tests that reuse the same data_dir)
+    cleanup_data_dir: bool,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
-        if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+        if self.cleanup_data_dir {
+            let log_path = self.data_dir.join("daemon.log");
+            if let Ok(log) = std::fs::read_to_string(&log_path) {
+                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            }
+            let _ = std::fs::remove_dir_all(&self.data_dir);
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -62,7 +66,14 @@ fn temp_data_dir() -> PathBuf {
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    use std::fs::OpenOptions;
+    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+    // Append to daemon.log instead of truncating, so multi-boot tests preserve all logs
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("daemon.log"))
+        .expect("open daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
@@ -250,6 +261,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -379,6 +391,168 @@ async fn runtime_ws_listener_toggle_over_wss() {
     );
 }
 
+/// Regression test: boot with --listen uds + persisted server.wsApi.enabled=true
+/// should auto-start the WSS listener. This tests the sidecar/packaged posture
+/// where the daemon is spawned with --listen uds but the user has previously
+/// enabled the WSS listener via the UI toggle. Before the fix, the persisted
+/// setting was ignored at boot and the listener stayed down until manual toggle.
+#[tokio::test]
+async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
+    let data_dir = temp_data_dir();
+    let port_s = free_port().to_string();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
+
+    // STEP 1: Boot with --listen uds, persist server.wsApi.enabled=true
+    let child = spawn_serve(&data_dir, "uds", &env);
+    let mut _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: false, // Don't cleanup - we'll reuse this data_dir for second boot
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    // Persist the port setting
+    let port_value: u64 = port_s.parse().unwrap();
+    let set_port = uds_rpc(
+        &socket,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.wsApi.port", "value": port_value }] }),
+    )
+    .await;
+    assert!(
+        set_port.get("error").is_none(),
+        "settings.update port should succeed: {set_port}"
+    );
+
+    // Enable the WSS listener (this will start it at runtime)
+    let enable = uds_rpc(
+        &socket,
+        2,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.wsApi.enabled", "value": true }] }),
+    )
+    .await;
+    assert!(
+        enable.get("error").is_none(),
+        "settings.update enable should succeed: {enable}"
+    );
+
+    // Give the listener a moment to start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify system.status shows the WSS listener is running
+    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let first_boot_port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set after enable") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+
+    // Connect over WSS to verify it works
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(first_boot_port, cfg.clone()).await;
+    let ping = wss_rpc(
+        &mut ws,
+        10,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        ping.get("error").is_none(),
+        "events.subscribe should work: {ping}"
+    );
+
+    // Verify setting is persisted before shutdown
+    let get_setting = uds_rpc(
+        &socket,
+        5,
+        "settings.get",
+        json!({ "path": "server.wsApi.enabled" }),
+    )
+    .await;
+    assert!(
+        get_setting["result"]["value"].as_bool() == Some(true),
+        "setting should be true before shutdown: {get_setting}"
+    );
+
+    // STEP 2: Shutdown the daemon gracefully (simulating app relaunch)
+    // Call system.shutdown to ensure clean SQLite close and WAL flush.
+    // Wait for the process to exit naturally (don't drop the Daemon which would kill it).
+    let shutdown = uds_rpc(&socket, 6, "system.shutdown", json!({})).await;
+    assert!(
+        shutdown.get("result").is_some(),
+        "system.shutdown should succeed: {shutdown}"
+    );
+    // Wait for the daemon to exit gracefully (up to 3 seconds)
+    let mut exited = false;
+    for _ in 0..30 {
+        if matches!(_daemon.child.try_wait(), Ok(Some(_))) {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        exited,
+        "daemon did not exit within 3 seconds after system.shutdown"
+    );
+    // Drop the first daemon without cleanup; process already exited
+    drop(_daemon);
+
+    // STEP 3: Boot again with --listen uds (same data dir, persisted setting is true)
+    let child2 = spawn_serve(&data_dir, "uds", &env);
+    let _daemon2 = Daemon {
+        child: child2,
+        data_dir: data_dir.clone(),
+        cleanup_data_dir: true, // Second instance cleans up at end
+    };
+    assert!(await_uds(&socket).await, "daemon did not start on reboot");
+
+    // Give the listener a moment to auto-start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // REGRESSION TEST: Verify system.status shows the WSS listener is running
+    // (before the fix, port would be null because persisted setting was ignored)
+    let status2 = uds_rpc(&socket, 4, "system.status", json!({})).await;
+    let reboot_port = status2["result"]["port"]
+        .as_u64()
+        .expect("port should be set at reboot with persisted enabled=true")
+        as u16;
+    assert_eq!(
+        reboot_port, first_boot_port,
+        "listener should bind the same port after reboot"
+    );
+
+    // Verify we can connect over WSS (listener is actually running, not just a stale setting)
+    let mut ws2 = connect_ws(reboot_port, cfg.clone()).await;
+    let ping2 = wss_rpc(
+        &mut ws2,
+        20,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    assert!(
+        ping2.get("error").is_none(),
+        "events.subscribe should work after reboot: {ping2}"
+    );
+
+    // Verify server.pairingInfo returns the port (FE uses this for QR code)
+    let pairing = uds_rpc(&socket, 5, "server.pairingInfo", json!({})).await;
+    let pairing_port = pairing["result"]["port"]
+        .as_u64()
+        .expect("pairingInfo port should be set") as u16;
+    assert_eq!(
+        pairing_port, reboot_port,
+        "pairingInfo port should match system.status port"
+    );
+}
+
 /// Batch hook ordering: reverse input order test. A batch with changes in
 /// non-dependency input order should still apply hooks deterministically:
 /// value-setting keys (server.wsApi.port, priority 0) apply before
@@ -394,6 +568,7 @@ async fn batch_hook_ordering_port_before_enable() {
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -473,6 +648,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -512,6 +688,7 @@ async fn runtime_toggled_wss_serves_system_status() {
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "uds", &env),
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
