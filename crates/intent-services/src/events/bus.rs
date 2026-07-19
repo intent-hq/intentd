@@ -3,7 +3,9 @@
 //! Append-then-broadcast over the M2.1 `event` store, mirroring
 //! `~/src/intent/src/main/websocket-event-bridge.ts`: [`EventBus::publish`]
 //! persists the event first (so the durable log is the source of truth), then
-//! fans it out to live subscribers. [`EventBus::subscribe`] returns a
+//! fans it out to live subscribers. [`EventBus::publish_transient`] mints an
+//! event id and broadcasts WITHOUT persisting (for high-volume ephemeral events
+//! like `agent:stream:chunk`). [`EventBus::subscribe`] returns a
 //! [`Subscription`] whose per-subscriber delivery task applies the
 //! [`SubscriptionFilter`] and coalesces matched events within `batch_window`
 //! (the TS `batchFlushWorker`: the timer starts on the first matched event).
@@ -14,6 +16,7 @@ use intent_core::{Error, Event, Result};
 use intent_store::{NewEvent, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use super::filter::{event_matches, SubscriptionFilter};
 
@@ -88,6 +91,31 @@ impl EventBus {
             .map_err(|_| Error::Internal("event writer task closed".to_string()))?;
         rx.await
             .map_err(|_| Error::Internal("event writer task dropped response".to_string()))?
+    }
+
+    /// Mint an event id (UUIDv7) + timestamp and broadcast to live subscribers
+    /// WITHOUT persisting. Used for high-volume ephemeral events (e.g.
+    /// `agent:stream:chunk`) that do not need durable storage. The wire shape
+    /// matches persisted events exactly (same id/timestamp minting as
+    /// `Store::insert_event`), so subscribers see identical structure.
+    pub fn publish_transient(&self, ev: &NewEvent) -> Event {
+        let id = Uuid::now_v7().to_string();
+        let event = Event {
+            id,
+            workspace_id: ev.workspace_id.clone(),
+            timestamp: ev.timestamp.clone(),
+            event_type: ev.event_type.clone(),
+            actor: ev.actor.clone(),
+            session_id: ev.session_id.clone(),
+            correlation_id: ev.correlation_id.clone(),
+            parent_event_id: ev.parent_event_id.clone(),
+            metadata: ev.metadata.clone(),
+            data: ev.data.clone(),
+        };
+        // Broadcast on the same channel so transient/persisted events interleave
+        // correctly for subscribers (ordering preserved from a single publisher).
+        let _ = self.tx.send(Arc::new(event.clone()));
+        event
     }
 
     /// Subscribe with `filter`. The returned [`Subscription`] yields batches of
@@ -237,7 +265,8 @@ async fn delivery_task(
                         }
                     }
                 }
-                // Slow consumer: skip dropped events (still durable in the log).
+                // Slow consumer: skip dropped events (persisted events remain in
+                // the log; transient events are lost, matching their semantics).
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 // Bus dropped: flush any buffered batch, then stop.
                 Err(broadcast::error::RecvError::Closed) => {

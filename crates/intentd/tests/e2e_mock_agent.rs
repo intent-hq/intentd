@@ -211,7 +211,8 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         "assistant message persisted"
     );
 
-    // Exactly one terminal stream:end, plus at least one streamed chunk.
+    // Chunks are broadcast-only (transient), so they don't appear in the store.
+    // Only the terminal stream:end and other lifecycle events persist.
     let events = store.events_by_workspace(&ws, 200).await.expect("events");
     let ends = events
         .iter()
@@ -222,7 +223,10 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         .filter(|e| e.event_type == AGENT_STREAM_CHUNK)
         .count();
     assert_eq!(ends, 1, "exactly one stream:end per turn");
-    assert!(chunks >= 1, "at least one streamed chunk");
+    assert_eq!(
+        chunks, 0,
+        "chunks are transient (broadcast-only, never persisted)"
+    );
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {

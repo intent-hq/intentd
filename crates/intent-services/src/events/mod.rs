@@ -20,4 +20,7 @@ pub use watcher::FileWatcher;
 mod bus_tests;
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 mod watcher_tests;
