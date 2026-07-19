@@ -405,6 +405,10 @@ async fn cmd_serve(
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
+    // WAL growth when continuous readers hold long-lived transactions. Aborted
+    // during shutdown before Store::close().
+    let checkpoint_handle = store.spawn_periodic_wal_checkpoint();
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
@@ -856,6 +860,9 @@ async fn cmd_serve(
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
     manager.shutdown().await;
+
+    // Stop the periodic WAL checkpoint task before closing the store.
+    checkpoint_handle.abort();
 
     // Close the store pool gracefully, checkpointing the WAL so settings and
     // other persisted data are visible to the next daemon instance (regression:
