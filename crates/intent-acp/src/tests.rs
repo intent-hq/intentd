@@ -351,6 +351,35 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn new_session_serializes_meta_with_correct_wire_name() {
+        use serde_json::json;
+        use crate::session::Meta;
+        let (conn, responder) = connect_session();
+
+        let mut meta = Meta::new();
+        meta.insert("systemPrompt".to_string(), json!({"append": "test prompt"}));
+
+        let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/new with _meta succeeds");
+        assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
+
+        let requests = responder.await.expect("responder completes");
+        assert_eq!(requests.len(), 1, "exactly one request sent");
+        let params = &requests[0]["params"];
+        assert!(
+            params.get("_meta").is_some(),
+            "_meta field present on wire (not 'meta')"
+        );
+        let meta_payload = params["_meta"].as_object().expect("_meta is object");
+        assert_eq!(
+            meta_payload.get("systemPrompt").and_then(|v| v.get("append")).and_then(|v| v.as_str()),
+            Some("test prompt"),
+            "_meta payload preserved"
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_returns_stop_reason_and_load_caps_detected() {
         let provider = intent_providers::find_provider("auggie").unwrap();
         let (conn, _responder) = connect_session();
