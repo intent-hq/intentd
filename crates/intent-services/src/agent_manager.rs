@@ -2228,6 +2228,66 @@ impl AgentManager {
                     .and_then(|s| s.acp_session_id)
                     .is_some();
             if cancellable {
+                // STAB-114: Before interrupting, check if the current turn has
+                // produced zero output (no assistant messages after the last user
+                // message). If so, re-queue the preempted user message so it gets
+                // processed after the interrupt completes.
+                if let Ok(messages) = self
+                    .services
+                    .store
+                    .get_agent_messages(&agent_id, None)
+                    .await
+                {
+                    // Walk backwards to find the last user message
+                    if let Some(last_user_msg) = messages.iter().rev().find(|m| m.role == "user") {
+                        // Check if any assistant messages exist after it
+                        let last_user_idx = messages
+                            .iter()
+                            .rposition(|m| m.id == last_user_msg.id)
+                            .unwrap();
+                        let has_output_after = messages
+                            .iter()
+                            .skip(last_user_idx + 1)
+                            .any(|m| m.role == "assistant");
+
+                        if !has_output_after {
+                            // Zero-output condition: re-queue the preempted message.
+                            // Extract text from content blocks (JSON array).
+                            let text_content = if let Some(blocks) = last_user_msg.content.as_array() {
+                                blocks
+                                    .iter()
+                                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                    .collect::<Vec<&str>>()
+                                    .join("\n")
+                            } else {
+                                String::new()
+                            };
+
+                            // `persisted: true` prevents duplicate transcript append.
+                            let queued = crate::agent_ops::QueuedMessage {
+                                id: crate::agent_ops::new_message_id(),
+                                content: text_content,
+                                image_blocks: None,
+                                file_blocks: None,
+                                queued_at: crate::now_iso(),
+                                editing: false,
+                                persisted: true,
+                            };
+                            self.services.requeue_front(&agent_id, queued);
+
+                            // Publish queue updated so FE reflects the re-queued message
+                            self.services
+                                .publish_queue_updated_for(
+                                    &agent_id,
+                                    &workspace_id,
+                                    self.services.queue_snapshot(&agent_id),
+                                )
+                                .await;
+                        }
+                    }
+                }
+
                 // Keep-alive: cancels the turn over the wire, aborts the
                 // draining worker, releases the in-flight slot, and emits the
                 // terminal `agent:stream:end` — the child + ACP session stay
