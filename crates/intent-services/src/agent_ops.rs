@@ -2713,6 +2713,20 @@ impl Services {
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
+        // SUB-1 delegation-group conflict suppression: skip ungrouped watch
+        // registration when the (caller, target) pair is already a member of
+        // an undelivered after_all delegation group (mirrors the existing
+        // child_in_undelivered_group suppression used for reportToParent wakes).
+        // Prevents duplicate wakes when a coordinator sends coordination messages
+        // (sendToTask) to children that are already covered by a grouped watch.
+        if self.child_in_undelivered_group(&workspace_id, &caller_agent_id, &target_agent_id) {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — target already in undelivered after_all group"
+            );
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
         let id = self
