@@ -5487,8 +5487,9 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     .await;
     assert_eq!(sent["success"], true);
 
-    // Give agent time to park
-    sleep(Duration::from_millis(200)).await;
+    // Give agent time to park (without streaming chunks). The mock agent with
+    // parkBeforeFirstChunk parks immediately without emitting any chunks.
+    sleep(Duration::from_millis(500)).await;
 
     // Interrupt before any output
     let interrupted = wss_rpc(
@@ -5640,10 +5641,10 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         &mut rpc,
         13,
         "agent.getQueue",
-        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+        json!({ "agentId": &agent_id }),
     )
     .await;
-    let messages = queue["messages"].as_array().expect("messages array");
+    let messages = queue["queue"].as_array().expect("queue array");
     assert!(
         messages.is_empty(),
         "STAB-114: interrupt after streaming should NOT re-queue"
