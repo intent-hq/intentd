@@ -6050,7 +6050,7 @@ async fn sub1_sendtotask_after_all_no_duplicate_wake() {
         &ws,
         AGENT_IDLE,
         &child_a,
-        json!({ "agentId": child_a.0, "lastResponseSummary": "child A done" }),
+        json!({ "agentId": child_a.0.clone(), "lastResponseSummary": "child A done" }),
     )
     .await;
 
@@ -6059,7 +6059,7 @@ async fn sub1_sendtotask_after_all_no_duplicate_wake() {
         &ws,
         AGENT_IDLE,
         &child_b,
-        json!({ "agentId": child_b.0, "lastResponseSummary": "child B done" }),
+        json!({ "agentId": child_b.0.clone(), "lastResponseSummary": "child B done" }),
     )
     .await;
 
@@ -6072,28 +6072,49 @@ async fn sub1_sendtotask_after_all_no_duplicate_wake() {
         &ws,
         AGENT_IDLE,
         &parent,
-        json!({ "agentId": parent.0, "lastResponseSummary": "coordination done" }),
+        json!({ "agentId": parent.0.clone(), "lastResponseSummary": "coordination done" }),
     )
     .await;
 
     // CRITICAL ASSERTION: parent should receive exactly ONE wake message
     // (the aggregated group wake), NOT individual wakes for each child.
-    // Wait for the delivery worker to process completions and deliver the aggregated wake.
-    wait_for_message_count(&svc, &parent, baseline + 1).await;
+    // To avoid race conditions, wait specifically for the AGGREGATED wake content
+    // to appear in the transcript, then assert count == baseline + 1, and re-check
+    // after a short grace period to catch any late duplicate wakes.
+
+    // Wait for the aggregated wake content to appear
+    let mut attempts = 0;
+    loop {
+        let msgs_text = parent_messages_text(&svc, &parent).await;
+        if msgs_text.contains("All 2 settled")
+            || (msgs_text.contains("child A done") && msgs_text.contains("child B done"))
+        {
+            break;
+        }
+        attempts += 1;
+        if attempts > 100 {
+            panic!("Timeout waiting for aggregated wake content in transcript");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // Assert exactly baseline + 1 messages (one aggregated wake)
+    let count_after_wake = parent_message_count(&svc, &parent).await;
+    assert_eq!(
+        count_after_wake,
+        baseline + 1,
+        "Parent should have exactly 1 aggregated wake after content appears, not {} wakes",
+        count_after_wake - baseline
+    );
+
+    // Grace period: wait 300ms to catch any late duplicate wakes
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     let final_count = parent_message_count(&svc, &parent).await;
     assert_eq!(
         final_count,
         baseline + 1,
-        "Parent should receive exactly 1 aggregated wake, not {} wakes",
+        "Parent should still have exactly 1 wake after grace period, not {} wakes (late duplicates detected)",
         final_count - baseline
-    );
-
-    // Verify the wake message contains the aggregated report
-    let msgs_text = parent_messages_text(&svc, &parent).await;
-    assert!(
-        msgs_text.contains("All 2 settled")
-            || (msgs_text.contains("child A done") && msgs_text.contains("child B done")),
-        "Wake should be aggregated with both reports: {msgs_text}"
     );
 
     // Verify delegation group was delivered and cleaned up
