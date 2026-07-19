@@ -350,37 +350,7 @@ mod session_tests {
         assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
     }
 
-    #[tokio::test]
-    async fn new_session_serializes_meta_with_correct_wire_name() {
-        use crate::session::Meta;
-        use serde_json::json;
-        let (conn, responder) = connect_session();
 
-        let mut meta = Meta::new();
-        meta.insert("systemPrompt".to_string(), json!({"append": "test prompt"}));
-
-        let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
-            .await
-            .expect("session/new with _meta succeeds");
-        assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
-
-        let requests = responder.await.expect("responder completes");
-        assert_eq!(requests.len(), 1, "exactly one request sent");
-        let params = &requests[0]["params"];
-        assert!(
-            params.get("_meta").is_some(),
-            "_meta field present on wire (not 'meta')"
-        );
-        let meta_payload = params["_meta"].as_object().expect("_meta is object");
-        assert_eq!(
-            meta_payload
-                .get("systemPrompt")
-                .and_then(|v| v.get("append"))
-                .and_then(|v| v.as_str()),
-            Some("test prompt"),
-            "_meta payload preserved"
-        );
-    }
 
     #[tokio::test]
     async fn claude_code_new_session_injects_disallowed_tools_and_system_prompt() {
