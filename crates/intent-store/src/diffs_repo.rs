@@ -62,7 +62,7 @@ impl Store {
             .bind(&d.hunks_json)
             .bind(&now)
             .bind(&now)
-            .execute(self.read_pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert diff failed: {e}")))?;
         Ok(())

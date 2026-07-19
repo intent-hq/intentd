@@ -41,7 +41,7 @@ impl Store {
             .bind(&note.created_at)
             .bind(note.rev)
             .bind(&note.updated_at)
-            .execute(self.read_pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert note failed: {e}")))?;
         Ok(())
@@ -146,7 +146,7 @@ impl Store {
             query = query.bind(rev);
         }
         let res = query
-            .execute(self.read_pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
         if res.rows_affected() == 0 {

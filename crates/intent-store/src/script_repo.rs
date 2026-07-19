@@ -34,7 +34,7 @@ impl Store {
             .bind(s.auto_start.map(|b| b as i64))
             .bind(&s.created_at)
             .bind(&s.updated_at)
-            .execute(self.read_pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert script failed: {e}")))?;
         Ok(())

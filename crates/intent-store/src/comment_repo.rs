@@ -92,7 +92,7 @@ impl Store {
             .bind(&c.created_at)
             .bind(&c.updated_at)
             .bind(&workspace_id.0)
-            .execute(self.read_pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
         Ok(())
@@ -154,7 +154,7 @@ impl Store {
         .bind(&c.updated_at)
         .bind(&c.id)
         .bind(&workspace_id.0)
-        .execute(self.read_pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update comment failed: {e}")))?;
         if res.rows_affected() == 0 {

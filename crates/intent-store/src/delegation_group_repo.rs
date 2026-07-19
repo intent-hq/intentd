@@ -73,7 +73,7 @@ impl Store {
         .bind(&raw_events_json)
         .bind(&g.created_at)
         .bind(&g.updated_at)
-        .execute(self.read_pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert delegation_group failed: {e}")))?;
         Ok(())

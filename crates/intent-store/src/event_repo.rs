@@ -74,7 +74,7 @@ impl Store {
             .bind(&ev.parent_event_id)
             .bind(&metadata_json)
             .bind(&data_json)
-            .execute(self.read_pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert event failed: {e}")))?;
         Ok(Event {
@@ -184,7 +184,7 @@ impl Store {
         .bind("file:%")
         .bind(intent_core::events::TERMINAL_DATA)
         .bind("host:exec:%")
-        .execute(self.read_pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("ephemeral event retention sweep failed: {e}")))?;
         Ok(result.rows_affected())

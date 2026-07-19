@@ -89,7 +89,7 @@ impl Store {
                 .bind(c.deletions)
                 .bind(&now)
                 .bind(&id)
-                .execute(self.read_pool())
+                .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("update tracked change failed: {e}")))?;
             }
@@ -115,7 +115,7 @@ impl Store {
                     .bind(c.deletions)
                     .bind(&now)
                     .bind(&now)
-                    .execute(self.read_pool())
+                    .execute(self.write_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("insert tracked change failed: {e}")))?;
             }
