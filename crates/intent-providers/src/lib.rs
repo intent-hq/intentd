@@ -23,7 +23,7 @@ pub use args::{
 pub use config::{
     all_provider_ids, always_enabled_providers, auth_error_message, default_provider_config,
     default_provider_id, disableable_providers, find_provider, is_provider_authentication_error,
-    provider_config, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
+    provider_config, InjectionMechanism, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
 };
 pub use discover::{
     discover_providers, find_npx, find_provider_binary, probe_npx, resolve_on_path, NpxStatus,

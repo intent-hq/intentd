@@ -172,11 +172,12 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   `--max-old-space-size`. [`ProviderRuntime::Native`] binaries are left
 ///   untouched.
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
-/// - `opencode`: `OPENCODE_CONFIG_CONTENT={"model":"<model>"}` when a model is
-///   set, because the `opencode acp` subcommand has no `--model` flag.
+/// - `opencode`: `OPENCODE_CONFIG_CONTENT` with `model` (when set) and
+///   `instructions` (when a rules file path is provided).
 pub fn build_provider_env(
     config: &ProviderConfig,
     model: Option<&str>,
+    rules_file: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     if matches!(
@@ -194,13 +195,18 @@ pub fn build_provider_env(
         "cortex" => {
             env.insert("ELECTRON_RUN_AS_NODE".to_string(), "1".to_string());
         }
-        "opencode" => {
+        "opencode" if model.is_some() || rules_file.is_some() => {
+            let mut parts = Vec::new();
             if let Some(model) = model {
-                env.insert(
-                    "OPENCODE_CONFIG_CONTENT".to_string(),
-                    format!("{{\"model\":\"{}\"}}", json_escape(model)),
-                );
+                parts.push(format!("\"model\":\"{}\"", json_escape(model)));
             }
+            if let Some(path) = rules_file {
+                parts.push(format!("\"instructions\":[\"{}\"]", json_escape(path)));
+            }
+            env.insert(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                format!("{{{}}}", parts.join(",")),
+            );
         }
         _ => {}
     }

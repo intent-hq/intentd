@@ -62,6 +62,8 @@ fn registry_field_parity() {
     let droid = find_provider("droid").unwrap();
     assert_eq!(droid.base_args, &["exec", "--output-format", "acp"]);
     assert_eq!(droid.model_flag, Some("--model"));
+    assert!(droid.supports_rules_file);
+    assert_eq!(droid.rules_flag, Some("--append-system-prompt-file"));
 
     let mock = find_provider("mock").unwrap();
     assert_eq!(mock.command, "node");
@@ -273,20 +275,20 @@ fn provider_runtimes() {
 
 #[test]
 fn env_assembly_quirks() {
-    let cortex = build_provider_env(find_provider("cortex").unwrap(), None);
+    let cortex = build_provider_env(find_provider("cortex").unwrap(), None, None);
     assert_eq!(
         cortex.get("ELECTRON_RUN_AS_NODE").map(String::as_str),
         Some("1")
     );
 
     let opencode = find_provider("opencode").unwrap();
-    let oc = build_provider_env(opencode, Some("claude-sonnet-4"));
+    let oc = build_provider_env(opencode, Some("claude-sonnet-4"), None);
     assert_eq!(
         oc.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"model":"claude-sonnet-4"}"#)
     );
     // No model → no OPENCODE_CONFIG_CONTENT.
-    assert!(!build_provider_env(opencode, None).contains_key("OPENCODE_CONFIG_CONTENT"));
+    assert!(!build_provider_env(opencode, None, None).contains_key("OPENCODE_CONFIG_CONTENT"));
 }
 
 /// Serializes env-var mutation across tests in this binary: the vars are
@@ -356,7 +358,7 @@ fn v8_runtime_node_options_heap_cap() {
         None
     );
 
-    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None);
+    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None, None);
 
     // Env-driven scenarios (serialized within this single test).
     std::env::remove_var("NODE_OPTIONS");
@@ -709,4 +711,117 @@ fn registry_invariants() {
         assert!(!p.display_name.is_empty());
         assert!(!p.command.is_empty());
     }
+}
+
+#[test]
+fn injection_mechanism_registry() {
+    use InjectionMechanism::*;
+    assert_eq!(
+        find_provider("auggie").unwrap().injection_mechanism,
+        RulesFileFlag
+    );
+    assert_eq!(
+        find_provider("droid").unwrap().injection_mechanism,
+        RulesFileFlag
+    );
+    assert_eq!(
+        find_provider("claude-code").unwrap().injection_mechanism,
+        SessionMeta
+    );
+    assert_eq!(
+        find_provider("codex").unwrap().injection_mechanism,
+        SessionMeta
+    );
+    assert_eq!(
+        find_provider("opencode").unwrap().injection_mechanism,
+        EnvConfig
+    );
+    assert_eq!(
+        find_provider("cortex").unwrap().injection_mechanism,
+        FirstTurnPrepend
+    );
+    assert_eq!(
+        find_provider("mock").unwrap().injection_mechanism,
+        FirstTurnPrepend
+    );
+}
+
+#[test]
+fn droid_arg_assembly_includes_append_system_prompt_file() {
+    let droid = find_provider("droid").unwrap();
+    let args = build_provider_args(
+        droid,
+        &ArgInputs {
+            model: Some("gpt-5"),
+            rules_file: Some("/tmp/rules.md"),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        args,
+        vec![
+            "exec",
+            "--output-format",
+            "acp",
+            "--model",
+            "gpt-5",
+            "--append-system-prompt-file",
+            "/tmp/rules.md",
+        ]
+    );
+}
+
+#[test]
+fn opencode_env_includes_instructions_with_model() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, Some("claude-sonnet-4"), Some("/tmp/rules.md"));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"model":"claude-sonnet-4","instructions":["/tmp/rules.md"]}"#)
+    );
+}
+
+#[test]
+fn opencode_env_includes_instructions_without_model() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, None, Some("/tmp/rules.md"));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"instructions":["/tmp/rules.md"]}"#)
+    );
+}
+
+#[test]
+fn opencode_env_model_only_no_instructions() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"model":"claude-sonnet-4"}"#)
+    );
+}
+
+#[test]
+fn opencode_env_escapes_json_in_instructions_path() {
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env(opencode, None, Some(r#"/tmp/"rules".md"#));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"instructions":["/tmp/\"rules\".md"]}"#)
+    );
+}
+
+#[test]
+fn auggie_mechanism_unchanged() {
+    // auggie still uses RulesFileFlag, not affected by opencode/droid changes
+    let auggie = find_provider("auggie").unwrap();
+    assert_eq!(
+        auggie.injection_mechanism,
+        InjectionMechanism::RulesFileFlag
+    );
+    assert_eq!(auggie.rules_flag, Some("--rules"));
+
+    // Env assembly doesn't add OPENCODE_CONFIG_CONTENT for auggie
+    let env = build_provider_env(auggie, Some("sonnet4.5"), Some("/tmp/rules.md"));
+    assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
 }
