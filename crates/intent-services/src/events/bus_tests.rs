@@ -243,3 +243,130 @@ async fn dropping_bus_flushes_buffered_batch_before_close() {
     // After the flush the channel is closed; no further batches arrive.
     assert!(sub.recv().await.is_none());
 }
+
+#[tokio::test]
+async fn concurrent_burst_batches_events_correctly() {
+    let (_tmp, bus) = bus().await;
+    // Subscribe to capture all events (no batching for simpler per-publisher assertions).
+    let mut filter = SubscriptionFilter::default();
+    filter.batch_window = None;
+    let mut sub = bus.subscribe(filter);
+
+    const PUBLISHERS: usize = 30;
+    const EVENTS_PER_PUBLISHER: usize = 17; // ~510 total events
+    const TOTAL_EVENTS: usize = PUBLISHERS * EVENTS_PER_PUBLISHER;
+
+    // Spawn 30 concurrent tasks, each publishing 17 events.
+    let handles: Vec<_> = (0..PUBLISHERS)
+        .map(|publisher_id| {
+            let bus = bus.clone();
+            tokio::spawn(async move {
+                let mut results = Vec::new();
+                for seq in 0..EVENTS_PER_PUBLISHER {
+                    let ev = new_event(
+                        "test:burst",
+                        Some(&format!("publisher-{}", publisher_id)),
+                        ActorType::Agent,
+                    );
+                    let mut ev_with_seq = ev;
+                    ev_with_seq.data = serde_json::json!({
+                        "publisher_id": publisher_id,
+                        "seq": seq,
+                    });
+                    let stored = bus.publish(&ev_with_seq).await.expect("publish");
+                    results.push((stored.id.clone(), publisher_id, seq));
+                }
+                results
+            })
+        })
+        .collect();
+
+    // Await all publishers; collect the IDs each returned.
+    let mut all_published = Vec::new();
+    for h in handles {
+        all_published.extend(h.await.expect("join"));
+    }
+    assert_eq!(
+        all_published.len(),
+        TOTAL_EVENTS,
+        "all concurrent publishes should succeed"
+    );
+
+    // Collect all events from the subscriber.
+    let start = std::time::Instant::now();
+    let mut received = Vec::new();
+    for _ in 0..TOTAL_EVENTS {
+        let batch = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("subscriber recv timed out")
+            .expect("subscription closed early");
+        assert_eq!(batch.len(), 1, "no batching; each event is single-element");
+        received.push(batch.into_iter().next().unwrap());
+    }
+    let elapsed = start.elapsed();
+
+    // All published events should be received (check by id set equality).
+    let published_ids: std::collections::HashSet<_> =
+        all_published.iter().map(|(id, _, _)| id.as_str()).collect();
+    let received_ids: std::collections::HashSet<_> =
+        received.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(
+        published_ids, received_ids,
+        "subscriber should receive all published events"
+    );
+
+    // Verify per-publisher ordering: for each publisher, the received events
+    // with that publisher_id should have monotonically increasing seq.
+    for publisher_id in 0..PUBLISHERS {
+        let seqs: Vec<_> = received
+            .iter()
+            .filter_map(|e| {
+                if e.data["publisher_id"] == publisher_id {
+                    Some(e.data["seq"].as_u64().unwrap())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            seqs.len(),
+            EVENTS_PER_PUBLISHER,
+            "publisher {} should have {} events",
+            publisher_id,
+            EVENTS_PER_PUBLISHER
+        );
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            seqs, sorted,
+            "publisher {} events should be in order",
+            publisher_id
+        );
+    }
+
+    // Verify all events are in the store.
+    let queried = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            event_types: vec!["test:burst".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(
+        queried.len(),
+        TOTAL_EVENTS,
+        "all events should be durably stored"
+    );
+
+    // Throughput sanity: the burst should complete reasonably fast. With batching,
+    // we expect this to take well under what 510 sequential single-insert transactions
+    // would take (~500ms+ on most systems). Assert an upper bound (e.g. 2s) to catch
+    // regressions where batching breaks.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "burst should complete in <3s with batching; took {:?}",
+        elapsed
+    );
+}
