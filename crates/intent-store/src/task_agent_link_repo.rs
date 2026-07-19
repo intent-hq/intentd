@@ -27,7 +27,7 @@ impl Store {
         .bind(&link.task_text)
         .bind(&link.agent_id)
         .bind(link.created_at)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert task agent link failed: {e}")))?;
         Ok(link.clone())
@@ -47,7 +47,7 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(note_id.as_str())
         .bind(task_key)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("get task agent link failed: {e}")))?;
         row.as_ref().map(map_link_row).transpose()
@@ -68,7 +68,7 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(note_id.as_str())
         .bind(task_key)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("delete task agent link failed: {e}")))?;
         Ok(res.rows_affected() > 0)
@@ -85,7 +85,7 @@ impl Store {
              WHERE workspace_id = ? ORDER BY created_at, note_id, task_key"
         ))
         .bind(&workspace_id.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list task agent links failed: {e}")))?;
         rows.iter().map(map_link_row).collect()

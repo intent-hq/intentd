@@ -41,7 +41,7 @@ impl Store {
             .bind(&note.created_at)
             .bind(note.rev)
             .bind(&note.updated_at)
-            .execute(self.pool())
+            .execute(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert note failed: {e}")))?;
         Ok(())
@@ -53,7 +53,7 @@ impl Store {
             format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("list notes failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
@@ -64,7 +64,7 @@ impl Store {
     pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note ORDER BY created_at");
         let rows = sqlx::query(&sql)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list all notes failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
@@ -79,7 +79,7 @@ impl Store {
         let row = sqlx::query(&sql)
             .bind(&id.0)
             .bind(&workspace_id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get note failed: {e}")))?;
         match row {
@@ -146,7 +146,7 @@ impl Store {
             query = query.bind(rev);
         }
         let res = query
-            .execute(self.pool())
+            .execute(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
         if res.rows_affected() == 0 {
@@ -191,14 +191,14 @@ impl Store {
                     .bind(&id.0)
                     .bind(&workspace_id.0)
                     .bind(rev)
-                    .execute(self.pool())
+                    .execute(self.write_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?
             }
             None => sqlx::query("DELETE FROM note WHERE id = ? AND workspace_id = ?")
                 .bind(&id.0)
                 .bind(&workspace_id.0)
-                .execute(self.pool())
+                .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
         };
@@ -228,7 +228,7 @@ impl Store {
         );
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list tasks failed: {e}")))?;
         rows.iter().map(map_note_row).collect()
@@ -256,7 +256,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<(NoteId, String)>> {
-        let pool = self.pool();
+        let pool = self.write_pool();
         let workspace_id = workspace_id.clone();
 
         crate::with_write_txn_retry(|| async {

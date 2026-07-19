@@ -34,7 +34,7 @@ impl Store {
             .bind(s.auto_start.map(|b| b as i64))
             .bind(&s.created_at)
             .bind(&s.updated_at)
-            .execute(self.pool())
+            .execute(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert script failed: {e}")))?;
         Ok(())
@@ -45,7 +45,7 @@ impl Store {
     pub async fn remove_script(&self, id: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM script WHERE id = ?")
             .bind(id)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("remove script failed: {e}")))?;
         Ok(res.rows_affected() > 0)
@@ -56,7 +56,7 @@ impl Store {
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
         let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at");
         let rows = sqlx::query(&sql)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list scripts failed: {e}")))?;
         rows.iter().map(map_script_row).collect()

@@ -92,7 +92,7 @@ impl Store {
             .bind(&s.sandbox_path)
             .bind(&s.sandbox_branch)
             .bind(&s.stop_reason)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
         Ok(())
@@ -103,7 +103,7 @@ impl Store {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(&id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent session failed: {e}")))?;
         match row {
@@ -124,7 +124,7 @@ impl Store {
     pub async fn get_agent_session_status(&self, id: &AgentId) -> Result<AgentStatus> {
         let row = sqlx::query("SELECT status FROM agent_session WHERE id = ?")
             .bind(&id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent session status failed: {e}")))?;
         match row {
@@ -139,7 +139,7 @@ impl Store {
     pub async fn get_agent_session_name(&self, id: &AgentId) -> Result<Option<String>> {
         let row = sqlx::query("SELECT name FROM agent_session WHERE id = ?")
             .bind(&id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent session name failed: {e}")))?;
         Ok(row.map(|r| r.get::<String, _>("name")))
@@ -155,7 +155,7 @@ impl Store {
         );
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list agent sessions failed: {e}")))?;
         let mut sessions = Vec::with_capacity(rows.len());
@@ -182,7 +182,7 @@ impl Store {
         );
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list agent session summaries failed: {e}")))?;
         rows.iter().map(map_session_row).collect()
@@ -200,7 +200,7 @@ impl Store {
         let sql = "SELECT id FROM agent_session WHERE workspace_id = ?";
         let rows = sqlx::query(sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent session message stats failed: {e}")))?;
 
@@ -213,7 +213,7 @@ impl Store {
             let count_row =
                 sqlx::query("SELECT COUNT(*) as count FROM agent_message WHERE agent_id = ?")
                     .bind(&agent_id)
-                    .fetch_one(self.pool())
+                    .fetch_one(self.read_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("count messages failed: {e}")))?;
             let message_count: i64 = count_row.get("count");
@@ -223,7 +223,7 @@ impl Store {
                 "SELECT EXISTS(SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant') as has_assistant"
             )
             .bind(&agent_id)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("check assistant message failed: {e}")))?;
             let has_assistant: i64 = assistant_row.get("has_assistant");
@@ -248,7 +248,7 @@ impl Store {
         "#;
         let row = sqlx::query(sql)
             .bind(&workspace_id.0)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get workspace message watermark failed: {e}")))?;
         let count: i64 = row.get("count");
@@ -267,7 +267,7 @@ impl Store {
         let session_sql = "SELECT id, model FROM agent_session WHERE workspace_id = ?";
         let session_rows = sqlx::query(session_sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent sessions for usage failed: {e}")))?;
 
@@ -281,7 +281,7 @@ impl Store {
                 "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
             let message_rows = sqlx::query(message_sql)
                 .bind(&agent_id)
-                .fetch_all(self.pool())
+                .fetch_all(self.read_pool())
                 .await
                 .map_err(|e| {
                     Error::Internal(format!("get agent messages for usage failed: {e}"))
@@ -308,7 +308,7 @@ impl Store {
     pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
         let rows = sqlx::query(&sql)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list all agent sessions failed: {e}")))?;
         rows.iter().map(map_session_row).collect()
@@ -336,7 +336,7 @@ impl Store {
             "SELECT workspace_id, provider, acp_session_id FROM agent_session WHERE id = ?",
         )
         .bind(&s.id.0)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("update agent session invariant check failed: {e}")))?
         .ok_or_else(|| Error::NotFound(format!("agent session {}", s.id)))?;
@@ -404,7 +404,7 @@ impl Store {
         .bind(&s.stop_reason)
         .bind(&s.id.0)
         .bind(&workspace_id.0)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update agent session failed: {e}")))?
         .rows_affected();
@@ -447,7 +447,7 @@ impl Store {
                 .bind(updated_at)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
-                .execute(self.pool())
+                .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
                 .rows_affected()
@@ -464,7 +464,7 @@ impl Store {
                 .bind(reason)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
-                .execute(self.pool())
+                .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("set agent session status failed: {e}")))?
                 .rows_affected()
@@ -495,7 +495,7 @@ impl Store {
                 .bind(updated_at)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
-                .execute(self.pool())
+                .execute(self.write_pool())
                 .await
                 .map_err(|e| {
                     Error::Internal(format!("refresh agent session timestamp failed: {e}"))
@@ -531,7 +531,7 @@ impl Store {
         .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("clear completion report failed: {e}")))?
         .rows_affected();
@@ -546,7 +546,7 @@ impl Store {
             )
             .bind(&id.0)
             .bind(&workspace_id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
             if exists.is_none() {
@@ -565,7 +565,7 @@ impl Store {
     /// spawns. Returns the count of rows reset.
     pub async fn reset_all_active_flags(&self) -> Result<usize> {
         let rows = sqlx::query("UPDATE agent_session SET is_active=0 WHERE is_active=1")
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("reset active flags failed: {e}")))?
             .rows_affected();
@@ -595,7 +595,7 @@ impl Store {
             .bind(acp_session_id)
             .bind(&id.0)
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set acp session id failed: {e}")))?;
         Ok(())
@@ -653,7 +653,7 @@ impl Store {
             .bind(acp_session_id)
             .bind(&id.0)
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
         Ok(())
@@ -670,7 +670,7 @@ impl Store {
         let result = sqlx::query("DELETE FROM agent_session WHERE id = ? AND workspace_id = ?")
             .bind(&id.0)
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
         Ok(result.rows_affected() > 0)
@@ -812,7 +812,7 @@ impl Store {
             "SELECT COALESCE(MAX(seq), -1) + 1 AS next FROM agent_message WHERE agent_id = ?",
         )
         .bind(&agent_id.0)
-        .fetch_one(self.pool())
+        .fetch_one(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("next agent message seq failed: {e}")))?
         .get::<i64, _>("next");
@@ -834,7 +834,7 @@ impl Store {
             .bind(&content_json)
             .bind(metadata_json.as_deref())
             .bind(created_at)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
         Ok(AgentMessage {
@@ -870,7 +870,7 @@ impl Store {
             query = query.bind(n);
         }
         let rows = query
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent messages failed: {e}")))?;
         rows.iter().map(map_message_row).collect()
@@ -881,7 +881,7 @@ impl Store {
     pub async fn count_agent_messages(&self, agent_id: &AgentId) -> Result<i64> {
         let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM agent_message WHERE agent_id = ?")
             .bind(&agent_id.0)
-            .fetch_one(self.pool())
+            .fetch_one(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("count agent messages failed: {e}")))?
             .get::<i64, _>("n");
@@ -902,7 +902,7 @@ impl Store {
         agent_id: &AgentId,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<Vec<AgentMessage>> {
-        let pool = self.pool();
+        let pool = self.write_pool();
         let agent_id = agent_id.clone();
         // Clone messages into owned data for retry closure
         let owned_messages: Vec<(String, serde_json::Value, Option<serde_json::Value>, String)> =
@@ -998,7 +998,7 @@ impl Store {
             .bind(&workspace_id.0)
             .bind(prev_status)
             .bind(interrupted_at)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert interrupted_agent failed: {e}")))?;
         Ok(res.rows_affected() > 0)
@@ -1014,7 +1014,7 @@ impl Store {
                    LEFT JOIN workspace w ON ia.workspace_id = w.id \
                    WHERE ia.resolution = 'pending'";
         sqlx::query(sql)
-            .fetch_all(&self.pool)
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list interrupted_agent failed: {e}")))?
             .iter()
@@ -1044,7 +1044,7 @@ impl Store {
                    WHERE ia.agent_id = ? AND ia.resolution = 'pending'";
         let row = sqlx::query(sql)
             .bind(&agent_id.0)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get interrupted_agent failed: {e}")))?;
         match row {
@@ -1075,7 +1075,7 @@ impl Store {
             .bind(resolution)
             .bind(resolved_at)
             .bind(&agent_id.0)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set interrupted resolution failed: {e}")))?;
         Ok(res.rows_affected() > 0)
@@ -1089,7 +1089,7 @@ impl Store {
                    WHERE agent_id = ?";
         let res = sqlx::query(sql)
             .bind(&agent_id.0)
-            .execute(&self.pool)
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("reset interrupted resolution failed: {e}")))?;
         Ok(res.rows_affected() > 0)

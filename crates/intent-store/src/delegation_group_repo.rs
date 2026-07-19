@@ -73,7 +73,7 @@ impl Store {
         .bind(&raw_events_json)
         .bind(&g.created_at)
         .bind(&g.updated_at)
-        .execute(self.pool())
+        .execute(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert delegation_group failed: {e}")))?;
         Ok(())
@@ -94,7 +94,7 @@ impl Store {
              ORDER BY created_at ASC",
         )
         .bind(&workspace_id.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list undelivered delegation groups: {e}")))?;
 
@@ -105,7 +105,7 @@ impl Store {
     pub async fn delete_delegation_group(&self, group_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM delegation_group WHERE group_id = ?")
             .bind(group_id)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete delegation_group failed: {e}")))?;
         Ok(())
@@ -116,7 +116,7 @@ impl Store {
     pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
         let rows =
             sqlx::query("SELECT DISTINCT workspace_id FROM delegation_group WHERE delivered = 0")
-                .fetch_all(self.pool())
+                .fetch_all(self.write_pool())
                 .await
                 .map_err(|e| {
                     Error::Internal(format!("list workspaces with undelivered groups: {e}"))

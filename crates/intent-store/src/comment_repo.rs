@@ -92,7 +92,7 @@ impl Store {
             .bind(&c.created_at)
             .bind(&c.updated_at)
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
         Ok(())
@@ -103,7 +103,7 @@ impl Store {
         let sql = format!("SELECT {COMMENT_COLUMNS} FROM comment WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(id)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("get comment failed: {e}")))?;
         match row {
@@ -154,7 +154,7 @@ impl Store {
         .bind(&c.updated_at)
         .bind(&c.id)
         .bind(&workspace_id.0)
-        .execute(self.pool())
+        .execute(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("update comment failed: {e}")))?;
         if res.rows_affected() == 0 {
@@ -169,7 +169,7 @@ impl Store {
         let res = sqlx::query("DELETE FROM comment WHERE id = ? AND workspace_id = ?")
             .bind(id)
             .bind(&workspace_id.0)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete comment failed: {e}")))?;
         if res.rows_affected() == 0 {
@@ -185,7 +185,7 @@ impl Store {
         );
         let rows = sqlx::query(&sql)
             .bind(&note_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list comments failed: {e}")))?;
         rows.iter().map(map_comment_row).collect()
@@ -208,7 +208,7 @@ impl Store {
         let rows = sqlx::query(&sql)
             .bind(&note_id.0)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list comments failed: {e}")))?;
         rows.iter().map(map_comment_row).collect()
@@ -221,7 +221,7 @@ impl Store {
         );
         let rows = sqlx::query(&sql)
             .bind(thread_id)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list thread comments failed: {e}")))?;
         rows.iter().map(map_comment_row).collect()
@@ -246,7 +246,7 @@ impl Store {
         .bind(updated_at)
         .bind(thread_id)
         .bind(&workspace_id.0)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("set thread status failed: {e}")))?;
         Ok(res.rows_affected())

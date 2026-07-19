@@ -18,7 +18,7 @@ impl Store {
         )
         .bind(workspace_id)
         .bind(key)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("idempotency lookup failed: {e}")))?;
         Ok(row.map(|r| r.get::<String, _>("result_json")))
@@ -45,7 +45,7 @@ impl Store {
         .bind(method)
         .bind(result_json)
         .bind(now_iso())
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("idempotency insert failed: {e}")))?;
         Ok(res.rows_affected() > 0)
@@ -57,7 +57,7 @@ impl Store {
     pub async fn reap_idempotent(&self, cutoff: &str) -> Result<u64> {
         let res = sqlx::query("DELETE FROM idempotency_key WHERE created_at < ?")
             .bind(cutoff)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("idempotency reap failed: {e}")))?;
         Ok(res.rows_affected())

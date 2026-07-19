@@ -62,7 +62,7 @@ impl Store {
             .bind(&d.hunks_json)
             .bind(&now)
             .bind(&now)
-            .execute(self.pool())
+            .execute(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("upsert diff failed: {e}")))?;
         Ok(())
@@ -75,7 +75,7 @@ impl Store {
             format!("SELECT {DIFF_COLUMNS} FROM diffs WHERE workspace_id = ? ORDER BY created_at");
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list diffs failed: {e}")))?;
         rows.iter().map(map_diff_row).collect()
