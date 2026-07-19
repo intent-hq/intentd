@@ -122,10 +122,14 @@ impl Store {
     }
 
     /// Close the pool gracefully, checkpointing the WAL and freeing resources.
-    /// Call this during daemon shutdown to ensure WAL changes are visible to
-    /// subsequent daemon instances (regression: persisted settings must survive
-    /// app relaunches in sidecar mode).
+    /// Call this during daemon shutdown to checkpoint the WAL and close the pool.
+    /// This ensures WAL changes are visible to subsequent daemon instances
+    /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        // Best-effort WAL checkpoint before closing the pool
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
         self.pool.close().await;
     }
 

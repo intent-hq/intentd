@@ -40,17 +40,21 @@ fn free_port() -> u16 {
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
+    /// If false, skip data_dir cleanup in Drop (for tests that reuse the same data_dir)
+    cleanup_data_dir: bool,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let log_path = self.data_dir.join("daemon.log");
-        if let Ok(log) = std::fs::read_to_string(&log_path) {
-            eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+        if self.cleanup_data_dir {
+            let log_path = self.data_dir.join("daemon.log");
+            if let Ok(log) = std::fs::read_to_string(&log_path) {
+                eprintln!("=== DAEMON LOG ===\n{}\n=== END LOG ===", log);
+            }
+            let _ = std::fs::remove_dir_all(&self.data_dir);
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -62,8 +66,14 @@ fn temp_data_dir() -> PathBuf {
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+    use std::fs::OpenOptions;
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
-    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    // Append to daemon.log instead of truncating, so multi-boot tests preserve all logs
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("daemon.log"))
+        .expect("open daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
@@ -251,6 +261,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -396,6 +407,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let mut _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
+        cleanup_data_dir: false, // Don't cleanup - we'll reuse this data_dir for second boot
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -489,14 +501,15 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
         exited,
         "daemon did not exit within 3 seconds after system.shutdown"
     );
-    // Don't run Drop (which would kill the already-exited process); the second Daemon will clean up the data dir
-    std::mem::forget(_daemon);
+    // Drop the first daemon without cleanup; process already exited
+    drop(_daemon);
 
     // STEP 3: Boot again with --listen uds (same data dir, persisted setting is true)
     let child2 = spawn_serve(&data_dir, "uds", &env);
     let _daemon2 = Daemon {
         child: child2,
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true, // Second instance cleans up at end
     };
     assert!(await_uds(&socket).await, "daemon did not start on reboot");
 
@@ -555,6 +568,7 @@ async fn batch_hook_ordering_port_before_enable() {
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -634,6 +648,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -673,6 +688,7 @@ async fn runtime_toggled_wss_serves_system_status() {
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "uds", &env),
         data_dir: data_dir.clone(),
+        cleanup_data_dir: true,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
