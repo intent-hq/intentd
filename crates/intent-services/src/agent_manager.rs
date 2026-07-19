@@ -2236,18 +2236,22 @@ impl AgentManager {
                     .and_then(|s| s.acp_session_id)
                     .is_some();
             if cancellable {
-                // STAB-114: Before interrupting, check if the current turn has
-                // produced zero output (no assistant content chunks). If so,
-                // re-queue the preempted user message so it gets processed after
-                // the interrupt completes. Use the live-turn slot (not persisted
-                // transcript) to detect zero output: assistant rows are only
-                // persisted at turn END, so an interrupted mid-stream turn would
-                // incorrectly look like zero output if we checked the transcript.
+                // STAB-114: Check if the current turn has produced zero output
+                // (no assistant content chunks) BEFORE we cancel. Use the live-turn
+                // slot (not persisted transcript) to detect zero output: assistant
+                // rows are only persisted at turn END, so an interrupted mid-stream
+                // turn would incorrectly look like zero output if we checked the
+                // transcript.
                 let has_output = self
                     .services
                     .live_turn(&agent_id)
                     .map(|live| !live.blocks.is_empty())
                     .unwrap_or(false);
+
+                // Cancel the turn IMMEDIATELY to prevent it from finishing while
+                // we prepare the re-queue logic below. This releases the in-flight
+                // slot and aborts the draining worker.
+                self.interrupt(&agent_id).await;
 
                 if !has_output {
                     // Zero-output condition: re-queue the preempted message.
@@ -2353,12 +2357,6 @@ impl AgentManager {
                         }
                     }
                 }
-
-                // Keep-alive: cancels the turn over the wire, aborts the
-                // draining worker, releases the in-flight slot, and emits the
-                // terminal `agent:stream:end` — the child + ACP session stay
-                // alive.
-                self.interrupt(&agent_id).await;
             }
         }
         // The slot was just released (or was never held): the send path claims
