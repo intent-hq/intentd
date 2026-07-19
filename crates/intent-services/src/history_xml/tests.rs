@@ -102,6 +102,40 @@ fn sanitizes_malformed_tool_results_and_empty_assistants() {
     assert_eq!(xml.matches("<tool_result ").count(), 1);
 }
 
+/// Regression test for STAB-108: dangling tool_use blocks (no corresponding
+/// tool_result) should be removed during sanitization to prevent provider
+/// rejection on session resume.
+#[test]
+fn sanitizes_dangling_tool_use_blocks() {
+    let messages = vec![
+        msg("user", json!([{ "type": "text", "text": "edit file" }])),
+        msg(
+            "assistant",
+            json!([
+                // This tool_use has a result → should be kept.
+                { "type": "tool_use", "name": "edit", "tool_use_id": "t1", "input": {} },
+                // This tool_use has NO result → should be dropped.
+                { "type": "tool_use", "name": "view", "tool_use_id": "t2", "input": {} },
+            ]),
+        ),
+        msg(
+            "user",
+            json!([
+                // Result for t1 → keeps t1 alive.
+                { "type": "tool_result", "tool_use_id": "t1", "output": "done" },
+                // No result for t2 → t2 should be dropped.
+            ]),
+        ),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    // t1 with result should appear.
+    assert!(xml.contains("<tool_use name=\"edit\" tool_use_id=\"t1\">"));
+    assert!(xml.contains("<tool_result tool_use_id=\"t1\" is_error=\"false\">"));
+    // t2 without result should NOT appear.
+    assert!(!xml.contains("tool_use_id=\"t2\""));
+    assert!(!xml.contains("<tool_use name=\"view\""));
+}
+
 #[test]
 fn truncates_oversized_tool_content_in_the_middle() {
     let big = "x".repeat(10_000);
@@ -192,10 +226,16 @@ fn assistant_whose_blocks_all_get_sanitized_is_dropped() {
 fn tool_use_without_name_or_input_renders_defaults() {
     // Missing `name`/`toolName` → str_field returns "" (the `String::new()`
     // tail); missing/falsy `input` → defaults to `{}` (the `_` match arm).
-    let messages = vec![msg(
-        "assistant",
-        json!([{ "type": "tool_use", "tool_use_id": "t1" }]),
-    )];
+    let messages = vec![
+        msg(
+            "assistant",
+            json!([{ "type": "tool_use", "tool_use_id": "t1" }]),
+        ),
+        msg(
+            "user",
+            json!([{ "type": "tool_result", "tool_use_id": "t1", "output": "ok" }]),
+        ),
+    ];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     assert!(xml.contains("<tool_use name=\"\" tool_use_id=\"t1\">"));
     // Empty input object stringifies to `{}` (then XML-escapes to `{}`).
@@ -206,10 +246,16 @@ fn tool_use_without_name_or_input_renders_defaults() {
 fn long_tool_name_is_truncated_with_ellipsis() {
     // tool_name > MAX_TOOL_NAME_CHARS (200) → truncated head + "...".
     let long = "n".repeat(300);
-    let messages = vec![msg(
-        "assistant",
-        json!([{ "type": "tool_use", "name": long, "tool_use_id": "t" }]),
-    )];
+    let messages = vec![
+        msg(
+            "assistant",
+            json!([{ "type": "tool_use", "name": long, "tool_use_id": "t" }]),
+        ),
+        msg(
+            "user",
+            json!([{ "type": "tool_result", "tool_use_id": "t", "output": "ok" }]),
+        ),
+    ];
     let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
     // 200 cap → 197 chars of head + "..." (3 chars).
     let head: String = "n".repeat(197);
