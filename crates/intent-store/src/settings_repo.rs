@@ -49,7 +49,7 @@ impl Store {
     /// List every persisted `(key, value)` pair (raw JSON `value` strings).
     pub async fn list_settings(&self) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query("SELECT key, value FROM settings ORDER BY key")
-            .fetch_all(self.write_pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list settings failed: {e}")))?;
         Ok(rows.iter().map(map_setting_row).collect())

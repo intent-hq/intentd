@@ -53,7 +53,7 @@ impl Store {
             format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
         let rows = sqlx::query(&sql)
             .bind(&workspace_id.0)
-            .fetch_all(self.write_pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list notes failed: {e}")))?;
         rows.iter().map(map_note_row).collect()

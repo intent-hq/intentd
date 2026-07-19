@@ -30,6 +30,11 @@ const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 
 /// Capacity of the writer task's inbound channel. Controls backpressure when
 /// publishers send events faster than the writer task can batch-persist them.
+/// At 512 slots, the channel can buffer ~8 full batches (64 events each) before
+/// backpressure kicks in. When the channel is full, `EventBus::publish()` awaits
+/// the `send()` until a slot opens (blocking the publisher until the writer task
+/// drains a batch). This prevents unbounded memory growth under sustained bursts
+/// while keeping typical publish calls non-blocking.
 const WRITER_CHANNEL_CAPACITY: usize = 512;
 
 /// Max events drained per batch by the writer task (to bound transaction size).
@@ -98,6 +103,13 @@ impl EventBus {
     /// `agent:stream:chunk`) that do not need durable storage. The wire shape
     /// matches persisted events exactly (same id/timestamp minting as
     /// `Store::insert_event`), so subscribers see identical structure.
+    ///
+    /// **Ordering guarantee**: Events broadcast from a single publisher (e.g., one
+    /// agent session) are delivered to subscribers in publish order, whether they
+    /// are transient or persisted. Cross-publisher ordering is not guaranteed; if
+    /// publisher A calls `publish_transient(ev1)` and publisher B calls
+    /// `publish(ev2).await` concurrently, A's transient event may broadcast before
+    /// B's persisted event commits, even if B's call started first.
     pub fn publish_transient(&self, ev: &NewEvent) -> Event {
         let id = Uuid::now_v7().to_string();
         let event = Event {
@@ -161,6 +173,12 @@ impl Drop for Subscription {
 /// a single transaction (up to WRITER_BATCH_SIZE or WRITER_BATCH_WINDOW_MS),
 /// resolves each oneshot with the result, and broadcasts each stored event in
 /// order. Stops when the channel closes (all EventBus handles dropped).
+///
+/// **Shutdown invariant**: The task receives `None` from `rx.recv()` only after
+/// all `EventBus` clones (and their `writer_tx` senders) have been dropped. This
+/// guarantees no `publish()` call can be awaiting a response when the task exits,
+/// because `publish()` requires a live `writer_tx` to send the request. Any pending
+/// events at shutdown are flushed before the task returns.
 async fn writer_task(
     store: Store,
     mut rx: mpsc::Receiver<WriterRequest>,

@@ -116,7 +116,7 @@ impl Store {
     pub async fn list_workspaces_with_undelivered_groups(&self) -> Result<Vec<WorkspaceId>> {
         let rows =
             sqlx::query("SELECT DISTINCT workspace_id FROM delegation_group WHERE delivered = 0")
-                .fetch_all(self.write_pool())
+                .fetch_all(self.read_pool())
                 .await
                 .map_err(|e| {
                     Error::Internal(format!("list workspaces with undelivered groups: {e}"))

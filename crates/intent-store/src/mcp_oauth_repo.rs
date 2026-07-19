@@ -59,7 +59,7 @@ impl Store {
     /// internal (server-side) reads.
     pub async fn list_mcp_oauth_server_ids(&self) -> Result<Vec<String>> {
         let rows = sqlx::query("SELECT server_id FROM mcp_oauth_tokens ORDER BY server_id")
-            .fetch_all(self.write_pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list mcp oauth tokens failed: {e}")))?;
         Ok(rows

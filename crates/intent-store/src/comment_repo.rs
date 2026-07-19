@@ -103,7 +103,7 @@ impl Store {
         let sql = format!("SELECT {COMMENT_COLUMNS} FROM comment WHERE id = ?");
         let row = sqlx::query(&sql)
             .bind(id)
-            .fetch_optional(self.write_pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get comment failed: {e}")))?;
         match row {

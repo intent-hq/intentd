@@ -1,7 +1,7 @@
 //! Stress test: concurrent writes must not starve reads (pool-contention fix).
 //!
 //! Drives 30+ concurrent note writes over WSS and asserts that a lightweight
-//! read RPC (`system.status`) issued mid-load responds within a small bound
+//! read RPC (`workspace.list`) issued mid-load responds within a small bound
 //! (< 2s), proving the single-writer/read pool split (fix/sqlite-pool-contention)
 //! prevents pool exhaustion and `database is locked` errors.
 

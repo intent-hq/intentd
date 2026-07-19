@@ -117,36 +117,56 @@ impl Store {
         }
 
         // Build multi-row INSERT within a single BEGIN IMMEDIATE transaction.
-        let mut tx = self
+        // IMMEDIATE mode acquires the exclusive write lock upfront (avoiding the
+        // DEFERRED-mode lock upgrade race). With max_connections=1 on the write
+        // pool, concurrent insert_events calls serialize at pool.acquire() instead
+        // of hitting SQLITE_BUSY during transaction upgrade.
+        let mut conn = self
             .write_pool()
-            .begin()
+            .acquire()
             .await
-            .map_err(|e| Error::Internal(format!("begin transaction failed: {e}")))?;
-
-        // QueryBuilder for multi-row insert.
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(format!("INSERT INTO event ({EVENT_COLUMNS}) "));
-        qb.push_values(events.iter().zip(&prepared), |mut b, (ev, prep)| {
-            b.push_bind(&prep.0) // id
-                .push_bind(&ev.workspace_id.0)
-                .push_bind(&ev.timestamp)
-                .push_bind(&ev.event_type)
-                .push_bind(&prep.1) // actor_json
-                .push_bind(&ev.session_id)
-                .push_bind(&ev.correlation_id)
-                .push_bind(&ev.parent_event_id)
-                .push_bind(&prep.3) // metadata_json
-                .push_bind(&prep.2); // data_json
-        });
-
-        qb.build()
-            .execute(&mut *tx)
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
-            .map_err(|e| Error::Internal(format!("insert events failed: {e}")))?;
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| Error::Internal(format!("commit transaction failed: {e}")))?;
+        // Execute multi-row insert; rollback explicitly on error.
+        let result = async {
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(format!("INSERT INTO event ({EVENT_COLUMNS}) "));
+            qb.push_values(events.iter().zip(&prepared), |mut b, (ev, prep)| {
+                b.push_bind(&prep.0) // id
+                    .push_bind(&ev.workspace_id.0)
+                    .push_bind(&ev.timestamp)
+                    .push_bind(&ev.event_type)
+                    .push_bind(&prep.1) // actor_json
+                    .push_bind(&ev.session_id)
+                    .push_bind(&ev.correlation_id)
+                    .push_bind(&ev.parent_event_id)
+                    .push_bind(&prep.3) // metadata_json
+                    .push_bind(&prep.2); // data_json
+            });
+
+            qb.build()
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("insert events failed: {e}")))
+        }
+        .await;
+
+        match result {
+            Ok(_) => {
+                sqlx::query("COMMIT")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("commit failed: {e}")))?;
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e);
+            }
+        }
 
         // Reconstruct Event structs in insertion order.
         let mut result = Vec::with_capacity(events.len());

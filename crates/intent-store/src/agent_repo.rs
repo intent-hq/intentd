@@ -1207,7 +1207,7 @@ mod tests {
             "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
         )
         .bind(&agent_id.0)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .expect("count");
         assert_eq!(count, 1, "should have one pending row");
@@ -1224,7 +1224,7 @@ mod tests {
             "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
         )
         .bind(&agent_id.0)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .expect("count after resolve");
         assert_eq!(count2, 0, "resolved row should not be pending");
@@ -1240,7 +1240,7 @@ mod tests {
             "SELECT COUNT(*) FROM interrupted_agent WHERE agent_id = ? AND resolution = 'pending'",
         )
         .bind(&agent_id.0)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .expect("count after re-interrupt");
         assert_eq!(count3, 1, "re-interrupted row should be pending again");
@@ -1250,7 +1250,7 @@ mod tests {
             "SELECT prev_status, interrupted_at FROM interrupted_agent WHERE agent_id = ?",
         )
         .bind(&agent_id.0)
-        .fetch_one(store.pool())
+        .fetch_one(store.read_pool())
         .await
         .expect("fetch row");
         assert_eq!(row.0, "processing");

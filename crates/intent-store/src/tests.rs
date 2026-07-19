@@ -132,7 +132,7 @@ async fn backfill_repository_name_from_path_basename() {
     sqlx::raw_sql(include_str!(
         "../migrations/0031_workspace_repository_name_backfill.sql"
     ))
-    .execute(store.read_pool())
+    .execute(store.write_pool())
     .await
     .expect("re-run backfill");
 
@@ -199,7 +199,7 @@ async fn heal_slug_seeded_titles_clears_only_matching_rows() {
     sqlx::raw_sql(include_str!(
         "../migrations/0034_workspace_title_untitled_heal.sql"
     ))
-    .execute(store.read_pool())
+    .execute(store.write_pool())
     .await
     .expect("re-run heal");
 
