@@ -281,23 +281,44 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
 /// `_meta` injection (auggie, droid, opencode, cortex, mock use other mechanisms).
 /// Provider-specific shapes:
-/// - claude-code: `{ "systemPrompt": { "append": "<prompt>" } }` (append to base)
-/// - codex: `{ "developerInstructions": "<prompt>" }` (bare top-level key)
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
+///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
+/// - codex: `{ "developerInstructions": "<prompt>" }` (bare top-level key, when non-blank prompt)
 fn build_session_meta(provider_id: Option<&str>, system_prompt: Option<&str>) -> Option<Meta> {
-    let prompt = system_prompt?.trim();
-    if prompt.is_empty() {
-        return None;
-    }
     let provider = provider_id?;
     match provider {
         "claude-code" => {
             let mut meta = Meta::new();
-            let mut system_prompt_obj = serde_json::Map::new();
-            system_prompt_obj.insert("append".to_string(), Value::String(prompt.to_string()));
-            meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
+
+            // Always add disallowedTools to prevent provider-native Task tool
+            // (verified against @agentclientprotocol/claude-agent-acp 0.59.0;
+            // disallowedTools are merged with ACP's internal deny rules).
+            meta.insert(
+                "claudeCode".to_string(),
+                serde_json::json!({
+                    "options": {
+                        "disallowedTools": ["Task"]
+                    }
+                }),
+            );
+
+            // Add systemPrompt.append if non-blank prompt exists
+            if let Some(prompt) = system_prompt {
+                let prompt = prompt.trim();
+                if !prompt.is_empty() {
+                    let mut system_prompt_obj = serde_json::Map::new();
+                    system_prompt_obj.insert("append".to_string(), Value::String(prompt.to_string()));
+                    meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
+                }
+            }
+
             Some(meta)
         }
         "codex" => {
+            let prompt = system_prompt?.trim();
+            if prompt.is_empty() {
+                return None;
+            }
             let mut meta = Meta::new();
             meta.insert(
                 "developerInstructions".to_string(),
