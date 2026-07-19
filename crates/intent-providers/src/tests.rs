@@ -280,13 +280,19 @@ fn env_assembly_quirks() {
     );
 
     let opencode = find_provider("opencode").unwrap();
-    let oc = build_provider_env(opencode, Some("claude-sonnet-4"));
+    // With model: permission.task=deny is merged with the model key.
+    let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"));
     assert_eq!(
-        oc.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"model":"claude-sonnet-4"}"#)
+        oc_with_model.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"model":"claude-sonnet-4","permission":{"task":"deny"}}"#)
     );
-    // No model → no OPENCODE_CONFIG_CONTENT.
-    assert!(!build_provider_env(opencode, None).contains_key("OPENCODE_CONFIG_CONTENT"));
+    // No model: permission.task=deny is still emitted (change from prior behavior
+    // where no config was set without a model).
+    let oc_no_model = build_provider_env(opencode, None);
+    assert_eq!(
+        oc_no_model.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"}}"#)
+    );
 }
 
 /// Serializes env-var mutation across tests in this binary: the vars are
