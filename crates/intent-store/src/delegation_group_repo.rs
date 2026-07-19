@@ -124,11 +124,12 @@ impl Store {
 
         Ok(rows
             .iter()
-            .map(|row| {
-                let ws_id: String = row
-                    .try_get("workspace_id")
-                    .unwrap_or_else(|_| String::new());
-                WorkspaceId::from(ws_id.as_str())
+            .filter_map(|row| match row.try_get::<String, _>("workspace_id") {
+                Ok(ws_id) => Some(WorkspaceId::from(ws_id.as_str())),
+                Err(e) => {
+                    eprintln!("WARN: Skipping delegation_group row with decode error: {e}");
+                    None
+                }
             })
             .collect())
     }

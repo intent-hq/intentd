@@ -824,6 +824,7 @@ impl Services {
                     // Conservative completion predicate (STAB-108):
                     // - If status is Completed, child is done
                     // - If status is Deleted, child is done
+                    // - If status is Error, child is done (terminal failure)
                     // - If status is RuntimeIdle:
                     //   * AND completion_report is present
                     //   * AND there is NO interrupted_agent row
@@ -832,37 +833,49 @@ impl Services {
 
                     let is_deleted = matches!(session.status, AgentStatus::Deleted);
                     let is_explicitly_completed = matches!(session.status, AgentStatus::Completed);
+                    let is_failed = matches!(session.status, AgentStatus::Error);
 
-                    let is_idle_and_genuinely_complete =
-                        if matches!(session.status, AgentStatus::RuntimeIdle) {
-                            // Check if there's a completion report and no interrupted row
-                            let has_completion_report = session.completion_report.is_some();
-                            let has_interrupted_row = self
-                                .store
-                                .get_interrupted_agent(&child_id)
-                                .await
-                                .unwrap_or(None)
-                                .is_some();
+                    let is_idle_and_genuinely_complete = if matches!(
+                        session.status,
+                        AgentStatus::RuntimeIdle
+                    ) {
+                        // Check if there's a completion report and no interrupted row
+                        let has_completion_report = session.completion_report.is_some();
+                        let interrupted_check = self.store.get_interrupted_agent(&child_id).await;
 
-                            has_completion_report && !has_interrupted_row
-                        } else {
-                            false
-                        };
+                        match interrupted_check {
+                            Ok(opt) => has_completion_report && opt.is_none(),
+                            Err(e) => {
+                                // On store error, skip this child (don't mark complete)
+                                tracing::warn!(
+                                        "Skipping RuntimeIdle child {} due to interrupted_agent store error: {e}",
+                                        child_id.0
+                                    );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
 
-                    let should_record =
-                        is_deleted || is_explicitly_completed || is_idle_and_genuinely_complete;
+                    let should_record = is_deleted
+                        || is_explicitly_completed
+                        || is_failed
+                        || is_idle_and_genuinely_complete;
 
                     if should_record {
-                        // Build a synthetic agent:idle or agent:deleted event
+                        // Build a synthetic agent:idle, agent:failed, or agent:deleted event
                         // Prefer the child's persisted completion_report when present
                         let report = session.completion_report;
                         let event_type = if is_deleted {
                             intent_core::events::AGENT_DELETED
+                        } else if is_failed {
+                            intent_core::events::AGENT_FAILED
                         } else {
                             intent_core::events::AGENT_IDLE
                         };
                         let event = Event {
-                            id: String::new(),
+                            id: uuid::Uuid::new_v4().to_string(),
                             workspace_id: workspace_id.clone(),
                             timestamp: now_iso(),
                             event_type: event_type.to_string(),
@@ -895,38 +908,45 @@ impl Services {
                         .await;
                     }
                 }
-                Err(_) => {
-                    // Agent session not found or error - treat as deleted
-                    let event = Event {
-                        id: String::new(),
-                        workspace_id: workspace_id.clone(),
-                        timestamp: now_iso(),
-                        event_type: intent_core::events::AGENT_DELETED.to_string(),
-                        actor: intent_core::EventActor {
-                            actor_type: intent_core::ActorType::Agent,
-                            id: Some(child_id.0.clone()),
-                            ..Default::default()
-                        },
-                        session_id: Some(child_id.0.clone()),
-                        correlation_id: None,
-                        parent_event_id: None,
-                        metadata: None,
-                        data: serde_json::json!({
-                            "agentId": child_id.0,
-                            "status": "deleted",
-                        }),
-                    };
-                    let summary = crate::format_group_child_line(&child_id, &event, None);
+                Err(e) => {
+                    // Only NotFound → deleted; other errors → log and skip
+                    if matches!(e, intent_store::Error::NotFound(_)) {
+                        let event = Event {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            workspace_id: workspace_id.clone(),
+                            timestamp: now_iso(),
+                            event_type: intent_core::events::AGENT_DELETED.to_string(),
+                            actor: intent_core::EventActor {
+                                actor_type: intent_core::ActorType::Agent,
+                                id: Some(child_id.0.clone()),
+                                ..Default::default()
+                            },
+                            session_id: Some(child_id.0.clone()),
+                            correlation_id: None,
+                            parent_event_id: None,
+                            metadata: None,
+                            data: serde_json::json!({
+                                "agentId": child_id.0,
+                                "status": "deleted",
+                            }),
+                        };
+                        let summary = crate::format_group_child_line(&child_id, &event, None);
 
-                    self.record_group_child_completion(
-                        workspace_id,
-                        group_id,
-                        &child_id,
-                        true, // deleted
-                        summary,
-                        event,
-                    )
-                    .await;
+                        self.record_group_child_completion(
+                            workspace_id,
+                            group_id,
+                            &child_id,
+                            true, // deleted
+                            summary,
+                            event,
+                        )
+                        .await;
+                    } else {
+                        tracing::warn!(
+                            "Skipping reconciliation for child {} due to store error: {e}",
+                            child_id.0
+                        );
+                    }
                 }
             }
         }
