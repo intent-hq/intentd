@@ -303,7 +303,7 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_uses_npx_fallback_when_set() {
+    fn build_command_uses_npx_when_no_provider_binary() {
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
@@ -359,7 +359,7 @@ mod build_command_tests {
     }
 
     #[test]
-    fn build_command_enriches_path_with_npx_parent_when_using_fallback() {
+    fn build_command_enriches_path_with_npx_parent_when_spawning_via_npx() {
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/custom/node/bin/npx");
