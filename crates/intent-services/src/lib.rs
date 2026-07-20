@@ -1390,10 +1390,14 @@ impl Services {
     /// and by the background loop. The matching rule is `pr.head.ref ==
     /// workspace.branch` (NOT baseRef). When the workspace is already linked the
     /// PR is re-fetched and its snapshot diffed (clearing a stale link on a
-    /// positive branch mismatch); when unlinked, an open PR whose head ref
-    /// equals the branch is discovered and linked. Remote/archived workspaces,
-    /// and those lacking repo/branch info, are skipped. A missing forge token
-    /// (no injected/registry provider) surfaces as `Internal`.
+    /// positive branch mismatch); a linked PR fetched as merged/closed stays
+    /// recorded in `pull_requests` and triggers discovery of a newer open PR on
+    /// the same branch (relinking + `pr:linked` when found); when unlinked, an
+    /// open PR whose head ref equals the branch is discovered and linked. Every
+    /// refreshed/discovered PR snapshot is upserted into the daemon-owned
+    /// `pull_requests` list. Remote/archived workspaces, and those lacking
+    /// repo/branch info, are skipped. A missing forge token (no
+    /// injected/registry provider) surfaces as `Internal`.
     pub async fn refresh_workspace_pr(
         &self,
         workspace_id: &WorkspaceId,
@@ -1454,7 +1458,57 @@ impl Services {
                     return Ok(PrRefreshOutcome::Unlinked);
                 }
                 let info = pr_ops::build_pr_info(&pr);
-                let changed = ws.pr_status != Some(info.status)
+                // Keep the daemon-owned PR list current on every linked refresh.
+                let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                // A merged/closed linked PR stays recorded in `pull_requests`
+                // but no longer blocks discovery: relink to a newer open PR
+                // whose head ref equals the branch, so the workspace follows
+                // the latest PR without waiting for an unlink. A discovery
+                // failure degrades to the plain update path below so the
+                // merged/closed status delta is never lost to a transient
+                // `list_prs` error (the next sweep retries discovery).
+                if matches!(
+                    info.status,
+                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+                ) && !ws.branch.is_empty()
+                {
+                    let query = intent_sourcecontrol::PrQuery {
+                        state: Some(intent_sourcecontrol::PrState::Open),
+                        head: Some(ws.branch.clone()),
+                        ..Default::default()
+                    };
+                    let prs = match sc.list_prs(&repo_ref, query).await {
+                        Ok(page) => page.items,
+                        Err(e) => {
+                            tracing::warn!(
+                                workspace_id = %workspace_id.as_str(),
+                                error = %e,
+                                "pr refresh: relink discovery failed, persisting status only"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    // Highest PR number wins so successor selection is
+                    // deterministic regardless of forge sort order.
+                    if let Some(open_pr) = prs
+                        .into_iter()
+                        .filter(|p| p.number != number && pr_ops::pr_matches_branch(p, &ws.branch))
+                        .max_by_key(|p| p.number)
+                    {
+                        let open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                        ws.pr_number = Some(open_pr.number);
+                        ws.pr_url = Some(open_pr.url.clone());
+                        ws.pr_status = Some(open_info.status);
+                        ws.active_pull_request = Some(open_info);
+                        ws.updated_at = now_iso();
+                        self.store.update_workspace(&ws).await?;
+                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                        return Ok(PrRefreshOutcome::Linked);
+                    }
+                }
+                let changed = list_changed
+                    || ws.pr_status != Some(info.status)
                     || ws.active_pull_request.as_ref() != Some(&info)
                     || ws.pr_url.as_deref() != Some(pr.url.as_str());
                 if !changed {
@@ -1489,6 +1543,7 @@ impl Services {
                 {
                     Some(pr) => {
                         let info = pr_ops::build_pr_info(&pr);
+                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                         ws.pr_number = Some(pr.number);
                         ws.pr_url = Some(pr.url.clone());
                         ws.pr_status = Some(info.status);
@@ -1903,6 +1958,24 @@ impl Services {
         let Some(group) = self.take_group_if_ready(workspace_id, group_id).await else {
             return;
         };
+        // STAB-129: settle the group's watches BEFORE the wake delivery await.
+        // A member recorded via `agent:failed` (e.g. the `session/prompt` idle
+        // timeout firing mid-turn) may still be working and settle for real
+        // later; dropping every group watch here would leave the parent with
+        // no wake path for that late settlement. `settle_group_watches`
+        // atomically converts each failed-not-deleted member's grouped watch
+        // into an ungrouped oneShot watch (and drops the rest), so there is no
+        // window in which the child has neither a live group nor a watch.
+        let failed_children = failed_group_children(&group);
+        let retained = self.settle_group_watches(workspace_id, group_id, &failed_children);
+        if retained > 0 {
+            tracing::info!(
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                retained,
+                "retained oneShot watch(es) for failed group member(s) after settlement"
+            );
+        }
         let wake = format_group_wake(&group);
         let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
         let metadata = build_event_notification_metadata(&event_refs);
@@ -1922,7 +1995,6 @@ impl Services {
                 "failed to deliver aggregated after_all wake to parent"
             );
         }
-        self.remove_group_watches(workspace_id, group_id);
         self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
             .await;
     }
@@ -4097,7 +4169,8 @@ fn git_commit_event(
 
 /// Build a `pr:linked` event for a workspace that just gained a PR link (§7.6).
 /// Self-sufficient payload `{ workspaceId, prNumber, prUrl, prStatus,
-/// activePullRequest }` so a client can render the link without a follow-up read.
+/// activePullRequest, pullRequests }` so a client can render the link — and the
+/// full daemon-owned PR list — without a follow-up read.
 fn pr_linked_event(ws: &Workspace) -> NewEvent {
     NewEvent {
         workspace_id: ws.id.clone(),
@@ -4114,12 +4187,16 @@ fn pr_linked_event(ws: &Workspace) -> NewEvent {
             "prUrl": ws.pr_url,
             "prStatus": ws.pr_status,
             "activePullRequest": ws.active_pull_request,
+            // Always an array on the wire — never null — so clients can
+            // treat the list as required.
+            "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
         }),
     }
 }
 
 /// Build a `pr:updated` event for a linked PR whose persisted snapshot changed
-/// (§7.6). Payload `{ workspaceId, prNumber, prStatus, activePullRequest }`.
+/// (§7.6). Payload `{ workspaceId, prNumber, prStatus, activePullRequest,
+/// pullRequests }`.
 fn pr_updated_event(ws: &Workspace) -> NewEvent {
     NewEvent {
         workspace_id: ws.id.clone(),
@@ -4135,6 +4212,9 @@ fn pr_updated_event(ws: &Workspace) -> NewEvent {
             "prNumber": ws.pr_number,
             "prStatus": ws.pr_status,
             "activePullRequest": ws.active_pull_request,
+            // Always an array on the wire — never null — so clients can
+            // treat the list as required.
+            "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
         }),
     }
 }
@@ -4511,6 +4591,24 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| event.actor.id.clone())
+}
+
+/// STAB-129: the group members whose recorded terminal event was
+/// `agent:failed` and that were not deleted — the candidates whose grouped
+/// watch is retained (as an ungrouped oneShot) across settlement because the
+/// underlying agent may still be working and settle for real later. The
+/// `deleted_agent_ids` guard is defensive: `record_group_child_completion`
+/// records at most one terminal event per child, so a deleted member's raw
+/// event is `agent:deleted`, which the type filter already excludes.
+fn failed_group_children(group: &agent_subscriptions::DelegationGroup) -> Vec<AgentId> {
+    group
+        .raw_events
+        .iter()
+        .filter(|e| e.event_type == AGENT_FAILED)
+        .filter_map(|e| completion_event_child_id(e))
+        .map(AgentId::from)
+        .filter(|id| !group.deleted_agent_ids.contains(id))
+        .collect()
 }
 
 /// Build a concise, human-readable wake string describing a child agent's
@@ -8084,7 +8182,7 @@ impl WorkspaceApi for Services {
     fn save_repo_config(
         &self,
         id: WorkspaceId,
-        config: intent_core::RepoConfig,
+        config: serde_json::Map<String, serde_json::Value>,
     ) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -8094,8 +8192,7 @@ impl WorkspaceApi for Services {
                     "Cannot save repo config: workspace has no repository path".to_string(),
                 ));
             };
-            repo_config::write_repo_config(&repo_path, config.clone()).await?;
-            Ok(config)
+            repo_config::merge_repo_config(&repo_path, config).await
         })
     }
 
@@ -14615,6 +14712,7 @@ impl Services {
             .map_err(pr_ops::map_sc_err)?;
 
         let info = pr_ops::build_pr_info(&pr);
+        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
         ws.pr_number = Some(pr.number);
         ws.pr_url = Some(pr.url.clone());
         ws.pr_status = Some(info.status);
@@ -14654,6 +14752,11 @@ impl Services {
                 ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
                 if let Some(info) = ws.active_pull_request.as_mut() {
                     info.status = intent_core::PullRequestStatus::Merged;
+                }
+                // Mirror the merged status into the daemon-owned list so the
+                // pr:updated payload below is internally consistent.
+                if let Some(info) = ws.active_pull_request.clone() {
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;
