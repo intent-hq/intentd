@@ -6716,3 +6716,158 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     assert_eq!(evt.data["queue"].as_array().unwrap().len(), 1);
     assert_eq!(evt.data["queue"][0]["requeuedAfterFailure"], true);
 }
+
+/// STAB-129 regression: a delegation group settling with a failed (not
+/// deleted) child must not leave the parent with zero wake paths for that
+/// child. Observed 2026-07-20: a grouped child hit the `session/prompt` idle
+/// timeout mid-turn (`agent:failed`) while its underlying work was still
+/// running; the group settled, group-watch removal dropped every parent
+/// watch, and the child's eventual real completion (after a resume) never
+/// woke the parent.
+///
+/// After the fix, `settle_group_watches` ensures each failed-not-deleted
+/// member keeps exactly one ungrouped wake path at settlement time (before
+/// the wake delivery await): the grouped watch is converted into an ungrouped
+/// oneShot watch, unless a live ungrouped watch for the pair already exists,
+/// in which case the grouped watch is simply dropped. Either way the child's
+/// later settlement still wakes the parent.
+#[tokio::test]
+async fn group_settle_with_failed_child_reestablishes_parent_watch() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // Delegate 2 children with after_all.
+    let resp1 = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("child A task".into()),
+                wait_mode: Some("after_all".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate child A");
+    let child_a = AgentId::from(resp1["agentId"].as_str().expect("agentId"));
+    let resp2 = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("child B task".into()),
+                wait_mode: Some("after_all".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate child B");
+    let child_b = AgentId::from(resp2["agentId"].as_str().expect("agentId"));
+
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // Child A completes normally; child B "fails" via the prompt idle timeout
+    // (the exact error shape run_prompt_turn publishes on a timed-out turn).
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child_a,
+        json!({ "agentId": child_a.0.clone(), "lastResponseSummary": "child A done" }),
+    )
+    .await;
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_FAILED,
+        &child_b,
+        json!({
+            "agentId": child_b.0.clone(),
+            "error": "session/prompt failed: request `session/prompt idle timeout (1800s of silence)` timed out",
+        }),
+    )
+    .await;
+    wait_for_group_children(&svc, &ws, &parent, 2).await;
+
+    // Seal the group by publishing parent idle (its delegating turn ended).
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0.clone(), "lastResponseSummary": "coordination done" }),
+    )
+    .await;
+
+    // The group settles: exactly one aggregated wake reaches the parent.
+    wait_for_message_count(&svc, &parent, baseline + 1).await;
+    let msgs = parent_messages_text(&svc, &parent).await;
+    assert!(
+        msgs.contains("All 2 delegated child agent(s) settled"),
+        "aggregated wake expected, got: {msgs}"
+    );
+
+    // REGRESSION ASSERTION: settlement must leave the parent an ungrouped
+    // oneShot watch on the failed child (and none on the completed one), so
+    // the failed-but-possibly-still-working child's later settlement wakes it.
+    // try_fire_group swaps the watches before the wake-delivery await, but the
+    // transcript write we synchronized on above is a separate async step, so
+    // poll until the registry reaches its settled state.
+    let watches = timeout(Duration::from_secs(2), async {
+        loop {
+            let watches = svc.list_watches_for_parent(&ws, &parent);
+            let settled = watches.iter().all(|w| w.group_id.is_none())
+                && watches.iter().any(|w| w.child_agent_id == child_b);
+            if settled {
+                return watches;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("failed-child watch re-established after group settlement");
+    assert!(
+        !watches.iter().any(|w| w.child_agent_id == child_a),
+        "no watch should be retained for the successfully completed child"
+    );
+    let retained: Vec<_> = watches
+        .iter()
+        .filter(|w| w.child_agent_id == child_b)
+        .collect();
+    assert_eq!(
+        retained.len(),
+        1,
+        "exactly one watch retained for the failed child, got: {watches:?}"
+    );
+    assert!(retained[0].one_shot, "retained watch must be oneShot");
+    assert!(
+        retained[0].group_id.is_none(),
+        "retained watch must be ungrouped (the group is gone)"
+    );
+
+    // The failed child later genuinely completes (e.g. resumed via sendToTask):
+    // its agent:idle must wake the parent again through the retained watch.
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child_b,
+        json!({ "agentId": child_b.0.clone(), "lastResponseSummary": "child B really done" }),
+    )
+    .await;
+    wait_for_message_count(&svc, &parent, baseline + 2).await;
+    let msgs = parent_messages_text(&svc, &parent).await;
+    assert!(
+        msgs.contains("child B really done"),
+        "late completion wake expected, got: {msgs}"
+    );
+
+    // The oneShot watch is consumed by the delivery.
+    let watches_after = svc.list_watches_for_parent(&ws, &parent);
+    assert!(
+        !watches_after.iter().any(|w| w.child_agent_id == child_b),
+        "oneShot watch removed after the late completion delivered"
+    );
+}

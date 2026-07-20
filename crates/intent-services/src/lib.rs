@@ -1958,6 +1958,24 @@ impl Services {
         let Some(group) = self.take_group_if_ready(workspace_id, group_id).await else {
             return;
         };
+        // STAB-129: settle the group's watches BEFORE the wake delivery await.
+        // A member recorded via `agent:failed` (e.g. the `session/prompt` idle
+        // timeout firing mid-turn) may still be working and settle for real
+        // later; dropping every group watch here would leave the parent with
+        // no wake path for that late settlement. `settle_group_watches`
+        // atomically converts each failed-not-deleted member's grouped watch
+        // into an ungrouped oneShot watch (and drops the rest), so there is no
+        // window in which the child has neither a live group nor a watch.
+        let failed_children = failed_group_children(&group);
+        let retained = self.settle_group_watches(workspace_id, group_id, &failed_children);
+        if retained > 0 {
+            tracing::info!(
+                parent = %group.parent_agent_id.0,
+                group = %group_id,
+                retained,
+                "retained oneShot watch(es) for failed group member(s) after settlement"
+            );
+        }
         let wake = format_group_wake(&group);
         let event_refs: Vec<&Event> = group.raw_events.iter().map(|e| e.as_ref()).collect();
         let metadata = build_event_notification_metadata(&event_refs);
@@ -1977,7 +1995,6 @@ impl Services {
                 "failed to deliver aggregated after_all wake to parent"
             );
         }
-        self.remove_group_watches(workspace_id, group_id);
         self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
             .await;
     }
@@ -4574,6 +4591,24 @@ fn completion_event_child_id(event: &Event) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .or_else(|| event.actor.id.clone())
+}
+
+/// STAB-129: the group members whose recorded terminal event was
+/// `agent:failed` and that were not deleted — the candidates whose grouped
+/// watch is retained (as an ungrouped oneShot) across settlement because the
+/// underlying agent may still be working and settle for real later. The
+/// `deleted_agent_ids` guard is defensive: `record_group_child_completion`
+/// records at most one terminal event per child, so a deleted member's raw
+/// event is `agent:deleted`, which the type filter already excludes.
+fn failed_group_children(group: &agent_subscriptions::DelegationGroup) -> Vec<AgentId> {
+    group
+        .raw_events
+        .iter()
+        .filter(|e| e.event_type == AGENT_FAILED)
+        .filter_map(|e| completion_event_child_id(e))
+        .map(AgentId::from)
+        .filter(|id| !group.deleted_agent_ids.contains(id))
+        .collect()
 }
 
 /// Build a concise, human-readable wake string describing a child agent's

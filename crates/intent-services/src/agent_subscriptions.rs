@@ -614,8 +614,24 @@ impl Services {
         Some(group)
     }
 
-    /// Drop every completion watch carrying `group_id`; returns the count removed.
-    pub(crate) fn remove_group_watches(&self, workspace_id: &WorkspaceId, group_id: &str) -> usize {
+    /// Settle a delivered group's watches in one atomic registry pass: every
+    /// completion watch carrying `group_id` is dropped, EXCEPT that watches on
+    /// children listed in `retain_children` are converted in place into
+    /// ungrouped oneShot watches (STAB-129: failed-not-deleted members may
+    /// still be working, and their eventual real settlement must keep a wake
+    /// path to the parent). Conversion dedupes against any live ungrouped
+    /// watch for the same parent→child pair — oneShot or not (e.g. a SUB-1
+    /// sendToTask auto-watch or a queued non-oneShot `wakeOrCreate` watch
+    /// racing settlement) — since either already gives the parent a wake path,
+    /// so the late settlement delivers exactly one wake. Returns the number of
+    /// watches retained.
+    pub(crate) fn settle_group_watches(
+        &self,
+        workspace_id: &WorkspaceId,
+        group_id: &str,
+        retain_children: &[AgentId],
+    ) -> usize {
+        let retain_set: std::collections::HashSet<&AgentId> = retain_children.iter().collect();
         let mut guard = self
             .agent_subscriptions
             .lock()
@@ -623,10 +639,29 @@ impl Services {
         let Some(w) = guard.get_mut(workspace_id) else {
             return 0;
         };
-        let before = w.subscriptions.len();
-        w.subscriptions
-            .retain(|s| s.group_id.as_deref() != Some(group_id));
-        before - w.subscriptions.len()
+        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = w
+            .subscriptions
+            .iter()
+            .filter(|s| s.group_id.is_none())
+            .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
+            .collect();
+        let mut retained = 0;
+        w.subscriptions.retain_mut(|s| {
+            if s.group_id.as_deref() != Some(group_id) {
+                return true;
+            }
+            if retain_set.contains(&s.child_agent_id) {
+                let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
+                if kept.insert(pair) {
+                    s.group_id = None;
+                    s.one_shot = true;
+                    retained += 1;
+                    return true;
+                }
+            }
+            false
+        });
+        retained
     }
 
     /// All delegation groups parented by `parent_id` (read snapshot for
