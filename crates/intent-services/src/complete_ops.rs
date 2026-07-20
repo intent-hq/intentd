@@ -227,10 +227,11 @@ mod tests {
         let fake = fake_auggie("setting", "printf 'from-setting\\n'");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-completeops-{}.toml", uuid::Uuid::new_v4()));
-        let registry =
-            Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
 
         // Case 1: context.auggiePath set and valid → use it exclusively
         registry

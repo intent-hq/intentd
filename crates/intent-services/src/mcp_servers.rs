@@ -987,10 +987,11 @@ mod tests {
         assert_eq!(got, m);
     }
 
-    /// Fresh registry over a unique temp `config.toml` path.
-    fn temp_registry() -> SettingsRegistry {
-        let path = std::env::temp_dir().join(format!("intentd-mcp-{}.toml", Uuid::new_v4()));
-        SettingsRegistry::load(&path).expect("load registry")
+    /// Fresh registry over a `config.toml` in a self-cleaning temp dir.
+    fn temp_registry() -> (SettingsRegistry, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let reg = SettingsRegistry::load(&dir.path().join("config.toml")).expect("load registry");
+        (reg, dir)
     }
 
     #[test]
@@ -1000,7 +1001,7 @@ mod tests {
 
     #[test]
     fn enable_user_servers_reads_false() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
         assert!(!enable_user_servers(&reg.snapshot().effective));
@@ -1013,7 +1014,7 @@ mod tests {
 
     #[test]
     fn disabled_servers_round_trip_via_setter() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let list = vec!["a".to_string(), "b".to_string()];
         set_disabled_servers(Some(&reg), &list).unwrap();
         let got = disabled_servers(&reg.snapshot().effective);
@@ -1289,7 +1290,7 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_enable_with_user_servers_off_returns_stopped_and_persists_flag() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         let s = svc(Some(&reg), &secrets, &h);
@@ -1312,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_disable_emits_stopped_and_tracks_disabled_list() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         let s = svc(Some(&reg), &secrets, &h);
@@ -1335,7 +1336,7 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_enable_removes_id_from_disabled_list() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         let s = svc(Some(&reg), &secrets, &h);
@@ -1374,7 +1375,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_returns_stopped_when_user_servers_gate_off() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         let s = svc(Some(&reg), &secrets, &h);
@@ -1412,7 +1413,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_enabled_no_op_when_gate_off() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         // Even a config that would normally be started is skipped.
@@ -1432,7 +1433,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_enabled_skips_disabled_ids_and_disabled_configs() {
-        let reg = temp_registry();
+        let (reg, _cfg) = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         let mut m = Map::new();

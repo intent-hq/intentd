@@ -3466,21 +3466,32 @@ mod merge_user_mcp_servers_tests {
     use intent_acp::EventSink;
     use intent_store::Store;
 
-    async fn manager_with_secrets() -> (TempDb, AgentManager, Arc<InMemorySecretStore>) {
+    async fn manager_with_secrets() -> (
+        TempDb,
+        AgentManager,
+        Arc<InMemorySecretStore>,
+        tempfile::TempDir,
+    ) {
         let tmp = super::TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let secrets = Arc::new(InMemorySecretStore::default());
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-merge-mcp-{}.toml", uuid::Uuid::new_v4()));
-        let registry =
-            Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = Arc::new(
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
         let services = Services::new(store)
             .with_event_bus(bus.clone())
             .with_secret_store(secrets.clone() as Arc<dyn SecretStore>)
             .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-        (tmp, AgentManager::new(services, sink, 8), secrets)
+        (
+            tmp,
+            AgentManager::new(services, sink, 8),
+            secrets,
+            config_dir,
+        )
     }
 
     fn write_servers(secrets: &InMemorySecretStore, servers: serde_json::Value) {
@@ -3491,7 +3502,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn skips_when_enable_user_servers_disabled() {
-        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
             json!({ "srv-1": { "id": "srv-1", "name": "u", "transport": "stdio",
@@ -3509,7 +3520,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn merges_enabled_stdio_server_by_name() {
-        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
             json!({
@@ -3535,7 +3546,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn skips_disabled_and_globally_disabled_servers() {
-        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
             json!({
@@ -3562,7 +3573,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn injects_oauth_authorization_header_for_http() {
-        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
             json!({
@@ -3602,7 +3613,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn preserves_existing_authorization_header() {
-        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
             json!({
@@ -3638,7 +3649,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn does_not_overwrite_reserved_workspace_mcp() {
-        let (_tmp, mgr, secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, secrets, _cfg) = manager_with_secrets().await;
         write_servers(
             &secrets,
             json!({
@@ -3666,7 +3677,7 @@ mod merge_user_mcp_servers_tests {
 
     #[tokio::test]
     async fn empty_secret_is_a_noop() {
-        let (_tmp, mgr, _secrets) = manager_with_secrets().await;
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
         let mut out = NormalizedMcpServers::new();
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
         assert!(out.is_empty());

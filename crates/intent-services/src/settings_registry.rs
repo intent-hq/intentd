@@ -388,6 +388,11 @@ impl SettingsRegistry {
         let mut inner = self.inner.lock().expect("settings registry lock poisoned");
         inner.file = file;
         inner.doc = doc;
+        // The accepted external edit supersedes the last self-write: clear the
+        // stamp so a later external edit that happens to match those earlier
+        // self-written bytes (e.g. a manual revert) is not misclassified as a
+        // self-write and skipped by the watcher.
+        inner.last_write = None;
         self.publish(&inner)
     }
 

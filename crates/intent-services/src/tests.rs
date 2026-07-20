@@ -10470,10 +10470,10 @@ mod worktree_provisioning {
     async fn create_names_branch_from_prompt_with_prefix_and_suffix() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-wtslug-{}.toml", uuid::Uuid::new_v4()));
+        let config_dir = tempfile::tempdir().expect("temp config dir");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(&config_path).expect("load registry"),
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
         );
         registry
             .apply(&[(
@@ -10518,10 +10518,10 @@ mod worktree_provisioning {
     async fn create_keeps_explicit_branch_untouched() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-wtexpl-{}.toml", uuid::Uuid::new_v4()));
+        let config_dir = tempfile::tempdir().expect("temp config dir");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(&config_path).expect("load registry"),
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
         );
         registry
             .apply(&[(
