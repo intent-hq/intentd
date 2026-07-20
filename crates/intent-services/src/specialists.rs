@@ -391,7 +391,13 @@ impl SpecialistsService {
     /// Resolve a single id through the 3-tier order project > user > bundled.
     /// Within the bundled tier an on-disk file wins over the embedded copy;
     /// the compile-time [`EMBEDDED_BUNDLED`] set is the always-available floor.
+    /// SECURITY: validates the id before file access to prevent path traversal
+    /// (review thread PRRT_kwDOS9Wxuc6SIlcV).
     fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
+        // Validate id before passing to load_from_dir to prevent path traversal
+        // attacks on ALL frontmatter lookups (resolve_agent_type, resolve_model,
+        // resolve_role_reminder, resolve_prompt_injection).
+        validate_id(id).ok()?;
         if let Some(wp) = workspace_path {
             if let Some(def) = Self::load_from_dir(&project_dir(wp), id, "project") {
                 return Some(def);
@@ -422,6 +428,20 @@ impl SpecialistsService {
     ) -> Option<String> {
         self.resolve(id, workspace_path).and_then(|def| {
             def.get("agentType")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
+    /// Resolve a specialist's `model` frontmatter scalar through the 3-tier
+    /// order (project > user > bundled), used at spawn time when no explicit
+    /// model parameter is supplied. Returns `None` when the specialist is
+    /// unknown or declares no `model`, allowing the caller to fall through to
+    /// the settings chain. Validation is now performed inside resolve().
+    pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("model")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)

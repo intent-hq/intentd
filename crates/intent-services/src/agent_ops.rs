@@ -56,6 +56,9 @@ mod tests_stab28;
 #[cfg(test)]
 mod tests_stab115;
 
+#[cfg(test)]
+mod tests_specialist_frontmatter;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (documented in the task):
 /// 1. `model.workspaceOverrides[workspaceId]`
@@ -1111,12 +1114,13 @@ impl Services {
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
         // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
         // `isBackground`/`source`/`skipAutoCommit` without a follow-up round-trip.
-        // `agent_type`, `workspace_path`, `workspace_context` remain deferred.
+        // `workspace_path` is now used for project-tier specialist resolution;
+        // `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
             agent_type: _,
             metadata,
-            workspace_path: _,
+            workspace_path: _, // Ignored; derived from workspace record for security
             workspace_context: _,
             context_references,
             image_blocks,
@@ -1146,26 +1150,53 @@ impl Services {
         // The resolved model is persisted to session.model, pinning it for the
         // agent's lifetime. Settings changes only affect new agents created
         // afterwards; existing agents change model only via explicit agent.setModel.
+        //
+        // Precedence: explicit model > specialist frontmatter model > settings chain
         let resolved_model = match model {
             Some(m) => Some(m),
             None => {
-                // Pass `specialist` as the agent_type parameter for
-                // backgroundAgents.typeOverrides lookup. The specialist value
-                // (e.g., "implementor", "verifier") is used as-is in the override
-                // map. When `specialist` is None, the type-specific override is
-                // skipped and we fall through to backgroundAgents.defaultModel or
-                // model.default. A full solution would require passing the derived
-                // agent_type through AgentCreateExtra, but that's outside this
-                // task's scope and the current specialist-based lookup covers the
-                // common case.
-                resolve_default_model_from_settings(
-                    self,
-                    &workspace_id,
-                    is_background,
-                    specialist.as_deref(),
-                    provider.as_deref(),
-                )
-                .await
+                // Try specialist frontmatter model first (3-tier: project > user > bundled)
+                let specialist_model = if let Some(spec_id) = specialist.as_deref() {
+                    let specialists_svc = self.specialists_service();
+                    // SECURITY: derive workspace_path from the stored workspace record
+                    // rather than trusting the client-supplied value (review thread
+                    // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
+                    // workspacePath and read specialist files from other workspaces.
+                    // Use worktree_path if available, otherwise repository_path.
+                    let wp = self
+                        .store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .ok()
+                        .and_then(|w| crate::git_ops::worktree_path(&w));
+                    specialists_svc.resolve_model(spec_id, wp.as_deref())
+                } else {
+                    None
+                };
+
+                // If specialist declares a model, use it; otherwise fall through to settings
+                match specialist_model {
+                    Some(m) => Some(m),
+                    None => {
+                        // Pass `specialist` as the agent_type parameter for
+                        // backgroundAgents.typeOverrides lookup. The specialist value
+                        // (e.g., "implementor", "verifier") is used as-is in the override
+                        // map. When `specialist` is None, the type-specific override is
+                        // skipped and we fall through to backgroundAgents.defaultModel or
+                        // model.default. A full solution would require passing the derived
+                        // agent_type through AgentCreateExtra, but that's outside this
+                        // task's scope and the current specialist-based lookup covers the
+                        // common case.
+                        resolve_default_model_from_settings(
+                            self,
+                            &workspace_id,
+                            is_background,
+                            specialist.as_deref(),
+                            provider.as_deref(),
+                        )
+                        .await
+                    }
+                }
             }
         };
 
