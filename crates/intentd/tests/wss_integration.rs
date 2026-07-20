@@ -934,6 +934,39 @@ async fn wss_agent_enhance_prompt_round_trip() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn wss_agent_enhance_prompt_unavailable_when_provider_not_auggie() {
+    // Provider-neutrality gate: with a non-auggie active provider,
+    // agent.enhancePrompt returns a typed `{ available: false, reason }`
+    // result instead of an error, so the FE can hide the affordance.
+    let bin = fake_auggie_script(
+        "gated-enhance",
+        "printf '🤖\\n<augment-enhanced-prompt>never runs</augment-enhanced-prompt>\\n'",
+    );
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.store
+        .set_setting("providers.active", "\"claude-code\"")
+        .await
+        .expect("set active provider");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":34,"method":"agent.enhancePrompt","params":{"prompt":"ship it"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 34);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "enhance-prompt requires auggie as the active provider"
+        })
+    );
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // A reply without the `<augment-enhanced-prompt>` tags in enhance mode is
     // the documented -32603 parse failure (§5.31).
@@ -1038,6 +1071,36 @@ async fn wss_agent_complete_once_round_trip() {
     assert_eq!(resp["id"], 41);
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["result"]["text"], "fix-login-flow");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_agent_complete_once_unavailable_when_provider_not_auggie() {
+    // Provider-neutrality gate: with a non-auggie active provider,
+    // agent.completeOnce returns a typed `{ available: false, reason }`
+    // result instead of an error.
+    let bin = fake_auggie_script("gated-complete", "printf '🤖\\nnever-runs\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.store
+        .set_setting("providers.active", "\"claude-code\"")
+        .await
+        .expect("set active provider");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":44,"method":"agent.completeOnce","params":{"prompt":"slug"}}"#,
+    )
+    .await;
+    assert_eq!(resp["id"], 44);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({
+            "available": false,
+            "reason": "completeOnce requires auggie as the active provider"
+        })
+    );
     srv.ws.stop().await;
 }
 

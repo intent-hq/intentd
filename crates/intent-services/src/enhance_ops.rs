@@ -277,7 +277,8 @@ impl Services {
         let active_provider = match self.store.get_setting("providers.active").await {
             Ok(Some(json_str)) => serde_json::from_str::<serde_json::Value>(&json_str)
                 .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
+                .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "auggie".to_string()),
             _ => "auggie".to_string(), // Default to auggie when setting is unset
         };

@@ -174,8 +174,13 @@ fn load_workspace_rules(
     if parts.is_empty() {
         None
     } else {
-        // Use .intent/rules as the primary source dir for reporting
-        let dir = workspace_path.join(".intent").join("rules");
+        // Report the dir that actually contributed content; prefer .intent/rules
+        // when both tiers contributed.
+        let dir = if files.iter().any(|f| f.source.starts_with(".intent/rules/")) {
+            workspace_path.join(".intent").join("rules")
+        } else {
+            workspace_path.join(".augment").join("rules")
+        };
         Some((
             parts.join("\n\n---\n\n"),
             dir.to_string_lossy().into_owned(),
