@@ -269,7 +269,6 @@ mod tests {
         // (skip this case since a real auggie on the system would make it nondeterministic)
 
         std::fs::remove_file(&fake).ok();
-        std::fs::remove_file(&config_path).ok();
     }
 
     #[tokio::test]
