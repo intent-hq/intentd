@@ -43,6 +43,24 @@ fn resolve_provider_id_bare_model_none_provider_uses_default() {
 }
 
 #[test]
+fn resolve_provider_id_malformed_compound_falls_back() {
+    // Malformed compound id like ":sonnet" yields empty prefix -> falls back to provider field
+    let provider_id = resolve_provider_id(Some(":sonnet"), Some("codex"));
+    assert_eq!(
+        provider_id, "codex",
+        "malformed compound :sonnet falls back to provider field"
+    );
+
+    // Malformed compound with no provider field -> default
+    let provider_id = resolve_provider_id(Some(":sonnet"), None);
+    assert_eq!(
+        provider_id,
+        intent_providers::default_provider_id(),
+        "malformed compound :sonnet with no provider -> default"
+    );
+}
+
+#[test]
 fn claude_code_meta_appends_system_prompt() {
     let meta = build_session_meta("claude-code", Some("Test prompt"));
     assert!(meta.is_some(), "claude-code gets _meta");

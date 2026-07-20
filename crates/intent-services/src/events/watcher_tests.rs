@@ -248,26 +248,36 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
                     }
                 }
             }
-            _ => {
+            Ok(None) => {
+                // Subscription closed unexpectedly
+                if !seen_burst {
+                    panic!(
+                        "Event subscription closed before burst was observed; \
+                         got {} events total",
+                        events.len()
+                    );
+                }
+                break;
+            }
+            Err(_) => {
+                // Timeout
                 if seen_burst {
+                    // Quiet period after burst => done collecting
                     break;
                 }
+                // else keep polling until deadline
             }
         }
     }
 
-    // Under extreme load (coverage instrumentation on a slow machine), the FS
-    // watcher's notify callbacks may not fire at all, or may deliver only a few
-    // events before the system stalls. If we received very few events (< 10),
-    // it's a system-level stall, not a watcher bug. Skip validation in that case.
-    if events.len() < 10 {
-        eprintln!(
-            "WARNING: FS watcher delivered only {} events within 15s timeout - \
-             system is under extreme load, skipping test",
-            events.len()
-        );
-        return;
-    }
+    // The test requires a burst event to have been seen. If the system is under such
+    // extreme load that the FS watcher never delivered the burst, fail explicitly.
+    assert!(
+        seen_burst,
+        "FS watcher did not deliver a burst event within 15s; \
+         got {} events total (system may be under extreme load, but the test cannot pass)",
+        events.len()
+    );
 
     // Should have emitted fewer events than the 150 individual files.
     // When burst threshold is exceeded, we emit per-directory summaries instead.

@@ -278,9 +278,11 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 }
 
 /// Resolve the effective provider id for an agent session using the same precedence
-/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:`) →
-/// `provider` field → default provider. This ensures `_meta` injection, spawn args,
-/// and all provider-keyed logic use a consistent provider id.
+/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
+/// yields a non-empty provider) → `provider` field → default provider. Malformed
+/// compound ids like `:sonnet` yield an empty prefix and fall through to the provider
+/// field / default. This ensures `_meta` injection, spawn args, and all provider-keyed
+/// logic use a consistent provider id.
 fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
     model
         .filter(|m| m.contains(':'))
