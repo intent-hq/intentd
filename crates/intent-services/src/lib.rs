@@ -151,6 +151,11 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Serializes [`agent_ops`] queue write-through persists. Each persist
+    /// snapshots the live queue *inside* this async lock, so the last write to
+    /// the `agent_queue` table always reflects the newest in-memory state — an
+    /// older snapshot can never overwrite a newer one out of mutation order.
+    agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last per-session stats snapshot observed by `agent.getSessionStats`
     /// (PROTOCOL §5.24). The `stats` field on `AgentSession` is derived/not
     /// persisted, so this in-memory cache lets a refresh detect a change and push
@@ -347,6 +352,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
             auggie_bin: None,
@@ -11822,6 +11828,71 @@ impl WorkspaceApi for Services {
                         options.file_blocks,
                     )
                     .await
+                }
+            }
+        })
+    }
+
+    fn agent_edit_and_regenerate(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        model: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let options = crate::agent_manager::TurnOptions {
+                image_blocks,
+                file_blocks,
+                ..Default::default()
+            };
+            match self.agent_manager() {
+                Some(manager) => {
+                    manager
+                        .edit_and_regenerate(
+                            agent_id,
+                            workspace_id,
+                            message_id,
+                            content,
+                            model,
+                            options,
+                        )
+                        .await
+                }
+                None => {
+                    // Store-level fallback (no `agent_manager` wired — UDS unit
+                    // harnesses): validate + optional model switch + truncate +
+                    // persist the edited message, without the runtime
+                    // stop/recreate/regenerate orchestration (which requires a
+                    // live manager).
+                    self.agent_validate_edit_target_op(&agent_id, &message_id)
+                        .await?;
+                    if let Some(model_id) = model {
+                        self.agent_set_model_op(agent_id.clone(), model_id).await?;
+                    }
+                    let truncated_count =
+                        self.agent_edit_truncate_op(&agent_id, &message_id).await?;
+                    let result = self
+                        .agent_send_message_op(
+                            agent_id,
+                            content,
+                            None,
+                            options.image_blocks,
+                            options.file_blocks,
+                            None,
+                        )
+                        .await?;
+                    let mut result = result;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert(
+                            "truncatedCount".to_string(),
+                            serde_json::json!(truncated_count),
+                        );
+                    }
+                    Ok(result)
                 }
             }
         })

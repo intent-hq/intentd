@@ -6893,3 +6893,513 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
         "explicit messageMetadata must win over the auto-tag: {row}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// agent.editAndRegenerate (PROTOCOL §5.5 extension)
+// ---------------------------------------------------------------------------
+
+/// `agent.editAndRegenerate` happy path over WSS: after two full turns, edit
+/// the SECOND user message. The transcript truncates to just before it
+/// (`agent:updated { truncatedCount: 2 }`), the ACP session is recreated, and
+/// the regenerated turn's outbound prompt replays the kept prefix as
+/// `<supervisor>` XML with the edited text — WITHOUT the truncated content
+/// (asserted via the mock fixture's `MOCK_AGENT_PROMPT_LOG` seam).
+#[tokio::test]
+async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
+    let Some(script) = gate("WSS editAndRegenerate happy-path E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "the answer" }).to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Edit", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Two full turns so there is a kept prefix AND a truncated tail.
+    for (rpc_id, content) in [(11, "first question"), (12, "second question")] {
+        let sent = wss_rpc(
+            &mut rpc,
+            rpc_id,
+            "agent.sendMessage",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
+        )
+        .await;
+        assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+        let mut saw_end = false;
+        for _ in 0..80 {
+            let frame = wss_event(&mut sub, 30).await;
+            if frame["params"]["event"]["type"] == "agent:stream:end" {
+                saw_end = true;
+                break;
+            }
+        }
+        assert!(saw_end, "turn '{content}' completed");
+    }
+
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 4, "two full exchanges persisted: {conv}");
+    assert_eq!(messages[2]["role"], "user");
+    let edit_target = messages[2]["id"].as_str().expect("target id").to_string();
+
+    let edited = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.editAndRegenerate",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "messageId": edit_target,
+            "content": "edited question",
+        }),
+    )
+    .await;
+    assert_eq!(edited["success"], true, "editAndRegenerate ok: {edited}");
+    assert_eq!(
+        edited["truncatedCount"],
+        json!(2),
+        "edited user message + trailing assistant truncated: {edited}"
+    );
+
+    // The truncation emits `agent:updated { truncatedCount }`; the regenerated
+    // turn then streams and ends.
+    let mut saw_truncation_update = false;
+    let mut saw_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        match event["type"].as_str() {
+            Some("agent:updated") if event["data"]["truncatedCount"] == json!(2) => {
+                saw_truncation_update = true;
+            }
+            Some("agent:stream:end") => {
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_truncation_update,
+        "agent:updated with truncatedCount emitted for the truncation"
+    );
+    assert!(saw_end, "regenerated turn completed");
+
+    // Transcript: kept prefix + edited user + fresh assistant.
+    let conv = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 4, "prefix + edited + regenerated: {conv}");
+    assert_eq!(messages[0]["contentBlocks"][0]["text"], "first question");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(
+        messages[2]["contentBlocks"][0]["text"], "edited question",
+        "edited content persisted as the new user message"
+    );
+    assert_eq!(messages[3]["role"], "assistant");
+
+    // Outbound-prompt contract (fresh session + history replay): the
+    // regenerated turn's prompt carries the kept prefix as `<supervisor>` XML
+    // plus the edited text, and NOT the truncated second exchange.
+    let log = std::fs::read_to_string(&prompt_log).expect("prompt log");
+    let last_prompt: Value =
+        serde_json::from_str(log.lines().last().expect("prompt lines")).expect("prompt log line");
+    let text = last_prompt["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("<supervisor>"),
+        "regenerated prompt replays history as <supervisor> XML: {text}"
+    );
+    assert!(
+        text.contains("first question"),
+        "kept prefix replayed: {text}"
+    );
+    assert!(
+        text.contains("edited question"),
+        "edited content sent: {text}"
+    );
+    assert!(
+        !text.contains("second question"),
+        "truncated content must NOT reach the provider: {text}"
+    );
+}
+
+/// `agent.editAndRegenerate` on a BUSY agent stops the in-flight turn first
+/// (forceMessage stop semantics), then truncates and regenerates — no wedged
+/// state. The first turn parks mid-flight (`parkIfPromptContains`); the edit
+/// lands while it is in flight.
+#[tokio::test]
+async fn edit_and_regenerate_stops_in_flight_turn_over_wss() {
+    let Some(script) = gate("WSS editAndRegenerate busy-agent E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "parkIfPromptContains": "PARK_ME",
+        "response": "regenerated answer",
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Busy", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "please PARK_ME now" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait until the turn is provably in flight.
+    let mut busy = false;
+    for i in 0..100 {
+        let got = wss_rpc(
+            &mut rpc,
+            20 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["turnInFlight"] == true {
+            busy = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(busy, "first turn is in flight (parked by the mock)");
+
+    let conv = wss_rpc(
+        &mut rpc,
+        200,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let target = conv["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("parked user row")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Edit while mid-turn: the daemon must stop the parked turn first.
+    let edited = wss_rpc(
+        &mut rpc,
+        201,
+        "agent.editAndRegenerate",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "messageId": target,
+            "content": "edited while busy",
+        }),
+    )
+    .await;
+    assert_eq!(edited["success"], true, "editAndRegenerate ok: {edited}");
+    assert_eq!(edited["queued"], false, "delivered immediately: {edited}");
+
+    // The regenerated turn streams the mock's response and terminates.
+    let mut saw_regen_chunk = false;
+    let mut saw_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        match event["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if event["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("regenerated answer")
+                {
+                    saw_regen_chunk = true;
+                }
+            }
+            Some("agent:stream:end") if saw_regen_chunk => {
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_regen_chunk, "regenerated turn streamed");
+    assert!(saw_end, "regenerated turn completed");
+
+    // The parked original message was truncated away: edited user + assistant.
+    let conv = wss_rpc(
+        &mut rpc,
+        202,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 2, "old parked message truncated: {conv}");
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["contentBlocks"][0]["text"], "edited while busy");
+    assert_eq!(messages[1]["role"], "assistant");
+
+    // And the agent is not wedged: liveness fields reset.
+    let mut reset = false;
+    for i in 0..40 {
+        let got = wss_rpc(
+            &mut rpc,
+            300 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["turnInFlight"] == false {
+            reset = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(reset, "agent returned to idle after the regenerated turn");
+}
+
+/// Invalid and non-user `messageId` → `-32602` with NO transcript mutation
+/// (PROTOCOL §5.5: validation precedes any state change).
+#[tokio::test]
+async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
+    let Some(script) = gate("WSS editAndRegenerate bad-id E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "fine" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Guard", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut saw_end = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            saw_end = true;
+            break;
+        }
+    }
+    assert!(saw_end, "turn completed");
+
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let before = messages.len();
+    assert!(before >= 2, "user + assistant persisted: {conv}");
+    let assistant_id = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant row")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Unknown messageId → -32602.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        13,
+        "agent.editAndRegenerate",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "messageId": "msg-does-not-exist",
+            "content": "edited",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "unknown messageId is -32602: {resp}"
+    );
+
+    // Non-user messageId → -32602.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        14,
+        "agent.editAndRegenerate",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "messageId": assistant_id,
+            "content": "edited",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "non-user messageId is -32602: {resp}"
+    );
+
+    // No transcript mutation from either rejection.
+    let conv = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        conv["messages"].as_array().expect("messages").len(),
+        before,
+        "transcript untouched by rejected edits: {conv}"
+    );
+}
