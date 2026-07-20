@@ -6313,6 +6313,10 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            // Clone fields for logging (input moves into the closure below).
+            let log_repo_path = input.repository_path.clone();
+            let log_branch = input.branch.clone();
+
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
             let result = with_idempotency(
@@ -7052,6 +7056,18 @@ impl WorkspaceApi for Services {
                 },
             )
             .await;
+
+            // Log workspace.create failures at WARN so they are diagnosable
+            // (STAB-68: iOS saw -32603 with no daemon-side log evidence).
+            if let Err(ref e) = result {
+                tracing::warn!(
+                    method = "workspace.create",
+                    error = %e,
+                    repository_path = ?log_repo_path,
+                    branch = ?log_branch,
+                    "workspace.create failed"
+                );
+            }
             result
         })
     }
