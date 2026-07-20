@@ -3,6 +3,7 @@
 //! `file:*` events (create → `file:created`, delete → `file:deleted`, modify →
 //! `file:changed`) whose payload matches the TS `FileChangedEvent` shape.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use tokio::time::{timeout, Instant};
 
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
-use super::watcher::FileWatcher;
+use super::watcher::{flush_due, Action, FileWatcher};
 
 /// Self-cleaning temp directory (db file + watched workspace root).
 struct TempDir {
@@ -223,6 +224,7 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
     // instrumentation. Exit when we see a burst event followed by 1s of silence,
     // or when we hit the overall deadline.
     let mut events = Vec::new();
+    let start = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut seen_burst = false;
     loop {
@@ -245,6 +247,16 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
                         if ev.data.get("burst").and_then(|v| v.as_bool()) == Some(true) {
                             seen_burst = true;
                         }
+                        eprintln!(
+                            "[STAB-121] +{:>6}ms #{:<3} type={} path={} action={} burst={:?} affected={:?}",
+                            start.elapsed().as_millis(),
+                            events.len(),
+                            ev.event_type,
+                            ev.data["relativePath"],
+                            ev.data["action"],
+                            ev.data.get("burst"),
+                            ev.data.get("affectedCount"),
+                        );
                         events.push(ev);
                     }
                 }
@@ -335,6 +347,179 @@ async fn normal_single_file_edit_still_emits_individual_event() {
         "normal edit should not be a burst event"
     );
     assert_eq!(ev.data["relativePath"], "single.txt");
+}
+
+/// Drain already-published `file:*` events from the subscription; stops after
+/// `quiet` with no new batch. Used by the deterministic `flush_due` tests
+/// below, where every publish has completed before the first `recv`.
+async fn drain_file_events(sub: &mut super::bus::Subscription, quiet: Duration) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(quiet, sub.recv()).await {
+        for ev in batch {
+            if ev.event_type.starts_with("file:") {
+                events.push(ev);
+            }
+        }
+    }
+    events
+}
+
+fn burst_flag(ev: &Event) -> Option<bool> {
+    ev.data.get("burst").and_then(|v| v.as_bool())
+}
+
+fn affected_sum(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .filter_map(|e| e.data.get("affectedCount").and_then(|v| v.as_u64()))
+        .sum()
+}
+
+/// STAB-121 regression: a bulk churn whose per-path deadlines are spread out
+/// (staggered OS delivery / slow publishes) comes due across several flushes
+/// that are each below the burst threshold. The burst decision must look at
+/// the whole pending backlog, not just the instantaneously-due set.
+#[tokio::test]
+async fn backlog_above_threshold_collapses_flush_even_when_due_set_is_small() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let now = Instant::now();
+    let mut pending: HashMap<String, (Action, Instant)> = HashMap::new();
+    // 40 paths already due, 110 more still inside their debounce window:
+    // 150 in-flight total, well above BURST_THRESHOLD (100).
+    for i in 0..40 {
+        pending.insert(
+            format!("due{i:03}.txt"),
+            (Action::Create, now - Duration::from_millis(5)),
+        );
+    }
+    for i in 0..110 {
+        pending.insert(
+            format!("later{i:03}.txt"),
+            (Action::Create, now + Duration::from_secs(60)),
+        );
+    }
+
+    let mut burst_until = None;
+    flush_due(
+        &bus,
+        &WorkspaceId::from("ws-backlog"),
+        &mut pending,
+        &mut burst_until,
+    )
+    .await;
+
+    assert_eq!(pending.len(), 110, "only due paths are flushed");
+    assert!(
+        burst_until.is_some(),
+        "collapsed flush must arm the cooldown"
+    );
+    let events = drain_file_events(&mut sub, Duration::from_millis(300)).await;
+    assert!(!events.is_empty(), "expected directory summaries");
+    for ev in &events {
+        assert_eq!(
+            burst_flag(ev),
+            Some(true),
+            "large backlog must collapse to summaries, got {:?}",
+            ev.data
+        );
+    }
+    assert_eq!(
+        affected_sum(&events),
+        40,
+        "summaries must cover all due paths"
+    );
+}
+
+/// STAB-121 regression: after a burst flush, a trailing wave of the same churn
+/// (e.g. late modify re-notifications) that is below the threshold on its own
+/// must still collapse while the cooldown is active — and refresh it.
+#[tokio::test]
+async fn cooldown_collapses_trailing_wave_below_threshold() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let now = Instant::now();
+    let mut pending: HashMap<String, (Action, Instant)> = HashMap::new();
+    for i in 0..60 {
+        pending.insert(
+            format!("trail{i:03}.txt"),
+            (Action::Modify, now - Duration::from_millis(5)),
+        );
+    }
+
+    let cooldown_end = now + Duration::from_millis(500);
+    let mut burst_until = Some(cooldown_end);
+    flush_due(
+        &bus,
+        &WorkspaceId::from("ws-trail"),
+        &mut pending,
+        &mut burst_until,
+    )
+    .await;
+
+    assert!(pending.is_empty(), "all due paths are flushed");
+    let refreshed = burst_until.expect("cooldown stays armed");
+    assert!(
+        refreshed > cooldown_end,
+        "collapsed flush must refresh the cooldown"
+    );
+    let events = drain_file_events(&mut sub, Duration::from_millis(300)).await;
+    assert!(!events.is_empty(), "expected directory summaries");
+    for ev in &events {
+        assert_eq!(
+            burst_flag(ev),
+            Some(true),
+            "trailing wave inside cooldown must collapse, got {:?}",
+            ev.data
+        );
+    }
+    assert_eq!(affected_sum(&events), 60);
+}
+
+/// A small flush with no backlog and an expired cooldown keeps the normal
+/// per-file behavior.
+#[tokio::test]
+async fn small_flush_after_cooldown_expiry_emits_individual_events() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let now = Instant::now();
+    let mut pending: HashMap<String, (Action, Instant)> = HashMap::new();
+    for i in 0..5 {
+        pending.insert(
+            format!("solo{i}.txt"),
+            (Action::Create, now - Duration::from_millis(5)),
+        );
+    }
+
+    let mut burst_until = Some(now - Duration::from_millis(100));
+    flush_due(
+        &bus,
+        &WorkspaceId::from("ws-solo"),
+        &mut pending,
+        &mut burst_until,
+    )
+    .await;
+
+    assert!(pending.is_empty());
+    let events = drain_file_events(&mut sub, Duration::from_millis(300)).await;
+    assert_eq!(events.len(), 5, "each file gets its own event");
+    for ev in &events {
+        assert_ne!(
+            burst_flag(ev),
+            Some(true),
+            "small flush must not summarize, got {:?}",
+            ev.data
+        );
+    }
 }
 
 #[tokio::test]

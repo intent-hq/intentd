@@ -35,6 +35,15 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// one row per file (finding F4: prevent 31,881 INSERTs from bulk churn).
 const BURST_THRESHOLD: usize = 100;
 
+/// After a burst flush, keep collapsing due paths into directory summaries for
+/// this long. Bulk churn often reaches the loop in several waves (staggered OS
+/// delivery, late modify re-notifications for the same writes), and each wave
+/// on its own can sit below [`BURST_THRESHOLD`]; the cooldown makes trailing
+/// waves of the same churn collapse too instead of flushing per-file
+/// (STAB-121). Refreshed on every collapsed flush, so sustained churn stays
+/// collapsed until it quiesces.
+const BURST_COOLDOWN: Duration = Duration::from_millis(1000);
+
 /// Directory names ignored at any depth, mirroring the `IGNORE_PATTERNS` of
 /// `unified-workspace-watcher.ts` plus the `.workspace-notes` additions of
 /// `tracking.config.ts`. A path is dropped if any component matches.
@@ -72,9 +81,10 @@ const IGNORED_DIRS: &[&str] = &[
 ];
 
 /// The `data.action` discriminant of a `file:changed` event. Serializes to the
-/// lowercase TS values (`change.action.toLowerCase()`).
+/// lowercase TS values (`change.action.toLowerCase()`). `pub(super)` so the
+/// flush tests can build pending maps directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
+pub(super) enum Action {
     Modify,
     Rename,
     Create,
@@ -212,11 +222,15 @@ async fn debounce_loop(
     mut raw_rx: mpsc::UnboundedReceiver<notify::Event>,
 ) {
     let mut pending: HashMap<String, (Action, tokio::time::Instant)> = HashMap::new();
+    let mut burst_until: Option<tokio::time::Instant> = None;
     loop {
         let next_deadline = pending.values().map(|(_, at)| *at).min();
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
-                Some(event) => ingest(&root, &event, &mut pending),
+                Some(event) => {
+                    ingest(&root, &event, &mut pending);
+                    drain_ready(&root, &mut raw_rx, &mut pending);
+                }
                 // Watcher dropped: flush whatever is pending, then stop.
                 None => {
                     flush_all(&bus, &workspace_id, &mut pending).await;
@@ -224,9 +238,29 @@ async fn debounce_loop(
                 }
             },
             _ = sleep_until(next_deadline), if next_deadline.is_some() => {
-                flush_due(&bus, &workspace_id, &mut pending).await;
+                // Ingest everything already delivered before deciding what is
+                // due, so the burst decision sees the full backlog even when
+                // publishes are slow (STAB-121).
+                drain_ready(&root, &mut raw_rx, &mut pending);
+                flush_due(&bus, &workspace_id, &mut pending, &mut burst_until).await;
             }
         }
+    }
+}
+
+/// Ingest every raw event already sitting in the channel without awaiting.
+/// `tokio::select!` only takes one branch per iteration, so slow publishes
+/// would otherwise starve ingestion: each raw event would be ingested one
+/// publish-latency apart, spreading per-path deadlines so far that no single
+/// flush ever sees the whole churn and the burst collapse never engages
+/// (STAB-121).
+fn drain_ready(
+    root: &Path,
+    raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+    pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+) {
+    while let Ok(event) = raw_rx.try_recv() {
+        ingest(root, &event, pending);
     }
 }
 
@@ -263,11 +297,23 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 }
 
 /// Publish + remove every path whose debounce deadline has elapsed. When the
-/// burst exceeds [`BURST_THRESHOLD`], collapse into per-directory summaries.
-async fn flush_due(
+/// in-flight backlog exceeds [`BURST_THRESHOLD`], collapse into per-directory
+/// summaries.
+///
+/// The burst decision is based on the whole `pending` map, not just the paths
+/// due at this instant: staggered OS delivery spreads per-path deadlines, so
+/// a single bulk churn can come due across several flushes that individually
+/// sit below the threshold (STAB-121). Once a flush collapses, `burst_until`
+/// keeps subsequent flushes collapsed for [`BURST_COOLDOWN`] so trailing waves
+/// of the same churn (e.g. late modify re-notifications) summarize too.
+///
+/// `pub(super)` so tests can exercise the burst decision deterministically
+/// with hand-built pending maps (no OS watcher or sleeps).
+pub(super) async fn flush_due(
     bus: &EventBus,
     workspace_id: &WorkspaceId,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
+    burst_until: &mut Option<tokio::time::Instant>,
 ) {
     let now = tokio::time::Instant::now();
     let due: Vec<String> = pending
@@ -275,8 +321,13 @@ async fn flush_due(
         .filter(|(_, (_, at))| *at <= now)
         .map(|(p, _)| p.clone())
         .collect();
+    if due.is_empty() {
+        return;
+    }
 
-    if due.len() > BURST_THRESHOLD {
+    let in_cooldown = burst_until.is_some_and(|until| now < until);
+    if pending.len() > BURST_THRESHOLD || in_cooldown {
+        *burst_until = Some(now + BURST_COOLDOWN);
         flush_burst(bus, workspace_id, pending, &due).await;
     } else {
         for path in due {
