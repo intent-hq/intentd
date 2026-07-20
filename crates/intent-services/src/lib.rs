@@ -1463,7 +1463,10 @@ impl Services {
                 // A merged/closed linked PR stays recorded in `pull_requests`
                 // but no longer blocks discovery: relink to a newer open PR
                 // whose head ref equals the branch, so the workspace follows
-                // the latest PR without waiting for an unlink.
+                // the latest PR without waiting for an unlink. A discovery
+                // failure degrades to the plain update path below so the
+                // merged/closed status delta is never lost to a transient
+                // `list_prs` error (the next sweep retries discovery).
                 if matches!(
                     info.status,
                     intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
@@ -1474,14 +1477,23 @@ impl Services {
                         head: Some(ws.branch.clone()),
                         ..Default::default()
                     };
-                    let prs = sc
-                        .list_prs(&repo_ref, query)
-                        .await
-                        .map_err(pr_ops::map_sc_err)?
-                        .items;
+                    let prs = match sc.list_prs(&repo_ref, query).await {
+                        Ok(page) => page.items,
+                        Err(e) => {
+                            tracing::warn!(
+                                workspace_id = %workspace_id.as_str(),
+                                error = %e,
+                                "pr refresh: relink discovery failed, persisting status only"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    // Highest PR number wins so successor selection is
+                    // deterministic regardless of forge sort order.
                     if let Some(open_pr) = prs
                         .into_iter()
-                        .find(|p| p.number != number && pr_ops::pr_matches_branch(p, &ws.branch))
+                        .filter(|p| p.number != number && pr_ops::pr_matches_branch(p, &ws.branch))
+                        .max_by_key(|p| p.number)
                     {
                         let open_info = pr_ops::build_pr_info(&open_pr);
                         pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
@@ -14685,6 +14697,11 @@ impl Services {
                 ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
                 if let Some(info) = ws.active_pull_request.as_mut() {
                     info.status = intent_core::PullRequestStatus::Merged;
+                }
+                // Mirror the merged status into the daemon-owned list so the
+                // pr:updated payload below is internally consistent.
+                if let Some(info) = ws.active_pull_request.clone() {
+                    pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                 }
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;

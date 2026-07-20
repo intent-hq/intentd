@@ -4717,6 +4717,9 @@ mod pr {
         /// When set, `list_prs` also returns an *open* PR with this number (same
         /// head ref as the sample), simulating a newer PR on the same branch.
         open_pr_number: Option<u64>,
+        /// When set, `list_prs` fails, simulating a transient forge error
+        /// during relink discovery.
+        fail_list_prs: bool,
         /// When set, `list_repos` emits a two-page sequence driven by the opaque
         /// cursor, exercising the §5.5 multi-page round-trip end to end.
         paginate: bool,
@@ -4888,6 +4891,9 @@ mod pr {
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
+            if self.fail_list_prs {
+                return Err(intent_sourcecontrol::Error::Api("list_prs down".into()));
+            }
             let mut items = if self.discover {
                 vec![sample_pr()]
             } else {
@@ -5706,6 +5712,31 @@ mod pr {
     }
 
     #[tokio::test]
+    async fn refresh_merged_pr_persists_status_when_discovery_fails() {
+        // A transient `list_prs` failure during relink discovery must not
+        // discard the merged-status delta: the refresh degrades to the plain
+        // update path, persists Merged, and the next sweep retries discovery.
+        let forge = StubForge {
+            merged_linked: true,
+            fail_list_prs: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+    }
+
+    #[tokio::test]
     async fn refresh_skips_remote_workspace() {
         // Remote workspaces are not refreshed (no forge call, no event).
         let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "feature", Some(42), true).await;
@@ -5895,6 +5926,12 @@ mod pr {
             merged.pr_status,
             Some(intent_core::PullRequestStatus::Merged)
         );
+        // The daemon-owned list mirrors the merged status so the pr:updated
+        // payload is internally consistent (activePullRequest vs pullRequests).
+        let list = merged.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 7);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
     }
 
     #[tokio::test]

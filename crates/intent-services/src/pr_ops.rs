@@ -109,22 +109,35 @@ pub(crate) fn pr_branch_mismatch(pr: &PullRequest, branch: &str) -> bool {
 /// (keyed by PR number), returning `true` when the list actually changed.
 /// Keeps merged/closed PRs recorded alongside the currently-linked one so the
 /// FE can render the full per-branch PR history without a refetch (§7.6).
+/// Pre-existing duplicates for the same number (e.g. written via
+/// `workspace.update` before the daemon owned the list) are collapsed into the
+/// single upserted entry.
 pub(crate) fn upsert_pr_info(
     list: &mut Option<Vec<PullRequestInfo>>,
     info: &PullRequestInfo,
 ) -> bool {
     let items = list.get_or_insert_with(Vec::new);
-    match items.iter_mut().find(|p| p.number == info.number) {
-        Some(existing) if *existing == *info => false,
-        Some(existing) => {
-            *existing = info.clone();
-            true
+    let matches = items.iter().filter(|p| p.number == info.number).count();
+    // Unchanged only when exactly one entry for this number exists and it
+    // already equals the snapshot.
+    if matches == 1 {
+        let existing = items.iter_mut().find(|p| p.number == info.number).unwrap();
+        if *existing == *info {
+            return false;
         }
-        None => {
-            items.push(info.clone());
-            true
-        }
+        *existing = info.clone();
+        return true;
     }
+    // 0 matches: append. >1 matches: collapse the duplicates, keeping the
+    // fresh snapshot at the first duplicate's position.
+    if matches == 0 {
+        items.push(info.clone());
+        return true;
+    }
+    let first = items.iter().position(|p| p.number == info.number).unwrap();
+    items.retain(|p| p.number != info.number);
+    items.insert(first, info.clone());
+    true
 }
 
 /// Derive the persisted [`PullRequestStatus`] from a forge PR (draft wins over
@@ -795,6 +808,18 @@ mod tests {
         second.number = 2;
         assert!(upsert_pr_info(&mut list, &build_pr_info(&second)));
         assert_eq!(list.as_ref().unwrap().len(), 2);
+
+        // Pre-existing duplicates (e.g. legacy workspace.update writes) are
+        // collapsed into a single entry at the first duplicate's position.
+        let dup = list.as_ref().unwrap()[0].clone();
+        list.as_mut().unwrap().push(dup);
+        assert_eq!(list.as_ref().unwrap().len(), 3);
+        assert!(upsert_pr_info(&mut list, &merged));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, merged.number);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].number, 2);
     }
 
     #[test]
