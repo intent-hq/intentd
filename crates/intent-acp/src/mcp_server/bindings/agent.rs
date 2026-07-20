@@ -463,17 +463,15 @@ async fn report_to_parent(
     Ok(merge_ok(v))
 }
 
-/// Build the `{ type: "agent_message", fromAgentId, fromAgentName? }`
-/// sender-attribution payload (PROTOCOL §5.5). `fromAgentName` is omitted
-/// when the caller lookup failed, so clients must treat it as optional.
+/// Build the `{ type: "agent_message", fromAgentId, fromAgentName }`
+/// sender-attribution payload (PROTOCOL §5.5). `fromAgentName` is always
+/// present for a stable schema; it is `null` when the caller lookup failed.
 fn agent_message_metadata(caller: &AgentId, name: Option<&str>) -> Value {
-    let mut metadata = serde_json::Map::new();
-    metadata.insert("type".to_string(), json!("agent_message"));
-    metadata.insert("fromAgentId".to_string(), json!(caller.as_str()));
-    if let Some(n) = name {
-        metadata.insert("fromAgentName".to_string(), json!(n));
-    }
-    Value::Object(metadata)
+    json!({
+        "type": "agent_message",
+        "fromAgentId": caller.as_str(),
+        "fromAgentName": name,
+    })
 }
 
 /// An explicit non-null `messageMetadata` arg, if the caller supplied one.

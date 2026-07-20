@@ -5659,7 +5659,7 @@ mod wsapi4_bindings_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture,
+        AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
         EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Result,
         WorkspaceApi, WorkspaceId,
     };
@@ -5689,6 +5689,8 @@ mod wsapi4_bindings_tests {
         event_recent_files_calls: Mutex<Vec<Option<i64>>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
         event_dir_calls: Mutex<Vec<DirCall>>,
+        /// When set, `agent_get` fails with this error (name-lookup failure path).
+        agent_get_error: Mutex<Option<String>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -5753,7 +5755,13 @@ mod wsapi4_bindings_tests {
             let id = agent_id.as_str().to_string();
             self.agent_get_calls.lock().unwrap().push(id.clone());
             let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string("amber-forest"));
-            Box::pin(async move { Ok(stub_agent(&id, &ws)) })
+            let error = self.agent_get_error.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(Error::NotFound(e));
+                }
+                Ok(stub_agent(&id, &ws))
+            })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -6085,6 +6093,25 @@ mod wsapi4_bindings_tests {
                 "type": "agent_message",
                 "fromAgentId": "caller-1",
                 "fromAgentName": "agent-caller-1",
+            }))
+        );
+    }
+
+    /// The attribution schema stays stable when the caller name lookup fails:
+    /// `fromAgentName` is present but `null`, never omitted.
+    #[tokio::test]
+    async fn agent_send_name_lookup_failure_keeps_null_from_agent_name() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.agent_get_error.lock().unwrap() = Some("agent not found".to_string());
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": null,
             }))
         );
     }
