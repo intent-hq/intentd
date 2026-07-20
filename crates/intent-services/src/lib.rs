@@ -1923,8 +1923,68 @@ impl Services {
             );
         }
         self.remove_group_watches(workspace_id, group_id);
+        self.reestablish_watches_for_failed_children(workspace_id, &group)
+            .await;
         self.publish_subscriptions_changed(workspace_id, &group.parent_agent_id)
             .await;
+    }
+
+    /// STAB-129: after an after_all group settles, a member that was recorded
+    /// via `agent:failed` (e.g. the `session/prompt` idle timeout firing
+    /// mid-turn) may still be working and settle for real later — but
+    /// `remove_group_watches` has just dropped every parent watch, leaving the
+    /// parent with no wake path for that late settlement. Re-establish an
+    /// ungrouped oneShot parent→child watch for each failed-not-deleted member
+    /// so the child's eventual `agent:idle` / `agent:failed` still wakes the
+    /// parent. Dedupes against a live ungrouped watch (e.g. one created by a
+    /// SUB-1 sendToTask auto-watch racing settlement).
+    async fn reestablish_watches_for_failed_children(
+        &self,
+        workspace_id: &WorkspaceId,
+        group: &agent_subscriptions::DelegationGroup,
+    ) {
+        let failed_children: Vec<AgentId> = group
+            .raw_events
+            .iter()
+            .filter(|e| e.event_type == AGENT_FAILED)
+            .filter_map(|e| completion_event_child_id(e))
+            .map(|id| AgentId::from(id.as_str()))
+            .filter(|id| !group.deleted_agent_ids.contains(id))
+            .collect();
+        if failed_children.is_empty() {
+            return;
+        }
+        let parent_name = self
+            .store
+            .get_agent_session(&group.parent_agent_id)
+            .await
+            .ok()
+            .map(|s| s.name);
+        for child in failed_children {
+            let reused = self.find_and_refresh_ungrouped_watch(
+                workspace_id,
+                &group.parent_agent_id,
+                &child,
+                true,
+                parent_name.clone(),
+            );
+            if reused.is_none() {
+                self.register_completion_watch(
+                    workspace_id,
+                    group.parent_agent_id.clone(),
+                    parent_name.clone().unwrap_or_default(),
+                    child.clone(),
+                    true,
+                    None,
+                );
+            }
+            tracing::info!(
+                parent = %group.parent_agent_id.0,
+                child = %child.0,
+                group = %group.group_id,
+                "retained oneShot watch for failed group member after settlement"
+            );
+        }
     }
 
     /// Handle sandbox merge-back on agent completion.
