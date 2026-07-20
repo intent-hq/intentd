@@ -6871,3 +6871,72 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         "oneShot watch removed after the late completion delivered"
     );
 }
+
+/// Resume appends the system interruption marker before the continuation, and
+/// the append is idempotent on retry: when a prior resume attempt already left
+/// the marker as the transcript tail (continuation delivery failed, row reset
+/// to pending), a second resume must not append a duplicate marker.
+#[tokio::test]
+async fn resume_interrupted_marker_is_idempotent_on_retry() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Interrupted").await;
+    let marker_content = json!([{
+        "type": "text",
+        "text": "The previous turn was interrupted because the harness shut down. Continuing below.",
+        "meta": { "kind": "interruption" }
+    }]);
+
+    // First resume: appends marker + continuation.
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    svc.resume_interrupted_agent(&id).await.expect("resume 1");
+    let messages = svc.store.get_agent_messages(&id, None).await.expect("msgs");
+    let markers: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "system" && m.content == marker_content)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(markers.len(), 1, "first resume appends exactly one marker");
+    let continuation_idx = messages
+        .iter()
+        .rposition(|m| m.role == "user")
+        .expect("continuation user message");
+    assert!(
+        markers[0] < continuation_idx,
+        "marker precedes the continuation"
+    );
+
+    // Simulate a retry after a failed continuation delivery: a second agent
+    // whose transcript tail is already the marker (the prior attempt appended
+    // it, then the continuation failed and the row was reset to pending). The
+    // resume must skip the duplicate marker append.
+    let retry = create_agent(&svc, &ws, "Retry").await;
+    svc.store
+        .append_agent_message(&retry, "system", &marker_content, &now_iso())
+        .await
+        .expect("pre-append marker (prior failed attempt)");
+    svc.store
+        .insert_interrupted_agent(&retry, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    svc.resume_interrupted_agent(&retry)
+        .await
+        .expect("resume retry");
+    let messages = svc
+        .store
+        .get_agent_messages(&retry, None)
+        .await
+        .expect("msgs");
+    let marker_count = messages
+        .iter()
+        .filter(|m| m.role == "system" && m.content == marker_content)
+        .count();
+    assert_eq!(marker_count, 1, "retry must not duplicate the marker");
+    assert!(
+        messages.iter().any(|m| m.role == "user"),
+        "retry still delivers the continuation"
+    );
+}

@@ -432,13 +432,16 @@ impl Services {
     /// Best-effort flush of an agent's partial in-flight assistant content at
     /// interruption-capture time (graceful shutdown, INT-41 follow-up): when the
     /// live-turn slot holds streamed blocks, persist them as a normal `assistant`
-    /// row tagged `metadata.status = "interrupted"` so the transcript keeps the
+    /// row tagged `metadata.interrupted = true` + `stopReason = "interrupted"`
+    /// (the terminal-message convention the FE stopped-indicator keys off;
+    /// `status` is kept as a redundant tag) so the transcript keeps the
     /// streamed-so-far output across the restart. Reuses the turn's minted
     /// `message_id` (CS-0 D1) so persisted block ids `{messageId}:{index}` match
-    /// what streamed — and so the append collides (UNIQUE id) rather than
-    /// duplicating if the worker happens to persist the full turn concurrently.
-    /// Errors are logged and swallowed: this must never block shutdown or the
-    /// interrupted_agent row insert.
+    /// what streamed. The caller aborts the turn worker before flushing; if the
+    /// worker already persisted the full turn, the append collides on the UNIQUE
+    /// id and is logged at debug (benign — the full row won). Errors are logged
+    /// and swallowed: this must never block shutdown or the interrupted_agent
+    /// row insert.
     pub(crate) async fn flush_partial_turn_on_interruption(&self, agent_id: &AgentId) {
         let Some(live) = self.live_turn(agent_id) else {
             return;
@@ -446,7 +449,11 @@ impl Services {
         if live.blocks.is_empty() {
             return;
         }
-        let metadata = json!({ "status": "interrupted" });
+        let metadata = json!({
+            "interrupted": true,
+            "stopReason": "interrupted",
+            "status": "interrupted",
+        });
         match self
             .store
             .append_agent_message_with_id(
@@ -460,6 +467,11 @@ impl Services {
             .await
         {
             Ok(_) => self.clear_live_turn(agent_id),
+            Err(e) if e.to_string().contains("UNIQUE constraint failed") => tracing::debug!(
+                agent = %agent_id,
+                error = %e,
+                "partial flush skipped: worker already persisted the full turn under this id"
+            ),
             Err(e) => tracing::warn!(
                 agent = %agent_id,
                 error = %e,

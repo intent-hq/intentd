@@ -619,8 +619,9 @@ async fn manager_tracks_lookup_stop_and_shuts_down() {
 }
 
 /// Graceful shutdown flushes a busy agent's partial in-flight assistant content
-/// (the live-turn slot) as an `assistant` row tagged
-/// `metadata.status = "interrupted"` — reusing the turn's minted message id so
+/// (the live-turn slot) as an `assistant` row tagged with the FE
+/// terminal-message convention (`metadata.interrupted = true` +
+/// `stopReason = "interrupted"`) — reusing the turn's minted message id so
 /// block ids match what streamed — alongside the interrupted_agent row. A busy
 /// agent with no live-turn slot gets only the interrupted row (no phantom
 /// assistant message).
@@ -666,10 +667,10 @@ async fn shutdown_flushes_partial_live_turn_as_interrupted_assistant_row() {
     assert_eq!(msg.id, "msg-flush");
     assert_eq!(msg.role, "assistant");
     assert_eq!(msg.content, Value::Array(blocks));
-    assert_eq!(
-        msg.metadata.as_ref().expect("metadata")["status"],
-        "interrupted"
-    );
+    let metadata = msg.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    assert_eq!(metadata["stopReason"], "interrupted");
+    assert_eq!(metadata["status"], "interrupted");
 
     // Both busy agents got interrupted_agent rows; the one without a live-turn
     // slot got no assistant row.

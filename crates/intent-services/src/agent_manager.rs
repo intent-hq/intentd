@@ -2702,6 +2702,19 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
+            // Abort the turn worker FIRST so it cannot race the partial flush by
+            // persisting the full turn under the same minted message id (which
+            // would leave the transcript stuck on the partial snapshot while the
+            // worker's own append errors on the UNIQUE id). stop() below removes
+            // the (already-gone) worker entry harmlessly.
+            if let Some(worker) = self.workers.lock().unwrap().remove(id) {
+                worker.abort();
+            }
+            // Best-effort: persist any partial in-flight assistant content from
+            // the live-turn slot so the transcript keeps the streamed-so-far
+            // output across the restart. Runs before the status guards below so
+            // a degenerate status read/encode failure never drops the content.
+            self.services.flush_partial_turn_on_interruption(id).await;
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -2745,10 +2758,6 @@ impl AgentManager {
                     continue;
                 }
             };
-            // Best-effort: persist any partial in-flight assistant content from the
-            // live-turn slot BEFORE stop() aborts the worker (which would drop it),
-            // so the transcript keeps the streamed-so-far output across the restart.
-            self.services.flush_partial_turn_on_interruption(id).await;
             // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
             // this agent and the daemon was restarted without the FE resolving it, the row
             // is refreshed to the latest state).
