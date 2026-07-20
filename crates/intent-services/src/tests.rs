@@ -4711,6 +4711,15 @@ mod pr {
         /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
         /// link an unlinked workspace by head ref.
         discover: bool,
+        /// When set, `get_pr` returns the sample PR as merged, so refresh sees a
+        /// linked PR whose lifecycle ended (relink-after-merge tests).
+        merged_linked: bool,
+        /// When set, `list_prs` also returns an *open* PR with this number (same
+        /// head ref as the sample), simulating a newer PR on the same branch.
+        open_pr_number: Option<u64>,
+        /// When set, `list_prs` fails, simulating a transient forge error
+        /// during relink discovery.
+        fail_list_prs: bool,
         /// When set, `list_repos` emits a two-page sequence driven by the opaque
         /// cursor, exercising the §5.5 multi-page round-trip end to end.
         paginate: bool,
@@ -4872,6 +4881,9 @@ mod pr {
             // `run_wait_for_changes`); harmless for non-poll callers.
             self.first_get_pr.notify_one();
             let mut pr = sample_pr();
+            if self.merged_linked {
+                pr.state = PrState::Merged;
+            }
             if self.mutate_head {
                 let n = self.head_seq.fetch_add(1, Ordering::SeqCst);
                 pr.head_sha = Some(format!("sha{n}"));
@@ -4879,11 +4891,20 @@ mod pr {
             Ok(pr)
         }
         async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
-            let items = if self.discover {
+            if self.fail_list_prs {
+                return Err(intent_sourcecontrol::Error::Api("list_prs down".into()));
+            }
+            let mut items = if self.discover {
                 vec![sample_pr()]
             } else {
                 vec![]
             };
+            if let Some(n) = self.open_pr_number {
+                let mut pr = sample_pr();
+                pr.number = n;
+                pr.url = format!("https://github.com/o/r/pull/{n}");
+                items.push(pr);
+            }
             Ok(Page {
                 items,
                 next_cursor: None,
@@ -5530,6 +5551,11 @@ mod pr {
         assert_eq!(info.number, 42);
         assert_eq!(info.head_ref.as_deref(), Some("feature"));
 
+        // The daemon-owned PR list is upserted on every linked refresh.
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 42);
+
         let evs = svc
             .store()
             .events_by_type(&ws_id, "pr:updated", 10)
@@ -5538,6 +5564,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data["prNumber"], 42);
         assert_eq!(evs[0].data["prStatus"], "Open");
+        assert_eq!(evs[0].data["pullRequests"][0]["number"], 42);
 
         // Re-running with the same forge state is a no-op (no new event).
         let again = svc.refresh_workspace_pr(&ws_id).await.expect("refresh2");
@@ -5585,6 +5612,10 @@ mod pr {
         let after = svc.store().get_workspace(&ws_id).await.unwrap();
         assert_eq!(after.pr_number, Some(42));
         assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        // Discovery also upserts into the daemon-owned PR list.
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 42);
 
         let evs = svc
             .store()
@@ -5594,6 +5625,115 @@ mod pr {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data["prNumber"], 42);
         assert_eq!(evs[0].data["prUrl"], "https://github.com/o/r/pull/42");
+        assert_eq!(evs[0].data["pullRequests"][0]["number"], 42);
+    }
+
+    #[tokio::test]
+    async fn refresh_relinks_merged_pr_to_newer_open_pr() {
+        // Regression: a linked PR fetched as merged (head ref still equals the
+        // workspace branch) used to stay linked forever, so a newer open PR on
+        // the same branch was never discovered. Now the merged PR is kept in
+        // `pull_requests`, and the refresh relinks to the newer open PR.
+        let forge = StubForge {
+            merged_linked: true,
+            open_pr_number: Some(300),
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(300));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/300")
+        );
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        assert_eq!(after.active_pull_request.as_ref().unwrap().number, 300);
+
+        // Both the merged historical PR and the new open PR are recorded.
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 2);
+        let merged = list.iter().find(|p| p.number == 42).expect("merged PR");
+        assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
+        let open = list.iter().find(|p| p.number == 300).expect("open PR");
+        assert_eq!(open.status, intent_core::PullRequestStatus::Open);
+
+        // `pr:linked` was emitted with the full list in the payload.
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 300);
+        assert_eq!(evs[0].data["pullRequests"].as_array().unwrap().len(), 2);
+
+        // Re-running never relinks to the already-linked PR: the stub still
+        // reports the linked PR as merged and offers only #300 in discovery,
+        // and the self-exclusion guard (`p.number != number`) prevents a
+        // relink loop back onto the same number.
+        let again = svc.refresh_workspace_pr(&ws_id).await.expect("refresh2");
+        assert_ne!(again, crate::PrRefreshOutcome::Linked);
+    }
+
+    #[tokio::test]
+    async fn refresh_merged_pr_without_successor_stays_linked() {
+        // A merged linked PR with no newer open PR on the branch: no relink,
+        // the status delta persists (Merged) and the PR lands in the list.
+        let forge = StubForge {
+            merged_linked: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 42);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:updated", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prStatus"], "Merged");
+        assert_eq!(evs[0].data["pullRequests"][0]["status"], "Merged");
+    }
+
+    #[tokio::test]
+    async fn refresh_merged_pr_persists_status_when_discovery_fails() {
+        // A transient `list_prs` failure during relink discovery must not
+        // discard the merged-status delta: the refresh degrades to the plain
+        // update path, persists Merged, and the next sweep retries discovery.
+        let forge = StubForge {
+            merged_linked: true,
+            fail_list_prs: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", Some(42), false).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(
+            after.pr_status,
+            Some(intent_core::PullRequestStatus::Merged)
+        );
+        let list = after.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
     }
 
     #[tokio::test]
@@ -5751,9 +5891,12 @@ mod pr {
         assert_eq!(res["result"]["prNumber"], 7);
         assert!(res["result"]["prUrl"].as_str().unwrap().contains("pull/7"));
 
-        // Linkage persisted.
+        // Linkage persisted, including the daemon-owned PR list.
         let linked = svc.store().get_workspace(&ws).await.unwrap();
         assert_eq!(linked.pr_number, Some(7));
+        let list = linked.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 7);
 
         // getStatus reflects the pushed branch + linked PR.
         let st = svc
@@ -5783,6 +5926,12 @@ mod pr {
             merged.pr_status,
             Some(intent_core::PullRequestStatus::Merged)
         );
+        // The daemon-owned list mirrors the merged status so the pr:updated
+        // payload is internally consistent (activePullRequest vs pullRequests).
+        let list = merged.pull_requests.as_ref().expect("pull_requests");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].number, 7);
+        assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
     }
 
     #[tokio::test]
