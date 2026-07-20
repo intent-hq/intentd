@@ -10387,7 +10387,17 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
-            intent_git::status::status(&path)
+            let started = std::time::Instant::now();
+            let status = intent_git::status::status(&path);
+            if let Ok(s) = &status {
+                tracing::debug!(
+                    workspace_id = workspace_id.as_str(),
+                    files = s.files.len(),
+                    total_ms = started.elapsed().as_millis() as u64,
+                    "git.status: working-tree status scan"
+                );
+            }
+            status
         })
     }
 
@@ -13942,11 +13952,13 @@ impl WorkspaceApi for Services {
             }
 
             // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
+            let boundary_started = std::time::Instant::now();
             let boundary_sha = intent_git::history::resolve_workspace_boundary(
                 &worktree,
                 ws.base_ref.as_deref(),
                 ws.base_commit_sha.as_deref(),
             )?;
+            let boundary_ms = boundary_started.elapsed().as_millis() as u64;
 
             // If boundary info exists but nothing resolved, return empty (safety net
             // to avoid showing arbitrary base-branch commits). This holds regardless
@@ -13956,12 +13968,23 @@ impl WorkspaceApi for Services {
             }
 
             // Fetch one past the page window to decide whether older commits remain.
+            let walk_started = std::time::Instant::now();
             let commits = intent_git::history::history_bounded(
                 &worktree,
                 boundary_sha.as_deref(),
                 skip + limit + 1,
                 include_older,
             )?;
+            tracing::debug!(
+                workspace_id = workspace_id.as_str(),
+                commits = commits.len(),
+                limit,
+                skip,
+                include_older,
+                boundary_resolve_ms = boundary_ms,
+                history_walk_ms = walk_started.elapsed().as_millis() as u64,
+                "file-tracking.loadCommits: boundary resolve + history walk"
+            );
             let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()

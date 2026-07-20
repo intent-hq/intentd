@@ -5,6 +5,7 @@
 //! double-entry rule from `parseStatusOutput`).
 
 use std::path::Path;
+use std::time::Instant;
 
 use git2::{Repository, Status, StatusOptions};
 use intent_core::{FileStatus, GitFileStatus, GitStatus, Result};
@@ -27,17 +28,25 @@ pub fn empty_status() -> GitStatus {
 
 /// Compute the working-tree status for the repository at `worktree_path`.
 pub fn status(worktree_path: &Path) -> Result<GitStatus> {
+    let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let branch = current_branch(&repo);
     let (ahead, behind) = ahead_behind(&repo, &branch);
     // The canonical definition (per the `GitStatus.diverged` doc): both ahead
     // and behind the upstream.
     let diverged = ahead > 0 && behind > 0;
+    let scan_started = Instant::now();
     let files = collect_files(&repo)?;
     let has_uncommitted_changes = files
         .iter()
         .any(|f| f.staged || f.status != GitFileStatus::Untracked);
     let has_untracked_files = files.iter().any(|f| f.status == GitFileStatus::Untracked);
+    tracing::debug!(
+        files = files.len(),
+        scan_ms = scan_started.elapsed().as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "status: working-tree status scan"
+    );
     Ok(GitStatus {
         branch,
         ahead,

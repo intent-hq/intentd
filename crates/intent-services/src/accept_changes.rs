@@ -175,7 +175,9 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
         return Ok(minimal_status_value(ws, &trunk));
     }
 
+    let started = std::time::Instant::now();
     let status = intent_git::status::status(worktree)?;
+    let status_ms = started.elapsed().as_millis() as u64;
     let branch = if status.branch.is_empty() {
         ws.branch.clone()
     } else {
@@ -187,11 +189,23 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
     let is_pushed = has_remote
         && intent_git::remote::remote_tracking_exists(worktree, "origin", &branch).unwrap_or(false);
 
+    let trunk_started = std::time::Instant::now();
     let trunk_ref = resolve_trunk_ref(worktree, &trunk, has_remote);
     let (ahead, behind) = intent_git::remote::ahead_behind(worktree, &trunk_ref)?;
+    let trunk_ms = trunk_started.elapsed().as_millis() as u64;
 
+    let history_started = std::time::Instant::now();
     let commits = intent_git::history::history_since(worktree, Some(&trunk_ref), 200)?;
     let local_commits: Vec<Value> = commits.iter().map(commit_to_value).collect();
+    tracing::debug!(
+        files = status.files.len(),
+        local_commits = local_commits.len(),
+        status_ms,
+        trunk_resolve_ms = trunk_ms,
+        history_walk_ms = history_started.elapsed().as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "accept-changes.getStatus: status scan + trunk resolve + history walk"
+    );
 
     let mut uncommitted = std::collections::HashSet::new();
     let mut staged = std::collections::HashSet::new();
