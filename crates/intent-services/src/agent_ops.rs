@@ -782,7 +782,7 @@ fn has_unresolved_tool_use(blocks: &[Value]) -> bool {
     })
 }
 
-/// STAB-122: strip anonymous `tool_use` blocks (`name` missing/empty) and the
+/// STAB-124: strip anonymous `tool_use` blocks (`name` missing/empty) and the
 /// `tool_result` blocks paired to them (matched by `tool_use_id == toolCallId`)
 /// from a message before serving it. Pre-fix daemons persisted this malformed
 /// pair when an interrupt landed mid-tool-call; the FE conversation load chokes
@@ -933,7 +933,7 @@ impl Services {
     /// within a page (wire parity with the TS handler); `nextToken` is additive
     /// and is `null` once the oldest message has been returned.
     ///
-    /// STAB-122 loading tolerance: rows persisted by pre-fix daemons can carry
+    /// STAB-124 loading tolerance: rows persisted by pre-fix daemons can carry
     /// an anonymous `tool_use` block (`name: ""`, the fabricated echo of a
     /// tool call aborted by an interrupt) that breaks FE conversation loading.
     /// The served page strips those blocks (and their paired `tool_result`s)

@@ -158,7 +158,7 @@ fn prompt_updates_with_tool_result() -> Vec<String> {
 /// A prompt turn whose FIRST update is a stale `tool_call_update` for a
 /// toolCallId this turn never saw (the shape a cancelled child emits after an
 /// interrupt: no title, no rawInput → derived name ""), followed by a real
-/// text chunk. STAB-122: the stale update must be dropped, not fabricated into
+/// text chunk. STAB-124: the stale update must be dropped, not fabricated into
 /// an anonymous `tool_use` block.
 fn prompt_updates_stale_anonymous_tool() -> Vec<String> {
     let stale = json!({
@@ -718,7 +718,7 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     );
 }
 
-/// STAB-122 regression: a stale `tool_call_update` for a toolCallId this turn
+/// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn
 /// never saw (the abort echo a cancelled child emits after an interrupt: no
 /// title/rawInput → derived name "") must NOT fabricate an anonymous
 /// `tool_use` block in the persisted message, and no `agent:tool:call` event

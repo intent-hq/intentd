@@ -25,7 +25,7 @@ const SESSION_ID = 'mock-session-1';
 let promptCount = 0;
 const pendingPromptIds = [];
 // Tool calls parked by `parkMidToolCall`; on `session/cancel` each gets a
-// title-less failed `tool_call_update` echo before the prompt resolves (STAB-122).
+// title-less failed `tool_call_update` echo before the prompt resolves (STAB-124).
 const cancelledToolCallIds = [];
 
 // Agent→client request correlation: track outgoing request IDs separately from
@@ -207,7 +207,7 @@ async function handlePrompt(id, params) {
     pendingPromptIds.push(id);
     return;
   }
-  // STAB-122: park MID-TOOL-CALL — emit a `tool_call` (in_progress) then park.
+  // STAB-124: park MID-TOOL-CALL — emit a `tool_call` (in_progress) then park.
   // On `session/cancel` the mock echoes a title-less `tool_call_update`
   // (status failed, abort-error output) BEFORE resolving the parked prompt,
   // mirroring how a real provider reports the aborted tool. The daemon must
@@ -425,7 +425,7 @@ async function dispatch(msg) {
     case 'session/prompt':
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
-      // STAB-122: echo the abort for any tool call parked by `parkMidToolCall`
+      // STAB-124: echo the abort for any tool call parked by `parkMidToolCall`
       // — a title-less `tool_call_update` (failed, abort-error output), the
       // shape real providers emit when a cancel lands mid-tool-call.
       while (cancelledToolCallIds.length) {

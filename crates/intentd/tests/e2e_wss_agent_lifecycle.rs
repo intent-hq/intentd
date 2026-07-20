@@ -5950,7 +5950,7 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
     );
 }
 
-/// STAB-122 regression: an interrupt landing mid-tool-call must NOT persist an
+/// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an
 /// anonymous `tool_use` block (`name: ""`). The mock parks after emitting a
 /// `tool_call` (in_progress); on `session/cancel` it echoes a title-less
 /// `tool_call_update` (failed, abort-error output) — the stale echo that,
@@ -5959,8 +5959,8 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
 /// After the interrupt turn completes, every persisted `tool_use` block must
 /// carry a non-empty name.
 #[tokio::test]
-async fn stab_122_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
-    let Some(script) = gate("STAB-122 anonymous tool_use E2E") else {
+async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
+    let Some(script) = gate("STAB-124 anonymous tool_use E2E") else {
         return;
     };
 
@@ -6032,7 +6032,7 @@ async fn stab_122_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
     }
     assert!(
         saw_tool_call,
-        "STAB-122: must be mid-tool-call before interrupt"
+        "STAB-124: must be mid-tool-call before interrupt"
     );
 
     // Interrupt mid-tool-call.
@@ -6099,7 +6099,7 @@ async fn stab_122_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
                 let name = block["name"].as_str().unwrap_or_default();
                 assert!(
                     !name.trim().is_empty(),
-                    "STAB-122: anonymous tool_use block persisted/served: {block}"
+                    "STAB-124: anonymous tool_use block persisted/served: {block}"
                 );
             }
         }

@@ -1680,7 +1680,7 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "session/cancel failed");
             }
         }
-        // STAB-122: the cancelled child echoes `tool_call_update`s for the
+        // STAB-124: the cancelled child echoes `tool_call_update`s for the
         // aborted tool call (title-less, status failed). With the worker gone,
         // they buffer in the handle's notification channel and would be drained
         // by the NEXT turn's fresh transcript — which fabricated an anonymous

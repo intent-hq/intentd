@@ -761,7 +761,7 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
-/// STAB-122 loading tolerance: rows persisted by pre-fix daemons can carry an
+/// STAB-124 loading tolerance: rows persisted by pre-fix daemons can carry an
 /// anonymous `tool_use` block (`name: ""`) plus its paired errored
 /// `tool_result` at the head of an interrupt turn's assistant message.
 /// `agent.getConversation` must strip the anonymous pair on read (keeping the
