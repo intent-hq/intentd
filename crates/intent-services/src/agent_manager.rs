@@ -2729,6 +2729,28 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
+            // Snapshot the live-turn slot BEFORE aborting the worker: the abort
+            // drops the worker future and with it the LiveTurnGuard, which
+            // clears the slot — reading after the abort would race that drop
+            // and frequently lose the partial content.
+            let partial_turn = self.services.live_turn(id);
+            // Abort the turn worker BEFORE flushing so it cannot race the
+            // partial flush by persisting the full turn under the same minted
+            // message id (which would leave the transcript stuck on the partial
+            // snapshot while the worker's own append errors on the UNIQUE id).
+            // stop() below removes the (already-gone) worker entry harmlessly.
+            if let Some(worker) = self.workers.lock().unwrap().remove(id) {
+                worker.abort();
+            }
+            // Best-effort: persist any partial in-flight assistant content from
+            // the snapshot so the transcript keeps the streamed-so-far output
+            // across the restart. Runs before the status guards below so a
+            // degenerate status read/encode failure never drops the content.
+            if let Some(live) = partial_turn {
+                self.services
+                    .flush_partial_turn_on_interruption(id, live)
+                    .await;
+            }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
