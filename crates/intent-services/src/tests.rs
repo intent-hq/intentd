@@ -6041,32 +6041,45 @@ mod pr {
     #[test]
     fn sweep_due_tiers_by_recency_and_tick() {
         use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
-        let cutoff = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
+        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
+        let cutoff = intent_core::parse_iso(&cutoff_str);
+        assert!(cutoff.is_some());
         let ws_id = WorkspaceId::new();
 
         // Recently active (updated_at = now): due on every tick.
         let active = workspace(&ws_id);
-        assert!(sweep_due(&active, &cutoff, 1));
+        assert!(sweep_due(&active, cutoff, 1));
 
         // Idle (updated_at past the window, no last_activity): due only on
         // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
         let mut idle = workspace(&ws_id);
         idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
-        assert!(!sweep_due(&idle, &cutoff, 1));
-        assert!(!sweep_due(&idle, &cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
-        assert!(sweep_due(&idle, &cutoff, 0));
-        assert!(sweep_due(&idle, &cutoff, SWEEP_IDLE_TICK_MULTIPLE));
-        assert!(sweep_due(&idle, &cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
+        assert!(!sweep_due(&idle, cutoff, 1));
+        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
+        assert!(sweep_due(&idle, cutoff, 0));
+        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
+        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
+
+        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
+        let mut boundary = workspace(&ws_id);
+        boundary.updated_at = cutoff_str.clone();
+        assert!(sweep_due(&boundary, cutoff, 1));
 
         // A recent last_activity revives an otherwise-idle workspace.
         let mut revived = idle.clone();
         revived.last_activity = Some(now_iso());
-        assert!(sweep_due(&revived, &cutoff, 1));
+        assert!(sweep_due(&revived, cutoff, 1));
 
-        // Malformed timestamps fail open (count as active).
+        // Malformed timestamps fail open (count as active), on either field.
         let mut malformed = idle.clone();
         malformed.updated_at = "not-a-timestamp".to_string();
-        assert!(sweep_due(&malformed, &cutoff, 1));
+        assert!(sweep_due(&malformed, cutoff, 1));
+        let mut malformed_la = idle.clone();
+        malformed_la.last_activity = Some(String::new());
+        assert!(sweep_due(&malformed_la, cutoff, 1));
+
+        // An unparseable cutoff fails open too.
+        assert!(sweep_due(&idle, None, 1));
     }
 
     #[tokio::test]

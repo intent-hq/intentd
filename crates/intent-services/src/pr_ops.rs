@@ -17,6 +17,7 @@ use intent_sourcecontrol::{
     SourceControlSettings,
 };
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 /// TS `NO_ACTIVE_PR_ERROR`; every `pr.*` method needs an active PR (§5.7).
 pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
@@ -71,15 +72,16 @@ pub(crate) const SWEEP_IDLE_TICK_MULTIPLE: u64 = 10;
 /// the §7.7 "defer non-urgent refreshes" trimming): every
 /// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick (including tick 0, the first sweep
 /// after startup) refreshes every workspace; ticks in between refresh only
-/// workspaces active since `active_cutoff` (RFC-3339). A sweep that persists a
-/// PR delta bumps `updatedAt`, so workspaces with churning PRs stay on the
-/// every-tick cadence while quiet ones cool down. Malformed timestamps fail
-/// open (count as active) so a bad record never slows its own refreshes.
-pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: &str, tick: u64) -> bool {
+/// workspaces active since `active_cutoff` (parsed once per sweep by the
+/// caller). A sweep that persists a PR delta bumps `updatedAt`, so workspaces
+/// with churning PRs stay on the every-tick cadence while quiet ones cool
+/// down. Malformed workspace timestamps — and a `None` cutoff — fail open
+/// (count as active) so a bad record never slows its own refreshes.
+pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: Option<OffsetDateTime>, tick: u64) -> bool {
     if tick % SWEEP_IDLE_TICK_MULTIPLE == 0 {
         return true;
     }
-    let Some(cutoff) = parse_iso(active_cutoff) else {
+    let Some(cutoff) = active_cutoff else {
         return true;
     };
     let active = |ts: &str| match parse_iso(ts) {
