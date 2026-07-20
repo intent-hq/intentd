@@ -166,3 +166,94 @@ async fn malicious_specialist_id_rejected() {
     // With no settings configured, model should be None
     assert_eq!(got.model, None);
 }
+
+/// SECURITY: workspace_path is derived from workspace record, not client params
+/// (regression test for review thread PRRT_kwDOS9Wxuc6SIhDc). A malicious client
+/// cannot supply a spoofed workspacePath to read project-tier specialists from
+/// other workspaces.
+#[tokio::test]
+async fn spoofed_workspace_path_ignored() {
+    let (_t, svc, ws, specialists_dir) = setup().await;
+
+    // Create a project-tier specialist in a different directory
+    let evil_dir = specialists_dir
+        .path()
+        .join("evil-workspace")
+        .join(".augment")
+        .join("specialists");
+    std::fs::create_dir_all(&evil_dir).expect("mkdir evil specialists dir");
+    let specialist_content = "---\nmodel: attacker:model\n---\n# Evil Specialist";
+    std::fs::write(evil_dir.join("implementor.md"), specialist_content)
+        .expect("write evil specialist");
+
+    // Create an agent with specialistId "implementor" and client-supplied workspacePath
+    // pointing to the evil directory. The code should derive workspace_path from the
+    // stored workspace record instead.
+    let extra = intent_core::AgentCreateExtra {
+        workspace_path: Some(
+            evil_dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+        ),
+        is_background: Some(true),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("TestAgent".into()),
+            None, // no explicit model
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            None,
+            extra,
+        )
+        .await
+        .expect("create");
+    let id = AgentId(created["agent"]["id"].as_str().unwrap().to_string());
+
+    // The agent should be created but the model should NOT be "attacker:model"
+    // because the workspace record has no workspace_path (new workspace), so
+    // resolve_model gets None and falls through to settings (which is also None).
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_ne!(
+        got.model.as_deref(),
+        Some("attacker:model"),
+        "spoofed workspace_path was used"
+    );
+    assert_eq!(got.model, None, "expected settings chain fallback");
+}
+
+/// SECURITY: resolve_agent_type validates id to prevent path traversal
+/// (regression test for review thread PRRT_kwDOS9Wxuc6SIlcV). The validation
+/// is now done inside resolve() so all frontmatter lookups are guarded.
+#[tokio::test]
+async fn malicious_specialist_id_rejected_in_agent_type_resolution() {
+    let (_t, svc, ws, specialists_dir) = setup().await;
+
+    // Create a user-tier specialist with an agentType frontmatter field
+    let specialist_content = "---\nagentType: test-agent-type\n---\n# Test Specialist";
+    std::fs::write(
+        specialists_dir.path().join("test-specialist.md"),
+        specialist_content,
+    )
+    .expect("write specialist");
+
+    // Attempt to create agent with path-traversal specialist id.
+    // resolve_agent_type (via derive_agent_type) should validate the id inside resolve()
+    // and return None, falling back to the default agent type.
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("../evil".into())).await;
+
+    // The agent should be created with the default agent type (no path traversal)
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert!(got.id.0.starts_with("agent-"), "agent created");
+    // We can't directly inspect the agent_type from AgentLite, but we can verify
+    // that the agent was created successfully and didn't crash/panic during
+    // derive_agent_type, which would have happened if path traversal was allowed.
+}

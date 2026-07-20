@@ -1120,7 +1120,7 @@ impl Services {
             provider,
             agent_type: _,
             metadata,
-            workspace_path,
+            workspace_path: _, // Ignored; derived from workspace record for security
             workspace_context: _,
             context_references,
             image_blocks,
@@ -1158,8 +1158,23 @@ impl Services {
                 // Try specialist frontmatter model first (3-tier: project > user > bundled)
                 let specialist_model = if let Some(spec_id) = specialist.as_deref() {
                     let specialists_svc = self.specialists_service();
-                    let wp = workspace_path.as_deref().map(std::path::Path::new);
-                    specialists_svc.resolve_model(spec_id, wp)
+                    // SECURITY: derive workspace_path from the stored workspace record
+                    // rather than trusting the client-supplied value (review thread
+                    // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
+                    // workspacePath and read specialist files from other workspaces.
+                    // Use worktree_path if available, otherwise repository_path.
+                    let wp = self
+                        .store
+                        .get_workspace(&workspace_id)
+                        .await
+                        .ok()
+                        .and_then(|w| {
+                            w.worktree_path
+                                .as_ref()
+                                .or(w.repository_path.as_ref())
+                                .map(std::path::PathBuf::from)
+                        });
+                    specialists_svc.resolve_model(spec_id, wp.as_deref())
                 } else {
                     None
                 };
