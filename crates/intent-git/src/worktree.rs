@@ -129,8 +129,25 @@ pub fn provision_worktree(
     let mut opts = WorktreeAddOptions::new();
     opts.reference(Some(&branch_ref));
     repo.worktree(name, worktree_path, Some(&opts))
-        .map_err(map_git_err)?;
+        .map_err(|e| map_worktree_add_err(e, branch))?;
     Ok(checked_out_sha)
+}
+
+/// Map a libgit2 worktree-add error into a domain error, classifying the
+/// "branch already checked out" failure as InvalidParams with an actionable
+/// message (PROTOCOL §9 `-32602`) instead of a generic Internal error.
+fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
+    let msg = e.message();
+    // libgit2 surfaces "branch '...' is already checked out" when the branch
+    // is in use by another worktree (including the main working tree).
+    if msg.contains("already checked out") {
+        Error::InvalidParams(format!(
+            "branch '{}' is already checked out in another worktree; choose a different branch or remove the conflicting worktree",
+            branch
+        ))
+    } else {
+        map_git_err(e)
+    }
 }
 
 /// The branch checked out in the worktree at `worktree_path` (ports the
@@ -261,6 +278,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn provision_rejects_branch_already_checked_out() {
+        let dir = init_repo("wt-dup");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap();
+        let branch = head.shorthand().expect("branch name").to_string();
+
+        // Attempt to create a worktree on the same branch that's already
+        // checked out in the main working tree.
+        let wt_path = std::env::temp_dir().join(format!("wt-dup-{}", uuid_ish()));
+        let err = provision_worktree(
+            dir.path(),
+            "duplicate-ws",
+            &wt_path,
+            &branch,
+            None,
+            "origin",
+        )
+        .unwrap_err();
+
+        // Expect InvalidParams (→ -32602) with "already checked out" message.
+        match err {
+            Error::InvalidParams(msg) => {
+                assert!(
+                    msg.contains("already checked out"),
+                    "expected 'already checked out' in message, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&branch),
+                    "expected branch name in message, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidParams, got: {other:?}"),
+        }
     }
 
     fn uuid_ish() -> u128 {
