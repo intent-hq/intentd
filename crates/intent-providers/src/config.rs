@@ -31,6 +31,11 @@ pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
 /// the pin.
 pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 
+/// Pinned npx package spec for the codex ACP fallback. Matches the
+/// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
+/// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@zed-industries/codex-acp@0.16.0";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
@@ -223,7 +228,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         injection_mechanism: InjectionMechanism::SessionMeta,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
-        fallback_npx_package: Some("@agentclientprotocol/codex-acp"),
+        fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {

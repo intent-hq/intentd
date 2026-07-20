@@ -407,4 +407,23 @@ mod build_command_tests {
             "claude-code must not have a fallback (npx is the only path)"
         );
     }
+
+    #[test]
+    fn codex_fallback_npx_package_is_pinned() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let pkg = provider
+            .fallback_npx_package
+            .expect("codex should have fallback_npx_package configured");
+        assert_eq!(pkg, intent_providers::config::CODEX_ACP_NPX_PACKAGE);
+        assert!(
+            pkg.starts_with("@zed-industries/codex-acp@"),
+            "codex npx fallback should use the @zed-industries package, got: {pkg}"
+        );
+        let version = pkg.rsplit('@').next().unwrap();
+        let parts: Vec<&str> = version.split('.').collect();
+        assert!(
+            parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
+            "codex npx fallback must be pinned to an exact semver version, got: {version}"
+        );
+    }
 }
