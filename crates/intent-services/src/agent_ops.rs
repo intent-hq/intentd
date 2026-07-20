@@ -858,11 +858,14 @@ impl Services {
     pub(crate) fn project_lite_with_flags(&self, session: AgentSession) -> AgentLite {
         let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
             self.agent_activity_flags_for(&session);
+        let (turn_in_flight, last_stream_activity_at) = self.live_turn_liveness_for(&session);
         let mut lite = project_lite(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
         lite.is_waiting_for_other_agents = is_waiting_for_other_agents;
         lite.waiting_for_agent_ids = waiting_for_agent_ids;
+        lite.turn_in_flight = turn_in_flight;
+        lite.last_stream_activity_at = last_stream_activity_at;
         lite
     }
 
@@ -927,6 +930,33 @@ impl Services {
             .unwrap_or(false)
     }
 
+    /// Turn-liveness for `session` (STAB-125): `(turnInFlight,
+    /// lastStreamActivityAt)`. `turnInFlight` is `true` while an active worker
+    /// is draining a `session/prompt` turn whose live-turn slot is open;
+    /// `lastStreamActivityAt` is the slot's most-recent stream-event timestamp,
+    /// so a poller can tell a long-but-alive turn (timestamp advancing) from a
+    /// wedged agent (timestamp pinned) even when nothing has persisted yet.
+    /// Gated on [`agent_is_busy`](Self::agent_is_busy) — the same authoritative
+    /// "active worker" signal behind `isResponding` and `chat_snapshot`'s
+    /// live-turn merge — so an orphan slot with no worker never reports a
+    /// phantom in-flight turn. Terminal agents (completed/error/deleted) report
+    /// `(false, None)`, mirroring
+    /// [`agent_activity_flags_for`](Self::agent_activity_flags_for)'s terminal
+    /// short-circuit.
+    pub(crate) fn live_turn_liveness_for(&self, session: &AgentSession) -> (bool, Option<String>) {
+        let terminal = matches!(
+            session.status,
+            AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
+        );
+        if terminal || !self.agent_is_busy(session.id.clone()) {
+            return (false, None);
+        }
+        match self.live_turn(&session.id) {
+            Some(live) => (true, Some(live.last_activity_at)),
+            None => (false, None),
+        }
+    }
+
     /// `agent.getConversation` (PROTOCOL §5.5). Paginated per the TA-2 contract:
     /// the limit clamps to `[1,200]` (default 50) and an opaque `nextToken`
     /// walks backward to older pages. The `messages` array stays oldest→newest
@@ -952,6 +982,10 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
+        // Turn-liveness indicator (STAB-125): a long in-flight turn persists
+        // nothing until it ends, so without these additive fields a
+        // conversation read mid-turn is indistinguishable from a wedged agent.
+        let (turn_in_flight, last_stream_activity_at) = self.live_turn_liveness_for(&session);
         let messages = session.messages;
         let total = messages.len();
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
@@ -970,6 +1004,8 @@ impl Services {
             "truncated": win.next_token.is_some(),
             "totalMessages": total,
             "nextToken": win.next_token,
+            "turnInFlight": turn_in_flight,
+            "lastStreamActivityAt": last_stream_activity_at,
         }))
     }
 

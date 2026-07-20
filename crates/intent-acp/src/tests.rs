@@ -5707,6 +5707,8 @@ mod wsapi4_bindings_tests {
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: vec![],
+            turn_in_flight: false,
+            last_stream_activity_at: None,
             stats: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

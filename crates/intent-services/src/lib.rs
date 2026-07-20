@@ -11515,11 +11515,15 @@ impl WorkspaceApi for Services {
                         is_waiting_for_other_agents,
                         waiting_for_agent_ids,
                     ) = self.agent_activity_flags_for(&session);
+                    let (turn_in_flight, last_stream_activity_at) =
+                        self.live_turn_liveness_for(&session);
                     serde_json::json!({
                         "isResponding": is_responding,
                         "isWaitingOnTool": is_waiting_on_tool,
                         "isWaitingForOtherAgents": is_waiting_for_other_agents,
                         "waitingForAgentIds": waiting_for_agent_ids,
+                        "turnInFlight": turn_in_flight,
+                        "lastStreamActivityAt": last_stream_activity_at,
                     })
                 }
                 Err(_) => serde_json::json!({
@@ -11527,6 +11531,8 @@ impl WorkspaceApi for Services {
                     "isWaitingOnTool": false,
                     "isWaitingForOtherAgents": false,
                     "waitingForAgentIds": [],
+                    "turnInFlight": false,
+                    "lastStreamActivityAt": null,
                 }),
             }
         })

@@ -714,6 +714,14 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let snap = read_json(&mut sub_reader).await;
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["snapshot"]["totalMessages"], 2);
+    // STAB-125: the flags overlay carries turn-liveness — a mid-turn snapshot
+    // reports the open live-turn slot and its last stream-activity stamp.
+    assert_eq!(snap["params"]["snapshot"]["turnInFlight"], true);
+    assert!(
+        snap["params"]["snapshot"]["lastStreamActivityAt"].is_string(),
+        "mid-turn snapshot carries lastStreamActivityAt: {}",
+        snap["params"]["snapshot"]
+    );
     let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
         .as_array()
         .cloned()
@@ -938,6 +946,10 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
             || messages[0]["isStreaming"] == Value::Bool(false),
         "no streaming flag on the durable user message"
     );
+    // STAB-125: the orphan slot must not report a phantom in-flight turn
+    // either — liveness is gated on the busy claim like the merge above.
+    assert_eq!(snap["params"]["snapshot"]["turnInFlight"], false);
+    assert!(snap["params"]["snapshot"]["lastStreamActivityAt"].is_null());
 
     // Claiming the busy slot now restores the merge: re-subscribing on a fresh
     // connection sees the in-flight assistant message exactly as before.
@@ -963,6 +975,9 @@ async fn chat_snapshot_does_not_merge_live_turn_when_agent_is_not_busy() {
     assert_eq!(messages2.len(), 2);
     assert_eq!(messages2[1]["id"], mid.as_str());
     assert_eq!(messages2[1]["isStreaming"], true);
+    // With the busy claim in place the turn-liveness fields go live too.
+    assert_eq!(snap2["params"]["snapshot"]["turnInFlight"], true);
+    assert!(snap2["params"]["snapshot"]["lastStreamActivityAt"].is_string());
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

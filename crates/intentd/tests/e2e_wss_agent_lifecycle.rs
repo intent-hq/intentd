@@ -812,6 +812,42 @@ async fn agent_stop_keep_alive_resume_over_wss() {
     }
     assert!(saw_block_chunk, "first turn streamed a chunk and parked");
 
+    // STAB-125 turn-liveness over the wire: while the turn is parked mid-flight
+    // (nothing persisted for it yet), `agent.get` and `agent.getConversation`
+    // must report `turnInFlight: true` with an RFC-3339 `lastStreamActivityAt`
+    // — the additive fields that let a poller tell a long-but-alive turn from
+    // a wedged agent.
+    let got = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        got["agent"]["turnInFlight"], true,
+        "mid-turn agent.get reports turnInFlight: {got}"
+    );
+    assert!(
+        got["agent"]["lastStreamActivityAt"].is_string(),
+        "mid-turn agent.get carries lastStreamActivityAt: {got}"
+    );
+    let conv = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        conv["turnInFlight"], true,
+        "mid-turn getConversation reports turnInFlight: {conv}"
+    );
+    assert!(
+        conv["lastStreamActivityAt"].is_string(),
+        "mid-turn getConversation carries lastStreamActivityAt: {conv}"
+    );
+
     // Stop the agent mid-turn — interrupt (not kill); terminal stream:end fires.
     let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
@@ -871,6 +907,30 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         saw_resume_end,
         "resumed turn emits its own terminal stream:end"
     );
+
+    // STAB-125: once the turn ends the liveness fields reset — turnInFlight
+    // false, lastStreamActivityAt absent. Poll briefly: the worker releases
+    // the busy slot just after the terminal stream:end.
+    let mut reset = false;
+    for i in 0..40 {
+        let got = wss_rpc(
+            &mut rpc,
+            30 + i,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["turnInFlight"] == false {
+            assert!(
+                got["agent"].get("lastStreamActivityAt").is_none(),
+                "idle agent omits lastStreamActivityAt: {got}"
+            );
+            reset = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(reset, "turn-liveness fields reset after the turn ends");
 }
 
 /// Interrupt-priority delivery (PROTOCOL §5.5): `agent.sendMessage` with
