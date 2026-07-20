@@ -123,8 +123,9 @@ impl Transcript {
     /// `toolCallId`, flush any open text and push a `tool_use` block; on repeats,
     /// patch its `metadata.status`. When the tool reaches `completed`/`error`
     /// WITH output, append (then patch) a matching `tool_result` block. Returns
-    /// the index of the `tool_use` block (the block the `agent:tool:call` event
-    /// is enriched against).
+    /// `Some(index)` of the `tool_use` block (the block the `agent:tool:call`
+    /// event is enriched against), or `None` when the update was dropped —
+    /// callers must skip event publishing for dropped updates.
     ///
     /// STAB-124: a first-sight update whose derived name is empty is DROPPED
     /// (returns `None`, nothing recorded). This is the stale shape a cancelled

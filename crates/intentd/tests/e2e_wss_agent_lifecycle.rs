@@ -6004,7 +6004,7 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         &mut rpc,
         10,
         "agent.create",
-        json!({ "workspaceId": &ws_id, "name": "STAB122", "model": "mock:default" }),
+        json!({ "workspaceId": &ws_id, "name": "STAB124", "model": "mock:default" }),
     )
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();

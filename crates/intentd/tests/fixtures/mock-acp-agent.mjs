@@ -222,7 +222,7 @@ async function handlePrompt(id, params) {
         title: 'slow-tool: park until cancel',
         kind: 'execute',
         status: 'in_progress',
-        rawInput: { marker: 'stab-122' },
+        rawInput: { marker: 'stab-124' },
       },
     });
     cancelledToolCallIds.push(toolCallId);
