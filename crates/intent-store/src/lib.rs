@@ -12,6 +12,7 @@ use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
 
+mod agent_queue_repo;
 mod agent_repo;
 mod client_repo;
 mod comment_repo;
@@ -35,6 +36,7 @@ mod workspace_context_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
 
+pub use agent_queue_repo::AgentQueueRow;
 pub use agent_repo::{InterruptedAgent, ReplaceMessage};
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};

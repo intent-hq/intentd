@@ -151,6 +151,11 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Serializes [`agent_ops`] queue write-through persists. Each persist
+    /// snapshots the live queue *inside* this async lock, so the last write to
+    /// the `agent_queue` table always reflects the newest in-memory state — an
+    /// older snapshot can never overwrite a newer one out of mutation order.
+    agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last per-session stats snapshot observed by `agent.getSessionStats`
     /// (PROTOCOL §5.24). The `stats` field on `AgentSession` is derived/not
     /// persisted, so this in-memory cache lets a refresh detect a change and push
@@ -347,6 +352,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
             auggie_bin: None,

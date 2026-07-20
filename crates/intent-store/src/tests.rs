@@ -11,7 +11,7 @@ use intent_core::{
 };
 use serde_json::json;
 
-use crate::{EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
+use crate::{AgentQueueRow, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 /// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
 struct TempDb {
@@ -89,14 +89,14 @@ async fn migration_status_reports_current_after_open() {
         status.expected,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46
         ]
     );
     assert_eq!(
         status.applied,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46
         ]
     );
 }
@@ -2762,4 +2762,185 @@ async fn agent_message_append_refreshes_updated_at() {
         "updated_at must advance when a message is appended"
     );
     assert_eq!(after.messages.len(), 1, "message log should have 1 entry");
+}
+
+fn queue_row(agent_id: &AgentId, position: i64, content: &str) -> AgentQueueRow {
+    // Matches production, where the row id is the queued message id.
+    let id = uuid::Uuid::new_v4().to_string();
+    AgentQueueRow {
+        id: id.clone(),
+        agent_id: agent_id.clone(),
+        position,
+        payload: json!({
+            "id": id,
+            "content": content,
+            "queuedAt": now_iso(),
+            "editing": false,
+            "persisted": true,
+            "requeuedAfterFailure": false,
+            "messageMetadata": { "source": "test" },
+        }),
+        created_at: now_iso(),
+    }
+}
+
+#[tokio::test]
+async fn agent_queue_replace_load_delete_round_trip() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+
+    // Snapshot with two entries round-trips in position order with the payload intact.
+    let rows = vec![
+        queue_row(&agent, 0, "first"),
+        queue_row(&agent, 1, "second"),
+    ];
+    store
+        .replace_agent_queue(&agent, &rows)
+        .await
+        .expect("replace queue");
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].agent_id, agent);
+    assert_eq!(loaded[0].position, 0);
+    assert_eq!(loaded[0].payload["content"], "first");
+    assert_eq!(loaded[0].payload["persisted"], json!(true));
+    assert_eq!(loaded[0].payload["messageMetadata"]["source"], "test");
+    assert_eq!(loaded[1].position, 1);
+    assert_eq!(loaded[1].payload["content"], "second");
+
+    // Replace is a whole-queue snapshot: a shorter snapshot drops the rest.
+    store
+        .replace_agent_queue(&agent, &[queue_row(&agent, 0, "only")])
+        .await
+        .expect("replace shorter");
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].payload["content"], "only");
+
+    // Per-agent delete clears the persisted queue.
+    store
+        .delete_agent_queue(&agent)
+        .await
+        .expect("delete queue");
+    assert!(store
+        .load_all_agent_queues()
+        .await
+        .expect("load queues")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_queue_cascades_with_agent_session() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let doomed = AgentId::new();
+    let survivor = AgentId::new();
+    for agent in [&doomed, &survivor] {
+        store
+            .insert_agent_session(&sample_agent_session(agent, &ws))
+            .await
+            .expect("insert session");
+        store
+            .replace_agent_queue(agent, &[queue_row(agent, 0, "queued")])
+            .await
+            .expect("replace queue");
+    }
+
+    // Deleting the agent session cascades its queue rows via the FK.
+    assert!(store
+        .delete_agent_session(&ws, &doomed)
+        .await
+        .expect("delete session"));
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].agent_id, survivor);
+
+    // Workspace delete cascades the remaining session and its queue rows.
+    store.delete_workspace(&ws).await.expect("delete ws");
+    assert!(store
+        .load_all_agent_queues()
+        .await
+        .expect("load queues")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_queue_replace_rejects_mismatched_agent_id() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+
+    // A row stamped with a different agent id fails fast instead of being
+    // silently persisted under `agent`.
+    let other = AgentId::new();
+    let err = store
+        .replace_agent_queue(&agent, &[queue_row(&other, 0, "misfiled")])
+        .await
+        .expect_err("mismatched row must be rejected");
+    assert!(err.to_string().contains("belongs to agent"));
+    assert!(store
+        .load_all_agent_queues()
+        .await
+        .expect("load queues")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_queue_load_survives_corrupt_payload() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+    let rows = vec![queue_row(&agent, 0, "bad"), queue_row(&agent, 1, "good")];
+    let corrupt_id = rows[0].id.clone();
+    store
+        .replace_agent_queue(&agent, &rows)
+        .await
+        .expect("replace queue");
+
+    // Corrupt one payload behind the API's back (e.g. a manual DB edit).
+    sqlx::query("UPDATE agent_queue SET payload = 'not json' WHERE id = ?")
+        .bind(&corrupt_id)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt payload");
+
+    // Load stays best-effort: the corrupt row comes back as Null instead of
+    // failing the whole load, and the healthy row is intact.
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].payload, serde_json::Value::Null);
+    assert_eq!(loaded[1].payload["content"], "good");
 }
