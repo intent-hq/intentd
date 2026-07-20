@@ -5333,8 +5333,12 @@ impl WorkspaceApi for Services {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
+                        // Registry-backed restores are collected and applied as ONE batch
+                        // (a single config.toml rewrite + one change publication) instead of
+                        // per-key applies.
                         let mut rollback_failed = false;
                         let mut compensating_changes = Vec::new();
+                        let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
                         for (path, old_val, old_store) in old_values {
                             let rollback_result = match old_store {
                                 OldStore::Secret => {
@@ -5347,19 +5351,15 @@ impl WorkspaceApi for Services {
                                 }
                                 OldStore::Registry => {
                                     // TOML-backed setting: restore the prior file
-                                    // value (or remove the key when it was absent)
-                                    // through the registry; `Null` clears back to
-                                    // the schema default.
+                                    // value (or remove the key when it was absent);
+                                    // `Null` clears back to the schema default.
+                                    // Deferred into one registry batch below.
                                     let value = old_val
                                         .as_deref()
                                         .and_then(|raw| serde_json::from_str(raw).ok())
                                         .unwrap_or(serde_json::Value::Null);
-                                    match registry {
-                                        Some(reg) => {
-                                            reg.apply(&[(path.clone(), value.clone())]).map(|_| ())
-                                        }
-                                        None => Ok(()),
-                                    }
+                                    registry_restores.push((path.clone(), value));
+                                    Ok(())
                                 }
                                 OldStore::Db => {
                                     // Non-sensitive setting: restore to DB or delete
@@ -5396,6 +5396,20 @@ impl WorkspaceApi for Services {
                                     "path": path,
                                     "value": val_json
                                 }));
+                            }
+                        }
+
+                        // Restore all TOML-backed keys as one atomic registry batch
+                        // (single config.toml rewrite, single change publication).
+                        if !registry_restores.is_empty() {
+                            if let Some(reg) = registry {
+                                if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                    tracing::error!(
+                                        error = %rollback_err,
+                                        "settings.update registry rollback batch failed"
+                                    );
+                                    rollback_failed = true;
+                                }
                             }
                         }
 
