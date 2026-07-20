@@ -6761,10 +6761,15 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
 
-    // Wait until FOUR distinct agents finished a turn: sender, task target,
-    // and the two created children.
+    // Wait until the SPECIFIC expected agents finished a turn, accumulating
+    // every `agent:stream:end` agentId in one set so nothing is lost across
+    // the two phases (unrelated agents' events cannot exit the wait early).
+    // Phase 1: the ids known upfront — sender and task assignee.
     let mut done: Vec<String> = Vec::new();
     for _ in 0..200 {
+        if done.contains(&sender_id) && done.contains(&target_id) {
+            break;
+        }
         let Some(frame) = wss_event_opt(&mut sub, 30).await else {
             break;
         };
@@ -6778,13 +6783,15 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
                 done.push(id);
             }
         }
-        if done.len() >= 4 {
-            break;
-        }
     }
-    assert_eq!(done.len(), 4, "all four turns completed: {done:?}");
+    assert!(done.contains(&sender_id), "sender turn completed: {done:?}");
+    assert!(
+        done.contains(&target_id),
+        "task assignee turn completed: {done:?}"
+    );
 
-    // Resolve the created children by name.
+    // The sender's turn is over, so both `ws.agent.create` calls have
+    // returned — resolve the created children by name.
     let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": &ws_id })).await;
     let agents = list["agents"].as_array().expect("agents array");
     let by_name = |name: &str| -> String {
@@ -6797,6 +6804,35 @@ async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
     };
     let auto_child = by_name("ChildAuto");
     let explicit_child = by_name("ChildExplicit");
+
+    // Phase 2: keep draining until BOTH created children finished their
+    // kickoff turns (their earlier stream:ends are already in `done`).
+    for _ in 0..200 {
+        if done.contains(&auto_child) && done.contains(&explicit_child) {
+            break;
+        }
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+    }
+    assert!(
+        done.contains(&auto_child),
+        "auto-tag child turn completed: {done:?}"
+    );
+    assert!(
+        done.contains(&explicit_child),
+        "explicit-metadata child turn completed: {done:?}"
+    );
 
     let expected_tag = json!({
         "type": "agent_message",
