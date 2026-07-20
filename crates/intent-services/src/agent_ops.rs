@@ -3480,6 +3480,7 @@ impl Services {
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         let task = self.get_my_task(workspace_id.clone(), task_note_id).await?;
         let Some(agent) = task.assigned_agents.first().cloned() else {
@@ -3494,33 +3495,29 @@ impl Services {
         // `agent_send_message` (WorkspaceApi) routing: the manager path
         // spawns the turn worker; only the read-only wiring with no
         // manager falls back to the store-only op.
+        let options = crate::agent_manager::TurnOptions {
+            message_metadata,
+            ..crate::agent_manager::TurnOptions::default()
+        };
         let result = match (
             self.agent_manager(),
             is_interrupt_priority(priority.as_deref()),
         ) {
             (Some(manager), true) => {
                 manager
-                    .interrupt_send_message(
-                        agent.clone(),
-                        workspace_id,
-                        message,
-                        None,
-                        crate::agent_manager::TurnOptions::default(),
-                    )
+                    .interrupt_send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
             (Some(manager), false) => {
                 manager
-                    .send_message(
-                        agent.clone(),
-                        workspace_id,
-                        message,
-                        None,
-                        crate::agent_manager::TurnOptions::default(),
-                    )
+                    .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
             (None, _) => {
+                // Read-only fallback (no `agent_manager` wired): mirrors
+                // `agent_send_message` — the store-only op doesn't accept
+                // metadata, so the payload is dropped here (it IS preserved
+                // on the production manager paths above).
                 self.agent_send_message_op(agent.clone(), message, None, None, None)
                     .await?
             }

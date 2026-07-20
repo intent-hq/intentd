@@ -1007,8 +1007,11 @@ async fn dispatch(
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
             let message = require_str_param(params, "message")?;
             let priority = opt_str(params, "priority");
+            // Same opaque per-message payload as `agent.sendMessage` below
+            // (PROTOCOL §5.5) — persisted on the assignee's user row.
+            let message_metadata = opt_value(params, "messageMetadata");
             let result = api
-                .agent_send_to_task(ws, task_note_id, message, priority)
+                .agent_send_to_task(ws, task_note_id, message, priority, message_metadata)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

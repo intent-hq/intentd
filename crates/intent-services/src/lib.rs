@@ -11697,10 +11697,17 @@ impl WorkspaceApi for Services {
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_send_to_task_op(workspace_id, task_note_id, message, priority)
-                .await
+            self.agent_send_to_task_op(
+                workspace_id,
+                task_note_id,
+                message,
+                priority,
+                message_metadata,
+            )
+            .await
         })
     }
 

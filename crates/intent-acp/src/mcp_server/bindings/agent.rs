@@ -185,7 +185,7 @@ async fn create(
             None,
             None,
             None,
-            None,
+            sender_metadata(api, ws, caller).await,
         )
         .await
     {
@@ -246,7 +246,7 @@ async fn send(
             None,
             None,
             None,
-            None,
+            sender_metadata(api, ws, caller).await,
         )
         .await
         .map_err(map_err)?;
@@ -276,6 +276,7 @@ async fn send_to_task(
             NoteId::from_string(&task_note_id),
             message,
             opt_str(args, "priority"),
+            sender_metadata(api, ws, caller).await,
         )
         .await
         .map_err(map_err)?;
@@ -454,6 +455,27 @@ async fn report_to_parent(
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
+}
+
+/// Sender-attribution `messageMetadata` for agent-originated sends: when the
+/// caller is an agent (not the FE/RPC front door), tag the delivered message
+/// with `{ type: "agent_message", fromAgentId, fromAgentName? }` so clients
+/// can render who sent it (PROTOCOL §5.5). `fromAgentName` is resolved from
+/// the caller's session and omitted when the lookup fails; human-originated
+/// sends (`caller == None`) return `None` and stay untagged.
+async fn sender_metadata(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+) -> Option<Value> {
+    let caller = caller?;
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("type".to_string(), json!("agent_message"));
+    metadata.insert("fromAgentId".to_string(), json!(caller.as_str()));
+    if let Ok(caller_lite) = api.agent_get(caller.clone(), Some(ws.clone())).await {
+        metadata.insert("fromAgentName".to_string(), json!(caller_lite.name));
+    }
+    Some(Value::Object(metadata))
 }
 
 /// SUB-1 sender auto-subscribe: register the caller→target completion watch

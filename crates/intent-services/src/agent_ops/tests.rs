@@ -6141,7 +6141,7 @@ async fn deliv1_send_to_task_non_interrupt_drives_turn_via_runtime() {
 
     let mut sub = subscribe_status(&bus);
     let resp = svc
-        .agent_send_to_task_op(ws.clone(), note_id, "follow up".into(), None)
+        .agent_send_to_task_op(ws.clone(), note_id, "follow up".into(), None, None)
         .await
         .expect("send_to_task");
     assert_eq!(resp["ok"], true);

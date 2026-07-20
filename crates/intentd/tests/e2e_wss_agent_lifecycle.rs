@@ -6453,3 +6453,193 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
     assert_eq!(file["fileName"], "notes.txt");
     assert_eq!(file["mimeType"], "text/plain");
 }
+
+/// Sender attribution for agent-to-agent sends (PROTOCOL §5.5): when agent A
+/// messages agent B through the `ws.agent.send` host binding, the delivered
+/// user row on B's transcript must carry
+/// `metadata == { type: "agent_message", fromAgentId, fromAgentName }` so
+/// clients can render who sent it. A human `agent.sendMessage` (FE/RPC front
+/// door, no caller agent) must stay untagged.
+#[tokio::test]
+async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
+    let Some(script) = gate("WSS agent-to-agent sender metadata E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Rule-matched behavior: the SENDER's kickoff prompt drives a real MCP
+    // `workspace_api` call that finds the target by name and sends to it; the
+    // TARGET's delivered message (and the human follow-up) fall through to
+    // the plain default response.
+    let send_code = "const agents = await ws.agent.list(true); \
+                     const target = agents.find(a => a.name === 'TargetB'); \
+                     return await ws.agent.send(target.id, 'cross-agent hello');";
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "do the send",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": send_code, "summary": "cross-agent send e2e" }
+                },
+                "response": "send dispatched"
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let target = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "TargetB", "model": "mock:default" }),
+    )
+    .await;
+    let target_id = target["agent"]["id"].as_str().unwrap().to_string();
+    let sender = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "mock:default" }),
+    )
+    .await;
+    let sender_id = sender["agent"]["id"].as_str().unwrap().to_string();
+
+    // Kick off the sender's turn; its workspace_api call fans the message out
+    // to the target, which then runs its own turn on the delivered message.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &sender_id, "content": "do the send" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
+
+    // Wait for BOTH turns to complete: the sender's and the target's.
+    let mut sender_done = false;
+    let mut target_done = false;
+    for _ in 0..120 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+            if ev_agent == sender_id {
+                sender_done = true;
+            } else if ev_agent == target_id {
+                target_done = true;
+            }
+        }
+        if sender_done && target_done {
+            break;
+        }
+    }
+    assert!(sender_done, "sender turn completed");
+    assert!(target_done, "target turn completed");
+
+    // THE assertion: the target's user row for the cross-agent message
+    // carries the `agent_message` sender-attribution metadata.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &target_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let tagged = messages
+        .iter()
+        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "cross-agent hello")
+        .expect("cross-agent user row present");
+    assert_eq!(
+        tagged["metadata"],
+        json!({
+            "type": "agent_message",
+            "fromAgentId": sender_id,
+            "fromAgentName": "SenderA",
+        }),
+        "agent-originated send must carry sender attribution: {tagged}"
+    );
+
+    // Control: a human send (FE/RPC front door) stays untagged.
+    let human = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &target_id, "content": "human follow-up" }),
+    )
+    .await;
+    assert_eq!(human["success"], true, "human sendMessage ok: {human}");
+    let mut human_done = false;
+    for _ in 0..80 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end"
+            && ev["data"]["agentId"].as_str() == Some(target_id.as_str())
+        {
+            human_done = true;
+            break;
+        }
+    }
+    assert!(human_done, "human follow-up turn completed");
+
+    let conv2 = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &target_id }),
+    )
+    .await;
+    let human_row = conv2["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "human follow-up")
+        .expect("human user row present")
+        .clone();
+    assert!(
+        human_row["metadata"].is_null()
+            || human_row["metadata"]
+                .get("type")
+                .map(|t| t != "agent_message")
+                == Some(true),
+        "human send must NOT carry agent_message metadata: {human_row}"
+    );
+}
