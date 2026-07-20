@@ -121,7 +121,7 @@ Update a workspace note after each iteration with: Iteration number, PR state su
 | `gh pr view <n> --json reviewThreads` (or GraphQL `pullRequest.reviewThreads`) | List inline review threads with `isResolved` + thread IDs (REST `/pulls/{n}/comments` lacks this) |
 | `gh api -X POST .../pulls/{n}/comments/{id}/replies` + GraphQL `resolveReviewThread` mutation | Reply to a review comment (REST) and resolve its thread (GraphQL-only) |
 | `gh pr view <n> --comments` | List general (non-inline) PR comments |
-| `gh pr comment <n> --body "..."` | Post a general comment (e.g., "augment review") |
+| `gh pr comment <n> --body "..."` | Post a general comment (e.g., ping a reviewer or post a review bot's trigger phrase) |
 | `gh pr update-branch <n>` | Merge base branch into PR branch (update from trunk) |
 | ~~`gh pr merge`~~ | **DO NOT USE** — merging is the Coordinator's decision, not the Shepherd's |
 | `gh pr checks <n>` / `gh run rerun <id> --failed` | CI status and rerun failed jobs |
