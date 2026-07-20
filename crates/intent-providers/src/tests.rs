@@ -26,6 +26,15 @@ fn registry_default_and_lookups() {
 }
 
 #[test]
+fn claude_agent_acp_pin_is_single_sourced() {
+    assert!(!CLAUDE_AGENT_ACP_VERSION.is_empty());
+    assert_eq!(
+        CLAUDE_AGENT_ACP_NPX_PACKAGE,
+        format!("@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}")
+    );
+}
+
+#[test]
 fn registry_field_parity() {
     let auggie = find_provider("auggie").unwrap();
     assert_eq!(auggie.display_name, "Augment Auggie");
@@ -46,9 +55,12 @@ fn registry_field_parity() {
     assert_eq!(cc.base_args, &[] as &[&str]);
     assert_eq!(cc.auth_check_args, Some(&["auth", "status"][..]));
     assert!(cc.model_flag.is_none() && cc.can_be_disabled);
+    assert_eq!(cc.npx_only_package, Some(CLAUDE_AGENT_ACP_NPX_PACKAGE));
+    assert_eq!(cc.fallback_npx_package, None);
 
     let codex = find_provider("codex").unwrap();
     assert_eq!(codex.auth_check_args, Some(&["login", "status"][..]));
+    assert_eq!(codex.npx_only_package, None);
 
     let cortex = find_provider("cortex").unwrap();
     assert_eq!(cortex.command, "cortex-acp");

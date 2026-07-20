@@ -42,10 +42,12 @@ pub struct SpawnOptions<'a> {
     /// [`ProviderConfig::remove_tool_flag`] — providers that don't advertise a
     /// flag silently ignore the input rather than receive an unknown arg.
     pub tools_to_remove: Vec<&'static str>,
-    /// When provider_binary is None and the provider has a fallback_npx_package,
-    /// this is the resolved npx path.
+    /// When provider_binary is None and the provider spawns via npx (either a
+    /// `fallback_npx_package` or an npx-only provider's pinned
+    /// `npx_only_package`), this is the resolved npx path.
     pub npx_fallback_binary: Option<&'a Path>,
-    /// The package name to pass to npx when npx_fallback_binary is set.
+    /// The package spec to pass to npx when npx_fallback_binary is set (may
+    /// carry a pinned `@<version>` suffix).
     pub npx_fallback_package: Option<&'static str>,
 }
 
@@ -306,34 +308,47 @@ mod build_command_tests {
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        opts.npx_fallback_package = Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
         let cmd = build_command(&opts);
         let program = cmd.as_std().get_program();
         assert_eq!(program, npx_path.as_os_str());
     }
 
     #[test]
-    fn build_args_prepends_npx_package_when_fallback_set() {
+    fn claude_code_npx_spawn_argv_is_pinned() {
+        // The exact spawn argv for claude-code: `<npx> -y <pinned package>` —
+        // no other args (claude-code has no base args).
         let provider = intent_providers::find_provider("claude-code").unwrap();
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        opts.npx_fallback_package = provider.npx_only_package;
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = build_args(&opts);
-        assert!(args.len() >= 2, "npx args should include -y and package");
-        assert_eq!(args[0], "-y");
-        assert_eq!(args[1], "@agentclientprotocol/claude-agent-acp");
+        assert_eq!(
+            args,
+            vec![
+                "-y".to_string(),
+                format!(
+                    "@agentclientprotocol/claude-agent-acp@{}",
+                    intent_providers::CLAUDE_AGENT_ACP_VERSION
+                ),
+            ]
+        );
     }
 
     #[test]
     fn build_command_prefers_provider_binary_over_npx_fallback() {
-        let provider = intent_providers::find_provider("claude-code").unwrap();
+        // Uses codex (a fallback-npx provider) — claude-code is npx-only and
+        // never resolves a provider binary.
+        let provider = intent_providers::find_provider("codex").unwrap();
         let mut opts = SpawnOptions::new(provider);
-        let provider_binary = PathBuf::from("/custom/claude-agent-acp");
+        let provider_binary = PathBuf::from("/custom/codex-acp");
         let npx_path = PathBuf::from("/usr/local/bin/npx");
         opts.provider_binary = Some(&provider_binary);
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        opts.npx_fallback_package = provider.fallback_npx_package;
         let cmd = build_command(&opts);
         let program = cmd.as_std().get_program();
         // Should use provider_binary, not npx
@@ -349,7 +364,7 @@ mod build_command_tests {
         let mut opts = SpawnOptions::new(provider);
         let npx_path = PathBuf::from("/custom/node/bin/npx");
         opts.npx_fallback_binary = Some(&npx_path);
-        opts.npx_fallback_package = Some("@agentclientprotocol/claude-agent-acp");
+        opts.npx_fallback_package = Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
         let cmd = build_command(&opts);
         let env_path = cmd.as_std().get_envs().find(|(k, _)| *k == "PATH");
         assert!(env_path.is_some());
@@ -373,15 +388,23 @@ mod build_command_tests {
             provider.fallback_npx_package, None,
             "auggie should not have fallback_npx_package"
         );
+        assert_eq!(
+            provider.npx_only_package, None,
+            "auggie should not have npx_only_package"
+        );
     }
 
     #[test]
-    fn claude_code_has_fallback_npx_package() {
+    fn claude_code_is_npx_only_with_pinned_package() {
         let provider = intent_providers::find_provider("claude-code").unwrap();
         assert_eq!(
-            provider.fallback_npx_package,
-            Some("@agentclientprotocol/claude-agent-acp"),
-            "claude-code should have fallback_npx_package configured"
+            provider.npx_only_package,
+            Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE),
+            "claude-code must spawn exclusively via the pinned npx package"
+        );
+        assert_eq!(
+            provider.fallback_npx_package, None,
+            "claude-code must not have a fallback (npx is the only path)"
         );
     }
 }
