@@ -155,6 +155,36 @@ fn prompt_updates_with_tool_result() -> Vec<String> {
     vec![chunk, tool_call, tool_done]
 }
 
+/// A prompt turn whose FIRST update is a stale `tool_call_update` for a
+/// toolCallId this turn never saw (the shape a cancelled child emits after an
+/// interrupt: no title, no rawInput → derived name ""), followed by a real
+/// text chunk. STAB-124: the stale update must be dropped, not fabricated into
+/// an anonymous `tool_use` block.
+fn prompt_updates_stale_anonymous_tool() -> Vec<String> {
+    let stale = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "stale-1",
+                "status": "failed",
+                "rawOutput": { "error": "The operation was aborted" } }
+        }
+    })
+    .to_string();
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Resumed" } }
+        }
+    })
+    .to_string();
+    vec![stale, chunk]
+}
+
 /// Wire a `Connection` to a fresh mock agent, returning the connection, its
 /// notification receiver, and the agent task handle.
 fn connect() -> (
@@ -685,6 +715,59 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     assert_eq!(
         tool_events[1].data["output"],
         json!({ "summary": "12 passed" })
+    );
+}
+
+/// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn
+/// never saw (the abort echo a cancelled child emits after an interrupt: no
+/// title/rawInput → derived name "") must NOT fabricate an anonymous
+/// `tool_use` block in the persisted message, and no `agent:tool:call` event
+/// is published for it. The turn's real text still persists normally.
+#[tokio::test]
+async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_stale_anonymous_tool());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    // status, chunk, stream:end, idle — and NO agent:tool:call for the stale update.
+    let mut events = Vec::new();
+    while events.len() < 4 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:tool:call"),
+        "no tool event published for a dropped anonymous tool update"
+    );
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    assert_eq!(
+        messages[0].content,
+        json!([
+            { "type": "text", "id": format!("{mid}:0"), "text": "Resumed" },
+        ]),
+        "the anonymous tool_use block (and its errored tool_result) are never persisted"
     );
 }
 
