@@ -146,6 +146,23 @@ async fn resolve_default_model_from_settings(
     None
 }
 
+/// RAII claim on a client-supplied agent id while a create flow is in flight
+/// (see [`Services::reserve_agent_id`]). Dropping the guard — on success or
+/// failure — releases the id so a later legitimate create is not blocked.
+pub(crate) struct AgentIdReservation {
+    set: Arc<Mutex<HashSet<AgentId>>>,
+    id: AgentId,
+}
+
+impl Drop for AgentIdReservation {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -1142,6 +1159,48 @@ impl Services {
         .await;
     }
 
+    /// Reject a client-supplied agent id that already names a persisted
+    /// session (PROTOCOL §5.5): a duplicate is `-32602` naming the id, so a
+    /// retrying client sees a clear validation error instead of the opaque
+    /// `-32603` SQLite UNIQUE(1555) insert failure — and callers like
+    /// `workspace.create` can pre-validate BEFORE running provisioning side
+    /// effects.
+    pub(crate) async fn ensure_agent_id_available(&self, id: &AgentId) -> Result<()> {
+        match self.store.get_agent_session_status(id).await {
+            Ok(_) => Err(Error::InvalidParams(format!(
+                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
+            ))),
+            Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Atomically claim a client-supplied agent id for the duration of a
+    /// create flow, closing the check-then-act gap left by
+    /// [`ensure_agent_id_available`]: two overlapping `workspace.create`
+    /// retries with the same `initialAgent.agentId` would otherwise BOTH pass
+    /// the preflight SELECT, run expensive provisioning (clone, worktree, row
+    /// insert, `workspace:created`), and then one would lose at the agent
+    /// insert — orphaning a partial workspace. The loser now fails the same
+    /// `-32602` at preflight, before any side effect. The reservation is
+    /// in-process only (the daemon is the sole writer of its SQLite store)
+    /// and releases on [`AgentIdReservation`] drop — success or failure.
+    pub(crate) fn reserve_agent_id(&self, id: &AgentId) -> Result<AgentIdReservation> {
+        let mut set = self
+            .creating_agent_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !set.insert(id.clone()) {
+            return Err(Error::InvalidParams(format!(
+                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
+            )));
+        }
+        Ok(AgentIdReservation {
+            set: Arc::clone(&self.creating_agent_ids),
+            id: id.clone(),
+        })
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -1150,8 +1209,9 @@ impl Services {
     /// `requested_agent_id` is honored verbatim when it is a well-formed
     /// `agent-{uuid}`, so the FE can create + address the session under an id
     /// it already minted (fixes the UI create→sendMessage "not found: agent
-    /// session" race). Malformed values surface as `-32602`; when `None` a
-    /// fresh id is generated (existing behavior).
+    /// session" race). Malformed values surface as `-32602`, and so does a
+    /// duplicate id that already names a persisted session (naming the id);
+    /// when `None` a fresh id is generated (existing behavior).
     ///
     /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
     /// the persisted [`AgentSession`]; `metadata` is harvested for the
@@ -1213,6 +1273,7 @@ impl Services {
         let id = match requested_agent_id {
             Some(requested) => {
                 validate_client_agent_id(requested.as_str())?;
+                self.ensure_agent_id_available(&requested).await?;
                 requested
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),
