@@ -454,8 +454,9 @@ async fn resolve_interrupted_resume_and_abandon() {
     // message as the last user-role message (and that it no longer mentions
     // "intentd").
     use intent_core::AgentId;
+    let resume_agent_id = AgentId(agent_resume.clone());
     let resumed_session = store
-        .get_agent_session(&AgentId(agent_resume.clone()))
+        .get_agent_session(&resume_agent_id)
         .await
         .expect("get resumed session");
     let last_user_msg = resumed_session
