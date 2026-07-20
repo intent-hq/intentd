@@ -32,7 +32,7 @@ use intent_core::{
     now_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture,
     Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
-use intent_providers::ProviderConfig;
+use intent_providers::{InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
 use serde_json::{json, Value};
 use tokio::process::Child;
@@ -710,6 +710,16 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents whose NEXT turn must carry the assembled system prompt prepended
+    /// as a `<system>` block — the FirstTurnPrepend fallback (§18.1) for
+    /// providers with no native injection mechanism (cortex, mock). Set when a
+    /// FRESH ACP session is opened (`session/new`, brand-new or recreate) for a
+    /// provider whose `injection_mechanism` is
+    /// [`InjectionMechanism::FirstTurnPrepend`]; NOT set on `session/load`
+    /// resume (the provider kept its prior context, which already saw the
+    /// prompt). Consumed by [`AgentManager::build_turn_prompt`] so the block
+    /// fires exactly once per fresh session and re-fires after a recreate.
+    prepend_pending: Arc<Mutex<HashSet<AgentId>>>,
     /// Most recent interrupt-priority `messageId` delivered per agent
     /// (PROTOCOL §5.5). [`AgentManager::interrupt_send_message`] records the
     /// client-supplied id under this lock BEFORE preempting, so the SAME
@@ -775,6 +785,7 @@ impl AgentManager {
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1345,6 +1356,7 @@ impl AgentManager {
                 .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
             self.recreated.lock().unwrap().insert(agent_id.clone());
+            self.arm_first_turn_prepend(agent_id, provider);
             self.maybe_bypass_permissions(
                 conn.as_ref(),
                 provider,
@@ -1360,6 +1372,7 @@ impl AgentManager {
             .services
             .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
             .await?;
+        self.arm_first_turn_prepend(agent_id, provider);
         self.maybe_bypass_permissions(
             conn.as_ref(),
             provider,
@@ -1396,6 +1409,46 @@ impl AgentManager {
     /// turn, meaning the next prompt must resend the prior conversation history.
     fn take_recreated(&self, agent_id: &AgentId) -> bool {
         self.recreated.lock().unwrap().remove(agent_id)
+    }
+
+    /// Arm the FirstTurnPrepend flag for `agent_id` when the provider has no
+    /// native system-prompt mechanism (§18.1 fallback). Called only from the
+    /// fresh-session branches of [`AgentManager::start_session`] (`session/new`
+    /// for a brand-new agent, or the resume-impossible recreate) — never on a
+    /// `session/load` resume, where the provider retained the prior context
+    /// that already carried the prompt.
+    fn arm_first_turn_prepend(&self, agent_id: &AgentId, provider: &ProviderConfig) {
+        if provider.injection_mechanism == InjectionMechanism::FirstTurnPrepend {
+            self.prepend_pending
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone());
+        }
+    }
+
+    /// Take (clear) the FirstTurnPrepend flag for `agent_id`: `true` when the
+    /// next outbound prompt must carry the assembled system prompt as a
+    /// leading `<system>` block (fresh session on a FirstTurnPrepend provider).
+    fn take_prepend_pending(&self, agent_id: &AgentId) -> bool {
+        self.prepend_pending.lock().unwrap().remove(agent_id)
+    }
+
+    /// Compute the `<system>`-wrapped assembled system prompt for the
+    /// FirstTurnPrepend fallback, or `None` when nothing is pending. Consumes
+    /// the pending flag; the prompt text comes from the session's persisted
+    /// `system_prompt` (written by [`AgentManager::create_agent`] at spawn
+    /// time from `assemble_system_prompt`).
+    async fn build_first_turn_prepend(&self, agent_id: &AgentId) -> Option<String> {
+        if !self.take_prepend_pending(agent_id) {
+            return None;
+        }
+        let session = self.services.store.get_agent_session(agent_id).await.ok()?;
+        let prompt = session.system_prompt?;
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return None;
+        }
+        Some(format!("<system>\n{prompt}\n</system>"))
     }
     /// Compute the fire-once workspace-naming instruction for the outbound
     /// prompt, or `None` when it should be omitted. Ported from the reference
@@ -1501,6 +1554,18 @@ impl AgentManager {
                 }
                 _ => prompt_text,
             },
+        };
+        // FirstTurnPrepend fallback (§18.1): for providers with no native
+        // system-prompt mechanism (cortex, mock), the assembled system prompt
+        // is delivered as the OUTERMOST `<system>` block on the first prompt
+        // of each fresh ACP session — before context/naming/reminder/user
+        // content. Armed by `start_session` on `session/new` (brand-new or
+        // recreate, never `session/load` resume) and consumed here so it
+        // fires exactly once per fresh session.
+        let prepend = self.build_first_turn_prepend(agent_id).await;
+        let prompt_text = match prepend {
+            Some(sys) => format!("{sys}\n\n{prompt_text}"),
+            None => prompt_text,
         };
         let mut blocks = text_prompt(&prompt_text);
         append_attachment_blocks(&mut blocks, options);
@@ -1615,9 +1680,11 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
-        // Drop any pending recreate flag: the next spawn re-decides resume vs
-        // recreate from scratch, so a stale flag must not survive a teardown.
+        // Drop any pending recreate/prepend flags: the next spawn re-decides
+        // resume vs recreate from scratch, so stale flags must not survive a
+        // teardown (a session/load resume must not fire a stale prepend).
         self.recreated.lock().unwrap().remove(agent_id);
+        self.prepend_pending.lock().unwrap().remove(agent_id);
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
@@ -3994,6 +4061,169 @@ mod role_reminder_tests {
             .agent_specialist_injection(&agent_id, None)
             .await
             .is_none());
+    }
+
+    // ---- FirstTurnPrepend fallback (§18.1) ----
+
+    /// Persist an assembled system prompt on the seeded agent session (the
+    /// spawn path does this in `create_agent`; unit tests seed it directly).
+    async fn set_system_prompt(mgr: &AgentManager, agent_id: &AgentId, prompt: &str) {
+        let mut s = mgr
+            .services
+            .store
+            .get_agent_session(agent_id)
+            .await
+            .expect("session");
+        let ws = s.workspace_id.clone();
+        s.system_prompt = Some(prompt.to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("persist system_prompt");
+    }
+
+    #[tokio::test]
+    async fn first_turn_prepend_fires_once_per_fresh_session() {
+        let (mgr, agent_id) = manager_with(None, None).await;
+        set_system_prompt(&mgr, &agent_id, "You are helpful.").await;
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        // First turn carries the <system>-wrapped assembled prompt first.
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "first message",
+                &TurnOptions::default(),
+            )
+            .await;
+        let text = prompt_text(&prompt);
+        assert!(
+            text.starts_with("<system>\nYou are helpful.\n</system>\n\n"),
+            "missing first-turn prepend: {text:?}"
+        );
+        assert!(text.ends_with("first message"));
+        // Second turn on the SAME session must not repeat it.
+        let prompt = mgr
+            .build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "second message",
+                &TurnOptions::default(),
+            )
+            .await;
+        let text = prompt_text(&prompt);
+        assert!(
+            !text.contains("<system>\nYou are helpful."),
+            "prepend repeated on second turn: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_turn_prepend_refires_after_recreate() {
+        let (mgr, agent_id) = manager_with(None, None).await;
+        set_system_prompt(&mgr, &agent_id, "SP body").await;
+        let mock = intent_providers::find_provider("mock").unwrap();
+        // Fresh session → fires; consumed by the first turn.
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        let first = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "one",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(first.starts_with("<system>\nSP body\n</system>"));
+        // Recreate path re-arms (start_session recreate branch) → fires again.
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        let again = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "two",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert!(
+            again.starts_with("<system>\nSP body\n</system>"),
+            "prepend must re-fire after session recreation: {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_turn_prepend_not_armed_for_native_mechanism_providers() {
+        let (mgr, agent_id) = manager_with(None, None).await;
+        set_system_prompt(&mgr, &agent_id, "native SP").await;
+        // Native-mechanism providers (rules file / _meta / env) never arm the
+        // fallback — no double injection.
+        for id in ["auggie", "claude-code", "codex", "opencode", "droid"] {
+            let provider = intent_providers::find_provider(id).unwrap();
+            mgr.arm_first_turn_prepend(&agent_id, provider);
+        }
+        assert!(
+            !mgr.prepend_pending.lock().unwrap().contains(&agent_id),
+            "native-mechanism providers must not arm the prepend fallback"
+        );
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "hello",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(text, "hello");
+    }
+
+    #[tokio::test]
+    async fn first_turn_prepend_skipped_when_no_system_prompt() {
+        // Armed but the session has no persisted system_prompt (or blank) —
+        // no stray empty <system> block; the flag is still consumed.
+        let (mgr, agent_id) = manager_with(None, None).await;
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        let text = prompt_text(
+            &mgr.build_turn_prompt(
+                &agent_id,
+                &WorkspaceId::from("ws-1"),
+                "no sp",
+                &TurnOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(text, "no sp");
+        assert!(!mgr.prepend_pending.lock().unwrap().contains(&agent_id));
+    }
+
+    #[tokio::test]
+    async fn first_turn_prepend_precedes_context_and_reminder() {
+        // Ordering: the FirstTurnPrepend <system> block is OUTERMOST — before
+        // the stdinContext `Context:` block, role reminder, and body.
+        let dir = write_specialist(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nbody",
+        );
+        let (mgr, agent_id) = manager_with(Some("implementor"), Some(dir)).await;
+        set_system_prompt(&mgr, &agent_id, "SP").await;
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        let opts = TurnOptions {
+            stdin_context: Some("ctx".to_string()),
+            ..TurnOptions::default()
+        };
+        let text = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &WorkspaceId::from("ws-1"), "do it", &opts)
+                .await,
+        );
+        assert!(
+            text.starts_with("<system>\nSP\n</system>\n\nContext:\nctx\n\n---\n\n[Role Reminder:"),
+            "unexpected ordering: {text:?}"
+        );
     }
 }
 
