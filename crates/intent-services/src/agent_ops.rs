@@ -658,9 +658,44 @@ pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A single user text content block (the persisted/queued message shape).
-fn user_content_blocks(content: &str) -> Value {
-    json!([{ "type": "text", "text": content }])
+/// The persisted content-block array for a user message: one `text` block
+/// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
+/// attachments must reach the transcript so the conversation view can render
+/// them). Image entries require `data` + `mimeType` and file entries require
+/// `data` + `mimeType` + `fileName` — the same attachment contract prompt
+/// assembly (`append_attachment_blocks`) enforces; malformed entries are
+/// silently skipped so a partial attachment array never breaks the persist.
+pub(crate) fn user_message_blocks(
+    content: &str,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Value {
+    let mut blocks = vec![json!({ "type": "text", "text": content })];
+    if let Some(imgs) = image_blocks.and_then(Value::as_array) {
+        for img in imgs {
+            let data = img.get("data").and_then(Value::as_str);
+            let mime = img.get("mimeType").and_then(Value::as_str);
+            if let (Some(data), Some(mime)) = (data, mime) {
+                blocks.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+            }
+        }
+    }
+    if let Some(files) = file_blocks.and_then(Value::as_array) {
+        for file in files {
+            let data = file.get("data").and_then(Value::as_str);
+            let mime = file.get("mimeType").and_then(Value::as_str);
+            let name = file.get("fileName").and_then(Value::as_str);
+            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+                blocks.push(json!({
+                    "type": "file",
+                    "data": data,
+                    "mimeType": mime,
+                    "fileName": name,
+                }));
+            }
+        }
+    }
+    Value::Array(blocks)
 }
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
@@ -1999,7 +2034,9 @@ impl Services {
                 )));
             }
         }
-        let blocks = user_content_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block so
+        // the transcript row carries them (the conversation view renders them).
+        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
         let message = match message_id {
             Some(id) => {
@@ -2076,6 +2113,8 @@ impl Services {
         agent_id: AgentId,
         message_id: String,
         content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if message_id.len() > MAX_MESSAGE_ID_LEN {
@@ -2085,7 +2124,8 @@ impl Services {
             )));
         }
         let session = self.store.get_agent_session(&agent_id).await?;
-        let blocks = user_content_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block.
+        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
         let message = self
             .store
@@ -4478,6 +4518,55 @@ impl Services {
                         });
                 }
             }
+        }
+
+        // Append a system interruption marker BEFORE the continuation so the
+        // transcript shows the interruption boundary (same shape as the abandon
+        // path; the FE InterruptionNotice keys off `meta.kind == "interruption"`).
+        // Idempotent on retry: if a prior resume attempt appended the marker but
+        // failed delivering the continuation (row reset to pending), the marker
+        // is already the transcript tail — skip the duplicate append. A failed
+        // append is treated like a failed continuation delivery: reset the row
+        // to pending and surface the error.
+        let marker_text =
+            "The previous turn was interrupted because the harness shut down. Continuing below.";
+        let marker_content = json!([{
+            "type": "text",
+            "text": marker_text,
+            "meta": { "kind": "interruption" }
+        }]);
+        let already_marked = session
+            .messages
+            .last()
+            .is_some_and(|m| m.role == "system" && m.content == marker_content);
+        if !already_marked {
+            let marker = match self
+                .store
+                .append_agent_message(agent_id, "system", &marker_content, &now_iso())
+                .await
+            {
+                Ok(message) => message,
+                Err(e) => {
+                    reset_to_pending().await;
+                    return Err(e);
+                }
+            };
+
+            // Emit agent:message + agent:updated so live UIs render the marker.
+            self.publish_agent_mutation_event(
+                &workspace_id,
+                agent_id,
+                AGENT_MESSAGE,
+                json!({ "agentId": agent_id.0, "messageId": marker.id, "role": "system" }),
+            )
+            .await;
+            self.publish_agent_mutation_event(
+                &workspace_id,
+                agent_id,
+                AGENT_UPDATED,
+                json!({ "agentId": agent_id.0 }),
+            )
+            .await;
         }
 
         // Deliver continuation message

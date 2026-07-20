@@ -6327,3 +6327,129 @@ async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
         }
     }
 }
+
+/// STAB-133 regression: `agent.sendMessage` with `imageBlocks` / `fileBlocks`
+/// on the runtime manager path must persist the attachments into the user's
+/// transcript row (after the text block) so `agent.getConversation` — the
+/// conversation view's read — returns them. Pre-fix, only the text block was
+/// persisted and reloading the conversation dropped the attachments.
+#[tokio::test]
+async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
+    let Some(script) = gate("STAB-133 attachment persistence E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "response": "seen" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "STAB133", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "look at these",
+            "imageBlocks": [
+                { "type": "image", "data": image_data, "mimeType": "image/png" }
+            ],
+            "fileBlocks": [
+                { "type": "file", "data": "ZmlsZWRhdGE=", "mimeType": "text/plain", "fileName": "notes.txt" }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the turn to complete so the transcript is stable.
+    let mut saw_end = false;
+    for _ in 0..80 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            saw_end = true;
+            break;
+        }
+    }
+    assert!(saw_end, "turn completed");
+
+    // THE regression assertion: the persisted user row carries the image and
+    // file blocks after the text block.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_row = messages
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("user transcript row");
+    let blocks = user_row["contentBlocks"]
+        .as_array()
+        .expect("contentBlocks array");
+    assert_eq!(
+        blocks[0]["type"], "text",
+        "text block first: {:?}",
+        user_row["contentBlocks"]
+    );
+    assert_eq!(blocks[0]["text"], "look at these");
+    let image = blocks
+        .iter()
+        .find(|b| b["type"] == "image")
+        .expect("image block persisted on the user row");
+    assert_eq!(image["data"], image_data);
+    assert_eq!(image["mimeType"], "image/png");
+    let file = blocks
+        .iter()
+        .find(|b| b["type"] == "file")
+        .expect("file block persisted on the user row");
+    assert_eq!(file["data"], "ZmlsZWRhdGE=");
+    assert_eq!(file["fileName"], "notes.txt");
+    assert_eq!(file["mimeType"], "text/plain");
+}

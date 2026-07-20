@@ -2705,6 +2705,82 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
     assert_eq!(queue["queue"][0]["fileBlocks"], file_blocks);
 }
 
+/// STAB-133: `agent_send_message_op` must persist FE-supplied image and file
+/// blocks into the transcript row (after the text block) so the conversation
+/// view can render them.
+#[tokio::test]
+async fn send_message_op_persists_attachment_blocks_in_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttachRecv").await;
+    let image_blocks = json!([
+        { "type": "image", "data": "imgdata", "mimeType": "image/png" }
+    ]);
+    let file_blocks = json!([
+        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "notes.txt" }
+    ]);
+    let r = svc
+        .agent_send_message_op(
+            id.clone(),
+            "see attached".into(),
+            None,
+            Some(image_blocks),
+            Some(file_blocks),
+        )
+        .await
+        .expect("send");
+    assert_eq!(r["queued"], false);
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    let content = &conv["messages"][0]["contentBlocks"];
+    let blocks = content.as_array().expect("content blocks array");
+    assert_eq!(blocks.len(), 3, "text + image + file blocks: {content}");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "see attached");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["data"], "imgdata");
+    assert_eq!(blocks[1]["mimeType"], "image/png");
+    assert_eq!(blocks[2]["type"], "file");
+    assert_eq!(blocks[2]["data"], "filedata");
+    assert_eq!(blocks[2]["fileName"], "notes.txt");
+    assert_eq!(blocks[2]["mimeType"], "text/plain");
+}
+
+/// STAB-133: `agent_force_message_op` must persist FE-supplied image and file
+/// blocks into the transcript row (after the text block).
+#[tokio::test]
+async fn force_message_op_persists_attachment_blocks_in_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttachForce").await;
+    let image_blocks = json!([
+        { "type": "image", "data": "imgdata2", "mimeType": "image/jpeg" }
+    ]);
+    let r = svc
+        .agent_force_message_op(
+            id.clone(),
+            "m-force-1".into(),
+            "forced with image".into(),
+            Some(image_blocks),
+            None,
+        )
+        .await
+        .expect("force");
+    assert_eq!(r["queued"], false);
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    let content = &conv["messages"][0]["contentBlocks"];
+    let blocks = content.as_array().expect("content blocks array");
+    assert_eq!(blocks.len(), 2, "text + image blocks: {content}");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "forced with image");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["data"], "imgdata2");
+    assert_eq!(blocks[1]["mimeType"], "image/jpeg");
+}
+
 #[tokio::test]
 async fn summary_reports_counts_and_last_response() {
     let (_t, svc, ws) = setup().await;
@@ -6638,7 +6714,13 @@ async fn agent_force_message_emits_agent_message_event() {
     });
 
     let r = svc
-        .agent_force_message_op(id.clone(), "msg-123".into(), "forced content".into())
+        .agent_force_message_op(
+            id.clone(),
+            "msg-123".into(),
+            "forced content".into(),
+            None,
+            None,
+        )
         .await
         .expect("force");
     assert_eq!(r["success"], json!(true));
@@ -6925,5 +7007,74 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     assert!(
         !watches_after.iter().any(|w| w.child_agent_id == child_b),
         "oneShot watch removed after the late completion delivered"
+    );
+}
+
+/// Resume appends the system interruption marker before the continuation, and
+/// the append is idempotent on retry: when a prior resume attempt already left
+/// the marker as the transcript tail (continuation delivery failed, row reset
+/// to pending), a second resume must not append a duplicate marker.
+#[tokio::test]
+async fn resume_interrupted_marker_is_idempotent_on_retry() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Interrupted").await;
+    let marker_content = json!([{
+        "type": "text",
+        "text": "The previous turn was interrupted because the harness shut down. Continuing below.",
+        "meta": { "kind": "interruption" }
+    }]);
+
+    // First resume: appends marker + continuation.
+    svc.store
+        .insert_interrupted_agent(&id, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    svc.resume_interrupted_agent(&id).await.expect("resume 1");
+    let messages = svc.store.get_agent_messages(&id, None).await.expect("msgs");
+    let markers: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "system" && m.content == marker_content)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(markers.len(), 1, "first resume appends exactly one marker");
+    let continuation_idx = messages
+        .iter()
+        .rposition(|m| m.role == "user")
+        .expect("continuation user message");
+    assert!(
+        markers[0] < continuation_idx,
+        "marker precedes the continuation"
+    );
+
+    // Simulate a retry after a failed continuation delivery: a second agent
+    // whose transcript tail is already the marker (the prior attempt appended
+    // it, then the continuation failed and the row was reset to pending). The
+    // resume must skip the duplicate marker append.
+    let retry = create_agent(&svc, &ws, "Retry").await;
+    svc.store
+        .append_agent_message(&retry, "system", &marker_content, &now_iso())
+        .await
+        .expect("pre-append marker (prior failed attempt)");
+    svc.store
+        .insert_interrupted_agent(&retry, &ws, "active", &now_iso())
+        .await
+        .expect("insert interrupted row");
+    svc.resume_interrupted_agent(&retry)
+        .await
+        .expect("resume retry");
+    let messages = svc
+        .store
+        .get_agent_messages(&retry, None)
+        .await
+        .expect("msgs");
+    let marker_count = messages
+        .iter()
+        .filter(|m| m.role == "system" && m.content == marker_content)
+        .count();
+    assert_eq!(marker_count, 1, "retry must not duplicate the marker");
+    assert!(
+        messages.iter().any(|m| m.role == "user"),
+        "retry still delivers the continuation"
     );
 }
