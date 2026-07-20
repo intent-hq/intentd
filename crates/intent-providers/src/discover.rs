@@ -32,6 +32,10 @@ pub struct ProviderAvailability {
     pub auth_check_args: Option<&'static [&'static str]>,
     /// Whether this provider supports npx fallback when binary is unresolved.
     pub has_npx_fallback: bool,
+    /// When set, the provider is spawned exclusively via `npx -y <package>`
+    /// (pinned spec); `installed`/`resolved_path` then reflect npx itself
+    /// rather than a local provider binary.
+    pub npx_only_package: Option<&'static str>,
 }
 
 /// Status of npx availability for provider fallback spawning.
@@ -101,6 +105,8 @@ fn gated_reason(provider: &ProviderConfig) -> Option<String> {
 
 /// Discover availability for every configured provider (§6.9), in registry
 /// order. Gated providers report `gated_off` and are not probed on `PATH`.
+/// npx-only providers (claude-code) are probed for `npx` availability instead
+/// of a local provider binary — there is no local-binary path for them.
 pub fn discover_providers() -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
@@ -108,6 +114,8 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             let gated_off = gated_reason(provider);
             let resolved_path = if gated_off.is_some() {
                 None
+            } else if provider.npx_only_package.is_some() {
+                find_npx()
             } else {
                 resolve_on_path(provider.command)
             };
@@ -120,6 +128,7 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
                 gated_off,
                 auth_check_args: provider.auth_check_args,
                 has_npx_fallback: provider.fallback_npx_package.is_some(),
+                npx_only_package: provider.npx_only_package,
             }
         })
         .collect()
@@ -401,6 +410,30 @@ mod find_provider_binary_tests {
         let unique_cmd = format!("intent-test-nocand-{}", nanos);
         let result = find_provider_binary("test", &unique_cmd, None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn discover_providers_reports_claude_code_as_npx_only() {
+        let providers = discover_providers();
+        let cc = providers.iter().find(|p| p.id == "claude-code").unwrap();
+        assert_eq!(
+            cc.npx_only_package,
+            Some(crate::config::CLAUDE_AGENT_ACP_NPX_PACKAGE),
+            "claude-code availability must carry the pinned npx package"
+        );
+        // Installed reflects npx availability, never a local claude-agent-acp
+        // binary; the resolved path (when present) is npx itself.
+        let npx = find_npx();
+        assert_eq!(cc.installed, npx.is_some());
+        assert_eq!(cc.resolved_path, npx);
+    }
+
+    #[test]
+    fn discover_providers_non_npx_only_providers_unchanged() {
+        let providers = discover_providers();
+        for p in providers.iter().filter(|p| p.id != "claude-code") {
+            assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
+        }
     }
 
     #[test]
