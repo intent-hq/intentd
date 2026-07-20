@@ -230,10 +230,11 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         if remaining.is_zero() {
             break;
         }
-        // Once we've seen a burst event, wait 1s for stragglers, then exit.
-        // Otherwise keep polling until the deadline.
+        // Once we've seen a burst event, wait up to 1s for stragglers (but no
+        // longer than the overall deadline), then exit. Otherwise keep polling
+        // until the deadline.
         let poll_timeout = if seen_burst {
-            Duration::from_millis(1000)
+            Duration::from_millis(1000).min(remaining)
         } else {
             remaining
         };
