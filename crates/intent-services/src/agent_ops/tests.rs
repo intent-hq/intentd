@@ -5619,6 +5619,135 @@ async fn agent_replace_messages_rejects_non_array_and_bad_entries() {
     assert!(matches!(err, Error::InvalidParams(_)));
 }
 
+// -- agent.editAndRegenerate service ops (validate + truncate) --
+
+/// Seed a 4-message transcript (user, assistant, user, assistant) and return
+/// the persisted message ids in order.
+async fn seed_edit_transcript(svc: &Services, id: &AgentId) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (role, text) in [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "second question"),
+        ("assistant", "second answer"),
+    ] {
+        let r = svc
+            .agent_append_message_op(
+                id.clone(),
+                role.into(),
+                json!([{ "type": "text", "text": text }]),
+                None,
+            )
+            .await
+            .expect("append");
+        ids.push(r["message"]["id"].as_str().unwrap().to_string());
+    }
+    ids
+}
+
+/// `agent_validate_edit_target_op` returns the 0-based index for an existing
+/// user message and rejects unknown / non-user ids with `InvalidParams`
+/// (→ `-32602` on the wire).
+#[tokio::test]
+async fn agent_validate_edit_target_accepts_user_rejects_others() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditTarget").await;
+    let msg_ids = seed_edit_transcript(&svc, &id).await;
+
+    let idx = svc
+        .agent_validate_edit_target_op(&id, &msg_ids[2])
+        .await
+        .expect("valid user target");
+    assert_eq!(idx, 2);
+
+    let err = svc
+        .agent_validate_edit_target_op(&id, "msg-missing")
+        .await
+        .expect_err("unknown id");
+    assert!(matches!(err, Error::InvalidParams(_)));
+
+    let err = svc
+        .agent_validate_edit_target_op(&id, &msg_ids[1])
+        .await
+        .expect_err("assistant message is not editable");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// `agent_edit_truncate_op` truncates to just BEFORE the edited user message
+/// (dropping it and everything after) and emits `agent:updated` with
+/// `{ truncatedCount, remainingCount }`.
+#[tokio::test]
+async fn agent_edit_truncate_drops_edited_message_and_tail() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "EditTruncate").await;
+    let msg_ids = seed_edit_transcript(&svc, &id).await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let truncated = svc
+        .agent_edit_truncate_op(&id, &msg_ids[2])
+        .await
+        .expect("truncate");
+    assert_eq!(truncated, 2, "edited message + trailing assistant dropped");
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].role, "user");
+    assert_eq!(session.messages[1].role, "assistant");
+    assert_eq!(session.messages[0].seq, 0);
+    assert_eq!(session.messages[1].seq, 1);
+    // Content of the kept prefix survives the swap verbatim.
+    assert_eq!(
+        session.messages[0].content[0]["text"],
+        json!("first question")
+    );
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv")
+        .expect("open");
+    assert!(batch.iter().any(|e| e.event_type == AGENT_UPDATED
+        && e.data["truncatedCount"] == json!(2)
+        && e.data["remainingCount"] == json!(2)));
+}
+
+/// Truncating at the FIRST user message empties the transcript.
+#[tokio::test]
+async fn agent_edit_truncate_first_message_empties_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditFirst").await;
+    let msg_ids = seed_edit_transcript(&svc, &id).await;
+
+    let truncated = svc
+        .agent_edit_truncate_op(&id, &msg_ids[0])
+        .await
+        .expect("truncate at head");
+    assert_eq!(truncated, 4);
+
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert!(session.messages.is_empty());
+}
+
+/// A bad target leaves the transcript untouched (validation happens before
+/// any mutation).
+#[tokio::test]
+async fn agent_edit_truncate_bad_target_mutates_nothing() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditGuard").await;
+    let msg_ids = seed_edit_transcript(&svc, &id).await;
+
+    let err = svc
+        .agent_edit_truncate_op(&id, &msg_ids[3])
+        .await
+        .expect_err("assistant target");
+    assert!(matches!(err, Error::InvalidParams(_)));
+
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 4, "transcript untouched");
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // `agent.wakeOrCreate` widening (C1d-10a) — behaviors B1-B8 + backward compat.
 // Each test seeds a task note via `mark_as_task` and drives the widened
