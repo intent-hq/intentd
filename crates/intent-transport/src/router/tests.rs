@@ -4677,3 +4677,195 @@ async fn pr_refresh_unknown_workspace_is_minus_32602() {
     assert_eq!(err_code(&v), -32602);
     assert_eq!(v["error"]["message"], "Workspace not found");
 }
+
+// ---------------------------------------------------------------------------
+// agent.editAndRegenerate (PROTOCOL §5.5 extension)
+// ---------------------------------------------------------------------------
+
+mod edit_and_regenerate {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+    use super::err_code;
+
+    /// Recorded snapshot of a single `agent_edit_and_regenerate` call.
+    #[derive(Default, Debug, Clone)]
+    struct Capture {
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+        message_id: Option<String>,
+        content: Option<String>,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        model: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct RecordingApi {
+        edit: Arc<Mutex<Capture>>,
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        #[allow(clippy::too_many_arguments)]
+        fn agent_edit_and_regenerate(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            message_id: String,
+            content: String,
+            image_blocks: Option<Value>,
+            file_blocks: Option<Value>,
+            model: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.edit.clone();
+            Box::pin(async move {
+                *slot.lock().unwrap() = Capture {
+                    workspace_id: Some(workspace_id),
+                    agent_id: Some(agent_id),
+                    message_id: Some(message_id),
+                    content: Some(content),
+                    image_blocks,
+                    file_blocks,
+                    model,
+                };
+                Ok(json!({
+                    "success": true,
+                    "queued": false,
+                    "messageId": "m-new",
+                    "truncatedCount": 3,
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatches_and_forwards_all_params() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":1,"method":"agent.editAndRegenerate",
+            "params":{
+                "workspaceId":"ws-1",
+                "agentId":"agent-1",
+                "messageId":"msg-7",
+                "content":"edited text",
+                "imageBlocks":[{"data":"aGk=","mimeType":"image/png"}],
+                "fileBlocks":[{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}],
+                "model":"auggie:sonnet4.5"
+            }
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["success"], Value::Bool(true));
+        assert_eq!(v["result"]["truncatedCount"], json!(3));
+
+        let cap = api.edit.lock().unwrap().clone();
+        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
+        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(cap.message_id.as_deref(), Some("msg-7"));
+        assert_eq!(cap.content.as_deref(), Some("edited text"));
+        assert_eq!(
+            cap.image_blocks,
+            Some(json!([{"data":"aGk=","mimeType":"image/png"}]))
+        );
+        assert_eq!(
+            cap.file_blocks,
+            Some(json!([{"data":"aGk=","mimeType":"text/plain","fileName":"a.txt"}]))
+        );
+        assert_eq!(cap.model.as_deref(), Some("auggie:sonnet4.5"));
+    }
+
+    #[tokio::test]
+    async fn optional_params_are_none_when_omitted() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":2,"method":"agent.editAndRegenerate",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","messageId":"msg-7","content":"edited"}
+        }"#;
+        handle_message(&api, msg).await.expect("response");
+        let cap = api.edit.lock().unwrap().clone();
+        assert!(cap.image_blocks.is_none());
+        assert!(cap.file_blocks.is_none());
+        assert!(cap.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_message_id_is_minus_32602() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":3,"method":"agent.editAndRegenerate",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","content":"edited"}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(err_code(&v), -32602);
+    }
+
+    #[tokio::test]
+    async fn missing_content_is_minus_32602() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":4,"method":"agent.editAndRegenerate",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","messageId":"msg-7"}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(err_code(&v), -32602);
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_id_is_minus_32602() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":5,"method":"agent.editAndRegenerate",
+            "params":{"agentId":"agent-1","messageId":"msg-7","content":"edited"}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(err_code(&v), -32602);
+    }
+
+    /// Domain `InvalidParams` from the service (unknown / non-user messageId)
+    /// surfaces as `-32602` through `domain_to_rpc`.
+    struct RejectingApi;
+
+    impl WorkspaceApi for RejectingApi {
+        #[allow(clippy::too_many_arguments)]
+        fn agent_edit_and_regenerate(
+            &self,
+            _workspace_id: WorkspaceId,
+            _agent_id: AgentId,
+            message_id: String,
+            _content: String,
+            _image_blocks: Option<Value>,
+            _file_blocks: Option<Value>,
+            _model: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Err(intent_core::Error::InvalidParams(format!(
+                    "agent.editAndRegenerate: messageId {message_id} not found in transcript"
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn service_invalid_params_maps_to_minus_32602() {
+        let msg = r#"{
+            "jsonrpc":"2.0","id":6,"method":"agent.editAndRegenerate",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","messageId":"nope","content":"edited"}
+        }"#;
+        let out = handle_message(&RejectingApi, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(err_code(&v), -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not found in transcript"),
+            "error message should surface the domain detail: {v}"
+        );
+    }
+}
