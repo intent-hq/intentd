@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::agent_ops::new_message_id;
+use crate::agent_ops::{new_message_id, user_message_blocks};
 use crate::agent_session::agent_actor;
 use crate::events::EventBus;
 use crate::Services;
@@ -2104,7 +2104,13 @@ impl AgentManager {
             return Ok(result);
         }
         let message_id = message_id.unwrap_or_else(new_message_id);
-        let blocks = user_text_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block so
+        // the transcript row carries them (the conversation view renders them).
+        let blocks = user_message_blocks(
+            &content,
+            options.image_blocks.as_ref(),
+            options.file_blocks.as_ref(),
+        );
         if self
             .services
             .store
@@ -2222,6 +2228,8 @@ impl AgentManager {
                 &agent_id,
                 &workspace_id,
                 &next.content,
+                next.image_blocks.as_ref(),
+                next.file_blocks.as_ref(),
                 next.message_metadata.as_ref(),
             )
             .await;
@@ -2256,7 +2264,12 @@ impl AgentManager {
                 .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
                 .await;
         }
-        let blocks = user_text_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block.
+        let blocks = user_message_blocks(
+            &content,
+            options.image_blocks.as_ref(),
+            options.file_blocks.as_ref(),
+        );
         self.services
             .store
             .append_agent_message_with_metadata(
@@ -2864,11 +2877,6 @@ async fn kill_child_tree(mut child: Child) {
     let _ = child.start_kill();
 }
 
-/// A single user text content block (the persisted/prompt message shape).
-fn user_text_blocks(content: &str) -> Value {
-    json!([{ "type": "text", "text": content }])
-}
-
 /// One `text` ACP prompt content block for a user message.
 fn text_prompt(content: &str) -> Vec<ContentBlock> {
     serde_json::from_value(json!([{ "type": "text", "text": content }])).unwrap_or_default()
@@ -3322,6 +3330,8 @@ async fn run_message_worker(
                     &agent_id,
                     &workspace_id,
                     &next.content,
+                    next_image_blocks.as_ref(),
+                    next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                 )
                 .await;
@@ -3360,6 +3370,8 @@ async fn run_message_worker(
                     &agent_id,
                     &workspace_id,
                     &next.content,
+                    next_image_blocks.as_ref(),
+                    next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                 )
                 .await;
@@ -3392,26 +3404,32 @@ async fn run_message_worker(
 
 /// Persist a queued user message into the append-only transcript before its turn
 /// and publish the `agent:message` event so chat subscribers and the transcript
-/// reflect the dequeued message (STAB-4 fix). `message_metadata` is the queue
-/// entry's captured `messageMetadata` (e.g. a parent wake's `event_notification`
-/// payload). It is written in BOTH placements the two direct-delivery shapes
-/// use — folded onto the text block as `messageMetadata` (parity with
-/// `deliver_wake_message`'s in-block tag) AND on the row-level `metadata`
-/// column (parity with the direct `agent.sendMessage` persist) — so transcript
-/// consumers find the tag regardless of which field they read. Best-effort; a
-/// store or publish error is logged and the turn still proceeds.
+/// reflect the dequeued message (STAB-4 fix). FE-supplied attachments captured at
+/// enqueue time ride along so the persisted row carries them (STAB-133).
+/// `message_metadata` is the queue entry's captured `messageMetadata` (e.g. a
+/// parent wake's `event_notification` payload). It is written in BOTH placements
+/// the two direct-delivery shapes use — folded onto the text block as
+/// `messageMetadata` (parity with `deliver_wake_message`'s in-block tag) AND on
+/// the row-level `metadata` column (parity with the direct `agent.sendMessage`
+/// persist) — so transcript consumers find the tag regardless of which field
+/// they read. Best-effort; a store or publish error is logged and the turn
+/// still proceeds.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     content: &str,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
     message_metadata: Option<&Value>,
 ) {
     let created_at = now_iso();
-    let blocks = match message_metadata {
-        Some(md) => json!([{ "type": "text", "text": content, "messageMetadata": md }]),
-        None => user_text_blocks(content),
-    };
+    let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
+    if let Some(md) = message_metadata {
+        if let Some(text_block) = blocks.get_mut(0).and_then(Value::as_object_mut) {
+            text_block.insert("messageMetadata".into(), md.clone());
+        }
+    }
     match mgr
         .services
         .store

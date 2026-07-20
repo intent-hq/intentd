@@ -23,9 +23,9 @@ use tokio::time::{timeout, Duration};
 
 use super::{
     compute_process_cap, derive_agent_type, is_cancel_transport_closed, resolve_spawn, text_prompt,
-    user_text_blocks, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
-    DEFAULT_AGENT_TYPE,
+    AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, DEFAULT_AGENT_TYPE,
 };
+use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::Services;
 
@@ -2961,15 +2961,79 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
 
 // --- Prompt block shape helpers ----------------------------------------------
 
-/// The persisted/prompt wire shape for a user text message is a single
-/// `{ type: "text", text }` block in an array (parity with `agent.sendMessage`).
+/// The persisted/prompt wire shape for a user text message without attachments
+/// is a single `{ type: "text", text }` block in an array (parity with
+/// `agent.sendMessage`).
 #[test]
-fn user_text_blocks_emits_single_text_block_array() {
-    let blocks = user_text_blocks("hello world");
+fn user_message_blocks_emits_single_text_block_array_without_attachments() {
+    let blocks = user_message_blocks("hello world", None, None);
     let arr = blocks.as_array().expect("array");
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["type"], json!("text"));
     assert_eq!(arr[0]["text"], json!("hello world"));
+}
+
+/// STAB-133: FE-supplied image and file attachments are appended after the
+/// text block in the persisted user-message shape; malformed entries (missing
+/// required fields) are skipped.
+#[test]
+fn user_message_blocks_appends_image_and_file_blocks() {
+    let images = json!([
+        { "type": "image", "data": "imgdata", "mimeType": "image/png" },
+        { "type": "image", "mimeType": "image/png" }, // missing data → skipped
+    ]);
+    let files = json!([
+        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "a.txt" },
+        { "type": "file", "data": "orphan" }, // missing fileName → skipped
+        { "type": "file", "data": "x", "fileName": "b.txt" }, // missing mimeType → skipped
+    ]);
+    let blocks = user_message_blocks("look", Some(&images), Some(&files));
+    let arr = blocks.as_array().expect("array");
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr[0]["type"], json!("text"));
+    assert_eq!(arr[0]["text"], json!("look"));
+    assert_eq!(arr[1]["type"], json!("image"));
+    assert_eq!(arr[1]["data"], json!("imgdata"));
+    assert_eq!(arr[1]["mimeType"], json!("image/png"));
+    assert_eq!(arr[2]["type"], json!("file"));
+    assert_eq!(arr[2]["data"], json!("filedata"));
+    assert_eq!(arr[2]["fileName"], json!("a.txt"));
+    assert_eq!(arr[2]["mimeType"], json!("text/plain"));
+}
+
+/// STAB-133: the queue-drain `persist_user` path appends the FE-supplied
+/// attachments captured at enqueue time to the persisted user row.
+#[tokio::test]
+async fn persist_user_appends_attachment_blocks_to_transcript_row() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::new();
+    let id = AgentId::new();
+    seed_agent(&mgr, &ws, &id).await;
+
+    let images = json!([{ "type": "image", "data": "imgdata", "mimeType": "image/png" }]);
+    let files = json!([{ "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "f.txt" }]);
+    super::persist_user(&mgr, &id, &ws, "drained", Some(&images), Some(&files), None).await;
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(messages.len(), 1);
+    let blocks = messages[0].content.as_array().expect("blocks array");
+    assert_eq!(
+        blocks.len(),
+        3,
+        "text + image + file: {:?}",
+        messages[0].content
+    );
+    assert_eq!(blocks[0]["type"], json!("text"));
+    assert_eq!(blocks[0]["text"], json!("drained"));
+    assert_eq!(blocks[1]["type"], json!("image"));
+    assert_eq!(blocks[1]["data"], json!("imgdata"));
+    assert_eq!(blocks[2]["type"], json!("file"));
+    assert_eq!(blocks[2]["fileName"], json!("f.txt"));
 }
 
 #[test]

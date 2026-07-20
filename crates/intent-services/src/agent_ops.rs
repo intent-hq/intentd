@@ -658,9 +658,44 @@ pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A single user text content block (the persisted/queued message shape).
-fn user_content_blocks(content: &str) -> Value {
-    json!([{ "type": "text", "text": content }])
+/// The persisted content-block array for a user message: one `text` block
+/// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
+/// attachments must reach the transcript so the conversation view can render
+/// them). Image entries require `data` + `mimeType` and file entries require
+/// `data` + `mimeType` + `fileName` — the same attachment contract prompt
+/// assembly (`append_attachment_blocks`) enforces; malformed entries are
+/// silently skipped so a partial attachment array never breaks the persist.
+pub(crate) fn user_message_blocks(
+    content: &str,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Value {
+    let mut blocks = vec![json!({ "type": "text", "text": content })];
+    if let Some(imgs) = image_blocks.and_then(Value::as_array) {
+        for img in imgs {
+            let data = img.get("data").and_then(Value::as_str);
+            let mime = img.get("mimeType").and_then(Value::as_str);
+            if let (Some(data), Some(mime)) = (data, mime) {
+                blocks.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+            }
+        }
+    }
+    if let Some(files) = file_blocks.and_then(Value::as_array) {
+        for file in files {
+            let data = file.get("data").and_then(Value::as_str);
+            let mime = file.get("mimeType").and_then(Value::as_str);
+            let name = file.get("fileName").and_then(Value::as_str);
+            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+                blocks.push(json!({
+                    "type": "file",
+                    "data": data,
+                    "mimeType": mime,
+                    "fileName": name,
+                }));
+            }
+        }
+    }
+    Value::Array(blocks)
 }
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
@@ -1999,7 +2034,9 @@ impl Services {
                 )));
             }
         }
-        let blocks = user_content_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block so
+        // the transcript row carries them (the conversation view renders them).
+        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
         let message = match message_id {
             Some(id) => {
@@ -2076,6 +2113,8 @@ impl Services {
         agent_id: AgentId,
         message_id: String,
         content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if message_id.len() > MAX_MESSAGE_ID_LEN {
@@ -2085,7 +2124,8 @@ impl Services {
             )));
         }
         let session = self.store.get_agent_session(&agent_id).await?;
-        let blocks = user_content_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block.
+        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
         let message = self
             .store
