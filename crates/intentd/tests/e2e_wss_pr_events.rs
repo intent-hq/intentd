@@ -228,7 +228,7 @@ struct Fixture {
 /// seeded workspace linked to PR #42 on branch `feature`.
 async fn boot(forge: StubForge) -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-prevents-{}", &short[..8]));
+    let dir = std::env::temp_dir().join(format!("intentd-pr-events-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
