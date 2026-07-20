@@ -417,6 +417,18 @@ impl Services {
         self.live_turns.lock().ok()?.get(agent_id).cloned()
     }
 
+    /// Read just the live-turn slot's `last_activity_at` stamp (STAB-125)
+    /// without cloning the streamed blocks — the liveness reads
+    /// (`agent.get`/`agent.list`/`agent.getConversation`/snapshot overlay) poll
+    /// this while a potentially large response is mid-stream.
+    pub(crate) fn live_turn_activity_at(&self, agent_id: &AgentId) -> Option<String> {
+        self.live_turns
+            .lock()
+            .ok()?
+            .get(agent_id)
+            .map(|live| live.last_activity_at.clone())
+    }
+
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to

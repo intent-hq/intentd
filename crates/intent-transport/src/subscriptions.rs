@@ -432,6 +432,7 @@ pub(crate) async fn chat_snapshot(api: &dyn WorkspaceApi, agent_id: &AgentId) ->
     // Overlay the daemon-owned activity flags (PROTOCOL §7.1) so a client
     // arriving mid-turn renders the same `isResponding`/`isWaitingOnTool`/
     // `isWaitingForOtherAgents` (+ the companion `waitingForAgentIds` list)
+    // and STAB-125 turn-liveness (`turnInFlight`/`lastStreamActivityAt`)
     // state as the `AgentLite` projection (§5.5).
     let flags = api.agent_activity_flags(agent_id.clone()).await;
     if let (Some(obj), Some(flag_obj)) = (snapshot.as_object_mut(), flags.as_object()) {
