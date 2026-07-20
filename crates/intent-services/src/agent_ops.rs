@@ -955,9 +955,13 @@ impl Services {
         let messages = session.messages;
         let total = messages.len();
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
-        let page: Vec<AgentMessage> = messages[win.start..win.end]
-            .iter()
-            .cloned()
+        // The messages vec is owned, so the page is consumed in place — no
+        // clone; `strip_anonymous_tool_blocks` is a cheap pass-through for the
+        // common (well-formed) case.
+        let page: Vec<AgentMessage> = messages
+            .into_iter()
+            .skip(win.start)
+            .take(win.end - win.start)
             .map(strip_anonymous_tool_blocks)
             .collect();
         Ok(json!({
