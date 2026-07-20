@@ -16,7 +16,6 @@ use intent_store::Store;
 use serde_json::{json, Map, Value};
 
 use crate::rtk;
-use crate::settings::rtk_enabled;
 
 /// Settings-store key the per-rule-type user overrides persist under (§9.12).
 const END_USER_RULES_KEY: &str = "endUserRules";
@@ -366,8 +365,8 @@ fn build_isolation_hint(
 /// Build the RTK instruction line when enabled and available.
 /// Returns `None` when `rtk.enabled` is false or rtk is unavailable/has no
 /// usable subcommands. Mirrors `cloudlands-fe rtk-detector.ts getRtkPromptInstruction()`.
-async fn build_rtk_instruction(store: &Store) -> Option<String> {
-    if !rtk_enabled(store).await {
+async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
+    if !rtk_enabled {
         return None;
     }
 
@@ -412,6 +411,7 @@ pub(crate) async fn assemble_system_prompt(
     specialist: Option<&SpecialistPromptInjection>,
     is_sub_agent: bool,
     auto_commit_enabled: bool,
+    rtk_enabled: bool,
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
 ) -> Option<String> {
@@ -450,7 +450,7 @@ pub(crate) async fn assemble_system_prompt(
     // RTK layer: when rtk.enabled is true and rtk is detected with ≥1 usable
     // subcommand, append the instruction line. Placed after workspace-rules,
     // before skills / isolation hint / specialist role.
-    if let Some(rtk_instruction) = build_rtk_instruction(store).await {
+    if let Some(rtk_instruction) = build_rtk_instruction(rtk_enabled).await {
         parts.push(rtk_instruction);
     }
     // Skills catalog layer (reference layer 4.7: after specialization rules, user
@@ -756,6 +756,7 @@ This is a test skill.
             None,
             false,
             false,
+            false,
             Some(&workspace),
             None,
         )
@@ -812,6 +813,7 @@ This is a test skill.
             None,
             false,
             false,
+            false,
             Some(&workspace),
             None,
         )
@@ -832,8 +834,18 @@ This is a test skill.
         let tmp_db = TempDb::new();
         let store = Store::open(&tmp_db.path).await.unwrap();
 
-        let prompt =
-            assemble_system_prompt(&store, None, "workspace", None, false, false, None, None).await;
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await;
 
         assert!(prompt.is_some());
         let prompt_text = prompt.unwrap();

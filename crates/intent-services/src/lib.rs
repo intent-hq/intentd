@@ -56,6 +56,7 @@ mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
+mod config_watcher;
 mod crdt_notes;
 mod drafts;
 mod enhance_ops;
@@ -84,15 +85,20 @@ mod script_ops;
 mod search_ops;
 mod sentry_ops;
 mod settings;
+mod settings_registry;
 mod terminal_ops;
 pub mod tool_block;
 
 #[cfg(test)]
 mod tests;
 
+pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{max_concurrent_agents, InMemorySecretStore, SecretStore};
+pub use settings_registry::{
+    SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
+};
 pub use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
@@ -243,6 +249,12 @@ pub struct Services {
     /// backing call runs on the blocking pool with a bounded timeout + single-
     /// flight cache, keeping the async runtime free if the backing store stalls.
     secrets: Arc<settings::AsyncSecretStore>,
+    /// Layered `config.toml` registry backing the TOML-backed subset of
+    /// `settings.*` ([`KNOWN_PATHS`]). Wired by the composition root (and by
+    /// tests that exercise the file-backed path); `None` keeps the legacy
+    /// SQLite-only behavior for read-only/unit-test wiring. Shared across
+    /// clones so every handle reads/writes the same file + snapshot.
+    settings_registry: Option<Arc<SettingsRegistry>>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -379,6 +391,7 @@ impl Services {
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
+            settings_registry: None,
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
@@ -416,6 +429,32 @@ impl Services {
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
         self.secrets = Arc::new(settings::AsyncSecretStore::new(secrets));
         self
+    }
+
+    /// Wire the layered [`SettingsRegistry`] (`config.toml`) backing the
+    /// TOML-backed subset of `settings.*` ([`KNOWN_PATHS`]). The composition
+    /// root always wires the registry it loaded at boot; test/read-only
+    /// wiring may leave it unset, keeping the legacy SQLite-only behavior.
+    pub fn with_settings_registry(mut self, registry: Arc<SettingsRegistry>) -> Self {
+        self.settings_registry = Some(registry);
+        self
+    }
+
+    /// Borrow the wired [`SettingsRegistry`], if any (composition-root /
+    /// live-reload watcher use).
+    pub fn settings_registry(&self) -> Option<Arc<SettingsRegistry>> {
+        self.settings_registry.clone()
+    }
+
+    /// The effective typed settings (defaults ⊕ `config.toml` ⊕ startup pins)
+    /// for internal readers. Falls back to the schema defaults when no
+    /// registry is wired (read-only / unit-test wiring), which matches the
+    /// legacy per-key fallback values.
+    pub(crate) fn effective_settings(&self) -> intent_core::settings_file::SettingsFile {
+        self.settings_registry
+            .as_ref()
+            .map(|r| r.snapshot().effective.clone())
+            .unwrap_or_default()
     }
 
     /// Override the **user** and **bundled** specialist directory roots (§18.2).
@@ -517,12 +556,17 @@ impl Services {
         }
     }
 
-    /// Build a [`SettingsService`](settings::SettingsService) view over the store
-    /// and secret store for one `settings.*` call. The secret store is cloned
-    /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for
-    /// non-blocking, timeout-guarded secret-store access.
+    /// Build a [`SettingsService`](settings::SettingsService) view over the
+    /// store, secret store, and (when wired) the `config.toml` registry for
+    /// one `settings.*` call. The secret store is cloned as an `Arc` so
+    /// `SettingsService` can move it into `spawn_blocking` for non-blocking,
+    /// timeout-guarded secret-store access.
     fn settings_service(&self) -> settings::SettingsService<'_> {
-        settings::SettingsService::new(&self.store, &self.secrets)
+        settings::SettingsService::new(
+            &self.store,
+            &self.secrets,
+            self.settings_registry.as_deref(),
+        )
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -1382,9 +1426,13 @@ impl Services {
     }
 
     /// Build an [`McpServersService`](mcp_servers::McpServersService) view over the
-    /// store, secret store, and hub for one `mcp.servers.*` call.
+    /// settings registry, secret store, and hub for one `mcp.servers.*` call.
     fn mcp_servers_service(&self) -> mcp_servers::McpServersService<'_> {
-        mcp_servers::McpServersService::new(&self.store, &self.secrets, &self.mcp_hub)
+        mcp_servers::McpServersService::new(
+            self.settings_registry.as_deref(),
+            &self.secrets,
+            &self.mcp_hub,
+        )
     }
 
     /// Build an [`McpOauthService`](mcp_oauth::McpOauthService) view over the
@@ -5134,6 +5182,51 @@ impl Services {
         }
         Ok(())
     }
+
+    /// Apply an **externally driven** settings change (config.toml
+    /// live-reload): the registry has already adopted the new file layer, so
+    /// this runs the same server runtime hooks as `settings.update`
+    /// ([`Self::apply_server_setting_hooks`]) for the changed keys and emits
+    /// `settings:changed` with the effective values. Registry keys are
+    /// non-sensitive by construction (secrets are absent from [`KNOWN_PATHS`]),
+    /// so the payload needs no further redaction. A hook failure is logged
+    /// but not rolled back — there is no wire caller to answer and the user's
+    /// file edit is authoritative; the daemon keeps running on the new
+    /// effective values.
+    pub async fn apply_external_settings_change(&self, notice: &SettingsChanged) {
+        let Some(registry) = self.settings_registry.as_deref() else {
+            return;
+        };
+        if notice.changed.is_empty() {
+            return;
+        }
+        let snap = registry.snapshot();
+        let applied: Vec<serde_json::Value> = notice
+            .changed
+            .iter()
+            .map(|path| {
+                let raw = snap.get(path).unwrap_or(serde_json::Value::Null);
+                // Normalize number-typed values to the float wire shape so
+                // live-reload `settings:changed` payloads match what
+                // `settings.get`/`settings.list` report for the same key.
+                let value = match settings::find_definition(path) {
+                    Some(def) => settings::wire_value(&def, raw),
+                    None => raw,
+                };
+                serde_json::json!({ "path": path, "value": value })
+            })
+            .collect();
+        if let Some(control) = self.server_control.get() {
+            if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
+                tracing::warn!(
+                    error = %e,
+                    "config.toml live-reload: server runtime hook failed; effective \
+                     values kept, runtime state may differ until the file is corrected"
+                );
+            }
+        }
+        publish_event(&self.event_bus, settings_changed_event(applied)).await;
+    }
 }
 
 impl WorkspaceApi for Services {
@@ -5150,9 +5243,18 @@ impl WorkspaceApi for Services {
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            /// Which store a captured old value belongs to, so the rollback
+            /// path restores it through the same seam that persisted it.
+            enum OldStore {
+                Secret,
+                Db,
+                Registry,
+            }
             // Capture old values for ALL settings in the batch so we can rollback on hook failure.
-            // Store holds non-sensitive settings; secrets holds sensitive ones (§9.8).
+            // Registry holds the TOML-backed keys; store holds the remaining non-sensitive
+            // settings; secrets holds sensitive ones (§9.8).
             // Fail closed: any read error during snapshot capture aborts the whole batch.
+            let registry = self.settings_registry.as_deref();
             let old_values = if let Some(entries) = changes.as_array() {
                 let mut old = Vec::new();
                 for entry in entries {
@@ -5164,11 +5266,15 @@ impl WorkspaceApi for Services {
                                 // Fail closed: timeout/backing-error -> abort before applying anything.
                                 match self.secrets.load(path).await {
                                     Ok(Some(secret_val)) => {
-                                        old.push((path.to_string(), Some(secret_val), true));
+                                        old.push((
+                                            path.to_string(),
+                                            Some(secret_val),
+                                            OldStore::Secret,
+                                        ));
                                     }
                                     Ok(None) => {
                                         // Confirmed absent; mark for deletion on rollback.
-                                        old.push((path.to_string(), None, true));
+                                        old.push((path.to_string(), None, OldStore::Secret));
                                     }
                                     Err(e) => {
                                         return Err(Error::Internal(format!(
@@ -5176,15 +5282,32 @@ impl WorkspaceApi for Services {
                                         )));
                                     }
                                 }
+                            } else if let Some(reg) =
+                                registry.filter(|_| KNOWN_PATHS.contains(&path))
+                            {
+                                // TOML-backed setting: capture the file-layer
+                                // value from the registry snapshot. Origin
+                                // `file` → present (restore that value);
+                                // `default` → absent (rollback removes the
+                                // key). A pinned key rejects the apply, so it
+                                // never needs a rollback.
+                                let snap = reg.snapshot();
+                                let raw = match snap.origin(path) {
+                                    Some(SettingOrigin::File) => {
+                                        snap.get(path).map(|v| v.to_string())
+                                    }
+                                    _ => None,
+                                };
+                                old.push((path.to_string(), raw, OldStore::Registry));
                             } else {
                                 // Non-sensitive setting: capture from DB
                                 match self.store.get_setting(path).await {
                                     Ok(Some(raw)) => {
-                                        old.push((path.to_string(), Some(raw), false));
+                                        old.push((path.to_string(), Some(raw), OldStore::Db));
                                     }
                                     Ok(None) => {
                                         // Confirmed absent; mark for deletion on rollback.
-                                        old.push((path.to_string(), None, false));
+                                        old.push((path.to_string(), None, OldStore::Db));
                                     }
                                     Err(e) => {
                                         return Err(Error::Internal(format!(
@@ -5210,22 +5333,41 @@ impl WorkspaceApi for Services {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
+                        // Registry-backed restores are collected and applied as ONE batch
+                        // (a single config.toml rewrite + one change publication) instead of
+                        // per-key applies.
                         let mut rollback_failed = false;
                         let mut compensating_changes = Vec::new();
-                        for (path, old_val, is_sensitive) in old_values {
-                            let rollback_result = if is_sensitive {
-                                // Sensitive setting: restore to secrets store or delete
-                                if let Some(val) = &old_val {
-                                    self.secrets.store(&path, val).await
-                                } else {
-                                    self.secrets.delete(&path).await
+                        let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
+                        for (path, old_val, old_store) in old_values {
+                            let rollback_result = match old_store {
+                                OldStore::Secret => {
+                                    // Sensitive setting: restore to secrets store or delete
+                                    if let Some(val) = &old_val {
+                                        self.secrets.store(&path, val).await
+                                    } else {
+                                        self.secrets.delete(&path).await
+                                    }
                                 }
-                            } else {
-                                // Non-sensitive setting: restore to DB or delete
-                                if let Some(val) = &old_val {
-                                    self.store.set_setting(&path, val).await
-                                } else {
-                                    self.store.delete_setting(&path).await.map(|_| ())
+                                OldStore::Registry => {
+                                    // TOML-backed setting: restore the prior file
+                                    // value (or remove the key when it was absent);
+                                    // `Null` clears back to the schema default.
+                                    // Deferred into one registry batch below.
+                                    let value = old_val
+                                        .as_deref()
+                                        .and_then(|raw| serde_json::from_str(raw).ok())
+                                        .unwrap_or(serde_json::Value::Null);
+                                    registry_restores.push((path.clone(), value));
+                                    Ok(())
+                                }
+                                OldStore::Db => {
+                                    // Non-sensitive setting: restore to DB or delete
+                                    if let Some(val) = &old_val {
+                                        self.store.set_setting(&path, val).await
+                                    } else {
+                                        self.store.delete_setting(&path).await.map(|_| ())
+                                    }
                                 }
                             };
                             if let Err(rollback_err) = rollback_result {
@@ -5254,6 +5396,20 @@ impl WorkspaceApi for Services {
                                     "path": path,
                                     "value": val_json
                                 }));
+                            }
+                        }
+
+                        // Restore all TOML-backed keys as one atomic registry batch
+                        // (single config.toml rewrite, single change publication).
+                        if !registry_restores.is_empty() {
+                            if let Some(reg) = registry {
+                                if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                    tracing::error!(
+                                        error = %rollback_err,
+                                        "settings.update registry rollback batch failed"
+                                    );
+                                    rollback_failed = true;
+                                }
                             }
                         }
 
@@ -6328,6 +6484,7 @@ impl WorkspaceApi for Services {
         let workspaces_root = self.workspaces_root.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
+        let settings_branch_prefix = settings::branch_prefix(&self.effective_settings());
         Box::pin(async move {
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
@@ -6533,10 +6690,10 @@ impl WorkspaceApi for Services {
                                 let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                                 match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
                                     Some(p) => p,
-                                    None => settings::branch_prefix(&store).await,
+                                    None => settings_branch_prefix,
                                 }
                             } else {
-                                settings::branch_prefix(&store).await
+                                settings_branch_prefix
                             };
                             let desired = format!("{prefix}{slug}");
                             let git_repo = input
@@ -11100,6 +11257,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let settings = self.effective_settings();
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
@@ -11113,7 +11271,7 @@ impl WorkspaceApi for Services {
                 move || async move {
                     let store = op_store;
                     // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
-                    git_ops::assert_agent_commit_allowed(&store, false).await?;
+                    git_ops::assert_agent_commit_allowed(&settings, false)?;
                     // All commit failures surface as `-32603` (the TS handler wraps the
                     // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
                     let ws = store
@@ -11162,9 +11320,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let settings = self.effective_settings();
         Box::pin(async move {
             // userRequested bypasses the auto-commit gate (TS parity).
-            git_ops::assert_agent_commit_allowed(&store, user_requested).await?;
+            git_ops::assert_agent_commit_allowed(&settings, user_requested)?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -14784,7 +14943,7 @@ impl Services {
         stage_unstaged: bool,
     ) -> Result<String> {
         // accept-changes is a user-initiated action → bypass the auto-commit gate.
-        git_ops::assert_agent_commit_allowed(&self.store, true).await?;
+        git_ops::assert_agent_commit_allowed(&self.effective_settings(), true)?;
         let message = message
             .filter(|m| !m.trim().is_empty())
             .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;

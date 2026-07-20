@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use intent_core::settings_file::SettingsFile;
 use intent_core::{Error, Result, Workspace};
-use intent_store::Store;
 use serde_json::{json, Map, Value};
 
 /// TS `ws.git.stage` message when an agent tries to stage everything.
@@ -36,10 +36,13 @@ Use agent_commit_changes with userRequested: true if the user asked you to commi
 
 /// Port of `assertAgentCommitAllowed`: block an agent-initiated commit when
 /// auto-commit is disabled, unless `user_requested` bypasses it. The gate reads
-/// the persisted `git.autoCommit` setting (§9.8 OQ#2), which defaults to `true`
-/// so the established behavior is preserved when the setting is unset.
-pub(crate) async fn assert_agent_commit_allowed(store: &Store, user_requested: bool) -> Result<()> {
-    if user_requested || crate::settings::auto_commit_enabled(store).await {
+/// the effective `git.autoCommit` setting (§9.8 OQ#2), whose schema default is
+/// `true` so the established behavior is preserved when the key is unset.
+pub(crate) fn assert_agent_commit_allowed(
+    settings: &SettingsFile,
+    user_requested: bool,
+) -> Result<()> {
+    if user_requested || settings.git.auto_commit {
         return Ok(());
     }
     Err(Error::Internal(AUTO_COMMIT_DISABLED_MSG.to_string()))

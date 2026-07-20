@@ -8658,6 +8658,7 @@ mod rules {
             None,
             false,
             false,
+            false,
             None,
             None,
         )
@@ -8696,6 +8697,7 @@ mod rules {
             Some(&tree.0),
             "task-loop",
             None,
+            false,
             false,
             false,
             None,
@@ -8773,6 +8775,7 @@ mod rules {
             None,
             true,
             false,
+            false,
             None,
             None,
         )
@@ -8817,6 +8820,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             None,
             None,
@@ -8866,6 +8870,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             None,
             None,
         )
@@ -8891,6 +8896,7 @@ mod rules {
             Some(&tree.0),
             "task-loop",
             None,
+            false,
             false,
             false,
             None,
@@ -8942,6 +8948,7 @@ mod rules {
             None,
             true,
             false,
+            false,
             None,
             None,
         )
@@ -8972,6 +8979,7 @@ mod rules {
             None,
             false,
             true,
+            false,
             None,
             None,
         )
@@ -9037,6 +9045,7 @@ mod rules {
             Some(&tree.0),
             "task-loop",
             None,
+            false,
             false,
             false,
             None,
@@ -9149,6 +9158,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             Some(&workspace),
             Some(&agent_session),
@@ -9274,6 +9284,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             Some(&workspace),
             Some(&agent_session),
         )
@@ -9388,6 +9399,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             Some(&workspace),
             Some(&agent_session),
         )
@@ -9498,6 +9510,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             Some(&workspace),
             Some(&agent_session),
         )
@@ -9607,6 +9620,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             Some(&workspace),
             Some(&agent_session),
@@ -9721,6 +9735,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             Some(&workspace),
             Some(&agent_session),
@@ -10455,13 +10470,22 @@ mod worktree_provisioning {
     async fn create_names_branch_from_prompt_with_prefix_and_suffix() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        store
-            .set_setting("workspace.branchPrefix", "\"aw/\"")
-            .await
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.branchPrefix".to_string(),
+                serde_json::json!("aw/"),
+            )])
             .expect("set prefix");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
         let root = unique_dir("intentd-wtslug-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry);
 
         let create = |prompt: &str| WorkspaceCreate {
             repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
@@ -10494,12 +10518,21 @@ mod worktree_provisioning {
     async fn create_keeps_explicit_branch_untouched() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        store
-            .set_setting("workspace.branchPrefix", "\"aw/\"")
-            .await
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.branchPrefix".to_string(),
+                serde_json::json!("aw/"),
+            )])
             .expect("set prefix");
         let root = unique_dir("intentd-wtexpl-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry);
 
         let ws = svc
             .create_workspace(

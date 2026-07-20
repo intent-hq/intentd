@@ -946,10 +946,11 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `git.autoCommit` is a global (non-workspace-scoped) setting, so
-            // this lookup is independent of the session and cheap to do here.
-            let auto_commit_enabled =
-                crate::settings::auto_commit_enabled(&self.services.store).await;
+            // `git.autoCommit` / `rtk.enabled` are global (non-workspace-scoped)
+            // settings, so this snapshot is independent of the session and
+            // cheap to take here.
+            let settings = self.services.effective_settings();
+            let auto_commit_enabled = settings.git.auto_commit;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
             // background workers (`is_background`) skip the suggested-prompts
             // directive, matching the reference `isSubAgent` derivation. The
@@ -968,6 +969,7 @@ impl AgentManager {
                 specialist.as_ref(),
                 is_sub_agent,
                 auto_commit_enabled,
+                settings.rtk.enabled,
                 workspace.as_ref(),
                 Some(&session),
             )
@@ -1134,14 +1136,15 @@ impl AgentManager {
     /// already set one. Any config that collides with a reserved built-in name
     /// (e.g. `workspace-mcp`) is skipped so the bridge cannot be shadowed.
     async fn merge_user_mcp_servers(&self, out: &mut NormalizedMcpServers) -> Result<()> {
-        if !crate::mcp_servers::enable_user_servers(&self.services.store).await {
+        let settings = self.services.effective_settings();
+        if !crate::mcp_servers::enable_user_servers(&settings) {
             return Ok(());
         }
         let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
         if configs.is_empty() {
             return Ok(());
         }
-        let disabled = crate::mcp_servers::disabled_servers(&self.services.store).await;
+        let disabled = crate::mcp_servers::disabled_servers(&settings);
         let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
 
         let mut reshaped = serde_json::Map::new();
@@ -2762,7 +2765,11 @@ impl AgentManager {
     ) -> Result<String> {
         let session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
-        let resolved = resolve_spawn(&session, workspace.as_ref(), &self.services.store).await?;
+        let resolved = resolve_spawn(
+            &session,
+            workspace.as_ref(),
+            &self.services.effective_settings(),
+        )?;
 
         // Check if the agent's model/provider has changed (via agent.setModel).
         // If so, tear down the existing child and force a respawn with the new model.
@@ -3218,10 +3225,10 @@ fn derive_agent_type(
 /// Other providers resolve their binary to an absolute path using the
 /// precedence: `providers.paths` map → `~/.augment/bin/<command>` (for auggie)
 /// → enhanced PATH scan.
-async fn resolve_spawn(
+fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
-    store: &intent_store::Store,
+    settings: &intent_core::settings_file::SettingsFile,
 ) -> Result<ResolvedSpawn> {
     // Provider precedence: when the model carries an explicit `provider:` prefix
     // (e.g., "opencode:kimi-k3"), that prefix wins over session.provider,
@@ -3304,10 +3311,7 @@ async fn resolve_spawn(
     // `npx -y <pinned package>`; local-binary discovery (settings path /
     // managed bin / PATH scan) is skipped entirely.
     if provider.npx_only_package.is_some() {
-        if read_provider_path_setting(store, &provider_id)
-            .await
-            .is_some()
-        {
+        if read_provider_path_setting(settings, &provider_id).is_some() {
             tracing::warn!(
                 provider_id = provider_id,
                 "providers.paths override ignored: {} always spawns via pinned npx",
@@ -3327,7 +3331,7 @@ async fn resolve_spawn(
     }
 
     // Resolve provider binary using the precedence: setting → managed → PATH
-    let explicit_path = read_provider_path_setting(store, &provider_id).await;
+    let explicit_path = read_provider_path_setting(settings, &provider_id);
     let provider_binary = intent_providers::find_provider_binary(
         &provider_id,
         provider.command,
@@ -3400,14 +3404,11 @@ fn resolve_npx_only(
 }
 
 /// Read the provider path from the `providers.paths` map setting, if set.
-async fn read_provider_path_setting(
-    store: &intent_store::Store,
+fn read_provider_path_setting(
+    settings: &intent_core::settings_file::SettingsFile,
     provider_id: &str,
 ) -> Option<String> {
-    let json_str = store.get_setting("providers.paths").await.ok()??;
-    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-    let map = value.as_object()?;
-    let path = map.get(provider_id)?.as_str()?;
+    let path = settings.providers.paths.get(provider_id)?;
     let trimmed = path.trim();
     if trimmed.is_empty() {
         None
