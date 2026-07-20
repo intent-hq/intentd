@@ -162,6 +162,10 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
     let content = user_row["contentBlocks"]
         .as_array()
         .expect("contentBlocks array");
+    assert_eq!(
+        content[0]["type"], "text",
+        "text block first on the user row: {content:?}"
+    );
     let image = content
         .iter()
         .find(|b| b["type"] == "image")
