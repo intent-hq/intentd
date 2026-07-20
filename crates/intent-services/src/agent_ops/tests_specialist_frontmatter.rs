@@ -11,6 +11,7 @@ use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::tests::{workspace, TempDb};
@@ -26,11 +27,19 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir) {
     // Create a temp directory for specialists
     let specialists_dir = TempDir::new().expect("temp specialists dir");
 
-    // Configure Services with the temp specialists directory
-    let services = Services::new(store).with_specialist_dirs(
-        Some(specialists_dir.path().to_path_buf()),
-        Some(specialists_dir.path().to_path_buf()),
-    );
+    // Configure Services with the temp specialists directory and a wired
+    // settings registry (settings are TOML-backed, not SQLite-backed).
+    let config_path = std::env::temp_dir().join(format!(
+        "intentd-specialist-frontmatter-{}.toml",
+        uuid::Uuid::new_v4()
+    ));
+    let registry = Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
+    let services = Services::new(store)
+        .with_settings_registry(registry)
+        .with_specialist_dirs(
+            Some(specialists_dir.path().to_path_buf()),
+            Some(specialists_dir.path().to_path_buf()),
+        );
     (tmp, services, ws, specialists_dir)
 }
 
@@ -135,13 +144,13 @@ async fn missing_frontmatter_falls_through_to_settings() {
     // Create a specialist WITHOUT a frontmatter model
     create_specialist_without_model(&specialists_dir.path().to_path_buf(), "test-specialist");
 
-    // Set a background default in settings
-    svc.store
-        .set_setting(
-            "backgroundAgents.defaultModel",
-            &json!("auggie:haiku").to_string(),
-        )
-        .await
+    // Set a background default in settings (via the wired registry)
+    svc.settings_registry()
+        .expect("registry wired")
+        .apply(&[(
+            "backgroundAgents.defaultModel".to_string(),
+            json!("auggie:haiku"),
+        )])
         .expect("set background");
 
     // Create agent with specialist but no explicit model
