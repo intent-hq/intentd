@@ -262,7 +262,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
         ws.0
     };
 
-    // Create a user-tier specialist with a model frontmatter field
+    // Create a project-tier specialist with a model frontmatter field.
+    // (Located at repository_path/.augment/specialists/, which is the project tier.)
     let specialists_dir = data_dir.join(".augment").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =

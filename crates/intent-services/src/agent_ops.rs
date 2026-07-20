@@ -1172,6 +1172,7 @@ impl Services {
                             w.worktree_path
                                 .as_ref()
                                 .or(w.repository_path.as_ref())
+                                .filter(|s| !s.is_empty())
                                 .map(std::path::PathBuf::from)
                         });
                     specialists_svc.resolve_model(spec_id, wp.as_deref())

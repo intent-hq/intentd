@@ -153,6 +153,8 @@ async fn missing_frontmatter_falls_through_to_settings() {
 }
 
 /// Malicious specialist id with path traversal is rejected.
+/// SECURITY: validate_id is called inside SpecialistsService::resolve() (which
+/// resolve_model uses), blocking all frontmatter lookups from path traversal.
 #[tokio::test]
 async fn malicious_specialist_id_rejected() {
     let (_t, svc, ws, _specialists_dir) = setup().await;
@@ -161,7 +163,7 @@ async fn malicious_specialist_id_rejected() {
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("../evil".into())).await;
 
     // The agent should be created but resolve_model should have returned None
-    // (because validate_id fails), falling through to settings chain default
+    // (because validate_id fails inside resolve()), falling through to settings chain default
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     // With no settings configured, model should be None
     assert_eq!(got.model, None);
