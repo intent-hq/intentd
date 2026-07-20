@@ -731,13 +731,25 @@ pub struct AgentManager {
     interrupt_ids: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Agents whose NEXT session establishment must SKIP the `session/load`
     /// resume and open a fresh `session/new` instead — armed by
-    /// [`AgentManager::edit_and_regenerate`] after truncating the transcript,
-    /// because a resumed provider session would retain the truncated turns in
-    /// its context. Deliberately NOT cleared by [`AgentManager::stop`] (unlike
-    /// `recreated`/`prepend_pending`): the truncation is already persisted, so
-    /// the stale provider history must never be resumed regardless of
-    /// intervening stops. Consumed by [`AgentManager::start_session`] only when
-    /// a fresh session is successfully opened, so spawn retries keep the flag.
+    /// [`AgentManager::edit_and_regenerate`] (immediately after target
+    /// validation, before the stop) because a resumed provider session would
+    /// retain the truncated turns in its context. Deliberately NOT cleared by
+    /// [`AgentManager::stop`] (unlike `recreated`/`prepend_pending`): the
+    /// truncation is already persisted, so the stale provider history must
+    /// never be resumed regardless of intervening stops. Enforced at BOTH
+    /// establishment points — [`AgentManager::start_session`] skips the
+    /// resume, and [`AgentManager::ensure_started`]'s live-child reuse path
+    /// tears the child down when armed — and consumed only when a fresh
+    /// session is successfully opened, so spawn retries keep the flag.
+    ///
+    /// KNOWN LIMITATION: in-memory only, like `recreated` (and the same gap
+    /// `agent.replaceMessages` has today). If the daemon restarts before the
+    /// regenerated turn opens its fresh session (e.g. the spawn failed
+    /// terminally and the agent parked in `Error` awaiting `agent.retry`),
+    /// the intent is lost and the next spawn may resume the stale provider
+    /// session via `session/load`. Persisting a needs-recreate marker on the
+    /// session row would close this; not done here to keep parity with the
+    /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
 }
 
@@ -2340,6 +2352,15 @@ impl AgentManager {
         self.services
             .agent_validate_edit_target_op(&agent_id, &message_id)
             .await?;
+        // Arm `force_recreate` IMMEDIATELY after validation — before `stop()`
+        // — to shrink the window where a concurrent turn could establish a
+        // resumed session between the stop and the arm. It survives `stop()`
+        // by design, and a spuriously-armed flag is safe (worst case: one
+        // unnecessary fresh session + history replay). `ensure_started` also
+        // consults it on the live-child reuse path, so an interleaved turn
+        // that does establish a session before the truncation still gets torn
+        // down and recreated on the next prompt.
+        self.force_recreate.lock().unwrap().insert(agent_id.clone());
         self.stop(&agent_id).await;
         if self.services.clear_queue(&agent_id) {
             self.services
@@ -2355,10 +2376,8 @@ impl AgentManager {
             .services
             .agent_edit_truncate_op(&agent_id, &message_id)
             .await?;
-        // Arm AFTER `stop` (which clears `recreated`/`prepend_pending`):
-        // `force_recreate` makes `start_session` skip the resume, and
-        // `recreated` makes the next turn prepend the truncated history.
-        self.force_recreate.lock().unwrap().insert(agent_id.clone());
+        // Arm `recreated` AFTER `stop` (which clears it): it makes the next
+        // turn prepend the truncated history as `<supervisor>` XML.
         self.recreated.lock().unwrap().insert(agent_id.clone());
         let mut result = self
             .send_message(agent_id, workspace_id, content, None, options)
@@ -2750,7 +2769,16 @@ impl AgentManager {
                 }
             };
 
-            if needs_respawn {
+            // Forced recreate (`agent.editAndRegenerate`): the live child's
+            // provider session predates the truncation, so it must not be
+            // reused OR resumed — tear it down and let `start_session` open a
+            // fresh `session/new`. Checking here (not just in `start_session`)
+            // makes `ensure_started` the single enforcement point regardless
+            // of how an edit interleaves with concurrent turns: without it,
+            // the live-child reuse branch below would return the stale session
+            // with the armed flag sitting unconsumed.
+            let forced = self.force_recreate.lock().unwrap().contains(agent_id);
+            if needs_respawn || forced {
                 // Tear down the existing child (preserving the acpSessionId so
                 // start_session can try session/load for providers that support it).
                 // This is narrower than stop() — only kills the child/handle, no

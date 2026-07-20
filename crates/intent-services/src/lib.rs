@@ -11850,10 +11850,16 @@ impl WorkspaceApi for Services {
                         .await
                 }
                 None => {
-                    // Read-only fallback (no `agent_manager` wired — UDS unit
-                    // harnesses): validate + truncate + persist the edited
-                    // message, without the runtime stop/recreate/regenerate
-                    // orchestration (which requires a live manager).
+                    // Store-level fallback (no `agent_manager` wired — UDS unit
+                    // harnesses): validate + optional model switch + truncate +
+                    // persist the edited message, without the runtime
+                    // stop/recreate/regenerate orchestration (which requires a
+                    // live manager).
+                    self.agent_validate_edit_target_op(&agent_id, &message_id)
+                        .await?;
+                    if let Some(model_id) = model {
+                        self.agent_set_model_op(agent_id.clone(), model_id).await?;
+                    }
                     let truncated_count =
                         self.agent_edit_truncate_op(&agent_id, &message_id).await?;
                     let result = self

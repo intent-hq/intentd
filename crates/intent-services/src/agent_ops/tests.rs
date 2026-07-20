@@ -5748,6 +5748,65 @@ async fn agent_edit_truncate_bad_target_mutates_nothing() {
     assert_eq!(session.messages.len(), 4, "transcript untouched");
 }
 
+/// The `WorkspaceApi::agent_edit_and_regenerate` no-manager fallback applies
+/// the `model` param (parity with the manager path), truncates, and persists
+/// the edited message; a bad target is rejected BEFORE the model switch.
+#[tokio::test]
+async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditFallback").await;
+    let msg_ids = seed_edit_transcript(&svc, &id).await;
+
+    let result = svc
+        .agent_edit_and_regenerate(
+            ws.clone(),
+            id.clone(),
+            msg_ids[2].clone(),
+            "edited via fallback".into(),
+            None,
+            None,
+            Some("mock:other".into()),
+        )
+        .await
+        .expect("fallback edit");
+    assert_eq!(result["truncatedCount"], json!(2));
+
+    let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    assert_eq!(
+        session.model.as_deref(),
+        Some("mock:other"),
+        "model applied"
+    );
+    assert_eq!(session.messages.len(), 3, "prefix + edited message");
+    assert_eq!(session.messages[2].role, "user");
+    assert_eq!(
+        session.messages[2].content[0]["text"],
+        json!("edited via fallback")
+    );
+
+    // Bad target: rejected before ANY state change — model untouched.
+    let err = svc
+        .agent_edit_and_regenerate(
+            ws,
+            id.clone(),
+            "msg-missing".into(),
+            "x".into(),
+            None,
+            None,
+            Some("mock:third".into()),
+        )
+        .await
+        .expect_err("unknown target");
+    assert!(matches!(err, Error::InvalidParams(_)));
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(
+        session.model.as_deref(),
+        Some("mock:other"),
+        "model unchanged by rejected edit"
+    );
+    assert_eq!(session.messages.len(), 3, "transcript unchanged");
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // `agent.wakeOrCreate` widening (C1d-10a) — behaviors B1-B8 + backward compat.
 // Each test seeds a task note via `mark_as_task` and drives the widened
