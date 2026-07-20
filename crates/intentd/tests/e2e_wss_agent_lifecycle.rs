@@ -5613,17 +5613,17 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     assert_eq!(send2["queued"], true, "second message should queue");
 
     // Collect events: wait for agent:message role=user for the dequeued message.
+    // Use wss_event_opt with a single 30s deadline per event (parity with the
+    // sibling suites) so contention from parallel e2e tests — daemon + node
+    // mock-agent spawns easily exceeding a short silence window — doesn't
+    // flake the test (STAB-128).
     let mut saw_dequeued_user_message = false;
     let mut dequeued_message_id: Option<String> = None;
     let mut stream_end_count = 0;
-    for _ in 0..30 {
-        let frame_opt = wss_event_opt(&mut sub, 5).await;
-        let frame = frame_opt.unwrap_or_else(|| {
-            panic!(
-                "event timeout waiting for dequeued message (saw_dequeued={}, stream_end_count={})",
-                saw_dequeued_user_message, stream_end_count
-            )
-        });
+    for _ in 0..100 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:message") => {
@@ -5648,7 +5648,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     }
     assert!(
         saw_dequeued_user_message,
-        "agent:message event emitted for dequeued user message (persist_user path)"
+        "agent:message event emitted for dequeued user message (persist_user path); \
+         stream_end_count={stream_end_count}"
     );
 
     // Verify the messageId matches the second (queued) user message in the transcript.
@@ -5700,17 +5701,14 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let task_agent_id = wake_result["agentId"].as_str().unwrap().to_string();
 
     // Collect events: wait for agent:message role=user for the wake delivery.
+    // Same 30s-per-event deadline as above (STAB-128 contention hardening).
     let mut saw_wake_message_event = false;
     let mut wake_message_id: Option<String> = None;
     let mut wake_stream_end_count = 0;
-    for _ in 0..30 {
-        let frame_opt = wss_event_opt(&mut sub, 5).await;
-        let frame = frame_opt.unwrap_or_else(|| {
-            panic!(
-                "event timeout waiting for wake message (saw_wake={}, wake_stream_end_count={})",
-                saw_wake_message_event, wake_stream_end_count
-            )
-        });
+    for _ in 0..100 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
         let evt = &frame["params"]["event"];
         match evt["type"].as_str() {
             Some("agent:message") => {
@@ -5732,7 +5730,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     }
     assert!(
         saw_wake_message_event,
-        "agent:message event emitted for wake delivery (deliver_wake_message path)"
+        "agent:message event emitted for wake delivery (deliver_wake_message path); \
+         wake_stream_end_count={wake_stream_end_count}"
     );
 
     // Verify the wake messageId matches the first (and only) user message in the task agent's transcript.
