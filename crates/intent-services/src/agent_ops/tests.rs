@@ -6717,16 +6717,18 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     assert_eq!(evt.data["queue"][0]["requeuedAfterFailure"], true);
 }
 
-/// Regression: a delegation group settling with a failed (not deleted) child
-/// must not leave the parent with zero wake paths for that child. Observed
-/// 2026-07-20: a grouped child hit the `session/prompt` idle timeout mid-turn
-/// (`agent:failed`) while its underlying work was still running; the group
-/// settled, `remove_group_watches` dropped every parent watch, and the child's
-/// eventual real completion (after a resume) never woke the parent.
+/// STAB-129 regression: a delegation group settling with a failed (not
+/// deleted) child must not leave the parent with zero wake paths for that
+/// child. Observed 2026-07-20: a grouped child hit the `session/prompt` idle
+/// timeout mid-turn (`agent:failed`) while its underlying work was still
+/// running; the group settled, group-watch removal dropped every parent
+/// watch, and the child's eventual real completion (after a resume) never
+/// woke the parent.
 ///
-/// After the fix, group settlement re-establishes an ungrouped oneShot
-/// parent→child watch for each failed-not-deleted member, so the child's later
-/// settlement still wakes the parent.
+/// After the fix, `settle_group_watches` converts each failed-not-deleted
+/// member's grouped watch into an ungrouped oneShot watch at settlement time
+/// (before the wake delivery await), so the child's later settlement still
+/// wakes the parent.
 #[tokio::test]
 async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     let (_t, svc, ws, bus) = setup_with_bus().await;

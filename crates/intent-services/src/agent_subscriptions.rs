@@ -614,8 +614,21 @@ impl Services {
         Some(group)
     }
 
-    /// Drop every completion watch carrying `group_id`; returns the count removed.
-    pub(crate) fn remove_group_watches(&self, workspace_id: &WorkspaceId, group_id: &str) -> usize {
+    /// Settle a delivered group's watches in one atomic registry pass: every
+    /// completion watch carrying `group_id` is dropped, EXCEPT that watches on
+    /// children listed in `retain_children` are converted in place into
+    /// ungrouped oneShot watches (STAB-129: failed-not-deleted members may
+    /// still be working, and their eventual real settlement must keep a wake
+    /// path to the parent). Conversion dedupes against a live ungrouped
+    /// oneShot watch for the same parent→child pair (e.g. one created by a
+    /// SUB-1 sendToTask auto-watch racing settlement) so the late settlement
+    /// delivers exactly one wake. Returns the number of watches retained.
+    pub(crate) fn settle_group_watches(
+        &self,
+        workspace_id: &WorkspaceId,
+        group_id: &str,
+        retain_children: &[AgentId],
+    ) -> usize {
         let mut guard = self
             .agent_subscriptions
             .lock()
@@ -623,10 +636,29 @@ impl Services {
         let Some(w) = guard.get_mut(workspace_id) else {
             return 0;
         };
-        let before = w.subscriptions.len();
-        w.subscriptions
-            .retain(|s| s.group_id.as_deref() != Some(group_id));
-        before - w.subscriptions.len()
+        let mut kept: Vec<(AgentId, AgentId)> = w
+            .subscriptions
+            .iter()
+            .filter(|s| s.group_id.is_none() && s.one_shot)
+            .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
+            .collect();
+        let mut retained = 0;
+        w.subscriptions.retain_mut(|s| {
+            if s.group_id.as_deref() != Some(group_id) {
+                return true;
+            }
+            let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
+            if retain_children.contains(&s.child_agent_id) && !kept.contains(&pair) {
+                s.group_id = None;
+                s.one_shot = true;
+                kept.push(pair);
+                retained += 1;
+                true
+            } else {
+                false
+            }
+        });
+        retained
     }
 
     /// All delegation groups parented by `parent_id` (read snapshot for
