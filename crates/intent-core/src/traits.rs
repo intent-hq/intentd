@@ -1338,6 +1338,41 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.editAndRegenerate`: edit a past user message and regenerate from
+    /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
+    /// transcript to just before `message_id` (which must reference an existing
+    /// **user** message — otherwise `-32602`), forces a fresh ACP session on
+    /// the next prompt (the truncated history replays as `<supervisor>` XML so
+    /// the provider does not retain the truncated turns), then sends `content`
+    /// as a fresh user message with the same per-turn semantics as
+    /// `agent.sendMessage`.
+    #[allow(clippy::too_many_arguments)]
+    fn agent_edit_and_regenerate(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        model: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            agent_id,
+            message_id,
+            content,
+            image_blocks,
+            file_blocks,
+            model,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_edit_and_regenerate not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.queueMessage`: explicitly enqueue a message; `{ success,
     /// queuedMessage }` where `queuedMessage` is `{ id, content, queuedAt,
     /// position, imageBlocks?, fileBlocks? }` (PROTOCOL §5.5). Attachment

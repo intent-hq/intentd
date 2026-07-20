@@ -1847,6 +1847,90 @@ impl Services {
         Ok(json!({ "success": true, "messages": inserted }))
     }
 
+    /// Locate the `agent.editAndRegenerate` target in an already-fetched
+    /// transcript: `message_id` must reference an existing **user** message.
+    /// Returns its 0-based index into `messages`; `InvalidParams` (→ `-32602`)
+    /// otherwise. Pure, so validate + truncate can share ONE transcript fetch
+    /// (no TOCTOU between the index and the slice it cuts).
+    fn find_edit_target(messages: &[intent_core::AgentMessage], message_id: &str) -> Result<usize> {
+        let idx = messages
+            .iter()
+            .position(|m| m.id == message_id)
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "agent.editAndRegenerate: messageId {message_id} not found in transcript"
+                ))
+            })?;
+        if messages[idx].role != "user" {
+            return Err(Error::InvalidParams(format!(
+                "agent.editAndRegenerate: messageId {message_id} is not a user message (role: {})",
+                messages[idx].role
+            )));
+        }
+        Ok(idx)
+    }
+
+    /// Validate the `agent.editAndRegenerate` target: `message_id` must
+    /// reference an existing **user** message in the agent's transcript.
+    /// Returns the 0-based index of that message. Read-only, so the caller can
+    /// reject a bad `messageId` with `-32602` BEFORE stopping an in-flight
+    /// turn or mutating any state (PROTOCOL §5.5).
+    pub(crate) async fn agent_validate_edit_target_op(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<usize> {
+        let messages = self.store.get_agent_messages(agent_id, None).await?;
+        Self::find_edit_target(&messages, message_id)
+    }
+
+    /// `agent.editAndRegenerate` truncation step: atomically truncate the
+    /// transcript to just BEFORE the (already validated) user message
+    /// `message_id`, dropping it and everything after it. Reuses the
+    /// replaceMessages store machinery (fresh row ids / 0-based `seq`).
+    /// Emits `agent:updated` with `{ truncatedCount, remainingCount }`.
+    /// Returns the number of messages removed.
+    ///
+    /// Re-validates against the SAME transcript fetch it slices (single read;
+    /// no index/slice divergence). If the target vanished between the caller's
+    /// pre-stop validation and this call (concurrent `agent.replaceMessages`),
+    /// this fails with `-32602` after the stop already happened — the
+    /// "reject before any state change" contract covers the pre-stop check;
+    /// the transcript itself is still untouched here.
+    pub(crate) async fn agent_edit_truncate_op(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<usize> {
+        let session = self.store.get_agent_session(agent_id).await?;
+        let messages = self.store.get_agent_messages(agent_id, None).await?;
+        let idx = Self::find_edit_target(&messages, message_id)?;
+        let keep = &messages[..idx];
+        let batch: Vec<intent_store::ReplaceMessage<'_>> = keep
+            .iter()
+            .map(|m| intent_store::ReplaceMessage {
+                role: m.role.as_str(),
+                content: &m.content,
+                metadata: m.metadata.as_ref(),
+                created_at: m.created_at.as_str(),
+            })
+            .collect();
+        let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        let truncated_count = messages.len() - inserted.len();
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "truncatedCount": truncated_count,
+                "remainingCount": inserted.len(),
+            }),
+        )
+        .await;
+        Ok(truncated_count)
+    }
+
     /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
         let models = match fetch_auggie_models().await? {
