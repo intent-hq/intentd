@@ -22,8 +22,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use super::{
-    compute_process_cap, derive_agent_type, is_cancel_transport_closed, resolve_spawn, text_prompt,
-    AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry, DEFAULT_AGENT_TYPE,
+    compute_process_cap, derive_agent_type, is_cancel_transport_closed, resolve_npx_only,
+    resolve_spawn, text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
+    DEFAULT_AGENT_TYPE,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -2922,9 +2923,15 @@ async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
 }
 
 /// A compound `provider:model` id selects both the provider and the bare model
-/// id, without needing an explicit `provider` on the session.
+/// id, without needing an explicit `provider` on the session. claude-code is
+/// npx-only, so a successful resolution always carries the pinned npx package
+/// and never a locally-discovered provider binary.
 #[tokio::test]
 async fn resolve_spawn_parses_compound_model_id() {
+    if intent_providers::find_npx().is_none() {
+        eprintln!("skipping: npx not available on this host");
+        return;
+    }
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("store opens");
     let mut session = session_with_specialist(None);
@@ -2934,6 +2941,55 @@ async fn resolve_spawn_parses_compound_model_id() {
         .expect("compound resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
+    assert_eq!(
+        resolved.provider_binary, None,
+        "claude-code must never spawn a locally-discovered binary"
+    );
+    assert_eq!(
+        resolved.npx_fallback_package,
+        Some(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE)
+    );
+    assert!(
+        resolved.npx_fallback_binary.is_some(),
+        "npx path must be resolved for npx-only providers"
+    );
+}
+
+/// npx-only resolution: with npx present, the pinned package spec is returned;
+/// with npx missing, resolution fails with the user-facing Node.js error.
+#[test]
+fn resolve_npx_only_returns_pinned_package_and_errors_without_npx() {
+    let provider = intent_providers::provider_config("claude-code");
+
+    let npx = PathBuf::from("/usr/local/bin/npx");
+    let (bin, pkg) = resolve_npx_only(provider, Some(npx.clone())).expect("npx present resolves");
+    assert_eq!(bin, npx);
+    assert_eq!(pkg, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+
+    let err = resolve_npx_only(provider, None).expect_err("missing npx is a hard error");
+    assert!(
+        matches!(err, intent_core::Error::InvalidInput(_)),
+        "missing npx is an environment misconfiguration, not an internal error"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("npx not found")
+            && msg.contains(intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT),
+        "error must explain the npx/Node.js requirement, got: {msg}"
+    );
+    assert!(
+        msg.contains("Anthropic Claude Code"),
+        "error must name the provider, got: {msg}"
+    );
+}
+
+/// Non-npx-only providers reject npx-only resolution (defensive seam guard).
+#[test]
+fn resolve_npx_only_rejects_non_npx_only_provider() {
+    let provider = intent_providers::provider_config("auggie");
+    let err = resolve_npx_only(provider, Some(PathBuf::from("/usr/local/bin/npx")))
+        .expect_err("auggie is not npx-only");
+    assert!(err.to_string().contains("not configured for npx-only"));
 }
 
 /// When a model carries an explicit `provider:` prefix, that prefix wins over
