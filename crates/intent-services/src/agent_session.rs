@@ -430,23 +430,26 @@ impl Services {
     }
 
     /// Best-effort flush of an agent's partial in-flight assistant content at
-    /// interruption-capture time (graceful shutdown, INT-41 follow-up): when the
-    /// live-turn slot holds streamed blocks, persist them as a normal `assistant`
-    /// row tagged `metadata.interrupted = true` + `stopReason = "interrupted"`
-    /// (the terminal-message convention the FE stopped-indicator keys off;
-    /// `status` is kept as a redundant tag) so the transcript keeps the
-    /// streamed-so-far output across the restart. Reuses the turn's minted
-    /// `message_id` (CS-0 D1) so persisted block ids `{messageId}:{index}` match
-    /// what streamed. The caller aborts the turn worker before flushing; if the
-    /// worker already persisted the full turn, the append collides on the UNIQUE
-    /// id and is logged at debug (benign — the full row won; the live-turn slot
-    /// is cleared either way so no stale in-memory overlay survives). Errors are
-    /// logged and swallowed: this must never block shutdown or the
-    /// interrupted_agent row insert.
-    pub(crate) async fn flush_partial_turn_on_interruption(&self, agent_id: &AgentId) {
-        let Some(live) = self.live_turn(agent_id) else {
-            return;
-        };
+    /// interruption-capture time (graceful shutdown, INT-41 follow-up): persist
+    /// the caller-captured live-turn snapshot as a normal `assistant` row tagged
+    /// `metadata.interrupted = true` + `stopReason = "interrupted"` (the
+    /// terminal-message convention the FE stopped-indicator keys off; `status`
+    /// is kept as a redundant tag) so the transcript keeps the streamed-so-far
+    /// output across the restart. Reuses the turn's minted `message_id` (CS-0
+    /// D1) so persisted block ids `{messageId}:{index}` match what streamed.
+    /// The caller snapshots the slot via [`live_turn`](Self::live_turn) BEFORE
+    /// aborting the turn worker (the abort drops [`LiveTurnGuard`], clearing
+    /// the slot) and flushes AFTER the abort so the worker cannot race the
+    /// append; if the worker already persisted the full turn, the append
+    /// collides on the UNIQUE id and is logged at debug (benign — the full row
+    /// won; the stale slot, if any, is cleared). Errors are logged and
+    /// swallowed: this must never block shutdown or the interrupted_agent row
+    /// insert.
+    pub(crate) async fn flush_partial_turn_on_interruption(
+        &self,
+        agent_id: &AgentId,
+        live: LiveTurn,
+    ) {
         if live.blocks.is_empty() {
             return;
         }
