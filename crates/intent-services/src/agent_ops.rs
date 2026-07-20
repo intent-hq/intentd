@@ -856,8 +856,9 @@ impl Services {
     /// `isWaitingOnTool`, `isWaitingForOtherAgents`, `waitingForAgentIds`, plus
     /// the STAB-125 turn-liveness pair `turnInFlight`/`lastStreamActivityAt`.
     /// See [`agent_activity_flags_for`] and [`live_turn_liveness_for`]. The
-    /// liveness pair reuses `is_responding` as its busy signal so the two never
-    /// disagree within a single projection.
+    /// liveness pair reuses `is_responding` as its busy signal, so within one
+    /// projection `turnInFlight` implies `isResponding` (the converse need not
+    /// hold — a busy worker may not have opened its live-turn slot yet).
     pub(crate) fn project_lite_with_flags(&self, session: AgentSession) -> AgentLite {
         let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
             self.agent_activity_flags_for(&session);

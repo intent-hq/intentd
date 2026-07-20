@@ -11515,8 +11515,9 @@ impl WorkspaceApi for Services {
                         is_waiting_for_other_agents,
                         waiting_for_agent_ids,
                     ) = self.agent_activity_flags_for(&session);
-                    // Reuse `is_responding` as the busy signal so the liveness
-                    // pair never disagrees with it within one overlay.
+                    // Reuse `is_responding` as the busy signal so within one
+                    // overlay `turnInFlight` implies `isResponding` (a busy
+                    // worker without an open slot still reports `false`).
                     let (turn_in_flight, last_stream_activity_at) =
                         self.live_turn_liveness_for(&session, is_responding);
                     serde_json::json!({
