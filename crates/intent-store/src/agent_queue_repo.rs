@@ -24,12 +24,20 @@ pub struct AgentQueueRow {
 impl Store {
     /// Replace the persisted queue for one agent with the given snapshot
     /// (delete-then-insert in a single transaction). An empty `rows` slice
-    /// clears the agent's persisted queue.
+    /// clears the agent's persisted queue. Every row must belong to
+    /// `agent_id` — a mismatch fails fast instead of silently persisting
+    /// rows under the wrong agent.
     pub async fn replace_agent_queue(
         &self,
         agent_id: &AgentId,
         rows: &[AgentQueueRow],
     ) -> Result<()> {
+        if let Some(row) = rows.iter().find(|r| r.agent_id != *agent_id) {
+            return Err(Error::Internal(format!(
+                "replace agent queue row {} belongs to agent {}, not {}",
+                row.id, row.agent_id.0, agent_id.0
+            )));
+        }
         let pool = self.write_pool();
         let agent_id = agent_id.clone();
         let owned: Vec<(String, i64, String, String)> = rows
@@ -76,7 +84,10 @@ impl Store {
     /// Load every persisted queue entry, ordered by agent then queue position,
     /// for startup rehydration. Joined against `agent_session` so entries
     /// whose session row no longer exists are skipped (defensive; the FK
-    /// cascade should already have removed them).
+    /// cascade should already have removed them). A row whose stored payload
+    /// is not valid JSON comes back as `Value::Null` rather than failing the
+    /// whole load — rehydration is best-effort and the caller skips entries
+    /// it cannot decode.
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
         let rows = sqlx::query(
             "SELECT q.id, q.agent_id, q.position, q.payload, q.created_at \
@@ -86,21 +97,20 @@ impl Store {
         .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("load agent queues failed: {e}")))?;
-        rows.iter()
+        Ok(rows
+            .iter()
             .map(|row| {
                 let payload_raw: String = row.get("payload");
-                let payload = serde_json::from_str(&payload_raw).map_err(|e| {
-                    Error::Internal(format!("decode agent queue payload failed: {e}"))
-                })?;
-                Ok(AgentQueueRow {
+                let payload = serde_json::from_str(&payload_raw).unwrap_or(serde_json::Value::Null);
+                AgentQueueRow {
                     id: row.get("id"),
                     agent_id: AgentId(row.get("agent_id")),
                     position: row.get("position"),
                     payload,
                     created_at: row.get("created_at"),
-                })
+                }
             })
-            .collect()
+            .collect())
     }
 
     /// Delete every persisted queue entry for one agent.

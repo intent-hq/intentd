@@ -2878,3 +2878,69 @@ async fn agent_queue_cascades_with_agent_session() {
         .expect("load queues")
         .is_empty());
 }
+
+#[tokio::test]
+async fn agent_queue_replace_rejects_mismatched_agent_id() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+
+    // A row stamped with a different agent id fails fast instead of being
+    // silently persisted under `agent`.
+    let other = AgentId::new();
+    let err = store
+        .replace_agent_queue(&agent, &[queue_row(&other, 0, "misfiled")])
+        .await
+        .expect_err("mismatched row must be rejected");
+    assert!(err.to_string().contains("belongs to agent"));
+    assert!(store
+        .load_all_agent_queues()
+        .await
+        .expect("load queues")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn agent_queue_load_survives_corrupt_payload() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+    let rows = vec![queue_row(&agent, 0, "bad"), queue_row(&agent, 1, "good")];
+    let corrupt_id = rows[0].id.clone();
+    store
+        .replace_agent_queue(&agent, &rows)
+        .await
+        .expect("replace queue");
+
+    // Corrupt one payload behind the API's back (e.g. a manual DB edit).
+    sqlx::query("UPDATE agent_queue SET payload = 'not json' WHERE id = ?")
+        .bind(&corrupt_id)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt payload");
+
+    // Load stays best-effort: the corrupt row comes back as Null instead of
+    // failing the whole load, and the healthy row is intact.
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].payload, serde_json::Value::Null);
+    assert_eq!(loaded[1].payload["content"], "good");
+}
