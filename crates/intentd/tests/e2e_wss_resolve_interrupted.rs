@@ -465,6 +465,7 @@ async fn resolve_interrupted_resume_and_abandon() {
         .find(|m| m.role == "user")
         .expect("expected user continuation message on resumed session");
     let resumed_blocks = last_user_msg.content.as_array().expect("content blocks");
+    assert_eq!(resumed_blocks[0]["type"], "text");
     let continuation_text = resumed_blocks[0]["text"].as_str().expect("text block");
     assert!(
         continuation_text.contains(
