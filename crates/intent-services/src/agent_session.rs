@@ -439,9 +439,10 @@ impl Services {
     /// `message_id` (CS-0 D1) so persisted block ids `{messageId}:{index}` match
     /// what streamed. The caller aborts the turn worker before flushing; if the
     /// worker already persisted the full turn, the append collides on the UNIQUE
-    /// id and is logged at debug (benign — the full row won). Errors are logged
-    /// and swallowed: this must never block shutdown or the interrupted_agent
-    /// row insert.
+    /// id and is logged at debug (benign — the full row won; the live-turn slot
+    /// is cleared either way so no stale in-memory overlay survives). Errors are
+    /// logged and swallowed: this must never block shutdown or the
+    /// interrupted_agent row insert.
     pub(crate) async fn flush_partial_turn_on_interruption(&self, agent_id: &AgentId) {
         let Some(live) = self.live_turn(agent_id) else {
             return;
@@ -467,11 +468,15 @@ impl Services {
             .await
         {
             Ok(_) => self.clear_live_turn(agent_id),
-            Err(e) if e.to_string().contains("UNIQUE constraint failed") => tracing::debug!(
-                agent = %agent_id,
-                error = %e,
-                "partial flush skipped: worker already persisted the full turn under this id"
-            ),
+            Err(e) if e.to_string().contains("UNIQUE constraint failed") => {
+                // The durable full row exists — drop the now-stale overlay too.
+                self.clear_live_turn(agent_id);
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "partial flush skipped: worker already persisted the full turn under this id"
+                );
+            }
             Err(e) => tracing::warn!(
                 agent = %agent_id,
                 error = %e,
