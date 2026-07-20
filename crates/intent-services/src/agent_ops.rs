@@ -4233,7 +4233,11 @@ impl Services {
     /// queue (brief lock, dropped before the await) and replace the agent's
     /// `agent_queue` rows with it. Best-effort — a store failure is logged at
     /// WARN and never fails the calling RPC; the in-memory queue remains the
-    /// live source of truth and the next mutation re-snapshots.
+    /// live source of truth and the next mutation re-snapshots. Because the
+    /// DB write happens after the lock is dropped, two concurrent mutations
+    /// on the same agent can commit their snapshots out of mutation order,
+    /// briefly persisting the older one; the next mutation re-snapshots, so
+    /// this only matters if the daemon dies inside that window.
     pub(crate) async fn persist_queue_snapshot(&self, agent_id: &AgentId) {
         let rows: Vec<intent_store::AgentQueueRow> = {
             let guard = self
