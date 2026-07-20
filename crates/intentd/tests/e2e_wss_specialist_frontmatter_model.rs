@@ -247,6 +247,24 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     let data_dir = temp_data_dir();
     let socket = data_dir.join("intentd.sock");
 
+    // Pre-seed the database with a workspace that has a repository_path pointing
+    // to the data_dir (so specialist resolution works)
+    let ws_id = {
+        use intent_core::WorkspaceId;
+        use intent_store::Store;
+        let db_path = data_dir.join("intentd.db");
+        let store = Store::open(&db_path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let mut workspace = workspace_seed(&ws);
+        // Set repository_path so specialist resolution can find the specialist file
+        workspace.repository_path = Some(data_dir.to_string_lossy().to_string());
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert ws");
+        ws.0
+    };
+
     // Create a user-tier specialist with a model frontmatter field
     let specialists_dir = data_dir.join(".augment").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
@@ -258,34 +276,32 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     )
     .expect("write specialist file");
 
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let daemon = Daemon {
-        child: spawn_serve(&data_dir, "both", &[("INTENTD_AUTH_TOKEN", TOKEN)]),
+        child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     // Discover bound port + fingerprint via UDS
-    let srv_info = uds_rpc(&socket, 1, "server.info", json!({})).await;
-    let port = srv_info["result"]["wssPort"].as_u64().expect("wssPort") as u16;
-    let fp = srv_info["result"]["tlsFingerprint"]
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fp = status["result"]["fingerprint"]
         .as_str()
-        .expect("tlsFingerprint");
+        .expect("fingerprint")
+        .to_string();
 
     // Connect over WSS
-    let cfg = client_config(fp);
+    let cfg = client_config(&fp);
     let mut ws = connect_ws(port, cfg).await;
-
-    // Create a workspace
-    let ws_res = wss_rpc(&mut ws, 2, "workspace.create", json!({ "id": "test-ws" })).await;
-    assert_eq!(ws_res["workspace"]["id"], "test-ws");
 
     // Create an agent with specialistId but no explicit model (review thread PRRT_kwDOS9Wxuc6SIhDg)
     let agent_res = wss_rpc(
         &mut ws,
-        3,
+        2,
         "agent.create",
         json!({
-            "workspaceId": "test-ws",
+            "workspaceId": ws_id,
             "specialistId": "test-specialist",  // Correct param name
             "name": "TestAgent"
         }),
@@ -295,7 +311,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     let agent_id = agent_res["agent"]["id"].as_str().expect("agent id");
 
     // Get agent and verify model was pinned to specialist frontmatter value
-    let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
+    let get_res = wss_rpc(&mut ws, 3, "agent.get", json!({ "agentId": agent_id })).await;
 
     // Assert the session's model IS the frontmatter model (make the test fail if resolution is skipped)
     assert_eq!(
@@ -304,4 +320,46 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     );
 
     drop(daemon);
+}
+
+fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
+    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    let ts = now_iso();
+    Workspace {
+        id: id.clone(),
+        title: "WSS-E2E".to_string(),
+        branch: "main".to_string(),
+        base_ref: None,
+        base_commit_sha: None,
+        status: WorkspaceStatus::Active,
+        status_message: None,
+        activity: WorkspaceActivity::Idle,
+        attention: WorkspaceAttention::None,
+        created_at: ts.clone(),
+        updated_at: ts,
+        last_activity: None,
+        tags: vec![],
+        path: None,
+        repository_path: None,
+        repository_owner: None,
+        repository_name: None,
+        worktree_path: None,
+        scope: None,
+        skip_worktree: false,
+        setup_script: None,
+        is_remote: false,
+        default_model: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        active_pull_request: None,
+        pull_requests: None,
+        archived: false,
+        archived_at: None,
+        task_stats: None,
+        agent_summary: None,
+        diff_summary: None,
+        token_usage: None,
+        cow_supported: None,
+    }
 }
