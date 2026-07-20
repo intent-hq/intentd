@@ -2985,6 +2985,7 @@ fn user_message_blocks_appends_image_and_file_blocks() {
     let files = json!([
         { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "a.txt" },
         { "type": "file", "data": "orphan" }, // missing fileName → skipped
+        { "type": "file", "data": "x", "fileName": "b.txt" }, // missing mimeType → skipped
     ]);
     let blocks = user_message_blocks("look", Some(&images), Some(&files));
     let arr = blocks.as_array().expect("array");

@@ -662,8 +662,9 @@ pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
 /// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
 /// attachments must reach the transcript so the conversation view can render
 /// them). Image entries require `data` + `mimeType` and file entries require
-/// `data` + `fileName` (the shapes the FE renderer keys on); malformed entries
-/// are silently skipped so a partial attachment array never breaks the persist.
+/// `data` + `mimeType` + `fileName` — the same attachment contract prompt
+/// assembly (`append_attachment_blocks`) enforces; malformed entries are
+/// silently skipped so a partial attachment array never breaks the persist.
 pub(crate) fn user_message_blocks(
     content: &str,
     image_blocks: Option<&Value>,
@@ -682,13 +683,15 @@ pub(crate) fn user_message_blocks(
     if let Some(files) = file_blocks.and_then(Value::as_array) {
         for file in files {
             let data = file.get("data").and_then(Value::as_str);
+            let mime = file.get("mimeType").and_then(Value::as_str);
             let name = file.get("fileName").and_then(Value::as_str);
-            if let (Some(data), Some(name)) = (data, name) {
-                let mut block = json!({ "type": "file", "data": data, "fileName": name });
-                if let Some(mime) = file.get("mimeType").and_then(Value::as_str) {
-                    block["mimeType"] = json!(mime);
-                }
-                blocks.push(block);
+            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+                blocks.push(json!({
+                    "type": "file",
+                    "data": data,
+                    "mimeType": mime,
+                    "fileName": name,
+                }));
             }
         }
     }
