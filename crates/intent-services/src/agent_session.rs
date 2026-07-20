@@ -429,6 +429,72 @@ impl Services {
             .map(|live| live.last_activity_at.clone())
     }
 
+    /// Best-effort flush of an agent's partial in-flight assistant content at
+    /// interruption-capture time (graceful shutdown, INT-41 follow-up): persist
+    /// the caller-captured live-turn snapshot as a normal `assistant` row tagged
+    /// `metadata.interrupted = true` + `stopReason = "interrupted"` (the
+    /// terminal-message convention the FE stopped-indicator keys off; `status`
+    /// is kept as a redundant tag) so the transcript keeps the streamed-so-far
+    /// output across the restart. Reuses the turn's minted `message_id` (CS-0
+    /// D1) so persisted block ids `{messageId}:{index}` match what streamed.
+    /// The caller snapshots the slot via [`live_turn`](Self::live_turn) BEFORE
+    /// aborting the turn worker (the abort drops [`LiveTurnGuard`], clearing
+    /// the slot) and flushes AFTER the abort so the worker cannot race the
+    /// append; if the worker already persisted the full turn, the append
+    /// collides on the UNIQUE id and is logged at debug (benign — the full row
+    /// won; the stale slot, if any, is cleared). Errors are logged and
+    /// swallowed: this must never block shutdown or the interrupted_agent row
+    /// insert.
+    pub(crate) async fn flush_partial_turn_on_interruption(
+        &self,
+        agent_id: &AgentId,
+        live: LiveTurn,
+    ) {
+        if live.blocks.is_empty() {
+            return;
+        }
+        let metadata = json!({
+            "interrupted": true,
+            "stopReason": "interrupted",
+            "status": "interrupted",
+        });
+        match self
+            .store
+            .append_agent_message_with_id(
+                agent_id,
+                &live.message_id,
+                "assistant",
+                &Value::Array(live.blocks),
+                Some(&metadata),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(_) => self.clear_live_turn(agent_id),
+            // Only the `agent_message.id` violation means "the worker already
+            // persisted the full turn under this minted id" — a `(agent_id,
+            // seq)` collision is a different race and falls through to warn
+            // (keeping the live-turn slot as the only copy of the content).
+            Err(e)
+                if e.to_string()
+                    .contains("UNIQUE constraint failed: agent_message.id") =>
+            {
+                // The durable full row exists — drop the now-stale overlay too.
+                self.clear_live_turn(agent_id);
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "partial flush skipped: worker already persisted the full turn under this id"
+                );
+            }
+            Err(e) => tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "failed to flush partial in-flight assistant content at interruption capture"
+            ),
+        }
+    }
+
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to
