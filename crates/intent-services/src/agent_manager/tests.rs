@@ -3047,12 +3047,12 @@ fn text_prompt_produces_one_acp_text_content_block() {
 // --- derive_agent_type workspace path tier -----------------------------------
 
 /// When a specialist sits under the workspace project tier
-/// (`<ws>/.augment/specialists/<id>.md`), `derive_agent_type` discovers it via
+/// (`<ws>/.intent/specialists/<id>.md`), `derive_agent_type` discovers it via
 /// the workspace path and returns its declared `agentType`.
 #[tokio::test]
 async fn derive_agent_type_uses_workspace_project_specialists_dir() {
     let ws_dir = std::env::temp_dir().join(format!("intentd-dat-{}", uuid::Uuid::new_v4()));
-    let specialists_dir = ws_dir.join(".augment/specialists");
+    let specialists_dir = ws_dir.join(".intent/specialists");
     std::fs::create_dir_all(&specialists_dir).unwrap();
     std::fs::write(
         specialists_dir.join("worker.md"),

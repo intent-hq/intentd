@@ -239,7 +239,7 @@ pub struct Services {
     /// flight cache, keeping the async runtime free if the backing store stalls.
     secrets: Arc<settings::AsyncSecretStore>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
-    /// to `~/.augment/specialists/`; tests inject a temp dir for hermetic
+    /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
     specialists_user_dir: Option<PathBuf>,
     /// Override for the **bundled** (read-only) specialists directory (§18.2).
@@ -3598,7 +3598,7 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-    let readme = format!("# {repo_name}\n\nA new project created with Intent by Augment.\n");
+    let readme = format!("# {repo_name}\n\nA new project created with Intent.\n");
     std::fs::write(repo_path.join("README.md"), readme).map_err(|e| {
         Error::Internal(format!(
             "workspace.initializeRepository: write README.md failed: {e}"

@@ -1,6 +1,6 @@
 //! Skills directory watcher → `skills:changed` events.
 //!
-//! Watches the 5-tier skills scan roots (3 user-tier + 2 project-tier per workspace)
+//! Watches the 7-tier skills scan roots (4 user-tier + 3 project-tier per workspace)
 //! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted. User-tier changes affect all workspaces; project-tier changes are scoped
 //! to their workspace. Debounce is 500ms per workspace to coalesce rapid edits.
@@ -121,6 +121,7 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
     if let Some(home) = home_dir() {
         roots.push(home.join(".agents").join("skills"));
         roots.push(home.join(".claude").join("skills"));
+        roots.push(home.join(".intent").join("skills"));
         roots.push(home.join(".augment").join("skills"));
     }
     roots
@@ -129,6 +130,7 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
 fn get_project_skill_roots(workspace_path: &Path) -> Vec<PathBuf> {
     vec![
         workspace_path.join(".agents").join("skills"),
+        workspace_path.join(".intent").join("skills"),
         workspace_path.join(".augment").join("skills"),
     ]
 }
