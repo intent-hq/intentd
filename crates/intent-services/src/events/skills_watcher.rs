@@ -1,6 +1,6 @@
 //! Skills directory watcher → `skills:changed` events.
 //!
-//! Watches the 5-tier skills scan roots (3 user-tier + 2 project-tier per workspace)
+//! Watches the 7-tier skills scan roots (4 user-tier + 3 project-tier per workspace)
 //! and emits `skills:changed` events when SKILL.md files are created, modified, or
 //! deleted. User-tier changes affect all workspaces; project-tier changes are scoped
 //! to their workspace. Debounce is 500ms per workspace to coalesce rapid edits.

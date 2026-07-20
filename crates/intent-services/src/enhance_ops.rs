@@ -274,13 +274,13 @@ impl Services {
         // Provider neutrality gate: enhance-prompt is an auggie-specific capability.
         // When the active provider is not auggie, return a typed unavailable response
         // so the FE can hide the affordance gracefully without an error crash.
-        let active_provider = match self.store.get_setting("providers.active").await {
-            Ok(Some(json_str)) => serde_json::from_str::<serde_json::Value>(&json_str)
+        let active_provider = match self.store.get_setting("providers.active").await? {
+            Some(json_str) => serde_json::from_str::<serde_json::Value>(&json_str)
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "auggie".to_string()),
-            _ => "auggie".to_string(), // Default to auggie when setting is unset
+            None => "auggie".to_string(), // Default to auggie when setting is unset
         };
         if active_provider != "auggie" {
             return Ok(json!({
