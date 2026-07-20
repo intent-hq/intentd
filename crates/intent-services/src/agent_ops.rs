@@ -4437,8 +4437,7 @@ impl Services {
         }
 
         // Deliver continuation message
-        let continuation =
-            "intentd restarted while you were working. Review your last steps and continue the task.";
+        let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
 
         // Use the agent_send_message machinery to deliver the message
         // (lazily respawns provider and resumes via ACP session/load)
