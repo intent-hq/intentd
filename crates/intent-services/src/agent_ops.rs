@@ -4436,6 +4436,46 @@ impl Services {
             }
         }
 
+        // Append a system interruption marker BEFORE the continuation so the
+        // transcript shows the interruption boundary (same shape as the abandon
+        // path; the FE InterruptionNotice keys off `meta.kind == "interruption"`).
+        // A failed append is treated like a failed continuation delivery: reset
+        // the row to pending and surface the error.
+        let marker_text =
+            "The previous turn was interrupted because the harness shut down. Continuing below.";
+        let marker_content = json!([{
+            "type": "text",
+            "text": marker_text,
+            "meta": { "kind": "interruption" }
+        }]);
+        let marker = match self
+            .store
+            .append_agent_message(agent_id, "system", &marker_content, &now_iso())
+            .await
+        {
+            Ok(message) => message,
+            Err(e) => {
+                reset_to_pending().await;
+                return Err(e);
+            }
+        };
+
+        // Emit agent:message + agent:updated so live UIs render the marker.
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id.0, "messageId": marker.id, "role": "system" }),
+        )
+        .await;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            agent_id,
+            AGENT_UPDATED,
+            json!({ "agentId": agent_id.0 }),
+        )
+        .await;
+
         // Deliver continuation message
         let continuation = "You were interrupted because the harness shut down. You now have a chance to continue the work — review your last steps and pick up where you left off.";
 

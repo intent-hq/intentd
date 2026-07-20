@@ -459,12 +459,12 @@ async fn resolve_interrupted_resume_and_abandon() {
         .get_agent_session(&resume_agent_id)
         .await
         .expect("get resumed session");
-    let last_user_msg = resumed_session
+    let last_user_idx = resumed_session
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
+        .rposition(|m| m.role == "user")
         .expect("expected user continuation message on resumed session");
+    let last_user_msg = &resumed_session.messages[last_user_idx];
     let resumed_blocks = last_user_msg.content.as_array().expect("content blocks");
     assert_eq!(resumed_blocks[0]["type"], "text");
     let continuation_text = resumed_blocks[0]["text"].as_str().expect("text block");
@@ -477,6 +477,32 @@ async fn resolve_interrupted_resume_and_abandon() {
     assert!(
         !continuation_text.contains("intentd"),
         "continuation must not mention intentd, got: {continuation_text}"
+    );
+
+    // Phase 5b: the resume path also appends a system interruption marker
+    // (same shape as the abandon marker, meta.kind == "interruption") and it
+    // must appear BEFORE the continuation user message in the transcript.
+    let marker_idx = resumed_session
+        .messages
+        .iter()
+        .position(|m| m.role == "system")
+        .expect("expected system interruption marker on resumed session");
+    let marker_blocks = resumed_session.messages[marker_idx]
+        .content
+        .as_array()
+        .expect("marker content blocks");
+    assert_eq!(marker_blocks.len(), 1, "marker is a single text block");
+    assert_eq!(marker_blocks[0]["type"], "text");
+    assert_eq!(
+        marker_blocks[0]["text"].as_str().expect("marker text"),
+        "The previous turn was interrupted because the harness shut down. Continuing below.",
+        "marker should carry exactly the approved copy"
+    );
+    assert_eq!(marker_blocks[0]["meta"]["kind"], "interruption");
+    assert!(
+        marker_idx < last_user_idx,
+        "system marker (index {marker_idx}) must precede the continuation user \
+         message (index {last_user_idx})"
     );
 
     // Phase 6: Verify the abandoned agent has a system message

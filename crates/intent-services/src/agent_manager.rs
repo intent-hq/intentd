@@ -2745,6 +2745,10 @@ impl AgentManager {
                     continue;
                 }
             };
+            // Best-effort: persist any partial in-flight assistant content from the
+            // live-turn slot BEFORE stop() aborts the worker (which would drop it),
+            // so the transcript keeps the streamed-so-far output across the restart.
+            self.services.flush_partial_turn_on_interruption(id).await;
             // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
             // this agent and the daemon was restarted without the FE resolving it, the row
             // is refreshed to the latest state).

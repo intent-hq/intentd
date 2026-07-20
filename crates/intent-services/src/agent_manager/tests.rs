@@ -618,6 +618,84 @@ async fn manager_tracks_lookup_stop_and_shuts_down() {
     assert_eq!(mgr.registry().size(), 0);
 }
 
+/// Graceful shutdown flushes a busy agent's partial in-flight assistant content
+/// (the live-turn slot) as an `assistant` row tagged
+/// `metadata.status = "interrupted"` — reusing the turn's minted message id so
+/// block ids match what streamed — alongside the interrupted_agent row. A busy
+/// agent with no live-turn slot gets only the interrupted row (no phantom
+/// assistant message).
+#[tokio::test]
+async fn shutdown_flushes_partial_live_turn_as_interrupted_assistant_row() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-shutdown-flush");
+    let with_partial = AgentId::from("a-partial");
+    let without_partial = AgentId::from("a-no-partial");
+    seed_agent(&mgr, &ws, &with_partial).await;
+    insert_extra_session(&mgr, &ws, &without_partial).await;
+    track(&mgr, &with_partial);
+    track(&mgr, &without_partial);
+    assert!(mgr.try_begin(&with_partial, &ws).await);
+    assert!(mgr.try_begin(&without_partial, &ws).await);
+
+    // Simulate a mid-stream turn: the live-turn slot holds coalesced blocks.
+    let blocks = vec![
+        json!({ "type": "text", "id": "msg-flush:0", "text": "partial answer…" }),
+        json!({
+            "type": "tool_use",
+            "id": "msg-flush:1",
+            "name": "read_file",
+            "input": {},
+            "toolCallId": "call-1"
+        }),
+    ];
+    mgr.services
+        .set_live_turn(&with_partial, "msg-flush", blocks.clone());
+
+    mgr.shutdown().await;
+
+    // The partial content persisted as an assistant row with the turn's
+    // message id and metadata.status = "interrupted".
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&with_partial, None)
+        .await
+        .expect("messages");
+    assert_eq!(messages.len(), 1, "exactly one flushed assistant row");
+    let msg = &messages[0];
+    assert_eq!(msg.id, "msg-flush");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, Value::Array(blocks));
+    assert_eq!(
+        msg.metadata.as_ref().expect("metadata")["status"],
+        "interrupted"
+    );
+
+    // Both busy agents got interrupted_agent rows; the one without a live-turn
+    // slot got no assistant row.
+    for id in [&with_partial, &without_partial] {
+        assert!(
+            mgr.services
+                .store
+                .get_interrupted_agent(id)
+                .await
+                .expect("get interrupted")
+                .is_some(),
+            "interrupted row for {id}"
+        );
+    }
+    let other = mgr
+        .services
+        .store
+        .get_agent_messages(&without_partial, None)
+        .await
+        .expect("messages");
+    assert!(
+        other.is_empty(),
+        "no phantom assistant row without live turn"
+    );
+}
+
 #[tokio::test]
 async fn reap_idle_evicts_handles_and_deregisters() {
     let (_tmp, mgr) = manager().await;
