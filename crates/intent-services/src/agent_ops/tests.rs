@@ -6455,7 +6455,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
         "msg-live",
         vec![json!({ "type": "text", "text": "streaming…" })],
     );
-    svc.enqueue_message(&c, "queued follow-up".to_string(), None, None);
+    svc.enqueue_message(&c, "queued follow-up".to_string(), None, None, None);
     assert!(svc.live_turn(&a).is_some(), "live-turn slot seeded");
     assert!(svc.has_ready_to_send(&c), "queue seeded");
     assert_eq!(svc.find_watches_for_child(&ws, &b).len(), 1);
@@ -6690,6 +6690,7 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         editing: false,
         persisted: true,
         requeued_after_failure: true, // Terminal-failure requeue marker
+        message_metadata: None,
     };
 
     svc.requeue_front(&id, queued);
@@ -6715,6 +6716,61 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         .expect("queue:updated event");
     assert_eq!(evt.data["queue"].as_array().unwrap().len(), 1);
     assert_eq!(evt.data["queue"][0]["requeuedAfterFailure"], true);
+}
+
+/// `messageMetadata` captured at enqueue time (e.g. a parent wake's
+/// `event_notification` payload) must surface on the queue wire shape via
+/// `QueuedMessage::to_value`, and entries enqueued without metadata must keep
+/// the legacy shape (no `messageMetadata` key).
+#[tokio::test]
+async fn queued_message_metadata_surfaces_in_queue_snapshot() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "QMM").await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let metadata = json!({
+        "type": "event_notification",
+        "eventType": "task_completion",
+        "taskNoteId": "note-1",
+    });
+    let (queued, position) = svc.enqueue_message(
+        &id,
+        "wake while busy".to_string(),
+        None,
+        None,
+        Some(metadata.clone()),
+    );
+    assert_eq!(queued.to_value(position)["messageMetadata"], metadata);
+    svc.publish_queue_updated(&id).await;
+
+    // Wire shape: metadata present on the tagged entry.
+    let snapshot = svc.queue_snapshot(&id);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["content"], "wake while busy");
+    assert_eq!(snapshot[0]["messageMetadata"], metadata);
+
+    // agent:queue:updated event carries the same shape.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated event");
+    assert_eq!(evt.data["queue"][0]["messageMetadata"], metadata);
+
+    // Legacy shape: an entry enqueued without metadata omits the key.
+    let (plain, plain_pos) = svc.enqueue_message(&id, "plain".to_string(), None, None, None);
+    let v = plain.to_value(plain_pos);
+    assert!(
+        v.get("messageMetadata").is_none(),
+        "no messageMetadata key without metadata"
+    );
 }
 
 /// STAB-129 regression: a delegation group settling with a failed (not

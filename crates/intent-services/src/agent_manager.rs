@@ -102,9 +102,10 @@ pub struct TurnOptions {
     pub file_blocks: Option<serde_json::Value>,
     /// Opaque per-message payload from `agent.sendMessage` / `agent.forceMessage`
     /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
-    /// message row (via [`Store::append_agent_message_with_metadata`]) for the
-    /// FIRST turn only; queue-drained follow-up turns run with
-    /// [`TurnOptions::default`] and therefore carry no metadata of their own.
+    /// message row (via [`Store::append_agent_message_with_metadata`]). When a
+    /// send is enqueued behind a running turn the metadata rides along on the
+    /// `QueuedMessage` entry, so the drain-time persist keeps it; drained
+    /// turns still run with [`TurnOptions::default`] otherwise.
     pub message_metadata: Option<serde_json::Value>,
 }
 
@@ -2091,6 +2092,7 @@ impl AgentManager {
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
+                options.message_metadata.clone(),
             );
             let result = json!({
                 "success": true,
@@ -2125,6 +2127,7 @@ impl AgentManager {
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
+                options.message_metadata.clone(),
             );
             let result = json!({
                 "success": true,
@@ -2213,7 +2216,14 @@ impl AgentManager {
         // Skip the transcript append for a terminal-failure requeue — its
         // user row was already persisted before the failed turn began.
         if !next.persisted {
-            persist_user(&self, &agent_id, &workspace_id, &next.content).await;
+            persist_user(
+                &self,
+                &agent_id,
+                &workspace_id,
+                &next.content,
+                next.message_metadata.as_ref(),
+            )
+            .await;
         }
         // Queue-drained turns carry no per-turn prompt hints of their own,
         // but the FE-supplied attachments captured at enqueue time do ride
@@ -2428,6 +2438,7 @@ impl AgentManager {
                                     editing: false,
                                     persisted: true,
                                     requeued_after_failure: false,
+                                    message_metadata: last_user_msg.metadata.clone(),
                                 };
                                 self.services.requeue_front(&agent_id, queued);
 
@@ -3303,7 +3314,14 @@ async fn run_message_worker(
             // A terminal-failure requeue was already persisted before its
             // failed turn began — don't duplicate the user row on retry.
             if !next.persisted {
-                persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+                persist_user(
+                    &mgr,
+                    &agent_id,
+                    &workspace_id,
+                    &next.content,
+                    next.message_metadata.as_ref(),
+                )
+                .await;
             }
             content = next.content;
             options = TurnOptions {
@@ -3333,7 +3351,14 @@ async fn run_message_worker(
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             if !next.persisted {
-                persist_user(&mgr, &agent_id, &workspace_id, &next.content).await;
+                persist_user(
+                    &mgr,
+                    &agent_id,
+                    &workspace_id,
+                    &next.content,
+                    next.message_metadata.as_ref(),
+                )
+                .await;
             }
             content = next.content;
             options = TurnOptions {
@@ -3362,19 +3387,28 @@ async fn run_message_worker(
 
 /// Persist a queued user message into the append-only transcript before its turn
 /// and publish the `agent:message` event so chat subscribers and the transcript
-/// reflect the dequeued message (STAB-4 fix). Best-effort; a store or publish error
-/// is logged and the turn still proceeds.
+/// reflect the dequeued message (STAB-4 fix). `message_metadata` is the queue
+/// entry's captured `messageMetadata` (e.g. a parent wake's `event_notification`
+/// payload), persisted on the row exactly as a direct delivery would have.
+/// Best-effort; a store or publish error is logged and the turn still proceeds.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     content: &str,
+    message_metadata: Option<&Value>,
 ) {
     let created_at = now_iso();
     match mgr
         .services
         .store
-        .append_agent_message(agent_id, "user", &user_text_blocks(content), &created_at)
+        .append_agent_message_with_metadata(
+            agent_id,
+            "user",
+            &user_text_blocks(content),
+            message_metadata,
+            &created_at,
+        )
         .await
     {
         Ok(message) => {
@@ -3640,6 +3674,7 @@ async fn persist_error_and_requeue(
         editing: false,
         persisted: true,
         requeued_after_failure: true,
+        message_metadata: options.message_metadata.clone(),
     };
     mgr.services.requeue_front(agent_id, queued);
 
@@ -4557,7 +4592,7 @@ mod agent_retry_tests {
 
         // A requeued message is waiting (the persist_error_and_requeue path).
         mgr.services
-            .enqueue_message(&agent_id, "requeued".to_string(), None, None);
+            .enqueue_message(&agent_id, "requeued".to_string(), None, None, None);
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -4594,7 +4629,7 @@ mod agent_retry_tests {
                     tokio::task::yield_now().await;
                 }
                 mgr.services
-                    .enqueue_message(&agent_id, "raced".to_string(), None, None);
+                    .enqueue_message(&agent_id, "raced".to_string(), None, None, None);
                 mgr.clone()
                     .try_drain_queue(agent_id.clone(), ws.clone())
                     .await;
