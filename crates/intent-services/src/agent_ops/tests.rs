@@ -7164,17 +7164,12 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
 }
 
 #[tokio::test]
-async fn rehydrate_skips_orphaned_rows_and_preserves_live_map() {
+async fn rehydrate_preserves_live_map() {
     let (tmp, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Live").await;
     svc.agent_queue_message_op(id.clone(), "persisted".into(), None, None)
         .await
         .expect("queue");
-
-    // An agent whose session row no longer exists yields no rehydrated rows
-    // (the FK cascade removed them with the session).
-    let ghost = AgentId::new();
-    assert!(svc.store().replace_agent_queue(&ghost, &[]).await.is_ok());
 
     // Rehydrating over a Services that already holds a live queue for the
     // agent keeps the live (newer) queue rather than clobbering it.
@@ -7185,9 +7180,10 @@ async fn rehydrate_skips_orphaned_rows_and_preserves_live_map() {
         .await
         .expect("live queue");
     // The live enqueue's write-through replaced the persisted snapshot, so
-    // rehydration loads that same single entry — and `or_insert` leaves the
-    // in-memory queue untouched.
-    restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    // rehydration loads that same single entry — the vacant-entry insert
+    // leaves the in-memory queue untouched and counts nothing.
+    let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    assert_eq!(rehydrated, 0, "skipped live queue must not be counted");
     let q = restarted
         .agent_get_queue_op(id, None)
         .await

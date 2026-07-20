@@ -2765,12 +2765,14 @@ async fn agent_message_append_refreshes_updated_at() {
 }
 
 fn queue_row(agent_id: &AgentId, position: i64, content: &str) -> AgentQueueRow {
+    // Matches production, where the row id is the queued message id.
+    let id = uuid::Uuid::new_v4().to_string();
     AgentQueueRow {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: id.clone(),
         agent_id: agent_id.clone(),
         position,
         payload: json!({
-            "id": uuid::Uuid::new_v4().to_string(),
+            "id": id,
             "content": content,
             "queuedAt": now_iso(),
             "editing": false,

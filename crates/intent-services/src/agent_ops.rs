@@ -4268,7 +4268,8 @@ impl Services {
     /// preserved so a later drain does not double-append transcript rows
     /// (STAB-114/STAB-52). Rehydration never kicks `try_drain_queue`: messages
     /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
-    /// Returns the number of rehydrated messages.
+    /// Returns the number of messages actually inserted into the in-memory
+    /// map (agents that already hold a live queue are skipped, not counted).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
         let rows = self.store.load_all_agent_queues().await?;
         let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
@@ -4288,13 +4289,16 @@ impl Services {
                 }
             }
         }
-        let count = map.values().map(Vec::len).sum();
+        let mut count = 0;
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
         for (agent_id, queue) in map {
-            guard.entry(agent_id).or_insert(queue);
+            if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(agent_id) {
+                count += queue.len();
+                entry.insert(queue);
+            }
         }
         Ok(count)
     }
