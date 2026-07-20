@@ -3581,7 +3581,7 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-    let readme = format!("# {repo_name}\n\nA new project created with Intent by Augment.\n");
+    let readme = format!("# {repo_name}\n\nA new project created with Intent.\n");
     std::fs::write(repo_path.join("README.md"), readme).map_err(|e| {
         Error::Internal(format!(
             "workspace.initializeRepository: write README.md failed: {e}"
