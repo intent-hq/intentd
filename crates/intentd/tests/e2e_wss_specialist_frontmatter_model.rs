@@ -258,10 +258,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
         let mut workspace = workspace_seed(&ws);
         // Set repository_path so specialist resolution can find the specialist file
         workspace.repository_path = Some(data_dir.to_string_lossy().to_string());
-        store
-            .insert_workspace(&workspace)
-            .await
-            .expect("insert ws");
+        store.insert_workspace(&workspace).await.expect("insert ws");
         ws.0
     };
 
