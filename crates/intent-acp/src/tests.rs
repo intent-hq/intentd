@@ -344,10 +344,184 @@ mod session_tests {
     #[tokio::test]
     async fn new_session_returns_acp_session_id() {
         let (conn, _responder) = connect_session();
-        let resp = session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
+        let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), None)
             .await
             .expect("session/new succeeds");
         assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
+    }
+
+    #[tokio::test]
+    async fn claude_code_new_session_injects_disallowed_tools_and_system_prompt() {
+        use crate::session::Meta;
+        use serde_json::json;
+        let (conn, responder) = connect_session();
+
+        // Build meta with both disallowedTools and systemPrompt (as build_session_meta does)
+        let mut meta = Meta::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            json!({
+                "options": {
+                    "disallowedTools": ["Task"]
+                }
+            }),
+        );
+        meta.insert("systemPrompt".to_string(), json!({"append": "test prompt"}));
+
+        let resp = session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/new with _meta succeeds");
+        assert_eq!(resp.session_id.0.as_ref(), "acp-session-1");
+
+        drop(conn);
+        let seen = responder.await.expect("responder completes");
+        let new_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/new"))
+            .expect("agent received session/new");
+        let meta_payload = &new_req["params"]["_meta"];
+        assert_eq!(
+            meta_payload["claudeCode"]["options"]["disallowedTools"],
+            json!(["Task"]),
+            "session/new for claude-code must inject disallowedTools"
+        );
+        assert_eq!(
+            meta_payload["systemPrompt"]["append"],
+            json!("test prompt"),
+            "session/new systemPrompt.append preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_load_session_injects_disallowed_tools() {
+        use crate::session::Meta;
+        use serde_json::json;
+        let (conn, responder) = connect_session();
+
+        // Build meta with disallowedTools only (this test omits systemPrompt)
+        let mut meta = Meta::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            json!({
+                "options": {
+                    "disallowedTools": ["Task"]
+                }
+            }),
+        );
+
+        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/load succeeds");
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let load_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/load"))
+            .expect("agent received session/load");
+        let meta_payload = &load_req["params"]["_meta"];
+        assert_eq!(
+            meta_payload["claudeCode"]["options"]["disallowedTools"],
+            json!(["Task"]),
+            "session/load for claude-code must inject disallowedTools"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_meta_param_omits_meta_field() {
+        let (conn, responder) = connect_session();
+        // Passing meta=None omits the _meta field from JSON-RPC params
+        session::new_session(&conn, "/tmp/ws", Vec::new(), None)
+            .await
+            .expect("session/new succeeds");
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let new_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/new"))
+            .expect("agent received session/new");
+        let params = new_req["params"]
+            .as_object()
+            .expect("params must be an object");
+        assert!(
+            !params.contains_key("_meta"),
+            "session/new with meta=None must not inject _meta field"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_load_session_with_prompt_injects_both_disallowed_tools_and_system_prompt()
+    {
+        use crate::session::Meta;
+        use serde_json::json;
+        let (conn, responder) = connect_session();
+
+        // Build meta with both disallowedTools and systemPrompt (as build_session_meta does on resume)
+        let mut meta = Meta::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            json!({
+                "options": {
+                    "disallowedTools": ["Task"]
+                }
+            }),
+        );
+        let mut system_prompt_obj = serde_json::Map::new();
+        system_prompt_obj.insert("append".to_string(), json!("Resumed prompt"));
+        meta.insert(
+            "systemPrompt".to_string(),
+            serde_json::Value::Object(system_prompt_obj),
+        );
+
+        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/load succeeds");
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let load_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/load"))
+            .expect("agent received session/load");
+        let meta_payload = &load_req["params"]["_meta"];
+        assert_eq!(
+            meta_payload["claudeCode"]["options"]["disallowedTools"],
+            json!(["Task"]),
+            "session/load for claude-code must inject disallowedTools"
+        );
+        assert_eq!(
+            meta_payload["systemPrompt"]["append"],
+            json!("Resumed prompt"),
+            "session/load for claude-code must inject systemPrompt.append when provided"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_new_session_injects_developer_instructions() {
+        use crate::session::Meta;
+        use serde_json::json;
+        let (conn, responder) = connect_session();
+
+        // Build meta with developerInstructions (as build_session_meta does for codex)
+        let mut meta = Meta::new();
+        meta.insert(
+            "developerInstructions".to_string(),
+            json!("Codex test prompt"),
+        );
+
+        session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
+            .await
+            .expect("session/new succeeds");
+        drop(conn);
+        let seen = responder.await.unwrap();
+        let new_req = seen
+            .iter()
+            .find(|f| f.get("method").and_then(|v| v.as_str()) == Some("session/new"))
+            .expect("agent received session/new");
+        let meta_payload = &new_req["params"]["_meta"];
+        assert_eq!(
+            meta_payload["developerInstructions"],
+            json!("Codex test prompt"),
+            "session/new for codex must inject developerInstructions under _meta"
+        );
     }
 
     #[tokio::test]
@@ -357,7 +531,7 @@ mod session_tests {
         let handshake = crate::handshake::handshake(&conn, provider).await.unwrap();
         assert!(session::supports_load_session(&handshake.initialize));
 
-        session::load_session(&conn, "auggie", "acp-session-1", "/tmp/ws", Vec::new())
+        session::load_session(&conn, "acp-session-1", "/tmp/ws", Vec::new(), None)
             .await
             .expect("session/load succeeds when capability present");
 
@@ -382,7 +556,7 @@ mod session_tests {
         // Await a follow-up request: the single FIFO writer guarantees the
         // cancel line was flushed before this response arrives (avoids racing
         // the writer task against the drop below).
-        session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
+        session::new_session(&conn, "/tmp/ws", Vec::new(), None)
             .await
             .expect("follow-up request flushes the cancel line");
         // Drop the connection to close the agent read side, then inspect frames.
@@ -394,79 +568,6 @@ mod session_tests {
             .expect("agent received session/cancel");
         assert!(cancel.get("id").is_none(), "cancel is a notification");
         assert_eq!(cancel["params"]["sessionId"], json!("acp-session-1"));
-    }
-
-    #[tokio::test]
-    async fn claude_code_new_session_injects_meta_disallowed_tools() {
-        let (conn, responder) = connect_session();
-        // Call new_session with provider_id = "claude-code"
-        session::new_session(&conn, "claude-code", "/tmp/ws", Vec::new())
-            .await
-            .expect("session/new succeeds");
-        // Drop the connection to inspect outbound frames
-        drop(conn);
-        let seen = responder.await.unwrap();
-        // Find the session/new request
-        let new_req = seen
-            .iter()
-            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
-            .expect("agent received session/new");
-        // Assert _meta.claudeCode.options.disallowedTools = ["Task"]
-        let meta = &new_req["params"]["_meta"];
-        assert_eq!(
-            meta["claudeCode"]["options"]["disallowedTools"],
-            json!(["Task"]),
-            "session/new for claude-code must inject _meta.claudeCode.options.disallowedTools=[\"Task\"]"
-        );
-    }
-
-    #[tokio::test]
-    async fn claude_code_load_session_injects_meta_disallowed_tools() {
-        let (conn, responder) = connect_session();
-        // Call load_session with provider_id = "claude-code"
-        session::load_session(&conn, "claude-code", "acp-session-1", "/tmp/ws", Vec::new())
-            .await
-            .expect("session/load succeeds");
-        // Drop the connection to inspect outbound frames
-        drop(conn);
-        let seen = responder.await.unwrap();
-        // Find the session/load request
-        let load_req = seen
-            .iter()
-            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/load"))
-            .expect("agent received session/load");
-        // Assert _meta.claudeCode.options.disallowedTools = ["Task"]
-        let meta = &load_req["params"]["_meta"];
-        assert_eq!(
-            meta["claudeCode"]["options"]["disallowedTools"],
-            json!(["Task"]),
-            "session/load for claude-code must inject _meta.claudeCode.options.disallowedTools=[\"Task\"]"
-        );
-    }
-
-    #[tokio::test]
-    async fn non_claude_code_new_session_omits_meta() {
-        let (conn, responder) = connect_session();
-        // Call new_session with provider_id = "auggie"
-        session::new_session(&conn, "auggie", "/tmp/ws", Vec::new())
-            .await
-            .expect("session/new succeeds");
-        // Drop the connection to inspect outbound frames
-        drop(conn);
-        let seen = responder.await.unwrap();
-        // Find the session/new request
-        let new_req = seen
-            .iter()
-            .find(|f| f.get("method").and_then(Value::as_str) == Some("session/new"))
-            .expect("agent received session/new");
-        // Assert _meta is absent for non-claude-code providers (check key absence explicitly)
-        let params = new_req["params"]
-            .as_object()
-            .expect("params must be an object");
-        assert!(
-            !params.contains_key("_meta"),
-            "session/new for non-claude-code provider must not inject _meta"
-        );
     }
 
     #[test]

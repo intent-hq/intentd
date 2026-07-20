@@ -43,7 +43,7 @@ use crate::IncomingNotification;
 // service layer can consume them without depending on `agent-client-protocol`
 // directly (§3.2 keeps that crate an `intent-acp` implementation detail).
 pub use agent_client_protocol::schema::{
-    ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, NewSessionResponse,
+    ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, Meta, NewSessionResponse,
     SessionMode, SessionModeState, SessionUpdate, StopReason,
 };
 
@@ -120,41 +120,19 @@ fn elapsed_ms() -> u64 {
     start.elapsed().as_millis() as u64
 }
 
-/// `session/new` with `{ cwd, mcpServers }` → the agent's session id and initial
+/// `session/new` with `{ cwd, mcpServers, _meta? }` → the agent's session id and initial
 /// state. The caller persists `response.session_id` as `AgentSession.acpSessionId`
-/// (write-once) for later resume (§6.5).
-///
-/// For `claude-code`, injects `_meta.claudeCode.options.disallowedTools: ["Task"]`
-/// to disallow the provider-native Task tool (subagent spawning), forcing all
-/// delegation through the workspace `ws.agent.*` surface. Other providers receive
-/// no `_meta` payload.
+/// (write-once) for later resume (§6.5). `meta` (if present) is provider-specific
+/// metadata for system-prompt injection or other extensions.
 pub async fn new_session(
     conn: &Connection,
-    provider_id: &str,
     cwd: impl Into<PathBuf>,
     mcp_servers: Vec<McpServer>,
+    meta: Option<Meta>,
 ) -> AcpResult<NewSessionResponse> {
-    let request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
-    let mut params = serde_json::to_value(&request)?;
-
-    // Inject _meta.claudeCode.options.disallowedTools for claude-code only
-    // (verified against @agentclientprotocol/claude-agent-acp 0.59.0;
-    // disallowedTools are merged with ACP's internal deny rules).
-    if provider_id == "claude-code" {
-        if let Some(obj) = params.as_object_mut() {
-            obj.insert(
-                "_meta".to_string(),
-                serde_json::json!({
-                    "claudeCode": {
-                        "options": {
-                            "disallowedTools": ["Task"]
-                        }
-                    }
-                }),
-            );
-        }
-    }
-
+    let mut request = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
+    request.meta = meta;
+    let params = serde_json::to_value(&request)?;
     let result = conn
         .request_timeout("session/new", params, session_setup_timeout())
         .await?;
@@ -164,36 +142,19 @@ pub async fn new_session(
 
 /// `session/load` to resume an existing `acpSessionId` after a restart. Only
 /// valid when the agent advertised the `loadSession` capability — check with
-/// [`supports_load_session`] first (§6.5).
-///
-/// For `claude-code`, injects `_meta.claudeCode.options.disallowedTools: ["Task"]`
-/// to disallow the provider-native Task tool, matching the `session/new` behavior.
+/// [`supports_load_session`] first (§6.5). `meta` (if present) is provider-specific
+/// metadata for system-prompt injection or other extensions.
 pub async fn load_session(
     conn: &Connection,
-    provider_id: &str,
     session_id: &str,
     cwd: impl Into<PathBuf>,
     mcp_servers: Vec<McpServer>,
+    meta: Option<Meta>,
 ) -> AcpResult<LoadSessionResponse> {
-    let request = LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
-    let mut params = serde_json::to_value(&request)?;
-
-    // Inject _meta.claudeCode.options.disallowedTools for claude-code only
-    if provider_id == "claude-code" {
-        if let Some(obj) = params.as_object_mut() {
-            obj.insert(
-                "_meta".to_string(),
-                serde_json::json!({
-                    "claudeCode": {
-                        "options": {
-                            "disallowedTools": ["Task"]
-                        }
-                    }
-                }),
-            );
-        }
-    }
-
+    let mut request =
+        LoadSessionRequest::new(SessionId::new(session_id), cwd).mcp_servers(mcp_servers);
+    request.meta = meta;
+    let params = serde_json::to_value(&request)?;
     let result = conn
         .request_timeout("session/load", params, session_setup_timeout())
         .await?;

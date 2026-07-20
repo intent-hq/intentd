@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use intent_acp::session::{
-    self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer,
+    self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
     SessionModeState, StopReason,
 };
 use intent_acp::{Connection, IncomingNotification};
@@ -34,6 +34,9 @@ use crate::Services;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_meta;
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
 /// (persisted on `AgentSession`) plus the modes the provider advertised in the
@@ -274,6 +277,74 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
     }
 }
 
+/// Resolve the effective provider id for an agent session using the same precedence
+/// as the spawn path (§6.9): model's compound prefix (if `model` contains `:` and
+/// yields a non-empty provider) → `provider` field → default provider. Malformed
+/// compound ids like `:sonnet` yield an empty prefix and fall through to the provider
+/// field / default. This ensures `_meta` injection, spawn args, and all provider-keyed
+/// logic use a consistent provider id.
+fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
+    model
+        .filter(|m| m.contains(':'))
+        .map(|m| intent_providers::parse_compound_model_id(m).0)
+        .filter(|id| !id.is_empty()) // guard against malformed compound ids like ":sonnet"
+        .or_else(|| provider.filter(|p| !p.is_empty()).map(|p| p.to_string()))
+        .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
+}
+
+/// Build provider-specific `_meta` for `session/new` and `session/load` from the
+/// assembled system prompt (§18.1). Returns `None` for providers that do not use
+/// `_meta` injection (auggie, droid, opencode, cortex, mock use other mechanisms).
+/// Provider-specific shapes:
+/// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
+///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
+/// - codex: `{ "developerInstructions": "<prompt>" }` (bare top-level key, when non-blank prompt)
+fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<Meta> {
+    match provider_id {
+        "claude-code" => {
+            let mut meta = Meta::new();
+
+            // Always add disallowedTools to prevent provider-native Task tool
+            // (verified against @agentclientprotocol/claude-agent-acp 0.59.0;
+            // disallowedTools are merged with ACP's internal deny rules).
+            meta.insert(
+                "claudeCode".to_string(),
+                serde_json::json!({
+                    "options": {
+                        "disallowedTools": ["Task"]
+                    }
+                }),
+            );
+
+            // Add systemPrompt.append if non-blank prompt exists
+            if let Some(prompt) = system_prompt {
+                let prompt = prompt.trim();
+                if !prompt.is_empty() {
+                    let mut system_prompt_obj = serde_json::Map::new();
+                    system_prompt_obj
+                        .insert("append".to_string(), Value::String(prompt.to_string()));
+                    meta.insert("systemPrompt".to_string(), Value::Object(system_prompt_obj));
+                }
+            }
+
+            Some(meta)
+        }
+        "codex" => {
+            let prompt = system_prompt?.trim();
+            if prompt.is_empty() {
+                return None;
+            }
+            let mut meta = Meta::new();
+            meta.insert(
+                "developerInstructions".to_string(),
+                Value::String(prompt.to_string()),
+            );
+            Some(meta)
+        }
+        _ => None,
+    }
+}
+
 impl Services {
     /// Begin a live-turn slot for `agent_id` (CS-0 D5): seed it with the freshly
     /// minted assistant `message_id` and no blocks yet, returning a
@@ -336,7 +407,6 @@ impl Services {
     pub async fn open_acp_session(
         &self,
         conn: &Connection,
-        provider_id: &str,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
@@ -345,7 +415,12 @@ impl Services {
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
-        let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
+        let stored = self.store.get_agent_session(agent_id).await?;
+        let workspace_id = stored.workspace_id.clone();
+        // Resolve provider using the same precedence as spawn path (compound model
+        // prefix → provider field → default), then build provider-specific _meta.
+        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -354,7 +429,7 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::new_session(conn, provider_id, cwd, mcp_servers)
+        let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let acp_session_id = resp.session_id.0.to_string();
@@ -380,7 +455,6 @@ impl Services {
     pub async fn recreate_acp_session(
         &self,
         conn: &Connection,
-        provider_id: &str,
         agent_id: &AgentId,
         expected_old: &str,
         cwd: impl Into<PathBuf>,
@@ -388,7 +462,13 @@ impl Services {
     ) -> Result<AcpSessionOpened> {
         // Load the session up front so the CAS replace is scoped to the owning
         // workspace (see [`open_acp_session`]).
-        let workspace_id = self.store.get_agent_session(agent_id).await?.workspace_id;
+        let stored = self.store.get_agent_session(agent_id).await?;
+        let workspace_id = stored.workspace_id.clone();
+        // Resolve provider using the same precedence as spawn path, then build
+        // provider-specific _meta for system-prompt injection (recreate path sends
+        // the same prompt as new/load).
+        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -397,7 +477,7 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::new_session(conn, provider_id, cwd, mcp_servers)
+        let resp = session::new_session(conn, cwd, mcp_servers, meta)
             .await
             .map_err(|e| Error::Internal(format!("session/new failed: {e}")))?;
         let new_acp_session_id = resp.session_id.0.to_string();
@@ -425,7 +505,6 @@ impl Services {
     pub async fn resume_acp_session(
         &self,
         conn: &Connection,
-        provider_id: &str,
         init: &InitializeResponse,
         agent_id: &AgentId,
         cwd: impl Into<PathBuf>,
@@ -433,12 +512,16 @@ impl Services {
     ) -> Result<Option<AcpSessionOpened>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
-        let Some(acp_session_id) = stored.acp_session_id else {
+        let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
         };
         if !session::supports_load_session(init) {
             return Ok(None);
         }
+        // Resolve provider using the same precedence as spawn path, then build
+        // provider-specific _meta for system-prompt injection.
+        let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -447,7 +530,7 @@ impl Services {
             "info",
         )
         .await;
-        let resp = session::load_session(conn, provider_id, &acp_session_id, cwd, mcp_servers)
+        let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
         Ok(Some(AcpSessionOpened {

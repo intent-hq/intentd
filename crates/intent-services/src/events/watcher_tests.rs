@@ -218,33 +218,70 @@ async fn burst_above_threshold_collapses_to_directory_summaries() {
         std::fs::write(file, b"burst").expect("write file");
     }
 
-    // Wait for debounce + flush (300ms debounce + margin).
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
-    // Drain all file:* events from the subscription.
+    // Drain all file:* events from the subscription. Poll for up to 15 seconds
+    // to allow the watcher to process all events, even under slow coverage
+    // instrumentation. Exit when we see a burst event followed by 1s of silence,
+    // or when we hit the overall deadline.
     let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut seen_burst = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        match timeout(remaining, sub.recv()).await {
+        // Once we've seen a burst event, wait up to 1s for stragglers (but no
+        // longer than the overall deadline), then exit. Otherwise keep polling
+        // until the deadline.
+        let poll_timeout = if seen_burst {
+            Duration::from_millis(1000).min(remaining)
+        } else {
+            remaining
+        };
+        match timeout(poll_timeout, sub.recv()).await {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type.starts_with("file:") {
+                        if ev.data.get("burst").and_then(|v| v.as_bool()) == Some(true) {
+                            seen_burst = true;
+                        }
                         events.push(ev);
                     }
                 }
             }
-            _ => break,
+            Ok(None) => {
+                // Subscription closed unexpectedly
+                if !seen_burst {
+                    panic!(
+                        "Event subscription closed before burst was observed; \
+                         got {} events total",
+                        events.len()
+                    );
+                }
+                break;
+            }
+            Err(_) => {
+                // Timeout
+                if seen_burst {
+                    // Quiet period after burst => done collecting
+                    break;
+                }
+                // else keep polling until deadline
+            }
         }
     }
 
+    // The test requires a burst event to have been seen. If the system is under such
+    // extreme load that the FS watcher never delivered the burst, fail explicitly.
+    assert!(
+        seen_burst,
+        "FS watcher did not deliver a burst event within 15s; \
+         got {} events total (system may be under extreme load, but the test cannot pass)",
+        events.len()
+    );
+
     // Should have emitted fewer events than the 150 individual files.
     // When burst threshold is exceeded, we emit per-directory summaries instead.
-    // Under load, the debounce timer may fire multiple times (creating multiple
-    // batches), but the total should still be much less than 150.
     assert!(
         events.len() < 80,
         "Expected burst collapse to <80 events, got {} events (should be << 150)",
