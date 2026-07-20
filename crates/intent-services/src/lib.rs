@@ -8103,7 +8103,7 @@ impl WorkspaceApi for Services {
     fn save_repo_config(
         &self,
         id: WorkspaceId,
-        config: intent_core::RepoConfig,
+        config: serde_json::Map<String, serde_json::Value>,
     ) -> BoxFuture<'_, Result<intent_core::RepoConfig>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -8113,8 +8113,7 @@ impl WorkspaceApi for Services {
                     "Cannot save repo config: workspace has no repository path".to_string(),
                 ));
             };
-            repo_config::write_repo_config(&repo_path, config.clone()).await?;
-            Ok(config)
+            repo_config::merge_repo_config(&repo_path, config).await
         })
     }
 
