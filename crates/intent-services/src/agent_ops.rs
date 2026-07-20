@@ -1142,6 +1142,22 @@ impl Services {
         .await;
     }
 
+    /// Reject a client-supplied agent id that already names a persisted
+    /// session (PROTOCOL §5.5): a duplicate is `-32602` naming the id, so a
+    /// retrying client sees a clear validation error instead of the opaque
+    /// `-32603` SQLite UNIQUE(1555) insert failure — and callers like
+    /// `workspace.create` can pre-validate BEFORE running provisioning side
+    /// effects.
+    pub(crate) async fn ensure_agent_id_available(&self, id: &AgentId) -> Result<()> {
+        match self.store.get_agent_session_status(id).await {
+            Ok(_) => Err(Error::InvalidParams(format!(
+                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
+            ))),
+            Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -1150,8 +1166,9 @@ impl Services {
     /// `requested_agent_id` is honored verbatim when it is a well-formed
     /// `agent-{uuid}`, so the FE can create + address the session under an id
     /// it already minted (fixes the UI create→sendMessage "not found: agent
-    /// session" race). Malformed values surface as `-32602`; when `None` a
-    /// fresh id is generated (existing behavior).
+    /// session" race). Malformed values surface as `-32602`, and so does a
+    /// duplicate id that already names a persisted session (naming the id);
+    /// when `None` a fresh id is generated (existing behavior).
     ///
     /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
     /// the persisted [`AgentSession`]; `metadata` is harvested for the
@@ -1213,6 +1230,7 @@ impl Services {
         let id = match requested_agent_id {
             Some(requested) => {
                 validate_client_agent_id(requested.as_str())?;
+                self.ensure_agent_id_available(&requested).await?;
                 requested
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),

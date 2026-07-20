@@ -3641,6 +3641,74 @@ mod change_event_parity {
         );
     }
 
+    /// A duplicate client-supplied `initialAgent.agentId` fails
+    /// `workspace.create` with `-32602` naming the id BEFORE any provisioning
+    /// side effect: no new workspace row is persisted and neither
+    /// `workspace:created` nor the seeded spec's `note:created` is published
+    /// (pre-fix, the create failed with an opaque `-32603` UNIQUE(1555) AFTER
+    /// the row/worktree/spec/event had all been persisted).
+    #[tokio::test]
+    async fn workspace_create_duplicate_initial_agent_id_fails_clean() {
+        use intent_core::{Error, WorkspaceCreate, WorkspaceCreateInitialAgent};
+        let h = harness().await;
+        // Persist a session at the requested id in the pre-seeded workspace.
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        h.services
+            .agent_create_op(
+                h.ws.clone(),
+                Some("Existing".into()),
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(AgentId::from(requested.as_str())),
+                Default::default(),
+            )
+            .await
+            .expect("seed agent");
+        let before = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list before")
+            .len();
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let err = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Poisoned retry".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        agent_id: Some(requested.clone()),
+                        prompt: Some("retry with stale id".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("duplicate initialAgent.agentId must fail the create");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&requested),
+                "error must name the duplicate id, got: {msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // No partial workspace: row count unchanged and no event published.
+        let after = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list after")
+            .len();
+        assert_eq!(after, before, "failed create must not persist a row");
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "failed create must not publish events");
+    }
+
     /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
     /// with the same key returns the ORIGINAL workspace without re-executing —
     /// so no second row, and neither the `workspace:created` nor the seeded

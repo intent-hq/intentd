@@ -6335,6 +6335,26 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Fail fast on a bad client-supplied `initialAgent.agentId`
+                    // BEFORE any provisioning side effect (clone, worktree, row
+                    // insert, spec seed, `workspace:created`): a malformed or
+                    // duplicate id is `-32602` naming the problem and leaves no
+                    // partial workspace behind. Pre-fix, the duplicate only
+                    // surfaced as an opaque `-32603` UNIQUE(1555) from the
+                    // agent insert AFTER the workspace had been persisted,
+                    // orphaning a workspace per retry.
+                    if let Some(requested) = input
+                        .initial_agent
+                        .as_ref()
+                        .and_then(|a| a.agent_id.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        agent_ops::validate_client_agent_id(requested)?;
+                        services
+                            .ensure_agent_id_available(&AgentId::from(requested))
+                            .await?;
+                    }
                     let workspaces_root =
                         workspaces_root.unwrap_or_else(default_workspaces_root);
                     // Workspace id derivation (TS `generateLocalSlug` parity):
