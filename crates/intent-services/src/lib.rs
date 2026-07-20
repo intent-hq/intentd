@@ -4170,7 +4170,9 @@ fn pr_linked_event(ws: &Workspace) -> NewEvent {
             "prUrl": ws.pr_url,
             "prStatus": ws.pr_status,
             "activePullRequest": ws.active_pull_request,
-            "pullRequests": ws.pull_requests,
+            // Always an array on the wire — never null — so clients can
+            // treat the list as required.
+            "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
         }),
     }
 }
@@ -4193,7 +4195,9 @@ fn pr_updated_event(ws: &Workspace) -> NewEvent {
             "prNumber": ws.pr_number,
             "prStatus": ws.pr_status,
             "activePullRequest": ws.active_pull_request,
-            "pullRequests": ws.pull_requests,
+            // Always an array on the wire — never null — so clients can
+            // treat the list as required.
+            "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
         }),
     }
 }
