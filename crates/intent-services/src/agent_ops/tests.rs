@@ -2647,7 +2647,14 @@ async fn send_message_delivers_when_agent_exists() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Recv").await;
     let r = svc
-        .agent_send_message_op(id.clone(), "do it".into(), Some("m1".into()), None, None)
+        .agent_send_message_op(
+            id.clone(),
+            "do it".into(),
+            Some("m1".into()),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("send");
     assert_eq!(r["queued"], false);
@@ -2660,12 +2667,86 @@ async fn send_message_delivers_when_agent_exists() {
     assert_eq!(conv["messages"][0]["role"], "user");
 }
 
+/// Sender attribution: the store-only `agent_send_message_op` (no runtime
+/// manager wired) must persist a caller-supplied `messageMetadata` on the
+/// transcript row instead of silently dropping it, so attribution is
+/// consistent across deployments with and without an attached manager.
+#[tokio::test]
+async fn send_message_op_persists_message_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "MetaRecv").await;
+    let metadata = json!({
+        "type": "agent_message",
+        "fromAgentId": "agent-11111111-1111-1111-1111-111111111111",
+        "fromAgentName": "Coordinator"
+    });
+    let r = svc
+        .agent_send_message_op(
+            id.clone(),
+            "tagged".into(),
+            None,
+            None,
+            None,
+            Some(metadata.clone()),
+        )
+        .await
+        .expect("send");
+    assert_eq!(r["queued"], false);
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].metadata.as_ref(),
+        Some(&metadata),
+        "store-only send must persist messageMetadata verbatim"
+    );
+}
+
+/// Sender attribution: `agent_send_to_task_op` on the store-only fallback
+/// path (no runtime manager) must plumb `message_metadata` through to the
+/// persisted row rather than dropping it.
+#[tokio::test]
+async fn send_to_task_store_only_fallback_persists_message_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let agent_id = create_agent(&svc, &ws, "TaskMetaRecv").await;
+    let note_id = seed_task(&svc, &ws, "metadata fallback task").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), agent_id.0.clone())
+        .await
+        .expect("assign");
+    let metadata = json!({
+        "type": "agent_message",
+        "fromAgentId": "agent-22222222-2222-2222-2222-222222222222",
+        "fromAgentName": "Sender"
+    });
+    let r = svc
+        .agent_send_to_task_op(
+            ws.clone(),
+            note_id,
+            "tagged follow-up".into(),
+            None,
+            Some(metadata.clone()),
+        )
+        .await
+        .expect("send_to_task");
+    assert_eq!(r["ok"], true);
+    let session = svc
+        .store()
+        .get_agent_session(&agent_id)
+        .await
+        .expect("session");
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(
+        session.messages[0].metadata.as_ref(),
+        Some(&metadata),
+        "store-only sendToTask fallback must persist messageMetadata verbatim"
+    );
+}
+
 #[tokio::test]
 async fn send_message_auto_queues_for_unknown_agent() {
     let (_t, svc, _ws) = setup().await;
     let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
     let r = svc
-        .agent_send_message_op(id, "hi".into(), None, None, None)
+        .agent_send_message_op(id, "hi".into(), None, None, None, None)
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
@@ -2692,6 +2773,7 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
             None,
             Some(image_blocks.clone()),
             Some(file_blocks.clone()),
+            None,
         )
         .await
         .expect("send");
@@ -2725,6 +2807,7 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
             None,
             Some(image_blocks),
             Some(file_blocks),
+            None,
         )
         .await
         .expect("send");
@@ -6329,7 +6412,7 @@ async fn deliv1_send_to_task_non_interrupt_drives_turn_via_runtime() {
 
     let mut sub = subscribe_status(&bus);
     let resp = svc
-        .agent_send_to_task_op(ws.clone(), note_id, "follow up".into(), None)
+        .agent_send_to_task_op(ws.clone(), note_id, "follow up".into(), None, None)
         .await
         .expect("send_to_task");
     assert_eq!(resp["ok"], true);
@@ -6863,7 +6946,7 @@ async fn agent_send_message_emits_agent_message_event() {
     });
 
     let r = svc
-        .agent_send_message_op(id.clone(), "hello".into(), None, None, None)
+        .agent_send_message_op(id.clone(), "hello".into(), None, None, None, None)
         .await
         .expect("send");
     assert_eq!(r["success"], json!(true));

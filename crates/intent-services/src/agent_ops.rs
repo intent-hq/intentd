@@ -2117,6 +2117,7 @@ impl Services {
         message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if let Some(ref id) = message_id {
@@ -2139,14 +2140,20 @@ impl Services {
                         &id,
                         "user",
                         &blocks,
-                        None,
+                        message_metadata.as_ref(),
                         &created_at,
                     )
                     .await
             }
             None => {
                 self.store
-                    .append_agent_message(&agent_id, "user", &blocks, &created_at)
+                    .append_agent_message_with_metadata(
+                        &agent_id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &created_at,
+                    )
                     .await
             }
         };
@@ -2925,7 +2932,7 @@ impl Services {
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, None)
                         .await
                 }
             };
@@ -3573,6 +3580,7 @@ impl Services {
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         let task = self.get_my_task(workspace_id.clone(), task_note_id).await?;
         let Some(agent) = task.assigned_agents.first().cloned() else {
@@ -3587,35 +3595,38 @@ impl Services {
         // `agent_send_message` (WorkspaceApi) routing: the manager path
         // spawns the turn worker; only the read-only wiring with no
         // manager falls back to the store-only op.
+        let options = crate::agent_manager::TurnOptions {
+            message_metadata,
+            ..crate::agent_manager::TurnOptions::default()
+        };
         let result = match (
             self.agent_manager(),
             is_interrupt_priority(priority.as_deref()),
         ) {
             (Some(manager), true) => {
                 manager
-                    .interrupt_send_message(
-                        agent.clone(),
-                        workspace_id,
-                        message,
-                        None,
-                        crate::agent_manager::TurnOptions::default(),
-                    )
+                    .interrupt_send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
             (Some(manager), false) => {
                 manager
-                    .send_message(
-                        agent.clone(),
-                        workspace_id,
-                        message,
-                        None,
-                        crate::agent_manager::TurnOptions::default(),
-                    )
+                    .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
             (None, _) => {
-                self.agent_send_message_op(agent.clone(), message, None, None, None)
-                    .await?
+                // Read-only fallback (no `agent_manager` wired): mirrors
+                // `agent_send_message` — plumb the metadata through the
+                // store-only append so attribution is consistent across
+                // deployments with and without a runtime manager.
+                self.agent_send_message_op(
+                    agent.clone(),
+                    message,
+                    None,
+                    None,
+                    None,
+                    options.message_metadata,
+                )
+                .await?
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))

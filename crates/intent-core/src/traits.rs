@@ -1233,15 +1233,24 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.sendToTask`: follow up with the agent assigned to a task note
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). `message_metadata` is the same opaque per-message
+    /// payload as `agent.sendMessage` (persisted on the user row; e.g. the
+    /// `agent_message` sender-attribution block for agent-to-agent sends).
     fn agent_send_to_task(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, task_note_id, message, priority);
+        let _ = (
+            workspace_id,
+            task_note_id,
+            message,
+            priority,
+            message_metadata,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_to_task not implemented".to_string(),
