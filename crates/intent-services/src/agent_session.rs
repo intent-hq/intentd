@@ -468,7 +468,14 @@ impl Services {
             .await
         {
             Ok(_) => self.clear_live_turn(agent_id),
-            Err(e) if e.to_string().contains("UNIQUE constraint failed") => {
+            // Only the `agent_message.id` violation means "the worker already
+            // persisted the full turn under this minted id" — a `(agent_id,
+            // seq)` collision is a different race and falls through to warn
+            // (keeping the live-turn slot as the only copy of the content).
+            Err(e)
+                if e.to_string()
+                    .contains("UNIQUE constraint failed: agent_message.id") =>
+            {
                 // The durable full row exists — drop the now-stale overlay too.
                 self.clear_live_turn(agent_id);
                 tracing::debug!(
