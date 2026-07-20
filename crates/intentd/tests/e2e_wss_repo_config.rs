@@ -409,6 +409,108 @@ async fn repo_config_wss_e2e() {
         "instructions should be preserved"
     );
 
+    // Regression: a partial save must merge with the on-disk config, not
+    // replace it — saving only branchPrefix must not erase setupScript.
+    let partial_save_resp = wss_rpc(
+        &mut ws,
+        20,
+        "repoConfig.save",
+        json!({"workspaceId": workspace_id, "config": {"branchPrefix": "x/"}}),
+    )
+    .await;
+    assert_eq!(
+        partial_save_resp["result"]["config"]["branchPrefix"],
+        json!("x/"),
+        "partial save should apply the sent field"
+    );
+    assert_eq!(
+        partial_save_resp["result"]["config"]["setupScript"],
+        json!("npm install"),
+        "partial save must not clobber fields absent from the payload"
+    );
+    let get_after_partial = wss_rpc(
+        &mut ws,
+        21,
+        "repoConfig.get",
+        json!({"workspaceId": workspace_id}),
+    )
+    .await;
+    assert_eq!(
+        get_after_partial["result"]["config"]["branchPrefix"],
+        json!("x/"),
+        "partial save should persist the sent field"
+    );
+    assert_eq!(
+        get_after_partial["result"]["config"]["setupScript"],
+        json!("npm install"),
+        "setupScript must survive a partial save on disk"
+    );
+    assert_eq!(
+        get_after_partial["result"]["config"]["instructions"],
+        json!("Always use TypeScript"),
+        "instructions must survive a partial save on disk"
+    );
+
+    // Unknown keys sent by other tools still round-trip through save.
+    let unknown_key_save = wss_rpc(
+        &mut ws,
+        22,
+        "repoConfig.save",
+        json!({"workspaceId": workspace_id, "config": {"customKey": "customValue"}}),
+    )
+    .await;
+    assert_eq!(
+        unknown_key_save["result"]["config"]["customKey"],
+        json!("customValue"),
+        "unknown keys should be accepted and echoed back"
+    );
+    let get_after_unknown = wss_rpc(
+        &mut ws,
+        23,
+        "repoConfig.get",
+        json!({"workspaceId": workspace_id}),
+    )
+    .await;
+    assert_eq!(
+        get_after_unknown["result"]["config"]["customKey"],
+        json!("customValue"),
+        "unknown keys should round-trip on disk"
+    );
+    assert_eq!(
+        get_after_unknown["result"]["config"]["setupScript"],
+        json!("npm install"),
+        "known fields must survive an unknown-key save"
+    );
+
+    // Explicit null clears a field.
+    let null_save_resp = wss_rpc(
+        &mut ws,
+        24,
+        "repoConfig.save",
+        json!({"workspaceId": workspace_id, "config": {"setupScript": null}}),
+    )
+    .await;
+    assert!(
+        null_save_resp["result"]["config"]["setupScript"].is_null(),
+        "explicit null should clear setupScript in the response"
+    );
+    let get_after_null = wss_rpc(
+        &mut ws,
+        25,
+        "repoConfig.get",
+        json!({"workspaceId": workspace_id}),
+    )
+    .await;
+    assert!(
+        get_after_null["result"]["config"]["setupScript"].is_null(),
+        "explicit null should clear setupScript on disk"
+    );
+    assert_eq!(
+        get_after_null["result"]["config"]["branchPrefix"],
+        json!("x/"),
+        "other fields must survive a null-clearing save"
+    );
+
     // Test unknown workspace error (-32602)
     let unknown_resp = wss_rpc(
         &mut ws,

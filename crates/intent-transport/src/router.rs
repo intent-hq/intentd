@@ -252,12 +252,18 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let config_value = params
                 .get("config")
-                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: config"))?
-                .clone();
-            let config: intent_core::RepoConfig = serde_json::from_value(config_value)
+                .ok_or_else(|| rpc(INVALID_PARAMS, "Missing required parameter: config"))?;
+            // Keep the raw JSON object so the service can distinguish absent
+            // keys (preserve) from explicit `null` (clear) when merging.
+            let patch = config_value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| rpc(INVALID_PARAMS, "invalid config: expected a JSON object"))?;
+            // Validate field types up front so malformed payloads fail with -32602.
+            serde_json::from_value::<intent_core::RepoConfig>(Value::Object(patch.clone()))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid config: {e}")))?;
             let saved_config = api
-                .save_repo_config(id, config)
+                .save_repo_config(id, patch)
                 .await
                 .map_err(workspace_err)?;
             Ok(json!({ "config": saved_config }))

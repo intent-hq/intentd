@@ -1543,14 +1543,15 @@ impl WorkspaceApi for FakeApi {
     fn save_repo_config(
         &self,
         id: WorkspaceId,
-        config: RepoConfig,
+        config: serde_json::Map<String, serde_json::Value>,
     ) -> BoxFuture<'_, Result<RepoConfig>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
                 return Err(Error::NotFound("workspace".to_string()));
             }
-            // Echo back the config
-            Ok(config)
+            // Echo back the patch as a config (merge semantics live in
+            // intent-services and are covered by its unit tests + WSS e2e).
+            Ok(serde_json::from_value(serde_json::Value::Object(config)).unwrap_or_default())
         })
     }
 
@@ -4535,6 +4536,44 @@ async fn repo_config_save_invalid_config() {
         .as_str()
         .unwrap()
         .contains("invalid config"));
+}
+
+#[tokio::test]
+async fn repo_config_save_invalid_field_type() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"ws-1","config":{"branchPrefix":42}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("invalid config"));
+}
+
+#[tokio::test]
+async fn repo_config_save_null_field_accepted() {
+    // Explicit `null` is the "clear this field" signal — it must pass router
+    // validation and reach the API as part of the raw patch.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"ws-1","config":{"branchPrefix":"x/","setupScript":null}}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "null field should be accepted");
+    assert_eq!(v["result"]["config"]["branchPrefix"], "x/");
+}
+
+#[tokio::test]
+async fn repo_config_save_unknown_keys_forwarded() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.save","params":{"workspaceId":"ws-1","config":{"customKey":"customValue"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "unknown keys should be accepted");
+    assert_eq!(v["result"]["config"]["customKey"], "customValue");
 }
 
 #[tokio::test]
