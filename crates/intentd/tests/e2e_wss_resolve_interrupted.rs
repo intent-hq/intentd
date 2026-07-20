@@ -467,12 +467,11 @@ async fn resolve_interrupted_resume_and_abandon() {
     let resumed_blocks = last_user_msg.content.as_array().expect("content blocks");
     assert_eq!(resumed_blocks[0]["type"], "text");
     let continuation_text = resumed_blocks[0]["text"].as_str().expect("text block");
-    assert!(
-        continuation_text.contains(
-            "You were interrupted because the harness shut down. You now have a chance to \
-             continue the work — review your last steps and pick up where you left off."
-        ),
-        "continuation should carry the approved wording, got: {continuation_text}"
+    assert_eq!(
+        continuation_text,
+        "You were interrupted because the harness shut down. You now have a chance to \
+         continue the work — review your last steps and pick up where you left off.",
+        "continuation should carry exactly the approved wording"
     );
     assert!(
         !continuation_text.contains("intentd"),
