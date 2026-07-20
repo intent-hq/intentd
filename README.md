@@ -5,8 +5,7 @@ workspaces, notes, tasks, comments, agents, git, pull requests, scripts, termina
 and events — and exposes it over a **JSON-RPC 2.0** API. Clients (a desktop UI, a CLI, or an
 agent acting as an MCP client) are thin: all business logic lives in the daemon.
 
-> ⚠️ Private Repository — This repo is internal to the Cloudlands engineering team. It is
-> consumed as a git submodule by [intent-hq/monorepo](https://github.com/intent-hq/monorepo).
+Consumed as a git submodule by [intent-hq/monorepo](https://github.com/intent-hq/monorepo).
 
 ## What it is
 
