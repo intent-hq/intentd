@@ -5620,6 +5620,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let mut saw_dequeued_user_message = false;
     let mut dequeued_message_id: Option<String> = None;
     let mut stream_end_count = 0;
+    let drain_wait_started = std::time::Instant::now();
     for _ in 0..100 {
         let Some(frame) = wss_event_opt(&mut sub, 30).await else {
             break;
@@ -5634,6 +5635,10 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
                     // The dequeued message (second) will emit after the first turn completes.
                     dequeued_message_id = evt["data"]["messageId"].as_str().map(String::from);
                     saw_dequeued_user_message = true;
+                    // Both turns may have already ended; don't wait for another frame.
+                    if stream_end_count >= 2 {
+                        break;
+                    }
                 }
             }
             Some("agent:stream:end") => {
@@ -5649,7 +5654,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     assert!(
         saw_dequeued_user_message,
         "agent:message event emitted for dequeued user message (persist_user path); \
-         stream_end_count={stream_end_count}"
+         stream_end_count={stream_end_count}, elapsed={:?}",
+        drain_wait_started.elapsed()
     );
 
     // Verify the messageId matches the second (queued) user message in the transcript.
@@ -5705,6 +5711,7 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let mut saw_wake_message_event = false;
     let mut wake_message_id: Option<String> = None;
     let mut wake_stream_end_count = 0;
+    let wake_wait_started = std::time::Instant::now();
     for _ in 0..100 {
         let Some(frame) = wss_event_opt(&mut sub, 30).await else {
             break;
@@ -5717,6 +5724,10 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
                 {
                     wake_message_id = evt["data"]["messageId"].as_str().map(String::from);
                     saw_wake_message_event = true;
+                    // The wake turn may have already ended; don't wait for another frame.
+                    if wake_stream_end_count >= 1 {
+                        break;
+                    }
                 }
             }
             Some("agent:stream:end") => {
@@ -5731,7 +5742,8 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     assert!(
         saw_wake_message_event,
         "agent:message event emitted for wake delivery (deliver_wake_message path); \
-         wake_stream_end_count={wake_stream_end_count}"
+         wake_stream_end_count={wake_stream_end_count}, elapsed={:?}",
+        wake_wait_started.elapsed()
     );
 
     // Verify the wake messageId matches the first (and only) user message in the task agent's transcript.
