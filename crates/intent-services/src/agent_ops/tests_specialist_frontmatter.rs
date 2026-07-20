@@ -248,18 +248,34 @@ async fn malicious_specialist_id_rejected_in_agent_type_resolution() {
     .expect("write specialist");
 
     // First verify that a valid specialist ID does resolve agentType
-    let valid_id = create_agent(&svc, &ws, "ValidAgent", None, Some("test-specialist".into()))
-        .await;
+    let valid_id = create_agent(
+        &svc,
+        &ws,
+        "ValidAgent",
+        None,
+        Some("test-specialist".into()),
+    )
+    .await;
     let valid_agent = svc.agent_get_op(valid_id.clone(), None).await.expect("get");
     // AgentLite doesn't expose agent_type, but we can verify creation succeeded
-    assert!(valid_agent.id.0.starts_with("agent-"), "valid agent created");
+    assert!(
+        valid_agent.id.0.starts_with("agent-"),
+        "valid agent created"
+    );
 
     // Now attempt to create agent with path-traversal specialist id.
     // resolve_agent_type (via derive_agent_type) should call validate_id inside resolve()
     // and return None, so the agent should be created but with default agent_type.
     // If path traversal was allowed, it might read a file outside the specialists dir
     // or crash; the fact that it succeeds with no panic proves the guard works.
-    let malicious_id = create_agent(&svc, &ws, "MaliciousAgent", None, Some("../evil".into())).await;
-    let malicious_agent = svc.agent_get_op(malicious_id.clone(), None).await.expect("get");
-    assert!(malicious_agent.id.0.starts_with("agent-"), "malicious agent created with default type");
+    let malicious_id =
+        create_agent(&svc, &ws, "MaliciousAgent", None, Some("../evil".into())).await;
+    let malicious_agent = svc
+        .agent_get_op(malicious_id.clone(), None)
+        .await
+        .expect("get");
+    assert!(
+        malicious_agent.id.0.starts_with("agent-"),
+        "malicious agent created with default type"
+    );
 }

@@ -262,8 +262,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
         ws.0
     };
 
-    // Create a project-tier specialist with a model frontmatter field.
-    // (Located at repository_path/.augment/specialists/, which is the project tier.)
+    // Create a user-tier specialist with a model frontmatter field.
+    // (Hermetic: set HOME=data_dir below so the daemon reads $HOME/.augment/specialists/.)
     let specialists_dir = data_dir.join(".augment").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =
@@ -274,7 +274,11 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     )
     .expect("write specialist file");
 
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+    ];
     let daemon = Daemon {
         child: spawn_serve(&data_dir, "both", &env),
         data_dir: data_dir.clone(),

@@ -1168,13 +1168,7 @@ impl Services {
                         .get_workspace(&workspace_id)
                         .await
                         .ok()
-                        .and_then(|w| {
-                            w.worktree_path
-                                .as_ref()
-                                .or(w.repository_path.as_ref())
-                                .filter(|s| !s.is_empty())
-                                .map(std::path::PathBuf::from)
-                        });
+                        .and_then(|w| crate::git_ops::worktree_path(&w));
                     specialists_svc.resolve_model(spec_id, wp.as_deref())
                 } else {
                     None
