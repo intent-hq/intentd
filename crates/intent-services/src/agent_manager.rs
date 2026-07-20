@@ -104,8 +104,9 @@ pub struct TurnOptions {
     /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
     /// message row (via [`Store::append_agent_message_with_metadata`]). When a
     /// send is enqueued behind a running turn the metadata rides along on the
-    /// `QueuedMessage` entry, so the drain-time persist keeps it; drained
-    /// turns still run with [`TurnOptions::default`] otherwise.
+    /// `QueuedMessage` entry; drained turns rebuild their `TurnOptions` with
+    /// the entry's captured metadata so both the drain-time persist and a
+    /// later terminal-failure requeue keep the tag.
     pub message_metadata: Option<serde_json::Value>,
 }
 
@@ -2226,11 +2227,13 @@ impl AgentManager {
             .await;
         }
         // Queue-drained turns carry no per-turn prompt hints of their own,
-        // but the FE-supplied attachments captured at enqueue time do ride
-        // along so the drained turn receives the same image + file blocks.
+        // but the FE-supplied attachments and `messageMetadata` captured at
+        // enqueue time do ride along so the drained turn receives the same
+        // image + file blocks and a terminal-failure requeue keeps the tag.
         let options = TurnOptions {
             image_blocks: next.image_blocks.clone(),
             file_blocks: next.file_blocks.clone(),
+            message_metadata: next.message_metadata.clone(),
             ..TurnOptions::default()
         };
         self.spawn_worker(agent_id, workspace_id, next.content, options);
@@ -3327,6 +3330,7 @@ async fn run_message_worker(
             options = TurnOptions {
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
+                message_metadata: next.message_metadata.clone(),
                 ..TurnOptions::default()
             };
             continue;
@@ -3364,6 +3368,7 @@ async fn run_message_worker(
             options = TurnOptions {
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
+                message_metadata: next.message_metadata.clone(),
                 ..TurnOptions::default()
             };
             continue 'outer;
@@ -3389,8 +3394,12 @@ async fn run_message_worker(
 /// and publish the `agent:message` event so chat subscribers and the transcript
 /// reflect the dequeued message (STAB-4 fix). `message_metadata` is the queue
 /// entry's captured `messageMetadata` (e.g. a parent wake's `event_notification`
-/// payload), persisted on the row exactly as a direct delivery would have.
-/// Best-effort; a store or publish error is logged and the turn still proceeds.
+/// payload). It is written in BOTH placements the two direct-delivery shapes
+/// use — folded onto the text block as `messageMetadata` (parity with
+/// `deliver_wake_message`'s in-block tag) AND on the row-level `metadata`
+/// column (parity with the direct `agent.sendMessage` persist) — so transcript
+/// consumers find the tag regardless of which field they read. Best-effort; a
+/// store or publish error is logged and the turn still proceeds.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -3399,13 +3408,17 @@ async fn persist_user(
     message_metadata: Option<&Value>,
 ) {
     let created_at = now_iso();
+    let blocks = match message_metadata {
+        Some(md) => json!([{ "type": "text", "text": content, "messageMetadata": md }]),
+        None => user_text_blocks(content),
+    };
     match mgr
         .services
         .store
         .append_agent_message_with_metadata(
             agent_id,
             "user",
-            &user_text_blocks(content),
+            &blocks,
             message_metadata,
             &created_at,
         )

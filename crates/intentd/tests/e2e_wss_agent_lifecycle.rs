@@ -3853,6 +3853,13 @@ async fn queued_message_metadata_survives_drain_over_wss() {
         tagged["metadata"], metadata,
         "drained user row must persist messageMetadata: {tagged}"
     );
+    // Both direct-delivery placements are covered: the row-level `metadata`
+    // column (direct `agent.sendMessage` parity) and the in-block fold
+    // (`deliver_wake_message` parity).
+    assert_eq!(
+        tagged["contentBlocks"][0]["messageMetadata"], metadata,
+        "drained user block must fold messageMetadata: {tagged}"
+    );
 }
 
 #[tokio::test]
