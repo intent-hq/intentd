@@ -102,9 +102,11 @@ pub struct TurnOptions {
     pub file_blocks: Option<serde_json::Value>,
     /// Opaque per-message payload from `agent.sendMessage` / `agent.forceMessage`
     /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
-    /// message row (via [`Store::append_agent_message_with_metadata`]) for the
-    /// FIRST turn only; queue-drained follow-up turns run with
-    /// [`TurnOptions::default`] and therefore carry no metadata of their own.
+    /// message row (via [`Store::append_agent_message_with_metadata`]). When a
+    /// send is enqueued behind a running turn the metadata rides along on the
+    /// `QueuedMessage` entry; drained turns rebuild their `TurnOptions` with
+    /// the entry's captured metadata so both the drain-time persist and a
+    /// later terminal-failure requeue keep the tag.
     pub message_metadata: Option<serde_json::Value>,
 }
 
@@ -2091,6 +2093,7 @@ impl AgentManager {
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
+                options.message_metadata.clone(),
             );
             let result = json!({
                 "success": true,
@@ -2131,6 +2134,7 @@ impl AgentManager {
                 content,
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
+                options.message_metadata.clone(),
             );
             let result = json!({
                 "success": true,
@@ -2226,15 +2230,18 @@ impl AgentManager {
                 &next.content,
                 next.image_blocks.as_ref(),
                 next.file_blocks.as_ref(),
+                next.message_metadata.as_ref(),
             )
             .await;
         }
         // Queue-drained turns carry no per-turn prompt hints of their own,
-        // but the FE-supplied attachments captured at enqueue time do ride
-        // along so the drained turn receives the same image + file blocks.
+        // but the FE-supplied attachments and `messageMetadata` captured at
+        // enqueue time do ride along so the drained turn receives the same
+        // image + file blocks and a terminal-failure requeue keeps the tag.
         let options = TurnOptions {
             image_blocks: next.image_blocks.clone(),
             file_blocks: next.file_blocks.clone(),
+            message_metadata: next.message_metadata.clone(),
             ..TurnOptions::default()
         };
         self.spawn_worker(agent_id, workspace_id, next.content, options);
@@ -2447,6 +2454,7 @@ impl AgentManager {
                                     editing: false,
                                     persisted: true,
                                     requeued_after_failure: false,
+                                    message_metadata: last_user_msg.metadata.clone(),
                                 };
                                 self.services.requeue_front(&agent_id, queued);
 
@@ -3324,6 +3332,7 @@ async fn run_message_worker(
                     &next.content,
                     next_image_blocks.as_ref(),
                     next_file_blocks.as_ref(),
+                    next.message_metadata.as_ref(),
                 )
                 .await;
             }
@@ -3331,6 +3340,7 @@ async fn run_message_worker(
             options = TurnOptions {
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
+                message_metadata: next.message_metadata.clone(),
                 ..TurnOptions::default()
             };
             continue;
@@ -3362,6 +3372,7 @@ async fn run_message_worker(
                     &next.content,
                     next_image_blocks.as_ref(),
                     next_file_blocks.as_ref(),
+                    next.message_metadata.as_ref(),
                 )
                 .await;
             }
@@ -3369,6 +3380,7 @@ async fn run_message_worker(
             options = TurnOptions {
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
+                message_metadata: next.message_metadata.clone(),
                 ..TurnOptions::default()
             };
             continue 'outer;
@@ -3394,7 +3406,14 @@ async fn run_message_worker(
 /// and publish the `agent:message` event so chat subscribers and the transcript
 /// reflect the dequeued message (STAB-4 fix). FE-supplied attachments captured at
 /// enqueue time ride along so the persisted row carries them (STAB-133).
-/// Best-effort; a store or publish error is logged and the turn still proceeds.
+/// `message_metadata` is the queue entry's captured `messageMetadata` (e.g. a
+/// parent wake's `event_notification` payload). It is written in BOTH placements
+/// the two direct-delivery shapes use — folded onto the text block as
+/// `messageMetadata` (parity with `deliver_wake_message`'s in-block tag) AND on
+/// the row-level `metadata` column (parity with the direct `agent.sendMessage`
+/// persist) — so transcript consumers find the tag regardless of which field
+/// they read. Best-effort; a store or publish error is logged and the turn
+/// still proceeds.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -3402,13 +3421,25 @@ async fn persist_user(
     content: &str,
     image_blocks: Option<&Value>,
     file_blocks: Option<&Value>,
+    message_metadata: Option<&Value>,
 ) {
     let created_at = now_iso();
-    let blocks = user_message_blocks(content, image_blocks, file_blocks);
+    let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
+    if let Some(md) = message_metadata {
+        if let Some(text_block) = blocks.get_mut(0).and_then(Value::as_object_mut) {
+            text_block.insert("messageMetadata".into(), md.clone());
+        }
+    }
     match mgr
         .services
         .store
-        .append_agent_message(agent_id, "user", &blocks, &created_at)
+        .append_agent_message_with_metadata(
+            agent_id,
+            "user",
+            &blocks,
+            message_metadata,
+            &created_at,
+        )
         .await
     {
         Ok(message) => {
@@ -3674,6 +3705,7 @@ async fn persist_error_and_requeue(
         editing: false,
         persisted: true,
         requeued_after_failure: true,
+        message_metadata: options.message_metadata.clone(),
     };
     mgr.services.requeue_front(agent_id, queued);
 
@@ -4591,7 +4623,7 @@ mod agent_retry_tests {
 
         // A requeued message is waiting (the persist_error_and_requeue path).
         mgr.services
-            .enqueue_message(&agent_id, "requeued".to_string(), None, None);
+            .enqueue_message(&agent_id, "requeued".to_string(), None, None, None);
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -4628,7 +4660,7 @@ mod agent_retry_tests {
                     tokio::task::yield_now().await;
                 }
                 mgr.services
-                    .enqueue_message(&agent_id, "raced".to_string(), None, None);
+                    .enqueue_message(&agent_id, "raced".to_string(), None, None, None);
                 mgr.clone()
                     .try_drain_queue(agent_id.clone(), ws.clone())
                     .await;

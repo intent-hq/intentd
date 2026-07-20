@@ -2557,7 +2557,7 @@ async fn try_drain_queue_no_op_when_already_busy() {
     let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
     // Queue a ready message so the only barrier is the busy flag.
     mgr.services
-        .enqueue_message(&id, "queued".to_string(), None, None);
+        .enqueue_message(&id, "queued".to_string(), None, None, None);
     assert!(mgr.try_begin(&id, &ws).await);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -2600,7 +2600,7 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
         .expect("park session in error");
     // A ready-to-send message is waiting (the terminal-failure requeue).
     mgr.services
-        .enqueue_message(&id, "requeued".to_string(), None, None);
+        .enqueue_message(&id, "requeued".to_string(), None, None, None);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
 
@@ -2779,7 +2779,7 @@ async fn queue_dequeue_round_trip_preserves_image_and_file_blocks() {
         {"data": "F", "mimeType": "text/plain", "fileName": "r.txt"}
     ]));
     mgr.services
-        .enqueue_message(&id, "msg".to_string(), images.clone(), files.clone());
+        .enqueue_message(&id, "msg".to_string(), images.clone(), files.clone(), None);
     let drained = mgr
         .services
         .dequeue_message(&id)
@@ -3011,7 +3011,7 @@ async fn persist_user_appends_attachment_blocks_to_transcript_row() {
 
     let images = json!([{ "type": "image", "data": "imgdata", "mimeType": "image/png" }]);
     let files = json!([{ "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "f.txt" }]);
-    super::persist_user(&mgr, &id, &ws, "drained", Some(&images), Some(&files)).await;
+    super::persist_user(&mgr, &id, &ws, "drained", Some(&images), Some(&files), None).await;
 
     let messages = mgr
         .services
