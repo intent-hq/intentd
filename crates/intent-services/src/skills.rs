@@ -1,12 +1,14 @@
 //! Skills discovery module - ports skills-loader.ts faithfully.
 //!
 //! Scans user and project directories for SKILL.md files following the
-//! precedence order:
+//! precedence order (higher p wins name collisions):
 //! 1. `~/.agents/skills` (p1)
 //! 2. `~/.claude/skills` (p2)
-//! 3. `~/.augment/skills` (p3)
-//! 4. `<workspace>/.agents/skills` (p4)
-//! 5. `<workspace>/.augment/skills` (p5)
+//! 3. `~/.augment/skills` (p3, auggie convention for back-compat)
+//! 4. `~/.intent/skills` (p4, app-owned)
+//! 5. `<workspace>/.agents/skills` (p5)
+//! 6. `<workspace>/.augment/skills` (p6, auggie convention for back-compat)
+//! 7. `<workspace>/.intent/skills` (p7, app-owned)
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -177,18 +179,28 @@ fn get_scan_targets(
             precedence: 3,
             scope: "user".to_string(),
         });
+        targets.push(ScanTarget {
+            root: home.join(".intent").join("skills"),
+            precedence: 4,
+            scope: "user".to_string(),
+        });
     }
 
     if let Some(ws) = workspace_path {
         let ws_path = PathBuf::from(ws);
         targets.push(ScanTarget {
             root: ws_path.join(".agents").join("skills"),
-            precedence: 4,
+            precedence: 5,
             scope: "project".to_string(),
         });
         targets.push(ScanTarget {
             root: ws_path.join(".augment").join("skills"),
-            precedence: 5,
+            precedence: 6,
+            scope: "project".to_string(),
+        });
+        targets.push(ScanTarget {
+            root: ws_path.join(".intent").join("skills"),
+            precedence: 7,
             scope: "project".to_string(),
         });
     }
@@ -831,7 +843,7 @@ mod tests {
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
 
-        let skills_root = workspace_path.join(".augment").join("skills");
+        let skills_root = workspace_path.join(".intent").join("skills");
         let _skill_path = write_skill(
             &skills_root,
             "catalog-skill",
@@ -863,7 +875,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
 
         // User-level skill
-        let user_skills_root = home_dir.join(".augment").join("skills");
+        let user_skills_root = home_dir.join(".intent").join("skills");
         write_skill(
             &user_skills_root,
             "shared-skill",
@@ -893,6 +905,46 @@ mod tests {
         assert_eq!(
             PathBuf::from(&skills[0].location),
             std::fs::canonicalize(&project_skill_path).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precedence_intent_over_augment_on_collision() {
+        clear_cache();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().join("home");
+        let workspace_path = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_path).await.unwrap();
+
+        // Back-compat auggie-convention skill (lower precedence)
+        write_skill(
+            &workspace_path.join(".augment").join("skills"),
+            "shared-skill",
+            &build_skill_content(
+                "name: shared-skill\ndescription: Augment back-compat description",
+                "Use this skill when needed.",
+            ),
+        )
+        .await;
+
+        // App-owned skill (higher precedence) wins the name collision
+        let intent_skill_path = write_skill(
+            &workspace_path.join(".intent").join("skills"),
+            "shared-skill",
+            &build_skill_content(
+                "name: shared-skill\ndescription: Intent app-owned description",
+                "Use this skill when needed.",
+            ),
+        )
+        .await;
+
+        let skills = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "shared-skill");
+        assert_eq!(skills[0].description, "Intent app-owned description");
+        assert_eq!(
+            PathBuf::from(&skills[0].location),
+            std::fs::canonicalize(&intent_skill_path).unwrap()
         );
     }
 

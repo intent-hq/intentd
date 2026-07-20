@@ -25,7 +25,9 @@ impl Services {
     /// Composes an optional `system_prompt` with `prompt` in the same shape as
     /// `agent.enhancePrompt` (§5.31) and returns the cleaned CLI reply
     /// verbatim under `text`. The router pre-validates `prompt` is non-empty
-    /// and `timeout_ms` is positive.
+    /// and `timeout_ms` is positive. Gated on auggie being the active provider
+    /// per spec Decision 5 — when the active provider is not auggie, returns
+    /// a typed "unavailable" capability response (no error crash).
     pub(crate) async fn agent_complete_once_op(
         &self,
         prompt: String,
@@ -34,6 +36,24 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
+        // Provider neutrality gate: completion is an auggie-specific capability.
+        // When the active provider is not auggie, return a typed unavailable response
+        // so callers can degrade gracefully without an error crash.
+        let active_provider = match self.store.get_setting("providers.active").await? {
+            Some(json_str) => serde_json::from_str::<serde_json::Value>(&json_str)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "auggie".to_string()),
+            None => "auggie".to_string(), // Default to auggie when setting is unset
+        };
+        if active_provider != "auggie" {
+            return Ok(json!({
+                "available": false,
+                "reason": "completeOnce requires auggie as the active provider"
+            }));
+        }
+
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
         // a workspace without a filesystem root just runs without a cwd
         // (mirrors §5.31).

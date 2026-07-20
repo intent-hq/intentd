@@ -260,7 +260,9 @@ impl Services {
     /// `agent.enhancePrompt` (PROTOCOL §5.31): compose the mode-specific
     /// prompt, run the one-shot auggie CLI, clean the transcript, and parse
     /// the mode-specific result. `mode` is pre-validated by the router
-    /// (`"enhance"` or `"layout"`).
+    /// (`"enhance"` or `"layout"`). Gated on auggie being the active provider
+    /// per spec Decision 5 — when the active provider is not auggie, returns
+    /// a typed "unavailable" capability response (no error crash).
     pub(crate) async fn agent_enhance_prompt_op(
         &self,
         prompt: String,
@@ -269,6 +271,24 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         timeout_ms: Option<u64>,
     ) -> Result<Value> {
+        // Provider neutrality gate: enhance-prompt is an auggie-specific capability.
+        // When the active provider is not auggie, return a typed unavailable response
+        // so the FE can hide the affordance gracefully without an error crash.
+        let active_provider = match self.store.get_setting("providers.active").await? {
+            Some(json_str) => serde_json::from_str::<serde_json::Value>(&json_str)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "auggie".to_string()),
+            None => "auggie".to_string(), // Default to auggie when setting is unset
+        };
+        if active_provider != "auggie" {
+            return Ok(json!({
+                "available": false,
+                "reason": "enhance-prompt requires auggie as the active provider"
+            }));
+        }
+
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
         // a workspace without a filesystem root just runs without a cwd
         // (mirrors the FE dropping `cwd` when no workspace is bound).

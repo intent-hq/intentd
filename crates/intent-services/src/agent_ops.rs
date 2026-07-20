@@ -170,6 +170,12 @@ pub(crate) struct QueuedMessage {
     /// emits `requeuedAfterFailure: true` on the wire. Interrupt requeues
     /// (STAB-114) leave this `false` so the FE does not show "failed — will retry".
     pub requeued_after_failure: bool,
+    /// Per-message `messageMetadata` captured at enqueue time (e.g. the
+    /// `event_notification` payload of a parent wake that arrived while a turn
+    /// was in flight). `to_value` emits it as `messageMetadata` when present,
+    /// and drain paths persist it on the user message row so the transcript
+    /// carries the same metadata as a directly-delivered wake.
+    pub message_metadata: Option<Value>,
 }
 
 impl QueuedMessage {
@@ -180,7 +186,9 @@ impl QueuedMessage {
     /// by the caller since it is positional. `editing` is only present when `true`
     /// (a client that hasn't migrated still sees the legacy shape unchanged).
     /// `requeuedAfterFailure` is only present when `true` (STAB-112: backward-compatible
-    /// marker for terminal-failure requeues).
+    /// marker for terminal-failure requeues). `messageMetadata` is only present
+    /// when the entry was enqueued with metadata (e.g. a parent wake's
+    /// `event_notification` payload) — entries without it keep the legacy shape.
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -199,6 +207,9 @@ impl QueuedMessage {
         }
         if self.requeued_after_failure {
             v["requeuedAfterFailure"] = Value::Bool(true);
+        }
+        if let Some(md) = &self.message_metadata {
+            v["messageMetadata"] = md.clone();
         }
         v
     }
@@ -647,9 +658,44 @@ pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// A single user text content block (the persisted/queued message shape).
-fn user_content_blocks(content: &str) -> Value {
-    json!([{ "type": "text", "text": content }])
+/// The persisted content-block array for a user message: one `text` block
+/// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
+/// attachments must reach the transcript so the conversation view can render
+/// them). Image entries require `data` + `mimeType` and file entries require
+/// `data` + `mimeType` + `fileName` — the same attachment contract prompt
+/// assembly (`append_attachment_blocks`) enforces; malformed entries are
+/// silently skipped so a partial attachment array never breaks the persist.
+pub(crate) fn user_message_blocks(
+    content: &str,
+    image_blocks: Option<&Value>,
+    file_blocks: Option<&Value>,
+) -> Value {
+    let mut blocks = vec![json!({ "type": "text", "text": content })];
+    if let Some(imgs) = image_blocks.and_then(Value::as_array) {
+        for img in imgs {
+            let data = img.get("data").and_then(Value::as_str);
+            let mime = img.get("mimeType").and_then(Value::as_str);
+            if let (Some(data), Some(mime)) = (data, mime) {
+                blocks.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+            }
+        }
+    }
+    if let Some(files) = file_blocks.and_then(Value::as_array) {
+        for file in files {
+            let data = file.get("data").and_then(Value::as_str);
+            let mime = file.get("mimeType").and_then(Value::as_str);
+            let name = file.get("fileName").and_then(Value::as_str);
+            if let (Some(data), Some(mime), Some(name)) = (data, mime, name) {
+                blocks.push(json!({
+                    "type": "file",
+                    "data": data,
+                    "mimeType": mime,
+                    "fileName": name,
+                }));
+            }
+        }
+    }
+    Value::Array(blocks)
 }
 
 /// Build the persisted `agent_session.metadata` blob for the create branch of
@@ -1853,7 +1899,7 @@ impl Services {
         file_blocks: Option<Value>,
     ) -> Result<Value> {
         let (queued, position) =
-            self.enqueue_message(&agent_id, content, image_blocks, file_blocks);
+            self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
         let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
@@ -1988,7 +2034,9 @@ impl Services {
                 )));
             }
         }
-        let blocks = user_content_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block so
+        // the transcript row carries them (the conversation view renders them).
+        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
         let message = match message_id {
             Some(id) => {
@@ -2046,7 +2094,7 @@ impl Services {
                 // STAB-7: preserve image_blocks and file_blocks when auto-queueing
                 // on store failure, matching the runtime-manager path's behavior.
                 let (queued, position) =
-                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks);
+                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -2065,6 +2113,8 @@ impl Services {
         agent_id: AgentId,
         message_id: String,
         content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if message_id.len() > MAX_MESSAGE_ID_LEN {
@@ -2074,7 +2124,8 @@ impl Services {
             )));
         }
         let session = self.store.get_agent_session(&agent_id).await?;
-        let blocks = user_content_blocks(&content);
+        // STAB-133: persist FE-supplied attachments alongside the text block.
+        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
         let created_at = now_iso();
         let message = self
             .store
@@ -3848,9 +3899,9 @@ impl Services {
     /// the wake-tagged user block, spawn the turn worker) so the newly
     /// woken/created agent actually processes the message. A busy assignee
     /// gets the wake enqueued behind the running turn — its drain loop
-    /// picks the message up at turn end (the FE `messageMetadata` tag is
-    /// lost from the queued re-persist on this rare in-flight path, but
-    /// turn delivery is preserved). Read-only/test wiring with no manager
+    /// picks the message up at turn end, and the queue entry carries the
+    /// `messageMetadata` so the drained re-persist keeps the FE tag on the
+    /// user message row. Read-only/test wiring with no manager
     /// falls back to the pre-DELIV-1 store-only persist so hermetic tests
     /// keep working. Auto-queue-on-store-failure mirrors
     /// [`Services::agent_send_message_op`].
@@ -3867,7 +3918,13 @@ impl Services {
         };
         let Some(manager) = self.agent_manager() else {
             return self
-                .deliver_wake_message_store_only(workspace_id, agent_id, content, build_block)
+                .deliver_wake_message_store_only(
+                    workspace_id,
+                    agent_id,
+                    content,
+                    message_metadata,
+                    build_block,
+                )
                 .await;
         };
         // Runtime path (DELIV-1): two-step claim/persist/spawn so the
@@ -3883,8 +3940,16 @@ impl Services {
         //      path does not re-persist).
         let content_owned = content.to_string();
         if !manager.try_begin_turn(agent_id, workspace_id).await {
-            // Fast enqueue branch: the manager is already draining a turn.
-            let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+            // Fast enqueue branch: the manager is already draining a turn. The
+            // metadata rides along on the queue entry so the drain re-persist
+            // keeps the wake tag.
+            let (queued, position) = self.enqueue_message(
+                agent_id,
+                content_owned,
+                None,
+                None,
+                message_metadata.cloned(),
+            );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
                 "success": true,
@@ -3902,7 +3967,13 @@ impl Services {
             Ok(msg) => msg,
             Err(_) => {
                 manager.release_slot(agent_id).await;
-                let (queued, position) = self.enqueue_message(agent_id, content_owned, None, None);
+                let (queued, position) = self.enqueue_message(
+                    agent_id,
+                    content_owned,
+                    None,
+                    None,
+                    message_metadata.cloned(),
+                );
                 self.publish_queue_updated(agent_id).await;
                 manager
                     .clone()
@@ -3946,12 +4017,15 @@ impl Services {
 
     /// Pre-DELIV-1 store-only delivery for the read-only/test path (no
     /// [`AgentManager`] attached): persist the wake-tagged block, and on
-    /// store failure fall back to an in-memory enqueue with `queued: true`.
+    /// store failure fall back to an in-memory enqueue with `queued: true`
+    /// (the enqueue keeps `message_metadata` so the wake tag survives a
+    /// later drain).
     async fn deliver_wake_message_store_only<F>(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         content: &str,
+        message_metadata: Option<&Value>,
         build_block: F,
     ) -> Result<Value>
     where
@@ -3985,8 +4059,13 @@ impl Services {
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
             Err(_) => {
-                let (queued, position) =
-                    self.enqueue_message(agent_id, content.to_string(), None, None);
+                let (queued, position) = self.enqueue_message(
+                    agent_id,
+                    content.to_string(),
+                    None,
+                    None,
+                    message_metadata.cloned(),
+                );
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -4044,12 +4123,16 @@ impl Services {
     /// its 0-based `position` in the queue (the index just appended). New messages
     /// are always ready-to-send (`editing = false`) — the FE may transition an
     /// entry to `editing = true` later via `agent.editQueuedMessage`.
+    /// `message_metadata` carries an internal wake's `messageMetadata` (e.g.
+    /// `event_notification`) so the drain can persist it on the user message
+    /// row; user-typed enqueues pass `None`.
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
         content: String,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> (QueuedMessage, usize) {
         let queued = QueuedMessage {
             id: new_message_id(),
@@ -4060,6 +4143,7 @@ impl Services {
             editing: false,
             persisted: false,
             requeued_after_failure: false,
+            message_metadata,
         };
         let mut guard = self
             .agent_queues
