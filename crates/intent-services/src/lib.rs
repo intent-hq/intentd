@@ -16039,6 +16039,13 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
                 "hasNpxFallback".to_string(),
                 serde_json::json!(p.has_npx_fallback),
             );
+            obj.insert(
+                "npxOnly".to_string(),
+                serde_json::json!(p.npx_only_package.is_some()),
+            );
+            if let Some(pkg) = p.npx_only_package {
+                obj.insert("npxPackage".to_string(), serde_json::json!(pkg));
+            }
             serde_json::Value::Object(obj)
         })
         .collect();

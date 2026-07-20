@@ -2108,6 +2108,20 @@ async fn report_provider_availability() {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
+        // npx-only providers (claude-code) never resolve a local binary; report
+        // npx availability instead (the auth probe would need a package
+        // download, so it is skipped — auth is the external `claude` CLI).
+        if let Some(pkg) = provider.npx_only_package {
+            match &provider.resolved_path {
+                Some(npx) => println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display()),
+                None => println!(
+                    "  [--] {} unavailable (npx not found — {} is required)",
+                    provider.id,
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+                ),
+            }
+            continue;
+        }
         if !provider.installed {
             println!(
                 "  [--] {} not installed ({} not on PATH)",

@@ -2729,6 +2729,28 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
+            // Snapshot the live-turn slot BEFORE aborting the worker: the abort
+            // drops the worker future and with it the LiveTurnGuard, which
+            // clears the slot — reading after the abort would race that drop
+            // and frequently lose the partial content.
+            let partial_turn = self.services.live_turn(id);
+            // Abort the turn worker BEFORE flushing so it cannot race the
+            // partial flush by persisting the full turn under the same minted
+            // message id (which would leave the transcript stuck on the partial
+            // snapshot while the worker's own append errors on the UNIQUE id).
+            // stop() below removes the (already-gone) worker entry harmlessly.
+            if let Some(worker) = self.workers.lock().unwrap().remove(id) {
+                worker.abort();
+            }
+            // Best-effort: persist any partial in-flight assistant content from
+            // the snapshot so the transcript keeps the streamed-so-far output
+            // across the restart. Runs before the status guards below so a
+            // degenerate status read/encode failure never drops the content.
+            if let Some(live) = partial_turn {
+                self.services
+                    .flush_partial_turn_on_interruption(id, live)
+                    .await;
+            }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -3066,9 +3088,11 @@ fn derive_agent_type(
 /// id, else the default provider. The `mock` provider (E2E) reads its script
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
-/// `MOCK_AGENT_BEHAVIOR` to the child. Resolves the provider binary to an
-/// absolute path using the precedence: `providers.paths` map →
-/// `~/.augment/bin/<command>` (for auggie) → enhanced PATH scan.
+/// `MOCK_AGENT_BEHAVIOR` to the child. npx-only providers (claude-code) are
+/// always spawned via `npx -y <pinned package>` — no local-binary discovery.
+/// Other providers resolve their binary to an absolute path using the
+/// precedence: `providers.paths` map → `~/.augment/bin/<command>` (for auggie)
+/// → enhanced PATH scan.
 async fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
@@ -3151,6 +3175,32 @@ async fn resolve_spawn(
 
     let provider = *intent_providers::provider_config(&provider_id);
 
+    // npx-only providers (claude-code) are spawned exclusively via
+    // `npx -y <pinned package>`; local-binary discovery (settings path /
+    // managed bin / PATH scan) is skipped entirely.
+    if provider.npx_only_package.is_some() {
+        if read_provider_path_setting(store, &provider_id)
+            .await
+            .is_some()
+        {
+            tracing::warn!(
+                provider_id = provider_id,
+                "providers.paths override ignored: {} always spawns via pinned npx",
+                provider_id
+            );
+        }
+        let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
+        return Ok(ResolvedSpawn {
+            provider,
+            model,
+            cwd,
+            provider_binary: None,
+            extra_env,
+            npx_fallback_binary: Some(npx_binary),
+            npx_fallback_package: Some(npx_package),
+        });
+    }
+
     // Resolve provider binary using the precedence: setting → managed → PATH
     let explicit_path = read_provider_path_setting(store, &provider_id).await;
     let provider_binary = intent_providers::find_provider_binary(
@@ -3190,6 +3240,38 @@ async fn resolve_spawn(
         npx_fallback_binary,
         npx_fallback_package,
     })
+}
+
+/// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
+/// caller-supplied `find_npx()` result (parameterized as a test seam). Missing
+/// npx is a hard, user-facing error — there is no local-binary fallback.
+fn resolve_npx_only(
+    provider: &ProviderConfig,
+    npx_path: Option<PathBuf>,
+) -> Result<(PathBuf, &'static str)> {
+    let pkg = provider.npx_only_package.ok_or_else(|| {
+        Error::Internal(format!(
+            "provider {} is not configured for npx-only spawning",
+            provider.id
+        ))
+    })?;
+    let npx = npx_path.ok_or_else(|| {
+        // InvalidInput (not Internal): this is an environment misconfiguration,
+        // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
+        // Internal messages behind a literal "Internal error").
+        Error::InvalidInput(format!(
+            "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
+            provider.display_name
+        ))
+    })?;
+    tracing::info!(
+        provider_id = provider.id,
+        npx_path = ?npx,
+        package = pkg,
+        "spawning npx-only provider via pinned npx package"
+    );
+    Ok((npx, pkg))
 }
 
 /// Read the provider path from the `providers.paths` map setting, if set.
