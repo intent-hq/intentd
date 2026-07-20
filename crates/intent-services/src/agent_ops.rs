@@ -4315,13 +4315,16 @@ impl Services {
     ///
     /// The queue snapshot is taken **outside** the mutex it lives behind, but
     /// since this method only reads (under a brief lock that is dropped before
-    /// the await) it never holds the queue lock across an `await` point.
+    /// the await) it never holds the queue lock across an `await` point. The
+    /// snapshot is taken after the session lookup so the event payload and the
+    /// write-through snapshot in [`publish_queue_updated_for`] reflect queue
+    /// state from (nearly) the same moment.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
-        let queue = self.queue_snapshot(agent_id);
         let workspace_id = match self.store.get_agent_session(agent_id).await {
             Ok(s) => s.workspace_id,
             Err(_) => return,
         };
+        let queue = self.queue_snapshot(agent_id);
         self.publish_queue_updated_for(agent_id, &workspace_id, queue)
             .await;
     }
