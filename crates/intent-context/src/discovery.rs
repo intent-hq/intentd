@@ -28,8 +28,9 @@ fn home_dir() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().to_path_buf())
 }
 
-/// The Intent-managed binary path (`~/.augment/bin/auggie[.exe]`), highest
-/// priority in discovery.
+/// The auggie-managed binary path (`~/.augment/bin/auggie[.exe]`), highest
+/// priority in auggie discovery. This is auggie's own install location, not a
+/// generic Intent-managed binary tier.
 pub fn managed_binary_path() -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "auggie.exe"

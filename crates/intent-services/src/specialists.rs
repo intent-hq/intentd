@@ -1,7 +1,7 @@
 //! File-backed specialist definitions (§18.2, PROTOCOL §5.11): markdown-with-
 //! frontmatter files resolved in **3 tiers**, highest priority first — project
-//! (`<workspacePath>/.augment/specialists/`), then user
-//! (`~/.augment/specialists/`), then bundled (`resources/specialists/`,
+//! (`<workspacePath>/.intent/specialists/`), then user
+//! (`~/.intent/specialists/`), then bundled (`resources/specialists/`,
 //! read-only). Ports `specialist-file-loader.ts` + `specialists.ipc.ts`'s
 //! combined load. Nothing is persisted in SQLite; `create`/`edit`/`delete`
 //! write user/project files only and `bundled` definitions are read-only.
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use intent_core::{Error, Result};
 use serde_json::{json, Map, Value};
 
-/// Folder name under `.augment/` (and the bundled `resources/`) holding files.
+/// Folder name under `.intent/` (and the bundled `resources/`) holding files.
 const SPECIALISTS_FOLDER: &str = "specialists";
 /// Env override for the bundled (read-only) specialists directory; lets the
 /// daemon and tests point at app-shipped resources hermetically.
@@ -74,9 +74,9 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// Default user specialists directory (`~/.augment/specialists/`).
+/// Default user specialists directory (`~/.intent/specialists/`).
 fn default_user_dir() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".augment").join(SPECIALISTS_FOLDER))
+    home_dir().map(|h| h.join(".intent").join(SPECIALISTS_FOLDER))
 }
 
 /// Default bundled specialists directory: the [`BUNDLED_DIR_ENV`] override if
@@ -96,7 +96,7 @@ fn default_bundled_dir() -> Option<PathBuf> {
 
 /// The project specialists directory for a worktree.
 fn project_dir(workspace_path: &Path) -> PathBuf {
-    workspace_path.join(".augment").join(SPECIALISTS_FOLDER)
+    workspace_path.join(".intent").join(SPECIALISTS_FOLDER)
 }
 
 /// Reject ids that are empty or would escape the specialists directory; ids map

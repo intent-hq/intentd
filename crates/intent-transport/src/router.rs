@@ -1776,6 +1776,11 @@ async fn dispatch(
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "pr.refresh" => {
+            let ws = require_ws_note(params)?;
+            let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
+            Ok(r)
+        }
         "pr.listComments" => {
             let ws = require_ws_note(params)?;
             let count = opt_int(params, "count");

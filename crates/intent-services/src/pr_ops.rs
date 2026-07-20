@@ -91,6 +91,20 @@ pub enum PrRefreshOutcome {
     Unlinked,
 }
 
+impl PrRefreshOutcome {
+    /// The lowercase wire form of the outcome for the `pr.refresh` result
+    /// (PROTOCOL §5.7 extension).
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            PrRefreshOutcome::Skipped => "skipped",
+            PrRefreshOutcome::Unchanged => "unchanged",
+            PrRefreshOutcome::Linked => "linked",
+            PrRefreshOutcome::Updated => "updated",
+            PrRefreshOutcome::Unlinked => "unlinked",
+        }
+    }
+}
+
 /// True when `pr.head.ref` (the host-agnostic `source_branch`) equals the
 /// workspace's own `branch`, and both are non-empty — the link/discovery rule.
 pub(crate) fn pr_matches_branch(pr: &PullRequest, branch: &str) -> bool {

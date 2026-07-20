@@ -239,7 +239,7 @@ pub struct Services {
     /// flight cache, keeping the async runtime free if the backing store stalls.
     secrets: Arc<settings::AsyncSecretStore>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
-    /// to `~/.augment/specialists/`; tests inject a temp dir for hermetic
+    /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
     specialists_user_dir: Option<PathBuf>,
     /// Override for the **bundled** (read-only) specialists directory (§18.2).
@@ -3598,7 +3598,7 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-    let readme = format!("# {repo_name}\n\nA new project created with Intent by Augment.\n");
+    let readme = format!("# {repo_name}\n\nA new project created with Intent.\n");
     std::fs::write(repo_path.join("README.md"), readme).map_err(|e| {
         Error::Internal(format!(
             "workspace.initializeRepository: write README.md failed: {e}"
@@ -6313,6 +6313,10 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
+            // Clone fields for logging (input moves into the closure below).
+            let log_repo_path = input.repository_path.clone();
+            let log_branch = input.branch.clone();
+
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
             let result = with_idempotency(
@@ -7052,6 +7056,18 @@ impl WorkspaceApi for Services {
                 },
             )
             .await;
+
+            // Log workspace.create failures at WARN so they are diagnosable
+            // (STAB-68: iOS saw -32603 with no daemon-side log evidence).
+            if let Err(ref e) = result {
+                tracing::warn!(
+                    method = "workspace.create",
+                    error = %e,
+                    repository_path = ?log_repo_path,
+                    branch = ?log_branch,
+                    "workspace.create failed"
+                );
+            }
             result
         })
     }
@@ -12367,6 +12383,26 @@ impl WorkspaceApi for Services {
                 "isMerged": state == "merged",
                 "isClosed": state == "closed",
                 "summary": summary,
+            }))
+        })
+    }
+
+    fn pr_refresh(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let this = self.clone();
+        Box::pin(async move {
+            // `refresh_workspace_pr` owns persistence and the
+            // `pr:linked`/`pr:updated`/`pr:unlinked` emission — no duplicate
+            // event logic here; the RPC just reports the post-refresh state.
+            let outcome = this.refresh_workspace_pr(&workspace_id).await?;
+            let ws = this.store.get_workspace(&workspace_id).await?;
+            Ok(serde_json::json!({
+                "outcome": outcome.as_wire_str(),
+                "prNumber": ws.pr_number,
+                "prUrl": ws.pr_url,
+                "prStatus": ws.pr_status,
+                // Always an array on the wire — never null — matching the
+                // `pr:*` event payloads (§6.5).
+                "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
             }))
         })
     }

@@ -2637,6 +2637,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `pr.refresh`: force the same PR discovery/refresh the background sweep
+    /// runs for one workspace, returning the post-refresh linkage state as
+    /// `{ outcome, prNumber?, prUrl?, prStatus?, pullRequests }`. Ineligible
+    /// workspaces (remote/archived/no repo) report `outcome: "skipped"` rather
+    /// than erroring (PROTOCOL §5.7 extension).
+    fn pr_refresh(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_refresh not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.listComments`: conversation-level comments on the active PR, clamped to
     /// `count` (default 20, max 100) (PROTOCOL §5.7).
     fn pr_list_comments(
