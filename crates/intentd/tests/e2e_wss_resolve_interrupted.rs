@@ -450,8 +450,36 @@ async fn resolve_interrupted_resume_and_abandon() {
         "expected 0 interrupted agents after resolve"
     );
 
-    // Phase 5: Verify the abandoned agent has a system message
+    // Phase 5: Verify the resumed agent received the reworded continuation
+    // message as the last user-role message (and that it no longer mentions
+    // "intentd").
     use intent_core::AgentId;
+    let resume_agent_id = AgentId(agent_resume.clone());
+    let resumed_session = store
+        .get_agent_session(&resume_agent_id)
+        .await
+        .expect("get resumed session");
+    let last_user_msg = resumed_session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .expect("expected user continuation message on resumed session");
+    let resumed_blocks = last_user_msg.content.as_array().expect("content blocks");
+    assert_eq!(resumed_blocks[0]["type"], "text");
+    let continuation_text = resumed_blocks[0]["text"].as_str().expect("text block");
+    assert_eq!(
+        continuation_text,
+        "You were interrupted because the harness shut down. You now have a chance to \
+         continue the work — review your last steps and pick up where you left off.",
+        "continuation should carry exactly the approved wording"
+    );
+    assert!(
+        !continuation_text.contains("intentd"),
+        "continuation must not mention intentd, got: {continuation_text}"
+    );
+
+    // Phase 6: Verify the abandoned agent has a system message
     let abandoned_session = store
         .get_agent_session(&AgentId(agent_abandon.clone()))
         .await
@@ -468,7 +496,7 @@ async fn resolve_interrupted_resume_and_abandon() {
         .contains("interrupted because intentd restarted"));
     assert_eq!(text_block["meta"]["kind"], "interruption");
 
-    // Phase 6: Test error case - unknown agent id (already resolved)
+    // Phase 7: Test error case - unknown agent id (already resolved)
     let unknown_result = wss_rpc(
         &mut ws,
         5,
