@@ -420,9 +420,9 @@ mod build_command_tests {
             "codex npx fallback should use the @zed-industries package, got: {pkg}"
         );
         let version = pkg.rsplit('@').next().unwrap();
+        let parts: Vec<&str> = version.split('.').collect();
         assert!(
-            version.split('.').count() == 3
-                && version.split('.').all(|part| part.parse::<u32>().is_ok()),
+            parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
             "codex npx fallback must be pinned to an exact semver version, got: {version}"
         );
     }
