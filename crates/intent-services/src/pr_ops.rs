@@ -105,6 +105,28 @@ pub(crate) fn pr_branch_mismatch(pr: &PullRequest, branch: &str) -> bool {
     !pr.source_branch.is_empty() && !branch.is_empty() && pr.source_branch != branch
 }
 
+/// Upsert a PR snapshot into the daemon-owned `workspace.pull_requests` list
+/// (keyed by PR number), returning `true` when the list actually changed.
+/// Keeps merged/closed PRs recorded alongside the currently-linked one so the
+/// FE can render the full per-branch PR history without a refetch (§7.6).
+pub(crate) fn upsert_pr_info(
+    list: &mut Option<Vec<PullRequestInfo>>,
+    info: &PullRequestInfo,
+) -> bool {
+    let items = list.get_or_insert_with(Vec::new);
+    match items.iter_mut().find(|p| p.number == info.number) {
+        Some(existing) if *existing == *info => false,
+        Some(existing) => {
+            *existing = info.clone();
+            true
+        }
+        None => {
+            items.push(info.clone());
+            true
+        }
+    }
+}
+
 /// Derive the persisted [`PullRequestStatus`] from a forge PR (draft wins over
 /// open; merged/closed map directly), mirroring [`derive_status_state`].
 pub(crate) fn derive_pr_status(pr: &PullRequest) -> PullRequestStatus {
@@ -747,6 +769,32 @@ mod tests {
         assert!(!pr_branch_mismatch(&empty, "feat"));
         // Empty workspace branch: cannot determine → never a mismatch.
         assert!(!pr_branch_mismatch(&p, ""));
+    }
+
+    #[test]
+    fn upserts_pr_info_by_number() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+
+        // Insert into an absent list.
+        assert!(upsert_pr_info(&mut list, &open));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+
+        // Identical snapshot: no change.
+        assert!(!upsert_pr_info(&mut list, &open));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+
+        // Same number, different snapshot: replaced in place.
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info(&mut list, &merged));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+        assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
+
+        // A different number appends.
+        let mut second = pr(PrState::Open, false, None, None);
+        second.number = 2;
+        assert!(upsert_pr_info(&mut list, &build_pr_info(&second)));
+        assert_eq!(list.as_ref().unwrap().len(), 2);
     }
 
     #[test]

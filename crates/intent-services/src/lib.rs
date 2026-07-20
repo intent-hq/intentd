@@ -1390,10 +1390,14 @@ impl Services {
     /// and by the background loop. The matching rule is `pr.head.ref ==
     /// workspace.branch` (NOT baseRef). When the workspace is already linked the
     /// PR is re-fetched and its snapshot diffed (clearing a stale link on a
-    /// positive branch mismatch); when unlinked, an open PR whose head ref
-    /// equals the branch is discovered and linked. Remote/archived workspaces,
-    /// and those lacking repo/branch info, are skipped. A missing forge token
-    /// (no injected/registry provider) surfaces as `Internal`.
+    /// positive branch mismatch); a linked PR fetched as merged/closed stays
+    /// recorded in `pull_requests` and triggers discovery of a newer open PR on
+    /// the same branch (relinking + `pr:linked` when found); when unlinked, an
+    /// open PR whose head ref equals the branch is discovered and linked. Every
+    /// refreshed/discovered PR snapshot is upserted into the daemon-owned
+    /// `pull_requests` list. Remote/archived workspaces, and those lacking
+    /// repo/branch info, are skipped. A missing forge token (no
+    /// injected/registry provider) surfaces as `Internal`.
     pub async fn refresh_workspace_pr(
         &self,
         workspace_id: &WorkspaceId,
@@ -1454,7 +1458,45 @@ impl Services {
                     return Ok(PrRefreshOutcome::Unlinked);
                 }
                 let info = pr_ops::build_pr_info(&pr);
-                let changed = ws.pr_status != Some(info.status)
+                // Keep the daemon-owned PR list current on every linked refresh.
+                let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
+                // A merged/closed linked PR stays recorded in `pull_requests`
+                // but no longer blocks discovery: relink to a newer open PR
+                // whose head ref equals the branch, so the workspace follows
+                // the latest PR without waiting for an unlink.
+                if matches!(
+                    info.status,
+                    intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
+                ) && !ws.branch.is_empty()
+                {
+                    let query = intent_sourcecontrol::PrQuery {
+                        state: Some(intent_sourcecontrol::PrState::Open),
+                        head: Some(ws.branch.clone()),
+                        ..Default::default()
+                    };
+                    let prs = sc
+                        .list_prs(&repo_ref, query)
+                        .await
+                        .map_err(pr_ops::map_sc_err)?
+                        .items;
+                    if let Some(open_pr) = prs
+                        .into_iter()
+                        .find(|p| p.number != number && pr_ops::pr_matches_branch(p, &ws.branch))
+                    {
+                        let open_info = pr_ops::build_pr_info(&open_pr);
+                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
+                        ws.pr_number = Some(open_pr.number);
+                        ws.pr_url = Some(open_pr.url.clone());
+                        ws.pr_status = Some(open_info.status);
+                        ws.active_pull_request = Some(open_info);
+                        ws.updated_at = now_iso();
+                        self.store.update_workspace(&ws).await?;
+                        publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                        return Ok(PrRefreshOutcome::Linked);
+                    }
+                }
+                let changed = list_changed
+                    || ws.pr_status != Some(info.status)
                     || ws.active_pull_request.as_ref() != Some(&info)
                     || ws.pr_url.as_deref() != Some(pr.url.as_str());
                 if !changed {
@@ -1489,6 +1531,7 @@ impl Services {
                 {
                     Some(pr) => {
                         let info = pr_ops::build_pr_info(&pr);
+                        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                         ws.pr_number = Some(pr.number);
                         ws.pr_url = Some(pr.url.clone());
                         ws.pr_status = Some(info.status);
@@ -4097,7 +4140,8 @@ fn git_commit_event(
 
 /// Build a `pr:linked` event for a workspace that just gained a PR link (§7.6).
 /// Self-sufficient payload `{ workspaceId, prNumber, prUrl, prStatus,
-/// activePullRequest }` so a client can render the link without a follow-up read.
+/// activePullRequest, pullRequests }` so a client can render the link — and the
+/// full daemon-owned PR list — without a follow-up read.
 fn pr_linked_event(ws: &Workspace) -> NewEvent {
     NewEvent {
         workspace_id: ws.id.clone(),
@@ -4114,12 +4158,14 @@ fn pr_linked_event(ws: &Workspace) -> NewEvent {
             "prUrl": ws.pr_url,
             "prStatus": ws.pr_status,
             "activePullRequest": ws.active_pull_request,
+            "pullRequests": ws.pull_requests,
         }),
     }
 }
 
 /// Build a `pr:updated` event for a linked PR whose persisted snapshot changed
-/// (§7.6). Payload `{ workspaceId, prNumber, prStatus, activePullRequest }`.
+/// (§7.6). Payload `{ workspaceId, prNumber, prStatus, activePullRequest,
+/// pullRequests }`.
 fn pr_updated_event(ws: &Workspace) -> NewEvent {
     NewEvent {
         workspace_id: ws.id.clone(),
@@ -4135,6 +4181,7 @@ fn pr_updated_event(ws: &Workspace) -> NewEvent {
             "prNumber": ws.pr_number,
             "prStatus": ws.pr_status,
             "activePullRequest": ws.active_pull_request,
+            "pullRequests": ws.pull_requests,
         }),
     }
 }
@@ -14598,6 +14645,7 @@ impl Services {
             .map_err(pr_ops::map_sc_err)?;
 
         let info = pr_ops::build_pr_info(&pr);
+        pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
         ws.pr_number = Some(pr.number);
         ws.pr_url = Some(pr.url.clone());
         ws.pr_status = Some(info.status);
