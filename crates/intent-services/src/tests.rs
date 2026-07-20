@@ -5746,6 +5746,68 @@ mod pr {
         assert!(evs.is_empty());
     }
 
+    // ------------------------------------------------------------------------
+    // `pr.refresh` (PROTOCOL §5.7 extension): the on-demand RPC wraps
+    // `refresh_workspace_pr` and reports the post-refresh linkage state; the
+    // `pr:*` events flow through the existing refresh path only.
+    // ------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn pr_refresh_reports_linked_state_after_discovery() {
+        // Unlinked ws; discovery links PR #42 → outcome "linked" plus the
+        // post-refresh linkage fields.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+        let v = svc.pr_refresh(ws_id.clone()).await.expect("pr.refresh");
+        assert_eq!(v["outcome"], "linked");
+        assert_eq!(v["prNumber"], 42);
+        assert_eq!(v["prUrl"], "https://github.com/o/r/pull/42");
+        assert_eq!(v["prStatus"], "Open");
+        assert_eq!(v["pullRequests"][0]["number"], 42);
+
+        // Exactly one `pr:linked` event, emitted by the shared refresh path.
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_refresh_reports_unlinked_state_after_stale_link_cleared() {
+        // Linked PR #42 but ws branch "main" differs from PR head "feature" →
+        // the stale link is cleared and the RPC reports the cleared state.
+        let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", Some(42), false).await;
+        let v = svc.pr_refresh(ws_id.clone()).await.expect("pr.refresh");
+        assert_eq!(v["outcome"], "unlinked");
+        assert!(v["prNumber"].is_null());
+        assert!(v["prUrl"].is_null());
+        assert!(v["prStatus"].is_null());
+        // Always an array on the wire, even when empty.
+        assert!(v["pullRequests"].as_array().is_some());
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:unlinked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_refresh_skips_ineligible_workspace_without_error() {
+        // Remote workspace: outcome "skipped", no forge call, no event.
+        let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "feature", Some(42), true).await;
+        let v = svc.pr_refresh(ws_id.clone()).await.expect("pr.refresh");
+        assert_eq!(v["outcome"], "skipped");
+        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
+        assert!(evs.is_empty());
+    }
+
     #[tokio::test]
     async fn refresh_all_discovers_unlinked_workspaces() {
         // STAB-3 regression test: `refresh_all_workspace_prs()` (the background
