@@ -2229,6 +2229,7 @@ impl Services {
                         None, // messageId
                         None, // imageBlocks
                         None, // fileBlocks
+                        None, // messageMetadata
                     )
                     .await
                 {
@@ -6882,6 +6883,7 @@ impl WorkspaceApi for Services {
                                             prompt_text,
                                             None,
                                             created_image_blocks,
+                                            None,
                                             None,
                                         )
                                         .await
@@ -11759,20 +11761,18 @@ impl WorkspaceApi for Services {
                     }
                 }
                 None => {
-                    // Read-only fallback (no `agent_manager` wired): the
-                    // router has already extracted `messageMetadata`, but
-                    // the store-only op doesn't accept metadata since none
-                    // of its internal callers carry it; the payload is dropped
-                    // on this fallback path (metadata IS preserved on the
-                    // production `AgentManager::send_message` path above).
+                    // Read-only fallback (no `agent_manager` wired): plumb
+                    // `messageMetadata` through the store-only append so the
+                    // persisted row matches the production
+                    // `AgentManager::send_message` path above.
                     // STAB-7: image_blocks and file_blocks ARE forwarded now.
-                    let _ = message_metadata;
                     self.agent_send_message_op(
                         agent_id,
                         content,
                         message_id,
                         image_blocks,
                         file_blocks,
+                        message_metadata,
                     )
                     .await
                 }

@@ -2024,6 +2024,7 @@ impl Services {
         message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if let Some(ref id) = message_id {
@@ -2046,14 +2047,20 @@ impl Services {
                         &id,
                         "user",
                         &blocks,
-                        None,
+                        message_metadata.as_ref(),
                         &created_at,
                     )
                     .await
             }
             None => {
                 self.store
-                    .append_agent_message(&agent_id, "user", &blocks, &created_at)
+                    .append_agent_message_with_metadata(
+                        &agent_id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &created_at,
+                    )
                     .await
             }
         };
@@ -2832,7 +2839,7 @@ impl Services {
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, None)
                         .await
                 }
             };
@@ -3515,11 +3522,18 @@ impl Services {
             }
             (None, _) => {
                 // Read-only fallback (no `agent_manager` wired): mirrors
-                // `agent_send_message` — the store-only op doesn't accept
-                // metadata, so the payload is dropped here (it IS preserved
-                // on the production manager paths above).
-                self.agent_send_message_op(agent.clone(), message, None, None, None)
-                    .await?
+                // `agent_send_message` — plumb the metadata through the
+                // store-only append so attribution is consistent across
+                // deployments with and without a runtime manager.
+                self.agent_send_message_op(
+                    agent.clone(),
+                    message,
+                    None,
+                    None,
+                    None,
+                    options.message_metadata,
+                )
+                .await?
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))

@@ -6640,3 +6640,220 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         "human send must NOT carry agent_message metadata: {human_row}"
     );
 }
+
+/// Sender attribution for the remaining agent-originated send paths
+/// (PROTOCOL §5.5): `ws.agent.sendToTask` must tag the assignee's delivered
+/// row with the `agent_message` attribution, and the `ws.agent.create`
+/// kickoff message must carry the same auto-tag — unless the caller supplies
+/// an explicit `messageMetadata`, which is persisted verbatim (precedence).
+/// Drives all three through the full daemon stack: a real mock-ACP sender
+/// turn invokes the MCP `workspace_api` bindings, and the assertions read
+/// the persisted transcripts back over WSS `agent.getConversation`.
+#[tokio::test]
+async fn send_to_task_and_create_kickoff_tag_sender_metadata_over_wss() {
+    let Some(script) = gate("WSS sendToTask/create sender metadata E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // The SENDER's rule-matched turn fires one workspace_api call covering
+    // all three paths: sendToTask to the task assignee, an auto-tagged
+    // create kickoff, and a create kickoff with explicit messageMetadata.
+    let ops_code = format!(
+        "const st = await ws.agent.sendToTask({note}, 'task hello'); \
+         const auto = await ws.agent.create('ChildAuto', 'kickoff hello', {{ model: 'mock:default' }}); \
+         const explicit = await ws.agent.create('ChildExplicit', 'kickoff explicit', \
+             {{ model: 'mock:default', messageMetadata: {{ type: 'custom_tag', note: 'explicit wins' }} }}); \
+         return {{ st, auto, explicit }};",
+        note = json!(note_id),
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "do the sends",
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": ops_code, "summary": "sendToTask + create kickoff attribution e2e" }
+                },
+                "response": "sends dispatched"
+            }
+        ],
+        "response": "plain reply"
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:stream:end"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let target = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "TaskTarget", "model": "mock:default" }),
+    )
+    .await;
+    let target_id = target["agent"]["id"].as_str().unwrap().to_string();
+    let sender = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "SenderA", "model": "mock:default" }),
+    )
+    .await;
+    let sender_id = sender["agent"]["id"].as_str().unwrap().to_string();
+
+    // Make the seeded note a task and assign the target so sendToTask
+    // resolves an assignee.
+    let marked = wss_rpc(
+        &mut rpc,
+        12,
+        "task.markAsTask",
+        json!({ "workspaceId": &ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let assigned = wss_rpc(
+        &mut rpc,
+        13,
+        "task.assignAgent",
+        json!({ "workspaceId": &ws_id, "noteId": note_id, "agentId": target_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+
+    // Kick off the sender's turn; its workspace_api call fans out to the
+    // task assignee and both created children, each running its own turn.
+    let sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &sender_id, "content": "do the sends" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "kickoff sendMessage ok: {sent}");
+
+    // Wait until FOUR distinct agents finished a turn: sender, task target,
+    // and the two created children.
+    let mut done: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:stream:end" {
+            let id = ev["data"]["agentId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !id.is_empty() && !done.contains(&id) {
+                done.push(id);
+            }
+        }
+        if done.len() >= 4 {
+            break;
+        }
+    }
+    assert_eq!(done.len(), 4, "all four turns completed: {done:?}");
+
+    // Resolve the created children by name.
+    let list = wss_rpc(&mut rpc, 15, "agent.list", json!({ "workspaceId": &ws_id })).await;
+    let agents = list["agents"].as_array().expect("agents array");
+    let by_name = |name: &str| -> String {
+        agents
+            .iter()
+            .find(|a| a["name"] == name)
+            .and_then(|a| a["id"].as_str())
+            .unwrap_or_else(|| panic!("agent {name} listed: {list}"))
+            .to_string()
+    };
+    let auto_child = by_name("ChildAuto");
+    let explicit_child = by_name("ChildExplicit");
+
+    let expected_tag = json!({
+        "type": "agent_message",
+        "fromAgentId": sender_id,
+        "fromAgentName": "SenderA",
+    });
+    let user_row = |conv: &Value, text: &str| -> Value {
+        conv["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == text)
+            .unwrap_or_else(|| panic!("user row `{text}` present: {conv}"))
+            .clone()
+    };
+
+    // 1. sendToTask: the assignee's delivered row carries the auto-tag.
+    let conv = wss_rpc(
+        &mut rpc,
+        16,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &target_id }),
+    )
+    .await;
+    let row = user_row(&conv, "task hello");
+    assert_eq!(
+        row["metadata"], expected_tag,
+        "sendToTask must carry sender attribution: {row}"
+    );
+
+    // 2. create kickoff (no explicit metadata): auto-tagged.
+    let conv = wss_rpc(
+        &mut rpc,
+        17,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &auto_child }),
+    )
+    .await;
+    let row = user_row(&conv, "kickoff hello");
+    assert_eq!(
+        row["metadata"], expected_tag,
+        "create kickoff must carry sender attribution: {row}"
+    );
+
+    // 3. create kickoff with explicit messageMetadata: persisted verbatim,
+    // taking precedence over the auto-tag.
+    let conv = wss_rpc(
+        &mut rpc,
+        18,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &explicit_child }),
+    )
+    .await;
+    let row = user_row(&conv, "kickoff explicit");
+    assert_eq!(
+        row["metadata"],
+        json!({ "type": "custom_tag", "note": "explicit wins" }),
+        "explicit messageMetadata must win over the auto-tag: {row}"
+    );
+}
