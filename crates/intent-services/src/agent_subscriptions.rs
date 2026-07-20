@@ -619,10 +619,12 @@ impl Services {
     /// children listed in `retain_children` are converted in place into
     /// ungrouped oneShot watches (STAB-129: failed-not-deleted members may
     /// still be working, and their eventual real settlement must keep a wake
-    /// path to the parent). Conversion dedupes against a live ungrouped
-    /// oneShot watch for the same parent→child pair (e.g. one created by a
-    /// SUB-1 sendToTask auto-watch racing settlement) so the late settlement
-    /// delivers exactly one wake. Returns the number of watches retained.
+    /// path to the parent). Conversion dedupes against any live ungrouped
+    /// watch for the same parent→child pair — oneShot or not (e.g. a SUB-1
+    /// sendToTask auto-watch or a queued non-oneShot `wakeOrCreate` watch
+    /// racing settlement) — since either already gives the parent a wake path,
+    /// so the late settlement delivers exactly one wake. Returns the number of
+    /// watches retained.
     pub(crate) fn settle_group_watches(
         &self,
         workspace_id: &WorkspaceId,
@@ -639,7 +641,7 @@ impl Services {
         let mut kept: std::collections::HashSet<(AgentId, AgentId)> = w
             .subscriptions
             .iter()
-            .filter(|s| s.group_id.is_none() && s.one_shot)
+            .filter(|s| s.group_id.is_none())
             .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
             .collect();
         let mut retained = 0;
