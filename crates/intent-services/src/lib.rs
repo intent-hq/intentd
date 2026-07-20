@@ -12336,6 +12336,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_refresh(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let this = self.clone();
+        Box::pin(async move {
+            // `refresh_workspace_pr` owns persistence and the
+            // `pr:linked`/`pr:updated`/`pr:unlinked` emission — no duplicate
+            // event logic here; the RPC just reports the post-refresh state.
+            let outcome = this.refresh_workspace_pr(&workspace_id).await?;
+            let ws = this.store.get_workspace(&workspace_id).await?;
+            Ok(serde_json::json!({
+                "outcome": outcome.as_wire_str(),
+                "prNumber": ws.pr_number,
+                "prUrl": ws.pr_url,
+                "prStatus": ws.pr_status,
+                // Always an array on the wire — never null — matching the
+                // `pr:*` event payloads (§6.5).
+                "pullRequests": ws.pull_requests.as_deref().unwrap_or_default(),
+            }))
+        })
+    }
+
     fn pr_list_comments(
         &self,
         workspace_id: WorkspaceId,

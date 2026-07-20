@@ -559,3 +559,50 @@ async fn pr_updated_event_carries_pull_requests_list_over_wss() {
     assert_eq!(list[0]["number"], 42);
     assert_eq!(list[0]["status"], "Merged");
 }
+
+/// `pr.refresh` over the wire (PROTOCOL §5.7 extension): the RPC forces the
+/// same refresh the 60s background sweep runs and returns the post-refresh
+/// linkage state; the `pr:linked` event flows through the existing refresh
+/// path (no duplicate emission). A separate subscriber connection observes the
+/// event so the RPC response and notification framing stay independent.
+#[tokio::test]
+async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
+    let fx = boot(StubForge {
+        open_pr_number: Some(300),
+    })
+    .await;
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["pr:linked"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Relink-after-merge via the RPC: linked #42 is fetched as merged and an
+    // open successor #300 exists on the same branch.
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let result = wss_rpc(
+        &mut rpc,
+        2,
+        "pr.refresh",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(result["outcome"], "linked");
+    assert_eq!(result["prNumber"], 300);
+    assert_eq!(result["prUrl"], "https://github.com/o/r/pull/300");
+    assert_eq!(result["prStatus"], "Open");
+    let list = result["pullRequests"]
+        .as_array()
+        .expect("pullRequests array");
+    assert_eq!(list.len(), 2);
+
+    let evt = next_event(&mut sub, "pr:linked").await;
+    assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
+    assert_eq!(evt["data"]["prNumber"], 300);
+    assert_eq!(evt["data"]["pullRequests"].as_array().unwrap().len(), 2);
+}
