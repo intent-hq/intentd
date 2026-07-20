@@ -1572,6 +1572,21 @@ impl WorkspaceApi for FakeApi {
             Ok(())
         })
     }
+
+    fn pr_refresh(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            Ok(serde_json::json!({
+                "outcome": "linked",
+                "prNumber": 300,
+                "prUrl": "https://github.com/o/r/pull/300",
+                "prStatus": "Open",
+                "pullRequests": [{ "number": 300 }],
+            }))
+        })
+    }
 }
 
 async fn call(msg: &str) -> Option<Value> {
@@ -4618,6 +4633,44 @@ async fn repo_config_ensure_dir_happy_path() {
 async fn repo_config_ensure_dir_unknown_workspace() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"repoConfig.ensureDir","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "Workspace not found");
+}
+
+// ---------------------------------------------------------------------------
+// pr.refresh (PROTOCOL §5.7 extension)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pr_refresh_dispatches_and_returns_service_result() {
+    let v =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{"workspaceId":"ws-1"}}"#)
+            .await
+            .unwrap();
+    assert!(v.get("error").is_none(), "unexpected error: {v}");
+    assert_eq!(v["result"]["outcome"], "linked");
+    assert_eq!(v["result"]["prNumber"], 300);
+    assert_eq!(v["result"]["prUrl"], "https://github.com/o/r/pull/300");
+    assert_eq!(v["result"]["prStatus"], "Open");
+    assert_eq!(v["result"]["pullRequests"][0]["number"], 300);
+}
+
+#[tokio::test]
+async fn pr_refresh_missing_workspace_id_is_minus_32602() {
+    let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(v["error"]["message"], "workspaceId is required");
+}
+
+#[tokio::test]
+async fn pr_refresh_unknown_workspace_is_minus_32602() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"pr.refresh","params":{"workspaceId":"missing"}}"#,
     )
     .await
     .unwrap();
