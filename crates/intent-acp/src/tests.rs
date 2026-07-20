@@ -6147,6 +6147,51 @@ mod wsapi4_bindings_tests {
         );
     }
 
+    /// Explicit `messageMetadata` on `send` wins over the auto-tag — we never
+    /// overwrite metadata the caller supplied.
+    #[tokio::test]
+    async fn agent_send_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', null, { type: 'custom', reason: 'x' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].3, Some(json!({ "type": "custom", "reason": "x" })));
+    }
+
+    /// Explicit `messageMetadata` on `sendToTask` wins over the auto-tag.
+    #[tokio::test]
+    async fn agent_send_to_task_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', null, { type: 'custom' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_to_task_calls.lock().unwrap();
+        assert_eq!(calls[0].2, Some(json!({ "type": "custom" })));
+    }
+
+    /// Explicit `messageMetadata` in `create()` opts wins over the auto-tag on
+    /// the kickoff delivery.
+    #[tokio::test]
+    async fn agent_create_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('child', 'go', { messageMetadata: { type: 'custom' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].0, "child-1");
+        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+    }
+
     #[tokio::test]
     async fn agent_delegate_threads_wait_mode_and_caller() {
         let (srv, api) = server_with_caller("coord-1");

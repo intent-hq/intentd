@@ -6634,12 +6634,9 @@ async fn agent_to_agent_send_tags_sender_metadata_over_wss() {
         .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "human follow-up")
         .expect("human user row present")
         .clone();
-    assert!(
-        human_row["metadata"].is_null()
-            || human_row["metadata"]
-                .get("type")
-                .map(|t| t != "agent_message")
-                == Some(true),
+    assert_ne!(
+        human_row["metadata"]["type"],
+        json!("agent_message"),
         "human send must NOT carry agent_message metadata: {human_row}"
     );
 }

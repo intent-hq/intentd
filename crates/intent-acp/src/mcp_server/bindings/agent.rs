@@ -28,10 +28,10 @@ pub(crate) const PRELUDE: &str = r#"
         create: (name, message, opts) =>
             host({ method: 'agent.create', args: { name, message, ...(opts || {}) } }),
         delegate: (opts) => host({ method: 'agent.delegate', args: { ...(opts || {}) } }),
-        send: (agentId, message, priority) =>
-            host({ method: 'agent.send', args: { agentId, message, priority } }),
-        sendToTask: (taskNoteId, message, priority) =>
-            host({ method: 'agent.sendToTask', args: { taskNoteId, message, priority } }),
+        send: (agentId, message, priority, messageMetadata) =>
+            host({ method: 'agent.send', args: { agentId, message, priority, messageMetadata } }),
+        sendToTask: (taskNoteId, message, priority, messageMetadata) =>
+            host({ method: 'agent.sendToTask', args: { taskNoteId, message, priority, messageMetadata } }),
         subscribe: (eventTypes, opts) =>
             host({ method: 'agent.subscribe', args: { eventTypes, ...(opts || {}) } }),
         unsubscribe: (subscriptionId) =>
@@ -86,9 +86,11 @@ async fn create(
     let initial_message =
         req_str(args, "message").map_err(|_| "message is required".to_string())?;
     let mut caller_depth: i64 = 0;
+    let mut caller_name: Option<String> = None;
     if let Some(c) = caller {
         if let Ok(caller_lite) = api.agent_get(c.clone(), Some(ws.clone())).await {
             caller_depth = caller_lite.metadata.delegation_depth.unwrap_or(0);
+            caller_name = Some(caller_lite.name);
         }
         if caller_depth >= MAX_DELEGATION_DEPTH {
             return Err(format!(
@@ -172,7 +174,11 @@ async fn create(
     }
     // Deliver the initial message so the child actually starts its first
     // turn — parity with the WSAPI-2 path. Failure is non-fatal (the
-    // session already exists) but is logged.
+    // session already exists) but is logged. Sender attribution reuses the
+    // depth-guard lookup's name (no second `agent_get` round-trip); an
+    // explicit `messageMetadata` in opts wins over the auto-tag.
+    let kickoff_metadata = explicit_metadata(args)
+        .or_else(|| caller.map(|c| agent_message_metadata(c, caller_name.as_deref())));
     if let Err(e) = api
         .agent_send_message(
             ws.clone(),
@@ -185,7 +191,7 @@ async fn create(
             None,
             None,
             None,
-            sender_metadata(api, ws, caller).await,
+            kickoff_metadata,
         )
         .await
     {
@@ -246,7 +252,7 @@ async fn send(
             None,
             None,
             None,
-            sender_metadata(api, ws, caller).await,
+            sender_metadata(api, ws, caller, args).await,
         )
         .await
         .map_err(map_err)?;
@@ -276,7 +282,7 @@ async fn send_to_task(
             NoteId::from_string(&task_note_id),
             message,
             opt_str(args, "priority"),
-            sender_metadata(api, ws, caller).await,
+            sender_metadata(api, ws, caller, args).await,
         )
         .await
         .map_err(map_err)?;
@@ -457,25 +463,50 @@ async fn report_to_parent(
     Ok(merge_ok(v))
 }
 
-/// Sender-attribution `messageMetadata` for agent-originated sends: when the
-/// caller is an agent (not the FE/RPC front door), tag the delivered message
-/// with `{ type: "agent_message", fromAgentId, fromAgentName? }` so clients
-/// can render who sent it (PROTOCOL §5.5). `fromAgentName` is resolved from
-/// the caller's session and omitted when the lookup fails; human-originated
-/// sends (`caller == None`) return `None` and stay untagged.
+/// Build the `{ type: "agent_message", fromAgentId, fromAgentName? }`
+/// sender-attribution payload (PROTOCOL §5.5). `fromAgentName` is omitted
+/// when the caller lookup failed, so clients must treat it as optional.
+fn agent_message_metadata(caller: &AgentId, name: Option<&str>) -> Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("type".to_string(), json!("agent_message"));
+    metadata.insert("fromAgentId".to_string(), json!(caller.as_str()));
+    if let Some(n) = name {
+        metadata.insert("fromAgentName".to_string(), json!(n));
+    }
+    Value::Object(metadata)
+}
+
+/// An explicit non-null `messageMetadata` arg, if the caller supplied one.
+/// Explicit metadata always wins over auto-tagging; `null` is treated as
+/// absent (it does not suppress the auto-tag).
+fn explicit_metadata(args: &Value) -> Option<Value> {
+    args.get("messageMetadata")
+        .filter(|v| !v.is_null())
+        .cloned()
+}
+
+/// `messageMetadata` for agent-originated sends: an explicit caller-supplied
+/// `messageMetadata` arg takes precedence; otherwise, when the caller is an
+/// agent (not the FE/RPC front door), auto-tag the delivered message with
+/// [`agent_message_metadata`] so clients can render who sent it. `fromAgentName`
+/// is resolved from the caller's session; human-originated sends
+/// (`caller == None`, no explicit metadata) return `None` and stay untagged.
 async fn sender_metadata(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
+    args: &Value,
 ) -> Option<Value> {
-    let caller = caller?;
-    let mut metadata = serde_json::Map::new();
-    metadata.insert("type".to_string(), json!("agent_message"));
-    metadata.insert("fromAgentId".to_string(), json!(caller.as_str()));
-    if let Ok(caller_lite) = api.agent_get(caller.clone(), Some(ws.clone())).await {
-        metadata.insert("fromAgentName".to_string(), json!(caller_lite.name));
+    if let Some(explicit) = explicit_metadata(args) {
+        return Some(explicit);
     }
-    Some(Value::Object(metadata))
+    let caller = caller?;
+    let name = api
+        .agent_get(caller.clone(), Some(ws.clone()))
+        .await
+        .ok()
+        .map(|lite| lite.name);
+    Some(agent_message_metadata(caller, name.as_deref()))
 }
 
 /// SUB-1 sender auto-subscribe: register the caller→target completion watch
