@@ -58,6 +58,14 @@ fn resolve_provider_id_malformed_compound_falls_back() {
         intent_providers::default_provider_id(),
         "malformed compound :sonnet with no provider -> default"
     );
+
+    // Empty provider field falls back to default
+    let provider_id = resolve_provider_id(Some("gpt-4"), Some(""));
+    assert_eq!(
+        provider_id,
+        intent_providers::default_provider_id(),
+        "empty provider string falls back to default"
+    );
 }
 
 #[test]
