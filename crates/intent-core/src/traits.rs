@@ -229,14 +229,17 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Write the repo config to `.intent/config.json` keyed on `workspaceId`.
+    /// Merge a partial config patch into `.intent/config.json` keyed on
+    /// `workspaceId` (JSON-level field merge): keys **present** in `config`
+    /// overwrite the on-disk values, keys **absent** are preserved, and an
+    /// explicit `null` clears a field. Unknown keys still round-trip.
     /// Creates the `.intent/` directory and `.gitignore` if they don't exist.
-    /// Never overwrites an existing `.gitignore`. Unknown keys are preserved on
-    /// round-trip. `NotFound` if the workspace is absent.
+    /// Never overwrites an existing `.gitignore`. Returns the merged config as
+    /// written. `NotFound` if the workspace is absent.
     fn save_repo_config(
         &self,
         id: WorkspaceId,
-        config: RepoConfig,
+        config: serde_json::Map<String, serde_json::Value>,
     ) -> BoxFuture<'_, Result<RepoConfig>> {
         let _ = (id, config);
         Box::pin(async {
