@@ -6725,10 +6725,12 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
 /// watch, and the child's eventual real completion (after a resume) never
 /// woke the parent.
 ///
-/// After the fix, `settle_group_watches` converts each failed-not-deleted
-/// member's grouped watch into an ungrouped oneShot watch at settlement time
-/// (before the wake delivery await), so the child's later settlement still
-/// wakes the parent.
+/// After the fix, `settle_group_watches` ensures each failed-not-deleted
+/// member keeps exactly one ungrouped wake path at settlement time (before
+/// the wake delivery await): the grouped watch is converted into an ungrouped
+/// oneShot watch, unless a live ungrouped watch for the pair already exists,
+/// in which case the grouped watch is simply dropped. Either way the child's
+/// later settlement still wakes the parent.
 #[tokio::test]
 async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
