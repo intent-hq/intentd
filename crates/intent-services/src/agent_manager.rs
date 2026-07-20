@@ -1426,23 +1426,31 @@ impl AgentManager {
         }
     }
 
-    /// Take (clear) the FirstTurnPrepend flag for `agent_id`: `true` when the
-    /// next outbound prompt must carry the assembled system prompt as a
-    /// leading `<system>` block (fresh session on a FirstTurnPrepend provider).
-    fn take_prepend_pending(&self, agent_id: &AgentId) -> bool {
-        self.prepend_pending.lock().unwrap().remove(agent_id)
-    }
-
     /// Compute the `<system>`-wrapped assembled system prompt for the
-    /// FirstTurnPrepend fallback, or `None` when nothing is pending. Consumes
-    /// the pending flag; the prompt text comes from the session's persisted
-    /// `system_prompt` (written by [`AgentManager::create_agent`] at spawn
-    /// time from `assemble_system_prompt`).
+    /// FirstTurnPrepend fallback, or `None` when nothing is pending. The
+    /// prompt text comes from the session's persisted `system_prompt`
+    /// (written by [`AgentManager::create_agent`] at spawn time from
+    /// `assemble_system_prompt`). The pending flag is consumed only on a
+    /// definitive outcome (prompt built, or session provably has no usable
+    /// prompt); a transient store error keeps it armed so the NEXT turn
+    /// retries instead of silently dropping the system prompt for the whole
+    /// session.
     async fn build_first_turn_prepend(&self, agent_id: &AgentId) -> Option<String> {
-        if !self.take_prepend_pending(agent_id) {
+        if !self.prepend_pending.lock().unwrap().contains(agent_id) {
             return None;
         }
-        let session = self.services.store.get_agent_session(agent_id).await.ok()?;
+        let session = match self.services.store.get_agent_session(agent_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "first-turn prepend: session lookup failed; keeping flag armed for retry"
+                );
+                return None;
+            }
+        };
+        self.prepend_pending.lock().unwrap().remove(agent_id);
         let prompt = session.system_prompt?;
         let prompt = prompt.trim();
         if prompt.is_empty() {
