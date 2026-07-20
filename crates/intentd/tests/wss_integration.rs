@@ -896,6 +896,11 @@ async fn wss_agent_enhance_prompt_round_trip() {
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\n<augment-enhanced-prompt>Enhanced: ship it</augment-enhanced-prompt>\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    // Provider-neutrality: set auggie as active provider (these operations are auggie-specific).
+    srv.store
+        .set_setting("providers.active", "\"auggie\"")
+        .await
+        .expect("set active provider");
 
     let resp = wss_call(
         srv.port,
@@ -934,6 +939,10 @@ async fn wss_agent_enhance_prompt_parse_failure_is_internal_error() {
     // the documented -32603 parse failure (§5.31).
     let bin = fake_auggie_script("notags", "printf '🤖\\nno tags here\\n'");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.store
+        .set_setting("providers.active", "\"auggie\"")
+        .await
+        .expect("set active provider");
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -958,6 +967,10 @@ async fn wss_agent_enhance_prompt_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
+    srv.store
+        .set_setting("providers.active", "\"auggie\"")
+        .await
+        .expect("set active provider");
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1011,6 +1024,10 @@ async fn wss_agent_complete_once_round_trip() {
         "printf '\u{1b}[32m🔧 Tool call: noise\u{1b}[0m\\n🤖\\nfix-login-flow\\n'",
     );
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.store
+        .set_setting("providers.active", "\"auggie\"")
+        .await
+        .expect("set active provider");
 
     let resp = wss_call(
         srv.port,
@@ -1033,6 +1050,10 @@ async fn wss_agent_complete_once_cli_missing_is_internal_error() {
         Some(std::path::PathBuf::from("/nonexistent/intentd-wss/auggie")),
     )
     .await;
+    srv.store
+        .set_setting("providers.active", "\"auggie\"")
+        .await
+        .expect("set active provider");
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -1053,6 +1074,10 @@ async fn wss_agent_complete_once_timeout_reaps_and_errors() {
     // failure, no session/agent state is leaked.
     let bin = fake_auggie_script("complete-slow", "sleep 30");
     let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.store
+        .set_setting("providers.active", "\"auggie\"")
+        .await
+        .expect("set active provider");
     let resp = wss_call(
         srv.port,
         srv.cfg.clone(),
