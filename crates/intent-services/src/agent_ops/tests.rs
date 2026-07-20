@@ -761,6 +761,51 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
+/// STAB-122 loading tolerance: rows persisted by pre-fix daemons can carry an
+/// anonymous `tool_use` block (`name: ""`) plus its paired errored
+/// `tool_result` at the head of an interrupt turn's assistant message.
+/// `agent.getConversation` must strip the anonymous pair on read (keeping the
+/// rest of the message intact) so the FE conversation load no longer breaks.
+#[tokio::test]
+async fn get_conversation_strips_anonymous_tool_use_pairs() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Interrupted").await;
+    // The observed malformed shape (agent-695dcf49 seq 2): anonymous tool_use +
+    // its abort-errored tool_result, then the real turn content — including a
+    // NAMED tool pair that must survive the strip.
+    let malformed = json!([
+        { "type": "tool_use", "id": "m:0", "name": "", "input": {},
+          "toolCallId": "stale-1", "metadata": { "toolKind": "other", "status": "error" } },
+        { "type": "tool_result", "id": "m:1", "tool_use_id": "stale-1",
+          "output": { "error": "The operation was aborted" }, "is_error": true },
+        { "type": "text", "id": "m:2", "text": "Resuming after interrupt" },
+        { "type": "tool_use", "id": "m:3", "name": "view", "input": { "path": "src" },
+          "toolCallId": "real-1", "metadata": { "toolKind": "file", "status": "completed" } },
+        { "type": "tool_result", "id": "m:4", "tool_use_id": "real-1",
+          "output": { "files": 3 }, "is_error": false },
+    ]);
+    svc.store()
+        .append_agent_message(&id, "assistant", &malformed, &now_iso())
+        .await
+        .expect("append");
+
+    let res = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    let blocks = res["messages"][0]["contentBlocks"].as_array().unwrap();
+    assert_eq!(
+        blocks.len(),
+        3,
+        "anonymous tool_use + its tool_result stripped, rest kept: {blocks:?}"
+    );
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[1]["type"], "tool_use");
+    assert_eq!(blocks[1]["name"], "view");
+    assert_eq!(blocks[2]["type"], "tool_result");
+    assert_eq!(blocks[2]["tool_use_id"], "real-1");
+}
+
 #[tokio::test]
 async fn rename_and_set_model_persist() {
     let (_t, svc, ws) = setup().await;

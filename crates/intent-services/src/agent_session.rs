@@ -125,7 +125,14 @@ impl Transcript {
     /// WITH output, append (then patch) a matching `tool_result` block. Returns
     /// the index of the `tool_use` block (the block the `agent:tool:call` event
     /// is enriched against).
-    fn record_tool(&mut self, tc: &MappedToolCall) -> usize {
+    ///
+    /// STAB-122: a first-sight update whose derived name is empty is DROPPED
+    /// (returns `None`, nothing recorded). This is the stale shape a cancelled
+    /// child echoes after an interrupt — a title-less `tool_call_update` for a
+    /// toolCallId the (fresh) transcript never saw. Fabricating a `tool_use`
+    /// block from it persists an anonymous block (`name: ""`) that breaks FE
+    /// conversation loading. Known-id patching is unaffected.
+    fn record_tool(&mut self, tc: &MappedToolCall) -> Option<usize> {
         let use_index = match self.tool_use_index.get(&tc.tool_call_id) {
             Some(&i) => {
                 if let Some(meta) = self.blocks[i]
@@ -136,6 +143,7 @@ impl Transcript {
                 }
                 i
             }
+            None if tc.tool_name.trim().is_empty() => return None,
             None => {
                 self.flush_text();
                 let index = self.blocks.len();
@@ -183,7 +191,7 @@ impl Transcript {
                 }
             }
         }
-        use_index
+        Some(use_index)
     }
 
     fn into_blocks(mut self) -> Vec<Value> {
@@ -776,8 +784,11 @@ impl Services {
             }
             MappedUpdate::ToolCall(tc) => {
                 // D6: accumulate tool_use/tool_result blocks into the transcript
-                // so they persist (and reach `agent.getConversation`).
-                let block_index = transcript.record_tool(&tc);
+                // so they persist (and reach `agent.getConversation`). A dropped
+                // update (STAB-122: anonymous first sight) publishes no event.
+                let Some(block_index) = transcript.record_tool(&tc) else {
+                    return;
+                };
                 // D4: enrich additively — keep the existing fields, add agentId,
                 // the (previously dropped) toolCallId, and the block identity.
                 let mut data = json!({

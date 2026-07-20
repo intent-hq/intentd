@@ -1680,6 +1680,24 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "session/cancel failed");
             }
         }
+        // STAB-122: the cancelled child echoes `tool_call_update`s for the
+        // aborted tool call (title-less, status failed). With the worker gone,
+        // they buffer in the handle's notification channel and would be drained
+        // by the NEXT turn's fresh transcript — which fabricated an anonymous
+        // `tool_use` block (`name: ""`) that broke FE conversation loading.
+        // Discard them with the same bounded settle-window drain the resume
+        // path uses for the `session/load` replay burst. The aborted worker's
+        // channel lock is released when its task drops, so this cannot deadlock.
+        let notes = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .map(|h| h.notifications.clone());
+        if let Some(notes) = notes {
+            let mut guard = notes.lock().await;
+            Services::drain_replay_notifications(&mut guard).await;
+        }
         // Release the in-flight slot (recomputes workspace activity) and capture
         // the owning workspace BEFORE the slot is dropped so the terminal event
         // is stamped on the right workspace; fall back to the persisted session.

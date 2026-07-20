@@ -782,6 +782,47 @@ fn has_unresolved_tool_use(blocks: &[Value]) -> bool {
     })
 }
 
+/// STAB-122: strip anonymous `tool_use` blocks (`name` missing/empty) and the
+/// `tool_result` blocks paired to them (matched by `tool_use_id == toolCallId`)
+/// from a message before serving it. Pre-fix daemons persisted this malformed
+/// pair when an interrupt landed mid-tool-call; the FE conversation load chokes
+/// on the empty name. Messages without such blocks pass through unchanged.
+fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
+    fn is_anonymous_tool_use(b: &Value) -> bool {
+        b.get("type").and_then(Value::as_str) == Some("tool_use")
+            && b.get("name")
+                .and_then(Value::as_str)
+                .map(|n| n.trim().is_empty())
+                .unwrap_or(true)
+    }
+    let Some(blocks) = message.content.as_array() else {
+        return message;
+    };
+    if !blocks.iter().any(is_anonymous_tool_use) {
+        return message;
+    }
+    let anonymous_ids: HashSet<&str> = blocks
+        .iter()
+        .filter(|b| is_anonymous_tool_use(b))
+        .filter_map(|b| b.get("toolCallId").and_then(Value::as_str))
+        .collect();
+    let kept: Vec<Value> = blocks
+        .iter()
+        .filter(|b| match b.get("type").and_then(Value::as_str) {
+            Some("tool_use") => !is_anonymous_tool_use(b),
+            Some("tool_result") => b
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(|id| !anonymous_ids.contains(id))
+                .unwrap_or(true),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    message.content = Value::Array(kept);
+    message
+}
+
 impl Services {
     /// `agent.list` (PROTOCOL §5.5).
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
@@ -891,6 +932,13 @@ impl Services {
     /// walks backward to older pages. The `messages` array stays oldest→newest
     /// within a page (wire parity with the TS handler); `nextToken` is additive
     /// and is `null` once the oldest message has been returned.
+    ///
+    /// STAB-122 loading tolerance: rows persisted by pre-fix daemons can carry
+    /// an anonymous `tool_use` block (`name: ""`, the fabricated echo of a
+    /// tool call aborted by an interrupt) that breaks FE conversation loading.
+    /// The served page strips those blocks (and their paired `tool_result`s)
+    /// non-destructively — the stored rows are untouched, so the read is
+    /// idempotent and covers old rows and restored backups alike.
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -907,7 +955,11 @@ impl Services {
         let messages = session.messages;
         let total = messages.len();
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
-        let page = &messages[win.start..win.end];
+        let page: Vec<AgentMessage> = messages[win.start..win.end]
+            .iter()
+            .cloned()
+            .map(strip_anonymous_tool_blocks)
+            .collect();
         Ok(json!({
             "agentId": agent_id,
             "messages": page,
