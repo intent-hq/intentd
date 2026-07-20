@@ -436,7 +436,8 @@ async fn backlog_above_threshold_collapses_flush_even_when_due_set_is_small() {
 
 /// STAB-121 regression: after a burst flush, a trailing wave of the same churn
 /// (e.g. late modify re-notifications) that is below the threshold on its own
-/// must still collapse while the cooldown is active — and refresh it.
+/// must still collapse while the cooldown is active — without extending it,
+/// so unrelated small activity cannot keep the watcher in summary mode.
 #[tokio::test]
 async fn cooldown_collapses_trailing_wave_below_threshold() {
     let db = TempDb::new();
@@ -464,10 +465,10 @@ async fn cooldown_collapses_trailing_wave_below_threshold() {
     .await;
 
     assert!(pending.is_empty(), "all due paths are flushed");
-    let refreshed = burst_until.expect("cooldown stays armed");
-    assert!(
-        refreshed > cooldown_end,
-        "collapsed flush must refresh the cooldown"
+    assert_eq!(
+        burst_until,
+        Some(cooldown_end),
+        "cooldown-only collapse must consume the window, not extend it"
     );
     let events = drain_file_events(&mut sub, Duration::from_millis(300)).await;
     assert!(!events.is_empty(), "expected directory summaries");
@@ -480,6 +481,41 @@ async fn cooldown_collapses_trailing_wave_below_threshold() {
         );
     }
     assert_eq!(affected_sum(&events), 60);
+}
+
+/// The documented trade-off, pinned: while the cooldown is active even a lone
+/// file change flushes as a directory summary (`burst=true, affectedCount=1`)
+/// instead of a per-file event.
+#[tokio::test]
+async fn cooldown_collapses_single_file_flush() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let now = Instant::now();
+    let mut pending: HashMap<String, (Action, Instant)> = HashMap::new();
+    pending.insert(
+        "lone.txt".to_string(),
+        (Action::Modify, now - Duration::from_millis(5)),
+    );
+
+    let cooldown_end = now + Duration::from_millis(500);
+    let mut burst_until = Some(cooldown_end);
+    flush_due(
+        &bus,
+        &WorkspaceId::from("ws-lone"),
+        &mut pending,
+        &mut burst_until,
+    )
+    .await;
+
+    assert!(pending.is_empty());
+    assert_eq!(burst_until, Some(cooldown_end), "cooldown not extended");
+    let events = drain_file_events(&mut sub, Duration::from_millis(300)).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(burst_flag(&events[0]), Some(true));
+    assert_eq!(affected_sum(&events), 1);
 }
 
 /// A small flush with no backlog and an expired cooldown keeps the normal
@@ -500,7 +536,8 @@ async fn small_flush_after_cooldown_expiry_emits_individual_events() {
         );
     }
 
-    let mut burst_until = Some(now - Duration::from_millis(100));
+    let expired = now - Duration::from_millis(100);
+    let mut burst_until = Some(expired);
     flush_due(
         &bus,
         &WorkspaceId::from("ws-solo"),
@@ -510,6 +547,11 @@ async fn small_flush_after_cooldown_expiry_emits_individual_events() {
     .await;
 
     assert!(pending.is_empty());
+    assert_eq!(
+        burst_until,
+        Some(expired),
+        "per-file flush must not re-arm the cooldown"
+    );
     let events = drain_file_events(&mut sub, Duration::from_millis(300)).await;
     assert_eq!(events.len(), 5, "each file gets its own event");
     for ev in &events {

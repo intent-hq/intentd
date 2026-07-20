@@ -40,9 +40,17 @@ const BURST_THRESHOLD: usize = 100;
 /// delivery, late modify re-notifications for the same writes), and each wave
 /// on its own can sit below [`BURST_THRESHOLD`]; the cooldown makes trailing
 /// waves of the same churn collapse too instead of flushing per-file
-/// (STAB-121). Refreshed on every collapsed flush, so sustained churn stays
-/// collapsed until it quiesces.
+/// (STAB-121). Only refreshed when the backlog itself exceeds the threshold —
+/// cooldown-only collapses consume the window rather than extend it, so
+/// unrelated small activity after a churn returns to per-file events within
+/// one cooldown instead of staying in summary mode indefinitely.
 const BURST_COOLDOWN: Duration = Duration::from_millis(1000);
+
+/// Upper bound on raw events ingested per [`drain_ready`] call. `ingest` is
+/// cheap and never awaits, but the raw channel is unbounded; the cap keeps a
+/// pathological backlog from pinning the loop in a single non-yielding drain.
+/// Leftovers are picked up by the next `recv`/flush iteration.
+const DRAIN_MAX_PER_CALL: usize = 10_000;
 
 /// Directory names ignored at any depth, mirroring the `IGNORE_PATTERNS` of
 /// `unified-workspace-watcher.ts` plus the `.workspace-notes` additions of
@@ -80,9 +88,10 @@ const IGNORED_DIRS: &[&str] = &[
     ".workspace",
 ];
 
-/// The `data.action` discriminant of a `file:changed` event. Serializes to the
-/// lowercase TS values (`change.action.toLowerCase()`). `pub(super)` so the
-/// flush tests can build pending maps directly.
+/// The raw change verb carried in `data.action` of every `file:*` event
+/// (`file:created`/`file:deleted`/`file:changed` alike, per the module docs).
+/// Serializes to the lowercase TS values (`change.action.toLowerCase()`).
+/// `pub(super)` so the flush tests can build pending maps directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Action {
     Modify,
@@ -259,8 +268,11 @@ fn drain_ready(
     raw_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
     pending: &mut HashMap<String, (Action, tokio::time::Instant)>,
 ) {
-    while let Ok(event) = raw_rx.try_recv() {
-        ingest(root, &event, pending);
+    for _ in 0..DRAIN_MAX_PER_CALL {
+        match raw_rx.try_recv() {
+            Ok(event) => ingest(root, &event, pending),
+            Err(_) => break,
+        }
     }
 }
 
@@ -305,7 +317,10 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// a single bulk churn can come due across several flushes that individually
 /// sit below the threshold (STAB-121). Once a flush collapses, `burst_until`
 /// keeps subsequent flushes collapsed for [`BURST_COOLDOWN`] so trailing waves
-/// of the same churn (e.g. late modify re-notifications) summarize too.
+/// of the same churn (e.g. late modify re-notifications) summarize too. The
+/// cooldown is only refreshed while the backlog stays above the threshold;
+/// cooldown-only collapses do not extend it, so unrelated small activity
+/// cannot keep the watcher in summary mode indefinitely.
 ///
 /// `pub(super)` so tests can exercise the burst decision deterministically
 /// with hand-built pending maps (no OS watcher or sleeps).
@@ -325,9 +340,12 @@ pub(super) async fn flush_due(
         return;
     }
 
+    let over_threshold = pending.len() > BURST_THRESHOLD;
     let in_cooldown = burst_until.is_some_and(|until| now < until);
-    if pending.len() > BURST_THRESHOLD || in_cooldown {
-        *burst_until = Some(now + BURST_COOLDOWN);
+    if over_threshold || in_cooldown {
+        if over_threshold {
+            *burst_until = Some(now + BURST_COOLDOWN);
+        }
         flush_burst(bus, workspace_id, pending, &due).await;
     } else {
         for path in due {
