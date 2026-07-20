@@ -5205,10 +5205,15 @@ impl Services {
             .changed
             .iter()
             .map(|path| {
-                serde_json::json!({
-                    "path": path,
-                    "value": snap.get(path).unwrap_or(serde_json::Value::Null),
-                })
+                let raw = snap.get(path).unwrap_or(serde_json::Value::Null);
+                // Normalize number-typed values to the float wire shape so
+                // live-reload `settings:changed` payloads match what
+                // `settings.get`/`settings.list` report for the same key.
+                let value = match settings::find_definition(path) {
+                    Some(def) => settings::wire_value(&def, raw),
+                    None => raw,
+                };
+                serde_json::json!({ "path": path, "value": value })
             })
             .collect();
         if let Some(control) = self.server_control.get() {

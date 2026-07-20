@@ -15,16 +15,18 @@ use std::sync::Arc;
 use super::tests::{workspace, TempDb};
 use crate::Services;
 
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+async fn setup() -> (TempDb, Services, WorkspaceId, tempfile::TempDir) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let config_path =
-        std::env::temp_dir().join(format!("intentd-stab115-{}.toml", uuid::Uuid::new_v4()));
-    let registry = Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
     let services = Services::new(store).with_settings_registry(registry);
-    (tmp, services, ws)
+    (tmp, services, ws, config_dir)
 }
 
 /// Seed a TOML-backed setting through the wired registry.
@@ -62,7 +64,7 @@ async fn create_agent(
 /// settings `model.default` and persist to `session.model`.
 #[tokio::test]
 async fn agent_create_resolves_model_from_settings_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set model.default in settings
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
@@ -78,7 +80,7 @@ async fn agent_create_resolves_model_from_settings_default() {
 /// Bug B: Workspace-specific overrides take precedence over global default.
 #[tokio::test]
 async fn agent_create_workspace_override_beats_global_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and workspace-specific override
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
@@ -97,7 +99,7 @@ async fn agent_create_workspace_override_beats_global_default() {
 /// Bug B: Background agents check backgroundAgents.defaultModel before global default.
 #[tokio::test]
 async fn agent_create_background_agent_uses_background_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and background default
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
@@ -133,7 +135,7 @@ async fn agent_create_background_agent_uses_background_default() {
 /// Bug B: Explicit model at creation time overrides all settings.
 #[tokio::test]
 async fn agent_create_explicit_model_wins_over_settings() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set global default
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
@@ -149,7 +151,7 @@ async fn agent_create_explicit_model_wins_over_settings() {
 /// STAB-117 extension: providerDefaults applies when nothing more specific is set.
 #[tokio::test]
 async fn agent_create_resolves_from_provider_defaults() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set providerDefaults only
     let provider_defaults = json!({ "auggie": "fable-5" });
@@ -166,7 +168,7 @@ async fn agent_create_resolves_from_provider_defaults() {
 /// STAB-117 extension: providerDefaults[provider] is used when provider is set.
 #[tokio::test]
 async fn agent_create_uses_provider_defaults_for_explicit_provider() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set providerDefaults for opencode
     let provider_defaults = json!({ "opencode": "kimi-k3", "auggie": "fable-5" });
@@ -201,7 +203,7 @@ async fn agent_create_uses_provider_defaults_for_explicit_provider() {
 /// STAB-117 extension: more-specific settings (workspace override) beat providerDefaults.
 #[tokio::test]
 async fn agent_create_workspace_override_beats_provider_defaults() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both providerDefaults and workspace override
     let provider_defaults = json!({ "auggie": "fable-5" });
@@ -221,7 +223,7 @@ async fn agent_create_workspace_override_beats_provider_defaults() {
 /// STAB-117 extension: background default beats providerDefaults.
 #[tokio::test]
 async fn agent_create_background_default_beats_provider_defaults() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both providerDefaults and background default
     let provider_defaults = json!({ "auggie": "fable-5" });
@@ -258,7 +260,7 @@ async fn agent_create_background_default_beats_provider_defaults() {
 /// STAB-117 extension: providerDefaults beats global default.
 #[tokio::test]
 async fn agent_create_provider_defaults_beats_global_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and providerDefaults
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
@@ -277,7 +279,7 @@ async fn agent_create_provider_defaults_beats_global_default() {
 /// STAB-117 extension: unknown provider key in providerDefaults falls through to global default.
 #[tokio::test]
 async fn agent_create_unknown_provider_falls_through_to_global() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set global default and providerDefaults with a different provider
     set(&svc, "model.default", json!("auggie:sonnet4.5"));

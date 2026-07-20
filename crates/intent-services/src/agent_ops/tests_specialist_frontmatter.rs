@@ -18,7 +18,7 @@ use super::tests::{workspace, TempDb};
 use crate::Services;
 
 /// Set up a test with a temp specialist directory structure.
-async fn setup() -> (TempDb, Services, WorkspaceId, TempDir) {
+async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -29,18 +29,18 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir) {
 
     // Configure Services with the temp specialists directory and a wired
     // settings registry (settings are TOML-backed, not SQLite-backed).
-    let config_path = std::env::temp_dir().join(format!(
-        "intentd-specialist-frontmatter-{}.toml",
-        uuid::Uuid::new_v4()
-    ));
-    let registry = Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
+    let config_dir = TempDir::new().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
     let services = Services::new(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(
             Some(specialists_dir.path().to_path_buf()),
             Some(specialists_dir.path().to_path_buf()),
         );
-    (tmp, services, ws, specialists_dir)
+    (tmp, services, ws, specialists_dir, config_dir)
 }
 
 async fn create_agent(
@@ -92,7 +92,7 @@ fn create_specialist_without_model(dir: &PathBuf, id: &str) {
 /// Specialist frontmatter model is used when no explicit model param is passed.
 #[tokio::test]
 async fn specialist_frontmatter_model_used_for_delegated_agent() {
-    let (_t, svc, ws, specialists_dir) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
     create_user_specialist(
@@ -112,7 +112,7 @@ async fn specialist_frontmatter_model_used_for_delegated_agent() {
 /// Explicit model param beats specialist frontmatter model.
 #[tokio::test]
 async fn explicit_model_beats_specialist_frontmatter() {
-    let (_t, svc, ws, specialists_dir) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
     create_user_specialist(
@@ -139,7 +139,7 @@ async fn explicit_model_beats_specialist_frontmatter() {
 /// Missing/empty specialist frontmatter model falls through to settings chain.
 #[tokio::test]
 async fn missing_frontmatter_falls_through_to_settings() {
-    let (_t, svc, ws, specialists_dir) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist WITHOUT a frontmatter model
     create_specialist_without_model(&specialists_dir.path().to_path_buf(), "test-specialist");
@@ -166,7 +166,7 @@ async fn missing_frontmatter_falls_through_to_settings() {
 /// resolve_model uses), blocking all frontmatter lookups from path traversal.
 #[tokio::test]
 async fn malicious_specialist_id_rejected() {
-    let (_t, svc, ws, _specialists_dir) = setup().await;
+    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
     // Attempt to create agent with path-traversal specialist id
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("../evil".into())).await;
@@ -184,7 +184,7 @@ async fn malicious_specialist_id_rejected() {
 /// other workspaces.
 #[tokio::test]
 async fn spoofed_workspace_path_ignored() {
-    let (_t, svc, ws, specialists_dir) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a project-tier specialist in a different directory
     let evil_dir = specialists_dir
@@ -246,7 +246,7 @@ async fn spoofed_workspace_path_ignored() {
 /// is now done inside resolve() so all frontmatter lookups are guarded.
 #[tokio::test]
 async fn malicious_specialist_id_rejected_in_agent_type_resolution() {
-    let (_t, svc, ws, specialists_dir) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a user-tier specialist with an agentType frontmatter field
     let specialist_content = "---\nagentType: test-agent-type\n---\n# Test Specialist";

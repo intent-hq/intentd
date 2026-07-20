@@ -646,7 +646,15 @@ fn atomic_write(path: &Path, text: &str) -> Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        // Best-effort directory fsync so the rename itself is durable across
+        // a crash/power loss (without it some filesystems may surface the old
+        // file). Failures are ignored: not all platforms support fsync on a
+        // directory handle, and the data file itself is already synced.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     };
     write().map_err(|e| {
         std::fs::remove_file(&tmp).ok();

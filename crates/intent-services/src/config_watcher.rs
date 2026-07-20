@@ -19,6 +19,13 @@
 //!   last-good values with a WARN naming the file and offending key,
 //! - a missing file keeps last-good values with a WARN (never regenerated
 //!   mid-run).
+//!
+//! Concurrency note: writes are last-writer-wins. If a wire `settings.update`
+//! lands inside the debounce window after an external hand-edit, the
+//! registry's write-back (built from its in-memory document, which predates
+//! the hand-edit) overwrites the file and the follow-up watcher read matches
+//! the self-write hash — the hand-edit is lost silently. This is an accepted
+//! trade-off for a human-timescale file; the next external edit wins again.
 
 use std::future::Future;
 use std::sync::Arc;

@@ -33,7 +33,7 @@ use tokio::time::timeout;
 
 use intent_store::Store;
 
-use crate::settings_registry::{SettingsRegistry, KNOWN_PATHS};
+use crate::settings_registry::{SettingOrigin, SettingsRegistry, KNOWN_PATHS};
 
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
 /// the wire conveys presence without ever leaking the plaintext (§9.8).
@@ -1192,6 +1192,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             30.0,
         ),
+        number(
+            "events.streamRetentionHours",
+            "Event stream retention hours",
+            "Hours ephemeral events are retained before the retention sweep (0 disables)",
+            "events",
+            Some(0.0),
+            None,
+            72.0,
+        ),
     ]
 }
 
@@ -1213,7 +1222,7 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// Normalize a registry-read value for the wire: `Number`-typed settings are
 /// reported as floats (`5181.0`), matching the numeric shape the catalog
 /// defaults always had, so clients see one shape regardless of origin.
-fn wire_value(def: &SettingDefinition, value: Value) -> Value {
+pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
     match def.ty {
         SettingType::Number { .. } => match value.as_f64() {
             Some(n) => json!(n),
@@ -1387,8 +1396,12 @@ impl<'a> SettingsService<'a> {
     /// comment-preserving `config.toml` rewrite; a flag-pinned key rejects the
     /// whole batch with `-32602` before anything mutates) and never touch the
     /// SQLite `settings` table. Secrets and state-blob keys keep their
-    /// existing stores. Returns the **redacted** applied `{ path, value }`
-    /// pairs for the response + `settings:changed` payload.
+    /// existing stores. If a later secret/DB write in a mixed batch fails,
+    /// the already-applied registry batch is compensated (prior values
+    /// restored, config.toml rewritten back) so an error return never leaves
+    /// a durable file change without a `settings:changed` event. Returns the
+    /// **redacted** applied `{ path, value }` pairs for the response +
+    /// `settings:changed` payload.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
             .as_array()
@@ -1414,6 +1427,9 @@ impl<'a> SettingsService<'a> {
         // Apply the TOML-backed subset first, as one atomic registry batch:
         // unknown/pinned keys and typed-schema violations reject here with
         // `-32602` before ANY store (secret, DB, file) has been touched.
+        // Capture the prior effective values so a later secret/DB failure in
+        // a mixed batch can compensate (restore + rewrite config.toml back).
+        let mut registry_rollback: Vec<(String, Value)> = Vec::new();
         if let Some(reg) = self.registry {
             let registry_changes: Vec<(String, Value)> = planned
                 .iter()
@@ -1421,27 +1437,67 @@ impl<'a> SettingsService<'a> {
                 .map(|(def, value)| (def.path.to_string(), registry_value(def, value)))
                 .collect();
             if !registry_changes.is_empty() {
+                registry_rollback = registry_changes
+                    .iter()
+                    .map(|(path, _)| {
+                        // `origin == File` means the key was explicitly in the
+                        // file; otherwise roll back by removing it (Null).
+                        let prior = match reg.origin(path) {
+                            Some(SettingOrigin::File) => reg.get(path).unwrap_or(Value::Null),
+                            _ => Value::Null,
+                        };
+                        (path.clone(), prior)
+                    })
+                    .collect();
                 reg.apply(&registry_changes)?;
             }
         }
 
         let mut applied = Vec::with_capacity(planned.len());
         for (def, value) in planned {
-            if def.sensitive {
+            let persisted = if def.sensitive {
                 let secret_value = match &value {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                self.secrets.store(def.path, &secret_value).await?;
-                applied.push(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }));
+                self.secrets
+                    .store(def.path, &secret_value)
+                    .await
+                    .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
             } else if self.registry_for(def.path).is_some() {
-                // Already applied via the registry batch above.
-                applied.push(json!({ "path": def.path, "value": value }));
+                // Already applied via the registry batch above. Normalize the
+                // echoed value so number-typed settings keep the float wire
+                // shape (`5181.0`) that `settings.get`/`settings.list` report.
+                Ok(json!({ "path": def.path, "value": wire_value(&def, value) }))
             } else {
-                let raw = serde_json::to_string(&value)
-                    .map_err(|e| Error::Internal(format!("encode setting failed: {e}")))?;
-                self.store.set_setting(def.path, &raw).await?;
-                applied.push(json!({ "path": def.path, "value": value }));
+                match serde_json::to_string(&value) {
+                    Ok(raw) => self
+                        .store
+                        .set_setting(def.path, &raw)
+                        .await
+                        .map(|()| json!({ "path": def.path, "value": value })),
+                    Err(e) => Err(Error::Internal(format!("encode setting failed: {e}"))),
+                }
+            };
+            match persisted {
+                Ok(entry) => applied.push(entry),
+                Err(e) => {
+                    // Compensate the registry batch: without this, the TOML
+                    // subset would stay applied on disk while the caller sees
+                    // an error and never emits `settings:changed`.
+                    if !registry_rollback.is_empty() {
+                        if let Some(reg) = self.registry {
+                            if let Err(rollback_err) = reg.apply(&registry_rollback) {
+                                tracing::error!(
+                                    error = %rollback_err,
+                                    "settings.update registry rollback failed after \
+                                     secret/DB persistence error"
+                                );
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(applied)

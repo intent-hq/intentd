@@ -288,10 +288,11 @@ async fn task_linked_idle_commits_with_both_trailers() {
 async fn auto_commit_disabled_setting_is_silent_skip() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
-    let config_path =
-        std::env::temp_dir().join(format!("intentd-ac-{}.toml", uuid::Uuid::new_v4()));
-    let registry =
-        std::sync::Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = std::sync::Arc::new(
+        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
     registry
         .apply(&[("git.autoCommit".to_string(), serde_json::json!(false))])
         .unwrap();
