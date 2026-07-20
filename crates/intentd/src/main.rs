@@ -542,8 +542,9 @@ async fn cmd_serve(
         Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
         Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
     }
-    // Background PR refresh (§7.6): periodically re-fetch linked PRs, persist
-    // any change, and emit `pr:*` events so clients update without polling.
+    // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
+    // discover/link PRs for workspaces without one), persist any change, and
+    // emit `pr:*` events so clients update without polling.
     // Tiered by workspace recency to trim forge load (§7.7): recently-active
     // workspaces refresh every 60s tick, idle ones only on every 10th tick.
     // Safe when source control is unconfigured (a sweep with due workspaces
