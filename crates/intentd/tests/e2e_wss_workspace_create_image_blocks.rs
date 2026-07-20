@@ -142,4 +142,33 @@ async fn workspace_create_threads_image_blocks_to_first_turn() {
         agent_obj["metadata"]["initialMessage"].as_str().is_some(),
         "initial message persisted in metadata"
     );
+
+    // (3) STAB-133: the first user transcript row must carry the image block
+    // after the text block so the conversation view can render the attachment
+    // (this harness has no AgentManager, so this exercises the store-only
+    // `agent_send_message_op` fallback).
+    let conv = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let user_row = messages
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("first user transcript row");
+    let content = user_row["contentBlocks"]
+        .as_array()
+        .expect("contentBlocks array");
+    let image = content
+        .iter()
+        .find(|b| b["type"] == "image")
+        .expect("image block persisted on the user row");
+    assert_eq!(image["data"], image_data, "persisted image data matches");
+    assert_eq!(
+        image["mimeType"], "image/png",
+        "persisted mime type matches"
+    );
 }

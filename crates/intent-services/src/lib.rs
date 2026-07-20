@@ -11805,9 +11805,16 @@ impl WorkspaceApi for Services {
                     // See `agent_send_message` above: metadata is dropped
                     // on the read-only fallback and preserved on the
                     // production `AgentManager::force_message` path.
+                    // STAB-133: image_blocks and file_blocks ARE forwarded now.
                     let _ = message_metadata;
-                    self.agent_force_message_op(agent_id, message_id, content)
-                        .await
+                    self.agent_force_message_op(
+                        agent_id,
+                        message_id,
+                        content,
+                        options.image_blocks,
+                        options.file_blocks,
+                    )
+                    .await
                 }
             }
         })

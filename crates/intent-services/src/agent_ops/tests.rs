@@ -2705,6 +2705,82 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
     assert_eq!(queue["queue"][0]["fileBlocks"], file_blocks);
 }
 
+/// STAB-133: `agent_send_message_op` must persist FE-supplied image and file
+/// blocks into the transcript row (after the text block) so the conversation
+/// view can render them.
+#[tokio::test]
+async fn send_message_op_persists_attachment_blocks_in_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttachRecv").await;
+    let image_blocks = json!([
+        { "type": "image", "data": "imgdata", "mimeType": "image/png" }
+    ]);
+    let file_blocks = json!([
+        { "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "notes.txt" }
+    ]);
+    let r = svc
+        .agent_send_message_op(
+            id.clone(),
+            "see attached".into(),
+            None,
+            Some(image_blocks),
+            Some(file_blocks),
+        )
+        .await
+        .expect("send");
+    assert_eq!(r["queued"], false);
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    let content = &conv["messages"][0]["contentBlocks"];
+    let blocks = content.as_array().expect("content blocks array");
+    assert_eq!(blocks.len(), 3, "text + image + file blocks: {content}");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "see attached");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["data"], "imgdata");
+    assert_eq!(blocks[1]["mimeType"], "image/png");
+    assert_eq!(blocks[2]["type"], "file");
+    assert_eq!(blocks[2]["data"], "filedata");
+    assert_eq!(blocks[2]["fileName"], "notes.txt");
+    assert_eq!(blocks[2]["mimeType"], "text/plain");
+}
+
+/// STAB-133: `agent_force_message_op` must persist FE-supplied image and file
+/// blocks into the transcript row (after the text block).
+#[tokio::test]
+async fn force_message_op_persists_attachment_blocks_in_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttachForce").await;
+    let image_blocks = json!([
+        { "type": "image", "data": "imgdata2", "mimeType": "image/jpeg" }
+    ]);
+    let r = svc
+        .agent_force_message_op(
+            id.clone(),
+            "m-force-1".into(),
+            "forced with image".into(),
+            Some(image_blocks),
+            None,
+        )
+        .await
+        .expect("force");
+    assert_eq!(r["queued"], false);
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    let content = &conv["messages"][0]["contentBlocks"];
+    let blocks = content.as_array().expect("content blocks array");
+    assert_eq!(blocks.len(), 2, "text + image blocks: {content}");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "forced with image");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["data"], "imgdata2");
+    assert_eq!(blocks[1]["mimeType"], "image/jpeg");
+}
+
 #[tokio::test]
 async fn summary_reports_counts_and_last_response() {
     let (_t, svc, ws) = setup().await;
@@ -6638,7 +6714,13 @@ async fn agent_force_message_emits_agent_message_event() {
     });
 
     let r = svc
-        .agent_force_message_op(id.clone(), "msg-123".into(), "forced content".into())
+        .agent_force_message_op(
+            id.clone(),
+            "msg-123".into(),
+            "forced content".into(),
+            None,
+            None,
+        )
         .await
         .expect("force");
     assert_eq!(r["success"], json!(true));
