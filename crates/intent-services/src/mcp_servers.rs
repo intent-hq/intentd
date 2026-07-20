@@ -13,14 +13,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_acp::{Connection, ConnectionHooks};
+use intent_core::settings_file::SettingsFile;
 use intent_core::{events::MCP_SERVERS_STATUS_CHANGED, now_iso, Error, Result, WorkspaceId};
-use intent_store::{NewEvent, Store};
+use intent_store::NewEvent;
 use serde_json::{json, Map, Value};
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 use uuid::Uuid;
 
 use crate::settings::{AsyncSecretStore, REDACTED_PLACEHOLDER};
+use crate::settings_registry::SettingsRegistry;
 use crate::{system_actor, EventBus};
 
 /// Keychain account for the sensitive `mcp.servers` setting (§9.8). Mirrors the
@@ -180,38 +182,25 @@ fn validate_transport_fields(obj: &Map<String, Value>, transport: &str) -> Resul
     Ok(())
 }
 
-/// Read the `mcp.enableUserServers` gate (default `true`, §9.8 group A).
-pub(crate) async fn enable_user_servers(store: &Store) -> bool {
-    match store.get_setting("mcp.enableUserServers").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        _ => true,
-    }
+/// The effective `mcp.enableUserServers` gate (default `true`, §9.8 group A).
+pub(crate) fn enable_user_servers(settings: &SettingsFile) -> bool {
+    settings.mcp.enable_user_servers
 }
 
-/// Read the `mcp.disabledServers` list (ids that stay stopped, default `[]`).
-pub(crate) async fn disabled_servers(store: &Store) -> Vec<String> {
-    match store.get_setting("mcp.disabledServers").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .map(|a| {
-                a.into_iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
+/// The effective `mcp.disabledServers` list (ids that stay stopped, default `[]`).
+pub(crate) fn disabled_servers(settings: &SettingsFile) -> Vec<String> {
+    settings.mcp.disabled_servers.clone()
 }
 
-/// Persist the `mcp.disabledServers` list.
-async fn set_disabled_servers(store: &Store, list: &[String]) -> Result<()> {
-    let raw = serde_json::to_string(&json!(list))
-        .map_err(|e| Error::Internal(format!("encode disabledServers failed: {e}")))?;
-    store.set_setting("mcp.disabledServers", &raw).await
+/// Persist the `mcp.disabledServers` list through the registry (`config.toml`).
+/// Without a wired registry (read-only/test wiring) the write is a quiet no-op.
+fn set_disabled_servers(registry: Option<&SettingsRegistry>, list: &[String]) -> Result<()> {
+    match registry {
+        Some(reg) => reg
+            .apply(&[("mcp.disabledServers".to_string(), json!(list))])
+            .map(|_| ()),
+        None => Ok(()),
+    }
 }
 
 /// Read the configured external servers from the sensitive `mcp.servers` secret,
@@ -583,23 +572,34 @@ fn kill_group(
     killpg(Pid::from_raw(pid as i32), sig)
 }
 
-/// Stateless executor for the `mcp.servers.*` namespace (PROTOCOL §5.22) over the
-/// store (`mcp.enableUserServers`/`mcp.disabledServers`), the [`AsyncSecretStore`]
-/// (the sensitive `mcp.servers` config), and the runtime [`McpHub`]. Construct
-/// one per call from the long-lived `Services`.
+/// Stateless executor for the `mcp.servers.*` namespace (PROTOCOL §5.22) over
+/// the settings registry (`mcp.enableUserServers`/`mcp.disabledServers`), the
+/// [`AsyncSecretStore`] (the sensitive `mcp.servers` config), and the runtime
+/// [`McpHub`]. Construct one per call from the long-lived `Services`.
 pub(crate) struct McpServersService<'a> {
-    store: &'a Store,
+    registry: Option<&'a SettingsRegistry>,
     secrets: &'a AsyncSecretStore,
     hub: &'a McpHub,
 }
 
 impl<'a> McpServersService<'a> {
-    pub(crate) fn new(store: &'a Store, secrets: &'a AsyncSecretStore, hub: &'a McpHub) -> Self {
+    pub(crate) fn new(
+        registry: Option<&'a SettingsRegistry>,
+        secrets: &'a AsyncSecretStore,
+        hub: &'a McpHub,
+    ) -> Self {
         Self {
-            store,
+            registry,
             secrets,
             hub,
         }
+    }
+
+    /// The effective typed settings; schema defaults when no registry is wired.
+    fn effective(&self) -> SettingsFile {
+        self.registry
+            .map(|r| r.snapshot().effective.clone())
+            .unwrap_or_default()
     }
 
     /// Fetch one stored config by id, or `NotFound`.
@@ -649,7 +649,7 @@ impl<'a> McpServersService<'a> {
         // Apply live: a running server picks up the new command/env on restart.
         let running = self.hub.status(server_id)["state"] == "running";
         if running {
-            let enable = enable_user_servers(self.store).await;
+            let enable = enable_user_servers(&self.effective());
             self.hub.restart(normalized.clone(), enable).await;
         }
         Ok(json!({ "server": redact_config(&normalized) }))
@@ -680,17 +680,18 @@ impl<'a> McpServersService<'a> {
         configs.insert(server_id.to_string(), config.clone());
         write_configs(self.secrets, &configs).await?;
 
-        let mut disabled = disabled_servers(self.store).await;
+        let settings = self.effective();
+        let mut disabled = disabled_servers(&settings);
         let was_present = disabled.iter().any(|d| d == server_id);
         if enabled {
             disabled.retain(|d| d != server_id);
         } else if !was_present {
             disabled.push(server_id.to_string());
         }
-        set_disabled_servers(self.store, &disabled).await?;
+        set_disabled_servers(self.registry, &disabled)?;
 
         let status = if enabled {
-            let enable = enable_user_servers(self.store).await;
+            let enable = enable_user_servers(&settings);
             self.hub.start(config, enable).await
         } else {
             self.hub.stop(server_id).await;
@@ -702,7 +703,7 @@ impl<'a> McpServersService<'a> {
     /// `mcp.servers.restart` → stop-then-start; `{ status }`.
     pub(crate) async fn restart(&self, server_id: &str) -> Result<Value> {
         let config = self.require_config(server_id).await?;
-        let enable = enable_user_servers(self.store).await;
+        let enable = enable_user_servers(&self.effective());
         let status = self.hub.restart(config, enable).await;
         Ok(json!({ "status": status }))
     }
@@ -717,10 +718,11 @@ impl<'a> McpServersService<'a> {
     /// Start every enabled, non-disabled server (daemon boot). Best-effort: a
     /// failed spawn surfaces as an `error` status event, not a hard failure.
     pub(crate) async fn start_enabled(&self) {
-        if !enable_user_servers(self.store).await {
+        let settings = self.effective();
+        if !enable_user_servers(&settings) {
             return;
         }
-        let disabled = disabled_servers(self.store).await;
+        let disabled = disabled_servers(&settings);
         for (id, config) in read_configs(self.secrets).await {
             let enabled = config
                 .get("enabled")
@@ -985,75 +987,42 @@ mod tests {
         assert_eq!(got, m);
     }
 
-    #[tokio::test]
-    async fn enable_user_servers_defaults_true_without_setting() {
-        let (_tmp, store) = open_store().await;
-        assert!(enable_user_servers(&store).await);
+    /// Fresh registry over a unique temp `config.toml` path.
+    fn temp_registry() -> SettingsRegistry {
+        let path = std::env::temp_dir().join(format!("intentd-mcp-{}.toml", Uuid::new_v4()));
+        SettingsRegistry::load(&path).expect("load registry")
     }
 
-    #[tokio::test]
-    async fn enable_user_servers_reads_false() {
-        let (_tmp, store) = open_store().await;
-        store
-            .set_setting("mcp.enableUserServers", "false")
-            .await
+    #[test]
+    fn enable_user_servers_defaults_true_without_setting() {
+        assert!(enable_user_servers(&SettingsFile::default()));
+    }
+
+    #[test]
+    fn enable_user_servers_reads_false() {
+        let reg = temp_registry();
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
-        assert!(!enable_user_servers(&store).await);
+        assert!(!enable_user_servers(&reg.snapshot().effective));
     }
 
-    #[tokio::test]
-    async fn enable_user_servers_invalid_json_defaults_true() {
-        let (_tmp, store) = open_store().await;
-        store
-            .set_setting("mcp.enableUserServers", "not-json")
-            .await
-            .unwrap();
-        assert!(enable_user_servers(&store).await);
+    #[test]
+    fn disabled_servers_empty_without_setting() {
+        assert!(disabled_servers(&SettingsFile::default()).is_empty());
     }
 
-    #[tokio::test]
-    async fn enable_user_servers_non_bool_defaults_true() {
-        let (_tmp, store) = open_store().await;
-        store
-            .set_setting("mcp.enableUserServers", "42")
-            .await
-            .unwrap();
-        assert!(enable_user_servers(&store).await);
-    }
-
-    #[tokio::test]
-    async fn disabled_servers_empty_without_setting() {
-        let (_tmp, store) = open_store().await;
-        assert!(disabled_servers(&store).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn disabled_servers_round_trip_via_setter() {
-        let (_tmp, store) = open_store().await;
+    #[test]
+    fn disabled_servers_round_trip_via_setter() {
+        let reg = temp_registry();
         let list = vec!["a".to_string(), "b".to_string()];
-        set_disabled_servers(&store, &list).await.unwrap();
-        let got = disabled_servers(&store).await;
+        set_disabled_servers(Some(&reg), &list).unwrap();
+        let got = disabled_servers(&reg.snapshot().effective);
         assert_eq!(got, list);
     }
 
-    #[tokio::test]
-    async fn disabled_servers_invalid_json_returns_empty() {
-        let (_tmp, store) = open_store().await;
-        store
-            .set_setting("mcp.disabledServers", "garbled")
-            .await
-            .unwrap();
-        assert!(disabled_servers(&store).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn disabled_servers_non_array_returns_empty() {
-        let (_tmp, store) = open_store().await;
-        store
-            .set_setting("mcp.disabledServers", "\"x\"")
-            .await
-            .unwrap();
-        assert!(disabled_servers(&store).await.is_empty());
+    #[test]
+    fn set_disabled_servers_without_registry_is_noop() {
+        set_disabled_servers(None, &["a".to_string()]).unwrap();
     }
 
     // -- McpHub: non-spawning lifecycle -----------------------------------
@@ -1176,25 +1145,23 @@ mod tests {
     // -- McpServersService -------------------------------------------------
 
     fn svc<'a>(
-        store: &'a Store,
+        registry: Option<&'a SettingsRegistry>,
         secrets: &'a AsyncSecretStore,
         hub: &'a McpHub,
     ) -> McpServersService<'a> {
-        McpServersService::new(store, secrets, hub)
+        McpServersService::new(registry, secrets, hub)
     }
 
     #[tokio::test]
     async fn list_empty_when_no_configs() {
-        let (_tmp, store) = open_store().await;
         let s = mem_async();
         let h = McpHub::new();
-        let r = svc(&store, &s, &h).list(None).await.unwrap();
+        let r = svc(None, &s, &h).list(None).await.unwrap();
         assert_eq!(r["servers"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn list_sorted_by_id_and_redacts_secrets() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
         let mut m = Map::new();
@@ -1208,7 +1175,7 @@ mod tests {
         );
         write_configs(&secrets, &m).await.unwrap();
 
-        let r = svc(&store, &secrets, &h).list(None).await.unwrap();
+        let r = svc(None, &secrets, &h).list(None).await.unwrap();
         let arr = r["servers"].as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["id"], json!("a"));
@@ -1219,10 +1186,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_persists_and_redacts() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(None, &secrets, &h);
         let out = s
             .create(json!({
                 "id": "n1",
@@ -1241,10 +1207,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_duplicate_id() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(None, &secrets, &h);
         let cfg = json!({ "id": "dup", "transport": "stdio", "command": "x" });
         s.create(cfg.clone()).await.unwrap();
         let err = s.create(cfg).await.unwrap_err();
@@ -1254,10 +1219,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_propagates_normalize_error() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let err = svc(&store, &secrets, &h)
+        let err = svc(None, &secrets, &h)
             .create(json!({ "transport": "stdio" }))
             .await
             .unwrap_err();
@@ -1266,10 +1230,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_returns_not_found_for_unknown_id() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let err = svc(&store, &secrets, &h)
+        let err = svc(None, &secrets, &h)
             .update("missing", json!({ "command": "x" }))
             .await
             .unwrap_err();
@@ -1278,10 +1241,9 @@ mod tests {
 
     #[tokio::test]
     async fn update_pins_id_and_redacts() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(None, &secrets, &h);
         s.create(json!({ "id": "u1", "transport": "stdio", "command": "x" }))
             .await
             .unwrap();
@@ -1306,22 +1268,17 @@ mod tests {
 
     #[tokio::test]
     async fn delete_returns_not_found_for_unknown_id() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let err = svc(&store, &secrets, &h)
-            .delete("missing")
-            .await
-            .unwrap_err();
+        let err = svc(None, &secrets, &h).delete("missing").await.unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
     }
 
     #[tokio::test]
     async fn delete_removes_config_and_returns_success() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(None, &secrets, &h);
         s.create(json!({ "id": "d1", "transport": "stdio", "command": "x" }))
             .await
             .unwrap();
@@ -1332,17 +1289,15 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_enable_with_user_servers_off_returns_stopped_and_persists_flag() {
-        let (_tmp, store) = open_store().await;
+        let reg = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(Some(&reg), &secrets, &h);
         s.create(json!({ "id": "t1", "transport": "stdio", "command": "x", "enabled": false }))
             .await
             .unwrap();
         // Gate off: even toggle(true) yields stopped status.
-        store
-            .set_setting("mcp.enableUserServers", "false")
-            .await
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
 
         let out = s.toggle("t1", true).await.unwrap();
@@ -1350,15 +1305,17 @@ mod tests {
         // Persisted enabled flag flipped to true.
         assert_eq!(read_configs(&secrets).await["t1"]["enabled"], json!(true));
         // Enabled means the id should NOT be in disabledServers.
-        assert!(!disabled_servers(&store).await.iter().any(|d| d == "t1"));
+        assert!(!disabled_servers(&reg.snapshot().effective)
+            .iter()
+            .any(|d| d == "t1"));
     }
 
     #[tokio::test]
     async fn toggle_disable_emits_stopped_and_tracks_disabled_list() {
-        let (_tmp, store) = open_store().await;
+        let reg = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(Some(&reg), &secrets, &h);
         s.create(json!({ "id": "t2", "transport": "stdio", "command": "x", "enabled": true }))
             .await
             .unwrap();
@@ -1366,44 +1323,41 @@ mod tests {
         let out = s.toggle("t2", false).await.unwrap();
         assert_eq!(out["status"]["state"], json!("stopped"));
         assert_eq!(read_configs(&secrets).await["t2"]["enabled"], json!(false));
-        assert!(disabled_servers(&store).await.iter().any(|d| d == "t2"));
+        assert!(disabled_servers(&reg.snapshot().effective)
+            .iter()
+            .any(|d| d == "t2"));
 
         // Disabling again is idempotent — id appears only once.
         s.toggle("t2", false).await.unwrap();
-        let list = disabled_servers(&store).await;
+        let list = disabled_servers(&reg.snapshot().effective);
         assert_eq!(list.iter().filter(|d| *d == "t2").count(), 1);
     }
 
     #[tokio::test]
     async fn toggle_enable_removes_id_from_disabled_list() {
-        let (_tmp, store) = open_store().await;
+        let reg = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(Some(&reg), &secrets, &h);
         s.create(json!({ "id": "t3", "transport": "stdio", "command": "x" }))
             .await
             .unwrap();
         // Pre-populate the disabled list.
-        set_disabled_servers(&store, &["t3".to_string(), "other".to_string()])
-            .await
-            .unwrap();
-        store
-            .set_setting("mcp.enableUserServers", "false")
-            .await
+        set_disabled_servers(Some(&reg), &["t3".to_string(), "other".to_string()]).unwrap();
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
 
         let _ = s.toggle("t3", true).await.unwrap();
-        let list = disabled_servers(&store).await;
+        let list = disabled_servers(&reg.snapshot().effective);
         assert!(!list.iter().any(|d| d == "t3"));
         assert!(list.iter().any(|d| d == "other"));
     }
 
     #[tokio::test]
     async fn toggle_returns_not_found_for_unknown_id() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let err = svc(&store, &secrets, &h)
+        let err = svc(None, &secrets, &h)
             .toggle("ghost", true)
             .await
             .unwrap_err();
@@ -1412,28 +1366,22 @@ mod tests {
 
     #[tokio::test]
     async fn restart_returns_not_found_for_unknown_id() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let err = svc(&store, &secrets, &h)
-            .restart("ghost")
-            .await
-            .unwrap_err();
+        let err = svc(None, &secrets, &h).restart("ghost").await.unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
     }
 
     #[tokio::test]
     async fn restart_returns_stopped_when_user_servers_gate_off() {
-        let (_tmp, store) = open_store().await;
+        let reg = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(Some(&reg), &secrets, &h);
         s.create(json!({ "id": "r1", "transport": "stdio", "command": BOGUS_CMD }))
             .await
             .unwrap();
-        store
-            .set_setting("mcp.enableUserServers", "false")
-            .await
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
         let out = s.restart("r1").await.unwrap();
         assert_eq!(out["status"]["state"], json!("stopped"));
@@ -1441,10 +1389,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_returns_not_found_for_unknown_id() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let err = svc(&store, &secrets, &h)
+        let err = svc(None, &secrets, &h)
             .get_status("ghost")
             .await
             .unwrap_err();
@@ -1453,10 +1400,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_returns_stopped_for_known_but_inactive_server() {
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
-        let s = svc(&store, &secrets, &h);
+        let s = svc(None, &secrets, &h);
         s.create(json!({ "id": "g1", "transport": "stdio", "command": "x" }))
             .await
             .unwrap();
@@ -1466,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_enabled_no_op_when_gate_off() {
-        let (_tmp, store) = open_store().await;
+        let reg = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         // Even a config that would normally be started is skipped.
@@ -1476,19 +1422,17 @@ mod tests {
             json!({"id":"x","command":BOGUS_CMD,"enabled":true}),
         );
         write_configs(&secrets, &m).await.unwrap();
-        store
-            .set_setting("mcp.enableUserServers", "false")
-            .await
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
 
-        svc(&store, &secrets, &h).start_enabled().await;
+        svc(Some(&reg), &secrets, &h).start_enabled().await;
         // Nothing was started.
         assert_eq!(h.status("x"), status_stopped("x"));
     }
 
     #[tokio::test]
     async fn start_enabled_skips_disabled_ids_and_disabled_configs() {
-        let (_tmp, store) = open_store().await;
+        let reg = temp_registry();
         let secrets = mem_async();
         let h = McpHub::new();
         let mut m = Map::new();
@@ -1503,11 +1447,9 @@ mod tests {
             json!({"id":"off","command":BOGUS_CMD,"enabled":false}),
         );
         write_configs(&secrets, &m).await.unwrap();
-        set_disabled_servers(&store, &["blocked".to_string()])
-            .await
-            .unwrap();
+        set_disabled_servers(Some(&reg), &["blocked".to_string()]).unwrap();
 
-        svc(&store, &secrets, &h).start_enabled().await;
+        svc(Some(&reg), &secrets, &h).start_enabled().await;
 
         // Neither id was started (no error status from a failed spawn either).
         assert_eq!(h.status("blocked"), status_stopped("blocked"));
@@ -1519,7 +1461,6 @@ mod tests {
         // Eligible config has enabled=true and is NOT in disabledServers; the gate
         // is on by default. A bogus command makes spawn fail fast (error status),
         // which is the best-effort branch we want to cover.
-        let (_tmp, store) = open_store().await;
         let secrets = mem_async();
         let h = McpHub::new();
         let mut m = Map::new();
@@ -1529,7 +1470,7 @@ mod tests {
         );
         write_configs(&secrets, &m).await.unwrap();
 
-        svc(&store, &secrets, &h).start_enabled().await;
+        svc(None, &secrets, &h).start_enabled().await;
         // Spawn failed → no live entry → status stays stopped.
         assert_eq!(h.status("go"), status_stopped("go"));
     }

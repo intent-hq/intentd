@@ -2,27 +2,38 @@
 //!
 //! Owns the [`SettingDefinition`] schema (groups A + B of §9.8), type/enum/
 //! min/max validation, and the redaction rule for **sensitive** settings.
-//! Non-secret values persist in the `settings` table (`intent-store`); sensitive
-//! values (`mcp.servers`, `server.auth.token`, `sourceControl.github.token`,
-//! `linear.token`, `accounts.sentry.token`, `ai.apiToken`) live in the
-//! file-backed secrets store (`~/intent/secrets.json`, via
-//! [`intent_core::FileSecretStore`]) behind the [`SecretStore`] seam and are
-//! **never** returned in plaintext over the wire — list/get redact them to
-//! presence/placeholder only, and `server.auth.token` is read-only.
-//! `workspace.sshKeyPath` is a plain non-secret **path** setting (the real
-//! secret is the key file on disk); the FE `git`-env consumer must read the
-//! value back verbatim.
+//! Non-secret **TOML-backed** values (the [`KNOWN_PATHS`] catalog subset) are
+//! read from and written to the layered [`SettingsRegistry`] (`config.toml`);
+//! the remaining non-secret keys (SQLite-backed machine-state blobs such as
+//! `workspace.changeHistory` / `permissions.rules`) persist in the `settings`
+//! table (`intent-store`). Sensitive values (`mcp.servers`,
+//! `server.auth.token`, `sourceControl.github.token`, `linear.token`,
+//! `accounts.sentry.token`, `ai.apiToken`) live in the file-backed secrets
+//! store (`~/intent/secrets.json`, via [`intent_core::FileSecretStore`])
+//! behind the [`SecretStore`] seam and are **never** returned in plaintext
+//! over the wire — list/get redact them to presence/placeholder only, and
+//! `server.auth.token` is read-only. `workspace.sshKeyPath` is a plain
+//! non-secret **path** setting (the real secret is the key file on disk); the
+//! FE `git`-env consumer must read the value back verbatim.
+//!
+//! Internal readers of TOML-backed keys (e.g. [`branch_prefix`],
+//! [`max_concurrent_agents`]) consume the effective typed [`SettingsFile`]
+//! from the registry snapshot (`Services::effective_settings`); the SQLite
+//! `settings` table only persists the machine-state blobs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use intent_core::settings_file::SettingsFile;
 use intent_core::{Error, Result};
 use serde_json::{json, Map, Value};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
 use intent_store::Store;
+
+use crate::settings_registry::{SettingsRegistry, KNOWN_PATHS};
 
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
 /// the wire conveys presence without ever leaking the plaintext (§9.8).
@@ -1184,74 +1195,107 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
     ]
 }
 
-/// Read the effective `workspace.branchPrefix` (default empty) — prepended to
-/// auto-generated workspace branch names (TS `getBranchPrefix` parity). A
-/// missing/garbled row means "no prefix".
-pub(crate) async fn branch_prefix(store: &Store) -> String {
-    match store.get_setting("workspace.branchPrefix").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default(),
-        _ => String::new(),
+/// The effective `workspace.branchPrefix` (default empty) — prepended to
+/// auto-generated workspace branch names (TS `getBranchPrefix` parity).
+pub(crate) fn branch_prefix(settings: &SettingsFile) -> String {
+    settings.workspace.branch_prefix.clone().unwrap_or_default()
+}
+
+/// The effective `agents.maxConcurrent` setting: a positive integer sets an
+/// explicit cap; 0 (the default) means "auto" (RAM-based cap via
+/// `default_process_cap`). The typed schema already rejects negative /
+/// out-of-range / garbled values.
+pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
+    let n = settings.agents.max_concurrent;
+    (n > 0).then_some(n as usize)
+}
+
+/// Normalize a registry-read value for the wire: `Number`-typed settings are
+/// reported as floats (`5181.0`), matching the numeric shape the catalog
+/// defaults always had, so clients see one shape regardless of origin.
+fn wire_value(def: &SettingDefinition, value: Value) -> Value {
+    match def.ty {
+        SettingType::Number { .. } => match value.as_f64() {
+            Some(n) => json!(n),
+            None => value,
+        },
+        _ => value,
     }
 }
 
-/// Read the effective `git.autoCommit` flag (default `true`) — the gate behind
-/// `assert_agent_commit_allowed` (§9.8 OQ#2). A missing/garbled row defaults to
-/// the permissive `true` so the established auto-commit behavior is preserved.
-pub(crate) async fn auto_commit_enabled(store: &Store) -> bool {
-    match store.get_setting("git.autoCommit").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        _ => true,
+/// Coerce a validated wire value for the typed registry schema: whole-valued
+/// floats become integers so `u16`/`u32` fields (e.g. `server.port`) accept
+/// the `5182.0` shape JSON clients commonly send. Float fields re-accept
+/// integers via the schema's lenient deserializer.
+fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
+    if let SettingType::Number { .. } = def.ty {
+        if let Some(n) = value.as_f64() {
+            if n.is_finite() && n.fract() == 0.0 && n.abs() <= i64::MAX as f64 {
+                return json!(n as i64);
+            }
+        }
     }
-}
-
-/// Read the effective `rtk.enabled` flag (default `false`). A missing/garbled
-/// row defaults to `false` (disabled) — RTK prompt injection is opt-in.
-pub(crate) async fn rtk_enabled(store: &Store) -> bool {
-    match store.get_setting("rtk.enabled").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-/// Read the effective `agents.maxConcurrent` setting: a positive integer sets an
-/// explicit cap; 0 (the default), negative, unset, or garbled means "auto"
-/// (RAM-based cap via [`intent_services::default_process_cap`]).
-pub async fn max_concurrent_agents(store: &Store) -> Option<usize> {
-    match store.get_setting("agents.maxConcurrent").await {
-        Ok(Some(raw)) => serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|v| v.as_f64()) // accept both integer and whole-valued float forms
-            .filter(|&n| n.is_finite() && n.fract() == 0.0 && n > 0.0 && n <= 200.0)
-            .and_then(|n| usize::try_from(n as u64).ok()),
-        _ => None,
-    }
+    value.clone()
 }
 
 /// Stateless executor for the `settings.*` namespace over a [`Store`] +
-/// [`AsyncSecretStore`]. Construct one per call from the long-lived `Services`.
+/// [`AsyncSecretStore`] + optional [`SettingsRegistry`]. Construct one per
+/// call from the long-lived `Services`. When the registry is wired (the
+/// production composition root always wires it), the TOML-backed
+/// [`KNOWN_PATHS`] keys read from and write through the registry
+/// (`config.toml`); without it, every non-secret key keeps the legacy
+/// SQLite path (read-only test wiring).
 pub(crate) struct SettingsService<'a> {
     store: &'a Store,
     secrets: &'a AsyncSecretStore,
+    registry: Option<&'a SettingsRegistry>,
 }
 
 impl<'a> SettingsService<'a> {
-    pub(crate) fn new(store: &'a Store, secrets: &'a AsyncSecretStore) -> Self {
-        Self { store, secrets }
+    pub(crate) fn new(
+        store: &'a Store,
+        secrets: &'a AsyncSecretStore,
+        registry: Option<&'a SettingsRegistry>,
+    ) -> Self {
+        Self {
+            store,
+            secrets,
+            registry,
+        }
+    }
+
+    /// The registry serving `path`, when it is a TOML-backed key and the
+    /// registry is wired. `None` falls back to the legacy SQLite path.
+    fn registry_for(&self, path: &str) -> Option<&'a SettingsRegistry> {
+        self.registry.filter(|_| KNOWN_PATHS.contains(&path))
+    }
+
+    /// The wire `origin` for a TOML-backed key (`default` | `file` | `flag`),
+    /// or `None` for secrets / SQLite-backed keys (no origin on the wire).
+    fn origin_for(&self, path: &str) -> Option<&'static str> {
+        self.registry_for(path)
+            .and_then(|reg| reg.origin(path))
+            .map(|o| o.as_str())
+    }
+
+    /// The current value for a **non-secret** definition: TOML-backed keys
+    /// read the registry's effective snapshot (defaults ⊕ file ⊕ pins);
+    /// SQLite-backed keys read the DB, falling back to the default.
+    async fn non_secret_value(&self, def: &SettingDefinition) -> Value {
+        if let Some(reg) = self.registry_for(def.path) {
+            return wire_value(def, reg.get(def.path).unwrap_or(Value::Null));
+        }
+        match self.store.get_setting(def.path).await {
+            Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or(Value::Null),
+            _ => def.default_value.clone().unwrap_or(Value::Null),
+        }
     }
 
     /// The current value for a definition: sensitive settings are **redacted**
     /// (placeholder when present, `null` when absent — never plaintext);
-    /// non-secret settings come from the DB, falling back to the default.
-    /// Best-effort: load errors (timeout/backing failure) treated as absent for display.
+    /// non-secret settings come from the registry/DB, falling back to the
+    /// default. Best-effort: load errors (timeout/backing failure) treated as
+    /// absent for display.
     async fn current_value(&self, def: &SettingDefinition) -> Value {
         if def.sensitive {
             match self.secrets.load(def.path).await {
@@ -1259,10 +1303,7 @@ impl<'a> SettingsService<'a> {
                 Ok(None) | Err(_) => Value::Null,
             }
         } else {
-            match self.store.get_setting(def.path).await {
-                Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or(Value::Null),
-                _ => def.default_value.clone().unwrap_or(Value::Null),
-            }
+            self.non_secret_value(def).await
         }
     }
 
@@ -1308,35 +1349,45 @@ impl<'a> SettingsService<'a> {
                     Value::Null
                 }
             } else {
-                match self.store.get_setting(def.path).await {
-                    Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or(Value::Null),
-                    _ => def.default_value.clone().unwrap_or(Value::Null),
-                }
+                self.non_secret_value(def).await
             };
             let mut obj = def.definition_json();
             if let Some(map) = obj.as_object_mut() {
                 map.insert("value".into(), value);
+                if let Some(origin) = self.origin_for(def.path) {
+                    map.insert("origin".into(), json!(origin));
+                }
             }
             out.push(obj);
         }
         Ok(json!({ "settings": out }))
     }
 
-    /// `settings.get` → `{ path, value, definition }`; unknown path → `-32602`.
+    /// `settings.get` → `{ path, value, definition }` (+ `origin` for
+    /// TOML-backed keys: `default` | `file` | `flag`); unknown path → `-32602`.
     pub(crate) async fn get(&self, path: &str) -> Result<Value> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         let value = self.current_value(&def).await;
-        Ok(json!({
+        let mut out = json!({
             "path": def.path,
             "value": value,
             "definition": def.definition_json(),
-        }))
+        });
+        if let Some(origin) = self.origin_for(def.path) {
+            out["origin"] = json!(origin);
+        }
+        Ok(out)
     }
 
     /// `settings.update` — validate the whole batch first (unknown path,
     /// read-only path, or type/enum/min/max failure → `-32602`, nothing
-    /// applied), then persist. Returns the **redacted** applied `{ path, value }`
+    /// applied), then persist. TOML-backed keys go through the registry as
+    /// **one atomic apply** (typed-schema + pin validation, single
+    /// comment-preserving `config.toml` rewrite; a flag-pinned key rejects the
+    /// whole batch with `-32602` before anything mutates) and never touch the
+    /// SQLite `settings` table. Secrets and state-blob keys keep their
+    /// existing stores. Returns the **redacted** applied `{ path, value }`
     /// pairs for the response + `settings:changed` payload.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
@@ -1360,6 +1411,20 @@ impl<'a> SettingsService<'a> {
             planned.push((def, value));
         }
 
+        // Apply the TOML-backed subset first, as one atomic registry batch:
+        // unknown/pinned keys and typed-schema violations reject here with
+        // `-32602` before ANY store (secret, DB, file) has been touched.
+        if let Some(reg) = self.registry {
+            let registry_changes: Vec<(String, Value)> = planned
+                .iter()
+                .filter(|(def, _)| KNOWN_PATHS.contains(&def.path))
+                .map(|(def, value)| (def.path.to_string(), registry_value(def, value)))
+                .collect();
+            if !registry_changes.is_empty() {
+                reg.apply(&registry_changes)?;
+            }
+        }
+
         let mut applied = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             if def.sensitive {
@@ -1369,6 +1434,9 @@ impl<'a> SettingsService<'a> {
                 };
                 self.secrets.store(def.path, &secret_value).await?;
                 applied.push(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }));
+            } else if self.registry_for(def.path).is_some() {
+                // Already applied via the registry batch above.
+                applied.push(json!({ "path": def.path, "value": value }));
             } else {
                 let raw = serde_json::to_string(&value)
                     .map_err(|e| Error::Internal(format!("encode setting failed: {e}")))?;
@@ -1379,13 +1447,17 @@ impl<'a> SettingsService<'a> {
         Ok(applied)
     }
 
-    /// `settings.reset` → restore the default (delete the persisted/secret value)
-    /// and return the **redacted** `{ path, value }`; unknown path → `-32602`.
+    /// `settings.reset` → restore the default (remove the key from
+    /// `config.toml` for TOML-backed keys / delete the persisted or secret
+    /// value otherwise) and return the **redacted** `{ path, value }`;
+    /// unknown path → `-32602`, flag-pinned key → `-32602`.
     pub(crate) async fn reset(&self, path: &str) -> Result<Value> {
         let def = find_definition(path)
             .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
         if def.sensitive {
             self.secrets.delete(def.path).await?;
+        } else if let Some(reg) = self.registry_for(def.path) {
+            reg.apply(&[(def.path.to_string(), Value::Null)])?;
         } else {
             self.store.delete_setting(def.path).await?;
         }
@@ -1637,7 +1709,7 @@ mod tests {
             hang_for: Duration::from_secs(30),
         });
         let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets);
+        let svc = SettingsService::new(&store, &secrets, None);
 
         let started = std::time::Instant::now();
         // Outer cap: single-flight + TTL cache in AsyncSecretStore bounds the
@@ -1694,7 +1766,7 @@ mod tests {
             hang_for: Duration::from_secs(30),
         });
         let secrets = AsyncSecretStore::new(secrets);
-        let svc = SettingsService::new(&store, &secrets);
+        let svc = SettingsService::new(&store, &secrets, None);
 
         let started = std::time::Instant::now();
         // AsyncSecretStore's write budget is DEFAULT_WRITE_TIMEOUT; use it plus
@@ -1725,53 +1797,53 @@ mod tests {
         }
     }
 
-    /// `max_concurrent_agents` reads `agents.maxConcurrent`: positive value →
-    /// explicit override; 0 / unset / invalid / negative → `None` (fallback to
-    /// `default_process_cap()`). The schema sets default 0, min 0 so "auto" is
-    /// the default and negative values are rejected by validation.
-    #[tokio::test]
-    async fn max_concurrent_agents_resolves_override_or_auto() {
-        let tmp = std::env::temp_dir().join(format!("intent-test-{}", uuid::Uuid::new_v4()));
-        let store = intent_store::Store::open(&tmp).await.unwrap();
-
-        // Unset → None (auto).
-        assert_eq!(max_concurrent_agents(&store).await, None);
-
-        // 0 (the schema default) → None (auto).
-        store
-            .set_setting("agents.maxConcurrent", "0")
-            .await
-            .unwrap();
-        assert_eq!(max_concurrent_agents(&store).await, None);
+    /// `max_concurrent_agents` reads the effective `agents.maxConcurrent`:
+    /// positive value → explicit override; 0 (the schema default) → `None`
+    /// (fallback to `default_process_cap()`). Negative / garbled values are
+    /// rejected by the registry's typed validation before ever reaching here.
+    #[test]
+    fn max_concurrent_agents_resolves_override_or_auto() {
+        // Default (0) → None (auto).
+        let mut settings = SettingsFile::default();
+        assert_eq!(max_concurrent_agents(&settings), None);
 
         // Positive integer → Some(cap).
-        store
-            .set_setting("agents.maxConcurrent", "12")
-            .await
-            .unwrap();
-        assert_eq!(max_concurrent_agents(&store).await, Some(12));
+        settings.agents.max_concurrent = 12;
+        assert_eq!(max_concurrent_agents(&settings), Some(12));
+    }
 
-        // Whole-valued float (e.g., 12.0 from some JSON serializers) → Some(cap).
-        store
-            .set_setting("agents.maxConcurrent", "12.0")
-            .await
-            .unwrap();
-        assert_eq!(max_concurrent_agents(&store).await, Some(12));
+    /// Q1 regression: with the registry wired (production composition), a
+    /// `settings.update` of a TOML-backed key persists to `config.toml` only —
+    /// it must NOT write a row to the SQLite `settings` table, which now holds
+    /// machine-state blobs + dynamic non-TOML keys exclusively.
+    #[tokio::test]
+    async fn update_of_toml_backed_key_does_not_write_sqlite() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-nodb-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-nodb-{tag}.toml"));
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
-        // Garbled / non-numeric → None (fallback to auto).
-        store
-            .set_setting("agents.maxConcurrent", "\"not-a-number\"")
+        svc.update(&json!([{ "path": "git.autoCommit", "value": false }]))
             .await
-            .unwrap();
-        assert_eq!(max_concurrent_agents(&store).await, None);
+            .expect("update TOML-backed key");
 
-        // Negative (should be rejected by schema, but defensively handle) → None.
-        store
-            .set_setting("agents.maxConcurrent", "-5")
-            .await
-            .unwrap();
-        assert_eq!(max_concurrent_agents(&store).await, None);
+        // Effective value comes from the registry (config.toml)…
+        assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
+        // …and the SQLite settings table stays untouched.
+        assert_eq!(
+            store
+                .get_setting("git.autoCommit")
+                .await
+                .expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
 
+        let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
                 "{}{suffix}",

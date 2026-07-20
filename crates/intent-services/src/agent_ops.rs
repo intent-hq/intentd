@@ -70,21 +70,23 @@ mod tests_specialist_frontmatter;
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
-async fn resolve_default_model_from_settings(
+fn resolve_default_model_from_settings(
     services: &Services,
     workspace_id: &WorkspaceId,
     is_background: bool,
     agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
+    let settings = services.effective_settings();
+
     // 1. Check workspace-specific override
-    if let Ok(Some(raw)) = services.store.get_setting("model.workspaceOverrides").await {
-        if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
-            if let Some(model) = overrides.get(workspace_id.as_str()).and_then(Value::as_str) {
-                if !model.is_empty() {
-                    return Some(model.to_string());
-                }
-            }
+    if let Some(model) = settings
+        .model
+        .workspace_overrides
+        .get(workspace_id.as_str())
+    {
+        if !model.is_empty() {
+            return Some(model.clone());
         }
     }
 
@@ -92,54 +94,35 @@ async fn resolve_default_model_from_settings(
     if is_background {
         // 2a. Check agent type override
         if let Some(typ) = agent_type {
-            if let Ok(Some(raw)) = services
-                .store
-                .get_setting("backgroundAgents.typeOverrides")
-                .await
-            {
-                if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(model) = overrides.get(typ).and_then(Value::as_str) {
-                        if !model.is_empty() {
-                            return Some(model.to_string());
-                        }
-                    }
+            if let Some(model) = settings.background_agents.type_overrides.get(typ) {
+                if !model.is_empty() {
+                    return Some(model.clone());
                 }
             }
         }
 
         // 2b. Check background agents default
-        if let Ok(Some(raw)) = services
-            .store
-            .get_setting("backgroundAgents.defaultModel")
-            .await
+        if let Some(model) = settings
+            .background_agents
+            .default_model
+            .as_deref()
+            .filter(|m| !m.is_empty())
         {
-            if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
-                if !model.is_empty() {
-                    return Some(model);
-                }
-            }
+            return Some(model.to_string());
         }
     }
 
     // 3. Check provider defaults
     let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
-    if let Ok(Some(raw)) = services.store.get_setting("model.providerDefaults").await {
-        if let Ok(Value::Object(defaults)) = serde_json::from_str::<Value>(&raw) {
-            if let Some(model) = defaults.get(provider_key).and_then(Value::as_str) {
-                if !model.is_empty() {
-                    return Some(model.to_string());
-                }
-            }
+    if let Some(model) = settings.model.provider_defaults.get(provider_key) {
+        if !model.is_empty() {
+            return Some(model.clone());
         }
     }
 
     // 4. Check global default
-    if let Ok(Some(raw)) = services.store.get_setting("model.default").await {
-        if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
-            if !model.is_empty() {
-                return Some(model);
-            }
-        }
+    if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
+        return Some(model.to_string());
     }
 
     // 5. None → CLI default (session.model stays None)
@@ -1362,7 +1345,6 @@ impl Services {
                             specialist.as_deref(),
                             provider.as_deref(),
                         )
-                        .await
                     }
                 }
             }

@@ -2906,12 +2906,9 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 /// provider (auggie), no model, and the temp dir as cwd (no workspace path).
 #[tokio::test]
 async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
-    let db = TempDb::new();
-    let store = Store::open(&db.path).await.expect("store opens");
+    let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
-    let resolved = resolve_spawn(&session, None, &store)
-        .await
-        .expect("default resolves");
+    let resolved = resolve_spawn(&session, None, &settings).expect("default resolves");
     assert_eq!(
         resolved.provider.id,
         intent_providers::default_provider_id()
@@ -2932,13 +2929,10 @@ async fn resolve_spawn_parses_compound_model_id() {
         eprintln!("skipping: npx not available on this host");
         return;
     }
-    let db = TempDb::new();
-    let store = Store::open(&db.path).await.expect("store opens");
+    let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.model = Some("claude-code:sonnet".to_string());
-    let resolved = resolve_spawn(&session, None, &store)
-        .await
-        .expect("compound resolves");
+    let resolved = resolve_spawn(&session, None, &settings).expect("compound resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     assert_eq!(
@@ -2997,14 +2991,11 @@ fn resolve_npx_only_rejects_non_npx_only_provider() {
 /// compound prefix is the user's latest intent.
 #[tokio::test]
 async fn resolve_spawn_compound_prefix_wins_over_session_provider() {
-    let db = TempDb::new();
-    let store = Store::open(&db.path).await.expect("store opens");
+    let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
     session.model = Some("opencode:opencode-go/kimi-k3".to_string());
-    let resolved = resolve_spawn(&session, None, &store)
-        .await
-        .expect("compound prefix wins");
+    let resolved = resolve_spawn(&session, None, &settings).expect("compound prefix wins");
     // The compound prefix (opencode) should win over session.provider (auggie).
     assert_eq!(resolved.provider.id, "opencode");
     // The model string is the bare half.
@@ -3014,14 +3005,11 @@ async fn resolve_spawn_compound_prefix_wins_over_session_provider() {
 /// Session.provider is used as a fallback for bare model ids (no `:` prefix).
 #[tokio::test]
 async fn resolve_spawn_session_provider_fallback_for_bare_model() {
-    let db = TempDb::new();
-    let store = Store::open(&db.path).await.expect("store opens");
+    let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
     session.model = Some("gpt-5.3-codex/high".to_string());
-    let resolved = resolve_spawn(&session, None, &store)
-        .await
-        .expect("session provider fallback");
+    let resolved = resolve_spawn(&session, None, &settings).expect("session provider fallback");
     // Bare model → session.provider is used.
     assert_eq!(resolved.provider.id, "codex");
     // The bare model is passed through as-is.
@@ -3032,8 +3020,7 @@ async fn resolve_spawn_session_provider_fallback_for_bare_model() {
 /// path silently falls back to the temp dir.
 #[tokio::test]
 async fn resolve_spawn_prefers_existing_workspace_path() {
-    let db = TempDb::new();
-    let store = Store::open(&db.path).await.expect("store opens");
+    let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
     let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&ws_dir).unwrap();
@@ -3074,8 +3061,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         token_usage: None,
         cow_supported: None,
     };
-    let resolved = resolve_spawn(&session, Some(&workspace), &store)
-        .await
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings)
         .expect("existing workspace path resolves");
     assert_eq!(resolved.cwd, ws_dir);
 
@@ -3086,9 +3072,8 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
             .display()
             .to_string(),
     );
-    let resolved = resolve_spawn(&session, Some(&workspace), &store)
-        .await
-        .expect("falls back to temp");
+    let resolved =
+        resolve_spawn(&session, Some(&workspace), &settings).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
 
     let _ = std::fs::remove_dir_all(&ws_dir);
@@ -3486,9 +3471,14 @@ mod merge_user_mcp_servers_tests {
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
         let secrets = Arc::new(InMemorySecretStore::default());
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-merge-mcp-{}.toml", uuid::Uuid::new_v4()));
+        let registry =
+            Arc::new(crate::SettingsRegistry::load(&config_path).expect("load registry"));
         let services = Services::new(store)
             .with_event_bus(bus.clone())
-            .with_secret_store(secrets.clone() as Arc<dyn SecretStore>);
+            .with_secret_store(secrets.clone() as Arc<dyn SecretStore>)
+            .with_settings_registry(registry);
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
         (tmp, AgentManager::new(services, sink, 8), secrets)
     }
@@ -3508,9 +3498,9 @@ mod merge_user_mcp_servers_tests {
                                  "command": "node", "enabled": true } }),
         );
         mgr.services
-            .store
-            .set_setting("mcp.enableUserServers", "false")
-            .await
+            .settings_registry()
+            .unwrap()
+            .apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
         let mut out = NormalizedMcpServers::new();
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
@@ -3558,12 +3548,9 @@ mod merge_user_mcp_servers_tests {
             }),
         );
         mgr.services
-            .store
-            .set_setting(
-                "mcp.disabledServers",
-                &serde_json::to_string(&json!(["srv-glo"])).unwrap(),
-            )
-            .await
+            .settings_registry()
+            .unwrap()
+            .apply(&[("mcp.disabledServers".to_string(), json!(["srv-glo"]))])
             .unwrap();
         let mut out = NormalizedMcpServers::new();
         mgr.merge_user_mcp_servers(&mut out).await.unwrap();
