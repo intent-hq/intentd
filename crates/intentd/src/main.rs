@@ -405,6 +405,10 @@ async fn cmd_serve(
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
+    // WAL growth when continuous readers hold long-lived transactions. Aborted
+    // during shutdown before Store::close().
+    let checkpoint_handle = store.spawn_periodic_wal_checkpoint();
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
@@ -856,6 +860,9 @@ async fn cmd_serve(
     mcp_monitor.abort();
     mcp_hub.shutdown().await;
     manager.shutdown().await;
+
+    // Stop the periodic WAL checkpoint task before closing the store.
+    checkpoint_handle.abort();
 
     // Close the store pool gracefully, checkpointing the WAL so settings and
     // other persisted data are visible to the next daemon instance (regression:
@@ -2147,7 +2154,7 @@ async fn report_db_health(store: &Store) {
     // Can return multiple rows if issues are found; treat anything other
     // than a single "ok" row as a warning.
     match sqlx::query("PRAGMA integrity_check")
-        .fetch_all(store.pool())
+        .fetch_all(store.read_pool())
         .await
     {
         Ok(rows) => {
@@ -2177,7 +2184,7 @@ async fn report_db_health(store: &Store) {
     // were checkpointed. PASSIVE mode does not block writers. busy > 0 means the
     // checkpoint couldn't complete.
     match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-        .fetch_one(store.pool())
+        .fetch_one(store.write_pool())
         .await
     {
         Ok(row) => {
@@ -2214,11 +2221,17 @@ async fn report_db_health(store: &Store) {
         }
     }
 
-    // Connection pool stats: report size and idle connections
-    let pool = store.pool();
-    let size = pool.size();
-    let idle = pool.num_idle();
-    println!("  [ok] pool: size={}, idle={}", size, idle);
+    // Connection pool stats: report size and idle connections for both pools
+    let write_pool = store.write_pool();
+    let write_size = write_pool.size();
+    let write_idle = write_pool.num_idle();
+    let read_pool = store.read_pool();
+    let read_size = read_pool.size();
+    let read_idle = read_pool.num_idle();
+    println!(
+        "  [ok] write_pool: size={}, idle={} | read_pool: size={}, idle={}",
+        write_size, write_idle, read_size, read_idle
+    );
 }
 
 #[cfg(unix)]

@@ -24,7 +24,7 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(&agent_id.0)
         .bind(&client_id.0)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("get draft failed: {e}")))?;
         row.as_ref().map(map_draft_row).transpose()
@@ -51,7 +51,7 @@ impl Store {
         .bind(&client_id.0)
         .bind(text)
         .bind(&now)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert draft failed: {e}")))?;
         Ok(now)
@@ -71,7 +71,7 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(&agent_id.0)
         .bind(&client_id.0)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("delete draft failed: {e}")))?;
         Ok(res.rows_affected() > 0)

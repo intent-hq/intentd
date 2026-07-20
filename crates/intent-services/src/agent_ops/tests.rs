@@ -5943,6 +5943,195 @@ async fn deliv1_wake_or_create_persists_block_metadata_alongside_runtime_drive()
     manager.stop(&agent_id).await;
 }
 
+/// STAB-118 regression: SUB-1 delegation-group dedupe.
+/// When a coordinator delegates children with `waitMode: after_all` then sends
+/// coordination messages (triggering SUB-1 auto-watch), the parent should receive exactly
+/// ONE aggregated wake (not individual wakes + aggregated).
+///
+/// Repro: parent delegates 2 children with after_all, triggers SUB-1 watch registration
+/// for each (simulating sendToTask/agent.send), both children complete.
+/// Before fix: parent received individual wake for child A, aggregated "All 2 settled"
+/// wake, AND duplicate individual wake for child B.
+/// After fix: parent receives exactly ONE aggregated wake.
+#[tokio::test]
+async fn sub1_sendtotask_after_all_no_duplicate_wake() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // Delegate 2 children with after_all
+    let resp1 = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("child A task".into()),
+                wait_mode: Some("after_all".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate child A");
+    let child_a = AgentId::from(resp1["agentId"].as_str().expect("agentId"));
+
+    let resp2 = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("child B task".into()),
+                wait_mode: Some("after_all".into()),
+                ..Default::default()
+            },
+            Some(parent.clone()),
+        )
+        .await
+        .expect("delegate child B");
+    let child_b = AgentId::from(resp2["agentId"].as_str().expect("agentId"));
+
+    // Verify delegation group was created with both children
+    let subs = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs");
+    let groups = subs["delegationGroups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 1, "exactly one delegation group");
+    let group = &groups[0];
+    assert_eq!(group["awaitMode"], "all");
+    let expected_ids = group["expectedAgentIds"].as_array().expect("expected");
+    assert_eq!(expected_ids.len(), 2, "both children in group");
+
+    // Verify child_in_undelivered_group returns true (the core of the fix)
+    assert!(
+        svc.child_in_undelivered_group(&ws, &parent, &child_a),
+        "child A should be in undelivered group"
+    );
+    assert!(
+        svc.child_in_undelivered_group(&ws, &parent, &child_b),
+        "child B should be in undelivered group"
+    );
+
+    // Trigger SUB-1 auto-watch path (what sendToTask/agent.send does internally).
+    // Before the fix, this would create competing ungrouped watches despite
+    // child_in_undelivered_group returning true.
+    svc.agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child_a.clone())
+        .await
+        .expect("watch child A completion");
+
+    svc.agent_watch_completion_for_sender_op(ws.clone(), parent.clone(), child_b.clone())
+        .await
+        .expect("watch child B completion");
+
+    // Verify NO ungrouped watches were created (they should have been suppressed by the
+    // child_in_undelivered_group check in agent_watch_completion_for_sender_op).
+    // Note: grouped watches (with group_id) SHOULD exist from delegation, but ungrouped
+    // watches (with group_id=null) should NOT be created.
+    let subs_mid = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs mid");
+    let all_watches = subs_mid["subscriptions"].as_array().expect("subscriptions");
+    let ungrouped_watches: Vec<_> = all_watches
+        .iter()
+        .filter(|w| w["delegationGroup"].is_null())
+        .collect();
+    assert_eq!(
+        ungrouped_watches.len(),
+        0,
+        "SUB-1 should NOT create ungrouped watches when children are in undelivered group"
+    );
+
+    // Get baseline parent message count before completions
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // Both children complete
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child_a,
+        json!({ "agentId": child_a.0.clone(), "lastResponseSummary": "child A done" }),
+    )
+    .await;
+
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child_b,
+        json!({ "agentId": child_b.0.clone(), "lastResponseSummary": "child B done" }),
+    )
+    .await;
+
+    // Wait for both children to be recorded in the group before sealing.
+    wait_for_group_children(&svc, &ws, &parent, 2).await;
+
+    // Seal the delegation group by publishing parent idle (mimics parent finishing its turn).
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0.clone(), "lastResponseSummary": "coordination done" }),
+    )
+    .await;
+
+    // CRITICAL ASSERTION: parent should receive exactly ONE wake message
+    // (the aggregated group wake), NOT individual wakes for each child.
+    // To avoid race conditions, wait specifically for the AGGREGATED wake content
+    // to appear in the transcript, then assert count == baseline + 1, and re-check
+    // after a short grace period to catch any late duplicate wakes.
+
+    // Wait for the aggregated wake content to appear
+    let mut attempts = 0;
+    loop {
+        let msgs_text = parent_messages_text(&svc, &parent).await;
+        if msgs_text.contains("All 2 settled")
+            || (msgs_text.contains("child A done") && msgs_text.contains("child B done"))
+        {
+            break;
+        }
+        attempts += 1;
+        if attempts > 100 {
+            panic!("Timeout waiting for aggregated wake content in transcript");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // Assert exactly baseline + 1 messages (one aggregated wake)
+    let count_after_wake = parent_message_count(&svc, &parent).await;
+    assert_eq!(
+        count_after_wake,
+        baseline + 1,
+        "Parent should have exactly 1 aggregated wake after content appears, not {} wakes",
+        count_after_wake - baseline
+    );
+
+    // Grace period: wait 300ms to catch any late duplicate wakes
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    let final_count = parent_message_count(&svc, &parent).await;
+    assert_eq!(
+        final_count,
+        baseline + 1,
+        "Parent should still have exactly 1 wake after grace period, not {} wakes (late duplicates detected)",
+        final_count - baseline
+    );
+
+    // Verify delegation group was delivered and cleaned up
+    let subs_after = svc
+        .agent_get_subscriptions(ws.clone(), parent.clone())
+        .await
+        .expect("subs after");
+    let groups_after = subs_after["delegationGroups"]
+        .as_array()
+        .expect("groups after");
+    assert_eq!(
+        groups_after.len(),
+        0,
+        "delegation group should be deleted after delivery"
+    );
+}
+
 /// Cross-workspace bare-id probes must NOT observe an agent that lives in a
 /// different workspace: `agent_get_op` / `agent_get_conversation_op` /
 /// `agent_get_queue_op` / `agent_get_session_stats_op` / `agent_delete_op` all
@@ -6333,7 +6522,8 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         file_blocks: None,
         queued_at: now_iso(),
         editing: false,
-        persisted: true, // Terminal-failure requeue marker
+        persisted: true,
+        requeued_after_failure: true, // Terminal-failure requeue marker
     };
 
     svc.requeue_front(&id, queued);

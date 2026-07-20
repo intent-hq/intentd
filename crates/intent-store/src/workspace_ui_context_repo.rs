@@ -21,7 +21,7 @@ impl Store {
     ) -> Result<Option<Value>> {
         let row = sqlx::query("SELECT payload FROM workspace_ui_context WHERE workspace_id = ?")
             .bind(&workspace_id.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get workspace ui context failed: {e}")))?;
 
@@ -58,7 +58,7 @@ impl Store {
         )
         .bind(&workspace_id.0)
         .bind(&payload)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace ui context failed: {e}")))?;
 

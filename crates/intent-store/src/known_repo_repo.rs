@@ -16,7 +16,7 @@ impl Store {
     pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
         let sql = format!("SELECT {KNOWN_REPO_COLUMNS} FROM known_repo ORDER BY last_used_at DESC");
         let rows = sqlx::query(&sql)
-            .fetch_all(self.pool())
+            .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list known repos failed: {e}")))?;
         rows.iter().map(map_known_repo_row).collect()
@@ -47,7 +47,7 @@ impl Store {
         .bind(owner)
         .bind(&now)
         .bind(&now)
-        .execute(self.pool())
+        .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("upsert known repo failed: {e}")))?;
         Ok(())
@@ -58,7 +58,7 @@ impl Store {
     pub async fn remove_known_repo(&self, path: &str) -> Result<bool> {
         let res = sqlx::query("DELETE FROM known_repo WHERE path = ?")
             .bind(path)
-            .execute(self.pool())
+            .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("remove known repo failed: {e}")))?;
         Ok(res.rows_affected() > 0)

@@ -189,6 +189,21 @@ async function handlePrompt(id, params) {
       process.exit(1);
     }
   }
+  // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
+  // with zero output. Send session/update with agent_status (thinking) to establish
+  // the session without emitting assistant content, then park. The live-turn will
+  // have zero assistant blocks, triggering the requeue path.
+  if (behavior.parkBeforeFirstChunk && promptCount === 1) {
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: {
+        sessionUpdate: 'agent_status',
+        status: { type: 'in_progress', message: 'Thinking...' },
+      },
+    });
+    pendingPromptIds.push(id);
+    return;
+  }
   // Keep-alive interrupt test: the FIRST turn streams a chunk then parks without
   // resolving, so the daemon can issue `agent.stop` mid-turn. It is left pending
   // until a `session/cancel` arrives; the child stays alive for the follow-up.

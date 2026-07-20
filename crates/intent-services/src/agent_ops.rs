@@ -144,12 +144,15 @@ pub(crate) struct QueuedMessage {
     pub queued_at: String,
     pub editing: bool,
     /// `true` when the user-message row already reached the transcript before
-    /// this entry was (re)queued — set by the terminal-failure requeue, whose
-    /// message was persisted before its turn started. Drain paths skip
-    /// `persist_user` for such entries so a retry does not duplicate the user
-    /// message in chat history. The field itself is internal, but when `true`,
-    /// `to_value` emits `requeuedAfterFailure: true` on the wire (STAB-112).
+    /// this entry was (re)queued — set by both the terminal-failure requeue
+    /// (STAB-112) and the interrupt zero-output requeue (STAB-114). Drain paths
+    /// skip `persist_user` for such entries so a retry does not duplicate the
+    /// user message in chat history.
     pub persisted: bool,
+    /// `true` when this is a terminal-failure requeue (STAB-112); `to_value`
+    /// emits `requeuedAfterFailure: true` on the wire. Interrupt requeues
+    /// (STAB-114) leave this `false` so the FE does not show "failed — will retry".
+    pub requeued_after_failure: bool,
 }
 
 impl QueuedMessage {
@@ -177,7 +180,7 @@ impl QueuedMessage {
         if self.editing {
             v["editing"] = Value::Bool(true);
         }
-        if self.persisted {
+        if self.requeued_after_failure {
             v["requeuedAfterFailure"] = Value::Bool(true);
         }
         v
@@ -2710,6 +2713,20 @@ impl Services {
         if skip {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
+        // SUB-1 delegation-group conflict suppression: skip ungrouped watch
+        // registration when the (caller, target) pair is already a member of
+        // an undelivered after_all delegation group (mirrors the existing
+        // child_in_undelivered_group suppression used for reportToParent wakes).
+        // Prevents duplicate wakes when a coordinator sends coordination messages
+        // (sendToTask) to children that are already covered by a grouped watch.
+        if self.child_in_undelivered_group(&workspace_id, &caller_agent_id, &target_agent_id) {
+            tracing::debug!(
+                caller = %caller_agent_id.0,
+                target = %target_agent_id.0,
+                "skipping SUB-1 auto-watch — target already in undelivered after_all group"
+            );
+            return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
+        }
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
         let id = self
@@ -3888,6 +3905,7 @@ impl Services {
             queued_at: now_iso(),
             editing: false,
             persisted: false,
+            requeued_after_failure: false,
         };
         let mut guard = self
             .agent_queues

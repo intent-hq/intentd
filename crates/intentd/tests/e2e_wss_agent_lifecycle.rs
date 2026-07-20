@@ -4731,6 +4731,285 @@ async fn wake_with_caller_delivers_completion_wake_to_sender_over_wss() {
     .await;
 }
 
+/// STAB-118 (SUB-1 `after_all` duplicate wake): when a coordinator delegates
+/// two `after_all` children, sends follow-up messages to both via
+/// `agent.sendMessage` (which triggers SUB-1 auto-watch), and both children
+/// complete, the parent's client-visible transcript MUST carry exactly ONE
+/// aggregated `[WORKSPACE EVENTS]` wake (listing both children), NOT separate
+/// individual wakes triggered by the SUB-1 auto-watch from each send. This is
+/// the WSS end-to-end test covering the real wire flow and transcript delivery
+/// (the Services-level regression test in `agent_ops/tests.rs` validates the
+/// internal completion-delivery logic; this test proves it over the full WSS
+/// stack including JSON-RPC routing and client-visible transcript reads).
+#[tokio::test]
+async fn sub1_sendmessage_after_all_no_duplicate_wake_wss() {
+    let Some(script) = gate("WSS SUB-1 after_all E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    const CHILD_A_TAG: &str = "SUB1_WSS_CHILD_A";
+    const CHILD_B_TAG: &str = "SUB1_WSS_CHILD_B";
+    const PARENT_GO: &str = "SUB1_WSS_PARENT_GO";
+    const FOLLOWUP_A: &str = "SUB1_WSS_FOLLOWUP_A";
+    const FOLLOWUP_B: &str = "SUB1_WSS_FOLLOWUP_B";
+
+    // The parent delegates two after_all children, sends follow-ups to each.
+    let delegate_js = format!(
+        "const a = await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default', waitMode: 'after_all' }}); \
+         const b = await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default', waitMode: 'after_all' }}); \
+         return {{ a, b }};",
+        json!(CHILD_A_TAG),
+        json!(CHILD_B_TAG),
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": CHILD_A_TAG,
+                "response": "child A done",
+            },
+            {
+                "ifPromptContains": CHILD_B_TAG,
+                "response": "child B done",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent wake acknowledged",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "delegate two after_all" }
+                },
+                "response": "parent delegated both",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("WORKSPACE_IDLE_DEBOUNCE_TEST_MS", "50"),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "SUB1 Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the delegation to complete: parent goes idle, and both children
+    // complete their first turns (stream:end + agent:idle).
+    let mut parent_idle = false;
+    let mut child_a_id: Option<String> = None;
+    let mut child_b_id: Option<String> = None;
+    let mut child_a_idle = false;
+    let mut child_b_idle = false;
+    for _ in 0..300 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        // Learn child IDs from stream chunks.
+        if ev_type == "agent:stream:chunk" && !ev_agent.is_empty() && ev_agent != parent_id {
+            if child_a_id.is_none() {
+                child_a_id = Some(ev_agent.to_string());
+            } else if child_b_id.is_none() && ev_agent != child_a_id.as_deref().unwrap() {
+                child_b_id = Some(ev_agent.to_string());
+            }
+        }
+        if ev_agent == parent_id && ev_type == "agent:idle" {
+            parent_idle = true;
+        }
+        if let Some(cid_a) = child_a_id.as_deref() {
+            if ev_agent == cid_a && ev_type == "agent:idle" {
+                child_a_idle = true;
+            }
+        }
+        if let Some(cid_b) = child_b_id.as_deref() {
+            if ev_agent == cid_b && ev_type == "agent:idle" {
+                child_b_idle = true;
+            }
+        }
+        if parent_idle && child_a_idle && child_b_idle {
+            break;
+        }
+    }
+    assert!(parent_idle, "parent went idle after delegation");
+    assert!(
+        child_a_idle && child_b_idle,
+        "both children completed first turn"
+    );
+    let child_a = child_a_id.expect("child A id");
+    let child_b = child_b_id.expect("child B id");
+
+    // Send follow-ups to both children via agent.sendMessage.
+    let sent_a = wss_rpc(
+        &mut rpc,
+        20,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child_a.clone(), "content": FOLLOWUP_A }),
+    )
+    .await;
+    assert_eq!(sent_a["success"], true, "sendMessage A ok: {sent_a}");
+    let sent_b = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child_b.clone(), "content": FOLLOWUP_B }),
+    )
+    .await;
+    assert_eq!(sent_b["success"], true, "sendMessage B ok: {sent_b}");
+
+    // Wait for both children to complete their follow-up turns (stream:end +
+    // agent:idle after the sendMessage follow-ups).
+    let mut child_a_idle_again = false;
+    let mut child_b_idle_again = false;
+    for _ in 0..200 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        if ev_agent == child_a && ev["type"] == "agent:idle" {
+            child_a_idle_again = true;
+        }
+        if ev_agent == child_b && ev["type"] == "agent:idle" {
+            child_b_idle_again = true;
+        }
+        if child_a_idle_again && child_b_idle_again {
+            break;
+        }
+    }
+    assert!(
+        child_a_idle_again && child_b_idle_again,
+        "both children completed follow-up turns"
+    );
+
+    // The parent's wake turn MUST fire: poll the parent's transcript until we
+    // see the aggregated `[WORKSPACE EVENTS]` completion message naming both
+    // children. Once we see it, wait an additional grace period (500ms with a
+    // single deadline) to confirm no late duplicate individual wake messages
+    // arrive. The fix ensures that the two SUB-1 auto-watches (triggered by
+    // the sendMessage calls) do NOT fire individual wakes because both children
+    // are already covered by the undelivered after_all delegation group.
+    let mut aggregated_wake_seen = false;
+    for attempt in 0..60i64 {
+        let conv = wss_rpc(
+            &mut rpc,
+            100 + attempt,
+            "agent.getConversation",
+            json!({ "agentId": parent_id }),
+        )
+        .await;
+        // Check per-message contentBlocks (not substring of the entire messages array).
+        if let Some(messages) = conv["messages"].as_array() {
+            let has_aggregated = messages.iter().any(|m| {
+                let blocks_text = serde_json::to_string(&m["contentBlocks"]).unwrap_or_default();
+                blocks_text.contains("[WORKSPACE EVENTS]")
+                    && blocks_text.contains(&child_a)
+                    && blocks_text.contains(&child_b)
+            });
+            if has_aggregated {
+                aggregated_wake_seen = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(aggregated_wake_seen, "parent received aggregated wake");
+
+    // Grace period: wait 500ms (single deadline) to ensure no duplicate
+    // individual wakes arrive. Count how many `[WORKSPACE EVENTS]` wake
+    // messages appear in the final transcript — MUST be exactly ONE.
+    let grace_start = tokio::time::Instant::now();
+    let grace_deadline = grace_start + Duration::from_millis(500);
+    loop {
+        let remaining = match grace_deadline.checked_duration_since(tokio::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => break,
+        };
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+
+    // Final assertion: count wake messages in the parent's transcript.
+    // Use per-message contentBlocks scanning (consistent with the pattern at
+    // line 2211-2230) to avoid over/under-counting if the marker appears
+    // multiple times in a single message's metadata.
+    let final_conv = wss_rpc(
+        &mut rpc,
+        200,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    let final_messages = final_conv["messages"].as_array().expect("messages array");
+    let wake_messages: Vec<String> = final_messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+        .collect();
+    assert_eq!(
+        wake_messages.len(),
+        1,
+        "parent transcript MUST have exactly ONE aggregated wake (after_all group), not {} — \
+         the SUB-1 auto-watch from sendMessage MUST NOT fire duplicate individual wakes",
+        wake_messages.len()
+    );
+
+    // Let the parent's wake turn wind down before teardown.
+    let _ = wss_rpc(&mut rpc, 201, "agent.stop", json!({ "agentId": parent_id })).await;
+}
+
 /// SP-1 (Suggested Next Steps): the `--rules` file assembled by
 /// `agent_manager::create_agent` for a top-level (non-sub-agent) interactive
 /// agent MUST contain the `## Suggested Next Steps` heading — the directive
@@ -5420,5 +5699,253 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         wake_message_id.as_deref(),
         first_wake_user_id,
         "wake agent:message event ID matches the first user message (wake contextMessage)"
+    );
+}
+
+/// STAB-114 regression: When an interrupt lands BEFORE any assistant output,
+/// the preempted user message is re-queued at the front (with persisted:true,
+/// requeued_after_failure:false, and attachments preserved).
+///
+/// Uses `parkBeforeFirstChunk` mock behavior + deterministic wait for
+/// agent:stream:status phase="prompt" to ensure the ACP session is established
+/// (making the turn cancellable) before sending the interrupt.
+#[tokio::test]
+async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
+    let Some(script) = gate("STAB-114 zero-output requeue E2E") else {
+        eprintln!("[STAB114-TEST] Gate returned None, test skipped");
+        return;
+    };
+    eprintln!("[STAB114-TEST] Test body running");
+
+    let data_dir = temp_data_dir();
+    let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    // parkBeforeFirstChunk parks immediately without streaming any chunks
+    let behavior = json!({ "parkBeforeFirstChunk": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Send first message — agent will park without streaming
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Deterministic wait: wait for agent:stream:status with phase="prompt".
+    // This ensures the ACP session is established and acp_session_id is persisted,
+    // making the turn cancellable. Waiting for isResponding alone is insufficient
+    // because it becomes true when the worker starts, before acp_session_id is set.
+    let mut saw_prompt_phase = false;
+    for _ in 0..50 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:stream:status" {
+                let phase = frame["params"]["event"]["data"]["phase"]
+                    .as_str()
+                    .unwrap_or("");
+                if phase == "prompt" {
+                    saw_prompt_phase = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_prompt_phase,
+        "STAB-114: must see prompt phase before interrupt (ensures session established)"
+    );
+
+    // Interrupt before any output
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "urgent",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true);
+
+    // Wait for queue-updated event showing the original message re-queued
+    let mut saw_requeue = false;
+    for _ in 0..20 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:queue:updated" {
+                let queue = frame["params"]["event"]["data"]["queue"]
+                    .as_array()
+                    .expect("queue array");
+                if !queue.is_empty() {
+                    let msg = &queue[0];
+                    if msg["content"].as_str().unwrap_or("").contains("first") {
+                        saw_requeue = true;
+                        // Wire omits requeuedAfterFailure unless true, so check it's absent or false
+                        let requeued_after_failure =
+                            msg["requeuedAfterFailure"].as_bool().unwrap_or(false);
+                        assert!(
+                            !requeued_after_failure,
+                            "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        saw_requeue,
+        "STAB-114: original message should be re-queued after zero-output interrupt"
+    );
+}
+
+/// STAB-114 regression: When an interrupt lands AFTER streaming started, the
+/// message is NOT re-queued (turn has progressed past zero output).
+#[tokio::test]
+async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
+    let Some(script) = gate("STAB-114 after-streaming no requeue E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    // blockUntilCancel streams a chunk then parks
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "STAB114", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Wait for chunk to be streamed
+    let mut saw_chunk = false;
+    for _ in 0..30 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:stream:chunk"
+                && frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("streaming-before-cancel")
+            {
+                saw_chunk = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_chunk, "agent streamed a chunk before parking");
+
+    // Interrupt after streaming started
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "urgent",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true);
+
+    // Check queue: should be empty (message should NOT be re-queued)
+    let queue = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getQueue",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let messages = queue["queue"].as_array().expect("queue array");
+    assert!(
+        messages.is_empty(),
+        "STAB-114: interrupt after streaming should NOT re-queue"
     );
 }
