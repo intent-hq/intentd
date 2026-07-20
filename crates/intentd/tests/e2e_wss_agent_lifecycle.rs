@@ -5949,3 +5949,159 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
         "STAB-114: interrupt after streaming should NOT re-queue"
     );
 }
+
+/// STAB-124 regression: an interrupt landing mid-tool-call must NOT persist an
+/// anonymous `tool_use` block (`name: ""`). The mock parks after emitting a
+/// `tool_call` (in_progress); on `session/cancel` it echoes a title-less
+/// `tool_call_update` (failed, abort-error output) — the stale echo that,
+/// pre-fix, the interrupt turn's fresh transcript fabricated into an anonymous
+/// `tool_use` + errored `tool_result` pair that broke FE conversation loading.
+/// After the interrupt turn completes, every persisted `tool_use` block must
+/// carry a non-empty name.
+#[tokio::test]
+async fn stab_124_interrupt_mid_tool_call_never_persists_anonymous_tool_use() {
+    let Some(script) = gate("STAB-124 anonymous tool_use E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // parkMidToolCall: emit tool_call (in_progress) then park until cancel.
+    let behavior = json!({ "parkMidToolCall": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "STAB124", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // First message — the mock emits a tool_call (in_progress) then parks.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Deterministic wait: the tool_call event proves the turn is mid-tool-call
+    // (and the ACP session is established → the turn is cancellable).
+    let mut saw_tool_call = false;
+    for _ in 0..50 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:tool:call" {
+                saw_tool_call = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_tool_call,
+        "STAB-124: must be mid-tool-call before interrupt"
+    );
+
+    // Interrupt mid-tool-call.
+    let interrupted = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "urgent",
+            "priority": "interrupt",
+        }),
+    )
+    .await;
+    assert_eq!(interrupted["success"], true);
+
+    // Wait for the interrupt turn to complete: its chunk ("resumed") then a
+    // terminal stream:end.
+    let mut saw_resumed_chunk = false;
+    let mut saw_end_after_chunk = false;
+    for _ in 0..80 {
+        let Some(frame) = wss_event_opt(&mut sub, 30).await else {
+            break;
+        };
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:chunk") => {
+                if frame["params"]["event"]["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("resumed")
+                {
+                    saw_resumed_chunk = true;
+                }
+            }
+            Some("agent:stream:end") if saw_resumed_chunk => {
+                saw_end_after_chunk = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_resumed_chunk,
+        "interrupt turn streamed on the same child"
+    );
+    assert!(saw_end_after_chunk, "interrupt turn completed");
+
+    // THE regression assertion: no persisted tool_use block has an empty name.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    for m in messages {
+        let Some(blocks) = m["contentBlocks"].as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block["type"] == "tool_use" {
+                let name = block["name"].as_str().unwrap_or_default();
+                assert!(
+                    !name.trim().is_empty(),
+                    "STAB-124: anonymous tool_use block persisted/served: {block}"
+                );
+            }
+        }
+    }
+}

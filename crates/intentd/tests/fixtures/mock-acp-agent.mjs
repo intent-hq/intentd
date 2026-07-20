@@ -24,6 +24,9 @@ const SESSION_ID = 'mock-session-1';
 // rather than respawning it.
 let promptCount = 0;
 const pendingPromptIds = [];
+// Tool calls parked by `parkMidToolCall`; on `session/cancel` each gets a
+// title-less failed `tool_call_update` echo before the prompt resolves (STAB-124).
+const cancelledToolCallIds = [];
 
 // Agent→client request correlation: track outgoing request IDs separately from
 // incoming prompt IDs. The daemon responds to each client call with a matching id.
@@ -218,6 +221,28 @@ async function handlePrompt(id, params) {
         status: { type: 'in_progress', message: 'Thinking...' },
       },
     });
+    pendingPromptIds.push(id);
+    return;
+  }
+  // STAB-124: park MID-TOOL-CALL — emit a `tool_call` (in_progress) then park.
+  // On `session/cancel` the mock echoes a title-less `tool_call_update`
+  // (status failed, abort-error output) BEFORE resolving the parked prompt,
+  // mirroring how a real provider reports the aborted tool. The daemon must
+  // not fabricate an anonymous tool_use block from that stale echo.
+  if (behavior.parkMidToolCall && promptCount === 1) {
+    const toolCallId = 'tc_park_mid_tool';
+    note('session/update', {
+      sessionId: SESSION_ID,
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId,
+        title: 'slow-tool: park until cancel',
+        kind: 'execute',
+        status: 'in_progress',
+        rawInput: { marker: 'stab-124' },
+      },
+    });
+    cancelledToolCallIds.push(toolCallId);
     pendingPromptIds.push(id);
     return;
   }
@@ -417,6 +442,20 @@ async function dispatch(msg) {
     case 'session/prompt':
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
+      // STAB-124: echo the abort for any tool call parked by `parkMidToolCall`
+      // — a title-less `tool_call_update` (failed, abort-error output), the
+      // shape real providers emit when a cancel lands mid-tool-call.
+      while (cancelledToolCallIds.length) {
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: cancelledToolCallIds.shift(),
+            status: 'failed',
+            rawOutput: { error: 'The operation was aborted' },
+          },
+        });
+      }
       // Resolve any turn parked by `blockUntilCancel` with a `cancelled` stop
       // reason and stay alive for a follow-up (resume) prompt — the observable
       // keep-alive interrupt. Notification itself gets no reply.
