@@ -631,6 +631,7 @@ impl Services {
         group_id: &str,
         retain_children: &[AgentId],
     ) -> usize {
+        let retain_set: std::collections::HashSet<&AgentId> = retain_children.iter().collect();
         let mut guard = self
             .agent_subscriptions
             .lock()
@@ -649,7 +650,7 @@ impl Services {
             if s.group_id.as_deref() != Some(group_id) {
                 return true;
             }
-            if retain_children.contains(&s.child_agent_id) {
+            if retain_set.contains(&s.child_agent_id) {
                 let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
                 if kept.insert(pair) {
                     s.group_id = None;

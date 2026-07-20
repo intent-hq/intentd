@@ -4543,7 +4543,7 @@ fn failed_group_children(group: &agent_subscriptions::DelegationGroup) -> Vec<Ag
         .iter()
         .filter(|e| e.event_type == AGENT_FAILED)
         .filter_map(|e| completion_event_child_id(e))
-        .map(|id| AgentId::from(id.as_str()))
+        .map(AgentId::from)
         .filter(|id| !group.deleted_agent_ids.contains(id))
         .collect()
 }
