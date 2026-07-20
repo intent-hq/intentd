@@ -300,9 +300,10 @@ const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
 /// Build an enhanced PATH for spawning a provider binary (§6.2).
 ///
 /// Prepends the discovered provider binary's parent directory and `~/.augment/bin`
-/// to the current PATH so a `#!/usr/bin/env node` shebang resolves the right
-/// `node`. Entries are de-duplicated while preserving order. Port of the
-/// `getAuggieExecPATH` behavior (generalized across providers).
+/// (auggie's install location, for back-compat) to the current PATH so a
+/// `#!/usr/bin/env node` shebang resolves the right `node`. Entries are
+/// de-duplicated while preserving order. Port of the `getAuggieExecPATH` behavior
+/// (generalized across providers).
 pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -316,7 +317,7 @@ pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
         }
     }
 
-    // 2. ~/.augment/bin (managed binaries)
+    // 2. ~/.augment/bin (auggie's install location, kept for auggie back-compat)
     if let Some(home) = home_dir() {
         path_utils::push_dir(&mut dirs, &mut seen, home.join(".augment").join("bin"));
     }

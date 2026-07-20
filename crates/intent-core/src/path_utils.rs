@@ -171,8 +171,8 @@ pub fn push_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, dir: PathB
 /// running in packaged app environments with minimal inherited PATH.
 ///
 /// Note: Callers that need custom precedence (e.g., provider-binary dir first,
-/// then ~/.augment/bin, then enriched dirs, then inherited PATH) should use
-/// `enriched_tool_dirs()` + split_paths to build the order themselves.
+/// then ~/.augment/bin for auggie, then enriched dirs, then inherited PATH) should
+/// use `enriched_tool_dirs()` + split_paths to build the order themselves.
 pub fn enhanced_path_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -196,8 +196,8 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
 /// (node, npm, homebrew, volta, asdf, nvm, etc.), WITHOUT the inherited PATH.
 ///
 /// Use this when you need to control precedence explicitly (e.g., prepend
-/// provider-binary dir and ~/.augment/bin, then these enriched dirs, then
-/// inherited PATH last).
+/// provider-binary dir and ~/.augment/bin for auggie, then these enriched dirs,
+/// then inherited PATH last).
 pub fn enriched_tool_dirs() -> Vec<PathBuf> {
     enriched_tool_dirs_with(login_shell_dirs)
 }
