@@ -60,8 +60,9 @@ mod tests_stab115;
 /// at agent creation time. Precedence chain (documented in the task):
 /// 1. `model.workspaceOverrides[workspaceId]`
 /// 2. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
-/// 3. `model.default`
-/// 4. None → CLI default (current behavior, last resort)
+/// 3. `model.providerDefaults[resolved provider]`
+/// 4. `model.default`
+/// 5. None → CLI default (current behavior, last resort)
 ///
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
@@ -71,6 +72,7 @@ async fn resolve_default_model_from_settings(
     workspace_id: &WorkspaceId,
     is_background: bool,
     agent_type: Option<&str>,
+    provider: Option<&str>,
 ) -> Option<String> {
     // 1. Check workspace-specific override
     if let Ok(Some(raw)) = services.store.get_setting("model.workspaceOverrides").await {
@@ -116,7 +118,19 @@ async fn resolve_default_model_from_settings(
         }
     }
 
-    // 3. Check global default
+    // 3. Check provider defaults
+    let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
+    if let Ok(Some(raw)) = services.store.get_setting("model.providerDefaults").await {
+        if let Ok(Value::Object(defaults)) = serde_json::from_str::<Value>(&raw) {
+            if let Some(model) = defaults.get(provider_key).and_then(Value::as_str) {
+                if !model.is_empty() {
+                    return Some(model.to_string());
+                }
+            }
+        }
+    }
+
+    // 4. Check global default
     if let Ok(Some(raw)) = services.store.get_setting("model.default").await {
         if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
             if !model.is_empty() {
@@ -125,7 +139,7 @@ async fn resolve_default_model_from_settings(
         }
     }
 
-    // 4. None → CLI default (session.model stays None)
+    // 5. None → CLI default (session.model stays None)
     None
 }
 
@@ -1093,6 +1107,7 @@ impl Services {
                     &workspace_id,
                     is_background,
                     specialist.as_deref(),
+                    provider.as_deref(),
                 )
                 .await
             }
