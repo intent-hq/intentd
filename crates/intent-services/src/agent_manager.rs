@@ -2367,15 +2367,28 @@ impl AgentManager {
                 .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
                 .await;
         }
-        if let Some(model_id) = model {
+        // Until the truncation actually lands, a failure must DISARM the
+        // flag: nothing was truncated, so leaving it set would force an
+        // unnecessary session recreate (lost provider warm state) on the next
+        // unrelated turn. After the truncation persists, the flag must stay
+        // armed no matter what fails later.
+        let pre_truncate = async {
+            if let Some(model_id) = model {
+                self.services
+                    .agent_set_model_op(agent_id.clone(), model_id)
+                    .await?;
+            }
             self.services
-                .agent_set_model_op(agent_id.clone(), model_id)
-                .await?;
-        }
-        let truncated_count = self
-            .services
-            .agent_edit_truncate_op(&agent_id, &message_id)
-            .await?;
+                .agent_edit_truncate_op(&agent_id, &message_id)
+                .await
+        };
+        let truncated_count = match pre_truncate.await {
+            Ok(count) => count,
+            Err(e) => {
+                self.force_recreate.lock().unwrap().remove(&agent_id);
+                return Err(e);
+            }
+        };
         // Arm `recreated` AFTER `stop` (which clears it): it makes the next
         // turn prepend the truncated history as `<supervisor>` XML.
         self.recreated.lock().unwrap().insert(agent_id.clone());
