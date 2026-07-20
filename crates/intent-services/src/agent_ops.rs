@@ -7,7 +7,7 @@
 //! [`parse_model_list_output`] port the `agent.getModels` static-tier fallback
 //! and auggie CLI parser respectively.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -152,23 +152,32 @@ async fn resolve_default_model_from_settings(
 /// queue so the drain skips it (PROTOCOL §5.5/§6.5). The agent may go idle only
 /// when every remaining queued entry has `editing == true`; setting `editing`
 /// back to `false` re-includes the message and self-drains.
-#[derive(Debug, Clone)]
+///
+/// Serializes to camelCase JSON as the durable `agent_queue.payload` shape
+/// (write-through persistence; see [`Services::persist_queue_snapshot`]). The
+/// bool fields take `#[serde(default)]` so older payloads missing a later
+/// flag still rehydrate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
     pub id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
     pub queued_at: String,
+    #[serde(default)]
     pub editing: bool,
     /// `true` when the user-message row already reached the transcript before
     /// this entry was (re)queued — set by both the terminal-failure requeue
     /// (STAB-112) and the interrupt zero-output requeue (STAB-114). Drain paths
     /// skip `persist_user` for such entries so a retry does not duplicate the
     /// user message in chat history.
+    #[serde(default)]
     pub persisted: bool,
     /// `true` when this is a terminal-failure requeue (STAB-112); `to_value`
     /// emits `requeuedAfterFailure: true` on the wire. Interrupt requeues
     /// (STAB-114) leave this `false` so the FE does not show "failed — will retry".
+    #[serde(default)]
     pub requeued_after_failure: bool,
     /// Per-message `messageMetadata` captured at enqueue time (e.g. the
     /// `event_notification` payload of a parent wake that arrived while a turn
@@ -4220,6 +4229,76 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// Write-through persistence of an agent's queue: snapshot the in-memory
+    /// queue (brief lock, dropped before the await) and replace the agent's
+    /// `agent_queue` rows with it. Best-effort — a store failure is logged at
+    /// WARN and never fails the calling RPC; the in-memory queue remains the
+    /// live source of truth and the next mutation re-snapshots.
+    pub(crate) async fn persist_queue_snapshot(&self, agent_id: &AgentId) {
+        let rows: Vec<intent_store::AgentQueueRow> = {
+            let guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            guard
+                .get(agent_id)
+                .map(|q| {
+                    q.iter()
+                        .enumerate()
+                        .map(|(i, m)| intent_store::AgentQueueRow {
+                            id: m.id.clone(),
+                            agent_id: agent_id.clone(),
+                            position: i as i64,
+                            payload: serde_json::to_value(m).unwrap_or(Value::Null),
+                            created_at: m.queued_at.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if let Err(e) = self.store.replace_agent_queue(agent_id, &rows).await {
+            tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
+        }
+    }
+
+    /// Rehydrate every persisted agent queue into the in-memory map at daemon
+    /// startup (before RPCs are served). Entries left `editing: true` at
+    /// shutdown come back ready-to-send (`editing: false`) — the editing
+    /// client's hold is gone; `persisted` / `requeuedAfterFailure` flags are
+    /// preserved so a later drain does not double-append transcript rows
+    /// (STAB-114/STAB-52). Rehydration never kicks `try_drain_queue`: messages
+    /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
+    /// Returns the number of rehydrated messages.
+    pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
+        let rows = self.store.load_all_agent_queues().await?;
+        let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
+        for row in rows {
+            match serde_json::from_value::<QueuedMessage>(row.payload) {
+                Ok(mut message) => {
+                    message.editing = false;
+                    map.entry(row.agent_id).or_default().push(message);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %row.agent_id,
+                        message_id = %row.id,
+                        error = %e,
+                        "skipping undecodable persisted queue entry"
+                    );
+                }
+            }
+        }
+        let count = map.values().map(Vec::len).sum();
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        for (agent_id, queue) in map {
+            guard.entry(agent_id).or_insert(queue);
+        }
+        Ok(count)
+    }
+
     /// Publish `agent:queue:updated` with the **current** queue snapshot.
     /// Looks up the owning workspace from the agent session — when the session
     /// row is missing (e.g. an idempotent remove on an unknown agent) or no bus
@@ -4242,12 +4321,18 @@ impl Services {
     /// Like [`publish_queue_updated`] but takes the workspace id directly —
     /// used by call sites (the turn worker, `force_message`) that already hold
     /// it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    ///
+    /// Every queue mutation flows through here (or through
+    /// [`publish_queue_updated`], which delegates here), so this is also the
+    /// single write-through choke point: the durable `agent_queue` snapshot is
+    /// refreshed before the event is published.
     pub(crate) async fn publish_queue_updated_for(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         queue: Vec<Value>,
     ) {
+        self.persist_queue_snapshot(agent_id).await;
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),

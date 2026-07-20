@@ -7009,3 +7009,190 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         "oneShot watch removed after the late completion delivered"
     );
 }
+
+// ── Durable queue: write-through persistence + startup rehydration ─────────
+
+/// Load the persisted `agent_queue` snapshot for one agent, ordered by position.
+async fn persisted_queue(svc: &Services, agent: &AgentId) -> Vec<serde_json::Value> {
+    svc.store()
+        .load_all_agent_queues()
+        .await
+        .expect("load agent queues")
+        .into_iter()
+        .filter(|r| r.agent_id == *agent)
+        .map(|r| r.payload)
+        .collect()
+}
+
+#[tokio::test]
+async fn queue_mutations_write_through_to_store() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Durable").await;
+
+    // Enqueue two messages → both persisted, in order, with attachments.
+    let first = svc
+        .agent_queue_message_op(
+            id.clone(),
+            "first".into(),
+            Some(json!([{ "type": "image", "data": "abc" }])),
+            None,
+        )
+        .await
+        .expect("queue first");
+    let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
+    svc.agent_queue_message_op(id.clone(), "second".into(), None, None)
+        .await
+        .expect("queue second");
+    let rows = persisted_queue(&svc, &id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["content"], "first");
+    assert_eq!(rows[0]["imageBlocks"][0]["data"], "abc");
+    assert_eq!(rows[1]["content"], "second");
+
+    // Edit (content + editing flag) → persisted snapshot reflects both.
+    svc.agent_edit_queued_message_op(id.clone(), first_id.clone(), "edited".into(), Some(true))
+        .await
+        .expect("edit");
+    let rows = persisted_queue(&svc, &id).await;
+    assert_eq!(rows[0]["content"], "edited");
+    assert_eq!(rows[0]["editing"], json!(true));
+
+    // Remove → persisted snapshot shrinks with it.
+    svc.agent_remove_queued_message_op(id.clone(), first_id)
+        .await
+        .expect("remove");
+    let rows = persisted_queue(&svc, &id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["content"], "second");
+
+    // Dequeue (the drain-side mutation) followed by the publish that every
+    // drain site performs → persisted snapshot empties.
+    let next = svc.dequeue_message(&id).expect("dequeue");
+    assert_eq!(next.content, "second");
+    svc.publish_queue_updated(&id).await;
+    assert!(persisted_queue(&svc, &id).await.is_empty());
+}
+
+#[tokio::test]
+async fn clear_queue_write_through_empties_persisted_snapshot() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Cleared").await;
+    svc.agent_queue_message_op(id.clone(), "doomed".into(), None, None)
+        .await
+        .expect("queue");
+    assert_eq!(persisted_queue(&svc, &id).await.len(), 1);
+
+    // `force_message` clears then publishes through the same choke point.
+    assert!(svc.clear_queue(&id));
+    svc.publish_queue_updated(&id).await;
+    assert!(persisted_queue(&svc, &id).await.is_empty());
+}
+
+#[tokio::test]
+async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
+    let (tmp, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Restored").await;
+    // Seed persisted rows the way a pre-shutdown daemon would have left them:
+    // entry 0 mid-edit, entry 1 a persisted interrupt-requeue with metadata.
+    svc.store()
+        .replace_agent_queue(
+            &id,
+            &[
+                intent_store::AgentQueueRow {
+                    id: "q-0".into(),
+                    agent_id: id.clone(),
+                    position: 0,
+                    payload: json!({
+                        "id": "q-0",
+                        "content": "was editing",
+                        "queuedAt": now_iso(),
+                        "editing": true,
+                    }),
+                    created_at: now_iso(),
+                },
+                intent_store::AgentQueueRow {
+                    id: "q-1".into(),
+                    agent_id: id.clone(),
+                    position: 1,
+                    payload: json!({
+                        "id": "q-1",
+                        "content": "requeued",
+                        "queuedAt": now_iso(),
+                        "editing": false,
+                        "persisted": true,
+                        "requeuedAfterFailure": true,
+                        "messageMetadata": { "source": "event_notification" },
+                    }),
+                    created_at: now_iso(),
+                },
+            ],
+        )
+        .await
+        .expect("seed persisted queue");
+
+    // Fresh Services over the same store = a daemon restart (empty in-memory map).
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    assert_eq!(rehydrated, 2);
+
+    // agent.getQueue sees both entries in original order; the mid-edit entry
+    // came back ready-to-send (no `editing` on the wire).
+    let q = restarted
+        .agent_get_queue_op(id.clone(), None)
+        .await
+        .expect("getQueue");
+    let queue = q["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue[0]["content"], "was editing");
+    assert!(queue[0].get("editing").is_none());
+    assert_eq!(queue[1]["content"], "requeued");
+    assert_eq!(queue[1]["requeuedAfterFailure"], json!(true));
+    assert_eq!(queue[1]["messageMetadata"]["source"], "event_notification");
+
+    // Internal flags round-trip: editing reset makes q-0 dequeuable first;
+    // q-1 keeps `persisted` so a drain will not double-append the transcript row.
+    let first = restarted.dequeue_message(&id).expect("dequeue q-0");
+    assert_eq!(first.id, "q-0");
+    assert!(!first.editing);
+    assert!(!first.persisted);
+    let second = restarted.dequeue_message(&id).expect("dequeue q-1");
+    assert_eq!(second.id, "q-1");
+    assert!(second.persisted);
+    assert!(second.requeued_after_failure);
+    assert!(restarted.dequeue_message(&id).is_none());
+}
+
+#[tokio::test]
+async fn rehydrate_skips_orphaned_rows_and_preserves_live_map() {
+    let (tmp, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Live").await;
+    svc.agent_queue_message_op(id.clone(), "persisted".into(), None, None)
+        .await
+        .expect("queue");
+
+    // An agent whose session row no longer exists yields no rehydrated rows
+    // (the FK cascade removed them with the session).
+    let ghost = AgentId::new();
+    assert!(svc.store().replace_agent_queue(&ghost, &[]).await.is_ok());
+
+    // Rehydrating over a Services that already holds a live queue for the
+    // agent keeps the live (newer) queue rather than clobbering it.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    restarted
+        .agent_queue_message_op(id.clone(), "live".into(), None, None)
+        .await
+        .expect("live queue");
+    // The live enqueue's write-through replaced the persisted snapshot, so
+    // rehydration loads that same single entry — and `or_insert` leaves the
+    // in-memory queue untouched.
+    restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    let q = restarted
+        .agent_get_queue_op(id, None)
+        .await
+        .expect("getQueue");
+    let queue = q["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0]["content"], "live");
+}

@@ -495,6 +495,17 @@ async fn cmd_serve(
         Ok(healed) => tracing::info!(healed, "healed stale in-flight agent sessions on startup"),
         Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
     }
+    // Rehydrate persisted agent send queues (write-through `agent_queue`
+    // table) into the in-memory map before any listener serves RPCs, so
+    // messages queued at the previous shutdown survive the restart. This only
+    // restores state — it never starts a turn; queued messages sit until an
+    // explicit kick (resume, sendMessage, queueMessage, retry). Best-effort:
+    // a failure is logged but never aborts startup.
+    match services.rehydrate_agent_queues().await {
+        Ok(0) => {}
+        Ok(rehydrated) => tracing::info!(rehydrated, "rehydrated persisted agent queue messages"),
+        Err(e) => tracing::warn!(error = %e, "agent queue rehydration failed"),
+    }
     // STAB-108: Rehydrate undelivered delegation groups on startup so groups
     // survive daemon restarts without requiring the resume path. Groups are
     // reconciled against current agent state (already-completed children are
