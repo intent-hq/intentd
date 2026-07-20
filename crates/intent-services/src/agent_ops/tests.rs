@@ -590,6 +590,127 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     assert_eq!(cv["waitingForAgentIds"], json!([]));
 }
 
+/// STAB-125: `agent.get` surfaces turn-liveness — `turnInFlight` and
+/// `lastStreamActivityAt` — from the live-turn slot so a poller can tell a
+/// long-but-alive turn from a wedged agent before anything persists.
+#[tokio::test]
+async fn agent_lite_surfaces_turn_liveness_from_live_turn_slot() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Streamer").await;
+
+    // Idle agent: no in-flight turn, timestamp omitted (skip_serializing_if).
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["turnInFlight"], false);
+    assert!(
+        v.get("lastStreamActivityAt").is_none(),
+        "idle agent omits lastStreamActivityAt: {v}"
+    );
+
+    // A worker draining an in-flight turn: turnInFlight with the slot's stamp.
+    let before = now_iso();
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "thinking…" })],
+    );
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(v["turnInFlight"], true);
+    let stamp = v["lastStreamActivityAt"]
+        .as_str()
+        .expect("lastStreamActivityAt present while in flight")
+        .to_string();
+    // Compare parsed instants — RFC-3339 strings carry variable sub-second
+    // precision, so lexicographic order is not chronological order.
+    let parsed = intent_core::parse_iso(&stamp).expect("valid RFC-3339 stamp");
+    let lo = intent_core::parse_iso(&before).unwrap();
+    let hi = intent_core::parse_iso(&now_iso()).unwrap();
+    assert!(
+        parsed >= lo && parsed <= hi,
+        "slot stamp within [begin, now]: {stamp}"
+    );
+
+    // Streaming progress re-stamps the slot: a later set_live_turn advances it.
+    // Wait until the clock has observably moved past the first stamp so the
+    // strict `>` holds even on coarse clock/formatting resolutions.
+    while intent_core::parse_iso(&now_iso()).unwrap() <= parsed {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "thinking… more" })],
+    );
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    let stamp2 = v["lastStreamActivityAt"].as_str().expect("stamp2");
+    let parsed2 = intent_core::parse_iso(stamp2).expect("valid RFC-3339 stamp2");
+    assert!(
+        parsed2 > parsed,
+        "stream activity advances the stamp: {stamp} -> {stamp2}"
+    );
+
+    // An orphan slot with NO busy claim must not report a phantom turn —
+    // same gate as chat_snapshot's live-turn merge.
+    svc.set_test_busy(&id, false);
+    let v = serde_json::to_value(svc.agent_get_op(id.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(
+        v["turnInFlight"], false,
+        "no busy worker → no in-flight turn"
+    );
+    assert!(v.get("lastStreamActivityAt").is_none());
+
+    // Turn end clears the slot: back to the idle shape.
+    svc.set_test_busy(&id, true);
+    svc.clear_live_turn(&id);
+    let v = serde_json::to_value(svc.agent_get_op(id, None).await.expect("get")).unwrap();
+    assert_eq!(v["turnInFlight"], false);
+    assert!(v.get("lastStreamActivityAt").is_none());
+}
+
+/// STAB-125: `agent.getConversation` carries the same turn-liveness fields, so
+/// a conversation read mid-turn (nothing persisted yet) is distinguishable
+/// from a wedged agent.
+#[tokio::test]
+async fn get_conversation_surfaces_turn_liveness() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Conv").await;
+
+    // Idle: turnInFlight false, lastStreamActivityAt null (always present).
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None)
+        .await
+        .expect("conv");
+    assert_eq!(res["turnInFlight"], false);
+    assert!(res["lastStreamActivityAt"].is_null());
+
+    // Mid-turn (busy worker + open slot): both fields live.
+    svc.set_test_busy(&id, true);
+    svc.set_live_turn(
+        &id,
+        "msg-1",
+        vec![json!({ "type": "text", "id": "msg-1:0", "text": "streaming…" })],
+    );
+    let res = svc
+        .agent_get_conversation_op(id.clone(), None, None, None)
+        .await
+        .expect("conv");
+    assert_eq!(res["turnInFlight"], true);
+    assert!(res["lastStreamActivityAt"].is_string());
+    // The long turn has persisted nothing: the page is still empty even though
+    // the turn is provably alive — exactly the STAB-125 gap being closed.
+    assert_eq!(res["totalMessages"], 0);
+
+    // Turn end: slot cleared, fields fall back to the idle shape.
+    svc.clear_live_turn(&id);
+    svc.set_test_busy(&id, false);
+    let res = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    assert_eq!(res["turnInFlight"], false);
+    assert!(res["lastStreamActivityAt"].is_null());
+}
+
 #[tokio::test]
 async fn agent_lite_metadata_created_by_agent_id_from_parent() {
     let (_t, svc, ws) = setup().await;

@@ -1932,6 +1932,19 @@ pub struct AgentLite {
     /// service projection.
     #[serde(default)]
     pub waiting_for_agent_ids: Vec<AgentId>,
+    /// Turn-liveness (STAB-125): `turnInFlight` is `true` while a
+    /// `session/prompt` turn's live-turn slot is open for this agent, and
+    /// `lastStreamActivityAt` is the RFC-3339 timestamp of the most recent
+    /// stream event observed for that turn — so a poller can tell a
+    /// long-but-alive turn (timestamp advancing) from a wedged agent
+    /// (timestamp pinned) before anything persists. Both are additive wire
+    /// fields: `turnInFlight` stays `false` and `lastStreamActivityAt` is
+    /// omitted in [`AgentLite::from_session`] (no runtime context); the
+    /// service projection overlays them.
+    #[serde(default)]
+    pub turn_in_flight: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stream_activity_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<SessionStats>,
     pub created_at: String,
@@ -2003,6 +2016,8 @@ impl AgentLite {
             is_waiting_on_tool: false,
             is_waiting_for_other_agents: false,
             waiting_for_agent_ids: Vec::new(),
+            turn_in_flight: false,
+            last_stream_activity_at: None,
             stats: session.stats,
             last_activity: Some(session.updated_at.clone()),
             created_at: session.created_at,

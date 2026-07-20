@@ -229,6 +229,11 @@ impl Transcript {
 pub(crate) struct LiveTurn {
     pub(crate) message_id: String,
     pub(crate) blocks: Vec<Value>,
+    /// RFC-3339 timestamp of the most recent stream event observed for this
+    /// turn (STAB-125): set when the slot opens and refreshed on every
+    /// [`update_live_turn`](Services::update_live_turn), so pollers can tell a
+    /// long-but-alive turn from a wedged agent even before anything persists.
+    pub(crate) last_activity_at: String,
 }
 
 /// Per-agent map of live turn slots, shared across [`Services`] clones so the
@@ -381,17 +386,20 @@ impl Services {
                 LiveTurn {
                     message_id: message_id.to_string(),
                     blocks,
+                    last_activity_at: now_iso(),
                 },
             );
         }
     }
 
     /// Refresh the agent's live-turn blocks from the current [`Transcript`] (a
-    /// non-consuming [`Transcript::snapshot_blocks`]). No-op if no slot is open.
+    /// non-consuming [`Transcript::snapshot_blocks`]) and stamp the slot's
+    /// `last_activity_at` (STAB-125). No-op if no slot is open.
     fn update_live_turn(&self, agent_id: &AgentId, transcript: &Transcript) {
         if let Ok(mut slots) = self.live_turns.lock() {
             if let Some(slot) = slots.get_mut(agent_id) {
                 slot.blocks = transcript.snapshot_blocks();
+                slot.last_activity_at = now_iso();
             }
         }
     }
@@ -407,6 +415,18 @@ impl Services {
     /// Read an agent's in-flight turn slot, if a turn is currently streaming.
     pub(crate) fn live_turn(&self, agent_id: &AgentId) -> Option<LiveTurn> {
         self.live_turns.lock().ok()?.get(agent_id).cloned()
+    }
+
+    /// Read just the live-turn slot's `last_activity_at` stamp (STAB-125)
+    /// without cloning the streamed blocks — the liveness reads
+    /// (`agent.get`/`agent.list`/`agent.getConversation`/snapshot overlay) poll
+    /// this while a potentially large response is mid-stream.
+    pub(crate) fn live_turn_activity_at(&self, agent_id: &AgentId) -> Option<String> {
+        self.live_turns
+            .lock()
+            .ok()?
+            .get(agent_id)
+            .map(|live| live.last_activity_at.clone())
     }
 
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
