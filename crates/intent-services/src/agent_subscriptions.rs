@@ -636,7 +636,7 @@ impl Services {
         let Some(w) = guard.get_mut(workspace_id) else {
             return 0;
         };
-        let mut kept: Vec<(AgentId, AgentId)> = w
+        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = w
             .subscriptions
             .iter()
             .filter(|s| s.group_id.is_none() && s.one_shot)
@@ -647,16 +647,16 @@ impl Services {
             if s.group_id.as_deref() != Some(group_id) {
                 return true;
             }
-            let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
-            if retain_children.contains(&s.child_agent_id) && !kept.contains(&pair) {
-                s.group_id = None;
-                s.one_shot = true;
-                kept.push(pair);
-                retained += 1;
-                true
-            } else {
-                false
+            if retain_children.contains(&s.child_agent_id) {
+                let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
+                if kept.insert(pair) {
+                    s.group_id = None;
+                    s.one_shot = true;
+                    retained += 1;
+                    return true;
+                }
             }
+            false
         });
         retained
     }

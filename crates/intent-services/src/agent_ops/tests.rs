@@ -6810,7 +6810,8 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     // REGRESSION ASSERTION: settlement must leave the parent an ungrouped
     // oneShot watch on the failed child (and none on the completed one), so
     // the failed-but-possibly-still-working child's later settlement wakes it.
-    // The wake is delivered before the watch swap inside try_fire_group, so
+    // try_fire_group swaps the watches before the wake-delivery await, but the
+    // transcript write we synchronized on above is a separate async step, so
     // poll until the registry reaches its settled state.
     let watches = timeout(Duration::from_secs(2), async {
         loop {
