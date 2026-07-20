@@ -1,23 +1,24 @@
 //! WSS end-to-end for the `pr:linked` / `pr:updated` event payloads
 //! (PROTOCOL §6.5): both must carry the daemon-owned `pullRequests` list so a
 //! subscribed client can render the full per-branch PR list without a refetch.
-//! Drives a real [`WsApiServer`] over plain `ws://` (insecure dev mode) with a
-//! stub forge injected via `with_source_control`, then triggers the same
-//! refresh the 60s background sweep runs and asserts the `events.event`
-//! notifications observed over the wire.
+//! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
+//! self-signed fingerprint (the production transport path) with a stub forge
+//! injected via `with_source_control`, then triggers the same refresh the 60s
+//! background sweep runs and asserts the `events.event` notifications observed
+//! over the wire.
 
 #![cfg(unix)]
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, Result as CoreResult, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
@@ -27,20 +28,120 @@ use intent_sourcecontrol::{
     ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
-use intent_transport::{WsApiServer, WsOptions};
+use intent_transport::{
+    ensure_tls_certificate, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
-type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A fixed 64-char hex token (valid shape) shared by server + client.
+const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// In-memory [`TokenStore`] so tests never touch the real OS keychain.
+#[derive(Default)]
+struct MemTokenStore(Mutex<Option<String>>);
+
+impl TokenStore for MemTokenStore {
+    fn load_token(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn store_token(&self, token: &str) -> CoreResult<()> {
+        *self.0.lock().unwrap() = Some(token.to_string());
+        Ok(())
+    }
+}
+
+/// Client cert verifier that pins the server's SHA-256 fingerprint (colon hex)
+/// and otherwise validates the handshake signature with the ring provider.
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider,
+        }))
+        .with_no_client_auth();
+    Arc::new(config)
 }
 
 /// Stub forge: `get_pr` reports the linked PR (#42, head `feature`) as merged;
@@ -219,13 +320,14 @@ impl SourceControl for StubForge {
 struct Fixture {
     _ws: WsApiServer,
     port: u16,
+    cfg: Arc<ClientConfig>,
     services: Arc<Services>,
     ws_id: WorkspaceId,
     _dir: TempDir,
 }
 
-/// Boot an insecure WSS listener whose services carry the stub forge and a
-/// seeded workspace linked to PR #42 on branch `feature`.
+/// Boot a TLS + bearer-auth WSS listener whose services carry the stub forge
+/// and a seeded workspace linked to PR #42 on branch `feature`.
 async fn boot(forge: StubForge) -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-pr-events-{}", &short[..8]));
@@ -283,31 +385,47 @@ async fn boot(forge: StubForge) -> Fixture {
             .with_source_control(Arc::new(forge)),
     );
     let api: Arc<dyn WorkspaceApi> = services.clone();
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
     let opts = WsOptions {
         base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),
         ..Default::default()
     };
-    let ws_srv = WsApiServer::new_insecure(api, bus, opts, None);
+    let ws_srv = WsApiServer::new(api, bus, &tls, token_store, opts, None).expect("server");
+    let cfg = client_config(&tls.fingerprint256);
     let port = ws_srv.start().await.expect("start");
     Fixture {
         _ws: ws_srv,
         port,
+        cfg,
         services,
         ws_id,
         _dir: TempDir(dir),
     }
 }
 
-async fn connect(port: u16) -> PlainWs {
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let (sock, _resp) = tokio_tungstenite::connect_async(&url)
+/// Establish an authenticated WSS connection over pinned TLS (token in the
+/// query string).
+async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
         .await
-        .expect("plain ws handshake");
-    sock
+        .expect("tcp connect");
+    let name = ServerName::try_from("localhost").unwrap();
+    let tls = TlsConnector::from(cfg)
+        .connect(name, tcp)
+        .await
+        .expect("tls connect");
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
+        .await
+        .expect("ws handshake");
+    ws
 }
 
-async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string())).await.unwrap();
     timeout(Duration::from_secs(5), async {
@@ -320,7 +438,10 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
                         return v["result"].clone();
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Message::Pong(_) => {}
                 _ => panic!("unexpected message"),
             }
         }
@@ -330,7 +451,7 @@ async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Valu
 }
 
 /// Wait for the next `events.event` notification whose `type` matches.
-async fn next_event(ws: &mut PlainWs, event_type: &str) -> Value {
+async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
     timeout(Duration::from_secs(10), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
@@ -342,7 +463,9 @@ async fn next_event(ws: &mut PlainWs, event_type: &str) -> Value {
                         return v["params"]["event"].clone();
                     }
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
                 _ => {}
             }
         }
@@ -362,7 +485,7 @@ async fn pr_linked_event_carries_pull_requests_list_over_wss() {
     })
     .await;
 
-    let mut sub = connect(fx.port).await;
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
     let sub_res = wss_rpc(
         &mut sub,
         1,
@@ -406,7 +529,7 @@ async fn pr_updated_event_carries_pull_requests_list_over_wss() {
     })
     .await;
 
-    let mut sub = connect(fx.port).await;
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
     let sub_res = wss_rpc(
         &mut sub,
         1,
