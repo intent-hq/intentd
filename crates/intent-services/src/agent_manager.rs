@@ -3149,6 +3149,16 @@ async fn resolve_spawn(
     // `npx -y <pinned package>`; local-binary discovery (settings path /
     // managed bin / PATH scan) is skipped entirely.
     if provider.npx_only_package.is_some() {
+        if read_provider_path_setting(store, &provider_id)
+            .await
+            .is_some()
+        {
+            tracing::warn!(
+                provider_id = provider_id,
+                "providers.paths override ignored: {} always spawns via pinned npx",
+                provider_id
+            );
+        }
         let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
         return Ok(ResolvedSpawn {
             provider,
@@ -3216,8 +3226,12 @@ fn resolve_npx_only(
         ))
     })?;
     let npx = npx_path.ok_or_else(|| {
-        Error::Internal(format!(
-            "npx not found — Node.js 18+ is required to run {}. Install Node.js (which provides npx) and try again.",
+        // InvalidInput (not Internal): this is an environment misconfiguration,
+        // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
+        // Internal messages behind a literal "Internal error").
+        Error::InvalidInput(format!(
+            "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
             provider.display_name
         ))
     })?;

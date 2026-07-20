@@ -1219,5 +1219,31 @@ async fn host_provider_discovery_over_wss() {
         "provider.hasNpxFallback must be boolean: {p0}"
     );
 
+    // Every provider carries a boolean npxOnly; claude-code is npx-only with
+    // the pinned package spec, and non-npx-only providers omit npxPackage.
+    for p in providers {
+        assert!(
+            p["npxOnly"].is_boolean(),
+            "provider.npxOnly must be boolean: {p}"
+        );
+        if p["id"] == "claude-code" {
+            assert_eq!(p["npxOnly"], true, "claude-code must be npxOnly: {p}");
+            assert_eq!(
+                p["npxPackage"].as_str().unwrap(),
+                format!(
+                    "@agentclientprotocol/claude-agent-acp@{}",
+                    intent_providers::CLAUDE_AGENT_ACP_VERSION
+                ),
+                "claude-code npxPackage must be the pinned spec: {p}"
+            );
+        } else {
+            assert_eq!(p["npxOnly"], false, "only claude-code is npx-only: {p}");
+            assert!(
+                p.get("npxPackage").is_none(),
+                "non-npx-only providers must omit npxPackage: {p}"
+            );
+        }
+    }
+
     drop(daemon);
 }

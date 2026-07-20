@@ -25,6 +25,12 @@ pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
     claude_agent_acp_version!()
 );
 
+/// Node.js version requirement for the pinned adapter, for user-facing
+/// messages. Must match the npm `engines.node` field of the pinned
+/// [`CLAUDE_AGENT_ACP_NPX_PACKAGE`] (currently `>=22`); re-check when bumping
+/// the pin.
+pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);

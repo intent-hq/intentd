@@ -24,7 +24,7 @@ pub use config::{
     all_provider_ids, always_enabled_providers, auth_error_message, default_provider_config,
     default_provider_id, disableable_providers, find_provider, is_provider_authentication_error,
     provider_config, InjectionMechanism, ProviderConfig, ProviderRuntime, ACP_PROVIDERS,
-    CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
+    CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
 };
 pub use discover::{
     discover_providers, find_npx, find_provider_binary, probe_npx, resolve_on_path, NpxStatus,

@@ -2848,13 +2848,17 @@ async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
 /// and never a locally-discovered provider binary.
 #[tokio::test]
 async fn resolve_spawn_parses_compound_model_id() {
+    if intent_providers::find_npx().is_none() {
+        eprintln!("skipping: npx not available on this host");
+        return;
+    }
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("store opens");
     let mut session = session_with_specialist(None);
     session.model = Some("claude-code:sonnet".to_string());
     let resolved = resolve_spawn(&session, None, &store)
         .await
-        .expect("compound resolves (requires npx on the test host)");
+        .expect("compound resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     assert_eq!(
@@ -2883,9 +2887,14 @@ fn resolve_npx_only_returns_pinned_package_and_errors_without_npx() {
     assert_eq!(pkg, intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
 
     let err = resolve_npx_only(provider, None).expect_err("missing npx is a hard error");
+    assert!(
+        matches!(err, intent_core::Error::InvalidInput(_)),
+        "missing npx is an environment misconfiguration, not an internal error"
+    );
     let msg = err.to_string();
     assert!(
-        msg.contains("npx not found") && msg.contains("Node.js 18+"),
+        msg.contains("npx not found")
+            && msg.contains(intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT),
         "error must explain the npx/Node.js requirement, got: {msg}"
     );
     assert!(

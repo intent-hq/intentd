@@ -2104,8 +2104,9 @@ async fn report_provider_availability() {
             match &provider.resolved_path {
                 Some(npx) => println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display()),
                 None => println!(
-                    "  [--] {} unavailable (npx not found — Node.js 18+ is required)",
-                    provider.id
+                    "  [--] {} unavailable (npx not found — {} is required)",
+                    provider.id,
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
                 ),
             }
             continue;
