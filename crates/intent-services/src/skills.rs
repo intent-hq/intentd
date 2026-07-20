@@ -4,9 +4,11 @@
 //! precedence order:
 //! 1. `~/.agents/skills` (p1)
 //! 2. `~/.claude/skills` (p2)
-//! 3. `~/.augment/skills` (p3)
-//! 4. `<workspace>/.agents/skills` (p4)
-//! 5. `<workspace>/.augment/skills` (p5)
+//! 3. `~/.intent/skills` (p3, app-owned)
+//! 4. `~/.augment/skills` (p4, auggie convention for back-compat)
+//! 5. `<workspace>/.agents/skills` (p5)
+//! 6. `<workspace>/.intent/skills` (p6, app-owned)
+//! 7. `<workspace>/.augment/skills` (p7, auggie convention for back-compat)
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -173,8 +175,13 @@ fn get_scan_targets(
             scope: "user".to_string(),
         });
         targets.push(ScanTarget {
-            root: home.join(".augment").join("skills"),
+            root: home.join(".intent").join("skills"),
             precedence: 3,
+            scope: "user".to_string(),
+        });
+        targets.push(ScanTarget {
+            root: home.join(".augment").join("skills"),
+            precedence: 4,
             scope: "user".to_string(),
         });
     }
@@ -183,12 +190,17 @@ fn get_scan_targets(
         let ws_path = PathBuf::from(ws);
         targets.push(ScanTarget {
             root: ws_path.join(".agents").join("skills"),
-            precedence: 4,
+            precedence: 5,
+            scope: "project".to_string(),
+        });
+        targets.push(ScanTarget {
+            root: ws_path.join(".intent").join("skills"),
+            precedence: 6,
             scope: "project".to_string(),
         });
         targets.push(ScanTarget {
             root: ws_path.join(".augment").join("skills"),
-            precedence: 5,
+            precedence: 7,
             scope: "project".to_string(),
         });
     }
@@ -831,7 +843,7 @@ mod tests {
         let workspace_path = temp_dir.path().join("workspace");
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
 
-        let skills_root = workspace_path.join(".augment").join("skills");
+        let skills_root = workspace_path.join(".intent").join("skills");
         let _skill_path = write_skill(
             &skills_root,
             "catalog-skill",
@@ -863,7 +875,7 @@ mod tests {
         tokio::fs::create_dir_all(&workspace_path).await.unwrap();
 
         // User-level skill
-        let user_skills_root = home_dir.join(".augment").join("skills");
+        let user_skills_root = home_dir.join(".intent").join("skills");
         write_skill(
             &user_skills_root,
             "shared-skill",

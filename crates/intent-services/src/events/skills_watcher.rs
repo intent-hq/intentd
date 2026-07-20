@@ -121,6 +121,7 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
     if let Some(home) = home_dir() {
         roots.push(home.join(".agents").join("skills"));
         roots.push(home.join(".claude").join("skills"));
+        roots.push(home.join(".intent").join("skills"));
         roots.push(home.join(".augment").join("skills"));
     }
     roots
@@ -129,6 +130,7 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
 fn get_project_skill_roots(workspace_path: &Path) -> Vec<PathBuf> {
     vec![
         workspace_path.join(".agents").join("skills"),
+        workspace_path.join(".intent").join("skills"),
         workspace_path.join(".augment").join("skills"),
     ]
 }

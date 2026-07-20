@@ -83,6 +83,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".tmp",
     ".temp",
     ".augment",
+    ".intent",
     ".workspace-notes",
     ".workspace-notes.backup",
     ".workspace",
