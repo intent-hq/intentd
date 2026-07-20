@@ -139,7 +139,7 @@ pub fn probe_npx() -> NpxStatus {
 
 /// Resolve a provider binary to an absolute path using the precedence order:
 /// 1. Explicit path from `providers.paths` map (keyed by provider ID)
-/// 2. Managed `~/.augment/bin/<command>`
+/// 2. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
 /// 3. Scan enhanced PATH directories
 ///
 /// Returns `None` when the binary cannot be resolved. Reuses the discovery
@@ -168,7 +168,7 @@ pub fn find_provider_binary(
         }
     }
 
-    // 2. Managed binary in ~/.augment/bin
+    // 2. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
     if let Some(managed) = managed_binary_path(command) {
         if is_executable_file(&managed) {
             return Some(managed);
@@ -179,7 +179,8 @@ pub fn find_provider_binary(
     find_in_enhanced_dirs(command)
 }
 
-/// The Intent-managed binary path (`~/.augment/bin/<command>[.exe]`).
+/// The auggie binary path (`~/.augment/bin/<command>[.exe]`). This is auggie's
+/// own install location, not a generic Intent-managed binary tier.
 fn managed_binary_path(command: &str) -> Option<PathBuf> {
     let home = home_dir()?;
     let name = if cfg!(windows) {

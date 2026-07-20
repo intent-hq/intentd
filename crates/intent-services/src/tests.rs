@@ -8550,7 +8550,7 @@ mod rules {
     async fn specialization_tier3_bundled_when_no_override_or_file() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-        // No override and no `.augment/agent-rules/task-loop.md` → bundled built-in,
+        // No override and no `.intent/agent-rules/task-loop.md` → bundled built-in,
         // composed as common + workspace + specific (task-loop is a workspace agent).
         let rules =
             crate::rules::get_specialization_rules(&store, Some(&tree.0), "task-loop").await;
@@ -8563,7 +8563,7 @@ mod rules {
     async fn specialization_tier2_workspace_file_overrides_bundled() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-        let dir = tree.0.join(".augment").join("agent-rules");
+        let dir = tree.0.join(".intent").join("agent-rules");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("task-loop.md"), "WORKSPACE_FILE_RULES").unwrap();
         let rules =
@@ -8575,7 +8575,7 @@ mod rules {
     async fn specialization_tier1_override_wins_over_file() {
         let tree = worktree();
         let (_tmp, store, svc, ws) = setup(&tree.0).await;
-        let dir = tree.0.join(".augment").join("agent-rules");
+        let dir = tree.0.join(".intent").join("agent-rules");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("task-loop.md"), "WORKSPACE_FILE_RULES").unwrap();
         // Settings override wins over both the workspace file and the bundled default.

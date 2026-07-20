@@ -3045,8 +3045,8 @@ fn derive_agent_type(
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
 /// `MOCK_AGENT_BEHAVIOR` to the child. Resolves the provider binary to an
-/// absolute path using the precedence: `providers.paths` map → managed
-/// `~/.augment/bin/<command>` → enhanced PATH scan.
+/// absolute path using the precedence: `providers.paths` map →
+/// `~/.augment/bin/<command>` (for auggie) → enhanced PATH scan.
 async fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,

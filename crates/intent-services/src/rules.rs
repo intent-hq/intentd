@@ -71,8 +71,9 @@ fn strip_frontmatter(content: &str) -> &str {
 }
 
 /// Enumerate the workspace rule files that exist, in `rules-loader.ts`
-/// precedence: `CLAUDE.md`, `AGENTS.md`, `.augment/guidelines.md`, then every
-/// `.md` under `.augment/rules/` (sorted). Each becomes a read-only entry.
+/// precedence: `CLAUDE.md`, `AGENTS.md`, `.intent/guidelines.md`,
+/// `.augment/guidelines.md` (auggie convention), then every `.md` under
+/// `.intent/rules/` and `.augment/rules/` (sorted). Each becomes a read-only entry.
 fn list_workspace_rule_files(workspace_path: &Path) -> Vec<WorkspaceRuleFile> {
     let mut out = Vec::new();
     let mut push_file = |rel: &str| {
@@ -88,10 +89,36 @@ fn list_workspace_rule_files(workspace_path: &Path) -> Vec<WorkspaceRuleFile> {
     };
     push_file("CLAUDE.md");
     push_file("AGENTS.md");
+    push_file(".intent/guidelines.md");
     push_file(".augment/guidelines.md");
 
-    let rules_dir = workspace_path.join(".augment").join("rules");
-    if let Ok(entries) = std::fs::read_dir(&rules_dir) {
+    // Scan .intent/rules/ (app-owned)
+    let intent_rules_dir = workspace_path.join(".intent").join("rules");
+    if let Ok(entries) = std::fs::read_dir(&intent_rules_dir) {
+        let mut md: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        md.sort();
+        for abs in md {
+            if let Ok(content) = std::fs::read_to_string(&abs) {
+                out.push(WorkspaceRuleFile {
+                    source: format!(
+                        ".intent/rules/{}",
+                        abs.file_name().unwrap().to_string_lossy()
+                    ),
+                    path: abs.to_string_lossy().into_owned(),
+                    content,
+                    updated_at: file_mtime_ms(&abs),
+                });
+            }
+        }
+    }
+
+    // Scan .augment/rules/ (auggie convention, kept for compatibility)
+    let augment_rules_dir = workspace_path.join(".augment").join("rules");
+    if let Ok(entries) = std::fs::read_dir(&augment_rules_dir) {
         let mut md: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
@@ -117,8 +144,9 @@ fn list_workspace_rule_files(workspace_path: &Path) -> Vec<WorkspaceRuleFile> {
 
 /// Resolve the single live workspace rule source for prompt injection — the
 /// first match in `rules-loader.ts` precedence (custom `--rules` path then
-/// `CLAUDE.md` / `AGENTS.md` / `.augment/guidelines.md`), else every `.md` under
-/// `.augment/rules/` joined. Returns `(content, source)` or `None`.
+/// `CLAUDE.md` / `AGENTS.md` / `.intent/guidelines.md` / `.augment/guidelines.md`),
+/// else every `.md` under `.intent/rules/` and `.augment/rules/` joined.
+/// Returns `(content, source)` or `None`.
 fn load_workspace_rules(
     workspace_path: &Path,
     custom_rules_path: Option<&Path>,
@@ -129,22 +157,30 @@ fn load_workspace_rules(
         }
     }
     let files = list_workspace_rule_files(workspace_path);
-    // First single-file match (CLAUDE.md/AGENTS.md/guidelines.md) wins.
+    // First single-file match (CLAUDE.md/AGENTS.md/.intent or .augment guidelines) wins.
     for f in &files {
-        if !f.source.starts_with(".augment/rules/") {
+        if !f.source.starts_with(".intent/rules/") && !f.source.starts_with(".augment/rules/") {
             return Some((f.content.clone(), f.path.clone()));
         }
     }
-    // Otherwise concatenate every `.augment/rules/*.md` body.
+    // Otherwise concatenate every `.intent/rules/*.md` and `.augment/rules/*.md` body.
     let parts: Vec<String> = files
         .iter()
-        .filter(|f| f.source.starts_with(".augment/rules/"))
+        .filter(|f| {
+            f.source.starts_with(".intent/rules/") || f.source.starts_with(".augment/rules/")
+        })
         .map(|f| strip_frontmatter(&f.content).to_string())
         .collect();
     if parts.is_empty() {
         None
     } else {
-        let dir = workspace_path.join(".augment").join("rules");
+        // Report the dir that actually contributed content; prefer .intent/rules
+        // when both tiers contributed.
+        let dir = if files.iter().any(|f| f.source.starts_with(".intent/rules/")) {
+            workspace_path.join(".intent").join("rules")
+        } else {
+            workspace_path.join(".augment").join("rules")
+        };
         Some((
             parts.join("\n\n---\n\n"),
             dir.to_string_lossy().into_owned(),
@@ -182,7 +218,7 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 /// fallback (port of `InstructionService.getSpecializationRules`,
 /// `instruction-service.ts` ~186–255):
 /// 1. the enabled `endUserRules` override for `agent_type` (settings **wins**),
-/// 2. else a non-empty `<ws>/.augment/agent-rules/{agent_type}.md` workspace file,
+/// 2. else a non-empty `<ws>/.intent/agent-rules/{agent_type}.md` workspace file,
 /// 3. else the bundled built-in via
 ///    [`crate::instructions::get_instruction_with_common`].
 ///
@@ -204,10 +240,10 @@ pub(crate) async fn get_specialization_rules(
     if let Some(c) = enabled_override(&overrides, agent_type) {
         return c;
     }
-    // 2. Workspace file `<ws>/.augment/agent-rules/{agent_type}.md` (non-empty wins).
+    // 2. Workspace file `<ws>/.intent/agent-rules/{agent_type}.md` (non-empty wins).
     if let Some(path) = workspace_path {
         let file = path
-            .join(".augment")
+            .join(".intent")
             .join("agent-rules")
             .join(format!("{agent_type}.md"));
         if let Ok(content) = std::fs::read_to_string(&file) {

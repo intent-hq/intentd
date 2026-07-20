@@ -263,8 +263,8 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     };
 
     // Create a user-tier specialist with a model frontmatter field.
-    // (Hermetic: set HOME=data_dir below so the daemon reads $HOME/.augment/specialists/.)
-    let specialists_dir = data_dir.join(".augment").join("specialists");
+    // (Hermetic: set HOME=data_dir below so the daemon reads $HOME/.intent/specialists/.)
+    let specialists_dir = data_dir.join(".intent").join("specialists");
     std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
     let specialist_content =
         "---\nmodel: auggie:opus\n---\n# Test Specialist\nTest behavior prompt.";
