@@ -631,7 +631,11 @@ async fn agent_lite_surfaces_turn_liveness_from_live_turn_slot() {
     );
 
     // Streaming progress re-stamps the slot: a later set_live_turn advances it.
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    // Wait until the clock has observably moved past the first stamp so the
+    // strict `>` holds even on coarse clock/formatting resolutions.
+    while intent_core::parse_iso(&now_iso()).unwrap() <= parsed {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     svc.set_live_turn(
         &id,
         "msg-1",
