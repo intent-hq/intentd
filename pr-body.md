@@ -1,74 +1,29 @@
-Implements workspace boundary resolution for `file-tracking.loadCommits` so the Changes panel only shows workspace-owned commits.
+## Summary
+
+Fixes specialist frontmatter `model` field resolution during agent creation, ensuring delegated/background agents use the specialist's declared model before falling back to settings.
 
 ## Changes
 
-### Core Implementation
+- **specialists.rs**: Added `SpecialistsService::resolve_model` to extract the `model` field from specialist frontmatter (3-tier resolution: project > user > bundled), with path-traversal validation via `validate_id`
+- **agent_ops.rs**: Modified `agent_create_op` to capture `workspace_path` from `AgentCreateExtra` and consult specialist frontmatter before the settings chain
+- **tests_specialist_frontmatter.rs**: Added regression test file with 4 tests covering precedence scenarios and path-traversal security
 
-- **intent-git/history.rs**: New boundary resolution logic
-  - `resolve_workspace_boundary()`: Prefers merge-base of HEAD vs `origin/<baseRef>` or `<baseRef>` (rebase-resilient), falls back to `baseCommitSha` when it's a valid ancestor
-  - `history_bounded()`: Returns commits in `boundary..HEAD` range with optional `includeOlder` parameter for pre-boundary commits (powers FE "show previous" toggle)
+## Precedence
 
-- **intent-services/lib.rs**: Updated `file_tracking_load_commits`
-  - Calls `resolve_workspace_boundary()` to get boundary SHA
-  - Returns `boundarySha` in result envelope: `{ commits, boundarySha, nextToken }`
-  - Added `includeOlder` parameter (optional bool, default false)
-  - Returns empty when boundary info exists but fails to resolve (safety net against showing arbitrary base-branch commits)
-
-- **intent-core/traits.rs**: Updated `WorkspaceApi` trait signature to include `includeOlder` parameter
-
-- **intent-transport/router.rs**: Wired `includeOlder` parameter from JSON-RPC request
-
-### Tests
-
-Added 7 unit tests in intent-git covering all boundary scenarios:
-- No boundary info returns None
-- baseCommitSha fallback when valid ancestor
-- Non-ancestor SHA rejected
-- Bounded returns commits after boundary
-- At-head boundary returns empty
-- No boundary returns all commits
-- includeOlder fetches pre-boundary commits
-
-Updated existing test in intent-services to pass new parameter.
-
-All tests pass: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
-
-## Wire Shape
-
-**Additive, backward-compatible change**
-
-Result now returns:
-```typescript
-{
-  commits: CommitWithAttribution[],
-  boundarySha: string | null,  // NEW
-  nextToken: string | null
-}
+```
+explicit model > specialist frontmatter model > settings chain > CLI default
 ```
 
-Request accepts optional parameter:
-```typescript
-{
-  workspaceId: string,
-  limit?: number,
-  nextToken?: string,
-  includeOlder?: boolean  // NEW (optional, default: false)
-                           // When true, returns commits BEFORE the workspace boundary
-                           // (powers FE "show previous" toggle)
-                           // When false (default), returns commits in boundary..HEAD range
-}
-```
+## Security
 
-**Parameter details:**
-- `includeOlder` (optional boolean, default `false`):
-  - `false` (default): Returns commits in `boundary..HEAD` range (workspace-owned commits only)
-  - `true`: Returns commits **before and including** the boundary (pre-workspace history, for "show previous" toggle; the boundary commit itself is included)
-  - When no boundary info exists (no `baseRef`/`baseCommitSha`), behavior is unbounded regardless of this flag
+`resolve_model` validates the specialist `id` parameter via `validate_id` before building file paths, preventing path traversal attacks.
 
-PROTOCOL.md update will be handled in monorepo Task 3.
+## Testing
 
-## Related
-
-Part of workspace-start-boundary fix (STAB-89). This PR implements the BE side; FE integration follows in cloudlands-fe.
-
-Fixes the Changes panel "Workspace start" marker to reflect the workspace's actual base commit rather than an arbitrary point ~50 commits in the past.
+- 4 unit tests in `tests_specialist_frontmatter.rs`:
+  - Specialist frontmatter model used when no explicit model
+  - Missing/empty frontmatter falls through to settings
+  - Explicit model beats specialist frontmatter
+  - Malicious specialist id with path traversal is rejected
+- Full `intent-services` test suite (1118 tests) green
+- `cargo fmt --check` and `cargo clippy -- -D warnings` clean

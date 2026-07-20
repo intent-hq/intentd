@@ -428,6 +428,22 @@ impl SpecialistsService {
         })
     }
 
+    /// Resolve a specialist's `model` frontmatter scalar through the 3-tier
+    /// order (project > user > bundled), used at spawn time when no explicit
+    /// model parameter is supplied. Returns `None` when the specialist is
+    /// unknown or declares no `model`, allowing the caller to fall through to
+    /// the settings chain.
+    pub(crate) fn resolve_model(&self, id: &str, workspace_path: Option<&Path>) -> Option<String> {
+        // Validate id before passing to resolve() to prevent path traversal
+        validate_id(id).ok()?;
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("model")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
     /// keyed by id (later tiers overwrite earlier — the precedence merge).
     fn collect_dir(dir: &Path, source: &str, acc: &mut std::collections::BTreeMap<String, Value>) {
