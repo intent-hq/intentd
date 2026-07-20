@@ -506,6 +506,31 @@ async fn agent_create_rejects_duplicate_client_agent_id() {
 }
 
 #[tokio::test]
+async fn reserve_agent_id_blocks_concurrent_claim_until_dropped() {
+    // The in-process reservation closes the check-then-act gap between the
+    // duplicate-id preflight (SELECT) and the session insert: while one
+    // create flow holds the claim, an overlapping claim on the same id is
+    // `-32602` naming the id; dropping the guard releases the id.
+    let (_t, svc, _ws) = setup().await;
+    let id = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
+    let guard = svc.reserve_agent_id(&id).expect("first claim");
+    let err = svc
+        .reserve_agent_id(&id)
+        .err()
+        .expect("overlapping claim must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(id.0.as_str()),
+            "error must name the contended id, got: {msg}"
+        ),
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    drop(guard);
+    let reclaim = svc.reserve_agent_id(&id).expect("released id is claimable");
+    drop(reclaim);
+}
+
+#[tokio::test]
 async fn agent_lite_carries_metadata_and_activity_fields() {
     let (_t, svc, ws) = setup().await;
     let created = svc

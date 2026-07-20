@@ -3743,6 +3743,65 @@ mod change_event_parity {
         );
     }
 
+    /// Two OVERLAPPING `workspace.create` requests with the same
+    /// `initialAgent.agentId` (client retry while the first attempt is still
+    /// in flight): the in-process reservation makes the preflight atomic, so
+    /// exactly one create wins and the loser is `-32602` naming the id BEFORE
+    /// provisioning — no second row, no partial workspace. Pre-reservation,
+    /// both passed the SELECT preflight and the loser failed at the agent
+    /// insert AFTER persisting its workspace.
+    #[tokio::test]
+    async fn workspace_create_concurrent_duplicate_initial_agent_id_single_winner() {
+        use intent_core::{Error, WorkspaceCreate, WorkspaceCreateInitialAgent};
+        let h = harness().await;
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let before = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list before")
+            .len();
+        let input = || WorkspaceCreate {
+            title: Some("Racing retry".to_string()),
+            initial_agent: Some(WorkspaceCreateInitialAgent {
+                agent_id: Some(requested.clone()),
+                prompt: Some("race the same id".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let svc_a = h.services.clone();
+        let svc_b = h.services.clone();
+        let (a, b) = tokio::join!(
+            svc_a.create_workspace(input(), None),
+            svc_b.create_workspace(input(), None),
+        );
+        let (ok, err) = match (a, b) {
+            (Ok(ok), Err(err)) | (Err(err), Ok(ok)) => (ok, err),
+            (Ok(_), Ok(_)) => panic!("both creates won the same agent id"),
+            (Err(a), Err(b)) => panic!("both creates failed: {a:?} / {b:?}"),
+        };
+        assert_eq!(
+            ok.initial_agent.expect("winner created the agent")["id"].as_str(),
+            Some(requested.as_str())
+        );
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&requested),
+                "loser must name the contended id, got: {msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Exactly one new workspace row: the loser left no partial state.
+        let after = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list after")
+            .len();
+        assert_eq!(after, before + 1, "loser must not persist a row");
+    }
+
     /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
     /// with the same key returns the ORIGINAL workspace without re-executing —
     /// so no second row, and neither the `workspace:created` nor the seeded
