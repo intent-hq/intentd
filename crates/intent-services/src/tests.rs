@@ -3709,6 +3709,40 @@ mod change_event_parity {
         assert!(none.is_err(), "failed create must not publish events");
     }
 
+    /// A whitespace-padded but otherwise valid, non-duplicate
+    /// `initialAgent.agentId` succeeds: the preflight validates the TRIMMED id
+    /// and the create path adopts the same trimmed id, so the padded value
+    /// cannot pass preflight and then fail inside `agent_create_op` after
+    /// provisioning side effects.
+    #[tokio::test]
+    async fn workspace_create_trims_padded_initial_agent_id() {
+        use intent_core::{WorkspaceCreate, WorkspaceCreateInitialAgent};
+        let h = harness().await;
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let result = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Padded id".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        agent_id: Some(format!("  {requested}  ")),
+                        prompt: Some("hello".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("padded valid non-duplicate id must not fail the create");
+        let agent = result.initial_agent.expect("initial agent created");
+        assert_eq!(
+            agent["id"].as_str(),
+            Some(requested.as_str()),
+            "the trimmed id is adopted verbatim: {agent}"
+        );
+    }
+
     /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
     /// with the same key returns the ORIGINAL workspace without re-executing —
     /// so no second row, and neither the `workspace:created` nor the seeded

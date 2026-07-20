@@ -140,11 +140,16 @@ fn dir_entries(path: &PathBuf) -> Vec<String> {
 fn init_git_repo(path: &PathBuf) {
     std::fs::create_dir_all(path).unwrap();
     let run = |args: &[&str]| {
-        std::process::Command::new("git")
+        let out = std::process::Command::new("git")
             .args(args)
             .current_dir(path)
             .output()
             .expect("git command");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     run(&["init"]);
     run(&["config", "user.name", "Test"]);

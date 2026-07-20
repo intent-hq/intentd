@@ -6851,8 +6851,12 @@ impl WorkspaceApi for Services {
                             is_background: Some(false),
                             ..Default::default()
                         };
+                        // Trim to match the preflight duplicate-id check above,
+                        // which validates the TRIMMED id: a whitespace-padded
+                        // valid id must not pass preflight and then fail inside
+                        // agent_create_op after provisioning side effects.
                         let requested = nonempty_owned(agent.agent_id)
-                            .map(|id| AgentId::from(id.as_str()));
+                            .map(|id| AgentId::from(id.trim()));
                         let created = services
                             .agent_create_op(
                                 ws.id.clone(),
