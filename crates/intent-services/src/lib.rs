@@ -272,6 +272,14 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Client-supplied agent ids currently claimed by an in-flight create flow
+    /// ([`Services::reserve_agent_id`]). Closes the check-then-act gap between
+    /// the duplicate-id preflight and the session insert so two overlapping
+    /// `workspace.create`/`agent.create` retries with the same requested id
+    /// cannot both pass the preflight and race provisioning — the loser fails
+    /// `-32602` before any side effect. Shared across clones so every service
+    /// handle observes the same reservations.
+    creating_agent_ids: Arc<Mutex<HashSet<AgentId>>>,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -377,6 +385,7 @@ impl Services {
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            creating_agent_ids: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -6335,6 +6344,34 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Fail fast on a bad client-supplied `initialAgent.agentId`
+                    // BEFORE any provisioning side effect (clone, worktree, row
+                    // insert, spec seed, `workspace:created`): a malformed or
+                    // duplicate id is `-32602` naming the problem and leaves no
+                    // partial workspace behind. Pre-fix, the duplicate only
+                    // surfaced as an opaque `-32603` UNIQUE(1555) from the
+                    // agent insert AFTER the workspace had been persisted,
+                    // orphaning a workspace per retry. The reservation guard
+                    // is held for the rest of the create flow so an
+                    // OVERLAPPING retry with the same id fails here too — not
+                    // at the agent insert after this request already
+                    // provisioned the workspace.
+                    let _initial_agent_id_reservation = match input
+                        .initial_agent
+                        .as_ref()
+                        .and_then(|a| a.agent_id.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(requested) => {
+                            agent_ops::validate_client_agent_id(requested)?;
+                            let id = AgentId::from(requested);
+                            let guard = services.reserve_agent_id(&id)?;
+                            services.ensure_agent_id_available(&id).await?;
+                            Some(guard)
+                        }
+                        None => None,
+                    };
                     let workspaces_root =
                         workspaces_root.unwrap_or_else(default_workspaces_root);
                     // Workspace id derivation (TS `generateLocalSlug` parity):
@@ -6831,8 +6868,12 @@ impl WorkspaceApi for Services {
                             is_background: Some(false),
                             ..Default::default()
                         };
+                        // Trim to match the preflight duplicate-id check above,
+                        // which validates the TRIMMED id: a whitespace-padded
+                        // valid id must not pass preflight and then fail inside
+                        // agent_create_op after provisioning side effects.
                         let requested = nonempty_owned(agent.agent_id)
-                            .map(|id| AgentId::from(id.as_str()));
+                            .map(|id| AgentId::from(id.trim()));
                         let created = services
                             .agent_create_op(
                                 ws.id.clone(),
@@ -11681,6 +11722,19 @@ impl WorkspaceApi for Services {
                 idempotency_key,
                 "agent.create",
                 move || async move {
+                    // Claim the client-supplied id for the duration of the op
+                    // (front-door parity with the `workspace.create`
+                    // preflight): a concurrent create racing the same id fails
+                    // `-32602` here instead of at the insert. Inside the
+                    // idempotency closure so a key replay (which never
+                    // re-runs the body) cannot trip over its own reservation.
+                    let _reservation = match &requested_agent_id {
+                        Some(id) => {
+                            agent_ops::validate_client_agent_id(id.as_str())?;
+                            Some(self.reserve_agent_id(id)?)
+                        }
+                        None => None,
+                    };
                     self.agent_create_op(
                         workspace_id,
                         name,
