@@ -15,14 +15,14 @@ use std::time::Duration;
 /// Apply the timeout multiplier from the environment for coverage
 /// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
 /// non-finite values are ignored and values below 1.0 are clamped so budgets
-/// can only be extended).
+/// can only be extended; overflow saturates to `Duration::MAX`).
 pub fn test_timeout(base: Duration) -> Duration {
     let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|m| m.is_finite())
         .unwrap_or(1.0);
-    base.mul_f64(multiplier.max(1.0))
+    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
 }
 
 /// Shared budget for waiting on daemon startup (UDS/socket ready): 60s base,
