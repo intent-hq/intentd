@@ -856,6 +856,101 @@ async fn wss_models_list_returns_catalog_with_source() {
     srv.ws.stop().await;
 }
 
+#[tokio::test]
+async fn wss_models_list_with_provider_id_and_force_refresh() {
+    // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
+    // through the generic cache. Unknown providers degrade to the static
+    // fallback (`source: "static"` + warning, never an error); cortex is
+    // feature-code gated (empty list + warning under its own source tag).
+    let srv = start(WsOptions::default()).await;
+
+    let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 8);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "no-such-provider");
+    assert_eq!(resp["result"]["source"], "static");
+    assert!(resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    assert!(resp["result"]["warning"].is_string(), "{resp}");
+    // Exactly the documented keys — degraded (not stale) data carries no
+    // `stale` flag and no extras.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["models", "providerId", "source", "warning"],
+        "{resp}"
+    );
+
+    let frame =
+        r#"{"jsonrpc":"2.0","id":9,"method":"models.list","params":{"providerId":"cortex"}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 9);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "cortex");
+    assert_eq!(resp["result"]["source"], "cortex");
+    assert!(resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    assert!(
+        resp["result"]["warning"]
+            .as_str()
+            .expect("warning")
+            .contains("Cortex"),
+        "{resp}"
+    );
+    // Gated empty success is fresh, not stale: same exact key set.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["models", "providerId", "source", "warning"],
+        "{resp}"
+    );
+
+    // Legacy path with only `forceRefresh` (no providerId): still routes and
+    // keeps the legacy shape. On a fresh daemon there is no last-good cache
+    // entry, so a failed forced probe degrades straight to the static catalog
+    // — exactly `{ models, source }`, no providerId/stale/warning fields.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":10,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 10);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert!(!resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source"], "{resp}");
+    srv.ws.stop().await;
+}
+
 /// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
 /// (§5.31): swallows the piped stdin, then runs `body`.
 #[cfg(unix)]
@@ -1783,6 +1878,81 @@ async fn wss_git_commit_details_round_trip() {
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// `accept-changes.getStatus` over WSS: proves the wire shape from PROTOCOL
+/// §5.18 — `localCommits` entries are metadata-only (`hash`, `message`,
+/// `author`, `date`, `isPushed`) and omit `files`/`filesChanged`, which
+/// clients fetch on demand via `git.commitDetails`.
+#[tokio::test]
+async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a repo: one commit on main, then a feature branch with one commit.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssacgs-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "feature/wss"]);
+    std::fs::write(repo.join("feat.txt"), "feat\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "add feat"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS AC WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"accept-changes.getStatus","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let result = &resp["result"];
+    assert_eq!(result["branch"], "feature/wss");
+    assert_eq!(result["trunkBranch"], "main");
+    assert_eq!(result["hasRemote"], false);
+    assert_eq!(result["aheadOfTrunk"], 1);
+    assert_eq!(result["uncommittedCount"], 0);
+    assert_eq!(result["stagedCount"], 0);
+    let commits = result["localCommits"].as_array().expect("localCommits");
+    assert_eq!(commits.len(), 1);
+    let c = &commits[0];
+    assert!(c["hash"].is_string());
+    assert_eq!(c["message"], "add feat");
+    assert_eq!(c["author"], "Test");
+    assert!(c["date"].is_string());
+    assert_eq!(c["isPushed"], false);
+    // Metadata-only walk: no per-commit tree diffs in getStatus.
+    assert!(c.get("files").is_none());
+    assert!(c.get("filesChanged").is_none());
 
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
