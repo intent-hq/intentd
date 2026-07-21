@@ -121,7 +121,9 @@ struct CommandOutput {
 
 /// Spawn auggie with the enhanced exec PATH, an optional `cwd`, optional stdin,
 /// and a timeout. No shell on unix (`execFile`-style); `cmd /C` for `.cmd`/
-/// `.bat` shims on Windows. The child is killed if the timeout elapses.
+/// `.bat` shims on Windows. The child is killed if the timeout elapses
+/// (`kill_on_drop`, plus a unix process-group SIGKILL so grandchildren are
+/// reaped too — mirroring `run_auggie_print` in intent-services).
 async fn run_auggie(
     auggie_path: &Path,
     args: &[&str],
@@ -144,10 +146,16 @@ async fn run_auggie(
         Stdio::null()
     });
     command.kill_on_drop(true);
+    // Put the child in its own process group (leader pgid == child pid) so a
+    // timeout can SIGKILL the WHOLE tree via `killpg` — `kill_on_drop` only
+    // reaches the direct child, leaving grandchildren orphaned.
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command
         .spawn()
         .map_err(|e| ContextError::Spawn(e.to_string()))?;
+    let pid = child.id();
 
     if let Some(data) = stdin {
         if let Some(mut sink) = child.stdin.take() {
@@ -159,7 +167,20 @@ async fn run_auggie(
 
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| ContextError::Spawn(e.to_string()))?,
-        Err(_) => return Err(ContextError::Timeout),
+        Err(_) => {
+            // Reap the whole process group (pgid == pid via `process_group`);
+            // the dropped `wait_with_output` future's `kill_on_drop` covers
+            // the direct child on non-unix.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                use nix::sys::signal::{killpg, Signal};
+                use nix::unistd::Pid;
+                let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+            }
+            #[cfg(not(unix))]
+            let _ = pid;
+            return Err(ContextError::Timeout);
+        }
     };
 
     Ok(CommandOutput {
@@ -335,6 +356,60 @@ mod tests {
                 version: Some("2.5.1".to_string()),
             }
         );
+    }
+
+    /// A fake binary that forks a `sleep 30` grandchild (writing its pid to a
+    /// file) must have the WHOLE group reaped when the timeout elapses — a
+    /// direct-child-only kill would leave the grandchild orphaned.
+    #[cfg(unix)]
+    #[test]
+    fn run_auggie_timeout_group_kills_grandchildren() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-ctx-groupkill-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("auggie");
+        let pidfile = dir.join("grandchild.pid");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nsleep 30 & echo $! > '{}'\nwait\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = futures_block_on(run_auggie(
+            &bin,
+            &[],
+            None,
+            None,
+            Duration::from_millis(1000),
+        ));
+        assert!(matches!(result, Err(ContextError::Timeout)));
+
+        let grandchild_pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild pid written before timeout")
+            .trim()
+            .parse()
+            .expect("parse grandchild pid");
+
+        // The grandchild is not our direct child, so it lingers until init
+        // reaps it; `kill(pid, 0)` returns ESRCH once the pid is gone.
+        futures_block_on(async {
+            for _ in 0..100 {
+                if nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild_pid), None).is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("grandchild pid {grandchild_pid} still alive after timeout group-kill");
+        });
     }
 
     /// Minimal single-threaded block-on so async tests need no extra deps.

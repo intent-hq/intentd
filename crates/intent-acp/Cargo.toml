@@ -22,6 +22,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[target."cfg(unix)".dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 # Integration tests drive the client-served `terminal/*` handlers against the

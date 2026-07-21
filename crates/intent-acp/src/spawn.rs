@@ -186,8 +186,16 @@ impl SpawnedAgent {
         &mut self.child
     }
 
-    /// Kill the child process.
+    /// Kill the child process and, on unix, its whole process group — the
+    /// child is its own group leader (`process_group(0)` in [`build_command`]),
+    /// so `killpg` reaps grandchildren a bare `kill()` would orphan.
     pub async fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
         self.child.kill().await
     }
 
@@ -263,6 +271,64 @@ mod build_args_tests {
                 "{id} spawn args unexpectedly include --remove-tool: {args:?}"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod kill_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `SpawnedAgent::kill` must reap the WHOLE process group: a `sh` child
+    /// that forks a `sleep 30` grandchild (writing its pid to a file) leaves
+    /// no survivor after `kill()` — a direct-child-only kill would orphan it.
+    #[tokio::test]
+    async fn kill_reaps_grandchildren_via_process_group() {
+        let pidfile =
+            std::env::temp_dir().join(format!("intent-acp-groupkill-{}.pid", uuid::Uuid::new_v4()));
+        let base = *intent_providers::find_provider("auggie").unwrap();
+        let provider = intent_providers::ProviderConfig {
+            command: "sh",
+            base_args: &["-c", r#"sleep 30 & echo $! > "$INTENT_TEST_PIDFILE"; wait"#],
+            model_flag: None,
+            rules_flag: None,
+            mcp_config_flag: None,
+            quiet_flag: None,
+            supports_mcp_config: false,
+            supports_rules_file: false,
+            ..base
+        };
+        let mut opts = SpawnOptions::new(&provider);
+        opts.extra_env.insert(
+            "INTENT_TEST_PIDFILE".to_string(),
+            pidfile.display().to_string(),
+        );
+        let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn sh child");
+
+        let mut grandchild_pid = None;
+        for _ in 0..100 {
+            if let Ok(s) = tokio::fs::read_to_string(&pidfile).await {
+                if let Ok(pid) = s.trim().parse::<i32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid written");
+
+        agent.kill().await.expect("kill agent");
+        tokio::fs::remove_file(&pidfile).await.ok();
+
+        // The grandchild is not our direct child, so it lingers until init
+        // reaps it; `kill(pid, 0)` returns ESRCH once the pid is gone.
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild_pid), None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild pid {grandchild_pid} still alive after group kill");
     }
 }
 
