@@ -3339,12 +3339,22 @@ fn resolve_spawn(
         }
         let base = intent_providers::find_provider("mock")
             .ok_or_else(|| Error::Internal("mock provider missing from registry".to_string()))?;
+        // `MOCK_AGENT_SESSION_MCP=1` flips the mock from `--mcp-config` file
+        // delivery to ACP session-setup delivery (`session/new` `mcpServers`),
+        // so the E2E suite can exercise the claude-code/codex/droid wire path
+        // (STAB-156) against the real daemon.
+        let session_mcp = std::env::var("MOCK_AGENT_SESSION_MCP").is_ok_and(|v| v == "1");
         let provider = ProviderConfig {
             command: "node",
             base_args,
             supports_authenticate: true,
-            supports_mcp_config: true,
-            mcp_config_flag: Some("--mcp-config"),
+            supports_mcp_config: !session_mcp,
+            mcp_config_flag: if session_mcp {
+                None
+            } else {
+                Some("--mcp-config")
+            },
+            supports_session_mcp_servers: session_mcp,
             ..*base
         };
         return Ok(ResolvedSpawn {
