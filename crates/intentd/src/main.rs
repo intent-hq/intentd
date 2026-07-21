@@ -261,7 +261,9 @@ async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>) -> anyhow::Result<()> 
 
     if let Some(path) = png {
         let img = code.render::<image::Luma<u8>>().build();
-        img.save(path)
+        // Always encode PNG regardless of the path's extension: `save()` would
+        // infer the format from the extension and fail confusingly otherwise.
+        img.save_with_format(path, image::ImageFormat::Png)
             .map_err(|e| anyhow::anyhow!("cannot write PNG to {}: {e}", path.display()))?;
         restrict_permissions(path)?;
         eprintln!("wrote {}", path.display());

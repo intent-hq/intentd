@@ -57,7 +57,12 @@ impl ServerPairingInfo for MockPairingInfo {
 }
 
 fn provider(port: Option<u16>, dir: &str, token: &str) -> (Arc<dyn ServerPairingInfo>, PathBuf) {
-    let tmpdir = std::env::temp_dir().join(format!("intentd-test-{}-{dir}", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmpdir =
+        std::env::temp_dir().join(format!("intentd-test-{}-{nanos}-{dir}", std::process::id()));
     std::fs::create_dir_all(&tmpdir).unwrap();
     let store = crate::AsyncTokenStore::new(Arc::new(MemoryStore::with(token)));
     let p: Arc<dyn ServerPairingInfo> = Arc::new(MockPairingInfo {
