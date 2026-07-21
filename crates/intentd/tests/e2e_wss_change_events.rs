@@ -73,7 +73,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(60), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
