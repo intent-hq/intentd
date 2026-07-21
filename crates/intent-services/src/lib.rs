@@ -10391,7 +10391,7 @@ impl WorkspaceApi for Services {
             let status = intent_git::status::status(&path);
             if let Ok(s) = &status {
                 tracing::debug!(
-                    workspace_id = workspace_id.as_str(),
+                    workspace_id = %workspace_id.as_str(),
                     files = s.files.len(),
                     total_ms = started.elapsed().as_millis() as u64,
                     "git.status: working-tree status scan"
@@ -13975,16 +13975,7 @@ impl WorkspaceApi for Services {
                 skip + limit + 1,
                 include_older,
             )?;
-            tracing::debug!(
-                workspace_id = workspace_id.as_str(),
-                commits = commits.len(),
-                limit,
-                skip,
-                include_older,
-                boundary_resolve_ms = boundary_ms,
-                history_walk_ms = walk_started.elapsed().as_millis() as u64,
-                "file-tracking.loadCommits: boundary resolve + history walk"
-            );
+            let walk_ms = walk_started.elapsed().as_millis() as u64;
             let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()
@@ -13992,6 +13983,17 @@ impl WorkspaceApi for Services {
                 .take(limit)
                 .map(file_tracking_ops::commit_to_value)
                 .collect();
+            tracing::debug!(
+                workspace_id = %workspace_id.as_str(),
+                commits_fetched = commits.len(),
+                commits_returned = values.len(),
+                limit,
+                skip,
+                include_older,
+                boundary_resolve_ms = boundary_ms,
+                history_walk_ms = walk_ms,
+                "file-tracking.loadCommits: boundary resolve + history walk"
+            );
             let next_token = if has_more {
                 serde_json::Value::String(pagination::offset_token(skip + limit))
             } else {

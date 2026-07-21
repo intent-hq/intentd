@@ -37,13 +37,14 @@ pub fn status(worktree_path: &Path) -> Result<GitStatus> {
     let diverged = ahead > 0 && behind > 0;
     let scan_started = Instant::now();
     let files = collect_files(&repo)?;
+    let scan_elapsed = scan_started.elapsed();
     let has_uncommitted_changes = files
         .iter()
         .any(|f| f.staged || f.status != GitFileStatus::Untracked);
     let has_untracked_files = files.iter().any(|f| f.status == GitFileStatus::Untracked);
     tracing::debug!(
         files = files.len(),
-        scan_ms = scan_started.elapsed().as_millis() as u64,
+        scan_ms = scan_elapsed.as_millis() as u64,
         total_ms = started.elapsed().as_millis() as u64,
         "status: working-tree status scan"
     );

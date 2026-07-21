@@ -54,7 +54,9 @@ pub fn history_since(
     }
 
     let branch = current_branch(&repo);
+    let unpushed_started = Instant::now();
     let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
+    let unpushed_elapsed = unpushed_started.elapsed();
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -104,8 +106,12 @@ pub fn history_since(
         commits = out.len(),
         limit,
         base_ref = base_ref.unwrap_or(""),
-        revwalk_ms = total.saturating_sub(diff_elapsed).as_millis() as u64,
+        unpushed_ms = unpushed_elapsed.as_millis() as u64,
         per_commit_diff_ms = diff_elapsed.as_millis() as u64,
+        other_ms = total
+            .saturating_sub(diff_elapsed)
+            .saturating_sub(unpushed_elapsed)
+            .as_millis() as u64,
         total_ms = total.as_millis() as u64,
         "history_since: revwalk + per-commit tree diffs"
     );
@@ -329,7 +335,9 @@ pub fn history_bounded(
     }
 
     let branch = current_branch(&repo);
+    let unpushed_started = Instant::now();
     let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
+    let unpushed_elapsed = unpushed_started.elapsed();
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -389,8 +397,12 @@ pub fn history_bounded(
         limit,
         include_older,
         bounded = boundary_sha.is_some(),
-        revwalk_ms = total.saturating_sub(diff_elapsed).as_millis() as u64,
+        unpushed_ms = unpushed_elapsed.as_millis() as u64,
         per_commit_diff_ms = diff_elapsed.as_millis() as u64,
+        other_ms = total
+            .saturating_sub(diff_elapsed)
+            .saturating_sub(unpushed_elapsed)
+            .as_millis() as u64,
         total_ms = total.as_millis() as u64,
         "history_bounded: revwalk + per-commit tree diffs"
     );

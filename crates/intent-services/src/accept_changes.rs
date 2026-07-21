@@ -184,10 +184,12 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
         status.branch.clone()
     };
 
+    let remote_started = std::time::Instant::now();
     let remote_url = intent_git::remote::origin_url(worktree)?;
     let has_remote = remote_url.is_some();
     let is_pushed = has_remote
         && intent_git::remote::remote_tracking_exists(worktree, "origin", &branch).unwrap_or(false);
+    let remote_ms = remote_started.elapsed().as_millis() as u64;
 
     let trunk_started = std::time::Instant::now();
     let trunk_ref = resolve_trunk_ref(worktree, &trunk, has_remote);
@@ -197,15 +199,7 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
     let history_started = std::time::Instant::now();
     let commits = intent_git::history::history_since(worktree, Some(&trunk_ref), 200)?;
     let local_commits: Vec<Value> = commits.iter().map(commit_to_value).collect();
-    tracing::debug!(
-        files = status.files.len(),
-        local_commits = local_commits.len(),
-        status_ms,
-        trunk_resolve_ms = trunk_ms,
-        history_walk_ms = history_started.elapsed().as_millis() as u64,
-        total_ms = started.elapsed().as_millis() as u64,
-        "accept-changes.getStatus: status scan + trunk resolve + history walk"
-    );
+    let history_ms = history_started.elapsed().as_millis() as u64;
 
     let mut uncommitted = std::collections::HashSet::new();
     let mut staged = std::collections::HashSet::new();
@@ -221,6 +215,17 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
         .and_then(parse_owner_repo)
         .map(|(o, r)| (Some(o), Some(r)))
         .unwrap_or((None, None));
+
+    tracing::debug!(
+        files = status.files.len(),
+        local_commits = local_commits.len(),
+        status_ms,
+        remote_ms,
+        trunk_resolve_ms = trunk_ms,
+        history_walk_ms = history_ms,
+        total_ms = started.elapsed().as_millis() as u64,
+        "accept-changes.getStatus: status scan + remote/trunk resolve + history walk"
+    );
 
     Ok(json!({
         "branch": branch,
