@@ -10,13 +10,6 @@
 use intent_sourcecontrol::{Branch, Repo, UserIdentity};
 use serde_json::{json, Map, Value};
 
-/// Guidance returned by the no-op `github.connect` / `github.revoke` methods in
-/// the PAT-from-env model (no OAuth / device flow; nothing to connect/revoke).
-pub(crate) const CONNECT_GUIDANCE: &str =
-    "GitHub uses a Personal Access Token from the environment. Set GITHUB_TOKEN (or GH_TOKEN) and restart.";
-pub(crate) const REVOKE_GUIDANCE: &str =
-    "GitHub credentials come from the environment (GITHUB_TOKEN / GH_TOKEN); there is nothing to revoke. Unset the variable and restart to disconnect.";
-
 /// Project an engine [`Repo`] to the wire `GithubRepo` (§5.27): the engine
 /// `url` carries GitHub's `html_url`, surfaced as `htmlUrl`; the remaining
 /// fields already match the camelCase contract. Absent optionals are omitted.
@@ -59,19 +52,6 @@ pub(crate) fn user_to_wire(user: &UserIdentity) -> Value {
         "login": user.login,
         "avatarUrl": user.avatar_url.clone().unwrap_or_default(),
         "htmlUrl": user.html_url.clone().unwrap_or_default(),
-    })
-}
-
-/// Build the `github.authStatus` result (§5.27). `is_configured` reflects an
-/// env PAT that resolves and whose `GET /user` succeeds; the remaining fields
-/// are kept for FE shape parity in the PAT-from-env model. Never carries a
-/// token.
-pub(crate) fn auth_status_to_wire(is_configured: bool) -> Value {
-    json!({
-        "isConfigured": is_configured,
-        "oauthUrl": "",
-        "configuredButNeedsUpdate": false,
-        "updatedScopes": "",
     })
 }
 
@@ -133,14 +113,5 @@ mod tests {
         assert_eq!(v["htmlUrl"], "");
         assert!(v.get("id").is_none());
         assert!(v.get("name").is_none());
-    }
-
-    #[test]
-    fn auth_status_shape() {
-        let v = auth_status_to_wire(true);
-        assert_eq!(v["isConfigured"], true);
-        assert_eq!(v["oauthUrl"], "");
-        assert_eq!(v["configuredButNeedsUpdate"], false);
-        assert_eq!(v["updatedScopes"], "");
     }
 }

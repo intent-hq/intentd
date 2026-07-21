@@ -3118,8 +3118,11 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `github.authStatus`: validate the resolved env PAT via `GET /user` and
-    /// report connection state. Never returns the token.
+    /// `github.authStatus`: validate the resolved token via `GET /user` and
+    /// report connection state, plus the in-flight device-flow state
+    /// (`deviceFlow: null | { status, userCode, verificationUri, expiresIn,
+    /// interval }`) when a `github.connect` flow is pending or terminal.
+    /// Never returns the token.
     fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(
@@ -3146,11 +3149,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `github.connect`: no-op / guidance in the PAT-from-env model (no OAuth).
+    /// `github.connect`: start (or return the still-pending) GitHub OAuth
+    /// device flow → `{ ok, userCode, verificationUri, expiresIn, interval }`.
+    /// The daemon polls GitHub in the background and emits
+    /// `github:auth-changed` on terminal transitions; the token is persisted
+    /// server-side and never crosses the wire.
     fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_connect not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `github.cancelAuth`: abort the in-flight device flow, if any →
+    /// `{ ok, cancelled }` (`cancelled: false` when nothing was pending).
+    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_cancel_auth not implemented".to_string(),
             ))
         })
     }
@@ -3173,7 +3190,9 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `github.revoke`: no-op / guidance; the token is environment-owned.
+    /// `github.revoke`: delete the stored `sourceControl.github.token` secret
+    /// and abort any in-flight device flow → `{ ok }`. Env / `gh` CLI
+    /// fallback resolution is untouched.
     fn github_revoke(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

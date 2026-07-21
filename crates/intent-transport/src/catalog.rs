@@ -108,6 +108,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "git.unstageHunk",
     "github.authStatus",
     "github.branches.list",
+    "github.cancelAuth",
     "github.connect",
     "github.getReviewThreads",
     "github.getUser",

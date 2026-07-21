@@ -5251,17 +5251,106 @@ mod pr {
         assert_eq!(v["oauthUrl"], "");
         assert_eq!(v["configuredButNeedsUpdate"], false);
         assert_eq!(v["updatedScopes"], "");
+        assert_eq!(v["deviceFlow"], serde_json::Value::Null);
     }
 
     #[tokio::test]
-    async fn github_connect_and_revoke_are_noops_with_guidance() {
+    async fn github_connect_against_unreachable_login_host_is_a_graceful_error() {
+        // Unroutable host: the device-flow start must fail with a domain error
+        // (mapped `Internal`), never hang or panic — and must not leave a
+        // pending slot behind.
         let (_t, svc) = github_svc().await;
+        let svc = svc.with_github_login_base_uri("http://127.0.0.1:1");
+        let err = svc.github_connect().await.expect_err("connect must fail");
+        assert!(matches!(err, Error::Internal(_)));
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_connect_returns_the_same_codes_while_a_flow_is_pending() {
+        // Pre-populate a live pending slot: a second connect must return the
+        // SAME codes without restarting the flow (no network touched — the
+        // unroutable base uri would fail the test if `start_at` were called).
+        let (_t, svc) = github_svc().await;
+        let svc = svc.with_github_login_base_uri("http://127.0.0.1:1");
+        {
+            let mut slot = svc.github_auth_flow.lock().await;
+            *slot = Some(crate::github_auth_ops::FlowSlot {
+                flow_id: crate::github_auth_ops::next_flow_id(),
+                user_code: "WXYZ-9876".into(),
+                verification_uri: "https://github.com/login/device".into(),
+                interval: 5,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                phase: crate::github_auth_ops::FlowPhase::Pending,
+                task: None,
+            });
+        }
         let c = svc.github_connect().await.expect("connect");
-        assert_eq!(c["ok"], false);
-        assert!(c["guidance"].as_str().unwrap().contains("GITHUB_TOKEN"));
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["userCode"], "WXYZ-9876");
+        // authStatus surfaces the pending flow and its verification uri.
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"]["status"], "pending");
+        assert_eq!(v["oauthUrl"], "https://github.com/login/device");
+    }
+
+    #[tokio::test]
+    async fn github_cancel_auth_clears_the_pending_flow() {
+        let (_t, svc) = github_svc().await;
+        {
+            let mut slot = svc.github_auth_flow.lock().await;
+            *slot = Some(crate::github_auth_ops::FlowSlot {
+                flow_id: crate::github_auth_ops::next_flow_id(),
+                user_code: "WXYZ-9876".into(),
+                verification_uri: "https://github.com/login/device".into(),
+                interval: 5,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                phase: crate::github_auth_ops::FlowPhase::Pending,
+                task: None,
+            });
+        }
+        let c = svc.github_cancel_auth().await.expect("cancel");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], true);
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"], serde_json::Value::Null);
+        // Cancelling again is an idempotent no-op.
+        let c = svc.github_cancel_auth().await.expect("cancel twice");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+    }
+
+    #[tokio::test]
+    async fn github_revoke_deletes_the_stored_token_and_clears_the_flow() {
+        let (_t, svc) = github_svc().await;
+        let mem = Arc::new(crate::settings::InMemorySecretStore::default());
+        crate::settings::SecretStore::store(&*mem, "sourceControl.github.token", "gho_stored")
+            .expect("seed token");
+        let svc = svc.with_secret_store(mem.clone());
+        {
+            let mut slot = svc.github_auth_flow.lock().await;
+            *slot = Some(crate::github_auth_ops::FlowSlot {
+                flow_id: crate::github_auth_ops::next_flow_id(),
+                user_code: "WXYZ-9876".into(),
+                verification_uri: "https://github.com/login/device".into(),
+                interval: 5,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                phase: crate::github_auth_ops::FlowPhase::Pending,
+                task: None,
+            });
+        }
         let r = svc.github_revoke().await.expect("revoke");
-        assert_eq!(r["ok"], false);
-        assert!(!r["guidance"].as_str().unwrap().is_empty());
+        assert_eq!(r["ok"], true);
+        assert_eq!(
+            crate::settings::SecretStore::load(&*mem, "sourceControl.github.token").expect("load"),
+            None
+        );
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"], serde_json::Value::Null);
+        // Revoking with nothing stored stays an idempotent success.
+        let r = svc.github_revoke().await.expect("revoke twice");
+        assert_eq!(r["ok"], true);
     }
 
     /// Drive `pr_wait_for_changes` deterministically under a paused clock.

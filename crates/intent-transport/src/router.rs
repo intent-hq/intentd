@@ -2147,6 +2147,10 @@ async fn dispatch(
             let r = api.github_connect().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.cancelAuth" => {
+            let r = api.github_cancel_auth().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.revoke" => {
             let r = api.github_revoke().await.map_err(domain_to_rpc)?;
             Ok(r)

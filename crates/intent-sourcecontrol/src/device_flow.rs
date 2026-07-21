@@ -84,12 +84,14 @@ pub struct DeviceFlow {
     store: FileSecretStore,
 }
 
-/// Build the github.com login client the flow requires (`base_uri`
-/// `https://github.com` + `Accept: application/json`, per octocrab's
-/// `authenticate_as_device` contract).
-fn login_client() -> Result<octocrab::Octocrab> {
+/// The production login host the device flow talks to.
+pub const DEFAULT_LOGIN_BASE_URI: &str = "https://github.com";
+
+/// Build the login client the flow requires (`base_uri` + `Accept:
+/// application/json`, per octocrab's `authenticate_as_device` contract).
+fn login_client(base_uri: &str) -> Result<octocrab::Octocrab> {
     Ok(octocrab::Octocrab::builder()
-        .base_uri("https://github.com")
+        .base_uri(base_uri)
         .map_err(|e| Error::Config(format!("invalid github login base uri: {e}")))?
         .add_header(http::header::ACCEPT, "application/json".to_string())
         .build()?)
@@ -99,6 +101,18 @@ fn login_client() -> Result<octocrab::Octocrab> {
 /// client id, e.g. [`DEFAULT_OAUTH_CLIENT_ID`]) and the given `scopes`.
 /// Returns the user-facing codes plus the opaque poll handle.
 pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorization, DeviceFlow)> {
+    start_at(DEFAULT_LOGIN_BASE_URI, client_id, scopes).await
+}
+
+/// [`start`] against an explicit login `base_uri` — the test seam that lets
+/// integration tests drive the full connect → poll → authorized path against
+/// a local mock of `/login/device/code` + `/login/oauth/access_token` without
+/// touching github.com. Production callers use [`start`].
+pub async fn start_at(
+    base_uri: &str,
+    client_id: &str,
+    scopes: &[&str],
+) -> Result<(DeviceAuthorization, DeviceFlow)> {
     if client_id.trim().is_empty() {
         return Err(Error::Config(
             "github device flow requires a non-empty oauth client id \
@@ -106,7 +120,7 @@ pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorizat
                 .to_string(),
         ));
     }
-    let crab = login_client()?;
+    let crab = login_client(base_uri)?;
     let client_id = SecretString::from(client_id.to_string());
     let codes = crab.authenticate_as_device(&client_id, scopes).await?;
     let auth = DeviceAuthorization {

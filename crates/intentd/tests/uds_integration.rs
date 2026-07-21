@@ -134,9 +134,16 @@ async fn uds_slice_end_to_end() {
 
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-    ));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store)
+            .with_workspaces_root(
+                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
+            )
+            // Keep the (y) github.* section hermetic: `github.connect` must
+            // fail fast against an unroutable login host, never touch the
+            // real github.com.
+            .with_github_login_base_uri("http://127.0.0.1:1"),
+    );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {
@@ -839,28 +846,43 @@ async fn uds_slice_end_to_end() {
     assert_eq!(sess[4]["result"], Value::Null, "the draft was cleared");
 
     // (y) github.* browse / auth / identity (PROTOCOL §5.27), token-absent path.
-    //     `connect` / `revoke` are no-ops (no engine, no network) and must return
-    //     guidance; `authStatus` validates the env PAT and degrades gracefully to
-    //     a well-formed `{ isConfigured: bool, ... }` (the single `GET /user`
-    //     probe is swallowed on failure, so this never asserts on live network).
+    //     `connect` starts a real device flow, but the login host is pinned to
+    //     an unroutable address above, so it fails with a graceful domain error
+    //     (never a hang, never live network); `cancelAuth` / `revoke` are
+    //     idempotent no-ops with nothing in flight; `authStatus` validates the
+    //     env PAT and degrades gracefully to a well-formed
+    //     `{ isConfigured: bool, ..., deviceFlow: null }` (the single
+    //     `GET /user` probe is swallowed on failure, so this never asserts on
+    //     live network).
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":40,"method":"github.connect","params":{}}"#,
     )
     .await;
-    assert_eq!(resp["result"]["ok"], json!(false));
-    assert!(resp["result"]["guidance"]
-        .as_str()
-        .expect("guidance string")
-        .contains("GITHUB_TOKEN"));
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32603),
+        "connect against an unroutable login host is a graceful Internal error"
+    );
+
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":41,"method":"github.cancelAuth","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true));
+    assert_eq!(
+        resp["result"]["cancelled"],
+        json!(false),
+        "nothing in flight — cancel is an idempotent no-op"
+    );
 
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":41,"method":"github.revoke","params":{}}"#,
     )
     .await;
-    assert_eq!(resp["result"]["ok"], json!(false));
-    assert!(resp["result"]["guidance"].is_string());
+    assert_eq!(resp["result"]["ok"], json!(true));
 
     let resp = send(
         &config.socket_path,
@@ -873,6 +895,7 @@ async fn uds_slice_end_to_end() {
         "isConfigured is a boolean"
     );
     assert_eq!(resp["result"]["oauthUrl"], json!(""));
+    assert_eq!(resp["result"]["deviceFlow"], Value::Null);
     // 🔒 The PAT is never echoed over the wire.
     assert!(resp["result"].get("token").is_none());
 

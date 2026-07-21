@@ -1,0 +1,332 @@
+//! State + pure DTO glue for the `github.connect` / `github.cancelAuth` /
+//! `github.revoke` device-flow wire surface (PROTOCOL §5.27). The daemon owns
+//! the flow: `github.connect` starts it and spawns a background poll task;
+//! terminal transitions land here as a [`FlowPhase`] and are broadcast as
+//! `github:auth-changed`. The engine (`intent_sourcecontrol::device_flow`)
+//! keeps the `device_code` / access token private — this module only ever
+//! sees the user-facing codes, so nothing sensitive can cross the wire.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use intent_core::events::GITHUB_AUTH_CHANGED;
+use intent_core::{now_iso, Result, WorkspaceId};
+use intent_sourcecontrol::{DeviceFlow, PollStatus};
+use intent_store::NewEvent;
+use serde_json::{json, Value};
+use tokio::time::Instant;
+
+use crate::events::EventBus;
+use crate::{publish_event, system_actor};
+
+/// Secret-store account the device flow persists the token under — the first
+/// slot of the existing resolution chain (`intent_sourcecontrol::token`).
+pub(crate) const SECRET_ACCOUNT: &str = "sourceControl.github.token";
+
+/// Env override for the GitHub login host the device flow talks to — the
+/// spawned-daemon test seam (e2e points it at a local mock).
+pub(crate) const LOGIN_BASE_URI_ENV: &str = "INTENTD_GITHUB_LOGIN_BASE_URI";
+
+/// Consecutive poll errors tolerated before the flow is marked [`FlowPhase::Error`]
+/// (transient network blips must not kill a 15-minute flow).
+pub(crate) const MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
+
+/// Where the in-flight (or most recently finished) device flow stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlowPhase {
+    /// Waiting for the user to enter the code; the poll task is live.
+    Pending,
+    /// The codes expired before the user authorized; restart to retry.
+    Expired,
+    /// The user denied the authorization request.
+    Denied,
+    /// Polling failed repeatedly (network / non-retryable API error).
+    Error,
+}
+
+impl FlowPhase {
+    /// Wire string for `deviceFlow.status` and `github:auth-changed`.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Expired => "expired",
+            Self::Denied => "denied",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// The single in-flight / last-terminal device-flow slot. Holds only the
+/// user-facing codes (never `device_code` or the token).
+pub(crate) struct FlowSlot {
+    /// Generation guard: a poll task only mutates the slot while its own
+    /// flow is still the resident one (a newer `connect` replaces it).
+    pub(crate) flow_id: u64,
+    pub(crate) user_code: String,
+    pub(crate) verification_uri: String,
+    pub(crate) interval: u64,
+    /// When the codes expire (`start` + `expires_in`).
+    pub(crate) deadline: Instant,
+    pub(crate) phase: FlowPhase,
+    /// Abort handle of the background poll task while pending.
+    pub(crate) task: Option<tokio::task::AbortHandle>,
+}
+
+impl FlowSlot {
+    /// Seconds until the codes expire (0 when already past the deadline).
+    pub(crate) fn remaining_secs(&self) -> u64 {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+    }
+
+    /// True iff the flow is pending *and* its codes have not expired.
+    pub(crate) fn is_live(&self) -> bool {
+        self.phase == FlowPhase::Pending && self.remaining_secs() > 0
+    }
+}
+
+/// Shared single-flow state: at most one device flow exists at a time.
+pub(crate) type FlowState = Arc<tokio::sync::Mutex<Option<FlowSlot>>>;
+
+/// Mint a process-unique flow id (generation guard for [`FlowSlot`]).
+pub(crate) fn next_flow_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Build a `github:auth-changed { status }` event. Global like
+/// `settings:changed` (empty workspace id) so subscribers that omit a
+/// `workspaceId` filter still receive it. Carries only the transition —
+/// never a token or code.
+pub(crate) fn auth_changed_event(status: &str) -> NewEvent {
+    NewEvent {
+        workspace_id: WorkspaceId::from_string(String::new()),
+        timestamp: now_iso(),
+        event_type: GITHUB_AUTH_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: json!({ "status": status }),
+    }
+}
+
+/// The daemon-owned poll loop `github.connect` spawns: polls GitHub at the
+/// engine's cadence until a terminal transition, then updates the slot (iff
+/// its generation still matches — a newer `connect` orphans this task) and
+/// emits `github:auth-changed`. On `Authorized` the engine has already
+/// persisted the token, so the slot is cleared and `github.authStatus`
+/// reflects the configured token from then on.
+pub(crate) async fn run_poll_loop(
+    state: FlowState,
+    bus: Option<EventBus>,
+    flow_id: u64,
+    mut flow: DeviceFlow,
+    deadline: Instant,
+) {
+    let mut consecutive_errors: u32 = 0;
+    // `None` = authorized (slot cleared); `Some(phase)` = terminal failure.
+    let outcome: Option<FlowPhase> = loop {
+        tokio::time::sleep(poll_sleep(flow.interval_secs())).await;
+        if Instant::now() >= deadline {
+            // GitHub kept answering pending past `expires_in`; expire locally
+            // so the loop cannot poll forever.
+            break Some(FlowPhase::Expired);
+        }
+        match flow.poll_once().await {
+            Ok(PollStatus::Pending) => consecutive_errors = 0,
+            Ok(PollStatus::Authorized) => break None,
+            Ok(PollStatus::Expired) => break Some(FlowPhase::Expired),
+            Ok(PollStatus::Denied) => break Some(FlowPhase::Denied),
+            Err(e) => {
+                consecutive_errors += 1;
+                tracing::warn!(
+                    error = %e,
+                    consecutive_errors,
+                    "github device-flow poll failed"
+                );
+                if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS {
+                    break Some(FlowPhase::Error);
+                }
+            }
+        }
+    };
+    {
+        let mut slot = state.lock().await;
+        match slot.as_mut() {
+            // Only touch the slot while this task's flow is still resident.
+            Some(s) if s.flow_id == flow_id => match outcome {
+                None => *slot = None,
+                Some(phase) => {
+                    s.phase = phase;
+                    s.task = None;
+                }
+            },
+            _ => return,
+        }
+    }
+    let status = outcome.map_or("authorized", FlowPhase::as_wire);
+    tracing::info!(status, "github device flow finished");
+    publish_event(&bus, auth_changed_event(status)).await;
+}
+
+/// Delete the stored `sourceControl.github.token` through the services
+/// secret-store seam (cache-coherent with `settings.*`, test-injectable).
+pub(crate) async fn delete_stored_token(secrets: &crate::settings::AsyncSecretStore) -> Result<()> {
+    secrets.delete(SECRET_ACCOUNT).await
+}
+
+/// Resolve the login host: test/builder override → env override → github.com.
+pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
+    override_uri
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(LOGIN_BASE_URI_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.to_string())
+}
+
+/// Poll cadence floor: the engine's interval comes from the server and a
+/// mock returning `0` must not turn the poll loop into a busy spin.
+pub(crate) fn poll_sleep(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(1))
+}
+
+/// The `github.connect` success payload (§5.27): the user-facing codes plus
+/// the remaining validity window. Identical shape whether the flow was just
+/// started or an existing pending flow was returned.
+pub(crate) fn connect_response(slot: &FlowSlot) -> Value {
+    json!({
+        "ok": true,
+        "userCode": slot.user_code,
+        "verificationUri": slot.verification_uri,
+        "expiresIn": slot.remaining_secs(),
+        "interval": slot.interval,
+    })
+}
+
+/// The `deviceFlow` object embedded in `github.authStatus` (§5.27).
+pub(crate) fn flow_to_wire(slot: &FlowSlot) -> Value {
+    json!({
+        "status": slot.phase.as_wire(),
+        "userCode": slot.user_code,
+        "verificationUri": slot.verification_uri,
+        "expiresIn": slot.remaining_secs(),
+        "interval": slot.interval,
+    })
+}
+
+/// Build the `github.authStatus` result (§5.27). `deviceFlow` is `null` when
+/// no flow is in flight; `oauthUrl` carries the verification URI while a flow
+/// is live so existing FE consumers can link to it. Never carries a token.
+pub(crate) fn auth_status_to_wire(is_configured: bool, slot: Option<&FlowSlot>) -> Value {
+    let oauth_url = slot
+        .filter(|s| s.is_live())
+        .map(|s| s.verification_uri.clone())
+        .unwrap_or_default();
+    json!({
+        "isConfigured": is_configured,
+        "oauthUrl": oauth_url,
+        "configuredButNeedsUpdate": false,
+        "updatedScopes": "",
+        "deviceFlow": slot.map(flow_to_wire).unwrap_or(Value::Null),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot(phase: FlowPhase, remaining: Duration) -> FlowSlot {
+        FlowSlot {
+            flow_id: 1,
+            user_code: "ABCD-1234".into(),
+            verification_uri: "https://github.com/login/device".into(),
+            interval: 5,
+            deadline: Instant::now() + remaining,
+            phase,
+            task: None,
+        }
+    }
+
+    #[test]
+    fn pending_slot_within_deadline_is_live() {
+        assert!(slot(FlowPhase::Pending, Duration::from_secs(60)).is_live());
+        assert!(!slot(FlowPhase::Pending, Duration::ZERO).is_live());
+        assert!(!slot(FlowPhase::Expired, Duration::from_secs(60)).is_live());
+        assert!(!slot(FlowPhase::Denied, Duration::from_secs(60)).is_live());
+        assert!(!slot(FlowPhase::Error, Duration::from_secs(60)).is_live());
+    }
+
+    #[test]
+    fn connect_response_carries_codes_and_remaining_window() {
+        let v = connect_response(&slot(FlowPhase::Pending, Duration::from_secs(120)));
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["userCode"], "ABCD-1234");
+        assert_eq!(v["verificationUri"], "https://github.com/login/device");
+        assert_eq!(v["interval"], 5);
+        let remaining = v["expiresIn"].as_u64().expect("expiresIn");
+        assert!(remaining > 0 && remaining <= 120);
+        // Nothing sensitive on the wire.
+        assert!(v.get("deviceCode").is_none());
+        assert!(v.get("accessToken").is_none());
+    }
+
+    #[test]
+    fn auth_status_without_flow_matches_the_legacy_shape() {
+        let v = auth_status_to_wire(true, None);
+        assert_eq!(v["isConfigured"], true);
+        assert_eq!(v["oauthUrl"], "");
+        assert_eq!(v["configuredButNeedsUpdate"], false);
+        assert_eq!(v["updatedScopes"], "");
+        assert_eq!(v["deviceFlow"], Value::Null);
+    }
+
+    #[test]
+    fn auth_status_with_pending_flow_carries_device_flow_and_oauth_url() {
+        let s = slot(FlowPhase::Pending, Duration::from_secs(60));
+        let v = auth_status_to_wire(false, Some(&s));
+        assert_eq!(v["oauthUrl"], "https://github.com/login/device");
+        assert_eq!(v["deviceFlow"]["status"], "pending");
+        assert_eq!(v["deviceFlow"]["userCode"], "ABCD-1234");
+        assert!(v["deviceFlow"]["expiresIn"].as_u64().unwrap() <= 60);
+    }
+
+    #[test]
+    fn auth_status_with_terminal_flow_keeps_oauth_url_empty() {
+        let s = slot(FlowPhase::Denied, Duration::from_secs(60));
+        let v = auth_status_to_wire(false, Some(&s));
+        assert_eq!(v["oauthUrl"], "");
+        assert_eq!(v["deviceFlow"]["status"], "denied");
+    }
+
+    #[test]
+    fn phase_wire_strings() {
+        assert_eq!(FlowPhase::Pending.as_wire(), "pending");
+        assert_eq!(FlowPhase::Expired.as_wire(), "expired");
+        assert_eq!(FlowPhase::Denied.as_wire(), "denied");
+        assert_eq!(FlowPhase::Error.as_wire(), "error");
+    }
+
+    #[test]
+    fn login_base_uri_resolution_prefers_override() {
+        assert_eq!(
+            resolve_login_base_uri(Some("http://127.0.0.1:9")),
+            "http://127.0.0.1:9"
+        );
+        // Without an override, resolution falls through to env/default — the
+        // env branch is exercised by the spawned-daemon e2e (process-global
+        // env vars are racy inside a multi-threaded test binary).
+    }
+
+    #[test]
+    fn poll_sleep_floors_at_one_second() {
+        assert_eq!(poll_sleep(0), Duration::from_secs(1));
+        assert_eq!(poll_sleep(5), Duration::from_secs(5));
+    }
+}

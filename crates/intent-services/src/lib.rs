@@ -69,6 +69,7 @@ pub mod host_exec_stream;
 
 mod github_ops;
 
+mod github_auth_ops;
 mod github_browse_ops;
 
 mod history_xml;
@@ -362,6 +363,17 @@ pub struct Services {
     /// since the last scan, the workspace is skipped. A restart rescans once.
     /// Shared across clones so every scan tick observes the same watermark state.
     token_usage_watermarks: Arc<Mutex<HashMap<WorkspaceId, u64>>>,
+    /// The single in-flight (or last-terminal) GitHub device-flow slot backing
+    /// `github.connect` / `github.cancelAuth` / `github.authStatus` (§5.27).
+    /// At most one flow exists at a time; a `connect` while one is pending
+    /// returns the same codes. Shared across clones so the background poll
+    /// task and every RPC handle observe the same slot.
+    github_auth_flow: github_auth_ops::FlowState,
+    /// Test-only override for the GitHub login host the device flow talks to
+    /// (`None` → `$INTENTD_GITHUB_LOGIN_BASE_URI` → `https://github.com`).
+    /// Unit tests inject an unroutable/mock URI so `github.connect` never
+    /// reaches github.com.
+    github_login_base_uri: Option<String>,
 }
 
 impl Services {
@@ -409,7 +421,17 @@ impl Services {
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
+            github_login_base_uri: None,
         }
+    }
+
+    /// Override the GitHub login host the device flow talks to (§5.27 test
+    /// seam). Production wiring keeps `None` (env override → github.com);
+    /// tests inject a mock/unroutable URI so `github.connect` is hermetic.
+    pub fn with_github_login_base_uri(mut self, base_uri: impl Into<String>) -> Self {
+        self.github_login_base_uri = Some(base_uri.into());
+        self
     }
 
     /// Override the context engine backing `search.codebase` (§8). The
@@ -13848,6 +13870,7 @@ impl WorkspaceApi for Services {
 
     fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
+        let state = self.github_auth_flow.clone();
         Box::pin(async move {
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
@@ -13859,28 +13882,111 @@ impl WorkspaceApi for Services {
                     .unwrap_or(false),
                 Err(_) => false,
             };
-            Ok(github_browse_ops::auth_status_to_wire(is_configured))
+            let slot = state.lock().await;
+            Ok(github_auth_ops::auth_status_to_wire(
+                is_configured,
+                slot.as_ref(),
+            ))
         })
     }
 
     fn github_connect(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        // No-op in the PAT-from-env model: nothing to connect (no OAuth/device
-        // flow). Return guidance so the FE button can explain the setup.
-        Box::pin(async {
-            Ok(serde_json::json!({
-                "ok": false,
-                "guidance": github_browse_ops::CONNECT_GUIDANCE,
-            }))
+        // Start (or return the still-pending) GitHub OAuth device flow
+        // (§5.27). The daemon polls GitHub in the background; the token is
+        // persisted server-side by the engine and never crosses the wire.
+        let state = self.github_auth_flow.clone();
+        let bus = self.event_bus.clone();
+        let client_id = self
+            .effective_settings()
+            .source_control
+            .github
+            .oauth_client_id;
+        let base_uri =
+            github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
+        Box::pin(async move {
+            let mut slot = state.lock().await;
+            // A connect while a flow is live returns the SAME codes — no
+            // restart, no second poll task.
+            if let Some(s) = slot.as_ref() {
+                if s.is_live() {
+                    return Ok(github_auth_ops::connect_response(s));
+                }
+            }
+            // Replace any terminal/expired slot: abort a lingering task first.
+            if let Some(s) = slot.take() {
+                if let Some(task) = s.task {
+                    task.abort();
+                }
+            }
+            let (auth, flow) = intent_sourcecontrol::device_flow::start_at(
+                &base_uri,
+                &client_id,
+                intent_sourcecontrol::device_flow::DEFAULT_SCOPES,
+            )
+            .await
+            .map_err(pr_ops::map_sc_err)?;
+            let flow_id = github_auth_ops::next_flow_id();
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
+            let task = tokio::spawn(github_auth_ops::run_poll_loop(
+                state.clone(),
+                bus,
+                flow_id,
+                flow,
+                deadline,
+            ));
+            let new_slot = github_auth_ops::FlowSlot {
+                flow_id,
+                user_code: auth.user_code,
+                verification_uri: auth.verification_uri,
+                interval: auth.interval,
+                deadline,
+                phase: github_auth_ops::FlowPhase::Pending,
+                task: Some(task.abort_handle()),
+            };
+            let resp = github_auth_ops::connect_response(&new_slot);
+            *slot = Some(new_slot);
+            tracing::info!("github device flow started");
+            Ok(resp)
+        })
+    }
+
+    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let state = self.github_auth_flow.clone();
+        Box::pin(async move {
+            let mut slot = state.lock().await;
+            let cancelled = match slot.take() {
+                Some(s) => {
+                    if let Some(task) = s.task {
+                        task.abort();
+                    }
+                    s.phase == github_auth_ops::FlowPhase::Pending
+                }
+                None => false,
+            };
+            Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
         })
     }
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        // No-op: the token is environment-owned, so there is nothing to revoke.
-        Box::pin(async {
-            Ok(serde_json::json!({
-                "ok": false,
-                "guidance": github_browse_ops::REVOKE_GUIDANCE,
-            }))
+        // Delete the stored `sourceControl.github.token` (device-flow slot of
+        // the resolution chain) and abort any in-flight flow. Env / `gh` CLI
+        // fallbacks are untouched — authStatus reflects them on next probe.
+        let state = self.github_auth_flow.clone();
+        let secrets = self.secrets.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            {
+                let mut slot = state.lock().await;
+                if let Some(s) = slot.take() {
+                    if let Some(task) = s.task {
+                        task.abort();
+                    }
+                }
+            }
+            github_auth_ops::delete_stored_token(&secrets).await?;
+            publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
+            Ok(serde_json::json!({ "ok": true }))
         })
     }
 
