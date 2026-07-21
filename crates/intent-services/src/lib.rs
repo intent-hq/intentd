@@ -77,6 +77,7 @@ mod note_ops;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
+pub mod provider_models;
 pub mod repo_config;
 mod rtk;
 mod sandbox_ops;
