@@ -68,6 +68,7 @@ pub fn history_since(
     walk.simplify_first_parent().map_err(map_git_err)?;
     walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
 
+    let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let mut diff_elapsed = Duration::ZERO;
     let mut out = Vec::new();
     for oid in walk {
@@ -83,9 +84,11 @@ pub fn history_since(
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
-        let diff_started = Instant::now();
+        let diff_started = timing_enabled.then(Instant::now);
         let files = changed_files(&repo, &commit)?;
-        diff_elapsed += diff_started.elapsed();
+        if let Some(t) = diff_started {
+            diff_elapsed += t.elapsed();
+        }
         let files_changed = files.len();
         let author = commit.author();
         out.push(CommitRecord {
@@ -358,6 +361,7 @@ pub fn history_bounded(
     walk.simplify_first_parent().map_err(map_git_err)?;
     walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
 
+    let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let mut diff_elapsed = Duration::ZERO;
     let mut out = Vec::new();
     for oid in walk {
@@ -373,9 +377,11 @@ pub fn history_bounded(
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
-        let diff_started = Instant::now();
+        let diff_started = timing_enabled.then(Instant::now);
         let files = changed_files(&repo, &commit)?;
-        diff_elapsed += diff_started.elapsed();
+        if let Some(t) = diff_started {
+            diff_elapsed += t.elapsed();
+        }
         let files_changed = files.len();
         let author = commit.author();
         out.push(CommitRecord {
