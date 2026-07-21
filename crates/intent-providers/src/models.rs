@@ -333,12 +333,15 @@ fn grok_model_from_value(value: &Value) -> Option<GrokModel> {
     if model_id.is_empty() {
         return None;
     }
+    // Upstream (`modelFromUnknown`) falls back to the raw id — JSON payloads
+    // carry authoritative labels, unlike the text parser which synthesizes
+    // one. The extra empty-check guards `name: ""` payloads.
     let name = value_to_string(value.get("name"))
         .or_else(|| value_to_string(value.get("label")))
         .or_else(|| value_to_string(value.get("displayName")))
-        .unwrap_or_else(|| model_id.clone())
-        .trim()
-        .to_string();
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| model_id.clone());
     Some(GrokModel {
         description: grok_description(value),
         model_id,
