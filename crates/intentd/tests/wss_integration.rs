@@ -856,6 +856,101 @@ async fn wss_models_list_returns_catalog_with_source() {
     srv.ws.stop().await;
 }
 
+#[tokio::test]
+async fn wss_models_list_with_provider_id_and_force_refresh() {
+    // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
+    // through the generic cache. Unknown providers degrade to the static
+    // fallback (`source: "static"` + warning, never an error); cortex is
+    // feature-code gated (empty list + warning under its own source tag).
+    let srv = start(WsOptions::default()).await;
+
+    let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 8);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "no-such-provider");
+    assert_eq!(resp["result"]["source"], "static");
+    assert!(resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    assert!(resp["result"]["warning"].is_string(), "{resp}");
+    // Exactly the documented keys — degraded (not stale) data carries no
+    // `stale` flag and no extras.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["models", "providerId", "source", "warning"],
+        "{resp}"
+    );
+
+    let frame =
+        r#"{"jsonrpc":"2.0","id":9,"method":"models.list","params":{"providerId":"cortex"}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 9);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "cortex");
+    assert_eq!(resp["result"]["source"], "cortex");
+    assert!(resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    assert!(
+        resp["result"]["warning"]
+            .as_str()
+            .expect("warning")
+            .contains("Cortex"),
+        "{resp}"
+    );
+    // Gated empty success is fresh, not stale: same exact key set.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["models", "providerId", "source", "warning"],
+        "{resp}"
+    );
+
+    // Legacy path with only `forceRefresh` (no providerId): still routes and
+    // keeps the legacy shape. On a fresh daemon there is no last-good cache
+    // entry, so a failed forced probe degrades straight to the static catalog
+    // — exactly `{ models, source }`, no providerId/stale/warning fields.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":10,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 10);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert!(!resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source"], "{resp}");
+    srv.ws.stop().await;
+}
+
 /// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
 /// (§5.31): swallows the piped stdin, then runs `body`.
 #[cfg(unix)]
