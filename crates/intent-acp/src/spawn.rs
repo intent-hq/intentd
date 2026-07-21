@@ -31,6 +31,10 @@ pub struct SpawnOptions<'a> {
     pub rules_file: Option<&'a str>,
     /// Path to an MCP config file (appended when the provider supports MCP).
     pub mcp_config_file: Option<&'a str>,
+    /// Pre-serialized MCP block (OpenCode `mcp` config shape) merged into
+    /// `OPENCODE_CONFIG_CONTENT` for providers that take env config
+    /// (opencode). Ignored by every other provider.
+    pub env_mcp_config: Option<&'a str>,
     /// Whether to append the provider's quiet flag.
     pub quiet: bool,
     /// Discovered provider binary, used for `PATH` enrichment.
@@ -60,6 +64,7 @@ impl<'a> SpawnOptions<'a> {
             cwd: None,
             rules_file: None,
             mcp_config_file: None,
+            env_mcp_config: None,
             quiet: false,
             provider_binary: None,
             extra_env: BTreeMap::new(),
@@ -130,7 +135,12 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     if let Some(cwd) = opts.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in build_provider_env(opts.provider, opts.model, opts.rules_file) {
+    for (key, value) in build_provider_env(
+        opts.provider,
+        opts.model,
+        opts.rules_file,
+        opts.env_mcp_config,
+    ) {
         cmd.env(key, value);
     }
     for (key, value) in &opts.extra_env {
@@ -299,6 +309,32 @@ mod build_command_tests {
             "PATH should start with {}, got: {}",
             expected_prefix,
             path_value
+        );
+    }
+
+    #[test]
+    fn build_command_merges_env_mcp_config_into_opencode_config_content() {
+        let provider = intent_providers::find_provider("opencode").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.model = Some("claude-sonnet-4");
+        let mcp_json = r#"{"workspace-mcp":{"type":"local","command":["intentd","mcp-bridge","--connect","127.0.0.1:9999"],"enabled":true,"environment":{}}}"#;
+        opts.env_mcp_config = Some(mcp_json);
+        let cmd = build_command(&opts);
+        let content = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "OPENCODE_CONFIG_CONTENT")
+            .and_then(|(_, v)| v)
+            .expect("OPENCODE_CONFIG_CONTENT must be set")
+            .to_string_lossy()
+            .into_owned();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
+        assert_eq!(parsed["permission"]["task"], "deny");
+        assert_eq!(parsed["model"], "claude-sonnet-4");
+        assert_eq!(
+            parsed["mcp"]["workspace-mcp"]["command"][1], "mcp-bridge",
+            "bridge server must ride in the mcp block"
         );
     }
 
