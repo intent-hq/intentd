@@ -10571,8 +10571,13 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
+            // Run the libgit2 status scan on the blocking pool so a slow scan
+            // on a big repo cannot stall other RPCs (same runtime-saturation
+            // vector `git_fetch_bounded` closes for `git.fetch`).
             let started = std::time::Instant::now();
-            let status = intent_git::status::status(&path);
+            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
+                .await
+                .map_err(|e| Error::Internal(format!("git.status task failed: {e}")))?;
             if let Ok(s) = &status {
                 tracing::debug!(
                     workspace_id = %workspace_id.as_str(),
@@ -11539,8 +11544,14 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            // Fetch one past the page window to decide whether older commits remain.
-            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
+            // Fetch one past the page window to decide whether older commits
+            // remain. The libgit2 revwalk runs on the blocking pool so a slow
+            // walk on a big repo cannot stall other RPCs.
+            let fetch = skip + limit + 1;
+            let commits =
+                tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
+                    .await
+                    .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
             let has_more = commits.len() > skip + limit;
             let items: Vec<serde_json::Value> = commits
                 .iter()
@@ -14205,31 +14216,46 @@ impl WorkspaceApi for Services {
                 return Ok(empty);
             }
 
-            // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
-            let boundary_started = std::time::Instant::now();
-            let boundary_sha = intent_git::history::resolve_workspace_boundary(
-                &worktree,
-                ws.base_ref.as_deref(),
-                ws.base_commit_sha.as_deref(),
-            )?;
-            let boundary_ms = boundary_started.elapsed().as_millis() as u64;
+            // Boundary resolve + history walk are libgit2 work; run both on
+            // the blocking pool so a slow walk on a big repo cannot stall
+            // other RPCs.
+            let base_ref = ws.base_ref.clone();
+            let base_commit_sha = ws.base_commit_sha.clone();
+            let walked = tokio::task::spawn_blocking(move || -> Result<_> {
+                // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
+                let boundary_started = std::time::Instant::now();
+                let boundary_sha = intent_git::history::resolve_workspace_boundary(
+                    &worktree,
+                    base_ref.as_deref(),
+                    base_commit_sha.as_deref(),
+                )?;
+                let boundary_ms = boundary_started.elapsed().as_millis() as u64;
 
-            // If boundary info exists but nothing resolved, return empty (safety net
-            // to avoid showing arbitrary base-branch commits). This holds regardless
-            // of includeOlder to prevent leaking arbitrary base-branch history.
-            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary_sha.is_none() {
+                // If boundary info exists but nothing resolved, return empty (safety net
+                // to avoid showing arbitrary base-branch commits). This holds regardless
+                // of includeOlder to prevent leaking arbitrary base-branch history.
+                if (base_ref.is_some() || base_commit_sha.is_some()) && boundary_sha.is_none() {
+                    return Ok(None);
+                }
+
+                // Fetch one past the page window to decide whether older commits remain.
+                let walk_started = std::time::Instant::now();
+                let commits = intent_git::history::history_bounded(
+                    &worktree,
+                    boundary_sha.as_deref(),
+                    skip + limit + 1,
+                    include_older,
+                )?;
+                let walk_ms = walk_started.elapsed().as_millis() as u64;
+                Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("file-tracking.loadCommits task failed: {e}"))
+            })??;
+            let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
                 return Ok(empty);
-            }
-
-            // Fetch one past the page window to decide whether older commits remain.
-            let walk_started = std::time::Instant::now();
-            let commits = intent_git::history::history_bounded(
-                &worktree,
-                boundary_sha.as_deref(),
-                skip + limit + 1,
-                include_older,
-            )?;
-            let walk_ms = walk_started.elapsed().as_millis() as u64;
+            };
             let has_more = commits.len() > skip + limit;
             let values: Vec<serde_json::Value> = commits
                 .iter()
@@ -14610,7 +14636,14 @@ impl Services {
             return Ok(accept_changes::minimal_status_value(&ws, &trunk));
         }
         match git_ops::worktree_path(&ws) {
-            Some(worktree) => accept_changes::build_git_status_value(&worktree, &ws),
+            // `build_git_status_value` runs a full status scan plus a bounded
+            // history walk (libgit2); run it on the blocking pool so a slow
+            // scan on a big repo cannot stall other RPCs.
+            Some(worktree) => tokio::task::spawn_blocking(move || {
+                accept_changes::build_git_status_value(&worktree, &ws)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("accept-changes.getStatus task failed: {e}")))?,
             None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
         }
     }
