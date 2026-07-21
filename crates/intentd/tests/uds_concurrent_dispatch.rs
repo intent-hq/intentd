@@ -106,10 +106,12 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let frame_budget = common::test_timeout(Duration::from_secs(30));
 
     // Slow request first: subprocess sleep. Without concurrency this would
-    // pin the read loop until the child exits.
+    // pin the read loop until the child exits. Round up to whole seconds:
+    // POSIX `sleep` only guarantees integer arguments, and a fractional
+    // multiplier would otherwise produce e.g. `sleep 2.2000000000000002`.
     let slow_frame = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"host.exec","params":{{"command":"sleep","args":["{}"]}}}}"#,
-        slow_sleep.as_secs_f64()
+        slow_sleep.as_secs_f64().ceil()
     );
     // Fast request second: goes through the JSON-RPC dispatcher slow path,
     // which is now also spawned.
@@ -138,6 +140,13 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     assert!(
         second.get("result").is_some(),
         "host.exec must succeed: got {second}"
+    );
+    // host.exec returns a result even for non-zero exits; assert the sleep
+    // child actually ran and exited cleanly so a broken invocation fails
+    // here instead of surfacing as a confusing ordering failure.
+    assert_eq!(
+        second["result"]["exitCode"], 0,
+        "sleep child must exit cleanly: got {second}"
     );
 
     let _ = shutdown_tx.send(());
