@@ -13904,18 +13904,23 @@ impl WorkspaceApi for Services {
         let base_uri =
             github_auth_ops::resolve_login_base_uri(self.github_login_base_uri.as_deref());
         Box::pin(async move {
-            let mut slot = state.lock().await;
-            // A connect while a flow is live returns the SAME codes — no
-            // restart, no second poll task.
-            if let Some(s) = slot.as_ref() {
-                if s.is_live() {
-                    return Ok(github_auth_ops::connect_response(s));
+            // Short critical section: reuse a live flow / clear a terminal
+            // one. The lock is NOT held across the network start below, so
+            // cancelAuth / revoke / authStatus stay responsive meanwhile.
+            {
+                let mut slot = state.lock().await;
+                // A connect while a flow is live returns the SAME codes — no
+                // restart, no second poll task.
+                if let Some(s) = slot.as_ref() {
+                    if s.is_live() {
+                        return Ok(github_auth_ops::connect_response(s));
+                    }
                 }
-            }
-            // Replace any terminal/expired slot: abort a lingering task first.
-            if let Some(s) = slot.take() {
-                if let Some(task) = s.task {
-                    task.abort();
+                // Replace any terminal/expired slot: abort a lingering task.
+                if let Some(s) = slot.take() {
+                    if let Some(task) = s.task {
+                        task.abort();
+                    }
                 }
             }
             let (auth, flow) = intent_sourcecontrol::device_flow::start_at(
@@ -13925,6 +13930,15 @@ impl WorkspaceApi for Services {
             )
             .await
             .map_err(pr_ops::map_sc_err)?;
+            let mut slot = state.lock().await;
+            // A concurrent connect raced us while the lock was released: keep
+            // the resident live flow (single-flow invariant) and drop ours —
+            // its handle never spawned a poll task, so nothing leaks.
+            if let Some(s) = slot.as_ref() {
+                if s.is_live() {
+                    return Ok(github_auth_ops::connect_response(s));
+                }
+            }
             let flow_id = github_auth_ops::next_flow_id();
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
