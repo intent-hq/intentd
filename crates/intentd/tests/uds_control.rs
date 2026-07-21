@@ -47,7 +47,7 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
 }
 
 async fn await_socket(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(60), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
