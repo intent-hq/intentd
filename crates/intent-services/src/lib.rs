@@ -11545,14 +11545,17 @@ impl WorkspaceApi for Services {
                 return Ok(empty);
             }
             // Fetch one past the page window to decide whether older commits
-            // remain. The libgit2 revwalk runs on the blocking pool so a slow
-            // walk on a big repo cannot stall other RPCs.
-            let fetch = skip + limit + 1;
+            // remain. `skip` comes from a client-provided token, so saturate
+            // the window math (a huge token degrades to an empty page rather
+            // than overflowing). The libgit2 revwalk runs on the blocking pool
+            // so a slow walk on a big repo cannot stall other RPCs.
+            let page_end = skip.saturating_add(limit);
+            let fetch = page_end.saturating_add(1);
             let commits =
                 tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
                     .await
                     .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
-            let has_more = commits.len() > skip + limit;
+            let has_more = commits.len() > page_end;
             let items: Vec<serde_json::Value> = commits
                 .iter()
                 .skip(skip)
@@ -11560,7 +11563,7 @@ impl WorkspaceApi for Services {
                 .map(git_ops::commit_to_commit_info)
                 .collect();
             let next_token = if has_more {
-                serde_json::Value::String(pagination::offset_token(skip + limit))
+                serde_json::Value::String(pagination::offset_token(page_end))
             } else {
                 serde_json::Value::Null
             };
@@ -14238,12 +14241,15 @@ impl WorkspaceApi for Services {
                     return Ok(None);
                 }
 
-                // Fetch one past the page window to decide whether older commits remain.
+                // Fetch one past the page window to decide whether older
+                // commits remain. `skip` comes from a client-provided token,
+                // so saturate the window math (a huge token degrades to an
+                // empty page rather than overflowing).
                 let walk_started = std::time::Instant::now();
                 let commits = intent_git::history::history_bounded(
                     &worktree,
                     boundary_sha.as_deref(),
-                    skip + limit + 1,
+                    skip.saturating_add(limit).saturating_add(1),
                     include_older,
                 )?;
                 let walk_ms = walk_started.elapsed().as_millis() as u64;
@@ -14256,7 +14262,8 @@ impl WorkspaceApi for Services {
             let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
                 return Ok(empty);
             };
-            let has_more = commits.len() > skip + limit;
+            let page_end = skip.saturating_add(limit);
+            let has_more = commits.len() > page_end;
             let values: Vec<serde_json::Value> = commits
                 .iter()
                 .skip(skip)
@@ -14275,7 +14282,7 @@ impl WorkspaceApi for Services {
                 "file-tracking.loadCommits: boundary resolve + history walk"
             );
             let next_token = if has_more {
-                serde_json::Value::String(pagination::offset_token(skip + limit))
+                serde_json::Value::String(pagination::offset_token(page_end))
             } else {
                 serde_json::Value::Null
             };
