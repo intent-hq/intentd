@@ -378,15 +378,10 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let requested = format!("agent-{}", uuid::Uuid::new_v4());
 
     // Stale-client shape: any client-supplied agentId is -32602.
-    let rejected = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{requested}","name":"WSS Client Id"}}}}"#
-        )
-        .as_str(),
-    )
-    .await;
+    let reject_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{requested}","name":"WSS Client Id"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &reject_frame).await;
     assert_eq!(
         rejected["error"]["code"].as_i64(),
         Some(-32602),
@@ -401,15 +396,10 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     );
 
     // Without the field the daemon mints the id and agent.get resolves it.
-    let created = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"WSS Minted"}}}}"#
-        )
-        .as_str(),
-    )
-    .await;
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"WSS Minted"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
     let minted = created["result"]["agent"]["id"]
         .as_str()
         .expect("server-minted id")
@@ -420,15 +410,10 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
             .is_some_and(|tail| uuid::Uuid::parse_str(tail).is_ok()),
         "server mints agent-{{uuid}}: {created}"
     );
-    let got = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
-        )
-        .as_str(),
-    )
-    .await;
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
     assert_eq!(
         got["result"]["agent"]["id"].as_str(),
         Some(minted.as_str()),
@@ -471,25 +456,17 @@ async fn wss_agent_create_widened_params_round_trip() {
         ),
         ws = ws_id,
     );
-    let created_resp = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        format!(r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{params}}}"#).as_str(),
-    )
-    .await;
+    let create_frame =
+        format!(r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{params}}}"#);
+    let created_resp = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
     let minted = created_resp["result"]["agent"]["id"]
         .as_str()
         .expect("server-minted id")
         .to_string();
-    let got_resp = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
-        )
-        .as_str(),
-    )
-    .await;
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
+    );
+    let got_resp = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
     let sess = [created_resp, got_resp];
 
     let created = &sess[0]["result"]["agent"];
@@ -528,15 +505,10 @@ async fn wss_agent_create_widened_params_round_trip() {
 
     // Backward-compat: a create that omits every widened param still returns
     // the full `AgentLite` shape (no error, no missing required fields).
-    let minimal = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}"}}}}"#
-        )
-        .as_str(),
-    )
-    .await;
+    let minimal_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let minimal = wss_call(srv.port, srv.cfg.clone(), &minimal_frame).await;
     assert!(
         minimal["result"]["agent"]["id"]
             .as_str()

@@ -958,15 +958,17 @@ async fn dispatch(
             }
         }
         "agent.create" => {
-            let ws = require_ws_note(params)?;
             // Agent ids are server-assigned: reject stale clients that still
-            // send `agentId` before the request reaches the service.
+            // send `agentId` before the request reaches the service (checked
+            // ahead of every other param so the stale-client signal is
+            // unambiguous even on otherwise-malformed requests).
             if params.get("agentId").is_some_and(|v| !v.is_null()) {
                 return Err(rpc(
                     INVALID_PARAMS,
                     "agentId: agent IDs are server-assigned and the field must be omitted",
                 ));
             }
+            let ws = require_ws_note(params)?;
             let name = opt_str(params, "name");
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
