@@ -19,9 +19,11 @@
 use git2::{Cred, RemoteCallbacks};
 
 /// Maximum number of times the credential callback is entered per fetch/push
-/// before it returns `Err` — enough to cover the ssh-agent, credential-helper,
-/// and resolved-token steps plus one retry libgit2 issues per allowed cred
-/// type, without leaving room for an unbounded auth-failure loop.
+/// before it returns `Err` — attempt 0 walks the full ssh-agent →
+/// credential-helper → resolved-token chain, and the re-entries (which skip
+/// the helper, see [`resolve_credential`]) give the ssh-agent and token steps
+/// one more turn each after a server rejection, without leaving room for an
+/// unbounded auth-failure loop.
 pub(crate) const MAX_CREDENTIAL_ATTEMPTS: u32 = 3;
 
 /// Username GitHub expects when a token is presented as an HTTPS basic-auth

@@ -4450,9 +4450,10 @@ mod github_token_source_tests {
     use intent_sourcecontrol::TokenSource;
 
     fn registry_with(value: Option<&str>) -> Arc<SettingsRegistry> {
-        let dir = tempfile::tempdir().expect("temp config dir");
-        let registry =
-            SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
+        // Persist the directory (no RAII cleanup) so the config file outlives
+        // the registry handle without leaking the allocation.
+        let dir = tempfile::tempdir().expect("temp config dir").keep();
+        let registry = SettingsRegistry::load(dir.join("config.toml")).expect("load registry");
         if let Some(v) = value {
             registry
                 .apply(&[(
@@ -4461,8 +4462,6 @@ mod github_token_source_tests {
                 )])
                 .expect("apply tokenSource");
         }
-        // Leak the tempdir so the config file outlives the registry handle.
-        std::mem::forget(dir);
         Arc::new(registry)
     }
 

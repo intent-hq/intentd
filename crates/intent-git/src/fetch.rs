@@ -44,8 +44,9 @@ const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
 /// itself). `|| exit 0` keeps the helper silent-but-successful for the
 /// `store`/`erase` ops git may also invoke.
 fn token_helper_config() -> String {
+    let username = crate::auth::TOKEN_USERNAME;
     format!(
-        "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username=x-access-token\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
+        "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username={username}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
     )
 }
 
