@@ -217,8 +217,13 @@ fn grok_native_candidates(home: &std::path::Path) -> Vec<PathBuf> {
 
 /// Resolve grok's native installer binary (`~/.grok/bin/grok`), or `None`.
 fn find_grok_native_binary() -> Option<PathBuf> {
-    let home = home_dir()?;
-    grok_native_candidates(&home)
+    find_grok_native_binary_in(&home_dir()?)
+}
+
+/// Resolve grok's native installer binary under an explicit `home` (test seam
+/// — avoids mutating the process-global `HOME` in parallel tests).
+fn find_grok_native_binary_in(home: &std::path::Path) -> Option<PathBuf> {
+    grok_native_candidates(home)
         .into_iter()
         .find(|p| is_executable_file(p))
 }
@@ -494,14 +499,20 @@ mod find_provider_binary_tests {
 
     #[cfg(unix)]
     #[test]
-    fn find_grok_native_binary_requires_executable_file() {
-        // A non-executable file at the native path must not resolve.
-        let dir = unique_temp_dir("grok-nonexec");
-        let bin = dir.join("grok");
+    fn find_grok_native_binary_in_requires_executable_at_native_path() {
+        // End-to-end against a fake home: `<home>/.grok/bin/grok` resolves
+        // only once it is executable (non-executable files must not resolve).
+        let home = unique_temp_dir("grok-home");
+        let bin_dir = home.join(".grok").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        assert_eq!(find_grok_native_binary_in(&home), None);
+
+        let bin = bin_dir.join("grok");
         fs::write(&bin, "not executable").unwrap();
-        assert!(!is_executable_file(&bin));
+        assert_eq!(find_grok_native_binary_in(&home), None);
+
         make_executable(&bin);
-        assert!(is_executable_file(&bin));
+        assert_eq!(find_grok_native_binary_in(&home), Some(bin));
     }
 
     #[test]

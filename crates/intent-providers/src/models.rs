@@ -277,7 +277,7 @@ fn value_to_string(value: Option<&Value>) -> Option<String> {
 
 /// Format an integer with `,` thousands separators (JS `toLocaleString`).
 fn thousands_separated(n: i64) -> String {
-    let digits = n.abs().to_string();
+    let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i) % 3 == 0 {

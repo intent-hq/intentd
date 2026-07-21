@@ -2241,8 +2241,8 @@ async fn report_provider_availability() {
         let program = provider
             .resolved_path
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| provider.command.to_string());
+            .map(|p| p.as_os_str().to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
         let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
     }
@@ -2255,7 +2255,7 @@ async fn report_provider_availability() {
 /// for the explicit auth markers instead of trusting the exit code.
 async fn check_provider_auth(
     provider_id: &str,
-    program: &str,
+    program: &std::ffi::OsStr,
     auth_check_args: Option<&[&str]>,
 ) -> String {
     let Some(args) = auth_check_args else {
