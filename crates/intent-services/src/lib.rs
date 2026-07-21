@@ -11550,17 +11550,11 @@ impl WorkspaceApi for Services {
             // git work (a saturated window would otherwise force a walk of
             // the entire history). The libgit2 revwalk runs on the blocking
             // pool so a slow walk on a big repo cannot stall other RPCs.
-            let (page_end, fetch) = match skip
+            let Some((page_end, fetch)) = skip
                 .checked_add(limit)
                 .and_then(|end| end.checked_add(1).map(|fetch| (end, fetch)))
-            {
-                Some(v) => v,
-                None => {
-                    return Ok(serde_json::json!({
-                        "items": [],
-                        "nextToken": serde_json::Value::Null
-                    }));
-                }
+            else {
+                return Ok(empty);
             };
             let commits =
                 tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
