@@ -126,16 +126,26 @@ where
     result
 }
 
+/// Grace window between SIGTERM and SIGKILL when reaping the probe child
+/// (mirrors `host_exec::TERM_GRACE` / `mcp_servers::reap`).
+const TERM_GRACE: Duration = Duration::from_millis(500);
+
 /// Kill the probe child and reap it. Signals the whole process group (the
 /// child is its own group leader via `process_group(0)`) so grandchildren
-/// (e.g. `npx` → `node`) die too, then waits briefly so the child does not
-/// linger as a zombie. `kill_on_drop(true)` back-stops any wait timeout.
+/// (e.g. `npx` → `node`) die too, following the crate's SIGTERM → grace →
+/// SIGKILL pattern, then waits briefly so the child does not linger as a
+/// zombie. `kill_on_drop(true)` back-stops any wait timeout.
 async fn reap_child(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
-        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let pgid = Pid::from_raw(pid as i32);
+        let _ = killpg(pgid, Signal::SIGTERM);
+        tokio::time::sleep(TERM_GRACE).await;
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
     }
     let _ = child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
