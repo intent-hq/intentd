@@ -3167,6 +3167,153 @@ async fn send_message_queues_when_already_busy() {
     assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
 }
 
+/// The direct-send branch persists the user row UNDER the caller-supplied
+/// `messageId` and publishes `agent:message` (role=user) with that id
+/// (PROTOCOL §5.5) — previously it emitted nothing and the RPC result's
+/// `messageId` named an id the store never used, so an
+/// `agent.editAndRegenerate` regenerated user message never reached clients
+/// until a full reload.
+#[tokio::test]
+async fn send_message_direct_branch_emits_agent_message_with_row_id() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-emit"), AgentId::from("a-emit"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "direct".to_string(),
+            Some("user-msg-direct-1".to_string()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("direct send");
+    assert_eq!(result["queued"], json!(false));
+    assert_eq!(
+        result["messageId"],
+        json!("user-msg-direct-1"),
+        "result messageId is the persisted row id"
+    );
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.last().unwrap().id,
+        "user-msg-direct-1",
+        "row persisted under the client-supplied id"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let msg_event = events
+        .iter()
+        .find(|e| e.event_type == "agent:message")
+        .expect("agent:message published on the direct-send branch");
+    assert_eq!(msg_event.data["messageId"], json!("user-msg-direct-1"));
+    assert_eq!(msg_event.data["role"], json!("user"));
+    assert_eq!(msg_event.data["agentId"], json!(id.0));
+}
+
+/// Without a client-supplied `messageId` the direct-send branch mints one and
+/// the RPC result names the ACTUAL persisted row id (they must match).
+#[tokio::test]
+async fn send_message_direct_branch_minted_id_matches_persisted_row() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-mint"), AgentId::from("a-mint"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "no id".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("direct send");
+    assert_eq!(result["queued"], json!(false));
+    let minted = result["messageId"].as_str().expect("minted id").to_string();
+    assert!(minted.starts_with("user-msg-"), "TS-shaped default id");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.last().unwrap().id,
+        minted,
+        "result messageId matches the persisted row"
+    );
+}
+
+/// An oversized client-supplied `messageId` is rejected with `-32602` BEFORE
+/// any state change (mirrors `agent_send_message_op`'s unconditional guard,
+/// now that the row is keyed on the client id): no slot claim, no status
+/// flap, nothing persisted.
+#[tokio::test]
+async fn send_message_rejects_oversized_message_id_before_any_state_change() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-len"), AgentId::from("a-len"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let err = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "too big".to_string(),
+            Some("x".repeat(300)),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect_err("oversized id rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
+    assert!(
+        !mgr.is_busy(&id),
+        "slot never claimed on validation failure"
+    );
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(messages.is_empty(), "nothing persisted");
+
+    // The guard is unconditional: a BUSY agent also rejects instead of
+    // silently queueing the oversized id.
+    assert!(mgr.try_begin(&id, &ws).await);
+    let err = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "still too big".to_string(),
+            Some("y".repeat(300)),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect_err("oversized id rejected while busy");
+    assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        0,
+        "nothing queued for an oversized id"
+    );
+}
+
 /// When `send_message` hits the busy auto-queue fallback, the caller's
 /// image + file blocks are preserved on the queued entry (the wire snapshot
 /// includes both) so the eventual drain turn reaches the agent with the same
