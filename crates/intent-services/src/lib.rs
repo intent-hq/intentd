@@ -11728,16 +11728,20 @@ impl WorkspaceApi for Services {
             else {
                 return Ok(empty);
             };
-            let commits =
-                tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
-                    .await
-                    .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
+            // Metadata-only walk (`include_files = false`): the list payload
+            // skips the O(commits) per-commit tree diff; clients fetch file
+            // details on demand via `git.commitDetails`.
+            let commits = tokio::task::spawn_blocking(move || {
+                intent_git::history::history_since(&worktree, None, fetch, false)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
             let has_more = commits.len() > page_end;
             let items: Vec<serde_json::Value> = commits
                 .iter()
                 .skip(skip)
                 .take(limit)
-                .map(git_ops::commit_to_commit_info)
+                .map(git_ops::commit_to_commit_summary)
                 .collect();
             let next_token = if has_more {
                 serde_json::Value::String(pagination::offset_token(page_end))
@@ -14434,11 +14438,15 @@ impl WorkspaceApi for Services {
                 }
 
                 let walk_started = std::time::Instant::now();
+                // Metadata-only walk (`include_files = false`): the list
+                // payload skips the O(commits) per-commit tree diff; the FE
+                // fetches per-file data on demand via `git.commitDetails`.
                 let commits = intent_git::history::history_bounded(
                     &worktree,
                     boundary_sha.as_deref(),
                     fetch,
                     include_older,
+                    false,
                 )?;
                 let walk_ms = walk_started.elapsed().as_millis() as u64;
                 Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
