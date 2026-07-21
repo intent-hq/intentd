@@ -1993,15 +1993,45 @@ impl Services {
                     .ok()
                     .and_then(|s| s.completion_report);
                 let summary = format_group_child_line(child_id, event, report.as_deref());
-                self.record_group_child_completion(
-                    workspace_id,
-                    &gid,
-                    child_id,
-                    deleted,
-                    summary,
-                    event.clone(),
-                )
-                .await;
+                let newly_recorded = self
+                    .record_group_child_completion(
+                        workspace_id,
+                        &gid,
+                        child_id,
+                        deleted,
+                        summary,
+                        event.clone(),
+                    )
+                    .await;
+                // STAB-160: a grouped child's failure must wake the parent
+                // immediately — a failed child is parked in Error and never
+                // auto-redriven (STAB-52), so deferring the notification until
+                // the whole group settles stalls the batch for as long as the
+                // remaining siblings run. The group watch stays in place and
+                // the group still owns settlement (its later aggregated wake
+                // may repeat the failure line, which is acceptable). The
+                // `newly_recorded` guard ensures a reprocessed duplicate
+                // `agent:failed` cannot deliver a second immediate wake.
+                if newly_recorded && event.event_type == AGENT_FAILED {
+                    let wake = format_completion_wake(child_id, event);
+                    let metadata = build_event_notification_metadata(&[event]);
+                    if let Err(e) = self
+                        .deliver_parent_wake(
+                            workspace_id,
+                            watch.parent_agent_id.clone(),
+                            wake,
+                            Some(metadata),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            parent = %watch.parent_agent_id.0,
+                            child = %child_id.0,
+                            "failed to deliver immediate grouped-failure wake to parent"
+                        );
+                    }
+                }
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
@@ -4912,11 +4942,17 @@ pub(crate) fn format_group_child_line(
 }
 
 /// Build the single aggregated wake for a settled after_all delegation group: a
-/// header with the child count and completionStatus (`partial` when any child was
-/// deleted, else `completed`) followed by the accumulated per-child lines.
+/// header with the child count and completionStatus (`partial` when any child
+/// was deleted or failed, else `completed`) followed by the accumulated
+/// per-child lines. STAB-160: a failed member must not be reported as
+/// `completed` — failures count toward `partial` just like deletions.
 fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     let total = group.expected_agent_ids.len();
-    let partial = !group.deleted_agent_ids.is_empty();
+    let any_failed = group
+        .raw_events
+        .iter()
+        .any(|e| e.event_type == AGENT_FAILED);
+    let partial = !group.deleted_agent_ids.is_empty() || any_failed;
     let status = if partial { "partial" } else { "completed" };
     let mut msg = format!(
         "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
@@ -11714,16 +11750,20 @@ impl WorkspaceApi for Services {
             else {
                 return Ok(empty);
             };
-            let commits =
-                tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
-                    .await
-                    .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
+            // Metadata-only walk (`include_files = false`): the list payload
+            // skips the O(commits) per-commit tree diff; clients fetch file
+            // details on demand via `git.commitDetails`.
+            let commits = tokio::task::spawn_blocking(move || {
+                intent_git::history::history_since(&worktree, None, fetch, false)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
             let has_more = commits.len() > page_end;
             let items: Vec<serde_json::Value> = commits
                 .iter()
                 .skip(skip)
                 .take(limit)
-                .map(git_ops::commit_to_commit_info)
+                .map(git_ops::commit_to_commit_summary)
                 .collect();
             let next_token = if has_more {
                 serde_json::Value::String(pagination::offset_token(page_end))
@@ -14518,11 +14558,15 @@ impl WorkspaceApi for Services {
                 }
 
                 let walk_started = std::time::Instant::now();
+                // Metadata-only walk (`include_files = false`): the list
+                // payload skips the O(commits) per-commit tree diff; the FE
+                // fetches per-file data on demand via `git.commitDetails`.
                 let commits = intent_git::history::history_bounded(
                     &worktree,
                     boundary_sha.as_deref(),
                     fetch,
                     include_older,
+                    false,
                 )?;
                 let walk_ms = walk_started.elapsed().as_millis() as u64;
                 Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))

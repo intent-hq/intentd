@@ -485,13 +485,19 @@ impl Services {
 
     /// Record one child's completion in its group (idempotent): adds it to the
     /// completed or deleted set, pushes a summary line, and retains the source
-    /// event for the aggregated wake's `event_notification` metadata. No-ops if
-    /// the child is not expected or already recorded, or if the group no longer
-    /// exists.
+    /// event for the aggregated wake's `event_notification` metadata. Returns
+    /// `true` iff this call newly recorded the child in memory (STAB-160: the
+    /// immediate failure-wake dedup guard keys off this); `false` when the
+    /// child is not expected or already recorded, or the group no longer
+    /// exists. The return reflects the in-memory recording only — it is still
+    /// `true` when the best-effort persist below fails.
     ///
     /// DURABILITY: Awaits the persist before returning so the completion is durable
     /// before the event is observable (fixes race where daemon kill between event
-    /// publish and spawned persist loses the completion across restart).
+    /// publish and spawned persist loses the completion across restart). The
+    /// persist is best-effort: a serialization or upsert failure is logged and
+    /// the in-memory recording stands (recovery across restart then relies on
+    /// the STAB-108 rehydration reconciliation).
     pub(crate) async fn record_group_child_completion(
         &self,
         workspace_id: &WorkspaceId,
@@ -500,14 +506,14 @@ impl Services {
         deleted: bool,
         summary: String,
         event: Event,
-    ) {
+    ) -> bool {
         let group_clone = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
             let Some(w) = guard.get_mut(workspace_id) else {
-                return;
+                return false;
             };
             if let Some(g) = w
                 .delegation_groups
@@ -515,12 +521,12 @@ impl Services {
                 .find(|g| g.group_id == group_id)
             {
                 if !g.expected_agent_ids.contains(child_id) {
-                    return;
+                    return false;
                 }
                 if g.completed_agent_ids.contains(child_id)
                     || g.deleted_agent_ids.contains(child_id)
                 {
-                    return;
+                    return false;
                 }
                 if deleted {
                     g.deleted_agent_ids.push(child_id.clone());
@@ -541,12 +547,15 @@ impl Services {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("skip delegation_group persist {group_id}: {e}");
-                    return;
+                    return true;
                 }
             };
             if let Err(e) = self.store.upsert_delegation_group(&persisted).await {
                 tracing::warn!("delegation_group upsert failed {group_id}: {e}");
             }
+            true
+        } else {
+            false
         }
     }
 

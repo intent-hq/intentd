@@ -338,11 +338,13 @@ impl Services {
             diff_text.push_str(&line);
         }
 
-        // Recent commit subjects for style mimicry.
-        let recent_commits = intent_git::history::history(worktree_path, RECENT_COMMITS_LIMIT)
-            .ok()
-            .map(|commits| commits.into_iter().map(|c| c.message).collect::<Vec<_>>())
-            .unwrap_or_default();
+        // Recent commit subjects for style mimicry — metadata only, no need
+        // for the per-commit tree diffs (`include_files = false`).
+        let recent_commits =
+            intent_git::history::history_since(worktree_path, None, RECENT_COMMITS_LIMIT, false)
+                .ok()
+                .map(|commits| commits.into_iter().map(|c| c.message).collect::<Vec<_>>())
+                .unwrap_or_default();
 
         // Repo-root AGENTS.md (if present, capped).
         let agents_md = worktree_path

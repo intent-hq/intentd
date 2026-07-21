@@ -7200,6 +7200,8 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     )
     .await;
     wait_for_group_children(&svc, &ws, &parent, 2).await;
+    // STAB-160: the grouped failure delivers an immediate wake to the parent.
+    wait_for_message_count(&svc, &parent, baseline + 1).await;
 
     // Seal the group by publishing parent idle (its delegating turn ended).
     publish_completion(
@@ -7211,8 +7213,9 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     )
     .await;
 
-    // The group settles: exactly one aggregated wake reaches the parent.
-    wait_for_message_count(&svc, &parent, baseline + 1).await;
+    // The group settles: exactly one aggregated wake reaches the parent, on
+    // top of the immediate failure wake.
+    wait_for_message_count(&svc, &parent, baseline + 2).await;
     let msgs = parent_messages_text(&svc, &parent).await;
     assert!(
         msgs.contains("All 2 delegated child agent(s) settled"),
@@ -7267,7 +7270,7 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         json!({ "agentId": child_b.0.clone(), "lastResponseSummary": "child B really done" }),
     )
     .await;
-    wait_for_message_count(&svc, &parent, baseline + 2).await;
+    wait_for_message_count(&svc, &parent, baseline + 3).await;
     let msgs = parent_messages_text(&svc, &parent).await;
     assert!(
         msgs.contains("child B really done"),
@@ -7279,6 +7282,187 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     assert!(
         !watches_after.iter().any(|w| w.child_agent_id == child_b),
         "oneShot watch removed after the late completion delivered"
+    );
+}
+
+/// STAB-160 regression: a grouped (`after_all`) child's `agent:failed` must
+/// wake the parent IMMEDIATELY, not only when the whole group settles.
+/// Observed 2026-07-21 (workspace `ideate-separate`, group `182d1feb`): a
+/// child hit the `session/prompt` idle timeout while its sibling kept
+/// working; the failure was only recorded into the delegation group, so the
+/// parent coordinator stayed idle and uninformed for the sibling's entire
+/// runtime — and a failed child is parked in Error and never auto-redriven
+/// (STAB-52), so only the coordinator could have recovered it.
+///
+/// After the fix, the grouped `agent:failed` delivers an immediate failure
+/// wake through the same path as ungrouped watches while the group stays
+/// live and still fires its single aggregated wake at settlement; a
+/// reprocessed duplicate `agent:failed` adds no second immediate wake.
+#[tokio::test]
+async fn grouped_child_failure_wakes_parent_immediately() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let _worker = svc.spawn_completion_delivery_loop();
+    wait_for_subscriber(&bus).await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child_a = delegate_after_all(&svc, &ws, &parent).await;
+    let child_b = delegate_after_all(&svc, &ws, &parent).await;
+    let baseline = parent_message_count(&svc, &parent).await;
+
+    // Child B fails mid-group while child A is still working.
+    let fail_data = json!({
+        "agentId": child_b.0.clone(),
+        "error": "session/prompt failed: request `session/prompt idle timeout (1800s of silence)` timed out",
+    });
+    publish_completion(&bus, &ws, AGENT_FAILED, &child_b, fail_data.clone()).await;
+
+    // The parent is woken immediately with the failure text — before the
+    // group settles and before the sibling finishes.
+    wait_for_message_count(&svc, &parent, baseline + 1).await;
+    let msgs = parent_messages_text(&svc, &parent).await;
+    assert!(
+        msgs.contains("failed") && msgs.contains("idle timeout"),
+        "immediate failure wake with the error text expected, got: {msgs}"
+    );
+
+    // The group is still live (it still owns settlement) and both grouped
+    // watches remain in place.
+    let group = svc
+        .delegation_group_for_parent(&ws, &parent)
+        .expect("group must remain live after the immediate failure wake");
+    assert_eq!(
+        group.completed_agent_ids.len() + group.deleted_agent_ids.len(),
+        1,
+        "only the failed child is recorded so far"
+    );
+    let watches = svc.list_watches_for_parent(&ws, &parent);
+    assert_eq!(
+        watches.len(),
+        2,
+        "both grouped watches retained: {watches:?}"
+    );
+    assert!(
+        watches.iter().all(|w| w.group_id.is_some()),
+        "watches must stay grouped: {watches:?}"
+    );
+
+    // A reprocessed duplicate agent:failed for the same child must NOT
+    // deliver a second immediate wake (record_group_child_completion no-ops).
+    publish_completion(&bus, &ws, AGENT_FAILED, &child_b, fail_data).await;
+
+    // The sibling settles and the parent idles: the group seals and fires
+    // exactly one aggregated wake on top of the immediate failure wake.
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &child_a,
+        json!({ "agentId": child_a.0.clone(), "lastResponseSummary": "child A done" }),
+    )
+    .await;
+    wait_for_group_children(&svc, &ws, &parent, 2).await;
+    publish_completion(
+        &bus,
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0.clone() }),
+    )
+    .await;
+    wait_for_message_count(&svc, &parent, baseline + 2).await;
+
+    // Bus order guarantees the duplicate was processed before the aggregated
+    // wake, so landing at exactly baseline + 2 proves it added nothing.
+    assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
+    let msgs = parent_messages_text(&svc, &parent).await;
+    assert!(
+        msgs.contains("All 2 delegated child agent(s) settled (completionStatus: partial)"),
+        "aggregated wake must settle with partial status, got: {msgs}"
+    );
+    // Pinned: the aggregated summary may repeat the failure line already
+    // delivered by the immediate wake — acceptable duplication.
+    assert!(
+        msgs.matches("idle timeout").count() >= 2,
+        "aggregated wake repeats the failure line, got: {msgs}"
+    );
+}
+
+/// STAB-160: `format_group_wake` header status must reflect member outcomes.
+/// Build a settled two-member group whose members carry the given terminal
+/// event types; ids listed in `deleted` land in `deleted_agent_ids`, the rest
+/// in `completed_agent_ids` (mirroring `record_group_child_completion`).
+fn settled_group(
+    ws: &WorkspaceId,
+    children: &[(&AgentId, &str)],
+    deleted: &[AgentId],
+) -> crate::agent_subscriptions::DelegationGroup {
+    crate::agent_subscriptions::DelegationGroup {
+        group_id: "group-test".into(),
+        parent_agent_id: AgentId::from("agent-parent"),
+        await_mode: "all".into(),
+        expected_agent_ids: children.iter().map(|(id, _)| (*id).clone()).collect(),
+        completed_agent_ids: children
+            .iter()
+            .filter(|(id, _)| !deleted.contains(id))
+            .map(|(id, _)| (*id).clone())
+            .collect::<Vec<_>>(),
+        deleted_agent_ids: deleted.to_vec(),
+        subscription_id: None,
+        sealed: true,
+        delivered: false,
+        event_summaries: children
+            .iter()
+            .map(|(id, ty)| format!("- {} {ty}.", id.0))
+            .collect(),
+        raw_events: children
+            .iter()
+            .map(|(id, ty)| {
+                Arc::new(completion_event(
+                    ws,
+                    ty,
+                    id,
+                    json!({ "agentId": id.0.clone() }),
+                ))
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn group_wake_status_completed_when_all_idle() {
+    let ws = WorkspaceId::new();
+    let a = AgentId::from("agent-a");
+    let b = AgentId::from("agent-b");
+    let g = settled_group(&ws, &[(&a, AGENT_IDLE), (&b, AGENT_IDLE)], &[]);
+    let msg = crate::format_group_wake(&g);
+    assert!(
+        msg.contains("completionStatus: completed"),
+        "all-idle group settles as completed, got: {msg}"
+    );
+}
+
+#[test]
+fn group_wake_status_partial_when_member_failed() {
+    let ws = WorkspaceId::new();
+    let a = AgentId::from("agent-a");
+    let b = AgentId::from("agent-b");
+    let g = settled_group(&ws, &[(&a, AGENT_IDLE), (&b, AGENT_FAILED)], &[]);
+    let msg = crate::format_group_wake(&g);
+    assert!(
+        msg.contains("completionStatus: partial"),
+        "a failed member must not report completed, got: {msg}"
+    );
+}
+
+#[test]
+fn group_wake_status_partial_when_member_deleted() {
+    let ws = WorkspaceId::new();
+    let a = AgentId::from("agent-a");
+    let b = AgentId::from("agent-b");
+    let g = settled_group(&ws, &[(&a, AGENT_IDLE), (&b, AGENT_DELETED)], &[b.clone()]);
+    let msg = crate::format_group_wake(&g);
+    assert!(
+        msg.contains("completionStatus: partial"),
+        "a deleted member settles as partial, got: {msg}"
     );
 }
 

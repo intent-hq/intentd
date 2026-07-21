@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::agent_ops::{new_message_id, user_message_blocks};
+use crate::agent_ops::{new_message_id, user_message_blocks, MAX_MESSAGE_ID_LEN};
 use crate::agent_session::agent_actor;
 use crate::events::EventBus;
 use crate::Services;
@@ -1932,6 +1932,20 @@ impl AgentManager {
     /// the Rust analog of TS reserving the kill for `killProcess: true`. Returns
     /// whether an agent was found.
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
+        self.interrupt_inner(agent_id, false).await
+    }
+
+    /// Shared body of [`AgentManager::interrupt`] with one extra knob:
+    /// `suppress_idle_emit` skips the STAB-28 synthetic `agent:idle`
+    /// (reason: `interrupted`) emit. The only caller passing `true` is
+    /// [`AgentManager::interrupt_send_message`] — an interrupt that carries a
+    /// follow-up message is a preemption, not a settlement: the child is about
+    /// to run the interrupt turn, so waking completion watches here would
+    /// deliver a spurious "child settled" report to the parent. The plain
+    /// `interrupt()` / `agent.stop` keep-alive path passes `false` so STAB-28
+    /// behavior (watches fire on interrupt) is preserved. `agent:stream:end`
+    /// is emitted unconditionally in both paths.
+    async fn interrupt_inner(&self, agent_id: &AgentId, suppress_idle_emit: bool) -> bool {
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
         let conn = self
@@ -2014,20 +2028,24 @@ impl AgentManager {
                 )
                 .await;
             // STAB-28: emit agent:idle after interrupt so completion watches fire.
-            // The aborted worker never reaches the worker-loop's idle-emit path
-            // (line ~2648), so we must emit here. Without this, a parent that
-            // re-messages via agent.send after the child settles registers a
-            // completion watch that never fires (no idle event → watch never
-            // delivered). Only emit when the agent has no queued ready-to-send
-            // messages (settlement coalescing: mirrors the worker-loop check).
-            if !self.services.has_ready_to_send(agent_id) {
+            // The aborted worker never reaches the settlement idle-emit in
+            // `run_prompt_turn` (agent_session.rs), so we must emit here.
+            // Without this, a parent that re-messages via agent.send after the
+            // child settles registers a completion watch that never fires (no
+            // idle event → watch never delivered). Only emit when the agent has
+            // no queued ready-to-send messages (settlement coalescing: mirrors
+            // the `run_prompt_turn` check) AND the interrupt is not part of
+            // interrupt-with-message (`suppress_idle_emit` — the follow-up
+            // content has not been queued yet at this point, so the
+            // ready-to-send check alone cannot see the imminent interrupt turn).
+            if !suppress_idle_emit && !self.services.has_ready_to_send(agent_id) {
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "interrupted",
                     "status": "idle",
                 });
-                // Enrich with agentName + completion report (reuse session loaded at
-                // line 1466; avoids duplicate I/O).
+                // Enrich with agentName + completion report (reuse the session
+                // loaded earlier in this method; avoids duplicate I/O).
                 if let Some(ref session) = session {
                     data["agentName"] = json!(session.name);
                     if let Some(ref report) = session.completion_report {
@@ -2288,10 +2306,13 @@ impl AgentManager {
 
     /// `agent.sendMessage` runtime path (§5.5/§6.8): when a turn is already in
     /// flight, enqueue (the worker flips it to in-flight when the current turn
-    /// ends); otherwise persist the user message and spawn a background worker
-    /// that lazily spawns the child on first turn, drives the ACP turn through
-    /// [`AgentManager::run_turn`], and drains the queue. Returns the TS-shaped
-    /// `{ success, queued, messageId | queuedMessage }`.
+    /// ends); otherwise persist the user message (under the client-supplied
+    /// `messageId` when given, else a minted `user-msg-{uuid}`), publish
+    /// `agent:message` (role=user) with the persisted row id, and spawn a
+    /// background worker that lazily spawns the child on first turn, drives
+    /// the ACP turn through [`AgentManager::run_turn`], and drains the queue.
+    /// Returns the TS-shaped `{ success, queued, messageId | queuedMessage }`
+    /// where `messageId` IS the persisted row id.
     pub async fn send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -2300,6 +2321,18 @@ impl AgentManager {
         message_id: Option<String>,
         options: TurnOptions,
     ) -> Result<Value> {
+        // Validate the caller-supplied id length BEFORE any state change
+        // (mirrors `agent_send_message_op`'s unconditional guard — the row id
+        // is now the client id). Hoisted above `try_begin` so a doomed
+        // request never claims the slot (no Active→RuntimeIdle status flap)
+        // and the busy branch never queues an oversized id.
+        if let Some(ref id) = message_id {
+            if id.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
+                )));
+            }
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
@@ -2324,42 +2357,63 @@ impl AgentManager {
             options.image_blocks.as_ref(),
             options.file_blocks.as_ref(),
         );
-        if self
+        // Persist the row UNDER the resolved `message_id` so the RPC result's
+        // `messageId` and the `agent:message` event both name the actual
+        // transcript row (PROTOCOL §5.5 — previously the store minted its own
+        // UUIDv7 id and the result id named nothing).
+        let message = match self
             .services
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_id(
                 &agent_id,
+                &message_id,
                 "user",
                 &blocks,
                 options.message_metadata.as_ref(),
                 &now_iso(),
             )
             .await
-            .is_err()
         {
-            // Store write failed (e.g. session not yet persisted) → auto-queue,
-            // matching the `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
-            // the slot we just released will be reclaimed below if the queue is
-            // ready and the agent is otherwise free.
-            self.end_turn(&agent_id).await;
-            let (queued, position) = self.services.enqueue_message(
+            Ok(message) => message,
+            Err(_) => {
+                // Store write failed (e.g. session not yet persisted) → auto-queue,
+                // matching the `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
+                // the slot we just released will be reclaimed below if the queue is
+                // ready and the agent is otherwise free.
+                self.end_turn(&agent_id).await;
+                let (queued, position) = self.services.enqueue_message(
+                    &agent_id,
+                    content,
+                    options.image_blocks.clone(),
+                    options.file_blocks.clone(),
+                    options.message_metadata.clone(),
+                );
+                let result = json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.services.publish_queue_updated(&agent_id).await;
+                self.clone().try_drain_queue(agent_id, workspace_id).await;
+                return Ok(result);
+            }
+        };
+        // Emit `agent:message` (role=user) with the persisted row id — the
+        // direct-send branch previously emitted nothing, so an
+        // `agent.editAndRegenerate` regenerated user message never reached
+        // clients until a full reload (PROTOCOL §5.5 step 6: "the usual
+        // agent:message / agent:stream:* events follow"). Mirrors the
+        // queue-drain (`persist_user`) and wake-delivery emits.
+        self.services
+            .publish_agent_mutation_event(
+                &workspace_id,
                 &agent_id,
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "queuedMessage": queued.to_value(position),
-            });
-            self.services.publish_queue_updated(&agent_id).await;
-            self.clone().try_drain_queue(agent_id, workspace_id).await;
-            return Ok(result);
-        }
+                intent_core::events::AGENT_MESSAGE,
+                json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+            )
+            .await;
         self.spawn_worker(agent_id, workspace_id, content, options);
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// Self-drain entrypoint (PROTOCOL §5.5). Invoked from `agent.queueMessage`
@@ -2654,8 +2708,12 @@ impl AgentManager {
 
                 // Cancel the turn IMMEDIATELY to prevent it from finishing while
                 // we prepare the re-queue logic below. This releases the in-flight
-                // slot and aborts the draining worker.
-                self.interrupt(&agent_id).await;
+                // slot and aborts the draining worker. The STAB-28 synthetic
+                // `agent:idle` is suppressed: this interrupt carries a
+                // follow-up message (the child is being preempted, not
+                // settling), so completion watches must not report "child
+                // settled" to the parent here.
+                self.interrupt_inner(&agent_id, true).await;
 
                 if !has_output {
                     // Zero-output condition: re-queue the preempted message.

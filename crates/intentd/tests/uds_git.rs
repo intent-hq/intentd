@@ -636,7 +636,9 @@ async fn uds_git_read_ops_round_trip() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["path"], json!("seed.txt"));
 
-    // (c) git.commits → §5.5 { items, nextToken } page of CommitInfo.
+    // (c) git.commits → §5.5 { items, nextToken } page of CommitSummary.
+    // Metadata-only: `files` is omitted (fetched on demand via
+    // git.commitDetails) so the list walk never tree-diffs per commit.
     let resp = send(
         &config.socket_path,
         r#"{"jsonrpc":"2.0","id":4,"method":"git.commits","params":{"workspaceId":"ws-gitr","page":{"limit":10}}}"#,
@@ -645,7 +647,7 @@ async fn uds_git_read_ops_round_trip() {
     let items = resp["result"]["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["message"].as_str().unwrap(), "seed");
-    assert_eq!(items[0]["files"], json!(["seed.txt"]));
+    assert!(items[0].get("files").is_none());
     assert_eq!(items[0]["email"], json!("test@example.com"));
     assert_eq!(resp["result"]["nextToken"], Value::Null);
 

@@ -1183,12 +1183,22 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
 
     // Preemption ordering: terminal stream:end for the cancelled first turn →
     // the interrupt message streams `turn=2` on the SAME child → its own end.
+    // Regression guard: the preemption must NOT emit the STAB-28 synthetic
+    // `agent:idle` (reason: "interrupted") on the wire — an interrupt that
+    // carries a follow-up message is a preemption, not a settlement, and the
+    // synthetic idle would wake parent completion watches mid-preemption.
     let mut saw_preempt_end = false;
     let mut saw_interrupt_chunk = false;
     let mut saw_interrupt_end = false;
+    let mut interrupted_idles = 0usize;
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
+            Some("agent:idle")
+                if frame["params"]["event"]["data"]["reason"].as_str() == Some("interrupted") =>
+            {
+                interrupted_idles += 1;
+            }
             Some("agent:stream:end") if !saw_preempt_end => {
                 assert_eq!(
                     frame["params"]["event"]["data"]["agentId"]
@@ -1230,6 +1240,11 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     assert!(
         saw_interrupt_end,
         "interrupt turn emits its own terminal stream:end"
+    );
+    assert_eq!(
+        interrupted_idles, 0,
+        "interrupt-with-message preemption must not emit the synthetic \
+         agent:idle (reason: interrupted) on the wire"
     );
 
     // Idle fall-through + liveness: another interrupt-priority send now behaves
@@ -5809,12 +5824,13 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
 }
 
 /// Emit `agent:message` on daemon-side user-row appends: verify that the
-/// queue-drain (persist_user) and wake-delivery (deliver_wake_message runtime)
-/// paths both publish `agent:message` with the persisted row's id. When an
-/// AgentManager is attached, plain agent.sendMessage routes through the manager
-/// and does NOT emit (FE optimistic rendering). This test covers the two runtime
-/// paths that DO emit: (1) dequeued message after a busy turn, (2) wake delivery
-/// to an idle agent.
+/// direct-send, queue-drain (persist_user), and wake-delivery
+/// (deliver_wake_message runtime) paths all publish `agent:message` with the
+/// persisted row's id. The direct-send branch of `AgentManager::send_message`
+/// emits too (PROTOCOL §5.5 — previously it was silent, which left an
+/// `agent.editAndRegenerate` regenerated user message invisible until reload).
+/// This test covers: (1) direct send to an idle agent, (2) dequeued message
+/// after a busy turn, (3) wake delivery to an idle agent.
 #[tokio::test]
 async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     let Some(script) = gate("WSS agent:message queue+wake E2E") else {
@@ -5883,6 +5899,9 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     .await;
     assert_eq!(send1["success"], true);
     assert_eq!(send1["queued"], false);
+    // The direct-send branch returns the PERSISTED row id (PROTOCOL §5.5) and
+    // emits agent:message for it — collected and asserted below.
+    let direct_message_id = send1["messageId"].as_str().expect("messageId").to_string();
 
     // Give the agent a moment to start processing.
     sleep(Duration::from_millis(200)).await;
@@ -5898,13 +5917,14 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second message should queue");
 
-    // Collect events: wait for agent:message role=user for the dequeued message.
+    // Collect events: wait for agent:message role=user for BOTH the direct
+    // send (emitted immediately by the send_message direct branch) and the
+    // dequeued message (emitted by persist_user after the first turn ends).
     // Use wss_event_opt with a single 30s deadline per event (parity with the
     // sibling suites) so contention from parallel e2e tests — daemon + node
     // mock-agent spawns easily exceeding a short silence window — doesn't
     // flake the test (STAB-128).
-    let mut saw_dequeued_user_message = false;
-    let mut dequeued_message_id: Option<String> = None;
+    let mut user_message_event_ids: Vec<String> = Vec::new();
     let mut stream_end_count = 0;
     let drain_wait_started = std::time::Instant::now();
     for _ in 0..100 {
@@ -5917,20 +5937,19 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
                 if evt["data"]["agentId"].as_str() == Some(agent_id.as_str())
                     && evt["data"]["role"] == "user"
                 {
-                    // The first turn's user message won't have an event (optimistic render).
-                    // The dequeued message (second) will emit after the first turn completes.
-                    dequeued_message_id = evt["data"]["messageId"].as_str().map(String::from);
-                    saw_dequeued_user_message = true;
-                    // Both turns may have already ended; don't wait for another frame.
-                    if stream_end_count >= 2 {
+                    if let Some(mid) = evt["data"]["messageId"].as_str() {
+                        user_message_event_ids.push(mid.to_string());
+                    }
+                    // Both turns ended and both user events seen — done.
+                    if stream_end_count >= 2 && user_message_event_ids.len() >= 2 {
                         break;
                     }
                 }
             }
             Some("agent:stream:end") => {
                 stream_end_count += 1;
-                // After 2 turns and we saw the dequeued message event, we're done.
-                if stream_end_count >= 2 && saw_dequeued_user_message {
+                // After 2 turns and both user message events, we're done.
+                if stream_end_count >= 2 && user_message_event_ids.len() >= 2 {
                     break;
                 }
             }
@@ -5938,13 +5957,19 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         }
     }
     assert!(
-        saw_dequeued_user_message,
-        "agent:message event emitted for dequeued user message (persist_user path); \
+        user_message_event_ids.len() >= 2,
+        "agent:message events emitted for BOTH the direct send and the dequeued \
+         user message (got ids {user_message_event_ids:?}); \
          stream_end_count={stream_end_count}, elapsed={:?}",
         drain_wait_started.elapsed()
     );
+    assert_eq!(
+        user_message_event_ids[0], direct_message_id,
+        "direct-send agent:message event carries the persisted row id returned by the RPC"
+    );
+    let dequeued_message_id = user_message_event_ids[1].clone();
 
-    // Verify the messageId matches the second (queued) user message in the transcript.
+    // Verify the messageIds match the transcript rows.
     let conv = wss_rpc(
         &mut rpc,
         13,
@@ -5959,10 +5984,16 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
         user_messages.len() >= 2,
         "should have at least 2 user messages (first + queued)"
     );
-    // The event messageId should match the second user message (the queued one).
+    // The direct send's RPC messageId is the first user row's id.
+    assert_eq!(
+        user_messages[0]["id"].as_str(),
+        Some(direct_message_id.as_str()),
+        "direct-send RPC messageId matches the first user message row"
+    );
+    // The dequeued event messageId should match the second user message.
     let second_user_id = user_messages[1]["id"].as_str();
     assert_eq!(
-        dequeued_message_id.as_deref(),
+        Some(dequeued_message_id.as_str()),
         second_user_id,
         "dequeued agent:message event ID matches the second (queued) user message"
     );
@@ -7149,10 +7180,17 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         json!(2),
         "edited user message + trailing assistant truncated: {edited}"
     );
+    let regenerated_message_id = edited["messageId"]
+        .as_str()
+        .expect("regenerated messageId")
+        .to_string();
 
     // The truncation emits `agent:updated { truncatedCount }`; the regenerated
-    // turn then streams and ends.
+    // user message emits `agent:message` (role=user, PROTOCOL §5.5 step 6 —
+    // the FE folds the edited message back in on this event, no reload); the
+    // regenerated turn then streams and ends.
     let mut saw_truncation_update = false;
+    let mut saw_regenerated_user_event = false;
     let mut saw_end = false;
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
@@ -7160,6 +7198,13 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
         match event["type"].as_str() {
             Some("agent:updated") if event["data"]["truncatedCount"] == json!(2) => {
                 saw_truncation_update = true;
+            }
+            Some("agent:message")
+                if event["data"]["role"] == "user"
+                    && event["data"]["messageId"].as_str()
+                        == Some(regenerated_message_id.as_str()) =>
+            {
+                saw_regenerated_user_event = true;
             }
             Some("agent:stream:end") => {
                 saw_end = true;
@@ -7171,6 +7216,11 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     assert!(
         saw_truncation_update,
         "agent:updated with truncatedCount emitted for the truncation"
+    );
+    assert!(
+        saw_regenerated_user_event,
+        "agent:message (role=user) emitted for the regenerated user message with the \
+         result's messageId — the FE convergence contract for the edit flow"
     );
     assert!(saw_end, "regenerated turn completed");
 
@@ -7189,6 +7239,11 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     assert_eq!(
         messages[2]["contentBlocks"][0]["text"], "edited question",
         "edited content persisted as the new user message"
+    );
+    assert_eq!(
+        messages[2]["id"].as_str(),
+        Some(regenerated_message_id.as_str()),
+        "result messageId names the persisted regenerated user row (PROTOCOL §5.5)"
     );
     assert_eq!(messages[3]["role"], "assistant");
 

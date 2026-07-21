@@ -158,16 +158,13 @@ pub(crate) fn validate_repo_path(repo_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the wire `CommitInfo` (§8.9) for a history record: `files` is the list
-/// of changed paths, `sha` the short hash, and the optional agent/note linkage
-/// is included only when present. Callers must pass records from a
-/// file-including walk (`git.commits` uses `history()` → `include_files =
-/// true`); `files == None` would silently serialize as `[]` on the wire.
-pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Value {
-    debug_assert!(
-        c.files.is_some(),
-        "commit_to_commit_info requires a file-including history walk"
-    );
+/// Build the wire `CommitSummary` (§5.6 `git.commits`) for a history record:
+/// `sha` is the short hash and the optional agent/note linkage is included
+/// only when present. `files` (changed paths) is emitted only when the record
+/// carries a computed file list; records from a metadata-only walk
+/// (`include_files = false`) omit it — clients fetch per-file data on demand
+/// via `git.commitDetails`.
+pub(crate) fn commit_to_commit_summary(c: &intent_git::history::CommitRecord) -> Value {
     let mut obj = Map::new();
     obj.insert("hash".to_string(), json!(c.hash));
     obj.insert(
@@ -178,10 +175,9 @@ pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Va
     obj.insert("email".to_string(), json!(c.author_email));
     obj.insert("date".to_string(), json!(c.date));
     obj.insert("message".to_string(), json!(c.message));
-    obj.insert(
-        "files".to_string(),
-        json!(c.files.as_deref().unwrap_or_default()),
-    );
+    if let Some(files) = &c.files {
+        obj.insert("files".to_string(), json!(files));
+    }
     if let Some(agent_id) = &c.agent_id {
         obj.insert("agentId".to_string(), json!(agent_id));
     }

@@ -70,6 +70,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("forward.rs", "forward."),
         ("host.rs", "host."),
         ("control.rs", "system."),
+        ("pairing.rs", "pairing."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {} at test time", filename));
@@ -126,7 +127,7 @@ const EXPECTED_TOTAL_METHODS: usize = 292;
 const EXPECTED_ROUTER_METHODS: usize = 262;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 28;
+const EXPECTED_FASTPATH_METHODS: usize = 29;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;

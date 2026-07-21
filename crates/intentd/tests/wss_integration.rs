@@ -333,6 +333,10 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
+        sess[0]["result"]["protocolVersion"], "2.0",
+        "explicit top-level protocolVersion in the client.hello result (§5.17)"
+    );
+    assert_eq!(
         sess[0]["result"]["server"]["locality"], "remote",
         "WSS ⇒ remote in the client.hello server block (§5.14/§5.17)"
     );
@@ -2069,6 +2073,13 @@ async fn wss_file_tracking_load_commits_bounded() {
     // Should have exactly 1 commit (workspace commit), not 2.
     assert_eq!(commits.len(), 1, "should only return workspace commits");
     assert_eq!(commits[0]["message"], "workspace commit");
+    // Metadata-only list payload: `files`/`filesChanged` are omitted (no
+    // per-commit tree diff); clients fetch details via git.commitDetails.
+    assert!(commits[0].get("files").is_none(), "files omitted: {resp}");
+    assert!(
+        commits[0].get("filesChanged").is_none(),
+        "filesChanged omitted: {resp}"
+    );
 
     // The boundary should match the base commit.
     assert_eq!(boundary_sha, base_sha, "boundary should be base commit SHA");

@@ -141,6 +141,15 @@ pub(crate) async fn process_frame(
                     None => true,
                 };
             }
+            if let Some(req) = crate::pairing::classify(&value) {
+                // pairing.getInfo shares the server.* provider and local-only gating:
+                // the payload embeds the bearer token, so it never crosses TCP.
+                let is_local = !crate::context::is_tcp_connection();
+                return match crate::pairing::handle(req, server_info, is_local).await {
+                    Some(frame) => out_tx.send(frame).await.is_ok(),
+                    None => true,
+                };
+            }
         }
         if let Some(req) = host::classify(&value) {
             // Slow path: spawn so `host.exec` and friends can't block the read
