@@ -1,5 +1,5 @@
 # Post-announce hook for the dist Release pipeline (see dist-workspace.toml
-# `post-announce-jobs`). After a vX.Y.Z[-beta.N] release is published, this
+# `post-announce-jobs`). After a vX.Y.Z[-<prerelease>] release is published, this
 # builds a channel manifest from the release's artifacts and uploads it to a
 # fixed channel release:
 #
