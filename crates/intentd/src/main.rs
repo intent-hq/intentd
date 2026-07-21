@@ -2249,10 +2249,11 @@ async fn report_provider_availability() {
 }
 
 /// Best-effort authentication probe for an installed provider: run its
-/// `auth_check_args` (exit 0 ⇒ authenticated) with a short timeout. Returns a
-/// trailing status fragment for the doctor line, or empty when no probe applies.
-/// grok's `models` probe exits 0 in both auth states, so its stdout is parsed
-/// for the explicit auth markers instead of trusting the exit code.
+/// `auth_check_args` with a short timeout and report auth status. Most
+/// providers signal auth via the exit code (0 ⇒ authenticated); grok's
+/// `models` probe exits 0 in both auth states, so its stdout is parsed for
+/// the explicit auth markers instead. Returns a trailing status fragment for
+/// the doctor line, or empty when no probe applies.
 async fn check_provider_auth(
     provider_id: &str,
     program: &std::ffi::OsStr,

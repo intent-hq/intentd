@@ -369,17 +369,15 @@ fn grok_models_from_value(value: &Value) -> Vec<GrokModel> {
         .unwrap_or(&[])
     };
 
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut models = Vec::new();
     for candidate in candidates {
         let Some(model) = grok_model_from_value(candidate) else {
             continue;
         };
-        if seen.contains(&model.model_id) {
-            continue;
+        if seen.insert(model.model_id.clone()) {
+            models.push(model);
         }
-        seen.push(model.model_id.clone());
-        models.push(model);
     }
     models
 }
