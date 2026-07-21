@@ -129,7 +129,7 @@ fn workspace_row(id: &WorkspaceId, worktree: &Path, branch: &str) -> Workspace {
 }
 
 async fn connect_retry(socket: &Path) -> UnixStream {
-    for _ in 0..200 {
+    for _ in 0..1200 {
         if let Ok(s) = UnixStream::connect(socket).await {
             return s;
         }

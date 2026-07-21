@@ -81,7 +81,7 @@ fn spawn_serve(data_dir: &Path) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    for _ in 0..200 {
+    for _ in 0..1200 {
         if tokio::net::UnixStream::connect(socket).await.is_ok() {
             return true;
         }

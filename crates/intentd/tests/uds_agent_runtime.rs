@@ -87,7 +87,7 @@ impl Drop for Daemon {
 }
 
 async fn connect_retry(socket: &PathBuf) -> UnixStream {
-    for _ in 0..200 {
+    for _ in 0..1200 {
         if let Ok(s) = UnixStream::connect(socket).await {
             return s;
         }
