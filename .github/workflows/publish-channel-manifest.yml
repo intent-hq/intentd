@@ -35,13 +35,16 @@ jobs:
         id: meta
         shell: bash
         run: |
-          tag=$(jq -r '.announcement_tag' <<<"$PLAN")
-          if [[ -z "$tag" || "$tag" == "null" ]]; then
+          tag=$(jq -r '.announcement_tag // empty' <<<"$PLAN")
+          if [[ -z "$tag" ]]; then
             echo "error: no announcement_tag in plan" >&2
             exit 1
           fi
-          version="${tag#v}"
-          if [[ "$version" == *-* ]]; then
+          # dist's prerelease bit is authoritative (release.yml uses the same
+          # field for the --prerelease flag), so routing can never disagree
+          # with what GitHub marks as a prerelease.
+          is_prerelease=$(jq -r '.announcement_is_prerelease' <<<"$PLAN")
+          if [[ "$is_prerelease" == "true" ]]; then
             channel="beta"
           else
             channel="stable"
@@ -50,22 +53,28 @@ jobs:
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Build channel manifest
         shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
         run: |
-          ./scripts/make-channel-manifest.sh \
-            "${{ steps.meta.outputs.tag }}" \
-            "${{ steps.meta.outputs.channel }}.json"
+          ./scripts/make-channel-manifest.sh "$TAG" "$CHANNEL" "$CHANNEL.json"
       - name: Publish manifest to channel release
         shell: bash
+        env:
+          CHANNEL: ${{ steps.meta.outputs.channel }}
         run: |
-          channel_tag="channel-${{ steps.meta.outputs.channel }}"
+          channel_tag="channel-$CHANNEL"
           if ! gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Tolerate a lost create race (two same-channel tags close together);
+            # the --clobber upload below is the source of truth.
             gh release create "$channel_tag" \
               --repo "$GITHUB_REPOSITORY" \
               --latest=false \
-              --title "Channel manifest: ${{ steps.meta.outputs.channel }}" \
-              --notes "Machine-readable pointer to the latest ${{ steps.meta.outputs.channel }} intentd release. Do not consume the tag itself; download the ${{ steps.meta.outputs.channel }}.json asset."
+              --title "Channel manifest: $CHANNEL" \
+              --notes "Machine-readable pointer to the latest $CHANNEL intentd release. Do not consume the tag itself; download the $CHANNEL.json asset." \
+              || true
           fi
           gh release upload "$channel_tag" \
-            "${{ steps.meta.outputs.channel }}.json" \
+            "$CHANNEL.json" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber

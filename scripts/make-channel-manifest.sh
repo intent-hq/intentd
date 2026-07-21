@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Build a channel manifest (stable.json / beta.json) for an intentd release.
 #
-# Usage: make-channel-manifest.sh <tag> <output-file>
+# Usage: make-channel-manifest.sh <tag> <channel> <output-file>
+#
+# <channel> is "stable" or "beta". The caller decides the routing (CI derives
+# it from dist's announcement_is_prerelease, the authoritative prerelease bit).
 #
 # Reads the GitHub Release for <tag> (via `gh`), pairs every platform archive
 # (intentd-<target>.tar.xz / .zip) with its .sha256 sidecar, and writes a JSON
-# manifest. Requires: gh (authenticated via GH_TOKEN), jq, curl.
+# manifest. Requires: gh (authenticated via GH_TOKEN), jq, awk.
 #
 # Manifest schema (schema version 1):
 # {
@@ -24,23 +27,33 @@
 # }
 set -euo pipefail
 
-TAG="${1:?usage: make-channel-manifest.sh <tag> <output-file>}"
-OUT="${2:?usage: make-channel-manifest.sh <tag> <output-file>}"
+usage="usage: make-channel-manifest.sh <tag> <channel> <output-file>"
+TAG="${1:?$usage}"
+CHANNEL="${2:?$usage}"
+OUT="${3:?$usage}"
 REPO="${GITHUB_REPOSITORY:-intent-hq/intentd}"
 
-VERSION="${TAG#v}"
-if [[ "$VERSION" == *-* ]]; then
-  CHANNEL="beta"
-else
-  CHANNEL="stable"
+if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
+  echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
+  exit 1
 fi
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+  echo "error: tag must look like vX.Y.Z or vX.Y.Z-<prerelease>, got: $TAG" >&2
+  exit 1
+fi
+VERSION="${TAG#v}"
 
 release_json=$(gh release view "$TAG" --repo "$REPO" --json assets,publishedAt)
-published_at=$(jq -r '.publishedAt' <<<"$release_json")
+published_at=$(jq -r '.publishedAt // empty' <<<"$release_json")
+if [[ -z "$published_at" ]]; then
+  echo "error: release $TAG has no publishedAt (draft/unpublished?)" >&2
+  exit 1
+fi
 
 # Platform archives look like intentd-<target-triple>.tar.xz or .zip.
-mapfile -t archives < <(jq -r '.assets[].name' <<<"$release_json" \
-  | grep -E '^intentd-[a-z0-9_]+-[a-z0-9-]+\.(tar\.xz|tar\.gz|zip)$' || true)
+mapfile -t archives < <(jq -r \
+  '.assets[].name | select(test("^intentd-[a-z0-9_]+-[a-z0-9-]+\\.(tar\\.xz|tar\\.gz|zip)$"))' \
+  <<<"$release_json")
 
 if [[ ${#archives[@]} -eq 0 ]]; then
   echo "error: no intentd platform archives found on release $TAG" >&2
