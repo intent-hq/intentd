@@ -395,7 +395,7 @@ async fn auto_commit_uses_generated_message_over_wss() {
     let (ws_id, _repo_dir) = seed_workspace_with_repo(&data_dir, Some(&auggie_bin)).await;
 
     // Mock agent behavior: write a file then return (triggers agent:idle).
-    let js = format!("return await ws.file.write('change.txt', 'agent wrote this\\n');");
+    let js = "return await ws.file.write('change.txt', 'agent wrote this\\n');".to_string();
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
@@ -571,7 +571,7 @@ async fn auto_commit_falls_back_when_auggie_missing() {
     let (ws_id, _repo_dir) = seed_workspace_with_repo(&data_dir, None).await;
 
     // Mock agent behavior: write a file then return.
-    let js = format!("return await ws.file.write('fallback.txt', 'fallback test\\n');");
+    let js = "return await ws.file.write('fallback.txt', 'fallback test\\n');".to_string();
     let behavior = json!({
         "toolCall": {
             "name": "workspace_api",
@@ -680,7 +680,7 @@ async fn auto_commit_falls_back_when_auggie_missing() {
     );
     assert_eq!(
         head["linkedNoteId"].as_str(),
-        Some(&task_id[..]),
+        Some(task_id),
         "Linked-Note-Id trailer in fallback: {head}"
     );
 }

@@ -229,7 +229,7 @@ mod tests {
         let store = Store::open(&tmp.path).await.expect("open store");
         let config_dir = tempfile::tempdir().expect("temp config dir");
         let registry = Arc::new(
-            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
 

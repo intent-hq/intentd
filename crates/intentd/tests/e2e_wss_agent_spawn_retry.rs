@@ -796,10 +796,10 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
             Some("agent:stream:end") => {
                 saw_end_from_exhaustion = true;
             }
-            Some("agent:status-changed") => {
-                if frame["params"]["event"]["data"]["status"] == "error" {
-                    saw_status_error = true;
-                }
+            Some("agent:status-changed")
+                if frame["params"]["event"]["data"]["status"] == "error" =>
+            {
+                saw_status_error = true;
             }
             _ => {}
         }

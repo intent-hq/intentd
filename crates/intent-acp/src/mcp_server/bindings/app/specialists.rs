@@ -572,7 +572,7 @@ mod tests {
         .unwrap();
 
         // Should have proposal and content items
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
         let proposal = result.get("proposal").unwrap();
         assert_eq!(
             proposal.get("kind").unwrap().as_str().unwrap(),

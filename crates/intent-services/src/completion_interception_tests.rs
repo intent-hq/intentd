@@ -67,8 +67,8 @@ mod tests {
     }
 
     fn init_test_repo(repo_path: &Path) {
-        fs::create_dir_all(&repo_path).unwrap();
-        let repo = Repository::init(&repo_path).unwrap();
+        fs::create_dir_all(repo_path).unwrap();
+        let repo = Repository::init(repo_path).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
         let tree_id = {
             let mut index = repo.index().unwrap();
@@ -79,7 +79,7 @@ mod tests {
             .unwrap();
     }
 
-    fn workspace_for_repo(repo_path: &PathBuf) -> intent_core::Workspace {
+    fn workspace_for_repo(repo_path: &Path) -> intent_core::Workspace {
         let now = now_iso();
         intent_core::Workspace {
             id: WorkspaceId::new(),
@@ -303,7 +303,7 @@ mod tests {
             .filter(|m| m.role == "user")
             .collect();
         assert!(
-            parent_user_messages.len() > 0,
+            !parent_user_messages.is_empty(),
             "Parent should have received a wake message on clean merge"
         );
 
@@ -473,7 +473,7 @@ mod tests {
         // Assert: bounce message was queued for the agent
         let messages = store.get_agent_messages(&child_id, None).await.unwrap();
         let user_messages: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
-        assert!(user_messages.len() > 0, "Bounce message should be queued");
+        assert!(!user_messages.is_empty(), "Bounce message should be queued");
         let last_msg = user_messages.last().unwrap();
         let content_str = last_msg.content.to_string();
         assert!(
@@ -630,7 +630,7 @@ mod tests {
             .filter(|m| m.role == "user")
             .collect();
         assert!(
-            parent_user_messages.len() > 0,
+            !parent_user_messages.is_empty(),
             "Parent should receive wake when retry cap exhausted"
         );
 

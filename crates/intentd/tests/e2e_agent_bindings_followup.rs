@@ -112,7 +112,7 @@ async fn agent_subscribe_creates_event_subscription() {
         .await
         .expect("unsubscribe");
     assert!(unsub_result["success"].is_boolean());
-    assert_eq!(unsub_result["success"].as_bool().unwrap(), true);
+    assert!(unsub_result["success"].as_bool().unwrap());
 
     drop(services);
     cleanup_db(&db);
@@ -143,7 +143,7 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
         .expect("diagnostics");
 
     // Assert concrete contract: full shape { ok, diagnostics, text }
-    assert_eq!(result["ok"].as_bool().unwrap(), true);
+    assert!(result["ok"].as_bool().unwrap());
     assert!(result["diagnostics"].is_object());
     assert!(result["text"].is_string());
     assert!(!result["text"].as_str().unwrap().is_empty());
@@ -183,7 +183,7 @@ async fn agent_status_returns_full_metadata() {
     assert_eq!(result.name, "StatusTest");
     use intent_core::AgentStatus;
     assert_eq!(result.status, AgentStatus::Idle);
-    assert_eq!(result.metadata.is_background, false);
+    assert!(!result.metadata.is_background);
 
     drop(services);
     cleanup_db(&db);

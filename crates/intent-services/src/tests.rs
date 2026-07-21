@@ -10525,7 +10525,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let config_dir = tempfile::tempdir().expect("temp config dir");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         registry
@@ -10573,7 +10573,7 @@ mod worktree_provisioning {
         let store = Store::open(&tmp.path).await.expect("open store");
         let config_dir = tempfile::tempdir().expect("temp config dir");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         registry

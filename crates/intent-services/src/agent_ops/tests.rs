@@ -7458,7 +7458,11 @@ fn group_wake_status_partial_when_member_deleted() {
     let ws = WorkspaceId::new();
     let a = AgentId::from("agent-a");
     let b = AgentId::from("agent-b");
-    let g = settled_group(&ws, &[(&a, AGENT_IDLE), (&b, AGENT_DELETED)], &[b.clone()]);
+    let g = settled_group(
+        &ws,
+        &[(&a, AGENT_IDLE), (&b, AGENT_DELETED)],
+        std::slice::from_ref(&b),
+    );
     let msg = crate::format_group_wake(&g);
     assert!(
         msg.contains("completionStatus: partial"),

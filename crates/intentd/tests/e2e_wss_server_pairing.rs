@@ -71,7 +71,8 @@ fn spawn_serve(data_dir: &Path) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    for (k, v) in &[("MOCK_ACP_HOST", "localhost:0")] {
+    {
+        let (k, v) = &("MOCK_ACP_HOST", "localhost:0");
         cmd.env(k, v);
     }
     cmd.spawn().expect("spawn intentd serve")

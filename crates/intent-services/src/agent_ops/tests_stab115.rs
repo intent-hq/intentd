@@ -22,7 +22,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, tempfile::TempDir) {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let config_dir = tempfile::tempdir().expect("temp config dir");
     let registry = Arc::new(
-        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
     let services = Services::new(store).with_settings_registry(registry);

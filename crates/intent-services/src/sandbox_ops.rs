@@ -753,10 +753,10 @@ mod tests {
     }
 
     fn init_test_repo(repo_path: &Path) {
-        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(repo_path).unwrap();
 
         // Initialize a git repository
-        let repo = git2::Repository::init(&repo_path).unwrap();
+        let repo = git2::Repository::init(repo_path).unwrap();
 
         // Create an initial commit
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -806,7 +806,7 @@ mod tests {
         store.insert_agent_session(&agent).await.unwrap();
     }
 
-    fn workspace_for_repo(repo_path: &PathBuf) -> Workspace {
+    fn workspace_for_repo(repo_path: &Path) -> Workspace {
         let now = now_iso();
         Workspace {
             id: WorkspaceId::new(),
@@ -1404,10 +1404,7 @@ mod tests {
         };
 
         // Verify no sandbox directory was created
-        let would_be_path = config
-            .workspaces_root
-            .join(ws.id.0.to_string())
-            .join(agent_id.0.to_string());
+        let would_be_path = config.workspaces_root.join(&ws.id.0).join(&agent_id.0);
         assert!(
             !would_be_path.exists(),
             "No sandbox directory should exist when CoW is unsupported"
