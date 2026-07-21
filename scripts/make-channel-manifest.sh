@@ -7,8 +7,8 @@
 # it from dist's announcement_is_prerelease, the authoritative prerelease bit).
 #
 # Reads the GitHub Release for <tag> (via `gh`), pairs every platform archive
-# (intentd-<target>.tar.xz / .zip) with its .sha256 sidecar, and writes a JSON
-# manifest. Requires: gh (authenticated via GH_TOKEN), jq, awk.
+# (intentd-<target>.tar.xz / .tar.gz / .zip) with its .sha256 sidecar, and writes
+# a JSON manifest. Requires: gh (authenticated via GH_TOKEN), jq, awk.
 #
 # Manifest schema (schema version 1):
 # {
@@ -50,7 +50,7 @@ if [[ -z "$published_at" ]]; then
   exit 1
 fi
 
-# Platform archives look like intentd-<target-triple>.tar.xz or .zip.
+# Platform archives look like intentd-<target-triple>.tar.xz / .tar.gz / .zip.
 mapfile -t archives < <(jq -r \
   '.assets[].name | select(test("^intentd-[a-z0-9_]+-[a-z0-9-]+\\.(tar\\.xz|tar\\.gz|zip)$"))' \
   <<<"$release_json")
