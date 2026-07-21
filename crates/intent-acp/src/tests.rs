@@ -847,6 +847,14 @@ mod session_tests {
             session::derive_tool_name("read", Some(&json!({ "filePath": null }))),
             "read"
         );
+        // cwd must be a non-empty string too; a null cwd is not bash.
+        assert_eq!(
+            session::derive_tool_name(
+                "echo hi",
+                Some(&json!({ "command": "echo hi", "cwd": null })),
+            ),
+            "echo hi"
+        );
         // Pattern-only inputs (grep/glob) intentionally derive nothing; the
         // bare title already names the tool.
         assert_eq!(

@@ -367,8 +367,8 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - `filePath` + `oldString`/`newString` → `edit`
 ///       - `filePath` + `content` → `write`
 ///       - `filePath` alone → `read`
-///       - string `command` + `cwd` (no `wait`/`max_wait_seconds`, which
-///         would mean auggie's `launch-process`) → `bash`
+///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
+///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
 ///  5. Otherwise the title passes through as-is.
 ///
@@ -456,11 +456,12 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
         }
         return Some("read".to_string());
     }
-    // command (string) + cwd → bash. Auggie's launch-process also carries a
-    // string `command` + `cwd` but always with `wait`/`max_wait_seconds`;
-    // codex sends `command` as an array — both are excluded here.
+    // command (string) + cwd (string) → bash. Auggie's launch-process also
+    // carries a string `command` + `cwd` but always with
+    // `wait`/`max_wait_seconds`; codex sends `command` as an array — both
+    // are excluded here.
     if is_non_empty_string(obj.get("command"))
-        && obj.contains_key("cwd")
+        && is_non_empty_string(obj.get("cwd"))
         && !obj.contains_key("wait")
         && !obj.contains_key("max_wait_seconds")
     {
