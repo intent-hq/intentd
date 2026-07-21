@@ -13998,6 +13998,11 @@ impl WorkspaceApi for Services {
                     }
                 }
             }
+            // Known narrow race: `abort()` cannot cancel a token write the
+            // engine already handed to `spawn_blocking`, so a poll that
+            // authorized in this exact window can re-materialize the token
+            // after the delete below. The next authStatus probe / explicit
+            // revoke reconciles it — not worth a drain barrier here.
             github_auth_ops::delete_stored_token(&secrets).await?;
             publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
             Ok(serde_json::json!({ "ok": true }))

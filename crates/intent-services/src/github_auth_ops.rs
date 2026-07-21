@@ -65,6 +65,9 @@ pub(crate) struct FlowSlot {
     pub(crate) flow_id: u64,
     pub(crate) user_code: String,
     pub(crate) verification_uri: String,
+    /// FE polling hint, captured at start. A `slow_down` grows the engine's
+    /// live cadence but not this snapshot, so the hint can understate the
+    /// real interval — harmless, the poll loop reads the engine each tick.
     pub(crate) interval: u64,
     /// When the codes expire (`start` + `expires_in`).
     pub(crate) deadline: Instant,

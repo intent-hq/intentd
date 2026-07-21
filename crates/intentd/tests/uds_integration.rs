@@ -879,7 +879,7 @@ async fn uds_slice_end_to_end() {
 
     let resp = send(
         &config.socket_path,
-        r#"{"jsonrpc":"2.0","id":41,"method":"github.revoke","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":43,"method":"github.revoke","params":{}}"#,
     )
     .await;
     assert_eq!(resp["result"]["ok"], json!(true));
