@@ -1476,24 +1476,21 @@ impl AgentManager {
     /// subcommand has no CLI model flag (`supports_set_model`; grok today —
     /// parity with the reference acp-provider, which applies the selected
     /// model via `session/set_model` after session creation for such
-    /// providers). The bare model id is stripped from the persisted compound
-    /// id; the `default` sentinel and empty ids are no-ops. Failures are
-    /// logged at WARN and never fail session startup.
+    /// providers). Compound ids are honored only when their provider prefix
+    /// matches the running provider (a stale id from a pre-spawn provider
+    /// switch must not be sent to grok); bare ids are treated as
+    /// provider-local. The `default` sentinel and empty ids are no-ops.
+    /// Failures are logged at WARN and never fail session startup.
     async fn maybe_apply_session_model(
         conn: &Connection,
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
     ) {
-        if !provider.supports_set_model {
+        let Some(model_id) = Self::set_model_target(provider, stored_model) else {
             return;
-        }
-        let Some(model) = stored_model else { return };
-        let model_id = intent_providers::parse_compound_model_id(model).1;
-        if model_id.is_empty() || model_id == "default" {
-            return;
-        }
-        match intent_acp::session::set_session_model(conn, acp_session_id, &model_id).await {
+        };
+        match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
             Ok(()) => {
                 tracing::debug!(
                     provider = provider.id,
@@ -1512,6 +1509,31 @@ impl AgentManager {
                 );
             }
         }
+    }
+
+    /// Resolve the model id `maybe_apply_session_model` should send, or `None`
+    /// when no `session/set_model` should be issued: providers without
+    /// `supports_set_model`, absent/empty models, the `default` sentinel, and
+    /// compound ids whose provider prefix does not match the running provider
+    /// (a stale id from a pre-spawn provider switch must not be sent to grok).
+    /// Bare ids are treated as provider-local.
+    fn set_model_target<'m>(
+        provider: &ProviderConfig,
+        stored_model: Option<&'m str>,
+    ) -> Option<&'m str> {
+        if !provider.supports_set_model {
+            return None;
+        }
+        let model = stored_model?;
+        let model_id = match model.split_once(':') {
+            Some((prefix, bare)) if prefix == provider.id => bare,
+            Some(_) => return None,
+            None => model,
+        };
+        if model_id.is_empty() || model_id == "default" {
+            return None;
+        }
+        Some(model_id)
     }
 
     /// Under the shipped `AllowAll` policy, best-effort ask the provider to run
@@ -4588,6 +4610,42 @@ mod role_reminder_tests {
             .await,
         );
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn set_model_target_gates_provider_sentinel_and_compound_prefix() {
+        let grok = intent_providers::find_provider("grok").unwrap();
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+
+        // Providers without supports_set_model never produce a target.
+        assert_eq!(
+            AgentManager::set_model_target(auggie, Some("opus4.7")),
+            None
+        );
+        // Absent / empty / sentinel models are no-ops.
+        assert_eq!(AgentManager::set_model_target(grok, None), None);
+        assert_eq!(AgentManager::set_model_target(grok, Some("")), None);
+        assert_eq!(AgentManager::set_model_target(grok, Some("default")), None);
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("grok:default")),
+            None
+        );
+        // Bare ids are provider-local.
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("grok-4.5")),
+            Some("grok-4.5")
+        );
+        // Matching compound prefix strips to the bare id.
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("grok:grok-4.5")),
+            Some("grok-4.5")
+        );
+        // A compound id for a DIFFERENT provider (stale pre-spawn provider
+        // switch) must not be sent to grok.
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("opencode:kimi-k3")),
+            None
+        );
     }
 
     #[tokio::test]

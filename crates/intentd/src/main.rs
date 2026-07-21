@@ -2278,7 +2278,11 @@ async fn check_provider_auth(
                     // No explicit marker but a parsed model list ⇒ the CLI is
                     // serving models, treat as authenticated.
                     (None, false) => " (authenticated)".to_string(),
-                    (None, true) => " (auth status unknown)".to_string(),
+                    // No markers, no models: distinguish a probe that ran but
+                    // said nothing from one that failed outright (broken
+                    // install exits non-zero with empty/garbage stdout).
+                    (None, true) if output.status.success() => " (auth status unknown)".to_string(),
+                    (None, true) => " (auth check failed)".to_string(),
                 }
             }
             Ok(Err(_)) => " (auth check failed)".to_string(),

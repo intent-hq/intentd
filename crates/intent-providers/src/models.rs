@@ -626,7 +626,9 @@ pub fn parse_grok_models_command_output(stdout: &str) -> GrokModelsCommandOutput
         None
     };
 
-    // A JSON payload (whole output or one line) wins over text-row parsing.
+    // A JSON payload (whole output or one line) that yields a non-empty
+    // model list wins over text-row parsing; empty/irrelevant JSON falls
+    // through to the text parser (parity with the TS implementation).
     for candidate in std::iter::once(text.as_str()).chain(lines.iter().copied()) {
         let Ok(parsed) = serde_json::from_str::<Value>(candidate) else {
             continue;

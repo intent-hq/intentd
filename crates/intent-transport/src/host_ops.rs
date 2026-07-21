@@ -361,9 +361,10 @@ pub(crate) const DEFAULT_TOOLS: &[&str] = &[
 
 /// Tool-specific `common_paths` hints for [`find_binary_op`]. grok's native
 /// installer puts the binary at `~/.grok/bin/grok` without necessarily adding
-/// it to PATH, so the availability probe must check there (keeps
-/// `host.toolAvailability` consistent with provider discovery, which prefers
-/// that location — see `intent_providers::discover`).
+/// it to PATH, so the availability probe must check there as a fallback
+/// (PATH still wins in `resolve_binary_path`; provider discovery, which
+/// spawns the binary, is what prefers the native location — see
+/// `intent_providers::discover`).
 fn tool_common_paths(name: &str) -> Vec<String> {
     if name != "grok" {
         return Vec::new();
