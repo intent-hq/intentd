@@ -986,10 +986,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         enumerated(
             "sourceControl.github.tokenSource",
             "GitHub token source",
-            "Where the GitHub token comes from",
+            "Where the GitHub token comes from: auto tries the secrets store, then \
+             environment variables, then the gh CLI",
             "sourceControl",
-            &["env", "gh-cli", "explicit"],
-            "gh-cli",
+            &["auto", "env", "gh-cli", "explicit"],
+            "auto",
         ),
         secret(
             "sourceControl.github.token",
