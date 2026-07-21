@@ -172,12 +172,18 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 ///   `--max-old-space-size`. [`ProviderRuntime::Native`] binaries are left
 ///   untouched.
 /// - `cortex`: `ELECTRON_RUN_AS_NODE=1` (run the Electron binary as Node).
-/// - `opencode`: `OPENCODE_CONFIG_CONTENT` with `model` (when set) and
-///   `instructions` (when a rules file path is provided).
+/// - `opencode`: `OPENCODE_CONFIG_CONTENT` with `model` (when set),
+///   `instructions` (when a rules file path is provided), and `mcp` (when a
+///   pre-serialized MCP block is provided via `mcp_config_json`).
+///
+/// `mcp_config_json` must be a serialized JSON object in the OpenCode `mcp`
+/// config shape (see `to_opencode_mcp_config` in `intent-acp`); it is spliced
+/// in verbatim. Providers that don't take env config ignore it.
 pub fn build_provider_env(
     config: &ProviderConfig,
     model: Option<&str>,
     rules_file: Option<&str>,
+    mcp_config_json: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     if matches!(
@@ -198,11 +204,12 @@ pub fn build_provider_env(
         "opencode" => {
             // Always emit OPENCODE_CONFIG_CONTENT with permission.task = deny to
             // disallow the provider-native task tool (subagent spawning). Merge
-            // with the model key when a model is set and the instructions array
-            // when a rules file is provided. Filter out the sentinel model id
-            // ("default") per build_provider_args. The permission key is preserved
-            // when workspace MCP servers are merged into the config at spawn time
-            // (see opencode_permission_survives_mcp_merge test in intent-acp).
+            // with the model key when a model is set, the instructions array
+            // when a rules file is provided, and the mcp block when workspace
+            // MCP servers are supplied at spawn time. Filter out the sentinel
+            // model id ("default") per build_provider_args. The permission key
+            // is preserved across the MCP merge (see
+            // opencode_permission_survives_mcp_merge test in intent-acp).
             let mut parts = Vec::new();
             // Always include permission.task = deny first.
             parts.push(r#""permission":{"task":"deny"}"#.to_string());
@@ -214,6 +221,11 @@ pub fn build_provider_env(
             }
             if let Some(path) = rules_file {
                 parts.push(format!("\"instructions\":[\"{}\"]", json_escape(path)));
+            }
+            if let Some(mcp) = mcp_config_json.map(str::trim) {
+                if !mcp.is_empty() {
+                    parts.push(format!("\"mcp\":{mcp}"));
+                }
             }
             env.insert(
                 "OPENCODE_CONFIG_CONTENT".to_string(),

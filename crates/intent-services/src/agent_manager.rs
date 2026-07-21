@@ -22,10 +22,10 @@ use intent_acp::session::{ContentBlock, SessionModeState, StopReason};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
     normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_auggie_mcp_config,
-    ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
-    IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
-    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
-    SpawnOptions, WorkspaceMcpServer,
+    to_opencode_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink,
+    FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
+    NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
+    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -927,6 +927,15 @@ impl AgentManager {
             mcp_config = Some(TempConfigFile { path });
         }
 
+        // For env-config providers (opencode), the same normalized server set
+        // (workspace bridge + user servers) rides in `OPENCODE_CONFIG_CONTENT`
+        // as an `mcp` block instead of an `--mcp-config` file, pointing at the
+        // same bridge endpoint.
+        let mut env_mcp_config: Option<String> = None;
+        if opts.provider.injection_mechanism == InjectionMechanism::EnvConfig {
+            env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
+        }
+
         // Assemble the effective system prompt (the §18.1 injection pipeline:
         // base/specialization/workspace user overrides + live workspace rule
         // files, plus — for specialist agents — the PP-1 `<specialist_role>`
@@ -1003,6 +1012,7 @@ impl AgentManager {
         if let Some(ref p) = mcp_config_path {
             spawn_opts.mcp_config_file = Some(p.as_str());
         }
+        spawn_opts.env_mcp_config = env_mcp_config.as_deref();
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
@@ -1095,16 +1105,33 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape): the
-    /// `workspace-mcp` server is the `intentd mcp-bridge --connect <addr>`
-    /// subcommand, with the user's `mcp.servers` catalog merged in and the safe
-    /// baseline env injected across every stdio entry (§6.8, §18.4). Mirrors
-    /// the FE `mergeUserMcpServersWithAuth` path: honours the
-    /// `mcp.enableUserServers` gate, filters out globally-disabled servers, and
-    /// — for http/sse transports — injects an `Authorization` header from the
-    /// persisted OAuth token bag when the catalog entry does not already set
-    /// one. `workspace-mcp` is reserved and never overridden.
+    /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape) from
+    /// the normalized spawn server set ([`Self::normalized_mcp_servers`]).
     async fn generate_mcp_config(&self, bridge: &McpBridge) -> Result<serde_json::Value> {
+        let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+        Ok(to_auggie_mcp_config(&servers))
+    }
+
+    /// Serialize the same normalized spawn server set as the OpenCode config
+    /// `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` at spawn for
+    /// env-config providers. The bridge entry points at the same endpoint the
+    /// auggie `--mcp-config` path uses.
+    async fn opencode_env_mcp_config(&self, connect_addr: String) -> Result<String> {
+        let servers = self.normalized_mcp_servers(connect_addr).await?;
+        serde_json::to_string(&to_opencode_mcp_config(&servers))
+            .map_err(|e| Error::Internal(format!("serialize opencode mcp config failed: {e}")))
+    }
+
+    /// Normalized MCP server set for a spawn: the `workspace-mcp` server is
+    /// the `intentd mcp-bridge --connect <addr>` subcommand, with the user's
+    /// `mcp.servers` catalog merged in and the safe baseline env injected
+    /// across every stdio entry (§6.8, §18.4). Mirrors the FE
+    /// `mergeUserMcpServersWithAuth` path: honours the `mcp.enableUserServers`
+    /// gate, filters out globally-disabled servers, and — for http/sse
+    /// transports — injects an `Authorization` header from the persisted OAuth
+    /// token bag when the catalog entry does not already set one.
+    /// `workspace-mcp` is reserved and never overridden.
+    async fn normalized_mcp_servers(&self, connect_addr: String) -> Result<NormalizedMcpServers> {
         let mut servers = NormalizedMcpServers::new();
         servers.insert(
             "workspace-mcp".to_string(),
@@ -1113,15 +1140,14 @@ impl AgentManager {
                 args: vec![
                     "mcp-bridge".to_string(),
                     "--connect".to_string(),
-                    bridge.connect_addr(),
+                    connect_addr,
                 ],
                 env: EnvMap::new(),
             },
         );
         self.merge_user_mcp_servers(&mut servers).await?;
         let baseline = build_baseline_mcp_env_from_process();
-        let servers = apply_baseline_env_to_stdio_servers(&servers, &baseline);
-        Ok(to_auggie_mcp_config(&servers))
+        Ok(apply_baseline_env_to_stdio_servers(&servers, &baseline))
     }
 
     /// Fold user-configured MCP servers (sensitive `mcp.servers` secret) into
@@ -1504,8 +1530,9 @@ impl AgentManager {
     /// * Fires only when the workspace lookup succeeds AND the current title
     ///   is empty/whitespace OR still shaped like an auto-generated slug
     ///   ([`intent_core::slug::is_workspace_slug`]).
-    /// * Names the concrete daemon tool the agent must call
-    ///   (`set_workspace_title_workspace-mcp`), not the FE `workspace_api`
+    /// * Names the concrete daemon tool the agent must call — spelled the way
+    ///   the session's provider will actually surface it (see
+    ///   [`workspace_naming_tool_reference`]) — not the FE `workspace_api`
     ///   JS surface (which daemon-spawned agents do not have).
     ///
     /// The agent-rename half of the reference block is intentionally SKIPPED:
@@ -1531,10 +1558,22 @@ impl AgentManager {
         if !needs_rename {
             return None;
         }
-        Some(
-            "<system>\nThis workspace needs a title. As your first action, call the `set_workspace_title_workspace-mcp` tool with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-                .to_string(),
-        )
+        // Spell the rename tool the way this session's provider surfaces it;
+        // a failed session lookup falls back to the generic phrasing.
+        let tool_ref = match self.services.store.get_agent_session(agent_id).await {
+            Ok(s) => workspace_naming_tool_reference(&session_provider_id(&s)),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "naming nudge: session lookup failed; using generic tool phrasing"
+                );
+                GENERIC_NAMING_TOOL_REFERENCE
+            }
+        };
+        Some(format!(
+            "<system>\nThis workspace needs a title. As your first action, call {tool_ref} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
+        ))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -3210,9 +3249,41 @@ fn derive_agent_type(
     DEFAULT_AGENT_TYPE.to_string()
 }
 
+/// Effective provider id for a session. Provider precedence: when the model
+/// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
+/// prefix wins over `session.provider`, because a cross-provider model switch
+/// should spawn the new provider's binary. `session.provider` is only used as
+/// a fallback for bare model ids, then the default provider. Delegates to
+/// [`crate::agent_session::resolve_provider_id`], which also guards against
+/// malformed compound ids like `:sonnet` (empty prefixes fall through to the
+/// provider field / default).
+fn session_provider_id(session: &AgentSession) -> String {
+    crate::agent_session::resolve_provider_id(session.model.as_deref(), session.provider.as_deref())
+}
+
+/// Fallback phrasing for the workspace-naming nudge when the provider's MCP
+/// tool naming convention is unknown (or its workspace-MCP wiring hasn't
+/// landed yet).
+const GENERIC_NAMING_TOOL_REFERENCE: &str =
+    "the `set_workspace_title` tool from the workspace MCP server";
+
+/// Provider-correct spelling of the workspace-MCP rename tool for the naming
+/// nudge. Providers affix the MCP server name differently: auggie exposes
+/// `<tool>_<server>` (trailing suffix → `set_workspace_title_workspace-mcp`),
+/// opencode exposes `<server>_<tool>` (leading prefix →
+/// `workspace-mcp_set_workspace_title`; confirmed against captured opencode
+/// 1.18.3 traffic). Every other provider gets the generic fallback phrasing.
+fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
+    match provider_id {
+        "auggie" => "the `set_workspace_title_workspace-mcp` tool",
+        "opencode" => "the `workspace-mcp_set_workspace_title` tool",
+        _ => GENERIC_NAMING_TOOL_REFERENCE,
+    }
+}
+
+/// Resolve everything needed to spawn (or respawn) this
 /// agent's child from its persisted session + workspace. The provider id comes
-/// from the session's explicit `provider`, else the `provider:model` compound
-/// id, else the default provider. The `mock` provider (E2E) reads its script
+/// from [`session_provider_id`]. The `mock` provider (E2E) reads its script
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
 /// `MOCK_AGENT_BEHAVIOR` to the child. npx-only providers (claude-code) are
@@ -3225,17 +3296,7 @@ fn resolve_spawn(
     workspace: Option<&intent_core::Workspace>,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Result<ResolvedSpawn> {
-    // Provider precedence: when the model carries an explicit `provider:` prefix
-    // (e.g., "opencode:kimi-k3"), that prefix wins over session.provider,
-    // because a cross-provider model switch should spawn the new provider's
-    // binary. Session.provider is only used as a fallback for bare model ids.
-    let provider_id = session
-        .model
-        .as_ref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .or_else(|| session.provider.clone())
-        .unwrap_or_else(|| intent_providers::default_provider_id().to_string());
+    let provider_id = session_provider_id(session);
     let model = session
         .model
         .as_ref()

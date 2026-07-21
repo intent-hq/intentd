@@ -211,16 +211,21 @@ pub(crate) fn worktree_relative(worktree: &Path, raw: &str) -> String {
 }
 
 /// Build the wire `CommitWithAttribution` for a history record (PROTOCOL §5.18).
+/// `files`/`filesChanged` are emitted only when the record carries a computed
+/// file list; records from a metadata-only walk (`include_files = false`) omit
+/// both — clients fetch per-file data on demand via `git.commitDetails`.
 pub(crate) fn commit_to_value(c: &CommitRecord) -> Value {
-    let files: Vec<Value> = c.files.iter().map(|p| json!({ "path": p })).collect();
     let mut obj = Map::new();
     obj.insert("hash".to_string(), json!(c.hash));
     obj.insert("message".to_string(), json!(c.message));
     obj.insert("author".to_string(), json!(c.author));
     obj.insert("date".to_string(), json!(c.date));
-    obj.insert("filesChanged".to_string(), json!(c.files_changed));
     obj.insert("isPushed".to_string(), json!(c.is_pushed));
-    obj.insert("files".to_string(), Value::Array(files));
+    if let Some(files) = &c.files {
+        let files: Vec<Value> = files.iter().map(|p| json!({ "path": p })).collect();
+        obj.insert("filesChanged".to_string(), json!(c.files_changed));
+        obj.insert("files".to_string(), Value::Array(files));
+    }
     if let Some(agent_id) = &c.agent_id {
         obj.insert("agentId".to_string(), json!(agent_id));
     }
@@ -326,7 +331,7 @@ mod tests {
             author: "Test".to_string(),
             author_email: "t@e.com".to_string(),
             date: "2025-01-01T00:00:00Z".to_string(),
-            files: vec!["a.ts".to_string()],
+            files: Some(vec!["a.ts".to_string()]),
             files_changed: 1,
             is_pushed: true,
             agent_id: Some("agent-1".to_string()),
@@ -339,5 +344,26 @@ mod tests {
         assert_eq!(v["files"], json!([{ "path": "a.ts" }]));
         assert_eq!(v["agentId"], json!("agent-1"));
         assert!(v.get("linkedNoteId").is_none());
+    }
+
+    #[test]
+    fn commit_shape_omits_files_when_not_computed() {
+        let c = CommitRecord {
+            hash: "abc".to_string(),
+            message: "msg".to_string(),
+            author: "Test".to_string(),
+            author_email: "t@e.com".to_string(),
+            date: "2025-01-01T00:00:00Z".to_string(),
+            files: None,
+            files_changed: 0,
+            is_pushed: false,
+            agent_id: None,
+            linked_note_id: None,
+        };
+        let v = commit_to_value(&c);
+        assert_eq!(v["hash"], json!("abc"));
+        assert_eq!(v["isPushed"], json!(false));
+        assert!(v.get("files").is_none());
+        assert!(v.get("filesChanged").is_none());
     }
 }

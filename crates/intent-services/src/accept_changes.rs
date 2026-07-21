@@ -200,7 +200,10 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
     let ahead_behind_ms = ahead_behind_started.elapsed().as_millis() as u64;
 
     let history_started = std::time::Instant::now();
-    let commits = intent_git::history::history_since(worktree, Some(&trunk_ref), 200)?;
+    // Metadata-only walk: no per-commit tree diffs. `localCommits` entries omit
+    // `files`/`filesChanged`; the FE fetches per-file data on demand via
+    // `git.commitDetails` (PROTOCOL §5.6).
+    let commits = intent_git::history::history_since(worktree, Some(&trunk_ref), 200, false)?;
     let local_commits: Vec<Value> = commits.iter().map(commit_to_value).collect();
     let history_ms = history_started.elapsed().as_millis() as u64;
 
@@ -394,8 +397,9 @@ pub(crate) fn build_prepare_value(
     }
     let files_count = unique.len();
 
+    // Only commit messages are needed here — skip the per-commit tree diffs.
     let commit_messages: Vec<String> =
-        intent_git::history::history_since(worktree, Some(&trunk_ref), 200)
+        intent_git::history::history_since(worktree, Some(&trunk_ref), 200, false)
             .unwrap_or_default()
             .into_iter()
             .map(|c| c.message)
@@ -904,6 +908,12 @@ mod tests {
         let commits = v["localCommits"].as_array().unwrap();
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0]["message"].as_str().unwrap(), "add b");
+        // Metadata-only walk: no per-commit tree diffs, so `files` and
+        // `filesChanged` are omitted (fetched on demand via git.commitDetails).
+        assert!(commits[0].get("files").is_none());
+        assert!(commits[0].get("filesChanged").is_none());
+        assert!(commits[0]["hash"].is_string());
+        assert_eq!(commits[0]["isPushed"], false);
         // No remote → null fields.
         assert!(v["remoteUrl"].is_null());
         assert!(v["owner"].is_null());
