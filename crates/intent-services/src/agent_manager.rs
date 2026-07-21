@@ -113,16 +113,21 @@ pub struct TurnOptions {
 /// Conservative cap used when total system memory cannot be determined.
 const DEFAULT_PROCESS_CAP: usize = 8;
 
-/// Maximum concurrent agent processes for `total_memory_bytes`: reserve 8 GB
-/// for the OS/other apps, then budget 1 GB per agent, clamped to [4, 100].
-/// The 1 GB/agent budget is 2–4× the measured worst case (auggie ≈ 230 MB RSS
-/// avg, claude-code chain ≈ 700 MB), so lower-RAM machines still get a tight
-/// cap while high-RAM machines are not artificially throttled (for exact byte
-/// counts: 16 GB → 8, 32 GB → 24, 64 GB → 56, ≥108 GB → 100; Linux MemTotal
-/// runs slightly below nominal RAM, so a nominal 16 GB box may compute 7).
+/// Maximum concurrent agent processes for `total_memory_bytes`, ported verbatim
+/// from `agent-process-registry.computeProcessCap` (lower-RAM machines get a
+/// tighter cap so the daemon does not overwhelm the system).
 pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
-    let budget_gb = total_memory_bytes.saturating_sub(8 * GB) / GB;
-    budget_gb.clamp(4, 100) as usize
+    if total_memory_bytes <= 8 * GB {
+        4
+    } else if total_memory_bytes <= 16 * GB {
+        8
+    } else if total_memory_bytes <= 32 * GB {
+        20
+    } else if total_memory_bytes <= 64 * GB {
+        30
+    } else {
+        100
+    }
 }
 
 /// Best-effort process cap from detected system RAM, falling back to
