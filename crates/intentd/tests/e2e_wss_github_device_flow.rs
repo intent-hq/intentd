@@ -469,12 +469,13 @@ async fn github_device_flow_full_lifecycle_over_wss() {
         "token persisted under the resolution-chain slot"
     );
 
-    // 6. authStatus after authorize → the flow slot is cleared; the token
-    //    probe hits the mock host (which 200s garbage for /user) — only the
-    //    deviceFlow reset is asserted here, isConfigured derives from the
-    //    forge probe and is environment-dependent.
-    let v = wss_rpc(&mut rpc, 13, "github.authStatus", json!({})).await;
-    assert_eq!(v["result"]["deviceFlow"], Value::Null);
+    // 6. The authorized transition cleared the flow slot: a cancel now has
+    //    nothing to cancel. (`github.authStatus` is deliberately NOT called
+    //    while the token is stored — its `GET /user` probe goes to the real
+    //    api.github.com, which would make this test network-dependent.)
+    let v = wss_rpc(&mut rpc, 13, "github.cancelAuth", json!({})).await;
+    assert_eq!(v["result"]["ok"], json!(true));
+    assert_eq!(v["result"]["cancelled"], json!(false));
 
     // 7. revoke → token deleted from the secrets file + revoked event.
     let v = wss_rpc(&mut rpc, 14, "github.revoke", json!({})).await;

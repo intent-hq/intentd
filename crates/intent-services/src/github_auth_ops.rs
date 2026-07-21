@@ -234,8 +234,9 @@ pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
                 true
             } else {
                 tracing::warn!(
-                    "ignoring github login base-uri override: cleartext http \
-                     is only allowed for loopback hosts"
+                    uri,
+                    "ignoring github login base-uri override: must be https:// \
+                     or cleartext http:// on a loopback host"
                 );
                 false
             }
