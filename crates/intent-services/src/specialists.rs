@@ -372,7 +372,7 @@ pub(crate) struct SpecialistsService {
 
 impl SpecialistsService {
     /// Build the service, resolving any unset directory from the environment
-    /// (`~/.augment/specialists/` for user, [`BUNDLED_DIR_ENV`]/exe-relative for
+    /// (`~/.intent/specialists/` for user, [`BUNDLED_DIR_ENV`]/exe-relative for
     /// bundled). Tests inject explicit roots for hermetic 3-tier coverage.
     pub(crate) fn new(user_dir: Option<PathBuf>, bundled_dir: Option<PathBuf>) -> Self {
         Self {
