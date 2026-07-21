@@ -297,7 +297,7 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// compound ids like `:sonnet` yield an empty prefix and fall through to the provider
 /// field / default. This ensures `_meta` injection, spawn args, and all provider-keyed
 /// logic use a consistent provider id.
-fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
+pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
     model
         .filter(|m| m.contains(':'))
         .map(|m| intent_providers::parse_compound_model_id(m).0)
@@ -308,7 +308,8 @@ fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -> String {
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
-/// `_meta` injection (auggie, droid, opencode, cortex, mock use other mechanisms).
+/// `_meta` injection (auggie, droid, opencode, cortex, grok, mock use other
+/// mechanisms).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
 ///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)

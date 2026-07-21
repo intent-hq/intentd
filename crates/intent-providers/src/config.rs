@@ -92,6 +92,10 @@ pub struct ProviderConfig {
     pub supports_authenticate: bool,
     /// Whether the provider supports `session/set_mode`.
     pub supports_set_mode: bool,
+    /// Whether the provider applies the selected model via `session/set_model`
+    /// after session creation. Set for providers whose ACP subcommand has no
+    /// CLI model flag (grok's `agent stdio`).
+    pub supports_set_model: bool,
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
@@ -157,6 +161,7 @@ impl ProviderConfig {
             default_agent: None,
             supports_authenticate: false,
             supports_set_mode: false,
+            supports_set_model: false,
             supports_mcp_config: false,
             supports_session_mcp_servers: false,
             supports_rules_file: false,
@@ -275,6 +280,22 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_session_mcp_servers: true,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
+    },
+    ProviderConfig {
+        // Native binary (the `empty()` default): no V8 heap-cap env. Grok's
+        // ACP stdio mode selects models after session creation via
+        // `session/set_model`, so there is no CLI model flag here.
+        base_args: &["agent", "stdio"],
+        can_be_disabled: true,
+        supports_set_model: true,
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        login_command_hint: Some("grok login"),
+        // `grok models` prints auth/readiness details to stdout (exit code 0
+        // in both auth states); the daemon parses that output instead of
+        // using ACP `authenticate` (see `models::parse_grok_models_command_output`).
+        auth_check_args: Some(&["models"]),
+        login_docs_url: Some("https://docs.x.ai/build/enterprise#authentication"),
+        ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {
         runtime: ProviderRuntime::Node,

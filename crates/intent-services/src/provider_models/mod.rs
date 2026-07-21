@@ -26,9 +26,9 @@
 //!   line.
 //!
 //! auggie (existing CLI path in `agent_ops`) and cortex (static catalog) are
-//! deliberately NOT implemented here — they are wired by the models-cache
-//! task. Nothing calls this module yet; it is unit-tested and ready for the
-//! follow-up wiring task.
+//! deliberately NOT implemented here — they live in [`crate::model_catalog`],
+//! whose provider→source registry wires these five sources into `models.list`
+//! alongside them.
 
 use std::path::PathBuf;
 use std::time::Duration;

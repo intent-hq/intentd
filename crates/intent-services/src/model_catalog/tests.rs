@@ -158,8 +158,60 @@ fn persistence_roundtrips_across_instances() {
 }
 
 #[test]
-fn registry_lists_only_todays_sources() {
-    assert!(source_for("auggie").is_some());
-    assert!(source_for("cortex").is_some());
+fn registry_covers_all_seven_providers() {
+    for provider in [
+        "auggie",
+        "cortex",
+        "claude-code",
+        "codex",
+        "pi",
+        "droid",
+        "opencode",
+    ] {
+        assert!(source_for(provider).is_some(), "{provider} not registered");
+    }
     assert!(source_for("no-such-provider").is_none());
+}
+
+#[test]
+fn registry_version_keys_follow_adapter_pins() {
+    let key = |provider: &str| (source_for(provider).unwrap().version_key)();
+    assert_eq!(key("auggie"), "");
+    assert_eq!(key("cortex"), "");
+    assert_eq!(
+        key("claude-code"),
+        intent_providers::CLAUDE_AGENT_ACP_VERSION
+    );
+    assert_eq!(key("pi"), crate::provider_models::PI_ACP_NPX_PACKAGE);
+    assert_eq!(key("droid"), "");
+    assert_eq!(key("opencode"), "");
+    // codex mirrors the fetch dispatch: pinned to the npx fallback only when
+    // no codex-acp binary resolves on this machine.
+    let expected = if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
+        String::new()
+    } else {
+        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
+    };
+    assert_eq!(key("codex"), expected);
+}
+
+#[tokio::test]
+async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
+    // A provider_models probe failure (models: None + warning) adapted via
+    // `from_provider_fetch` must flow into the cache's stale fallback.
+    let cache = ModelCatalogCache::new(None);
+    cache.store("droid", "", rows("droid-last-good"), 1_000);
+    let failed = || -> BoxFuture<'static, ModelFetchResult> {
+        Box::pin(async {
+            from_provider_fetch(crate::provider_models::ProviderModelsFetch {
+                models: None,
+                warning: Some("droid: droid binary not found".to_string()),
+            })
+        })
+    };
+    let r = resolve_with_cache(&cache, "droid", "", false, 1_000 + TTL_MS, failed).await;
+    assert_eq!(r.models, Some(rows("droid-last-good")));
+    assert!(r.stale);
+    let warning = r.warning.expect("stale data must be labeled");
+    assert!(warning.contains("droid binary not found"), "{warning}");
 }

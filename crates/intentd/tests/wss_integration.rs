@@ -948,6 +948,31 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source"], "{resp}");
+
+    // A newly registered discovery provider (opencode: native CLI probe).
+    // The probe's outcome depends on the host — either branch must be a
+    // documented §5.30 shape, never an error: dynamic rows tagged with the
+    // provider's own source, or the static fallback + warning when the
+    // binary is unavailable.
+    let frame = r#"{"jsonrpc":"2.0","id":11,"method":"models.list","params":{"providerId":"opencode","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 11);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "opencode");
+    let models = resp["result"]["models"].as_array().expect("models");
+    match resp["result"]["source"].as_str().expect("source") {
+        "opencode" => {
+            assert!(!models.is_empty(), "{resp}");
+            for m in models {
+                assert!(m["id"].is_string(), "{m}");
+                assert!(m["name"].is_string(), "{m}");
+                assert!(m["provider"].is_string(), "{m}");
+            }
+        }
+        "static" => assert!(resp["result"]["warning"].is_string(), "{resp}"),
+        other => panic!("unexpected source '{other}': {resp}"),
+    }
     srv.ws.stop().await;
 }
 
@@ -1878,6 +1903,81 @@ async fn wss_git_commit_details_round_trip() {
     )
     .await;
     assert_eq!(resp["error"]["code"], -32602);
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// `accept-changes.getStatus` over WSS: proves the wire shape from PROTOCOL
+/// §5.18 — `localCommits` entries are metadata-only (`hash`, `message`,
+/// `author`, `date`, `isPushed`) and omit `files`/`filesChanged`, which
+/// clients fetch on demand via `git.commitDetails`.
+#[tokio::test]
+async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a repo: one commit on main, then a feature branch with one commit.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssacgs-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "feature/wss"]);
+    std::fs::write(repo.join("feat.txt"), "feat\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "add feat"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS AC WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"accept-changes.getStatus","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let result = &resp["result"];
+    assert_eq!(result["branch"], "feature/wss");
+    assert_eq!(result["trunkBranch"], "main");
+    assert_eq!(result["hasRemote"], false);
+    assert_eq!(result["aheadOfTrunk"], 1);
+    assert_eq!(result["uncommittedCount"], 0);
+    assert_eq!(result["stagedCount"], 0);
+    let commits = result["localCommits"].as_array().expect("localCommits");
+    assert_eq!(commits.len(), 1);
+    let c = &commits[0];
+    assert!(c["hash"].is_string());
+    assert_eq!(c["message"], "add feat");
+    assert_eq!(c["author"], "Test");
+    assert!(c["date"].is_string());
+    assert_eq!(c["isPushed"], false);
+    // Metadata-only walk: no per-commit tree diffs in getStatus.
+    assert!(c.get("files").is_none());
+    assert!(c.get("filesChanged").is_none());
 
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();

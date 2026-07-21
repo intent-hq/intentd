@@ -251,6 +251,7 @@ mod build_args_tests {
             "cortex",
             "opencode",
             "droid",
+            "grok",
             "mock",
         ] {
             let provider = intent_providers::find_provider(id).unwrap();

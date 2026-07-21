@@ -1385,6 +1385,11 @@ impl AgentManager {
             })
             .collect();
 
+        // The persisted model (bare part of a compound id) feeds the
+        // post-session `session/set_model` for providers with no CLI model
+        // flag (grok) — see `maybe_apply_session_model`.
+        let stored_model = session_record.model.clone();
+
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
@@ -1438,6 +1443,13 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
+                Self::maybe_apply_session_model(
+                    conn.as_ref(),
+                    provider,
+                    &opened.session_id,
+                    stored_model.as_deref(),
+                )
+                .await;
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
@@ -1475,6 +1487,13 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
+            Self::maybe_apply_session_model(
+                conn.as_ref(),
+                provider,
+                &opened.session_id,
+                stored_model.as_deref(),
+            )
+            .await;
             return Ok(opened.session_id);
         }
 
@@ -1492,7 +1511,78 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
+        Self::maybe_apply_session_model(
+            conn.as_ref(),
+            provider,
+            &opened.session_id,
+            stored_model.as_deref(),
+        )
+        .await;
         Ok(opened.session_id)
+    }
+
+    /// Best-effort post-session `session/set_model` for providers whose ACP
+    /// subcommand has no CLI model flag (`supports_set_model`; grok today —
+    /// parity with the reference acp-provider, which applies the selected
+    /// model via `session/set_model` after session creation for such
+    /// providers). Compound ids are honored only when their provider prefix
+    /// matches the running provider (a stale id from a pre-spawn provider
+    /// switch must not be sent to grok); bare ids are treated as
+    /// provider-local. The `default` sentinel and empty ids are no-ops.
+    /// Failures are logged at WARN and never fail session startup.
+    async fn maybe_apply_session_model(
+        conn: &Connection,
+        provider: &ProviderConfig,
+        acp_session_id: &str,
+        stored_model: Option<&str>,
+    ) {
+        let Some(model_id) = Self::set_model_target(provider, stored_model) else {
+            return;
+        };
+        match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
+            Ok(()) => {
+                tracing::debug!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    "session/set_model accepted"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    error = %e,
+                    "session/set_model failed; provider keeps its default model"
+                );
+            }
+        }
+    }
+
+    /// Resolve the model id `maybe_apply_session_model` should send, or `None`
+    /// when no `session/set_model` should be issued: providers without
+    /// `supports_set_model`, absent/empty models, the `default` sentinel, and
+    /// compound ids whose provider prefix does not match the running provider
+    /// (a stale id from a pre-spawn provider switch must not be sent to grok).
+    /// Bare ids are treated as provider-local.
+    fn set_model_target<'m>(
+        provider: &ProviderConfig,
+        stored_model: Option<&'m str>,
+    ) -> Option<&'m str> {
+        if !provider.supports_set_model {
+            return None;
+        }
+        let model = stored_model?;
+        let model_id = match model.split_once(':') {
+            Some((prefix, bare)) if prefix == provider.id => bare,
+            Some(_) => return None,
+            None => model,
+        };
+        if model_id.is_empty() || model_id == "default" {
+            return None;
+        }
+        Some(model_id)
     }
 
     /// Under the shipped `AllowAll` policy, best-effort ask the provider to run
@@ -1579,8 +1669,9 @@ impl AgentManager {
     /// * Fires only when the workspace lookup succeeds AND the current title
     ///   is empty/whitespace OR still shaped like an auto-generated slug
     ///   ([`intent_core::slug::is_workspace_slug`]).
-    /// * Names the concrete daemon tool the agent must call
-    ///   (`set_workspace_title_workspace-mcp`), not the FE `workspace_api`
+    /// * Names the concrete daemon tool the agent must call — spelled the way
+    ///   the session's provider will actually surface it (see
+    ///   [`workspace_naming_tool_reference`]) — not the FE `workspace_api`
     ///   JS surface (which daemon-spawned agents do not have).
     ///
     /// The agent-rename half of the reference block is intentionally SKIPPED:
@@ -1606,10 +1697,22 @@ impl AgentManager {
         if !needs_rename {
             return None;
         }
-        Some(
-            "<system>\nThis workspace needs a title. As your first action, call the `set_workspace_title_workspace-mcp` tool with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-                .to_string(),
-        )
+        // Spell the rename tool the way this session's provider surfaces it;
+        // a failed session lookup falls back to the generic phrasing.
+        let tool_ref = match self.services.store.get_agent_session(agent_id).await {
+            Ok(s) => workspace_naming_tool_reference(&session_provider_id(&s)),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "naming nudge: session lookup failed; using generic tool phrasing"
+                );
+                GENERIC_NAMING_TOOL_REFERENCE
+            }
+        };
+        Some(format!(
+            "<system>\nThis workspace needs a title. As your first action, call {tool_ref} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
+        ))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -3285,9 +3388,41 @@ fn derive_agent_type(
     DEFAULT_AGENT_TYPE.to_string()
 }
 
+/// Effective provider id for a session. Provider precedence: when the model
+/// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
+/// prefix wins over `session.provider`, because a cross-provider model switch
+/// should spawn the new provider's binary. `session.provider` is only used as
+/// a fallback for bare model ids, then the default provider. Delegates to
+/// [`crate::agent_session::resolve_provider_id`], which also guards against
+/// malformed compound ids like `:sonnet` (empty prefixes fall through to the
+/// provider field / default).
+fn session_provider_id(session: &AgentSession) -> String {
+    crate::agent_session::resolve_provider_id(session.model.as_deref(), session.provider.as_deref())
+}
+
+/// Fallback phrasing for the workspace-naming nudge when the provider's MCP
+/// tool naming convention is unknown (or its workspace-MCP wiring hasn't
+/// landed yet).
+const GENERIC_NAMING_TOOL_REFERENCE: &str =
+    "the `set_workspace_title` tool from the workspace MCP server";
+
+/// Provider-correct spelling of the workspace-MCP rename tool for the naming
+/// nudge. Providers affix the MCP server name differently: auggie exposes
+/// `<tool>_<server>` (trailing suffix → `set_workspace_title_workspace-mcp`),
+/// opencode exposes `<server>_<tool>` (leading prefix →
+/// `workspace-mcp_set_workspace_title`; confirmed against captured opencode
+/// 1.18.3 traffic). Every other provider gets the generic fallback phrasing.
+fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
+    match provider_id {
+        "auggie" => "the `set_workspace_title_workspace-mcp` tool",
+        "opencode" => "the `workspace-mcp_set_workspace_title` tool",
+        _ => GENERIC_NAMING_TOOL_REFERENCE,
+    }
+}
+
+/// Resolve everything needed to spawn (or respawn) this
 /// agent's child from its persisted session + workspace. The provider id comes
-/// from the session's explicit `provider`, else the `provider:model` compound
-/// id, else the default provider. The `mock` provider (E2E) reads its script
+/// from [`session_provider_id`]. The `mock` provider (E2E) reads its script
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
 /// `MOCK_AGENT_BEHAVIOR` to the child. npx-only providers (claude-code) are
@@ -3300,17 +3435,7 @@ fn resolve_spawn(
     workspace: Option<&intent_core::Workspace>,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Result<ResolvedSpawn> {
-    // Provider precedence: when the model carries an explicit `provider:` prefix
-    // (e.g., "opencode:kimi-k3"), that prefix wins over session.provider,
-    // because a cross-provider model switch should spawn the new provider's
-    // binary. Session.provider is only used as a fallback for bare model ids.
-    let provider_id = session
-        .model
-        .as_ref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .or_else(|| session.provider.clone())
-        .unwrap_or_else(|| intent_providers::default_provider_id().to_string());
+    let provider_id = session_provider_id(session);
     let model = session
         .model
         .as_ref()
@@ -4579,6 +4704,42 @@ mod role_reminder_tests {
             .await,
         );
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn set_model_target_gates_provider_sentinel_and_compound_prefix() {
+        let grok = intent_providers::find_provider("grok").unwrap();
+        let auggie = intent_providers::find_provider("auggie").unwrap();
+
+        // Providers without supports_set_model never produce a target.
+        assert_eq!(
+            AgentManager::set_model_target(auggie, Some("opus4.7")),
+            None
+        );
+        // Absent / empty / sentinel models are no-ops.
+        assert_eq!(AgentManager::set_model_target(grok, None), None);
+        assert_eq!(AgentManager::set_model_target(grok, Some("")), None);
+        assert_eq!(AgentManager::set_model_target(grok, Some("default")), None);
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("grok:default")),
+            None
+        );
+        // Bare ids are provider-local.
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("grok-4.5")),
+            Some("grok-4.5")
+        );
+        // Matching compound prefix strips to the bare id.
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("grok:grok-4.5")),
+            Some("grok-4.5")
+        );
+        // A compound id for a DIFFERENT provider (stale pre-spawn provider
+        // switch) must not be sent to grok.
+        assert_eq!(
+            AgentManager::set_model_target(grok, Some("opencode:kimi-k3")),
+            None
+        );
     }
 
     #[tokio::test]

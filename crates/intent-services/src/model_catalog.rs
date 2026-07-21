@@ -9,10 +9,10 @@
 //! stale-while-revalidate) and fall back to the last-good list — labeled
 //! with a `warning` — only when the probe fails.
 //!
-//! The registry lists the sources that exist today (auggie via the rich CLI
-//! fetch, cortex via its feature-code-gated static catalog); ACP-probe sources
-//! (claude-code/codex/pi/droid) and opencode plug in as additional
-//! [`ModelSource`] entries.
+//! The registry lists every provider with a daemon-side model source: auggie
+//! (rich CLI fetch), cortex (feature-code-gated static catalog), the
+//! ACP-probe sources (claude-code/codex/pi/droid), and opencode (native CLI)
+//! via [`crate::provider_models`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,8 +108,80 @@ fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     })
 }
 
-/// The provider→source registry. Only the sources that exist today are
-/// listed; follow-up sources register here as they land.
+/// Adapt a completed [`crate::provider_models`] fetch into the cache's fetch
+/// result (same `Option<rows>` + warning semantics, so a probe failure flows
+/// into the cache's last-good/stale fallback).
+fn from_provider_fetch(fetched: crate::provider_models::ProviderModelsFetch) -> ModelFetchResult {
+    ModelFetchResult {
+        models: fetched.models,
+        warning: fetched.warning,
+    }
+}
+
+/// Probe a [`crate::provider_models`] source through its
+/// [`crate::provider_models::fetch_provider_models`] dispatcher — the single
+/// provider→fetch mapping, so the registry cannot drift from it.
+fn provider_models_fetch(provider_id: &'static str) -> BoxFuture<'static, ModelFetchResult> {
+    Box::pin(async move {
+        from_provider_fetch(crate::provider_models::fetch_provider_models(provider_id).await)
+    })
+}
+
+/// claude-code source: ACP probe via the pinned npx adapter.
+fn claude_code_fetch() -> BoxFuture<'static, ModelFetchResult> {
+    provider_models_fetch("claude-code")
+}
+
+/// claude-code cache entries are keyed to the adapter pin so a version bump
+/// invalidates them automatically.
+fn claude_code_version() -> String {
+    intent_providers::CLAUDE_AGENT_ACP_VERSION.to_string()
+}
+
+/// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
+/// npx fallback.
+fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
+    provider_models_fetch("codex")
+}
+
+/// codex is pinned only when the probe falls back to the npx adapter; a
+/// resolved `codex-acp` binary has no pin (mirrors the fetch dispatch in
+/// [`crate::provider_models::fetch_codex_models`]). The binary is resolved
+/// here and again inside the fetch — intentionally independent: the two
+/// resolutions are milliseconds apart, so at worst an install/uninstall
+/// mid-request stores one cache entry under the other branch's key, which
+/// the next request's key mismatch simply treats as a miss.
+fn codex_version() -> String {
+    if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
+        String::new()
+    } else {
+        intent_providers::config::CODEX_ACP_NPX_PACKAGE.to_string()
+    }
+}
+
+/// pi source: ACP probe via the pinned npx adapter.
+fn pi_fetch() -> BoxFuture<'static, ModelFetchResult> {
+    provider_models_fetch("pi")
+}
+
+/// pi cache entries are keyed to the adapter pin (the probe always runs the
+/// pinned npx package).
+fn pi_version() -> String {
+    crate::provider_models::PI_ACP_NPX_PACKAGE.to_string()
+}
+
+/// droid source: ACP probe via a resolved `droid` binary (no adapter pin).
+fn droid_fetch() -> BoxFuture<'static, ModelFetchResult> {
+    provider_models_fetch("droid")
+}
+
+/// opencode source: native `opencode models` CLI (no adapter pin).
+fn opencode_fetch() -> BoxFuture<'static, ModelFetchResult> {
+    provider_models_fetch("opencode")
+}
+
+/// The provider→source registry: every provider with a daemon-side model
+/// source.
 static SOURCES: &[ModelSource] = &[
     ModelSource {
         provider_id: "auggie",
@@ -120,6 +192,31 @@ static SOURCES: &[ModelSource] = &[
         provider_id: "cortex",
         version_key: no_version,
         fetch: cortex_fetch,
+    },
+    ModelSource {
+        provider_id: "claude-code",
+        version_key: claude_code_version,
+        fetch: claude_code_fetch,
+    },
+    ModelSource {
+        provider_id: "codex",
+        version_key: codex_version,
+        fetch: codex_fetch,
+    },
+    ModelSource {
+        provider_id: "pi",
+        version_key: pi_version,
+        fetch: pi_fetch,
+    },
+    ModelSource {
+        provider_id: "droid",
+        version_key: no_version,
+        fetch: droid_fetch,
+    },
+    ModelSource {
+        provider_id: "opencode",
+        version_key: no_version,
+        fetch: opencode_fetch,
     },
 ];
 
