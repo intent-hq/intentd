@@ -131,7 +131,8 @@ fn workspace_row(id: &WorkspaceId, worktree: &Path, branch: &str) -> Workspace {
 }
 
 async fn connect_retry(socket: &Path) -> UnixStream {
-    tokio::time::timeout(common::daemon_startup_timeout(), async {
+    let budget = common::daemon_startup_timeout();
+    tokio::time::timeout(budget, async {
         loop {
             if let Ok(s) = UnixStream::connect(socket).await {
                 return s;
@@ -140,7 +141,12 @@ async fn connect_retry(socket: &Path) -> UnixStream {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("could not connect to {}", socket.display()))
+    .unwrap_or_else(|_| {
+        panic!(
+            "daemon startup timed out: no connection to {} within {budget:?}",
+            socket.display()
+        )
+    })
 }
 
 async fn send(w: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
