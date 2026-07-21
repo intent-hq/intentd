@@ -1961,10 +1961,13 @@ name = "intent-sourcecontrol"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "http",
  "intent-core",
  "octocrab",
+ "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

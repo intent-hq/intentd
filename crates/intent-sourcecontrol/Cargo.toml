@@ -15,7 +15,10 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
+secrecy = "0.10"
+http = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
