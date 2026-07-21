@@ -856,6 +856,45 @@ async fn wss_models_list_returns_catalog_with_source() {
     srv.ws.stop().await;
 }
 
+#[tokio::test]
+async fn wss_models_list_with_provider_id_and_force_refresh() {
+    // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
+    // through the generic cache. Unknown providers degrade to the static
+    // fallback (`source: "static"` + warning, never an error); cortex is
+    // feature-code gated (empty list + warning under its own source tag).
+    let srv = start(WsOptions::default()).await;
+
+    let frame = r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"no-such-provider","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 8);
+    assert_eq!(resp["result"]["providerId"], "no-such-provider");
+    assert_eq!(resp["result"]["source"], "static");
+    assert!(resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    assert!(resp["result"]["warning"].is_string(), "{resp}");
+
+    let frame =
+        r#"{"jsonrpc":"2.0","id":9,"method":"models.list","params":{"providerId":"cortex"}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 9);
+    assert_eq!(resp["result"]["providerId"], "cortex");
+    assert_eq!(resp["result"]["source"], "cortex");
+    assert!(resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    assert!(
+        resp["result"]["warning"]
+            .as_str()
+            .expect("warning")
+            .contains("Cortex"),
+        "{resp}"
+    );
+    srv.ws.stop().await;
+}
+
 /// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
 /// (§5.31): swallows the piped stdin, then runs `body`.
 #[cfg(unix)]

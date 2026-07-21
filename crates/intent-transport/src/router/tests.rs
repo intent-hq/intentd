@@ -2830,6 +2830,14 @@ async fn agent_methods_are_routed_not_method_not_found() {
         .unwrap();
     assert_eq!(err_code(&v), -32603);
 
+    // models.list with the optional providerId/forceRefresh params routes too.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":8,"method":"models.list","params":{"providerId":"auggie","forceRefresh":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32603);
+
     // agent.enhancePrompt (§5.31) with valid params routes past dispatch (the
     // default impl yields -32603, never -32601).
     let v = call(

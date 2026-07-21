@@ -395,6 +395,28 @@ fn parse_model_line(line: &str) -> Option<(String, String)> {
     Some((label, value))
 }
 
+/// The static tier rows for one provider: [`static_models`] filtered to
+/// `provider_id`. Empty for providers absent from `PROVIDER_MODEL_TIERS`
+/// (dynamic-only lists such as opencode/droid).
+pub(crate) fn static_models_for(provider_id: &str) -> Vec<Value> {
+    static_models()
+        .into_iter()
+        .filter(|m| m.get("provider").and_then(Value::as_str) == Some(provider_id))
+        .collect()
+}
+
+/// The per-provider `models.list` static-fallback response (PROTOCOL §5.30):
+/// the provider's static tier rows when it has any, else an empty list —
+/// always labeled with `source: "static"` and a `warning`, never an error.
+pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Value {
+    json!({
+        "providerId": provider_id,
+        "models": static_models_for(provider_id),
+        "source": "static",
+        "warning": warning,
+    })
+}
+
 /// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
 /// stdout (then stderr), and map to wire models. Returns `Ok(None)` when the
 /// CLI is unavailable or yields nothing, so the caller can fall back to
@@ -1905,12 +1927,71 @@ impl Services {
     }
 
     /// `models.list`: the rich model catalog for FE model pickers (PROTOCOL
-    /// §5.30) — auggie CLI (JSON → plain-text fallback) with a 5-minute
-    /// success cache; degrades to the static tier catalog (`source: "static"`)
-    /// when the CLI is unavailable, so the result is never empty.
-    pub(crate) async fn models_list_op(&self) -> Result<Value> {
-        if let Some(models) = self.cached_models() {
-            return Ok(json!({ "models": models, "source": "auggie" }));
+    /// §5.30). With no `providerId` this is the backward-compatible auggie
+    /// path — auggie CLI (JSON → plain-text fallback) with a 5-minute success
+    /// cache, degrading to the static tier catalog (`source: "static"`) when
+    /// the CLI is unavailable, so the result is never empty; `forceRefresh`
+    /// skips the cache read. With a `providerId` the request goes through the
+    /// generic per-provider cache ([`crate::model_catalog`]): registered
+    /// sources are probed and cached per (provider, version key); unknown
+    /// providers degrade to their static tier catalog (or an empty list) with
+    /// a `warning` — never an error.
+    pub(crate) async fn models_list_op(
+        &self,
+        provider_id: Option<String>,
+        force_refresh: bool,
+    ) -> Result<Value> {
+        let Some(provider_id) = provider_id else {
+            return self.models_list_auggie_op(force_refresh).await;
+        };
+        let Some(source) = crate::model_catalog::source_for(&provider_id) else {
+            return Ok(static_provider_response(
+                &provider_id,
+                format!(
+                    "no dynamic model discovery for provider '{provider_id}'; using static catalog"
+                ),
+            ));
+        };
+        let version_key = (source.version_key)();
+        let resolved = crate::model_catalog::resolve_with_cache(
+            &self.models_catalog,
+            &provider_id,
+            &version_key,
+            force_refresh,
+            crate::model_catalog::ModelCatalogCache::now_ms(),
+            source.fetch,
+        )
+        .await;
+        match resolved.models {
+            Some(models) => {
+                let mut out =
+                    json!({ "providerId": provider_id, "models": models, "source": provider_id });
+                if resolved.stale {
+                    out["stale"] = Value::Bool(true);
+                }
+                if let Some(w) = resolved.warning {
+                    out["warning"] = Value::String(w);
+                }
+                Ok(out)
+            }
+            None => Ok(static_provider_response(
+                &provider_id,
+                resolved.warning.unwrap_or_else(|| {
+                    format!("model discovery for '{provider_id}' failed; using static catalog")
+                }),
+            )),
+        }
+    }
+
+    /// The legacy no-`providerId` `models.list` path, preserved byte-for-byte
+    /// for existing callers: 5-minute in-memory success cache over the auggie
+    /// CLI, static tier catalog fallback. `force_refresh` skips the cache
+    /// read; a successful probe still refills it.
+    async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
+        if !force_refresh {
+            if let Some(models) = self.cached_models() {
+                return Ok(json!({ "models": models, "source": "auggie" }));
+            }
         }
         if let Some(models) = fetch_auggie_models_rich().await {
             self.store_models_cache(models.clone());

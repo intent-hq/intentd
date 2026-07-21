@@ -74,6 +74,7 @@ mod github_browse_ops;
 mod history_xml;
 mod line_attribution;
 mod linear_ops;
+mod model_catalog;
 mod note_ops;
 mod pagination;
 mod pr_ops;
@@ -173,6 +174,11 @@ pub struct Services {
     /// successful auggie CLI fetch is cached; the static fallback is recomputed
     /// per call. Shared across clones so every handle sees the same window.
     models_cache: agent_ops::ModelsCache,
+    /// Generic per-provider model cache backing `models.list { providerId }`
+    /// (PROTOCOL §5.30): entries keyed by provider id + version key, 5-minute
+    /// TTL, persisted in the daemon data dir when configured via
+    /// [`Services::with_models_cache_dir`]. Shared across clones.
+    models_catalog: Arc<model_catalog::ModelCatalogCache>,
     /// Test-only override for the auggie binary the one-shot CLI RPCs
     /// (`agent.enhancePrompt` §5.31, `agent.completeOnce` §5.32) spawn.
     /// Production composition leaves this `None` and the ops resolve the CLI
@@ -368,6 +374,7 @@ impl Services {
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
+            models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
@@ -1356,6 +1363,16 @@ impl Services {
 
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Persist the per-provider `models.list` cache (PROTOCOL §5.30) under
+    /// `dir` (the daemon data dir), reloading any current-version snapshot.
+    /// Composition-root only — call before the surface is shared/cloned.
+    pub fn with_models_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.models_catalog = Arc::new(model_catalog::ModelCatalogCache::new(Some(
+            dir.join(model_catalog::MODELS_CACHE_FILE),
+        )));
         self
     }
 
@@ -12189,8 +12206,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_get_models_op().await })
     }
 
-    fn models_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.models_list_op().await })
+    fn models_list(
+        &self,
+        provider_id: Option<String>,
+        force_refresh: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.models_list_op(provider_id, force_refresh).await })
     }
 
     fn agent_enhance_prompt(
