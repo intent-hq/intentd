@@ -6610,8 +6610,11 @@ mod file_tracking {
         let head = &commits[0];
         assert_eq!(head["agentId"], serde_json::json!("agent-7"));
         assert_eq!(head["linkedNoteId"], serde_json::json!("note-2"));
-        assert_eq!(head["filesChanged"], serde_json::json!(1));
         assert_eq!(head["isPushed"], serde_json::json!(false));
+        // Metadata-only walk: `files`/`filesChanged` are omitted from the list
+        // payload; clients fetch per-file data via `git.commitDetails`.
+        assert!(head.get("files").is_none());
+        assert!(head.get("filesChanged").is_none());
     }
 
     #[tokio::test]
@@ -6846,8 +6849,10 @@ mod file_tracking {
     }
 
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
-    /// `CommitInfo` (§8.9), walking older pages via the opaque continuation
-    /// token; attribution trailers populate `agentId`/`linkedNoteId`.
+    /// `CommitSummary`, walking older pages via the opaque continuation
+    /// token; attribution trailers populate `agentId`/`linkedNoteId`. The
+    /// list payload is metadata-only — `files` is omitted (fetched on demand
+    /// via `git.commitDetails`).
     #[tokio::test]
     async fn git_commits_returns_commit_info_page() {
         let repo = init_git_repo();
@@ -6868,7 +6873,7 @@ mod file_tracking {
         assert_eq!(head["linkedNoteId"], serde_json::json!("note-2"));
         assert_eq!(head["author"], serde_json::json!("Test"));
         assert_eq!(head["email"], serde_json::json!("test@example.com"));
-        assert_eq!(head["files"], serde_json::json!(["feature.txt"]));
+        assert!(head.get("files").is_none());
         let hash = head["hash"].as_str().unwrap();
         assert_eq!(head["sha"], serde_json::json!(hash[..7].to_string()));
         assert!(head["message"].as_str().unwrap().starts_with("add feature"));

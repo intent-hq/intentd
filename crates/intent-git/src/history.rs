@@ -338,12 +338,16 @@ fn resolve_workspace_boundary_inner(
 /// `boundary_sha` is provided and valid. When `boundary_sha` is `None`, returns
 /// unbounded history (the existing behavior). When `include_older` is true,
 /// fetches commits **before and including** the boundary (powers the FE
-/// "show previous" toggle; the boundary commit itself is included).
+/// "show previous" toggle; the boundary commit itself is included). With
+/// `include_files = false` the per-commit tree diff is skipped entirely —
+/// `files` is `None` — keeping the walk O(commits) cheap for list payloads;
+/// clients fetch per-file data on demand via `git.commitDetails`.
 pub fn history_bounded(
     worktree_path: &Path,
     boundary_sha: Option<&str>,
     limit: usize,
     include_older: bool,
+    include_files: bool,
 ) -> Result<Vec<CommitRecord>> {
     let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
@@ -391,12 +395,17 @@ pub fn history_bounded(
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
-        let diff_started = timing_enabled.then(Instant::now);
-        let files = changed_files(&repo, &commit)?;
-        if let Some(t) = diff_started {
-            diff_elapsed += t.elapsed();
-        }
-        let files_changed = files.len();
+        let files = if include_files {
+            let diff_started = timing_enabled.then(Instant::now);
+            let files = changed_files(&repo, &commit)?;
+            if let Some(t) = diff_started {
+                diff_elapsed += t.elapsed();
+            }
+            Some(files)
+        } else {
+            None
+        };
+        let files_changed = files.as_ref().map_or(0, Vec::len);
         let author = commit.author();
         out.push(CommitRecord {
             hash,
@@ -404,7 +413,7 @@ pub fn history_bounded(
             author: author.name().unwrap_or("").to_string(),
             author_email: author.email().unwrap_or("").to_string(),
             date: iso_from_unix_secs(commit.time().seconds()),
-            files: Some(files),
+            files,
             files_changed,
             is_pushed,
             agent_id,
@@ -416,6 +425,7 @@ pub fn history_bounded(
         commits = out.len(),
         limit,
         include_older,
+        include_files,
         bounded = boundary_sha.is_some(),
         unpushed_ms = unpushed_elapsed.as_millis() as u64,
         per_commit_diff_ms = diff_elapsed.as_millis() as u64,
@@ -629,7 +639,7 @@ mod tests {
         commit_file(dir.path(), "b.txt", "workspace-1\n");
         commit_file(dir.path(), "c.txt", "workspace-2\n");
 
-        let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false).unwrap();
+        let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false, true).unwrap();
         assert_eq!(bounded.len(), 2);
         assert_eq!(
             bounded[0].files.as_deref(),
@@ -648,7 +658,7 @@ mod tests {
         let commits = history(dir.path(), 50).unwrap();
         let head_sha = &commits[0].hash;
 
-        let bounded = history_bounded(dir.path(), Some(head_sha), 50, false).unwrap();
+        let bounded = history_bounded(dir.path(), Some(head_sha), 50, false, true).unwrap();
         assert!(bounded.is_empty());
     }
 
@@ -658,8 +668,24 @@ mod tests {
         commit_file(dir.path(), "a.txt", "one\n");
         commit_file(dir.path(), "b.txt", "two\n");
 
-        let bounded = history_bounded(dir.path(), None, 50, false).unwrap();
+        let bounded = history_bounded(dir.path(), None, 50, false, true).unwrap();
         assert_eq!(bounded.len(), 2);
+    }
+
+    #[test]
+    fn history_bounded_without_files_skips_tree_diffs() {
+        let dir = init_repo("history-bounded-no-files");
+        commit_file(dir.path(), "a.txt", "one\n");
+        commit_file(dir.path(), "b.txt", "two\n");
+
+        let bounded = history_bounded(dir.path(), None, 50, false, false).unwrap();
+        assert_eq!(bounded.len(), 2);
+        for c in &bounded {
+            assert_eq!(c.files, None);
+            assert_eq!(c.files_changed, 0);
+            assert!(!c.message.is_empty());
+            assert!(!c.date.is_empty());
+        }
     }
 
     #[test]
@@ -673,7 +699,7 @@ mod tests {
         commit_file(dir.path(), "c.txt", "workspace\n");
 
         // Normal bounded: should get workspace commits only
-        let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false).unwrap();
+        let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false, true).unwrap();
         assert_eq!(bounded.len(), 1);
         assert_eq!(
             bounded[0].files.as_deref(),
@@ -681,7 +707,7 @@ mod tests {
         );
 
         // Include older: should get commits before boundary
-        let older = history_bounded(dir.path(), Some(boundary_sha), 50, true).unwrap();
+        let older = history_bounded(dir.path(), Some(boundary_sha), 50, true, true).unwrap();
         assert_eq!(older.len(), 2);
         assert_eq!(older[0].files.as_deref(), Some(&["b.txt".to_string()][..]));
         assert_eq!(older[1].files.as_deref(), Some(&["a.txt".to_string()][..]));
