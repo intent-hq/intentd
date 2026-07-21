@@ -172,7 +172,10 @@ pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Va
     obj.insert("email".to_string(), json!(c.author_email));
     obj.insert("date".to_string(), json!(c.date));
     obj.insert("message".to_string(), json!(c.message));
-    obj.insert("files".to_string(), json!(c.files));
+    obj.insert(
+        "files".to_string(),
+        json!(c.files.as_deref().unwrap_or_default()),
+    );
     if let Some(agent_id) = &c.agent_id {
         obj.insert("agentId".to_string(), json!(agent_id));
     }

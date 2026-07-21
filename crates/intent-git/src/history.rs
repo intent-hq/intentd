@@ -25,7 +25,10 @@ pub struct CommitRecord {
     pub author: String,
     pub author_email: String,
     pub date: String,
-    pub files: Vec<String>,
+    /// Changed-file paths (a tree diff vs the first parent), or `None` when the
+    /// caller skipped the per-commit diff (`include_files = false`).
+    pub files: Option<Vec<String>>,
+    /// `files.len()` when computed; `0` when the diff was skipped.
     pub files_changed: usize,
     pub is_pushed: bool,
     pub agent_id: Option<String>,
@@ -35,17 +38,20 @@ pub struct CommitRecord {
 /// Read up to `limit` commits of first-parent, non-merge history from `HEAD`,
 /// newest first. An empty repository (unborn `HEAD`) yields an empty list.
 pub fn history(worktree_path: &Path, limit: usize) -> Result<Vec<CommitRecord>> {
-    history_since(worktree_path, None, limit)
+    history_since(worktree_path, None, limit, true)
 }
 
 /// Like [`history`] but, when `base_ref` resolves, hides it from the walk so the
 /// result is the `base_ref..HEAD` range (the accept-changes `localCommits`:
 /// commits on the branch not yet on trunk). An unresolvable `base_ref` falls back
-/// to the full `HEAD` history.
+/// to the full `HEAD` history. With `include_files = false` the per-commit tree
+/// diff is skipped entirely — `files` is `None` — which keeps the walk cheap for
+/// callers that only need commit metadata (e.g. `accept-changes.getStatus`).
 pub fn history_since(
     worktree_path: &Path,
     base_ref: Option<&str>,
     limit: usize,
+    include_files: bool,
 ) -> Result<Vec<CommitRecord>> {
     let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
@@ -85,11 +91,15 @@ pub fn history_since(
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
         let diff_started = timing_enabled.then(Instant::now);
-        let files = changed_files(&repo, &commit)?;
+        let files = if include_files {
+            Some(changed_files(&repo, &commit)?)
+        } else {
+            None
+        };
         if let Some(t) = diff_started {
             diff_elapsed += t.elapsed();
         }
-        let files_changed = files.len();
+        let files_changed = files.as_ref().map_or(0, Vec::len);
         let author = commit.author();
         out.push(CommitRecord {
             hash,
@@ -109,6 +119,7 @@ pub fn history_since(
         commits = out.len(),
         limit,
         base_ref = base_ref.unwrap_or(""),
+        include_files,
         unpushed_ms = unpushed_elapsed.as_millis() as u64,
         per_commit_diff_ms = diff_elapsed.as_millis() as u64,
         other_ms = total
@@ -390,7 +401,7 @@ pub fn history_bounded(
             author: author.name().unwrap_or("").to_string(),
             author_email: author.email().unwrap_or("").to_string(),
             date: iso_from_unix_secs(commit.time().seconds()),
-            files,
+            files: Some(files),
             files_changed,
             is_pushed,
             agent_id,
@@ -456,7 +467,10 @@ mod tests {
         commit_file(dir.path(), "b.txt", "two\n");
         let commits = history(dir.path(), 50).unwrap();
         assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0].files, vec!["b.txt".to_string()]);
+        assert_eq!(
+            commits[0].files.as_deref(),
+            Some(&["b.txt".to_string()][..])
+        );
         assert_eq!(commits[0].files_changed, 1);
         // No upstream → every commit is treated as unpushed.
         assert!(!commits[0].is_pushed);
@@ -471,7 +485,25 @@ mod tests {
         commit_file(dir.path(), "c.txt", "3\n");
         let commits = history(dir.path(), 2).unwrap();
         assert_eq!(commits.len(), 2);
-        assert_eq!(commits[0].files, vec!["c.txt".to_string()]);
+        assert_eq!(
+            commits[0].files.as_deref(),
+            Some(&["c.txt".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn history_since_without_files_skips_tree_diffs() {
+        let dir = init_repo("history-no-files");
+        commit_file(dir.path(), "a.txt", "one\n");
+        commit_file(dir.path(), "b.txt", "two\n");
+        let commits = history_since(dir.path(), None, 50, false).unwrap();
+        assert_eq!(commits.len(), 2);
+        for c in &commits {
+            assert_eq!(c.files, None);
+            assert_eq!(c.files_changed, 0);
+            assert!(!c.message.is_empty());
+            assert!(!c.date.is_empty());
+        }
     }
 
     #[test]
@@ -596,8 +628,14 @@ mod tests {
 
         let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false).unwrap();
         assert_eq!(bounded.len(), 2);
-        assert_eq!(bounded[0].files, vec!["c.txt".to_string()]);
-        assert_eq!(bounded[1].files, vec!["b.txt".to_string()]);
+        assert_eq!(
+            bounded[0].files.as_deref(),
+            Some(&["c.txt".to_string()][..])
+        );
+        assert_eq!(
+            bounded[1].files.as_deref(),
+            Some(&["b.txt".to_string()][..])
+        );
     }
 
     #[test]
@@ -634,12 +672,15 @@ mod tests {
         // Normal bounded: should get workspace commits only
         let bounded = history_bounded(dir.path(), Some(boundary_sha), 50, false).unwrap();
         assert_eq!(bounded.len(), 1);
-        assert_eq!(bounded[0].files, vec!["c.txt".to_string()]);
+        assert_eq!(
+            bounded[0].files.as_deref(),
+            Some(&["c.txt".to_string()][..])
+        );
 
         // Include older: should get commits before boundary
         let older = history_bounded(dir.path(), Some(boundary_sha), 50, true).unwrap();
         assert_eq!(older.len(), 2);
-        assert_eq!(older[0].files, vec!["b.txt".to_string()]);
-        assert_eq!(older[1].files, vec!["a.txt".to_string()]);
+        assert_eq!(older[0].files.as_deref(), Some(&["b.txt".to_string()][..]));
+        assert_eq!(older[1].files.as_deref(), Some(&["a.txt".to_string()][..]));
     }
 }
