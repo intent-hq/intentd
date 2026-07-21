@@ -2000,8 +2000,8 @@ async fn build_turn_prompt_naming_instruction_ignores_empty_compound_prefix() {
 }
 
 /// Providers with unknown MCP tool naming (claude-code here; also codex/droid
-/// until their workspace-MCP wiring lands) → the nudge falls back to the
-/// generic phrasing instead of guessing an affixed tool name.
+/// until their MCP tool spellings are empirically captured) → the nudge falls
+/// back to the generic phrasing instead of guessing an affixed tool name.
 #[tokio::test]
 async fn build_turn_prompt_naming_instruction_generic_for_unknown_provider() {
     let (_tmp, mgr) = manager().await;
