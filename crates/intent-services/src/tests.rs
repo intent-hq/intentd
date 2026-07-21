@@ -6854,7 +6854,7 @@ mod file_tracking {
     /// list payload is metadata-only — `files` is omitted (fetched on demand
     /// via `git.commitDetails`).
     #[tokio::test]
-    async fn git_commits_returns_commit_info_page() {
+    async fn git_commits_returns_commit_summary_page() {
         let repo = init_git_repo();
         commit_file(
             &repo.dir,

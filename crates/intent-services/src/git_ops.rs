@@ -164,7 +164,7 @@ pub(crate) fn validate_repo_path(repo_path: &str) -> Result<()> {
 /// carries a computed file list; records from a metadata-only walk
 /// (`include_files = false`) omit it — clients fetch per-file data on demand
 /// via `git.commitDetails`.
-pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Value {
+pub(crate) fn commit_to_commit_summary(c: &intent_git::history::CommitRecord) -> Value {
     let mut obj = Map::new();
     obj.insert("hash".to_string(), json!(c.hash));
     obj.insert(

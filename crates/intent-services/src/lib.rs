@@ -11587,7 +11587,7 @@ impl WorkspaceApi for Services {
                 .iter()
                 .skip(skip)
                 .take(limit)
-                .map(git_ops::commit_to_commit_info)
+                .map(git_ops::commit_to_commit_summary)
                 .collect();
             let next_token = if has_more {
                 serde_json::Value::String(pagination::offset_token(page_end))
