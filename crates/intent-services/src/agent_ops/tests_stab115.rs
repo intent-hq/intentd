@@ -37,6 +37,15 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
         .expect("apply setting");
 }
 
+/// Seed a SQLite-backed state blob (e.g. `model.workspaceOverrides`) directly
+/// in the `settings` table — these keys are not TOML-backed.
+async fn set_blob(svc: &Services, path: &str, value: serde_json::Value) {
+    svc.store()
+        .set_setting(path, &value.to_string())
+        .await
+        .expect("persist state blob");
+}
+
 async fn create_agent(
     svc: &Services,
     ws: &WorkspaceId,
@@ -85,7 +94,7 @@ async fn agent_create_workspace_override_beats_global_default() {
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
     let overrides = json!({ ws.as_str(): "auggie:opus" });
-    set(&svc, "model.workspaceOverrides", overrides);
+    set_blob(&svc, "model.workspaceOverrides", overrides).await;
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
@@ -207,7 +216,7 @@ async fn agent_create_workspace_override_beats_provider_defaults() {
     set(&svc, "model.providerDefaults", provider_defaults);
 
     let overrides = json!({ ws.as_str(): "auggie:opus" });
-    set(&svc, "model.workspaceOverrides", overrides);
+    set_blob(&svc, "model.workspaceOverrides", overrides).await;
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;

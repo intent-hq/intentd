@@ -317,7 +317,9 @@ async fn host_detection_services_over_wss() {
     // host.toolAvailability (default set) ⇒ { tools: { <name>: { available } } }.
     let tools = wss_rpc(&mut ws, 5, "host.toolAvailability", json!({})).await;
     let map = tools["tools"].as_object().expect("tools object");
-    for name in ["claude", "codex", "cortex", "opencode", "git", "code"] {
+    for name in [
+        "claude", "codex", "cortex", "opencode", "grok", "git", "code",
+    ] {
         assert!(
             map.contains_key(name),
             "default set includes {name}: {tools}"

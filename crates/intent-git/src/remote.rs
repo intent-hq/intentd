@@ -32,15 +32,18 @@ pub enum RemoteBranch {
 /// [`RemoteBranch::Present`]/[`RemoteBranch::Missing`]; an unreachable remote
 /// (network/auth failure) is surfaced as an `Err`, preserving the TS distinction
 /// between "branch missing → local-only" and "remote unreachable → error".
+/// `token` is an optional caller-resolved GitHub token used as the final
+/// credential-chain step for HTTPS github.com remotes (see [`crate::auth`]).
 pub fn ls_remote_has_branch(
     worktree_path: &Path,
     remote: &str,
     branch: &str,
+    token: Option<&str>,
 ) -> Result<RemoteBranch> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
     let connection = remote_handle
-        .connect_auth(Direction::Fetch, Some(remote_callbacks()), None)
+        .connect_auth(Direction::Fetch, Some(remote_callbacks(token)), None)
         .map_err(map_git_err)?;
     let target = format!("refs/heads/{branch}");
     let present = connection
@@ -231,15 +234,15 @@ mod tests {
         let bare_dir = unique_bare("lsremote-bare");
         Repository::init_bare(&bare_dir).unwrap();
         repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
-        crate::push::push(src.path(), "origin", &branch, false).unwrap();
+        crate::push::push(src.path(), "origin", &branch, false, None).unwrap();
 
         // The pushed branch is advertised; a never-pushed branch is missing.
         assert_eq!(
-            ls_remote_has_branch(src.path(), "origin", &branch).unwrap(),
+            ls_remote_has_branch(src.path(), "origin", &branch, None).unwrap(),
             RemoteBranch::Present
         );
         assert_eq!(
-            ls_remote_has_branch(src.path(), "origin", "no-such-branch").unwrap(),
+            ls_remote_has_branch(src.path(), "origin", "no-such-branch", None).unwrap(),
             RemoteBranch::Missing
         );
 
@@ -254,7 +257,7 @@ mod tests {
         // Point origin at a path that does not exist — connecting must fail.
         let missing = unique_bare("lsremote-missing-remote");
         repo.remote("origin", missing.to_str().unwrap()).unwrap();
-        assert!(ls_remote_has_branch(src.path(), "origin", "main").is_err());
+        assert!(ls_remote_has_branch(src.path(), "origin", "main", None).is_err());
     }
 
     #[test]

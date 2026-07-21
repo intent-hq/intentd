@@ -8,7 +8,7 @@
 //! `workspace.changeHistory` / `permissions.rules`) persist in the `settings`
 //! table (`intent-store`). Sensitive values (`mcp.servers`,
 //! `server.auth.token`, `sourceControl.github.token`, `linear.token`,
-//! `accounts.sentry.token`, `ai.apiToken`) live in the file-backed secrets
+//! `accounts.sentry.token`) live in the file-backed secrets
 //! store (`~/intent/secrets.json`, via [`intent_core::FileSecretStore`])
 //! behind the [`SecretStore`] seam and are **never** returned in plaintext
 //! over the wire — list/get redact them to presence/placeholder only, and
@@ -19,7 +19,9 @@
 //! Internal readers of TOML-backed keys (e.g. [`branch_prefix`],
 //! [`max_concurrent_agents`]) consume the effective typed [`SettingsFile`]
 //! from the registry snapshot (`Services::effective_settings`); the SQLite
-//! `settings` table only persists the machine-state blobs.
+//! `settings` table only persists the machine-state blobs (including
+//! `model.workspaceOverrides`, re-homed from `config.toml` — see
+//! [`import_legacy_settings`] for the one-time boot import-and-strip).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -756,6 +758,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             Some(json!({})),
         ),
+        // High-churn per-workspace machine state: SQLite-backed (absent from
+        // KNOWN_PATHS), not part of config.toml. Wire surface unchanged.
         object(
             "model.workspaceOverrides",
             "Workspace model overrides",
@@ -986,7 +990,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         enumerated(
             "sourceControl.github.tokenSource",
             "GitHub token source",
-            "Where the GitHub token comes from",
+            "Where the GitHub token comes from: auto tries the secrets store, then \
+             environment variables, then the gh CLI",
             "sourceControl",
             &["auto", "env", "gh-cli", "explicit"],
             "auto",
@@ -1031,51 +1036,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Sentry organization slug (non-secret companion of accounts.sentry.token)",
             "accounts",
             None,
-        ),
-        // --- Group A: primary AI provider config ------------------------------
-        // Ports the FE `workspace-config` `config.ai.*` blob so the daemon owns
-        // the provider knobs the FE previously stored in electron-store.
-        // `ai.apiToken` is a **secret**; the rest are plain settings.
-        secret(
-            "ai.apiToken",
-            "AI provider API token",
-            "Bearer token used by the primary AI provider",
-            "ai",
-        ),
-        string(
-            "ai.apiUrl",
-            "AI provider API URL",
-            "Base URL for the primary AI provider",
-            "ai",
-            None,
-        ),
-        string("ai.model", "AI model", "Default AI model", "ai", None),
-        number(
-            "ai.temperature",
-            "AI temperature",
-            "Sampling temperature for the primary AI provider",
-            "ai",
-            Some(0.0),
-            Some(2.0),
-            0.7,
-        ),
-        number(
-            "ai.maxTokens",
-            "AI max tokens",
-            "Maximum tokens per completion for the primary AI provider",
-            "ai",
-            Some(1.0),
-            None,
-            4096.0,
-        ),
-        number(
-            "ai.streamingSpeed",
-            "AI streaming speed",
-            "Streaming pacing hint (tokens per second; 0 = no throttle)",
-            "ai",
-            Some(0.0),
-            None,
-            0.0,
         ),
         // --- Group A: persisted permission rules ------------------------------
         // Port of the FE `ConfigManager` `config.permissions.rules` bag: an array
@@ -1224,6 +1184,76 @@ pub(crate) fn branch_prefix(settings: &SettingsFile) -> String {
 pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
     let n = settings.agents.max_concurrent;
     (n > 0).then_some(n as usize)
+}
+
+/// One-time boot import of legacy `config.toml` keys back into the SQLite
+/// `settings` table (import-or-discard-and-strip). The registry's load
+/// tolerated the [`intent_core::settings_file::LEGACY_SETTINGS_PATHS`] keys
+/// and captured their values; here each captured value is persisted to SQLite
+/// when it matches its catalog definition (overwriting any existing row —
+/// the file value is the user's most recent intent) or discarded with a
+/// warning when it does not, and the keys are then stripped from the file
+/// with a comment-preserving rewrite. Nothing is stripped when a SQLite
+/// write fails, so the next boot retries the import. The strip itself is
+/// best-effort: once the values are safely in SQLite, a failed file rewrite
+/// (read-only file, perms, full disk) is logged and startup continues — the
+/// next boot re-runs the import, which idempotently overwrites the same
+/// rows and retries the strip. Returns the stripped paths (empty when the
+/// file had no legacy keys or the rewrite failed).
+pub async fn import_legacy_settings(
+    registry: &SettingsRegistry,
+    store: &Store,
+) -> Result<Vec<String>> {
+    let legacy = registry.legacy_values();
+    if legacy.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (path, value) in &legacy {
+        let Some(def) = find_definition(path) else {
+            tracing::warn!(
+                path,
+                "legacy config.toml key has no catalog entry; discarding"
+            );
+            continue;
+        };
+        if let Err(e) = def.validate(value) {
+            tracing::warn!(path, error = %e, "legacy config.toml value is invalid; discarding");
+            continue;
+        }
+        // `SettingType::Object` tolerates arrays and arbitrary member types;
+        // the workspace-overrides consumer (`resolve_default_model_from_settings`)
+        // requires a workspaceId -> model-string map, so enforce that shape
+        // here rather than importing a blob that silently never applies.
+        if *path == "model.workspaceOverrides"
+            && !value
+                .as_object()
+                .is_some_and(|m| m.values().all(Value::is_string))
+        {
+            tracing::warn!(
+                path,
+                "legacy value is not an object of workspaceId -> model strings; discarding"
+            );
+            continue;
+        }
+        let raw = serde_json::to_string(value)
+            .map_err(|e| Error::Internal(format!("encode legacy setting {path} failed: {e}")))?;
+        store.set_setting(path, &raw).await?;
+        tracing::info!(path, "imported legacy config.toml key into SQLite");
+    }
+    let stripped = match registry.strip_legacy() {
+        Ok(stripped) => stripped,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to strip legacy keys from config.toml; continuing with imported values (next boot retries)"
+            );
+            Vec::new()
+        }
+    };
+    if !stripped.is_empty() {
+        tracing::info!(?stripped, "stripped legacy keys from config.toml");
+    }
+    Ok(stripped)
 }
 
 /// Normalize a registry-read value for the wire: `Number`-typed settings are
@@ -1582,21 +1612,19 @@ mod tests {
         assert!(def.default_value.is_none());
     }
 
-    /// `accounts.sentry.token` and `ai.apiToken` — the two secret catalog gaps
-    /// closed for R0-4 — must be sensitive so `settings.update` persists them to
-    /// the shared secrets store under account = setting path (never the DB) and
-    /// every wire read (`settings.list` / `settings.get`) redacts them to a
-    /// placeholder or `null` when unset.
+    /// `accounts.sentry.token` must be sensitive so `settings.update` persists
+    /// it to the shared secrets store under account = setting path (never the
+    /// DB) and every wire read (`settings.list` / `settings.get`) redacts it to
+    /// a placeholder or `null` when unset.
     #[test]
     fn new_secret_catalog_entries_are_sensitive() {
-        for path in ["accounts.sentry.token", "ai.apiToken"] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert_eq!(def.path, path);
-            assert!(def.sensitive, "{path} must be a sensitive catalog entry");
-            assert!(!def.read_only, "{path} must not be read-only");
-            assert!(matches!(def.ty, SettingType::String));
-            assert!(def.default_value.is_none(), "{path} default is null");
-        }
+        let path = "accounts.sentry.token";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert_eq!(def.path, path);
+        assert!(def.sensitive, "{path} must be a sensitive catalog entry");
+        assert!(!def.read_only, "{path} must not be read-only");
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(def.default_value.is_none(), "{path} default is null");
     }
 
     /// `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
@@ -1630,53 +1658,31 @@ mod tests {
         assert!(def.default_value.is_none());
     }
 
-    /// The non-secret half of the `ai.*` group (URL / model / temperature /
-    /// maxTokens / streamingSpeed) ports the FE `workspace-config` `config.ai.*`
-    /// blob one-to-one; `temperature` carries the documented 0..=2 clamp and
-    /// `maxTokens` / `streamingSpeed` refuse negative values.
+    /// The `ai.*` group is retired: no catalog entry may remain for any of its
+    /// keys (the app drives AI via ACP agent providers, not a direct provider).
     #[test]
-    fn ai_non_secret_group_matches_fe_shape() {
-        for (path, default_present) in [
-            ("ai.apiUrl", false),
-            ("ai.model", false),
-            ("ai.temperature", true),
-            ("ai.maxTokens", true),
-            ("ai.streamingSpeed", true),
+    fn ai_group_is_gone_from_the_catalog() {
+        for path in [
+            "ai.apiToken",
+            "ai.apiUrl",
+            "ai.model",
+            "ai.temperature",
+            "ai.maxTokens",
+            "ai.streamingSpeed",
         ] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert!(!def.sensitive, "{path} is non-secret");
-            assert_eq!(def.category, "ai");
-            assert_eq!(
-                def.default_value.is_some(),
-                default_present,
-                "{path} default presence"
-            );
-        }
-        let temp = find_definition("ai.temperature").unwrap();
-        assert!(matches!(
-            temp.ty,
-            SettingType::Number {
-                min: Some(0.0),
-                max: Some(2.0),
-            }
-        ));
-        for path in ["ai.maxTokens", "ai.streamingSpeed"] {
-            let def = find_definition(path).unwrap();
-            let min = match def.ty {
-                SettingType::Number { min, .. } => min,
-                _ => panic!("{path} must be a Number"),
-            };
             assert!(
-                min.map(|m| m >= 0.0).unwrap_or(false),
-                "{path} must reject negative values"
+                find_definition(path).is_none(),
+                "{path} must not be in the catalog"
             );
         }
+        assert!(definitions().iter().all(|d| d.category != "ai"));
     }
 
-    /// The six non-secret gap entries live in the catalog as opaque `Object`
+    /// The non-secret gap entries live in the catalog as opaque `Object`
     /// settings with a documented default. Each is validated by shape only;
     /// downstream consumers own the internal schema (permission rules, prompt
-    /// rules, known repos, change-history bags, workspace-initializer state).
+    /// rules, known repos, change-history bags, workspace-initializer state,
+    /// per-workspace model overrides).
     #[test]
     fn non_secret_object_gap_entries_have_defaults() {
         for path in [
@@ -1686,6 +1692,7 @@ mod tests {
             "repos.known",
             "workspace.changeHistory",
             "workspaceInitializer.state",
+            "model.workspaceOverrides",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
@@ -1905,6 +1912,333 @@ mod tests {
             None,
             "TOML-backed keys must never write a SQLite settings row"
         );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `model.workspaceOverrides` is a SQLite-backed state blob: with the
+    /// registry wired, `settings.update` persists it to the `settings` table
+    /// (never `config.toml`), `settings.get` reads it back with **no**
+    /// `origin` field, and `settings.reset` deletes the row.
+    #[tokio::test]
+    async fn workspace_overrides_is_sqlite_backed_with_registry_wired() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.toml"));
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let overrides = json!({ "ws-1": "auggie:opus" });
+        svc.update(&json!([{ "path": "model.workspaceOverrides", "value": overrides.clone() }]))
+            .await
+            .expect("update state blob");
+
+        // Persisted to SQLite…
+        let raw = store
+            .get_setting("model.workspaceOverrides")
+            .await
+            .expect("read settings table")
+            .expect("row present");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("json"),
+            overrides
+        );
+        // …never to config.toml.
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("workspaceOverrides"), "{text}");
+
+        // settings.get reads the blob back with no origin field.
+        let got = svc.get("model.workspaceOverrides").await.expect("get");
+        assert_eq!(got["value"], overrides);
+        assert!(got.get("origin").is_none(), "state blobs carry no origin");
+
+        // settings.reset deletes the row (back to the catalog default).
+        let reset = svc.reset("model.workspaceOverrides").await.expect("reset");
+        assert_eq!(reset["value"], json!({}));
+        assert_eq!(
+            store
+                .get_setting("model.workspaceOverrides")
+                .await
+                .expect("read settings table"),
+            None
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// Boot-time legacy import: a `config.toml` carrying the retired
+    /// `model.workspaceOverrides` key loads (tolerated), the value lands in
+    /// SQLite, the key is stripped from the file with comments preserved,
+    /// and a second import is a no-op.
+    #[tokio::test]
+    async fn import_legacy_settings_imports_and_strips() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacy-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-legacy-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\" }\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy key must load");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
+
+        // Value landed in SQLite.
+        let raw = store
+            .get_setting("model.workspaceOverrides")
+            .await
+            .expect("read settings table")
+            .expect("row present");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("json"),
+            json!({ "ws1": "m1" })
+        );
+        // File stripped, comment + sibling key preserved.
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("workspaceOverrides"), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+        assert!(text.contains("default = \"m0\""), "{text}");
+
+        // Second boot: clean load, import is a no-op.
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
+        assert_eq!(
+            import_legacy_settings(&registry2, &store)
+                .await
+                .expect("no-op import"),
+            Vec::<String>::new()
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// A hand-edited file can carry the legacy key as a TOML table header
+    /// (`[model.workspaceOverrides]`) instead of an inline table. The capture
+    /// and strip paths must handle that form too — the one-shot migration
+    /// would otherwise lose the value from both the file and SQLite.
+    #[tokio::test]
+    async fn import_legacy_settings_handles_table_header_form() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyhdr-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyhdr-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[git]\nautoCommit = false\n\n[model.workspaceOverrides]\nws1 = \"m1\"\nws2 = \"m2\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy header form must load");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
+
+        let raw = store
+            .get_setting("model.workspaceOverrides")
+            .await
+            .expect("read settings table")
+            .expect("row present");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("json"),
+            json!({ "ws1": "m1", "ws2": "m2" })
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("workspaceOverrides"), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+        assert!(text.contains("autoCommit = false"), "{text}");
+
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// The strip step is best-effort: once the legacy values are safely in
+    /// SQLite, a failed file rewrite (e.g. unwritable config directory) must
+    /// not fail the import — the daemon continues with the imported state
+    /// and the next boot retries the strip. The rewrite is an atomic
+    /// temp-file + rename in the config's directory, so a read-only
+    /// directory makes it fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_legacy_settings_tolerates_strip_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyro-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_dir = std::env::temp_dir().join(format!("intentd-settings-legacyro-{tag}"));
+        std::fs::create_dir(&config_dir).expect("mkdir");
+        let config_path = config_dir.join("config.toml");
+        let body = "[model]\nworkspaceOverrides = { ws1 = \"m1\" }\n";
+        std::fs::write(&config_path, body).expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy key must load");
+
+        // Make the directory read-only so the temp-file rewrite fails.
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod dir read-only");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import must succeed despite strip failure");
+        assert_eq!(stripped, Vec::<String>::new(), "nothing was stripped");
+
+        // The value still landed in SQLite…
+        let raw = store
+            .get_setting("model.workspaceOverrides")
+            .await
+            .expect("read settings table")
+            .expect("row present");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("json"),
+            json!({ "ws1": "m1" })
+        );
+        // …and the file is untouched for the next-boot retry.
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            body
+        );
+
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod dir back");
+        let _ = std::fs::remove_dir_all(&config_dir);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// A legacy value that fails catalog validation — or the
+    /// workspaceId -> model-string shape the overrides consumer requires —
+    /// is discarded (never imported) but still stripped so the daemon does
+    /// not re-warn forever.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_invalid_values() {
+        for body in [
+            // An object-typed catalog entry with a scalar value: invalid.
+            "[model]\nworkspaceOverrides = \"not-an-object\"\n",
+            // Arrays pass SettingType::Object but not the map shape.
+            "[model]\nworkspaceOverrides = [\"m1\"]\n",
+            // Non-string member values are not model ids.
+            "[model]\nworkspaceOverrides = { ws1 = 42 }\n",
+        ] {
+            let tag = uuid::Uuid::new_v4();
+            let tmp = std::env::temp_dir().join(format!("intentd-settings-legacybad-{tag}.db"));
+            let store = Store::open(&tmp).await.expect("open store");
+            let config_path =
+                std::env::temp_dir().join(format!("intentd-settings-legacybad-{tag}.toml"));
+            std::fs::write(&config_path, body).expect("seed config");
+            let registry = SettingsRegistry::load(&config_path).expect("legacy key must load");
+
+            let stripped = import_legacy_settings(&registry, &store)
+                .await
+                .expect("import");
+            assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
+            assert_eq!(
+                store
+                    .get_setting("model.workspaceOverrides")
+                    .await
+                    .expect("read settings table"),
+                None,
+                "invalid legacy value must be discarded, not imported: {body}"
+            );
+            let text = std::fs::read_to_string(&config_path).expect("read config");
+            assert!(!text.contains("workspaceOverrides"), "{text}");
+
+            let _ = std::fs::remove_file(&config_path);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                    "{}{suffix}",
+                    tmp.display()
+                )));
+            }
+        }
+    }
+
+    /// The retired `[ai]` table has no catalog entry at all: a config.toml
+    /// still carrying it boots (tolerated), the values are DISCARDED (never
+    /// imported into SQLite), and the whole table is stripped from the file
+    /// with comments and sibling keys preserved.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_and_strips_ai_table() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyai-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyai-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[git]\nautoCommit = false\n\n[ai]\napiUrl = \"https://api.example\"\nmodel = \"m1\"\ntemperature = 0.5\nmaxTokens = 2048\nstreamingSpeed = 10.0\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy [ai] must load");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        assert_eq!(stripped, vec!["ai".to_string()]);
+
+        // Nothing landed in SQLite — the whole group is discarded.
+        for path in [
+            "ai",
+            "ai.apiUrl",
+            "ai.model",
+            "ai.temperature",
+            "ai.maxTokens",
+            "ai.streamingSpeed",
+        ] {
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "{path} must not be imported"
+            );
+        }
+        // File stripped; comment + sibling table preserved.
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("[ai]"), "{text}");
+        assert!(!text.contains("apiUrl"), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+        assert!(text.contains("autoCommit = false"), "{text}");
+
+        // Second boot: clean load, import is a no-op.
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

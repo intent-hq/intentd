@@ -8,4 +8,5 @@ description = "Provider registry, launch arg/env assembly, model-tier and capabi
 
 [dependencies]
 intent-core = { path = "../intent-core" }
+serde_json = { workspace = true }
 tracing.workspace = true

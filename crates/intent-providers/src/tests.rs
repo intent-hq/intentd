@@ -16,6 +16,7 @@ fn registry_default_and_lookups() {
             "cortex",
             "opencode",
             "droid",
+            "grok",
             "mock"
         ]
     );
@@ -76,6 +77,25 @@ fn registry_field_parity() {
     assert_eq!(droid.model_flag, Some("--model"));
     assert!(droid.supports_rules_file);
     assert_eq!(droid.rules_flag, Some("--append-system-prompt-file"));
+
+    let grok = find_provider("grok").unwrap();
+    assert_eq!(grok.display_name, "Grok Build");
+    assert_eq!(grok.command, "grok");
+    assert_eq!(grok.base_args, &["agent", "stdio"]);
+    // Grok selects models after session creation via session/set_model — no
+    // CLI model flag.
+    assert!(grok.model_flag.is_none() && grok.supports_set_model);
+    assert!(!grok.supports_authenticate && !grok.supports_set_mode);
+    assert!(!grok.supports_mcp_config && !grok.supports_rules_file);
+    assert!(grok.can_be_disabled);
+    assert_eq!(grok.login_command_hint, Some("grok login"));
+    assert_eq!(grok.auth_check_args, Some(&["models"][..]));
+    assert_eq!(
+        grok.login_docs_url,
+        Some("https://docs.x.ai/build/enterprise#authentication")
+    );
+    assert_eq!(grok.npx_only_package, None);
+    assert_eq!(grok.fallback_npx_package, None);
 
     let mock = find_provider("mock").unwrap();
     assert_eq!(mock.command, "node");
@@ -220,8 +240,15 @@ fn arg_assembly_dedupes_remove_tool_names() {
 #[test]
 fn arg_assembly_skips_remove_tool_for_providers_without_support() {
     // Providers with `remove_tool_flag = None` silently drop the input — we
-    // never pass an unknown flag to claude/codex/cortex/opencode/droid.
-    for id in ["claude-code", "codex", "cortex", "opencode", "droid"] {
+    // never pass an unknown flag to claude/codex/cortex/opencode/droid/grok.
+    for id in [
+        "claude-code",
+        "codex",
+        "cortex",
+        "opencode",
+        "droid",
+        "grok",
+    ] {
         let provider = find_provider(id).unwrap();
         assert!(
             provider.remove_tool_flag.is_none(),
@@ -283,6 +310,7 @@ fn provider_runtimes() {
     assert_eq!(runtime("cortex"), ProviderRuntime::Electron);
     assert_eq!(runtime("codex"), ProviderRuntime::Native);
     assert_eq!(runtime("droid"), ProviderRuntime::Native);
+    assert_eq!(runtime("grok"), ProviderRuntime::Native);
 }
 
 #[test]
@@ -464,7 +492,7 @@ fn v8_runtime_node_options_heap_cap() {
         );
     }
     // Native runtimes get no NODE_OPTIONS.
-    for id in ["codex", "droid"] {
+    for id in ["codex", "droid", "grok"] {
         assert!(
             !env_for(id).contains_key("NODE_OPTIONS"),
             "native provider {id} must not get NODE_OPTIONS"
@@ -550,6 +578,7 @@ fn tier_table_and_resolution() {
     assert_eq!(tiers_for("auggie").unwrap().smart, "opus4.7");
     // Dynamic-model providers are intentionally absent.
     assert!(tiers_for("opencode").is_none() && tiers_for("droid").is_none());
+    assert!(tiers_for("grok").is_none());
     // Falls back to auggie's tier for providers without mappings.
     assert_eq!(
         default_model_for_provider("opencode", ModelTier::Fast),
@@ -728,6 +757,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "cortex",
             "opencode",
             "droid",
+            "grok",
             "mock"
         ]
     );
@@ -831,6 +861,10 @@ fn injection_mechanism_registry() {
         FirstTurnPrepend
     );
     assert_eq!(
+        find_provider("grok").unwrap().injection_mechanism,
+        FirstTurnPrepend
+    );
+    assert_eq!(
         find_provider("mock").unwrap().injection_mechanism,
         FirstTurnPrepend
     );
@@ -906,6 +940,187 @@ fn opencode_env_escapes_json_in_instructions_path() {
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/\"rules\".md"]}"#)
     );
+}
+
+#[test]
+fn grok_arg_assembly_has_no_model_or_rules_flags() {
+    // Grok's `agent stdio` subcommand has no model/rules/mcp flags: the model
+    // is applied post-session via session/set_model, so the arg assembly must
+    // emit only the base args.
+    let grok = find_provider("grok").unwrap();
+    assert_eq!(
+        build_provider_args(
+            grok,
+            &ArgInputs {
+                model: Some("grok-4.5"),
+                rules_file: Some("/tmp/rules.md"),
+                mcp_config_file: Some("/tmp/mcp.json"),
+                quiet: true,
+                ..Default::default()
+            }
+        ),
+        vec!["agent", "stdio"]
+    );
+}
+
+#[test]
+fn grok_is_the_only_set_model_provider() {
+    for p in ACP_PROVIDERS {
+        assert_eq!(
+            p.supports_set_model,
+            p.id == "grok",
+            "{} supports_set_model mismatch",
+            p.id
+        );
+    }
+}
+
+#[test]
+fn grok_parses_initialize_models_after_update_banner_preamble() {
+    let fixture = format!(
+        "Update available 0.1.0 → 0.2.0\n{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "modelState": {
+                    "currentModelId": "grok-build",
+                    "availableModels": [
+                        { "modelId": "grok-build", "name": "Grok Build", "description": "Default Grok build model" },
+                        { "modelId": "gpt-5-5", "name": "GPT-5.5", "agentType": "reasoning", "contextWindow": 1048576 }
+                    ]
+                }
+            }
+        })
+    );
+
+    let parsed = parse_grok_initialize_response_from_stdout(&fixture, 1).unwrap();
+    assert_eq!(parsed.current_model_id.as_deref(), Some("grok-build"));
+    assert_eq!(
+        parsed.models,
+        vec![
+            GrokModel {
+                model_id: "grok-build".into(),
+                name: "Grok Build".into(),
+                description: Some("Default Grok build model".into()),
+            },
+            GrokModel {
+                model_id: "gpt-5-5".into(),
+                name: "GPT-5.5".into(),
+                description: Some("reasoning · 1,048,576 token context".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn grok_models_command_parses_readiness_without_trusting_exit_code() {
+    let parsed = parse_grok_models_command_output(
+        "Update available 0.1.0 → 0.2.0\nYou are logged in with grok.com.\ngrok-build  Grok Build  Default model\nopus-4-8  Opus 4.8",
+    );
+    assert_eq!(parsed.authenticated, Some(true));
+    assert_eq!(
+        parsed.models,
+        vec![
+            GrokModel {
+                model_id: "grok-build".into(),
+                name: "Grok Build".into(),
+                description: Some("Default model".into()),
+            },
+            GrokModel {
+                model_id: "opus-4-8".into(),
+                name: "Opus 4.8".into(),
+                description: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn grok_models_command_parses_default_marker_without_using_it_as_label() {
+    let parsed = parse_grok_models_command_output(
+        "You are logged in with grok.com.\n\nDefault model: grok-4.5\n\nAvailable models:\n  * grok-4.5 (default)\n  - grok-composer-2.5-fast\n  - opus-4-6",
+    );
+    assert_eq!(parsed.authenticated, Some(true));
+    assert_eq!(parsed.current_model_id.as_deref(), Some("grok-4.5"));
+    assert_eq!(
+        parsed.models,
+        vec![
+            GrokModel {
+                model_id: "grok-4.5".into(),
+                name: "Grok 4.5".into(),
+                description: None,
+            },
+            GrokModel {
+                model_id: "grok-composer-2.5-fast".into(),
+                name: "Grok Composer 2.5 Fast".into(),
+                description: None,
+            },
+            GrokModel {
+                model_id: "opus-4-6".into(),
+                name: "Opus 4 6".into(),
+                description: None,
+            },
+        ]
+    );
+    assert!(parsed.models.iter().all(|m| m.name != "(default)"));
+}
+
+#[test]
+fn grok_models_command_strips_trailing_current_marker() {
+    let parsed = parse_grok_models_command_output(
+        "grok-current  Grok Current  Current default alias (current)",
+    );
+    assert_eq!(parsed.current_model_id.as_deref(), Some("grok-current"));
+    assert_eq!(
+        parsed.models,
+        vec![GrokModel {
+            model_id: "grok-current".into(),
+            name: "Grok Current".into(),
+            description: Some("Current default alias".into()),
+        }]
+    );
+    assert!(parsed.models.iter().all(|m| m.name != "(current)"));
+}
+
+#[test]
+fn grok_models_command_detects_logged_out_state() {
+    let parsed = parse_grok_models_command_output(
+        "You are not authenticated. Please log in with `grok login`.",
+    );
+    assert_eq!(parsed.authenticated, Some(false));
+    assert!(parsed.models.is_empty());
+    assert_eq!(parsed.current_model_id, None);
+}
+
+#[test]
+fn grok_initialize_models_null_model_state_falls_through() {
+    // An explicit `"modelState": null` must fall through to top-level model
+    // containers (TS nullish-coalescing parity).
+    let result = serde_json::json!({
+        "modelState": null,
+        "currentModelId": "grok-4.5",
+        "availableModels": [ { "modelId": "grok-4.5" } ]
+    });
+    let parsed = parse_grok_initialize_models(&result);
+    assert_eq!(parsed.current_model_id.as_deref(), Some("grok-4.5"));
+    assert_eq!(parsed.models.len(), 1);
+    assert_eq!(parsed.models[0].model_id, "grok-4.5");
+}
+
+#[test]
+fn grok_initialize_stdout_skips_errors_and_unrelated_ids() {
+    // Error responses and other ids are skipped; a missing match yields None.
+    let stdout = format!(
+        "{}\n{}",
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": 401, "message": "auth required" } }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "result": { "models": [] } }),
+    );
+    assert_eq!(parse_grok_initialize_response_from_stdout(&stdout, 1), None);
+    // The id-2 success response parses (empty model list).
+    let parsed = parse_grok_initialize_response_from_stdout(&stdout, 2).unwrap();
+    assert!(parsed.models.is_empty() && parsed.current_model_id.is_none());
 }
 
 #[test]

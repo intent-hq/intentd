@@ -354,9 +354,29 @@ pub(crate) const DEFAULT_TOOLS: &[&str] = &[
     "codex",
     "codex-acp",
     "cortex",
+    "grok",
     "git",
     "code",
 ];
+
+/// Tool-specific `common_paths` hints for [`find_binary_op`]. grok's native
+/// installer puts the binary at `~/.grok/bin/grok` without necessarily adding
+/// it to PATH, so the availability probe must check there as a fallback
+/// (PATH still wins in `resolve_binary_path`; provider discovery, which
+/// spawns the binary, is what prefers the native location — see
+/// `intent_providers::discover`).
+fn tool_common_paths(name: &str) -> Vec<String> {
+    if name != "grok" {
+        return Vec::new();
+    }
+    let bin = home_dir().join(".grok").join("bin");
+    let mut paths = vec![bin.join("grok")];
+    if cfg!(windows) {
+        paths.push(bin.join("grok.exe"));
+        paths.push(bin.join("grok.cmd"));
+    }
+    paths.into_iter().map(|p| p.display().to_string()).collect()
+}
 
 /// Build the `host.toolAvailability` result `{ tools: { <name>: { available,
 /// path?, version? } } }`. Each tool is resolved via [`find_binary_op`]; an
@@ -368,7 +388,7 @@ pub(crate) fn tool_availability_op(tools: Option<Vec<String>>) -> Value {
     };
     let mut map = Map::new();
     for name in names {
-        let result = find_binary_op(&name, &[]);
+        let result = find_binary_op(&name, &tool_common_paths(&name));
         map.insert(name, result);
     }
     json!({ "tools": Value::Object(map) })

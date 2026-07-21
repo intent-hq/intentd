@@ -60,7 +60,9 @@ pub use model::{
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
-pub use settings_file::{SettingsFile, DEFAULT_CONFIG_TEMPLATE};
+pub use settings_file::{
+    LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
+};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,

@@ -152,10 +152,11 @@ pub(crate) fn get_buffer(
 }
 
 /// The workspace's live terminals as a bare array
-/// `[{ id, name, cwd, isExecutingCommand }]` (TS `ws.terminal.list`). The daemon
-/// tracks no terminal title, so `name` is the constant `"Terminal"`; `cwd` is the
-/// working directory resolved at spawn; `isExecutingCommand` is the child's
-/// liveness (the spawned process is the running command).
+/// `[{ id, name, cwd, isExecutingCommand }]` (TS `ws.terminal.list`). `name` is
+/// the display name given at spawn (`SpawnSpec::name`, e.g. "Setup Script"),
+/// else the constant `"Terminal"`; `cwd` is the working directory resolved at
+/// spawn; `isExecutingCommand` is the child's liveness (the spawned process is
+/// the running command).
 pub(crate) fn list(pty: &PtyHost, workspace_id: &WorkspaceId) -> Result<Value> {
     let mut terminals: Vec<(String, Value)> = pty
         .list_scope(workspace_id.as_str())
@@ -163,14 +164,15 @@ pub(crate) fn list(pty: &PtyHost, workspace_id: &WorkspaceId) -> Result<Value> {
         .map(|id| {
             let id_str = id.to_string();
             let info = pty.info(id);
-            let cwd = info
+            let cwd = info.as_ref().and_then(|i| i.cwd.as_deref()).unwrap_or("");
+            let name = info
                 .as_ref()
-                .and_then(|i| i.cwd.clone())
-                .unwrap_or_default();
-            let is_executing = info.map(|i| i.alive).unwrap_or(false);
+                .and_then(|i| i.name.as_deref())
+                .unwrap_or("Terminal");
+            let is_executing = info.as_ref().map(|i| i.alive).unwrap_or(false);
             let value = json!({
                 "id": id_str,
-                "name": "Terminal",
+                "name": name,
                 "cwd": cwd,
                 "isExecutingCommand": is_executing,
             });
@@ -806,6 +808,84 @@ mod tests {
         assert_eq!(entry["cwd"], json!("/"));
 
         kill(pty.as_ref(), &id).await.unwrap();
+    }
+
+    /// `list` surfaces the spawn-time display name; unnamed PTYs fall back to
+    /// the `"Terminal"` constant.
+    #[tokio::test]
+    async fn list_returns_spawn_name_or_default() {
+        let pty = host();
+        let mut named = SpawnSpec::new("ws-named", "cat");
+        named.name = Some(crate::SETUP_TERMINAL_NAME.to_string());
+        let named_id = pty.spawn(named).unwrap().to_string();
+
+        let res = create(
+            pty.clone(),
+            None,
+            None,
+            ws("ws-named"),
+            80,
+            24,
+            None,
+            Some("cat".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        let unnamed_id = term_id(&res);
+
+        let listed = list(pty.as_ref(), &ws("ws-named")).unwrap();
+        let arr = listed.as_array().unwrap();
+        let by_id = |id: &str| {
+            arr.iter()
+                .find(|e| e["id"] == json!(id))
+                .expect("terminal listed")
+        };
+        assert_eq!(by_id(&named_id)["name"], json!("Setup Script"));
+        assert_eq!(by_id(&unnamed_id)["name"], json!("Terminal"));
+
+        kill(pty.as_ref(), &named_id).await.unwrap();
+        kill(pty.as_ref(), &unnamed_id).await.unwrap();
+    }
+
+    /// The setup script wrapper appends a newline-prefixed completion summary
+    /// after the script's own output (a blank separator line when the script's
+    /// output ends with a newline) and preserves its exit code.
+    #[test]
+    fn setup_wrapper_appends_summary_and_preserves_exit_code() {
+        let run = |body: &str| {
+            let path =
+                std::env::temp_dir().join(format!("intentd-term-wrap-{}.sh", uuid::Uuid::new_v4()));
+            std::fs::write(&path, body).expect("write script");
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", crate::SETUP_SCRIPT_WRAPPER, "sh"])
+                .arg(&path)
+                .output()
+                .expect("run wrapper");
+            let _ = std::fs::remove_file(&path);
+            out
+        };
+
+        let ok = run("echo hello-from-script\n");
+        assert_eq!(ok.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&ok.stdout);
+        assert!(
+            stdout.contains("hello-from-script\n\nSetup script completed in "),
+            "blank line then summary must follow the script output: {stdout:?}"
+        );
+        let last = stdout.trim_end().lines().last().unwrap();
+        assert!(
+            last.starts_with("Setup script completed in "),
+            "got {last:?}"
+        );
+        assert!(last.ends_with("s (exit code 0)"), "got {last:?}");
+
+        let failed = run("exit 3\n");
+        assert_eq!(failed.status.code(), Some(3), "script exit code preserved");
+        let stdout = String::from_utf8_lossy(&failed.stdout);
+        let last = stdout.trim_end().lines().last().unwrap();
+        assert!(last.starts_with("Setup script failed in "), "got {last:?}");
+        assert!(last.ends_with("s (exit code 3)"), "got {last:?}");
     }
 
     /// A workspace row with an optional worktree path, for default-cwd tests.

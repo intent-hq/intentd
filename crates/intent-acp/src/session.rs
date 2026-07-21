@@ -211,6 +211,22 @@ pub async fn prompt(
     }
 }
 
+/// `session/set_model` to select the session's model after creation. Used for
+/// providers whose ACP subcommand has no CLI model flag
+/// ([`ProviderConfig::supports_set_model`](intent_providers::ProviderConfig),
+/// grok today; parity with the reference acp-provider's post-session
+/// `session/set_model`). The request shape is `{ sessionId, modelId }` — the
+/// pinned `agent-client-protocol` schema has no typed request for it yet.
+pub async fn set_session_model(
+    conn: &Connection,
+    session_id: &str,
+    model_id: &str,
+) -> AcpResult<()> {
+    let params = serde_json::json!({ "sessionId": session_id, "modelId": model_id });
+    conn.request("session/set_model", params).await?;
+    Ok(())
+}
+
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
 /// the agent then resolves the in-flight `session/prompt` with
 /// `StopReason::Cancelled`). Hard-cancel/reap process-tree kill is
