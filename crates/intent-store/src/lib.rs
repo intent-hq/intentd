@@ -101,8 +101,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Holds two pools over the same DB file: a single-connection **write pool**
 /// (max_connections=1) to serialize all mutations and eliminate in-process
 /// writer-vs-writer busy_timeout contention, and a **read pool** (32 connections)
-/// for concurrent SELECT-only queries. See `connect_write` / `connect_read` for
-/// the pool configurations.
+/// intended for concurrent read (SELECT) queries — a convention, not an enforced
+/// constraint. See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
 pub struct Store {
     write_pool: SqlitePool,
@@ -140,7 +140,7 @@ impl Store {
         &self.write_pool
     }
 
-    /// Borrow the read pool (32 connections, for SELECT-only queries).
+    /// Borrow the read pool (32 connections, intended for read/SELECT queries).
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
     }
@@ -257,8 +257,9 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
 }
 
 /// Open a WAL-mode SQLite **read pool** with `max_connections=32` (§9.4).
-/// The read pool serves SELECT-only queries and supports concurrent readers
-/// without contention (SQLite WAL mode allows many simultaneous readers).
+/// The read pool is intended for read (SELECT) queries — by convention, not an
+/// enforced read-only configuration — and supports concurrent readers without
+/// contention (SQLite WAL mode allows many simultaneous readers).
 ///
 /// The PRAGMAs match the write pool: `journal_mode = WAL`, `foreign_keys = ON`,
 /// `busy_timeout = 5000`, `synchronous = NORMAL`. The read pool size (32) is
