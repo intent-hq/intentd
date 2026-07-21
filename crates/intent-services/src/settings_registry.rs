@@ -261,11 +261,15 @@ impl SettingsRegistry {
             return Ok(Vec::new());
         }
         let stripped: Vec<String> = inner.legacy.keys().cloned().collect();
+        // Strip on a clone and only swap it in after the write succeeds, so a
+        // failed rewrite leaves the in-memory document in sync with the file.
+        let mut doc = inner.doc.clone();
         for path in &stripped {
-            doc_remove(&mut inner.doc, path);
+            doc_remove(&mut doc, path);
         }
-        let text = inner.doc.to_string();
+        let text = doc.to_string();
         atomic_write(&self.path, &text)?;
+        inner.doc = doc;
         inner.generation += 1;
         inner.last_write = Some(WriteStamp {
             generation: inner.generation,
