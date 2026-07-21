@@ -218,6 +218,9 @@ pub(crate) async fn delete_stored_token(secrets: &crate::settings::AsyncSecretSt
 }
 
 /// Resolve the login host: test/builder override → env override → github.com.
+/// 🔒 Cleartext `http://` overrides are only honored for loopback hosts (the
+/// hermetic-test seam); anything else would hand the access token to an
+/// unencrypted non-local endpoint, so it is ignored in favor of the default.
 pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
     override_uri
         .map(str::to_string)
@@ -226,7 +229,35 @@ pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
         })
+        .filter(|uri| {
+            if is_safe_login_base_uri(uri) {
+                true
+            } else {
+                tracing::warn!(
+                    "ignoring github login base-uri override: cleartext http \
+                     is only allowed for loopback hosts"
+                );
+                false
+            }
+        })
         .unwrap_or_else(|| intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI.to_string())
+}
+
+/// True iff `uri` is `https://…` or a cleartext `http://` pointing at a
+/// loopback host (`127.0.0.1`, `localhost`, `[::1]`).
+fn is_safe_login_base_uri(uri: &str) -> bool {
+    if uri.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = uri.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = authority
+        .strip_prefix("[::1]")
+        .map(|_| "::1")
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// Poll cadence floor: the engine's interval comes from the server and a
@@ -359,6 +390,23 @@ mod tests {
         // Without an override, resolution falls through to env/default — the
         // env branch is exercised by the spawned-daemon e2e (process-global
         // env vars are racy inside a multi-threaded test binary).
+    }
+
+    #[test]
+    fn cleartext_override_is_only_honored_for_loopback_hosts() {
+        // 🔒 A non-loopback http:// override would hand the token to an
+        // unencrypted endpoint — it falls back to the production default.
+        assert_eq!(
+            resolve_login_base_uri(Some("http://evil.example.com")),
+            intent_sourcecontrol::device_flow::DEFAULT_LOGIN_BASE_URI
+        );
+        assert!(is_safe_login_base_uri("https://github.example.com"));
+        assert!(is_safe_login_base_uri("http://127.0.0.1:8080"));
+        assert!(is_safe_login_base_uri("http://localhost:8080/path"));
+        assert!(is_safe_login_base_uri("http://[::1]:8080"));
+        assert!(!is_safe_login_base_uri("http://10.0.0.5:8080"));
+        assert!(!is_safe_login_base_uri("http://localhost.evil.com"));
+        assert!(!is_safe_login_base_uri("ftp://127.0.0.1"));
     }
 
     #[test]

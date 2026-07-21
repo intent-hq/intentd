@@ -140,9 +140,9 @@ async fn uds_slice_end_to_end() {
                 std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
             )
             // Keep the (y) github.* section hermetic: `github.connect` must
-            // fail fast against an unroutable login host, never touch the
-            // real github.com.
-            .with_github_login_base_uri("http://127.0.0.1:1"),
+            // deterministically fail fast (port 0 is never a valid
+            // destination), never touch the real github.com.
+            .with_github_login_base_uri("http://127.0.0.1:0"),
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
@@ -847,8 +847,8 @@ async fn uds_slice_end_to_end() {
 
     // (y) github.* browse / auth / identity (PROTOCOL §5.27), token-absent path.
     //     `connect` starts a real device flow, but the login host is pinned to
-    //     an unroutable address above, so it fails with a graceful domain error
-    //     (never a hang, never live network); `cancelAuth` / `revoke` are
+    //     an invalid port-0 address above, so it fails with a graceful domain
+    //     error (never a hang, never live network); `cancelAuth` / `revoke` are
     //     idempotent no-ops with nothing in flight; `authStatus` validates the
     //     env PAT and degrades gracefully to a well-formed
     //     `{ isConfigured: bool, ..., deviceFlow: null }` (the single
@@ -862,7 +862,7 @@ async fn uds_slice_end_to_end() {
     assert_eq!(
         resp["error"]["code"],
         json!(-32603),
-        "connect against an unroutable login host is a graceful Internal error"
+        "connect against an invalid login host is a graceful Internal error"
     );
 
     let resp = send(

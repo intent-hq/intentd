@@ -5256,11 +5256,12 @@ mod pr {
 
     #[tokio::test]
     async fn github_connect_against_unreachable_login_host_is_a_graceful_error() {
-        // Unroutable host: the device-flow start must fail with a domain error
+        // Port 0 is never a valid destination: the device-flow start must
+        // deterministically fail with a domain error
         // (mapped `Internal`), never hang or panic — and must not leave a
         // pending slot behind.
         let (_t, svc) = github_svc().await;
-        let svc = svc.with_github_login_base_uri("http://127.0.0.1:1");
+        let svc = svc.with_github_login_base_uri("http://127.0.0.1:0");
         let err = svc.github_connect().await.expect_err("connect must fail");
         assert!(matches!(err, Error::Internal(_)));
         let v = svc.github_auth_status().await.expect("auth");
@@ -5271,9 +5272,9 @@ mod pr {
     async fn github_connect_returns_the_same_codes_while_a_flow_is_pending() {
         // Pre-populate a live pending slot: a second connect must return the
         // SAME codes without restarting the flow (no network touched — the
-        // unroutable base uri would fail the test if `start_at` were called).
+        // invalid port-0 base uri would fail the test if `start_at` ran).
         let (_t, svc) = github_svc().await;
-        let svc = svc.with_github_login_base_uri("http://127.0.0.1:1");
+        let svc = svc.with_github_login_base_uri("http://127.0.0.1:0");
         {
             let mut slot = svc.github_auth_flow.lock().await;
             *slot = Some(crate::github_auth_ops::FlowSlot {
