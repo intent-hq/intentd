@@ -1560,13 +1560,17 @@ impl AgentManager {
         }
         // Spell the rename tool the way this session's provider surfaces it;
         // a failed session lookup falls back to the generic phrasing.
-        let tool_ref = self
-            .services
-            .store
-            .get_agent_session(agent_id)
-            .await
-            .map(|s| workspace_naming_tool_reference(&session_provider_id(&s)))
-            .unwrap_or(GENERIC_NAMING_TOOL_REFERENCE);
+        let tool_ref = match self.services.store.get_agent_session(agent_id).await {
+            Ok(s) => workspace_naming_tool_reference(&session_provider_id(&s)),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "naming nudge: session lookup failed; using generic tool phrasing"
+                );
+                GENERIC_NAMING_TOOL_REFERENCE
+            }
+        };
         Some(format!(
             "<system>\nThis workspace needs a title. As your first action, call {tool_ref} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
         ))
@@ -3282,8 +3286,7 @@ fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
 
 /// Resolve everything needed to spawn (or respawn) this
 /// agent's child from its persisted session + workspace. The provider id comes
-/// from the session's explicit `provider`, else the `provider:model` compound
-/// id, else the default provider. The `mock` provider (E2E) reads its script
+/// from [`session_provider_id`]. The `mock` provider (E2E) reads its script
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
 /// `MOCK_AGENT_BEHAVIOR` to the child. npx-only providers (claude-code) are
