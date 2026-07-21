@@ -337,17 +337,19 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 /// Derive the "real" tool name from a human-readable ACP `title` and, when the
 /// title carries no identifier, the shape of the `raw_input` parameters (§6.6).
 ///
-/// ACP providers (auggie, codex, …) deliver a prose `title` (e.g.
+/// ACP providers (auggie, codex, opencode, …) deliver a prose `title` (e.g.
 /// `"sub-agent-explore: Explore the AI agent system…"`) rather than the raw
 /// tool name the model invoked. Rules, in order:
 ///  1. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
-///  2. Trailing `_workspace-mcp` server suffixes (one or more) are stripped —
-///     auggie names an MCP tool `<tool>_<server>`, so our registry tool
-///     `add_to_note` surfaces as `add_to_note_workspace-mcp`; stripping
-///     recovers the registry name (§18.4).
-///  3. When neither of the above yielded an identifier (the title is prose
+///  2. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
+///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
+///     (repeatedly) recovers the registry name (§18.4).
+///  3. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///     canonical `web-fetch` builtin name.
+///  4. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -358,22 +360,37 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///         (or `conversation-retrieval` when the title mentions `conversation`)
 ///       - `file_paths` array → `remove-files`
 ///       - `input` string containing `*** Begin Patch` → `apply_patch`
-///  4. Otherwise the title passes through as-is.
+///
+///     Then opencode's camelCase shapes (captured from opencode 1.18.3,
+///     which titles its calls with raw prose — the command line, a file
+///     path, a regex — once arguments stream in):
+///       - `filePath` + `oldString`/`newString` → `edit`
+///       - `filePath` + `content` → `write`
+///       - `filePath` alone → `read`
+///       - string `command` + `cwd` (no `wait`/`max_wait_seconds`, which
+///         would mean auggie's `launch-process`) → `bash`
+///       - `url` → `web-fetch`
+///  5. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
 /// reassigned by an upstream codex-input unwrap (reference ~L1580–1606); for
-/// every path we reach today (title is prose, no prefix, no `_workspace-mcp`
-/// suffix), the two are equivalent. If a future codex-style path rewrite
+/// every path we reach today (title is prose, no prefix, no `workspace-mcp`
+/// affix), the two are equivalent. If a future codex-style path rewrite
 /// mutates the tool name before this call, feed the rewritten string into
 /// `title` to keep parity.
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
     if let Some(name) = split_name_prefix(title) {
-        return strip_workspace_mcp_suffix(name);
+        return strip_workspace_mcp_affix(name);
     }
-    let stripped = strip_workspace_mcp_suffix(title);
+    let stripped = strip_workspace_mcp_affix(title);
     if stripped != title {
         return stripped;
+    }
+    // Opencode's fetch tool is titled `webfetch`; normalize to the canonical
+    // builtin name so downstream consumers match on one spelling.
+    if title == "webfetch" {
+        return "web-fetch".to_string();
     }
     if let Some(input) = raw_input {
         if let Some(from_input) = derive_tool_name_from_input(title, input) {
@@ -426,6 +443,34 @@ fn derive_tool_name_from_input(title: &str, input: &Value) -> Option<String> {
             return Some("apply_patch".to_string());
         }
     }
+    // Opencode camelCase shapes (captured from opencode 1.18.3). These keys
+    // don't collide with the snake_case auggie/codex shapes above, so they
+    // are checked last. filePath + oldString/newString → edit; filePath +
+    // content → write; filePath alone → read.
+    if is_non_empty_string(obj.get("filePath")) {
+        if obj.contains_key("oldString") || obj.contains_key("newString") {
+            return Some("edit".to_string());
+        }
+        if obj.contains_key("content") {
+            return Some("write".to_string());
+        }
+        return Some("read".to_string());
+    }
+    // command (string) + cwd → bash. Auggie's launch-process also carries a
+    // string `command` + `cwd` but always with `wait`/`max_wait_seconds`;
+    // codex sends `command` as an array — both are excluded here.
+    if is_non_empty_string(obj.get("command"))
+        && obj.contains_key("cwd")
+        && !obj.contains_key("wait")
+        && !obj.contains_key("max_wait_seconds")
+    {
+        return Some("bash".to_string());
+    }
+    // url → web-fetch (opencode's webfetch and auggie's web-fetch both carry
+    // a bare url input).
+    if is_non_empty_string(obj.get("url")) {
+        return Some("web-fetch".to_string());
+    }
     None
 }
 
@@ -455,14 +500,28 @@ fn split_name_prefix(title: &str) -> Option<&str> {
     Some(name)
 }
 
-fn strip_workspace_mcp_suffix(name: &str) -> String {
+/// Strip `workspace-mcp` server affixes from an MCP tool name: auggie appends
+/// a trailing `_workspace-mcp` suffix (`add_to_note_workspace-mcp`), opencode
+/// prepends a leading `workspace-mcp_` prefix (`workspace-mcp_add_to_note`).
+/// Either is stripped repeatedly until the bare registry name remains.
+fn strip_workspace_mcp_affix(name: &str) -> String {
     const SUFFIX: &str = "_workspace-mcp";
+    const PREFIX: &str = "workspace-mcp_";
     let mut cur = name;
-    while let Some(stripped) = cur.strip_suffix(SUFFIX) {
-        if stripped.is_empty() {
-            break;
+    loop {
+        if let Some(stripped) = cur.strip_suffix(SUFFIX) {
+            if !stripped.is_empty() {
+                cur = stripped;
+                continue;
+            }
         }
-        cur = stripped;
+        if let Some(stripped) = cur.strip_prefix(PREFIX) {
+            if !stripped.is_empty() {
+                cur = stripped;
+                continue;
+            }
+        }
+        break;
     }
     cur.to_string()
 }
