@@ -1634,9 +1634,23 @@ async fn seed_agent_with_title(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentI
         .expect("update ws title");
 }
 
+/// Point the seeded agent session at a specific provider (allowed while
+/// `acp_session_id` is unset — provider immutability only kicks in after
+/// first real use).
+async fn set_session_provider(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId, provider: &str) {
+    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    session.provider = Some(provider.to_string());
+    mgr.services
+        .store
+        .update_agent_session(ws, &session)
+        .await
+        .expect("update session provider");
+}
+
 /// Slug-shaped workspace title on an agent's first turn → the naming instruction
-/// is prepended as a `<system>` block naming the daemon MCP tool
-/// (`set_workspace_title_workspace-mcp`), not the FE `workspace_api` surface.
+/// is prepended as a `<system>` block naming the daemon MCP tool as the default
+/// provider (auggie) surfaces it (`set_workspace_title_workspace-mcp`), not the
+/// FE `workspace_api` surface.
 #[tokio::test]
 async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
     let (_tmp, mgr) = manager().await;
@@ -1709,6 +1723,124 @@ async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
         "empty title still triggers the naming instruction: {text:?}"
     );
     assert!(text.contains("`set_workspace_title_workspace-mcp`"));
+}
+
+/// opencode session → the naming instruction spells the tool with opencode's
+/// LEADING server prefix (`workspace-mcp_set_workspace_title`), the mirror of
+/// auggie's trailing `_workspace-mcp` suffix.
+#[tokio::test]
+async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-oc"), AgentId::from("a-oc"));
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    set_session_provider(&mgr, &ws, &id, "opencode").await;
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("`workspace-mcp_set_workspace_title`"),
+        "opencode nudge uses the leading server prefix: {text:?}"
+    );
+    assert!(
+        !text.contains("set_workspace_title_workspace-mcp"),
+        "opencode nudge must not use auggie's trailing suffix: {text:?}"
+    );
+}
+
+/// A compound `provider:model` id wins over `session.provider` for the nudge
+/// spelling (same precedence as `resolve_spawn`): an auggie-flagged session
+/// whose model targets opencode gets the opencode tool name.
+#[tokio::test]
+async fn build_turn_prompt_naming_instruction_prefers_model_provider_prefix() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-compound"),
+        AgentId::from("a-compound"),
+    );
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("auggie".to_string());
+    session.model = Some("opencode:kimi-k3".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("`workspace-mcp_set_workspace_title`"),
+        "model provider prefix wins over session.provider: {text:?}"
+    );
+}
+
+/// Providers with unknown MCP tool naming (claude-code here; also codex/droid
+/// until their workspace-MCP wiring lands) → the nudge falls back to the
+/// generic phrasing instead of guessing an affixed tool name.
+#[tokio::test]
+async fn build_turn_prompt_naming_instruction_generic_for_unknown_provider() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-cc"), AgentId::from("a-cc"));
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    set_session_provider(&mgr, &ws, &id, "claude-code").await;
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("call the `set_workspace_title` tool from the workspace MCP server"),
+        "unknown-provider nudge uses the generic phrasing: {text:?}"
+    );
+    assert!(
+        !text.contains("set_workspace_title_workspace-mcp")
+            && !text.contains("workspace-mcp_set_workspace_title"),
+        "unknown-provider nudge must not carry an affixed tool name: {text:?}"
+    );
 }
 
 /// Custom workspace title on an agent's first turn → no naming instruction is

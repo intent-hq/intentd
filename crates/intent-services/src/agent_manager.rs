@@ -1530,8 +1530,9 @@ impl AgentManager {
     /// * Fires only when the workspace lookup succeeds AND the current title
     ///   is empty/whitespace OR still shaped like an auto-generated slug
     ///   ([`intent_core::slug::is_workspace_slug`]).
-    /// * Names the concrete daemon tool the agent must call
-    ///   (`set_workspace_title_workspace-mcp`), not the FE `workspace_api`
+    /// * Names the concrete daemon tool the agent must call — spelled the way
+    ///   the session's provider will actually surface it (see
+    ///   [`workspace_naming_tool_reference`]) — not the FE `workspace_api`
     ///   JS surface (which daemon-spawned agents do not have).
     ///
     /// The agent-rename half of the reference block is intentionally SKIPPED:
@@ -1557,10 +1558,18 @@ impl AgentManager {
         if !needs_rename {
             return None;
         }
-        Some(
-            "<system>\nThis workspace needs a title. As your first action, call the `set_workspace_title_workspace-mcp` tool with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
-                .to_string(),
-        )
+        // Spell the rename tool the way this session's provider surfaces it;
+        // a failed session lookup falls back to the generic phrasing.
+        let tool_ref = self
+            .services
+            .store
+            .get_agent_session(agent_id)
+            .await
+            .map(|s| workspace_naming_tool_reference(&session_provider_id(&s)))
+            .unwrap_or(GENERIC_NAMING_TOOL_REFERENCE);
+        Some(format!(
+            "<system>\nThis workspace needs a title. As your first action, call {tool_ref} with a short 3\u{2013}5 word sentence-case title describing the task. This can be called in parallel with information-gathering.\n</system>"
+        ))
     }
 
     /// Build the prompt blocks for an agent's next turn. Normally just the user
@@ -3236,6 +3245,42 @@ fn derive_agent_type(
     DEFAULT_AGENT_TYPE.to_string()
 }
 
+/// Effective provider id for a session. Provider precedence: when the model
+/// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
+/// prefix wins over `session.provider`, because a cross-provider model switch
+/// should spawn the new provider's binary. `session.provider` is only used as
+/// a fallback for bare model ids, then the default provider.
+fn session_provider_id(session: &AgentSession) -> String {
+    session
+        .model
+        .as_ref()
+        .filter(|m| m.contains(':'))
+        .map(|m| intent_providers::parse_compound_model_id(m).0)
+        .or_else(|| session.provider.clone())
+        .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
+}
+
+/// Fallback phrasing for the workspace-naming nudge when the provider's MCP
+/// tool naming convention is unknown (or its workspace-MCP wiring hasn't
+/// landed yet).
+const GENERIC_NAMING_TOOL_REFERENCE: &str =
+    "the `set_workspace_title` tool from the workspace MCP server";
+
+/// Provider-correct spelling of the workspace-MCP rename tool for the naming
+/// nudge. Providers affix the MCP server name differently: auggie exposes
+/// `<tool>_<server>` (trailing suffix → `set_workspace_title_workspace-mcp`),
+/// opencode exposes `<server>_<tool>` (leading prefix →
+/// `workspace-mcp_set_workspace_title`; confirmed against captured opencode
+/// 1.18.3 traffic). Every other provider gets the generic fallback phrasing.
+fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
+    match provider_id {
+        "auggie" => "the `set_workspace_title_workspace-mcp` tool",
+        "opencode" => "the `workspace-mcp_set_workspace_title` tool",
+        _ => GENERIC_NAMING_TOOL_REFERENCE,
+    }
+}
+
+/// Resolve everything needed to spawn (or respawn) this
 /// agent's child from its persisted session + workspace. The provider id comes
 /// from the session's explicit `provider`, else the `provider:model` compound
 /// id, else the default provider. The `mock` provider (E2E) reads its script
@@ -3251,17 +3296,7 @@ fn resolve_spawn(
     workspace: Option<&intent_core::Workspace>,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Result<ResolvedSpawn> {
-    // Provider precedence: when the model carries an explicit `provider:` prefix
-    // (e.g., "opencode:kimi-k3"), that prefix wins over session.provider,
-    // because a cross-provider model switch should spawn the new provider's
-    // binary. Session.provider is only used as a fallback for bare model ids.
-    let provider_id = session
-        .model
-        .as_ref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .or_else(|| session.provider.clone())
-        .unwrap_or_else(|| intent_providers::default_provider_id().to_string());
+    let provider_id = session_provider_id(session);
     let model = session
         .model
         .as_ref()
