@@ -504,6 +504,25 @@ async function dispatch(msg) {
   }
 }
 
+// Shutdown-reap e2e: when MOCK_AGENT_TREE_PID_FILE is set, spawn a long-lived
+// grandchild (`sleep 300`) that inherits this process's group and record both
+// pids ({ childPid, grandchildPid }) so the test can assert the daemon's
+// shutdown kill sweep reaps the WHOLE provider tree (bridge-style grandchild
+// included), not just the direct child.
+const treePidFile = process.env.MOCK_AGENT_TREE_PID_FILE;
+if (treePidFile) {
+  const grandchild = spawn('sleep', ['300'], { stdio: 'ignore' });
+  grandchild.on('error', (err) => log(`grandchild spawn failed: ${err.message}`));
+  try {
+    fs.writeFileSync(
+      treePidFile,
+      JSON.stringify({ childPid: process.pid, grandchildPid: grandchild.pid }) + '\n',
+    );
+  } catch (err) {
+    log(`tree pid file write failed: ${err.message}`);
+  }
+}
+
 // Deterministic failure mode: exit immediately on launch for the first N spawns.
 // This triggers "agent stdout closed" handshake failure during initialize.
 let exitBehavior = {};
