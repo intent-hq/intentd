@@ -105,19 +105,17 @@ fn registry_field_parity() {
 /// Exactly claude-code, codex, and droid consume MCP servers from the ACP
 /// `session/new` / `session/load` `mcpServers` field; every other provider
 /// receives MCP config out-of-band (auggie `--mcp-config`, opencode env
-/// config) or not at all.
+/// config) or not at all. Asserted over the full registry so a newly added
+/// provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    for id in ["claude-code", "codex", "droid"] {
-        assert!(
-            find_provider(id).unwrap().supports_session_mcp_servers,
-            "{id} consumes session/new mcpServers"
-        );
-    }
-    for id in ["auggie", "opencode", "cortex", "grok", "mock"] {
-        assert!(
-            !find_provider(id).unwrap().supports_session_mcp_servers,
-            "{id} must not opt into session/new mcpServers"
+    let opted_in = ["claude-code", "codex", "droid"];
+    for id in all_provider_ids() {
+        let p = find_provider(id).unwrap();
+        assert_eq!(
+            p.supports_session_mcp_servers,
+            opted_in.contains(&id),
+            "{id}: supports_session_mcp_servers must match the pinned opt-in set {opted_in:?}"
         );
     }
 }

@@ -454,11 +454,13 @@ async function dispatch(msg) {
           return;
         }
       }
-      // Stash any session-setup-delivered MCP servers (STAB-156) so
+      // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.
-      if (Array.isArray(msg.params && msg.params.mcpServers)) {
-        sessionMcpServers = msg.params.mcpServers;
-      }
+      // Always overwritten (defaulting to []) so a later session/new that
+      // omits the field can't silently reuse a stale server list.
+      sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
+        ? msg.params.mcpServers
+        : [];
       return result(msg.id, { sessionId: SESSION_ID });
     }
     case 'session/load':
