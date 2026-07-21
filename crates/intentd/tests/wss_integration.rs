@@ -359,12 +359,11 @@ async fn wss_client_hello_and_drafts_round_trip() {
     srv.ws.stop().await;
 }
 
-/// `agent.create` accepts a client-supplied `agentId` and the follow-up
-/// `agent.sendMessage` addressed to the same id lands on the persisted session
-/// instead of the pre-fix `-32602 not found: agent session` (PROTOCOL §5.5).
-/// This proves the create+send race the FE `UnifiedAgentFactory` was hitting.
+/// Agent ids are server-assigned: `agent.create` rejects a client-supplied
+/// `agentId` with `-32602` ("server-assigned"), and a create without the
+/// field mints an `agent-{uuid}` id that `agent.get` resolves (PROTOCOL §5.5).
 #[tokio::test]
-async fn wss_agent_create_honors_client_supplied_agent_id() {
+async fn wss_agent_create_rejects_client_supplied_agent_id() {
     let srv = start(WsOptions::default()).await;
     let created_ws = wss_call(
         srv.port,
@@ -378,47 +377,62 @@ async fn wss_agent_create_honors_client_supplied_agent_id() {
         .to_string();
     let requested = format!("agent-{}", uuid::Uuid::new_v4());
 
-    let sess = wss_session(
-        srv.port,
-        srv.cfg.clone(),
-        vec![
-            format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{requested}","name":"WSS Client Id"}}}}"#
-            ),
-            format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{requested}"}}}}"#
-            ),
-        ],
-    )
-    .await;
-    assert_eq!(
-        sess[0]["result"]["agent"]["id"].as_str(),
-        Some(requested.as_str()),
-        "agent.create must adopt the client-supplied agentId verbatim: {}",
-        sess[0]
-    );
-    assert_eq!(
-        sess[1]["result"]["agent"]["id"].as_str(),
-        Some(requested.as_str()),
-        "agent.get at the client-supplied id must resolve: {}",
-        sess[1]
-    );
-
-    // A malformed id is `-32602` (PROTOCOL §5.5 / §9) — a stray/hand-typed id
-    // must not slip through and collide with future daemon-minted ids.
-    let bad = wss_call(
+    // Stale-client shape: any client-supplied agentId is -32602.
+    let rejected = wss_call(
         srv.port,
         srv.cfg.clone(),
         format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"not-an-agent"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{requested}","name":"WSS Client Id"}}}}"#
         )
         .as_str(),
     )
     .await;
     assert_eq!(
-        bad["error"]["code"].as_i64(),
+        rejected["error"]["code"].as_i64(),
         Some(-32602),
-        "malformed agentId must be -32602: {bad}"
+        "client-supplied agentId must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("server-assigned"),
+        "error must say agent IDs are server-assigned: {rejected}"
+    );
+
+    // Without the field the daemon mints the id and agent.get resolves it.
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"WSS Minted"}}}}"#
+        )
+        .as_str(),
+    )
+    .await;
+    let minted = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("server-minted id")
+        .to_string();
+    assert!(
+        minted
+            .strip_prefix("agent-")
+            .is_some_and(|tail| uuid::Uuid::parse_str(tail).is_ok()),
+        "server mints agent-{{uuid}}: {created}"
+    );
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
+        )
+        .as_str(),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"]["id"].as_str(),
+        Some(minted.as_str()),
+        "agent.get at the server-minted id must resolve: {got}"
     );
 
     srv.ws.stop().await;
@@ -442,7 +456,6 @@ async fn wss_agent_create_widened_params_round_trip() {
         .as_str()
         .expect("workspace id")
         .to_string();
-    let requested = format!("agent-{}", uuid::Uuid::new_v4());
 
     // Full-param create: exercise every new optional field. `provider` and
     // `isBackground` (G-A1/P3-1.2c) persist on the session;
@@ -450,38 +463,38 @@ async fn wss_agent_create_widened_params_round_trip() {
     // deferred (per P2-12a audit).
     let params = format!(
         concat!(
-            r#"{{"workspaceId":"{ws}","agentId":"{aid}","name":"WSS Wide","#,
+            r#"{{"workspaceId":"{ws}","name":"WSS Wide","#,
             r#""model":"auggie:sonnet4.5","specialistId":"implementor","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
             r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
         ),
         ws = ws_id,
-        aid = requested,
     );
-    let sess = wss_session(
+    let created_resp = wss_call(
         srv.port,
         srv.cfg.clone(),
-        vec![
-            format!(
-                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{params}}}"#
-            ),
-            format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{requested}"}}}}"#
-            ),
-        ],
+        format!(r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{params}}}"#).as_str(),
     )
     .await;
+    let minted = created_resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("server-minted id")
+        .to_string();
+    let got_resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.get","params":{{"agentId":"{minted}"}}}}"#
+        )
+        .as_str(),
+    )
+    .await;
+    let sess = [created_resp, got_resp];
 
     let created = &sess[0]["result"]["agent"];
     // Return shape is the full `AgentLite` projection — a superset of the
     // pre-widening `{id, name}` snippet. Assert the persisted fields land.
-    assert_eq!(
-        created["id"].as_str(),
-        Some(requested.as_str()),
-        "widened create must adopt the client-supplied id: {}",
-        sess[0]
-    );
     assert_eq!(created["name"].as_str(), Some("WSS Wide"));
     assert_eq!(created["model"].as_str(), Some("auggie:sonnet4.5"));
     assert_eq!(created["provider"].as_str(), Some("auggie"));
@@ -502,7 +515,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     // `agent.get` must resolve at the same id and return the same projection.
     assert_eq!(
         sess[1]["result"]["agent"]["id"].as_str(),
-        Some(requested.as_str()),
+        Some(minted.as_str()),
     );
     assert_eq!(
         sess[1]["result"]["agent"]["provider"].as_str(),
@@ -515,20 +528,20 @@ async fn wss_agent_create_widened_params_round_trip() {
 
     // Backward-compat: a create that omits every widened param still returns
     // the full `AgentLite` shape (no error, no missing required fields).
-    let minimal_id = format!("agent-{}", uuid::Uuid::new_v4());
     let minimal = wss_call(
         srv.port,
         srv.cfg.clone(),
         format!(
-            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","agentId":"{minimal_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}"}}}}"#
         )
         .as_str(),
     )
     .await;
-    assert_eq!(
-        minimal["result"]["agent"]["id"].as_str(),
-        Some(minimal_id.as_str()),
-        "minimal create must still succeed: {minimal}",
+    assert!(
+        minimal["result"]["agent"]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("agent-")),
+        "minimal create must still succeed with a server-minted id: {minimal}",
     );
     assert!(
         minimal["result"]["agent"].get("createdAt").is_some(),

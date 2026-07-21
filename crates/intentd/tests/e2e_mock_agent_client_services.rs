@@ -121,7 +121,6 @@ async fn create_agent_session(
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await

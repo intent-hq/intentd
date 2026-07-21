@@ -461,8 +461,8 @@ async fn rtk_prompt_injection_over_wss() {
     );
 
     // RPC conn — workspace.create with initialAgent to trigger activation
+    // (agent id is server-assigned and read back from the result)
     let mut rpc = wss_connect(port, cfg.clone()).await;
-    let agent_id_1 = format!("agent-{}", Uuid::new_v4());
     let created = wss_rpc(
         &mut rpc,
         20,
@@ -472,7 +472,6 @@ async fn rtk_prompt_injection_over_wss() {
             "branch": "feat/rtk-enabled-e2e",
             "idempotencyKey": "rtk-test-1",
             "initialAgent": {
-                "agentId": agent_id_1,
                 "prompt": "run the build",
                 "name": "Test Agent (RTK on)",
                 "model": "mock:default",
@@ -483,6 +482,10 @@ async fn rtk_prompt_injection_over_wss() {
     let _ws_id_1 = created["result"]["workspace"]["id"]
         .as_str()
         .expect("workspace id");
+    let agent_id_1 = created["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
 
     // Wait for agent turn to complete by consuming events
     let mut saw_stream_end = false;
@@ -543,7 +546,6 @@ async fn rtk_prompt_injection_over_wss() {
     .await;
 
     // Create a second workspace + agent (flag off)
-    let agent_id_2 = format!("agent-{}", Uuid::new_v4());
     let created_2 = wss_rpc(
         &mut rpc,
         50,
@@ -553,7 +555,6 @@ async fn rtk_prompt_injection_over_wss() {
             "branch": "feat/rtk-disabled-e2e",
             "idempotencyKey": "rtk-test-2",
             "initialAgent": {
-                "agentId": agent_id_2,
                 "prompt": "run the build",
                 "name": "Test Agent (RTK off)",
                 "model": "mock:default",
@@ -564,6 +565,10 @@ async fn rtk_prompt_injection_over_wss() {
     let _ws_id_2 = created_2["result"]["workspace"]["id"]
         .as_str()
         .expect("workspace id");
+    let agent_id_2 = created_2["result"]["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent id")
+        .to_string();
 
     // Wait for the second agent turn to complete
     let mut saw_stream_end_2 = false;

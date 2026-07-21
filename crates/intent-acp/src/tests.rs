@@ -1064,7 +1064,6 @@ mod mcp_tests {
             specialist_id: Option<String>,
             parent_agent_id: Option<AgentId>,
             idempotency_key: Option<String>,
-            _requested_agent_id: Option<AgentId>,
             extra: AgentCreateExtra,
         ) -> BoxFuture<'_, Result<Value>> {
             self.agent_creates.lock().unwrap().push((
@@ -5815,7 +5814,6 @@ mod wsapi4_bindings_tests {
             _specialist_id: Option<String>,
             _parent_agent_id: Option<AgentId>,
             _idempotency_key: Option<String>,
-            _requested_agent_id: Option<AgentId>,
             _extra: intent_core::AgentCreateExtra,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })

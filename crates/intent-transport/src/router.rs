@@ -164,6 +164,18 @@ async fn dispatch(
             Ok(json!({ "workspace": ws }))
         }
         "workspace.create" => {
+            // Agent ids are server-assigned: reject stale clients that still
+            // send `initialAgent.agentId` before any provisioning runs.
+            if params
+                .get("initialAgent")
+                .and_then(|a| a.get("agentId"))
+                .is_some_and(|v| !v.is_null())
+            {
+                return Err(rpc(
+                    INVALID_PARAMS,
+                    "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
+                ));
+            }
             let idempotency_key = opt_str(params, "idempotencyKey");
             let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| rpc(INVALID_PARAMS, format!("invalid params: {e}")))?;
@@ -947,15 +959,18 @@ async fn dispatch(
         }
         "agent.create" => {
             let ws = require_ws_note(params)?;
+            // Agent ids are server-assigned: reject stale clients that still
+            // send `agentId` before the request reaches the service.
+            if params.get("agentId").is_some_and(|v| !v.is_null()) {
+                return Err(rpc(
+                    INVALID_PARAMS,
+                    "agentId: agent IDs are server-assigned and the field must be omitted",
+                ));
+            }
             let name = opt_str(params, "name");
             let model = opt_str(params, "model");
             let specialist_id = opt_str(params, "specialistId");
             let idempotency_key = opt_str(params, "idempotencyKey");
-            // Honor a client-supplied `agentId` verbatim so the FE can address
-            // `agent.sendMessage` at the same id it just handed us (fixes the
-            // create+send "not found: agent session" race). Malformed values
-            // are rejected inside the service as `-32602`.
-            let requested_agent_id = opt_str(params, "agentId").map(|s| AgentId::from(s.as_str()));
             // Widened FE-facing spawn hints (P2-12a): `provider`/`agentType`/
             // `metadata`/`workspacePath`/`workspaceContext`. All optional and
             // additive — omitted params behave exactly as pre-widening
@@ -975,16 +990,7 @@ async fn dispatch(
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
-                .agent_create(
-                    ws,
-                    name,
-                    model,
-                    specialist_id,
-                    None,
-                    idempotency_key,
-                    requested_agent_id,
-                    extra,
-                )
+                .agent_create(ws, name, model, specialist_id, None, idempotency_key, extra)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

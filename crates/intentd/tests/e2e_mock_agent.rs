@@ -120,7 +120,6 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await

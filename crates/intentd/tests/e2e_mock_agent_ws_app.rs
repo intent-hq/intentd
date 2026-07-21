@@ -119,7 +119,6 @@ async fn chief_agent_ws_app_workspaces_list() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -273,7 +272,6 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -420,7 +418,6 @@ async fn non_chief_agent_ws_app_gating_error() {
         .agent_create(
             ws.clone(),
             Some("Regular Agent".into()),
-            None,
             None,
             None,
             None,

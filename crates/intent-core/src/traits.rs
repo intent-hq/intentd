@@ -1192,11 +1192,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// `Some(caller)` to stamp the child's `parentAgentId`; the FE/RPC front door
     /// passes `None` (top-level creates stay parentless).
     ///
-    /// `requested_agent_id` is an optional well-formed `agent-{uuid}` id the
-    /// client already minted (e.g. the FE's `UnifiedAgentFactory` uses it to
-    /// key the pending session, then addresses `agent.sendMessage` at the same
-    /// id). When `Some`, the service adopts it verbatim; otherwise a fresh id
-    /// is minted. Malformed values are rejected as `-32602`.
+    /// Agent ids are server-assigned: the daemon always mints a fresh
+    /// `agent-{uuid}` id and returns it in the `AgentLite` projection.
+    /// Requests still carrying a client-supplied `agentId` are rejected at
+    /// the transport boundary as `-32602`.
     ///
     /// `extra` carries the widened FE-facing spawn hints
     /// (`provider`/`agentType`/`metadata`/`workspacePath`/`workspaceContext`).
@@ -1212,7 +1211,6 @@ pub trait WorkspaceApi: Send + Sync {
         specialist_id: Option<String>,
         parent_agent_id: Option<AgentId>,
         idempotency_key: Option<String>,
-        requested_agent_id: Option<AgentId>,
         extra: crate::model::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
@@ -1222,7 +1220,6 @@ pub trait WorkspaceApi: Send + Sync {
             specialist_id,
             parent_agent_id,
             idempotency_key,
-            requested_agent_id,
             extra,
         );
         Box::pin(async {
