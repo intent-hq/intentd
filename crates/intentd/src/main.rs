@@ -452,6 +452,8 @@ async fn cmd_serve(
     // subscribers on another (§10).
     let services = Services::new(store)
         .with_assets_root(config.data_dir.join("assets"))
+        // Persist the per-provider models.list cache in the data dir (§5.30).
+        .with_models_cache_dir(config.data_dir.clone())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone());
