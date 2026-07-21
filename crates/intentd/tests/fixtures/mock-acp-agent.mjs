@@ -464,6 +464,12 @@ async function dispatch(msg) {
       return result(msg.id, { sessionId: SESSION_ID });
     }
     case 'session/load':
+      // Mirror session/new's stash-overwrite so a future loadSession-capable
+      // fixture (or a test sending session/load first) can't observe a stale
+      // list; the load itself is still rejected (loadSession: false).
+      sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
+        ? msg.params.mcpServers
+        : [];
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
       // Accept any mode change request (no-op for the mock).
