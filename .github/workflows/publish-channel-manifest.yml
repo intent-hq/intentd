@@ -1,0 +1,71 @@
+# Post-announce hook for the dist Release pipeline (see dist-workspace.toml
+# `post-announce-jobs`). After a vX.Y.Z[-beta.N] release is published, this
+# builds a channel manifest from the release's artifacts and uploads it to a
+# fixed channel release:
+#
+#   stable tags (vX.Y.Z)        -> stable.json on the `channel-stable` release
+#   prerelease tags (vX.Y.Z-*)  -> beta.json   on the `channel-beta` release
+#
+# The manifests give consumers (e.g. cloudlands-fe pin-bump automation,
+# installer scripts) a stable URL to discover the latest release per channel.
+# Schema is documented in scripts/make-channel-manifest.sh and the README.
+name: Publish channel manifest
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-channel-manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Determine tag and channel
+        id: meta
+        shell: bash
+        run: |
+          tag=$(jq -r '.announcement_tag' <<<"$PLAN")
+          if [[ -z "$tag" || "$tag" == "null" ]]; then
+            echo "error: no announcement_tag in plan" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          if [[ "$version" == *-* ]]; then
+            channel="beta"
+          else
+            channel="stable"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Build channel manifest
+        shell: bash
+        run: |
+          ./scripts/make-channel-manifest.sh \
+            "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.meta.outputs.channel }}.json"
+      - name: Publish manifest to channel release
+        shell: bash
+        run: |
+          channel_tag="channel-${{ steps.meta.outputs.channel }}"
+          if ! gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$channel_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --latest=false \
+              --title "Channel manifest: ${{ steps.meta.outputs.channel }}" \
+              --notes "Machine-readable pointer to the latest ${{ steps.meta.outputs.channel }} intentd release. Do not consume the tag itself; download the ${{ steps.meta.outputs.channel }}.json asset."
+          fi
+          gh release upload "$channel_tag" \
+            "${{ steps.meta.outputs.channel }}.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
