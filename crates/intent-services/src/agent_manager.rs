@@ -1900,6 +1900,20 @@ impl AgentManager {
     /// grandchildren linger. Returns whether a handle existed. This is the
     /// `agent.stop` / hard-cancel cancel semantics.
     pub async fn stop(&self, agent_id: &AgentId) -> bool {
+        let (removed, child) = self.detach(agent_id).await;
+        if let Some(child) = child {
+            kill_child_tree(child).await;
+        }
+        removed
+    }
+
+    /// Shared teardown body of [`AgentManager::stop`]: abort the worker, drop
+    /// stale flags, settle the turn, remove the handle, deregister — and hand
+    /// back the detached child (if any) so the caller decides how to kill it.
+    /// `stop()` kills the single tree inline (SIGTERM→grace→SIGKILL);
+    /// `shutdown()` collects every detached child and kills all process groups
+    /// concurrently under ONE shared grace window.
+    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<Child>) {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
         }
@@ -1911,13 +1925,9 @@ impl AgentManager {
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
-        if let Some(mut handle) = handle {
-            if let Some(child) = handle._child.take() {
-                kill_child_tree(child).await;
-            }
-        }
+        let child = handle.and_then(|mut h| h._child.take());
         self.registry.deregister(agent_id);
-        removed
+        (removed, child)
     }
 
     /// Interrupt one agent's in-flight turn WITHOUT killing its child — the TS
@@ -3170,10 +3180,20 @@ impl AgentManager {
             }
         }
 
-        // Now stop every agent (settles to RuntimeIdle, kills children).
+        // Now tear down every agent's bookkeeping (settles to RuntimeIdle) and
+        // collect the detached children, then kill all process groups in
+        // parallel under ONE shared grace window — total teardown stays ~one
+        // grace period regardless of agent count, instead of N sequential
+        // SIGTERM→grace→SIGKILL cycles (which would blow past the 5s
+        // SIGTERM→SIGKILL windows of `intentd stop` and the Electron sidecar).
+        let mut children = Vec::new();
         for id in &ids {
-            self.stop(id).await;
+            let (_, child) = self.detach(id).await;
+            if let Some(child) = child {
+                children.push(child);
+            }
         }
+        kill_child_trees(children).await;
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
@@ -3260,6 +3280,105 @@ async fn kill_child_tree(mut child: Child) {
 #[cfg(not(unix))]
 async fn kill_child_tree(mut child: Child) {
     let _ = child.start_kill();
+}
+
+/// Parallel shutdown kill sweep: terminate MANY provider process trees under
+/// ONE shared grace window. Every group is SIGTERMed up-front, then a single
+/// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
+/// still-live group is SIGKILLed — so total teardown is ~one grace period
+/// regardless of how many agents were running (unlike per-child
+/// [`kill_child_tree`], which serialises one grace window per tree).
+#[cfg(unix)]
+async fn kill_child_trees(children: Vec<Child>) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    // Phase 1: SIGTERM every group up-front so all trees start exiting at once.
+    let mut pgids = Vec::new();
+    let mut waits = Vec::new();
+    for mut child in children {
+        match child.id() {
+            Some(pid) => {
+                let pgid = Pid::from_raw(pid as i32);
+                let _ = killpg(pgid, Signal::SIGTERM);
+                pgids.push(pgid);
+                // Reap on a task so all waits run concurrently; the task keeps
+                // running past the timeout below and reaps the child after the
+                // SIGKILL sweep (no zombies).
+                waits.push(tokio::spawn(async move {
+                    let _ = child.wait().await;
+                }));
+            }
+            None => {
+                // Already reaped — nothing to signal.
+                let _ = child.start_kill();
+            }
+        }
+    }
+    // Phase 2: ONE shared grace window over the whole batch.
+    let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, async {
+        for w in waits {
+            let _ = w.await;
+        }
+    })
+    .await;
+    // Phase 3: concurrent SIGKILL sweep for anything that ignored SIGTERM
+    // (no-op on groups that already exited).
+    for pgid in pgids {
+        let _ = killpg(pgid, Signal::SIGKILL);
+    }
+}
+
+/// Non-unix fallback: no process groups, so kill each direct child; the kills
+/// are signal-only (no grace waits), so the sweep is already time-bounded.
+#[cfg(not(unix))]
+async fn kill_child_trees(children: Vec<Child>) {
+    for child in children {
+        kill_child_tree(child).await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod kill_sweep_tests {
+    //! Timing proof for the parallel shutdown kill sweep: N children that
+    //! ignore SIGTERM must tear down in ~ONE shared grace window, not N
+    //! sequential ones.
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_children_tear_down_in_one_shared_grace_window() {
+        const N: usize = 4;
+        let mut children = Vec::with_capacity(N);
+        for _ in 0..N {
+            let mut cmd = tokio::process::Command::new("sh");
+            // Ignore SIGTERM so each child only dies on the SIGKILL sweep,
+            // forcing the full grace window to elapse.
+            cmd.args(["-c", "trap '' TERM; sleep 30"]);
+            cmd.process_group(0);
+            cmd.kill_on_drop(true);
+            children.push(cmd.spawn().expect("spawn slow child"));
+        }
+        // Let each sh install its trap before SIGTERM arrives.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let start = std::time::Instant::now();
+        kill_child_trees(children).await;
+        let elapsed = start.elapsed();
+
+        // Serial teardown would take ~N * grace (8s for 4 children); the
+        // shared window must finish in ~one grace period (<4s total).
+        assert!(
+            elapsed < PROCESS_GROUP_TERM_GRACE * 2,
+            "parallel sweep took {elapsed:?}, expected ~one {PROCESS_GROUP_TERM_GRACE:?} grace window"
+        );
+        // The children ignored SIGTERM, so the full shared grace must have
+        // elapsed (proves the window ran once, not that children died early).
+        assert!(
+            elapsed >= PROCESS_GROUP_TERM_GRACE - Duration::from_millis(500),
+            "sweep returned after {elapsed:?}, before the shared grace window elapsed"
+        );
+    }
 }
 
 /// One `text` ACP prompt content block for a user message.
