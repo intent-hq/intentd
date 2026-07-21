@@ -1667,20 +1667,7 @@ mod mcp_tests {
         use intent_providers::{build_provider_env, find_provider};
         use std::collections::BTreeMap;
 
-        // Build opencode's env with permission.task=deny (with model set)
-        let opencode = find_provider("opencode").unwrap();
-        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
-        let config_content = env
-            .get("OPENCODE_CONFIG_CONTENT")
-            .expect("OPENCODE_CONFIG_CONTENT must be set");
-
-        // Parse the initial config (should have model + permission keys)
-        let mut config: Value = serde_json::from_str(config_content)
-            .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
-        assert_eq!(config["model"], json!("claude-sonnet-4"));
-        assert_eq!(config["permission"]["task"], json!("deny"));
-
-        // Simulate the workspace-MCP merge path: prepare a normalized MCP server list
+        // Prepare a normalized MCP server list and its opencode `mcp` block.
         let mut servers = BTreeMap::new();
         servers.insert(
             "ws".to_string(),
@@ -1690,14 +1677,20 @@ mod mcp_tests {
                 env: BTreeMap::new(),
             },
         );
-
-        // Convert normalized servers to opencode mcp block
         let mcp_block = to_opencode_mcp_config(&servers);
+        let mcp_json = serde_json::to_string(&mcp_block).unwrap();
 
-        // Merge the mcp block into the existing config (opencode's env merge logic)
-        // This simulates what happens when the daemon merges workspace MCP servers
-        // into the provider's OPENCODE_CONFIG_CONTENT at spawn time.
-        config["mcp"] = mcp_block;
+        // Build opencode's env with the mcp block merged at spawn time — the
+        // real daemon path (agent_manager passes the serialized block through
+        // SpawnOptions::env_mcp_config into build_provider_env).
+        let opencode = find_provider("opencode").unwrap();
+        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None, Some(&mcp_json));
+        let config_content = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("OPENCODE_CONFIG_CONTENT must be set");
+
+        let config: Value = serde_json::from_str(config_content)
+            .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
 
         // Assert: permission.task=deny must still be present after the merge
         assert_eq!(
