@@ -115,9 +115,16 @@ pub(crate) fn resolve_credential(
     // No credential source produced a usable `Cred` — return `Err` rather than
     // falling through to `Cred::default()` (an anonymous credential libgit2
     // would silently retry, driving the auth-failure loop this module bounds).
-    Err(git2::Error::from_str(
-        "no usable git credentials (ssh-agent / credential helper / GitHub token)",
-    ))
+    // The token step only ever applies to HTTPS github.com remotes, so only
+    // mention it where it was actually in play.
+    let sources = if is_https_github_url(url) {
+        "ssh-agent / credential helper / GitHub token"
+    } else {
+        "ssh-agent / credential helper"
+    };
+    Err(git2::Error::from_str(&format!(
+        "no usable git credentials ({sources})"
+    )))
 }
 
 /// Build a bounded credentials closure suitable for
