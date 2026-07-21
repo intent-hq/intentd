@@ -669,6 +669,24 @@ pub(crate) fn new_message_id() -> String {
     format!("user-msg-{}", Uuid::new_v4())
 }
 
+/// The `agent:message` event payload for a persisted transcript row
+/// (PROTOCOL §6.5): `{ agentId, messageId, role }` plus `appMessageId` when
+/// the row carries a client-minted `userAppMessageId` (lifted from the row
+/// metadata at append time) — the echo the FE dedup guard matches its
+/// optimistic user message against. Rows without a client id keep the
+/// pre-existing three-field shape (backward compatible).
+pub(crate) fn agent_message_event_payload(agent_id: &AgentId, message: &AgentMessage) -> Value {
+    let mut payload = json!({
+        "agentId": agent_id.0,
+        "messageId": message.id,
+        "role": message.role,
+    });
+    if let Some(app_id) = &message.app_message_id {
+        payload["appMessageId"] = json!(app_id);
+    }
+    payload
+}
+
 /// Whether a wire `priority` requests interrupt delivery (PROTOCOL §5.5):
 /// `"interrupt"` preempts the in-flight turn keep-alive; anything else (or
 /// absent) is normal queue-vs-stream delivery.
@@ -1756,7 +1774,7 @@ impl Services {
             &session.workspace_id,
             &agent_id,
             AGENT_MESSAGE,
-            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+            agent_message_event_payload(&agent_id, &message),
         )
         .await;
         Ok(json!({ "success": true, "message": message }))
@@ -2266,7 +2284,7 @@ impl Services {
                             &session.workspace_id,
                             &agent_id,
                             AGENT_MESSAGE,
-                            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                            agent_message_event_payload(&agent_id, &message),
                         )
                         .await;
                     }
@@ -2294,6 +2312,9 @@ impl Services {
 
     /// `agent.forceMessage`: stop the current stream (best-effort) then deliver
     /// immediately with the caller-supplied `messageId` (PROTOCOL §5.5).
+    /// `message_metadata` is persisted on the row (parity with the runtime
+    /// `AgentManager::force_message` path) so a folded `userAppMessageId`
+    /// round-trips on transcript reads from the store-only fallback too.
     pub(crate) async fn agent_force_message_op(
         &self,
         agent_id: AgentId,
@@ -2301,6 +2322,7 @@ impl Services {
         content: String,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if message_id.len() > MAX_MESSAGE_ID_LEN {
@@ -2320,7 +2342,7 @@ impl Services {
                 &message_id,
                 "user",
                 &blocks,
-                None,
+                message_metadata.as_ref(),
                 &created_at,
             )
             .await?;
@@ -2341,7 +2363,7 @@ impl Services {
             &session.workspace_id,
             &agent_id,
             AGENT_MESSAGE,
-            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+            agent_message_event_payload(&agent_id, &message),
         )
         .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
@@ -4191,7 +4213,7 @@ impl Services {
             workspace_id,
             agent_id,
             AGENT_MESSAGE,
-            json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+            agent_message_event_payload(agent_id, &message),
         )
         .await;
         manager.clone().finish_prepersisted_turn_spawn(
@@ -4241,7 +4263,7 @@ impl Services {
                     workspace_id,
                     agent_id,
                     AGENT_MESSAGE,
-                    json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                    agent_message_event_payload(agent_id, &message),
                 )
                 .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))

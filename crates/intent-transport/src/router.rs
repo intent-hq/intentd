@@ -1045,13 +1045,16 @@ async fn dispatch(
             // `{ source: "system" }`). Passed through unmodified and persisted
             // on the user message row via the store's metadata-aware append.
             let message_metadata = opt_value(params, "messageMetadata");
-            // App-ID trio (`userAppMessageId` / `assistantMessageId` /
-            // `assistantAppMessageId`) is a client-side identity/dedupe layer
-            // that the daemon does NOT consume: the transcript is keyed on
-            // the server-minted UUIDv7 `id` (see `Store::append_agent_message*`)
-            // and the FE round-trips its ids through the arbitrary
-            // `messageMetadata` payload above. Any future daemon-side dedupe
-            // would surface as an explicit field on the request envelope.
+            // `userAppMessageId` (PROTOCOL §5.5): the FE's client-minted
+            // logical identity for its optimistic user message. Folded into
+            // the row `metadata` here so it persists without a schema change,
+            // then lifted back out as the wire `appMessageId` on transcript
+            // reads and echoed on the `agent:message` event so the FE dedup
+            // guard can match its optimistic insert. The assistant-side ids
+            // (`assistantMessageId` / `assistantAppMessageId`) remain
+            // unconsumed: assistant rows are keyed on the server-minted
+            // UUIDv7 id.
+            let message_metadata = merge_user_app_message_id(params, message_metadata)?;
             let result = api
                 .agent_send_message(
                     ws,
@@ -1083,9 +1086,10 @@ async fn dispatch(
             let stdin_context = opt_str(params, "stdinContext");
             let context_references = opt_value(params, "contextReferences");
             // Opaque per-message payload (PROTOCOL §5.5); see the
-            // `agent.sendMessage` extraction site above for the app-ID trio
-            // rationale and metadata semantics.
+            // `agent.sendMessage` extraction site above for the
+            // `userAppMessageId` fold and metadata semantics.
             let message_metadata = opt_value(params, "messageMetadata");
+            let message_metadata = merge_user_app_message_id(params, message_metadata)?;
             let result = api
                 .agent_force_message(
                     ws,
@@ -3020,6 +3024,56 @@ fn opt_value(params: &Map<String, Value>, name: &str) -> Option<Value> {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.clone()),
     }
+}
+
+/// Maximum accepted `userAppMessageId` length (bytes) — parity with the
+/// service-layer `messageId` cap so neither client-supplied id can bloat the
+/// row metadata unbounded.
+const MAX_USER_APP_MESSAGE_ID_LEN: usize = 256;
+
+/// Fold an optional top-level `userAppMessageId` param into the request's
+/// `messageMetadata` object under [`intent_core::USER_APP_MESSAGE_ID_KEY`]
+/// (PROTOCOL §5.5) so the id persists on the user message row without a
+/// schema change and round-trips as the wire `appMessageId`. Absent/empty ids
+/// leave the metadata untouched (backward compatible). An explicit
+/// `messageMetadata` copy of the key is preserved only when no top-level
+/// param is supplied (top-level wins). Errors: oversized id, or an id
+/// combined with a non-object `messageMetadata` (nowhere to fold it).
+fn merge_user_app_message_id(
+    params: &Map<String, Value>,
+    message_metadata: Option<Value>,
+) -> Result<Option<Value>, RpcErr> {
+    // Trim before folding (symmetric with `lift_app_message_id`): padding
+    // must not persist verbatim or count against the length cap, and a
+    // whitespace-only id reads as absent.
+    let Some(id) = opt_nonempty_str(params, intent_core::USER_APP_MESSAGE_ID_KEY)
+        .map(|s| s.trim().to_string())
+    else {
+        return Ok(message_metadata);
+    };
+    if id.len() > MAX_USER_APP_MESSAGE_ID_LEN {
+        return Err(rpc(
+            INVALID_PARAMS,
+            format!(
+                "userAppMessageId exceeds maximum length of {MAX_USER_APP_MESSAGE_ID_LEN} bytes"
+            ),
+        ));
+    }
+    let mut obj = match message_metadata {
+        None => Map::new(),
+        Some(Value::Object(m)) => m,
+        Some(_) => {
+            return Err(rpc(
+                INVALID_PARAMS,
+                "messageMetadata must be an object when userAppMessageId is supplied",
+            ))
+        }
+    };
+    obj.insert(
+        intent_core::USER_APP_MESSAGE_ID_KEY.to_string(),
+        Value::String(id),
+    );
+    Ok(Some(Value::Object(obj)))
 }
 
 /// Require a string param, mirroring TS `requireParam` (undefined/null → error).
