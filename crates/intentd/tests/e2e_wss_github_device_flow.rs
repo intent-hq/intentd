@@ -276,7 +276,8 @@ where
 // ---------------------------------------------------------------------------
 // Mock GitHub login host: plain-HTTP `/login/device/code` +
 // `/login/oauth/access_token`. Answers `authorization_pending` until
-// `authorize` is flipped, then mints the access token exactly once.
+// `authorize` is flipped, then answers every subsequent token poll with the
+// access token (the daemon's poll loop stops after the first Authorized).
 // ---------------------------------------------------------------------------
 
 struct MockGithub {
