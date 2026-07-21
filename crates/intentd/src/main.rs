@@ -1087,7 +1087,11 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
 
     let task_usage = usage.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        // Start one period out: `interval`'s first tick fires immediately,
+        // which would re-refresh right after the startup sample — under
+        // sysinfo's MINIMUM_CPU_UPDATE_INTERVAL, yielding an unreliable delta.
+        let period = Duration::from_secs(1);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
