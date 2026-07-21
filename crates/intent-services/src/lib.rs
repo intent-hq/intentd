@@ -39,8 +39,8 @@ use intent_core::{
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceEventSummary,
-    WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -91,6 +91,7 @@ mod settings;
 mod settings_registry;
 mod terminal_ops;
 pub mod tool_block;
+mod workspace_aggregates;
 
 #[cfg(test)]
 mod tests;
@@ -371,9 +372,15 @@ pub struct Services {
     github_auth_flow: github_auth_ops::FlowState,
     /// Test-only override for the GitHub login host the device flow talks to
     /// (`None` → `$INTENTD_GITHUB_LOGIN_BASE_URI` → `https://github.com`).
-    /// Unit tests inject an unroutable/mock URI so `github.connect` never
+    /// Unit tests inject an invalid/mock URI so `github.connect` never
     /// reaches github.com.
     github_login_base_uri: Option<String>,
+    /// Shared cache + offload gates for the git-derived workspace card
+    /// aggregates (`diffSummary` rollups, CoW support probes) so the
+    /// `workspace.list` / `workspace.get` emit paths never run blocking
+    /// libgit2/FS work inline on the async runtime (§9.1). Shared across
+    /// clones so concurrent list calls single-flight the same worktree.
+    workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
 }
 
 impl Services {
@@ -423,6 +430,7 @@ impl Services {
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
+            workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
         }
     }
 
@@ -780,7 +788,12 @@ impl Services {
     /// inline from the same notes/sessions scan (mirrors
     /// [`Services::derive_last_activity`] so list/get callers get both in one
     /// round-trip); keep the two derivations in lock-step when the rules or
-    /// underlying store queries change.
+    /// underlying store queries change. The git/FS-derived aggregates
+    /// (`diffSummary`, `cowSupported`) go through the shared
+    /// [`workspace_aggregates::WorkspaceAggregateCache`]: computed on the
+    /// blocking pool with bounded concurrency, cached, and degraded to the
+    /// last known value / omission when over budget, so a slow worktree can
+    /// never stall the async runtime or blow past FE RPC timeouts.
     pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
@@ -806,12 +819,19 @@ impl Services {
             }
             ws.agent_summary = Some(build_agent_summary(&sessions));
         }
-        ws.diff_summary = compute_diff_summary(ws);
+        ws.diff_summary = match ws.worktree_path.as_deref().filter(|p| !p.is_empty()) {
+            Some(worktree) => {
+                self.workspace_aggregates
+                    .diff_summary(ws.id.as_str(), PathBuf::from(worktree))
+                    .await
+            }
+            None => None,
+        };
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
         // Compute cow_supported (Task 5): direct mode + git repo + CoW probe Supported.
-        ws.cow_supported = self.compute_cow_supported(ws);
+        ws.cow_supported = self.compute_cow_supported(ws).await;
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -968,8 +988,10 @@ impl Services {
 
     /// Compute whether CoW agent isolation is supported for this workspace (Task 5).
     /// Returns Some(true) if direct mode + git repo + CoW probe Supported; Some(false)
-    /// if worktree mode or unsupported filesystem; None if probe fails.
-    fn compute_cow_supported(&self, ws: &Workspace) -> Option<bool> {
+    /// if worktree mode or unsupported filesystem; None if probe fails. The live
+    /// probe is offloaded to the blocking pool and cached per
+    /// `(repository_path, workspaces_root)` pair by the shared aggregate cache.
+    async fn compute_cow_supported(&self, ws: &Workspace) -> Option<bool> {
         // Only direct-mode workspaces
         let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
         if !is_direct_mode {
@@ -981,11 +1003,9 @@ impl Services {
         let workspaces_root = self.workspaces_root.as_ref()?;
 
         // Probe CoW support for the (repo, workspaces_root) pair
-        match intent_git::cow_probe(std::path::Path::new(repo_path), workspaces_root) {
-            Ok(intent_git::CowSupport::Supported) => Some(true),
-            Ok(intent_git::CowSupport::Unsupported) => Some(false),
-            Err(_) => None, // Probe failed; omit the field
-        }
+        self.workspace_aggregates
+            .cow_supported(repo_path.clone(), workspaces_root.clone())
+            .await
     }
 
     /// Record an agent session entering flight for `workspace_id`. On the
@@ -3300,31 +3320,6 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
         agents,
         agent_ids,
     }
-}
-
-/// Compute a workspace's `diffSummary` card aggregate from its git worktree,
-/// porting the on-demand `computeWorkspaceDiffSummary`. Returns `None` when the
-/// workspace has no worktree, the worktree is not a git repo, or there are no
-/// changes (matching the TS `undefined` fallback).
-fn compute_diff_summary(ws: &Workspace) -> Option<WorkspaceDiffSummary> {
-    let worktree = ws.worktree_path.as_deref().filter(|p| !p.is_empty())?;
-    let path = Path::new(worktree);
-    if !path.join(".git").exists() {
-        return None;
-    }
-    let (total_files, total_additions, total_deletions) =
-        intent_git::diff::head_diff_rollup(path).ok()?;
-    if total_files == 0 {
-        return None;
-    }
-    Some(WorkspaceDiffSummary {
-        schema_version: 1,
-        updated_at: now_iso(),
-        total_files,
-        total_additions,
-        total_deletions,
-        files: Vec::new(),
-    })
 }
 
 /// The seven valid task-note statuses, in the order the TS validator lists them.
@@ -6620,10 +6615,52 @@ impl WorkspaceApi for Services {
             let mut list = store.list_workspaces(include_archived).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
-            for ws in &mut list {
-                ws.activity = this.workspace_activity(&ws.id);
-                this.enrich_workspace_aggregates(ws).await;
+            // Enrichment fans out per workspace (bounded by a semaphore so a
+            // large workspace count doesn't burst-issue unbounded store reads):
+            // store reads stay on the async pool while the git/FS rollups are
+            // offloaded, bounded, and cached inside `enrich_workspace_aggregates`,
+            // so list latency is bounded by the per-aggregate budget instead of
+            // O(workspaces × workdir diff).
+            let started = std::time::Instant::now();
+            let count = list.len();
+            let enrich_gate = Arc::new(tokio::sync::Semaphore::new(
+                workspace_aggregates::MAX_CONCURRENT_ENRICHMENTS,
+            ));
+            let mut join = tokio::task::JoinSet::new();
+            for (idx, ws) in list.iter().enumerate() {
+                let mut ws = ws.clone();
+                let this = this.clone();
+                let enrich_gate = Arc::clone(&enrich_gate);
+                join.spawn(async move {
+                    // The semaphore is never closed, so acquisition can only
+                    // fail on a bug; fail loudly rather than dropping the bound.
+                    let _permit = enrich_gate
+                        .acquire_owned()
+                        .await
+                        .expect("enrichment semaphore closed");
+                    ws.activity = this.workspace_activity(&ws.id);
+                    this.enrich_workspace_aggregates(&mut ws).await;
+                    (idx, ws)
+                });
             }
+            // Merge back into store order (ORDER BY created_at) by index. If an
+            // enrichment task panics, degrade to the un-enriched base row —
+            // aggregates are advisory and optional on the wire, so one bad
+            // worktree must not fail the whole list call.
+            while let Some(res) = join.join_next().await {
+                match res {
+                    Ok((idx, ws)) => list[idx] = ws,
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "workspace.list: enrichment task failed; serving base row"
+                    ),
+                }
+            }
+            tracing::debug!(
+                workspaces = count,
+                total_ms = started.elapsed().as_millis() as u64,
+                "workspace.list: aggregate enrichment"
+            );
             // Background backfill: active workspaces with repository_path but missing
             // repository_owner/repository_name get derived from origin remote (STAB-64
             // backfill). Spawned non-blocking so list latency stays green.
