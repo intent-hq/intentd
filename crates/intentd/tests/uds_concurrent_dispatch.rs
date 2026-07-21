@@ -6,9 +6,11 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use intent_core::WorkspaceApi;
 use intent_services::{EventBus, Services};
@@ -66,10 +68,12 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>, budget: Duration) -> V
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
 
-/// A slow `host.exec` (sleeping ~1s) must not block a subsequent
-/// `workspace.list` on the same connection: the fast response comes back well
-/// before the slow one, and out-of-order responses are correlated by id.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// A slow `host.exec` (sleeping) must not block a subsequent `workspace.list`
+/// on the same connection. Concurrency is proven by response *ordering*: with
+/// serialized dispatch the slow id=1 response would always be written first;
+/// with concurrent dispatch the fast id=2 response arrives first. Ordering is
+/// robust under host load, unlike fixed wall-clock latency budgets.
+#[tokio::test(flavor = "multi_thread")]
 async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -91,20 +95,31 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let (read_half, mut write_half) = connect_retry(&socket).await.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // Slow request first: subprocess `sleep 1`. Without concurrency this would
+    // The slow sleep scales with INTENTD_TEST_TIMEOUT_MULTIPLIER so ordering
+    // stays deterministic when everything else (including workspace.list) is
+    // slowed down proportionally, e.g. under coverage instrumentation.
+    let slow_sleep = common::test_timeout(Duration::from_secs(2));
+    // Frame budgets are generous (and multiplier-scaled): they only guard
+    // against a hung connection, not latency. The base comfortably exceeds the
+    // sleep base so a serialized-dispatch regression fails on the ordering
+    // assertion below rather than on a read timeout.
+    let frame_budget = common::test_timeout(Duration::from_secs(30));
+
+    // Slow request first: subprocess sleep. Without concurrency this would
     // pin the read loop until the child exits.
-    let slow_frame = r#"{"jsonrpc":"2.0","id":1,"method":"host.exec","params":{"command":"sleep","args":["1"]}}"#;
+    let slow_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"host.exec","params":{{"command":"sleep","args":["{}"]}}}}"#,
+        slow_sleep.as_secs_f64()
+    );
     // Fast request second: goes through the JSON-RPC dispatcher slow path,
     // which is now also spawned.
     let fast_frame = r#"{"jsonrpc":"2.0","id":2,"method":"workspace.list"}"#;
 
-    let start = Instant::now();
-    send(&mut write_half, slow_frame).await;
+    send(&mut write_half, &slow_frame).await;
     send(&mut write_half, fast_frame).await;
 
-    // First response must be the fast one, well under the 1s sleep budget.
-    let first = read_json(&mut reader, Duration::from_millis(500)).await;
-    let elapsed = start.elapsed();
+    // Ordering is the regression signal: the fast response must arrive first.
+    let first = read_json(&mut reader, frame_budget).await;
     assert_eq!(
         first["id"], 2,
         "fast request (workspace.list) must respond before slow host.exec: got {first}"
@@ -113,13 +128,9 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
         first.get("result").is_some(),
         "workspace.list must succeed: got {first}"
     );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "workspace.list took {elapsed:?} — slow host.exec is still blocking the read loop"
-    );
 
     // The slow exec still completes and its response arrives afterwards.
-    let second = read_json(&mut reader, Duration::from_secs(5)).await;
+    let second = read_json(&mut reader, frame_budget).await;
     assert_eq!(
         second["id"], 1,
         "second response must be host.exec: {second}"
