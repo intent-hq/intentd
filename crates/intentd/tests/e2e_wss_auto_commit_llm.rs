@@ -12,6 +12,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -123,7 +125,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
@@ -371,13 +373,11 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         cow_supported: None,
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
-    // Set auggie path in settings if provided (store expects JSON-encoded string).
+    // Seed context.auggiePath via config.toml (TOML-backed setting) so the
+    // daemon's settings registry picks it up on boot.
     if let Some(bin) = auggie_bin {
-        let json_value = serde_json::json!(bin.to_string_lossy().to_string());
-        store
-            .set_setting("context.auggiePath", &json_value.to_string())
-            .await
-            .expect("set auggie path setting");
+        let toml = format!("[context]\nauggiePath = {:?}\n", bin.to_string_lossy());
+        std::fs::write(data_dir.join("config.toml"), toml).expect("write config.toml");
     }
     drop(store);
     (ws_id.0, repo_dir)

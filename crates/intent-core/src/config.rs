@@ -2,11 +2,15 @@
 //!
 //! Paths are resolved via the `directories` crate, honoring the
 //! `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment overrides. The data dir
-//! holds the SQLite database (`intentd.db`) and the UDS (`intentd.sock`).
+//! holds the SQLite database (`intentd.db`), the UDS (`intentd.sock`), and the
+//! non-secret settings file (`config.toml`), which is loaded strictly through
+//! [`crate::settings_file::SettingsFile`] — a malformed file fails `resolve()`
+//! instead of being silently ignored.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
+use crate::settings_file::SettingsFile;
 
 /// Default idle-reap TTL in minutes (`agents.idleReapMinutes`, §11.1); `0`
 /// disables the sweep entirely.
@@ -42,31 +46,37 @@ pub struct Config {
 }
 
 impl Config {
-    /// Resolve paths from the platform defaults and env overrides (§11.2).
+    /// Resolve paths from the platform defaults and env overrides (§11.2),
+    /// then load `config.toml` strictly via [`SettingsFile::load_or_init`].
+    ///
+    /// `config.toml` lives in the **data dir** (`<data_dir>/config.toml`);
+    /// `INTENTD_CONFIG` overrides the full path. A missing file is initialized
+    /// with the commented default template; a malformed file (unknown key,
+    /// wrong type, out-of-range value) is an error — never silently ignored.
+    /// `INTENTD_IDLE_REAP_MINUTES` / `INTENTD_STREAM_RETENTION_HOURS` env vars
+    /// still take precedence over the file for their respective knobs.
     pub fn resolve() -> Result<Self> {
-        let proj = directories::ProjectDirs::from("", "", "intentd");
-
         let data_dir = match std::env::var_os("INTENTD_DATA_DIR") {
             Some(p) => PathBuf::from(p),
-            None => proj
-                .as_ref()
+            None => directories::ProjectDirs::from("", "", "intentd")
                 .map(|d| d.data_dir().to_path_buf())
                 .ok_or_else(|| Error::Internal("could not resolve data directory".to_string()))?,
         };
 
         let config_path = match std::env::var_os("INTENTD_CONFIG") {
             Some(p) => PathBuf::from(p),
-            None => proj
-                .as_ref()
-                .map(|d| d.config_dir().join("config.toml"))
-                .ok_or_else(|| Error::Internal("could not resolve config directory".to_string()))?,
+            None => data_dir.join("config.toml"),
         };
+
+        let settings = SettingsFile::load_or_init(&config_path)?;
 
         let db_path = data_dir.join("intentd.db");
         let socket_path = data_dir.join("intentd.sock");
         let pid_path = data_dir.join("intentd.pid");
-        let idle_reap_minutes = load_idle_reap_minutes(&config_path);
-        let stream_retention_hours = load_stream_retention_hours(&config_path);
+        let idle_reap_minutes =
+            env_u32("INTENTD_IDLE_REAP_MINUTES").unwrap_or(settings.agents.idle_reap_minutes);
+        let stream_retention_hours = env_u32("INTENTD_STREAM_RETENTION_HOURS")
+            .unwrap_or(settings.events.stream_retention_hours);
 
         Ok(Self {
             data_dir,
@@ -80,121 +90,12 @@ impl Config {
     }
 }
 
-/// Read `agents.idleReapMinutes` from `config.toml`, falling back to the
-/// `INTENTD_IDLE_REAP_MINUTES` env override and finally
-/// [`DEFAULT_IDLE_REAP_MINUTES`]. A missing/unparseable file or key is not an
-/// error — the daemon simply uses the default.
-fn load_idle_reap_minutes(config_path: &Path) -> u32 {
-    if let Some(v) = std::env::var_os("INTENTD_IDLE_REAP_MINUTES") {
-        if let Ok(n) = v.to_string_lossy().trim().parse::<u32>() {
-            return n;
-        }
-    }
-    let Ok(text) = std::fs::read_to_string(config_path) else {
-        return DEFAULT_IDLE_REAP_MINUTES;
-    };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        return DEFAULT_IDLE_REAP_MINUTES;
-    };
-    value
-        .get("agents")
-        .and_then(|a| {
-            a.get("idleReapMinutes")
-                .or_else(|| a.get("idle_reap_minutes"))
-        })
-        .and_then(toml::Value::as_integer)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(DEFAULT_IDLE_REAP_MINUTES)
-}
-
-/// Read `events.streamRetentionHours` from `config.toml`, falling back to the
-/// `INTENTD_STREAM_RETENTION_HOURS` env override and finally
-/// [`DEFAULT_STREAM_RETENTION_HOURS`]. A missing/unparseable file or key is not
-/// an error — the daemon simply uses the default (72h opt-out retention).
-fn load_stream_retention_hours(config_path: &Path) -> u32 {
-    if let Some(v) = std::env::var_os("INTENTD_STREAM_RETENTION_HOURS") {
-        if let Ok(n) = v.to_string_lossy().trim().parse::<u32>() {
-            return n;
-        }
-    }
-    let Ok(text) = std::fs::read_to_string(config_path) else {
-        return DEFAULT_STREAM_RETENTION_HOURS;
-    };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        return DEFAULT_STREAM_RETENTION_HOURS;
-    };
-    value
-        .get("events")
-        .and_then(|e| {
-            e.get("streamRetentionHours")
-                .or_else(|| e.get("stream_retention_hours"))
-        })
-        .and_then(toml::Value::as_integer)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(DEFAULT_STREAM_RETENTION_HOURS)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp_config(body: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("intentd-cfg-{}.toml", uuid::Uuid::new_v4()));
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    #[test]
-    fn idle_reap_minutes_defaults_when_file_missing() {
-        let missing =
-            std::env::temp_dir().join(format!("intentd-missing-{}.toml", uuid::Uuid::new_v4()));
-        assert_eq!(load_idle_reap_minutes(&missing), DEFAULT_IDLE_REAP_MINUTES);
-    }
-
-    #[test]
-    fn idle_reap_minutes_parsed_from_camel_and_snake_case() {
-        let camel = temp_config("[agents]\nidleReapMinutes = 5\n");
-        assert_eq!(load_idle_reap_minutes(&camel), 5);
-        std::fs::remove_file(&camel).ok();
-
-        let snake = temp_config("[agents]\nidle_reap_minutes = 12\n");
-        assert_eq!(load_idle_reap_minutes(&snake), 12);
-        std::fs::remove_file(&snake).ok();
-    }
-
-    #[test]
-    fn idle_reap_minutes_zero_disables() {
-        let path = temp_config("[agents]\nidleReapMinutes = 0\n");
-        assert_eq!(load_idle_reap_minutes(&path), 0);
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn stream_retention_hours_defaults_to_72h_when_file_missing() {
-        let missing =
-            std::env::temp_dir().join(format!("intentd-missing-{}.toml", uuid::Uuid::new_v4()));
-        assert_eq!(
-            load_stream_retention_hours(&missing),
-            DEFAULT_STREAM_RETENTION_HOURS
-        );
-        assert_eq!(DEFAULT_STREAM_RETENTION_HOURS, 72);
-    }
-
-    #[test]
-    fn stream_retention_hours_parsed_from_camel_and_snake_case() {
-        let camel = temp_config("[events]\nstreamRetentionHours = 48\n");
-        assert_eq!(load_stream_retention_hours(&camel), 48);
-        std::fs::remove_file(&camel).ok();
-
-        let snake = temp_config("[events]\nstream_retention_hours = 72\n");
-        assert_eq!(load_stream_retention_hours(&snake), 72);
-        std::fs::remove_file(&snake).ok();
-    }
-
-    #[test]
-    fn stream_retention_hours_zero_disables() {
-        let path = temp_config("[events]\nstreamRetentionHours = 0\n");
-        assert_eq!(load_stream_retention_hours(&path), 0);
-        std::fs::remove_file(&path).ok();
-    }
+/// Read a `u32` env override; unset or unparseable values yield `None` so the
+/// caller falls through to the file-backed value.
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var_os(name)?
+        .to_string_lossy()
+        .trim()
+        .parse()
+        .ok()
 }

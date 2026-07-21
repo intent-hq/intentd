@@ -1,10 +1,10 @@
-//! WSS end-to-end regression tests for duplicate client-supplied agent ids
-//! (the retry-poisoned `workspace.create` bug): `agent.create` with an
-//! `agentId` that already names a persisted session is `-32602` naming the id
-//! (not the pre-fix opaque `-32603` SQLite UNIQUE(1555) failure), and
-//! `workspace.create` with a duplicate `initialAgent.agentId` fails fast with
-//! the same error and leaves NO partial workspace: no row, no worktree
-//! directory under the workspaces root, and no `workspace:created` event.
+//! WSS end-to-end regression tests for server-assigned agent ids: the
+//! protocol no longer accepts client-supplied ids, so `agent.create` with an
+//! `agentId` param and `workspace.create` with `initialAgent.agentId` are
+//! both rejected with `-32602` ("server-assigned") before any side effect —
+//! no agent row, no workspace row, no worktree directory under the
+//! workspaces root, and no `workspace:created` event. Requests without the
+//! field succeed and return a daemon-minted `agent-{uuid}` id.
 
 #![cfg(unix)]
 
@@ -42,7 +42,7 @@ struct Fixture {
 
 async fn boot() -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-dup-id-{}", &short[..8]));
+    let dir = std::env::temp_dir().join(format!("intentd-srv-id-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
@@ -159,10 +159,11 @@ fn init_git_repo(path: &PathBuf) {
     run(&["commit", "-m", "Initial commit"]);
 }
 
-/// `agent.create` with an `agentId` that already names a persisted session is
-/// `-32602` naming the duplicate id (PROTOCOL §5.5 / §9).
+/// `agent.create` with a client-supplied `agentId` is rejected `-32602`
+/// ("server-assigned"); the same request without the field succeeds and
+/// returns a daemon-minted `agent-{uuid}` id.
 #[tokio::test]
-async fn agent_create_duplicate_agent_id_returns_invalid_params() {
+async fn agent_create_rejects_client_agent_id_and_mints_server_id() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
 
@@ -177,65 +178,58 @@ async fn agent_create_duplicate_agent_id_returns_invalid_params() {
         .as_str()
         .expect("workspace id")
         .to_string();
+
+    // Stale-client shape: agentId supplied → -32602, no session persisted.
     let requested = format!("agent-{}", uuid::Uuid::new_v4());
-    let first = wss_rpc_raw(
+    let rejected = wss_rpc_raw(
         &mut rpc,
         2,
         "agent.create",
-        json!({ "workspaceId": ws_id, "agentId": requested, "name": "First" }),
+        json!({ "workspaceId": ws_id, "agentId": requested, "name": "Stale" }),
     )
     .await;
-    assert_eq!(
-        first["result"]["agent"]["id"].as_str(),
-        Some(requested.as_str()),
-        "first create adopts the client-supplied id: {first}"
-    );
-
-    let dup = wss_rpc_raw(
-        &mut rpc,
-        3,
-        "agent.create",
-        json!({ "workspaceId": ws_id, "agentId": requested, "name": "Second" }),
-    )
-    .await;
-    let err = dup.get("error").expect("duplicate agent.create must error");
-    assert_eq!(err["code"], -32602, "expected -32602, got: {dup}");
+    let err = rejected
+        .get("error")
+        .expect("agent.create with agentId must error");
+    assert_eq!(err["code"], -32602, "expected -32602, got: {rejected}");
     let msg = err["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains(&requested),
-        "error must name the duplicate id, got: {msg}"
+        msg.contains("server-assigned"),
+        "error must say ids are server-assigned, got: {msg}"
     );
+    let listed = wss_rpc_raw(&mut rpc, 3, "agent.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "rejected create must not persist a session: {listed}"
+    );
+
+    // Without the field the daemon mints and returns the id.
+    let ok = wss_rpc_raw(
+        &mut rpc,
+        4,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Fresh" }),
+    )
+    .await;
+    let minted = ok["result"]["agent"]["id"]
+        .as_str()
+        .expect("server-minted agent id");
+    let uuid_part = minted
+        .strip_prefix("agent-")
+        .expect("id uses the agent-{uuid} format");
+    uuid::Uuid::parse_str(uuid_part).expect("suffix is a valid uuid");
 }
 
-/// `workspace.create` with a duplicate `initialAgent.agentId` fails with
-/// `-32602` naming the id BEFORE any provisioning side effect: no workspace
-/// row, no worktree/clone directory under the workspaces root, and no
-/// `workspace:created` event.
+/// `workspace.create` carrying `initialAgent.agentId` fails with `-32602`
+/// BEFORE any provisioning side effect: no workspace row, no worktree/clone
+/// directory under the workspaces root, and no `workspace:created` event.
 #[tokio::test]
-async fn workspace_create_duplicate_initial_agent_id_leaves_no_partial_workspace() {
+async fn workspace_create_with_initial_agent_id_leaves_no_partial_workspace() {
     let fx = boot().await;
     let mut rpc = connect(fx.port).await;
 
-    // Workspace A hosts the pre-existing session at the requested id.
-    let created = wss_rpc_raw(
-        &mut rpc,
-        1,
-        "workspace.create",
-        json!({ "title": "Host WS" }),
-    )
-    .await;
-    let ws_id = created["result"]["workspace"]["id"]
-        .as_str()
-        .expect("workspace id")
-        .to_string();
     let requested = format!("agent-{}", uuid::Uuid::new_v4());
-    wss_rpc_raw(
-        &mut rpc,
-        2,
-        "agent.create",
-        json!({ "workspaceId": ws_id, "agentId": requested, "name": "Existing" }),
-    )
-    .await;
 
     // Subscribe BEFORE the failing create so a leaked `workspace:created`
     // would be observed on this connection.
@@ -253,9 +247,9 @@ async fn workspace_create_duplicate_initial_agent_id_leaves_no_partial_workspace
     );
 
     // A real git repo so worktree provisioning WOULD run if the create got
-    // past the duplicate-id validation.
+    // past the agentId rejection guard.
     let repo_dir =
-        std::env::temp_dir().join(format!("dup-id-repo-{}", uuid::Uuid::new_v4().simple()));
+        std::env::temp_dir().join(format!("srv-id-repo-{}", uuid::Uuid::new_v4().simple()));
     init_git_repo(&repo_dir);
 
     let list_before = wss_rpc_raw(&mut rpc, 3, "workspace.list", json!({})).await;
@@ -270,20 +264,20 @@ async fn workspace_create_duplicate_initial_agent_id_leaves_no_partial_workspace
         4,
         "workspace.create",
         json!({
-            "title": "Retry Poisoned",
+            "title": "Stale Client",
             "repositoryPath": repo_dir.to_string_lossy(),
-            "initialAgent": { "agentId": requested, "prompt": "retry with stale id" },
+            "initialAgent": { "agentId": requested, "prompt": "create with stale id" },
         }),
     )
     .await;
     let err = failed
         .get("error")
-        .expect("duplicate initialAgent.agentId must fail the create");
+        .expect("initialAgent.agentId must fail the create");
     assert_eq!(err["code"], -32602, "expected -32602, got: {failed}");
     let msg = err["message"].as_str().unwrap_or_default();
     assert!(
-        msg.contains(&requested),
-        "error must name the duplicate id, got: {msg}"
+        msg.contains("server-assigned"),
+        "error must say ids are server-assigned, got: {msg}"
     );
 
     // No partial workspace: row count and on-disk root entries unchanged.

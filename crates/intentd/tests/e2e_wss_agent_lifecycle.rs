@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -77,8 +79,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     cmd.spawn().expect("spawn intentd serve")
 }
 
+/// Wait for the daemon's UDS to accept connections, up to the shared
+/// daemon-startup budget (see `common::daemon_startup_timeout`).
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
@@ -4196,9 +4200,9 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
         "subscribed: {sub_resp}"
     );
 
-    // RPC conn — one workspace.create carrying the full initialAgent payload.
+    // RPC conn — one workspace.create carrying the full initialAgent payload
+    // (agent id is server-assigned and read back from the result).
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    let agent_id = format!("agent-{}", Uuid::new_v4());
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -4208,7 +4212,6 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
             "branch": "feat/initial-agent-e2e",
             "idempotencyKey": "wss-create-idem-1",
             "initialAgent": {
-                "agentId": agent_id,
                 "prompt": "build the initial feature",
                 "name": "Initial agent",
                 "model": "mock:default",
@@ -4218,9 +4221,13 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
     )
     .await;
     let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
-    assert_eq!(
-        created["initialAgent"]["id"], agent_id,
-        "result carries the created agent: {created}"
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("result carries the created agent")
+        .to_string();
+    assert!(
+        agent_id.starts_with("agent-"),
+        "server-minted agent-{{uuid}} id: {created}"
     );
     assert_eq!(created["initialAgent"]["name"], "Initial agent");
 
@@ -5389,7 +5396,6 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
     );
 
     let mut rpc = connect_ws(port, cfg.clone()).await;
-    let agent_id = format!("agent-{}", Uuid::new_v4());
     let created = wss_rpc(
         &mut rpc,
         10,
@@ -5398,7 +5404,6 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
             "title": "No-prompt WS",
             "branch": "feat/initial-agent-no-prompt-e2e",
             "initialAgent": {
-                "agentId": agent_id,
                 "name": "Coordinator",
                 "model": "mock:default",
                 "specialist": "implementor",
@@ -5407,10 +5412,10 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
     )
     .await;
     let ws_id = created["workspace"]["id"].as_str().expect("workspace id");
-    assert_eq!(
-        created["initialAgent"]["id"], agent_id,
-        "no-prompt create still returns the agent: {created}"
-    );
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("no-prompt create still returns the agent")
+        .to_string();
     assert_eq!(created["initialAgent"]["name"], "Coordinator");
 
     // Event flow: workspace:created → agent:created, NO stream frames.

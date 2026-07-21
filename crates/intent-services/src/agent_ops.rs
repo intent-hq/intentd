@@ -70,21 +70,23 @@ mod tests_specialist_frontmatter;
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
-async fn resolve_default_model_from_settings(
+fn resolve_default_model_from_settings(
     services: &Services,
     workspace_id: &WorkspaceId,
     is_background: bool,
     agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
+    let settings = services.effective_settings();
+
     // 1. Check workspace-specific override
-    if let Ok(Some(raw)) = services.store.get_setting("model.workspaceOverrides").await {
-        if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
-            if let Some(model) = overrides.get(workspace_id.as_str()).and_then(Value::as_str) {
-                if !model.is_empty() {
-                    return Some(model.to_string());
-                }
-            }
+    if let Some(model) = settings
+        .model
+        .workspace_overrides
+        .get(workspace_id.as_str())
+    {
+        if !model.is_empty() {
+            return Some(model.clone());
         }
     }
 
@@ -92,75 +94,39 @@ async fn resolve_default_model_from_settings(
     if is_background {
         // 2a. Check agent type override
         if let Some(typ) = agent_type {
-            if let Ok(Some(raw)) = services
-                .store
-                .get_setting("backgroundAgents.typeOverrides")
-                .await
-            {
-                if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(model) = overrides.get(typ).and_then(Value::as_str) {
-                        if !model.is_empty() {
-                            return Some(model.to_string());
-                        }
-                    }
+            if let Some(model) = settings.background_agents.type_overrides.get(typ) {
+                if !model.is_empty() {
+                    return Some(model.clone());
                 }
             }
         }
 
         // 2b. Check background agents default
-        if let Ok(Some(raw)) = services
-            .store
-            .get_setting("backgroundAgents.defaultModel")
-            .await
+        if let Some(model) = settings
+            .background_agents
+            .default_model
+            .as_deref()
+            .filter(|m| !m.is_empty())
         {
-            if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
-                if !model.is_empty() {
-                    return Some(model);
-                }
-            }
+            return Some(model.to_string());
         }
     }
 
     // 3. Check provider defaults
     let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
-    if let Ok(Some(raw)) = services.store.get_setting("model.providerDefaults").await {
-        if let Ok(Value::Object(defaults)) = serde_json::from_str::<Value>(&raw) {
-            if let Some(model) = defaults.get(provider_key).and_then(Value::as_str) {
-                if !model.is_empty() {
-                    return Some(model.to_string());
-                }
-            }
+    if let Some(model) = settings.model.provider_defaults.get(provider_key) {
+        if !model.is_empty() {
+            return Some(model.clone());
         }
     }
 
     // 4. Check global default
-    if let Ok(Some(raw)) = services.store.get_setting("model.default").await {
-        if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
-            if !model.is_empty() {
-                return Some(model);
-            }
-        }
+    if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
+        return Some(model.to_string());
     }
 
     // 5. None → CLI default (session.model stays None)
     None
-}
-
-/// RAII claim on a client-supplied agent id while a create flow is in flight
-/// (see [`Services::reserve_agent_id`]). Dropping the guard — on success or
-/// failure — releases the id so a later legitimate create is not blocked.
-pub(crate) struct AgentIdReservation {
-    set: Arc<Mutex<HashSet<AgentId>>>,
-    id: AgentId,
-}
-
-impl Drop for AgentIdReservation {
-    fn drop(&mut self) {
-        self.set
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
-    }
 }
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
@@ -666,24 +632,6 @@ pub(crate) fn is_interrupt_priority(priority: Option<&str>) -> bool {
     priority == Some("interrupt")
 }
 
-/// Validate a client-supplied `agent.create` `agentId` (PROTOCOL §5.5): the id
-/// must be the exact `agent-{uuid}` form (`agent-` prefix + a parsable UUID
-/// tail), matching the form the daemon mints. Anything else surfaces as
-/// `-32602` so a stray/hand-typed id cannot collide with future runtime ids.
-pub(crate) fn validate_client_agent_id(id: &str) -> Result<()> {
-    let Some(tail) = id.strip_prefix("agent-") else {
-        return Err(Error::InvalidParams(format!(
-            "agentId must be of the form 'agent-{{uuid}}' (got {id:?})"
-        )));
-    };
-    Uuid::parse_str(tail).map_err(|_| {
-        Error::InvalidParams(format!(
-            "agentId must be of the form 'agent-{{uuid}}' (got {id:?})"
-        ))
-    })?;
-    Ok(())
-}
-
 /// The persisted content-block array for a user message: one `text` block
 /// followed by any FE-supplied `image` / `file` attachment blocks (STAB-133:
 /// attachments must reach the transcript so the conversation view can render
@@ -1159,59 +1107,14 @@ impl Services {
         .await;
     }
 
-    /// Reject a client-supplied agent id that already names a persisted
-    /// session (PROTOCOL §5.5): a duplicate is `-32602` naming the id, so a
-    /// retrying client sees a clear validation error instead of the opaque
-    /// `-32603` SQLite UNIQUE(1555) insert failure — and callers like
-    /// `workspace.create` can pre-validate BEFORE running provisioning side
-    /// effects.
-    pub(crate) async fn ensure_agent_id_available(&self, id: &AgentId) -> Result<()> {
-        match self.store.get_agent_session_status(id).await {
-            Ok(_) => Err(Error::InvalidParams(format!(
-                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
-            ))),
-            Err(Error::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Atomically claim a client-supplied agent id for the duration of a
-    /// create flow, closing the check-then-act gap left by
-    /// [`ensure_agent_id_available`]: two overlapping `workspace.create`
-    /// retries with the same `initialAgent.agentId` would otherwise BOTH pass
-    /// the preflight SELECT, run expensive provisioning (clone, worktree, row
-    /// insert, `workspace:created`), and then one would lose at the agent
-    /// insert — orphaning a partial workspace. The loser now fails the same
-    /// `-32602` at preflight, before any side effect. The reservation is
-    /// in-process only (the daemon is the sole writer of its SQLite store)
-    /// and releases on [`AgentIdReservation`] drop — success or failure.
-    pub(crate) fn reserve_agent_id(&self, id: &AgentId) -> Result<AgentIdReservation> {
-        let mut set = self
-            .creating_agent_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if !set.insert(id.clone()) {
-            return Err(Error::InvalidParams(format!(
-                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
-            )));
-        }
-        Ok(AgentIdReservation {
-            set: Arc::clone(&self.creating_agent_ids),
-            id: id.clone(),
-        })
-    }
-
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
     /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
     ///
-    /// `requested_agent_id` is honored verbatim when it is a well-formed
-    /// `agent-{uuid}`, so the FE can create + address the session under an id
-    /// it already minted (fixes the UI create→sendMessage "not found: agent
-    /// session" race). Malformed values surface as `-32602`, and so does a
-    /// duplicate id that already names a persisted session (naming the id);
-    /// when `None` a fresh id is generated (existing behavior).
+    /// Agent ids are server-assigned: the op always mints a fresh
+    /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
+    /// transport boundary before this op runs).
     ///
     /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
     /// the persisted [`AgentSession`]; `metadata` is harvested for the
@@ -1238,7 +1141,6 @@ impl Services {
         parent_agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         skip_auto_commit: bool,
-        requested_agent_id: Option<AgentId>,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
         // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
@@ -1270,14 +1172,7 @@ impl Services {
         let name_explicitly_set = extra.name_explicitly_set.unwrap_or_else(|| name.is_some());
         let name =
             name.unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
-        let id = match requested_agent_id {
-            Some(requested) => {
-                validate_client_agent_id(requested.as_str())?;
-                self.ensure_agent_id_available(&requested).await?;
-                requested
-            }
-            None => AgentId(format!("agent-{}", Uuid::new_v4())),
-        };
+        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // `metadata` is persisted (C1d-10a, closes the metadata half of the
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
         // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
@@ -1362,7 +1257,6 @@ impl Services {
                             specialist.as_deref(),
                             provider.as_deref(),
                         )
-                        .await
                     }
                 }
             }
@@ -2803,7 +2697,6 @@ impl Services {
                 parent_agent_id.clone(),
                 session_task_note_id.clone(),
                 input.skip_auto_commit.unwrap_or(false),
-                None,
                 extra,
             )
             .await?;
@@ -3983,7 +3876,6 @@ impl Services {
                 None,
                 Some(task_note_id.clone()),
                 skip_auto_commit,
-                None,
                 extra,
             )
             .await?;

@@ -10,13 +10,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use intent_core::{Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
+use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
     CheckRun, CheckState, MergeMethod, PrState, PullRequest, Review, ReviewComment, ReviewThread,
     ReviewThreadComment, ReviewVerdict, SourceControl, SourceControlRegistry,
     SourceControlSettings,
 };
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 
 /// TS `NO_ACTIVE_PR_ERROR`; every `pr.*` method needs an active PR (§5.7).
 pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
@@ -55,6 +56,39 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
         (Some(owner), Some(name)) => Ok((owner.to_string(), name.to_string())),
         _ => Err(Error::Internal(NO_ACTIVE_PR.to_string())),
     }
+}
+
+/// Background-sweep activity window (§7.6/§7.7): workspaces whose
+/// `updatedAt`/`lastActivity` is within this many minutes are refreshed on
+/// every sweep tick; colder workspaces only refresh on every
+/// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick, trimming steady forge load.
+pub(crate) const SWEEP_ACTIVE_WINDOW_MINUTES: i64 = 30;
+
+/// Idle workspaces refresh on every Nth sweep tick (~10 minutes at the 60s
+/// base interval wired in `intentd/src/main.rs`).
+pub(crate) const SWEEP_IDLE_TICK_MULTIPLE: u64 = 10;
+
+/// Whether the background sweep should refresh `ws` on this `tick` (§7.6 with
+/// the §7.7 "defer non-urgent refreshes" trimming): every
+/// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick (including tick 0, the first sweep
+/// after startup) refreshes every workspace; ticks in between refresh only
+/// workspaces active since `active_cutoff` (parsed once per sweep by the
+/// caller). A sweep that persists a PR delta bumps `updatedAt`, so workspaces
+/// with churning PRs stay on the every-tick cadence while quiet ones cool
+/// down. Malformed workspace timestamps — and a `None` cutoff — fail open
+/// (count as active) so a bad record never slows its own refreshes.
+pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: Option<OffsetDateTime>, tick: u64) -> bool {
+    if tick % SWEEP_IDLE_TICK_MULTIPLE == 0 {
+        return true;
+    }
+    let Some(cutoff) = active_cutoff else {
+        return true;
+    };
+    let active = |ts: &str| match parse_iso(ts) {
+        Some(t) => t >= cutoff,
+        None => true,
+    };
+    active(&ws.updated_at) || ws.last_activity.as_deref().is_some_and(active)
 }
 
 /// The workspace's active PR number, or [`NO_ACTIVE_PR`] when unlinked.

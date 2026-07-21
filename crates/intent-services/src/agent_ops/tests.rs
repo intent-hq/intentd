@@ -377,7 +377,6 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -402,132 +401,34 @@ async fn create_then_list_and_get_projects_agent_lite() {
 }
 
 #[tokio::test]
-async fn agent_create_honors_client_supplied_agent_id() {
-    // The FE (`UnifiedAgentFactory`) pre-mints an `agent-{uuid}` and immediately
-    // addresses `agent.sendMessage` at it. When the daemon adopts the id
-    // verbatim, the follow-up send lands on a persisted session instead of
-    // `-32602 not found: agent session` (the create+send race this task fixes).
+async fn agent_create_mints_server_assigned_agent_id() {
+    // Agent ids are server-assigned: every create mints a fresh
+    // `agent-{uuid}` (client-supplied ids are rejected at the transport
+    // boundary and never reach this op).
     let (_t, svc, ws) = setup().await;
-    let requested = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
     let created = svc
         .agent_create_op(
             ws.clone(),
-            Some("Client-Minted".into()),
+            Some("Minted".into()),
             None,
             None,
             None,
             None,
             false,
-            Some(requested.clone()),
             Default::default(),
         )
         .await
-        .expect("create honors client id");
-    assert_eq!(created["agent"]["id"].as_str(), Some(requested.0.as_str()));
+        .expect("create");
+    let id = created["agent"]["id"].as_str().expect("agent id");
+    let tail = id.strip_prefix("agent-").expect("agent-{uuid} form");
+    uuid::Uuid::parse_str(tail).expect("uuid tail");
     // Round-trip through the store proves the session is addressable at the
-    // client-supplied id.
+    // server-minted id.
     let got = svc
-        .agent_get_op(requested.clone(), None)
+        .agent_get_op(AgentId::from(id), None)
         .await
         .expect("get");
-    assert_eq!(got.id, requested);
-}
-
-#[tokio::test]
-async fn agent_create_rejects_malformed_client_agent_id() {
-    // Anything other than `agent-{uuid}` is `-32602` (PROTOCOL §5.5 / §9): a
-    // stray/hand-typed id must not collide with future daemon-minted ids.
-    let (_t, svc, ws) = setup().await;
-    for bad in ["not-an-agent", "agent-", "agent-not-a-uuid", ""] {
-        let err = svc
-            .agent_create_op(
-                ws.clone(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                Some(AgentId::from(bad)),
-                Default::default(),
-            )
-            .await
-            .expect_err("malformed id must be rejected");
-        assert!(
-            matches!(err, Error::InvalidParams(_)),
-            "expected InvalidParams for {bad:?}, got {err:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn agent_create_rejects_duplicate_client_agent_id() {
-    // A client-supplied id that already names a persisted session is `-32602`
-    // naming the id (PROTOCOL §5.5) — not the opaque `-32603` the pre-fix
-    // SQLite UNIQUE(1555) insert failure surfaced. A retrying client (the FE
-    // reused a stale initial-agent id across create attempts) must see a
-    // clear validation error.
-    let (_t, svc, ws) = setup().await;
-    let requested = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
-    svc.agent_create_op(
-        ws.clone(),
-        Some("First".into()),
-        None,
-        None,
-        None,
-        None,
-        false,
-        Some(requested.clone()),
-        Default::default(),
-    )
-    .await
-    .expect("first create");
-    let err = svc
-        .agent_create_op(
-            ws.clone(),
-            Some("Second".into()),
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some(requested.clone()),
-            Default::default(),
-        )
-        .await
-        .expect_err("duplicate id must be rejected");
-    match &err {
-        Error::InvalidParams(msg) => assert!(
-            msg.contains(requested.0.as_str()),
-            "error must name the duplicate id, got: {msg}"
-        ),
-        other => panic!("expected InvalidParams, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn reserve_agent_id_blocks_concurrent_claim_until_dropped() {
-    // The in-process reservation closes the check-then-act gap between the
-    // duplicate-id preflight (SELECT) and the session insert: while one
-    // create flow holds the claim, an overlapping claim on the same id is
-    // `-32602` naming the id; dropping the guard releases the id.
-    let (_t, svc, _ws) = setup().await;
-    let id = AgentId::from(format!("agent-{}", uuid::Uuid::new_v4()).as_str());
-    let guard = svc.reserve_agent_id(&id).expect("first claim");
-    let err = svc
-        .reserve_agent_id(&id)
-        .err()
-        .expect("overlapping claim must be rejected");
-    match &err {
-        Error::InvalidParams(msg) => assert!(
-            msg.contains(id.0.as_str()),
-            "error must name the contended id, got: {msg}"
-        ),
-        other => panic!("expected InvalidParams, got {other:?}"),
-    }
-    drop(guard);
-    let reclaim = svc.reserve_agent_id(&id).expect("released id is claimable");
-    drop(reclaim);
+    assert_eq!(got.id.as_str(), id);
 }
 
 #[tokio::test]
@@ -542,7 +443,6 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -794,7 +694,6 @@ async fn agent_lite_metadata_created_by_agent_id_from_parent() {
             Some(parent.clone()),
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1031,7 +930,6 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1128,7 +1026,6 @@ async fn rename_skip_if_explicitly_set() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1179,7 +1076,6 @@ async fn create_persists_and_reserves_gap_fields() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -1229,7 +1125,6 @@ async fn create_is_background_top_level_wins_and_defaults_false() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -1249,7 +1144,6 @@ async fn create_is_background_top_level_wins_and_defaults_false() {
             None,
             None,
             false,
-            None,
             intent_core::AgentCreateExtra::default(),
         )
         .await
@@ -1343,7 +1237,6 @@ async fn report_to_parent_persists_completion_report() {
             Some(parent.clone()),
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1403,7 +1296,6 @@ async fn report_to_parent_transitions_linked_task_to_review_required() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1459,7 +1351,6 @@ async fn report_to_parent_does_not_overwrite_terminal_task_status() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1526,7 +1417,6 @@ async fn report_to_parent_review_required_second_call_is_a_note_write_noop() {
             Some(parent.clone()),
             Some(note.id.clone()),
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1596,7 +1486,6 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
             Some(parent.clone()),
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1737,7 +1626,6 @@ async fn report_to_parent_out_of_workspace_task_note_is_transition_noop() {
             Some(parent.clone()),
             Some(foreign.id.clone()),
             false,
-            None,
             Default::default(),
         )
         .await
@@ -1795,7 +1683,6 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
             Some(parent.clone()),
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -2232,7 +2119,6 @@ async fn delegate_rejects_when_parent_at_max_depth() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -2280,7 +2166,6 @@ async fn create_rejects_when_parent_at_max_depth() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -2295,7 +2180,6 @@ async fn create_rejects_when_parent_at_max_depth() {
             Some(parent),
             None,
             false,
-            None,
             intent_core::AgentCreateExtra::default(),
         )
         .await
@@ -2315,7 +2199,6 @@ async fn create_rejects_when_parent_at_max_depth() {
         Some(shallow),
         None,
         false,
-        None,
         intent_core::AgentCreateExtra::default(),
     )
     .await
@@ -3104,7 +2987,6 @@ async fn report_to_parent_delivers_for_delegated_caller() {
             Some(parent.clone()),
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -4714,7 +4596,6 @@ async fn create_without_name_keeps_generic_agent_fallback() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -5537,7 +5418,6 @@ async fn agent_get_session_projects_full_session_shape() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -6037,7 +5917,6 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -6051,7 +5930,6 @@ async fn wake_or_create_wakes_newest_of_multiple_assignments() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -6093,7 +5971,6 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -6107,7 +5984,6 @@ async fn wake_or_create_skips_stale_and_reports_cleanup() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -6182,7 +6058,6 @@ async fn wake_or_create_depth_guard_reads_caller_metadata() {
             None,
             None,
             false,
-            None,
             AgentCreateExtra {
                 metadata: Some(json!({ "delegationDepth": MAX_DELEGATION_DEPTH })),
                 ..Default::default()
@@ -6219,7 +6094,6 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -6952,7 +6826,6 @@ async fn clear_completion_report_on_turn_begin() {
             Some(parent.clone()),
             None,
             false,
-            None,
             Default::default(),
         )
         .await

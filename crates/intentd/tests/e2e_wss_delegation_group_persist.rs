@@ -15,6 +15,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -119,7 +121,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::proc
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;

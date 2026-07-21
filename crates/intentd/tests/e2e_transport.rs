@@ -17,6 +17,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -110,9 +112,10 @@ fn run_cli_with_env(
     cmd.output().expect("run intentd subcommand")
 }
 
-/// Wait (up to 10s) for the daemon's UDS to accept connections.
+/// Wait for the daemon's UDS to accept connections, up to the shared
+/// daemon-startup budget (see `common::daemon_startup_timeout`).
 async fn await_uds(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;

@@ -18,6 +18,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -81,13 +83,16 @@ fn spawn_serve(data_dir: &Path) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    for _ in 0..200 {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
-            return true;
+    tokio::time::timeout(common::daemon_startup_timeout(), async {
+        loop {
+            if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    false
+    })
+    .await
+    .is_ok()
 }
 
 async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {

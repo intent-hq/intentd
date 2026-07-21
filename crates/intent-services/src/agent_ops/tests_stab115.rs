@@ -10,17 +10,31 @@
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
 use serde_json::json;
+use std::sync::Arc;
 
 use super::tests::{workspace, TempDb};
 use crate::Services;
 
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+async fn setup() -> (TempDb, Services, WorkspaceId, tempfile::TempDir) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let services = Services::new(store);
-    (tmp, services, ws)
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            .expect("load registry"),
+    );
+    let services = Services::new(store).with_settings_registry(registry);
+    (tmp, services, ws, config_dir)
+}
+
+/// Seed a TOML-backed setting through the wired registry.
+fn set(svc: &Services, path: &str, value: serde_json::Value) {
+    svc.settings_registry()
+        .expect("registry wired")
+        .apply(&[(path.to_string(), value)])
+        .expect("apply setting");
 }
 
 async fn create_agent(
@@ -38,7 +52,6 @@ async fn create_agent(
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -50,13 +63,10 @@ async fn create_agent(
 /// settings `model.default` and persist to `session.model`.
 #[tokio::test]
 async fn agent_create_resolves_model_from_settings_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set model.default in settings
-    svc.store
-        .set_setting("model.default", &json!("auggie:sonnet4.5").to_string())
-        .await
-        .expect("set setting");
+    set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
@@ -69,19 +79,13 @@ async fn agent_create_resolves_model_from_settings_default() {
 /// Bug B: Workspace-specific overrides take precedence over global default.
 #[tokio::test]
 async fn agent_create_workspace_override_beats_global_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and workspace-specific override
-    svc.store
-        .set_setting("model.default", &json!("auggie:sonnet4.5").to_string())
-        .await
-        .expect("set global");
+    set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
     let overrides = json!({ ws.as_str(): "auggie:opus" });
-    svc.store
-        .set_setting("model.workspaceOverrides", &overrides.to_string())
-        .await
-        .expect("set override");
+    set(&svc, "model.workspaceOverrides", overrides);
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
@@ -94,21 +98,12 @@ async fn agent_create_workspace_override_beats_global_default() {
 /// Bug B: Background agents check backgroundAgents.defaultModel before global default.
 #[tokio::test]
 async fn agent_create_background_agent_uses_background_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and background default
-    svc.store
-        .set_setting("model.default", &json!("auggie:sonnet4.5").to_string())
-        .await
-        .expect("set global");
+    set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
-    svc.store
-        .set_setting(
-            "backgroundAgents.defaultModel",
-            &json!("auggie:haiku").to_string(),
-        )
-        .await
-        .expect("set background");
+    set(&svc, "backgroundAgents.defaultModel", json!("auggie:haiku"));
 
     // Create background agent without explicit model
     let extra = intent_core::AgentCreateExtra {
@@ -124,7 +119,6 @@ async fn agent_create_background_agent_uses_background_default() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -139,13 +133,10 @@ async fn agent_create_background_agent_uses_background_default() {
 /// Bug B: Explicit model at creation time overrides all settings.
 #[tokio::test]
 async fn agent_create_explicit_model_wins_over_settings() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set global default
-    svc.store
-        .set_setting("model.default", &json!("auggie:sonnet4.5").to_string())
-        .await
-        .expect("set global");
+    set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
     // Create agent with explicit model
     let id = create_agent(&svc, &ws, "TestAgent", Some("auggie:opus".into())).await;
@@ -158,14 +149,11 @@ async fn agent_create_explicit_model_wins_over_settings() {
 /// STAB-117 extension: providerDefaults applies when nothing more specific is set.
 #[tokio::test]
 async fn agent_create_resolves_from_provider_defaults() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set providerDefaults only
     let provider_defaults = json!({ "auggie": "fable-5" });
-    svc.store
-        .set_setting("model.providerDefaults", &provider_defaults.to_string())
-        .await
-        .expect("set providerDefaults");
+    set(&svc, "model.providerDefaults", provider_defaults);
 
     // Create agent without explicit model or provider
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
@@ -178,14 +166,11 @@ async fn agent_create_resolves_from_provider_defaults() {
 /// STAB-117 extension: providerDefaults[provider] is used when provider is set.
 #[tokio::test]
 async fn agent_create_uses_provider_defaults_for_explicit_provider() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set providerDefaults for opencode
     let provider_defaults = json!({ "opencode": "kimi-k3", "auggie": "fable-5" });
-    svc.store
-        .set_setting("model.providerDefaults", &provider_defaults.to_string())
-        .await
-        .expect("set providerDefaults");
+    set(&svc, "model.providerDefaults", provider_defaults);
 
     // Create agent with explicit provider but no model
     let extra = intent_core::AgentCreateExtra {
@@ -201,7 +186,6 @@ async fn agent_create_uses_provider_defaults_for_explicit_provider() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -216,20 +200,14 @@ async fn agent_create_uses_provider_defaults_for_explicit_provider() {
 /// STAB-117 extension: more-specific settings (workspace override) beat providerDefaults.
 #[tokio::test]
 async fn agent_create_workspace_override_beats_provider_defaults() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both providerDefaults and workspace override
     let provider_defaults = json!({ "auggie": "fable-5" });
-    svc.store
-        .set_setting("model.providerDefaults", &provider_defaults.to_string())
-        .await
-        .expect("set providerDefaults");
+    set(&svc, "model.providerDefaults", provider_defaults);
 
     let overrides = json!({ ws.as_str(): "auggie:opus" });
-    svc.store
-        .set_setting("model.workspaceOverrides", &overrides.to_string())
-        .await
-        .expect("set override");
+    set(&svc, "model.workspaceOverrides", overrides);
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
@@ -242,22 +220,13 @@ async fn agent_create_workspace_override_beats_provider_defaults() {
 /// STAB-117 extension: background default beats providerDefaults.
 #[tokio::test]
 async fn agent_create_background_default_beats_provider_defaults() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both providerDefaults and background default
     let provider_defaults = json!({ "auggie": "fable-5" });
-    svc.store
-        .set_setting("model.providerDefaults", &provider_defaults.to_string())
-        .await
-        .expect("set providerDefaults");
+    set(&svc, "model.providerDefaults", provider_defaults);
 
-    svc.store
-        .set_setting(
-            "backgroundAgents.defaultModel",
-            &json!("auggie:haiku").to_string(),
-        )
-        .await
-        .expect("set background");
+    set(&svc, "backgroundAgents.defaultModel", json!("auggie:haiku"));
 
     // Create background agent without explicit model
     let extra = intent_core::AgentCreateExtra {
@@ -273,7 +242,6 @@ async fn agent_create_background_default_beats_provider_defaults() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -288,19 +256,13 @@ async fn agent_create_background_default_beats_provider_defaults() {
 /// STAB-117 extension: providerDefaults beats global default.
 #[tokio::test]
 async fn agent_create_provider_defaults_beats_global_default() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set both global default and providerDefaults
-    svc.store
-        .set_setting("model.default", &json!("auggie:sonnet4.5").to_string())
-        .await
-        .expect("set global");
+    set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
     let provider_defaults = json!({ "auggie": "fable-5" });
-    svc.store
-        .set_setting("model.providerDefaults", &provider_defaults.to_string())
-        .await
-        .expect("set providerDefaults");
+    set(&svc, "model.providerDefaults", provider_defaults);
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
@@ -313,19 +275,13 @@ async fn agent_create_provider_defaults_beats_global_default() {
 /// STAB-117 extension: unknown provider key in providerDefaults falls through to global default.
 #[tokio::test]
 async fn agent_create_unknown_provider_falls_through_to_global() {
-    let (_t, svc, ws) = setup().await;
+    let (_t, svc, ws, _cfg) = setup().await;
 
     // Set global default and providerDefaults with a different provider
-    svc.store
-        .set_setting("model.default", &json!("auggie:sonnet4.5").to_string())
-        .await
-        .expect("set global");
+    set(&svc, "model.default", json!("auggie:sonnet4.5"));
 
     let provider_defaults = json!({ "opencode": "kimi-k3" });
-    svc.store
-        .set_setting("model.providerDefaults", &provider_defaults.to_string())
-        .await
-        .expect("set providerDefaults");
+    set(&svc, "model.providerDefaults", provider_defaults);
 
     // Create agent for default provider (auggie) with no explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;

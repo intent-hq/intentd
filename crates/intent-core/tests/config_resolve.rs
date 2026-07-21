@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use intent_core::config::{Config, DEFAULT_IDLE_REAP_MINUTES, DEFAULT_STREAM_RETENTION_HOURS};
+use intent_core::settings_file::DEFAULT_CONFIG_TEMPLATE;
 
 /// Serializes env-mutating tests in this binary. Cargo runs `#[test]`s on
 /// multiple threads by default, so without this guard `INTENTD_*` reads and
@@ -58,9 +59,12 @@ fn resolve_honors_data_dir_and_config_env_overrides() {
     assert_eq!(cfg.db_path, data_dir.join("intentd.db"));
     assert_eq!(cfg.socket_path, data_dir.join("intentd.sock"));
     assert_eq!(cfg.pid_path, data_dir.join("intentd.pid"));
-    // Config file does not exist → loaders fall back to the documented defaults.
+    // Config file did not exist → resolve() initialized it with the commented
+    // default template and used the documented defaults.
     assert_eq!(cfg.idle_reap_minutes, DEFAULT_IDLE_REAP_MINUTES);
     assert_eq!(cfg.stream_retention_hours, DEFAULT_STREAM_RETENTION_HOURS);
+    let written = std::fs::read_to_string(&config_path).expect("config.toml was initialized");
+    assert_eq!(written, DEFAULT_CONFIG_TEMPLATE);
 
     // Config is Clone + PartialEq + Eq + Debug — exercise the derives.
     let cloned = cfg.clone();
@@ -73,6 +77,52 @@ fn resolve_honors_data_dir_and_config_env_overrides() {
 
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
+    std::fs::remove_dir_all(config_path.parent().unwrap()).ok();
+}
+
+#[test]
+fn resolve_defaults_config_path_into_data_dir() {
+    let _g = env_lock();
+    let data_dir = unique_temp("intentd-datadir-cfg");
+
+    std::env::remove_var("INTENTD_IDLE_REAP_MINUTES");
+    std::env::remove_var("INTENTD_STREAM_RETENTION_HOURS");
+    std::env::remove_var("INTENTD_CONFIG");
+    std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+
+    let cfg = Config::resolve().expect("resolve without INTENTD_CONFIG should succeed");
+    assert_eq!(cfg.config_path, data_dir.join("config.toml"));
+    assert!(
+        cfg.config_path.is_file(),
+        "resolve() initializes config.toml in the data dir"
+    );
+
+    std::env::remove_var("INTENTD_DATA_DIR");
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+#[test]
+fn resolve_fails_on_malformed_config_file() {
+    let _g = env_lock();
+    let data_dir = unique_temp("intentd-data-bad");
+    let config_dir = unique_temp("intentd-cfgdir-bad");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    std::fs::write(&config_path, "[agents]\nidleReapMinuets = 5\n").unwrap();
+
+    std::env::remove_var("INTENTD_IDLE_REAP_MINUTES");
+    std::env::remove_var("INTENTD_STREAM_RETENTION_HOURS");
+    std::env::set_var("INTENTD_DATA_DIR", &data_dir);
+    std::env::set_var("INTENTD_CONFIG", &config_path);
+
+    let err = Config::resolve().expect_err("unknown key must fail resolve()");
+    let msg = err.to_string();
+    assert!(msg.contains("idleReapMinuets"), "names the bad key: {msg}");
+    assert!(msg.contains("config.toml"), "names the file: {msg}");
+
+    std::env::remove_var("INTENTD_DATA_DIR");
+    std::env::remove_var("INTENTD_CONFIG");
+    std::fs::remove_dir_all(&config_dir).ok();
 }
 
 #[test]
@@ -129,4 +179,5 @@ fn resolve_env_overrides_for_idle_and_retention_take_precedence() {
     std::env::remove_var("INTENTD_STREAM_RETENTION_HOURS");
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
+    std::fs::remove_dir_all(config_path.parent().unwrap()).ok();
 }
