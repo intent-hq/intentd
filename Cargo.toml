@@ -78,3 +78,8 @@ debug = "line-tables-only"
 # Strip debug symbols from all external dependencies
 [profile.dev.package."*"]
 debug = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

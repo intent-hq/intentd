@@ -1,0 +1,85 @@
+# Post-announce hook for the dist Release pipeline (see dist-workspace.toml
+# `post-announce-jobs`). After a vX.Y.Z[-<prerelease>] release is published, this
+# builds a channel manifest from the release's artifacts and uploads it to a
+# fixed channel release:
+#
+#   stable tags (vX.Y.Z)        -> stable.json on the `channel-stable` release
+#   prerelease tags (vX.Y.Z-*)  -> beta.json   on the `channel-beta` release
+#
+# The manifests give consumers (e.g. cloudlands-fe pin-bump automation,
+# installer scripts) a stable URL to discover the latest release per channel.
+# Schema is documented in scripts/make-channel-manifest.sh and the README.
+name: Publish channel manifest
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-channel-manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Determine tag and channel
+        id: meta
+        shell: bash
+        run: |
+          tag=$(jq -r '.announcement_tag // empty' <<<"$PLAN")
+          if [[ -z "$tag" ]]; then
+            echo "error: no announcement_tag in plan" >&2
+            exit 1
+          fi
+          # dist's prerelease bit is authoritative (release.yml uses the same
+          # field for the --prerelease flag), so routing can never disagree
+          # with what GitHub marks as a prerelease.
+          is_prerelease=$(jq -r '.announcement_is_prerelease' <<<"$PLAN")
+          if [[ "$is_prerelease" == "true" ]]; then
+            channel="beta"
+          else
+            channel="stable"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Build channel manifest
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+        run: |
+          ./scripts/make-channel-manifest.sh "$TAG" "$CHANNEL" "$CHANNEL.json"
+      - name: Publish manifest to channel release
+        shell: bash
+        env:
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+        run: |
+          channel_tag="channel-$CHANNEL"
+          if ! gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ! gh release create "$channel_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --latest=false \
+              --title "Channel manifest: $CHANNEL" \
+              --notes "Machine-readable pointer to the latest $CHANNEL intentd release. Do not consume the tag itself; download the $CHANNEL.json asset."
+            then
+              # Tolerate only a lost create race (two same-channel tags close
+              # together): the release must exist now; otherwise fail loudly.
+              if ! gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "error: failed to create release $channel_tag and it does not exist" >&2
+                exit 1
+              fi
+            fi
+          fi
+          gh release upload "$channel_tag" \
+            "$CHANNEL.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
