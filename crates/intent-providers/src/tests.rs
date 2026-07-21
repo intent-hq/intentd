@@ -82,6 +82,26 @@ fn registry_field_parity() {
     assert_eq!(mock.requires_env_var, Some("MOCK_AGENT_SCRIPT_PATH"));
 }
 
+/// Exactly claude-code, codex, and droid consume MCP servers from the ACP
+/// `session/new` / `session/load` `mcpServers` field; every other provider
+/// receives MCP config out-of-band (auggie `--mcp-config`, opencode env
+/// config) or not at all.
+#[test]
+fn session_mcp_servers_partition() {
+    for id in ["claude-code", "codex", "droid"] {
+        assert!(
+            find_provider(id).unwrap().supports_session_mcp_servers,
+            "{id} consumes session/new mcpServers"
+        );
+    }
+    for id in ["auggie", "opencode", "cortex", "mock"] {
+        assert!(
+            !find_provider(id).unwrap().supports_session_mcp_servers,
+            "{id} must not opt into session/new mcpServers"
+        );
+    }
+}
+
 #[test]
 fn auth_error_pattern_matching() {
     assert!(is_provider_authentication_error(

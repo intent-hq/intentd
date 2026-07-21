@@ -617,6 +617,7 @@ fn mock_handle() -> AgentHandle {
         _mcp_bridge: None,
         _mcp_config: None,
         _rules_config: None,
+        session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
     }
@@ -1168,6 +1169,7 @@ fn track_mock_agent_inner(
             _mcp_bridge: None,
             _mcp_config: None,
             _rules_config: None,
+            session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
         },
@@ -1329,6 +1331,102 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     // The recreate flag is set so the next turn resends history; take() clears it.
     assert!(mgr.take_recreated(&id), "recreate flags a history resend");
     assert!(!mgr.take_recreated(&id), "flag is cleared once taken");
+}
+
+/// The typed workspace-MCP bridge entry stashed on the handle (STAB-156):
+/// built from the same normalized-server shape `create_agent` uses for
+/// `supports_session_mcp_servers` providers (claude-code, codex, droid).
+fn test_session_mcp_servers() -> Vec<intent_acp::session::McpServer> {
+    let mut servers = intent_acp::NormalizedMcpServers::new();
+    servers.insert(
+        "workspace-mcp".to_string(),
+        intent_acp::NormalizedMcpServer::Stdio {
+            command: "/usr/local/bin/intentd".into(),
+            args: vec![
+                "mcp-bridge".to_string(),
+                "--connect".to_string(),
+                "127.0.0.1:9999".to_string(),
+            ],
+            env: intent_acp::EnvMap::new(),
+        },
+    );
+    intent_acp::to_acp_session_mcp_servers(&servers)
+}
+
+/// For providers that consume MCP servers from the ACP session setup
+/// (claude-code, codex, droid — STAB-156), the handle's stashed server list
+/// rides the `session/new` request's `mcpServers` field, with the stdio bridge
+/// entry serialized untagged (no `type`) as the ACP schema requires.
+#[tokio::test]
+async fn start_session_carries_session_mcp_servers_on_session_new() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-mcp-new"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .session_mcp_servers = test_session_mcp_servers();
+
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("first session");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/new")
+        .expect("session/new sent");
+    let servers = params["mcpServers"].as_array().expect("mcpServers array");
+    assert_eq!(servers.len(), 1);
+    let bridge = &servers[0];
+    assert_eq!(bridge["name"], json!("workspace-mcp"));
+    assert_eq!(bridge["command"], json!("/usr/local/bin/intentd"));
+    assert_eq!(
+        bridge["args"],
+        json!(["mcp-bridge", "--connect", "127.0.0.1:9999"])
+    );
+    assert!(
+        bridge.get("type").is_none(),
+        "stdio bridge entry must serialize untagged: {bridge}"
+    );
+}
+
+/// The same stashed server list rides `session/load` on the resume path, so a
+/// resumed session reconnects the workspace-MCP bridge of the NEW child (the
+/// old child's bridge died with it).
+#[tokio::test]
+async fn start_session_carries_session_mcp_servers_on_session_load() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-mcp-load"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "existing-id")
+        .await
+        .unwrap();
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, true);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .session_mcp_servers = test_session_mcp_servers();
+
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("resume");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/load")
+        .expect("session/load sent");
+    let servers = params["mcpServers"].as_array().expect("mcpServers array");
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["name"], json!("workspace-mcp"));
 }
 
 /// Under the shipped `AllowAll` default, `start_session` best-effort asks the

@@ -1137,8 +1137,8 @@ mod mcp_tests {
 
     use crate::mcp_config::{
         apply_baseline_env_to_stdio_servers, normalize_mcp_servers, to_acp_mcp_servers,
-        to_auggie_mcp_config, to_claude_mcp_json, to_codex_mcp_overrides, to_opencode_mcp_config,
-        NormalizedMcpServer,
+        to_acp_session_mcp_servers, to_auggie_mcp_config, to_claude_mcp_json,
+        to_codex_mcp_overrides, to_opencode_mcp_config, NormalizedMcpServer,
     };
     use crate::mcp_env::{
         build_baseline_mcp_env, is_likely_secret_env_key, merge_mcp_env,
@@ -1745,6 +1745,35 @@ mod mcp_tests {
             .iter()
             .any(|o| o.key == "mcp_servers.ws.command" && o.toml_value == "\"node\""));
         assert!(codex.iter().any(|o| o.key == "mcp_servers.ws.enabled"));
+    }
+
+    /// The typed `session/new` `mcpServers` list serializes to the same wire
+    /// shape as [`to_acp_mcp_servers`]: stdio entries untagged (no `type`
+    /// field) with `{ name, value }` env pairs, remotes tagged `http`/`sse`
+    /// with `{ name, value }` header pairs.
+    #[test]
+    fn typed_session_mcp_servers_match_acp_wire_shape() {
+        let normalized = normalize_mcp_servers(&stdio_servers());
+        let typed = to_acp_session_mcp_servers(&normalized);
+        assert_eq!(typed.len(), 2);
+
+        let wire: Vec<Value> = typed
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect();
+        let ws = wire.iter().find(|s| s["name"] == json!("ws")).unwrap();
+        assert!(
+            ws.get("type").is_none(),
+            "stdio entries serialize untagged (no `type` field): {ws}"
+        );
+        assert_eq!(ws["command"], json!("node"));
+        assert_eq!(ws["args"], json!(["server.js"]));
+        assert_eq!(ws["env"], json!([{ "name": "A", "value": "1" }]));
+
+        let remote = wire.iter().find(|s| s["name"] == json!("remote")).unwrap();
+        assert_eq!(remote["type"], json!("sse"));
+        assert_eq!(remote["url"], json!("https://h"));
+        assert_eq!(remote["headers"], json!([{ "name": "X", "value": "y" }]));
     }
 
     #[test]

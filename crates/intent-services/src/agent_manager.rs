@@ -18,14 +18,14 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
-use intent_acp::session::{ContentBlock, SessionModeState, StopReason};
+use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
-    normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_auggie_mcp_config,
-    to_opencode_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink,
-    FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
-    NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
-    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
+    normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_acp_session_mcp_servers,
+    to_auggie_mcp_config, to_opencode_mcp_config, ClientRequestHandler, Connection,
+    ConnectionHooks, EnvMap, EventSink, FileService, IncomingNotification, IncomingRequest,
+    McpBridge, NormalizedMcpServer, NormalizedMcpServers, PermissionOutcome, PermissionPolicy,
+    PermissionRegistry, PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -662,6 +662,12 @@ struct AgentHandle {
     _mcp_bridge: Option<McpBridge>,
     _mcp_config: Option<TempConfigFile>,
     _rules_config: Option<TempConfigFile>,
+    /// MCP servers (workspace bridge + user servers) delivered via the ACP
+    /// `session/new` / `session/load` `mcpServers` field for providers that
+    /// consume them there (claude-code, codex, droid). Empty for providers
+    /// that receive MCP config out-of-band (auggie `--mcp-config`, opencode
+    /// env config) — passing servers they'd ignore is avoided for wire parity.
+    session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
     spawned_provider: String,
 }
@@ -936,6 +942,18 @@ impl AgentManager {
             env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
         }
 
+        // For providers that consume MCP servers from the ACP session setup
+        // (claude-code, codex, droid), the same normalized server set is
+        // carried as the typed `session/new` / `session/load` `mcpServers`
+        // field, pointing at the same bridge endpoint. Kept on the handle so
+        // `start_session` (which runs after `create_agent`) can pass it into
+        // every session-open branch.
+        let mut session_mcp_servers: Vec<McpServer> = Vec::new();
+        if opts.provider.supports_session_mcp_servers {
+            let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+            session_mcp_servers = to_acp_session_mcp_servers(&servers);
+        }
+
         // Assemble the effective system prompt (the §18.1 injection pipeline:
         // base/specialization/workspace user overrides + live workspace rule
         // files, plus — for specialist agents — the PP-1 `<specialist_role>`
@@ -1084,6 +1102,7 @@ impl AgentManager {
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
             _rules_config: rules_config,
+            session_mcp_servers,
             spawned_model: opts.model.map(|s| s.to_string()),
             spawned_provider: opts.provider.command.to_string(),
         };
@@ -1294,9 +1313,13 @@ impl AgentManager {
     }
 
     /// Complete the connection handshake and establish an ACP session for a
-    /// spawned agent (the agent→BE MCP server is delivered out-of-band via the
-    /// generated `--mcp-config`, so `session/new` carries no `mcpServers`). On a
-    /// daemon respawn the agent may already have a persisted `acpSessionId`:
+    /// spawned agent. The agent→BE MCP server is delivered per the provider's
+    /// mechanism: out-of-band via the generated `--mcp-config` (auggie) or env
+    /// config (opencode) — those sessions carry no `mcpServers` — or in the
+    /// `session/new` / `session/load` `mcpServers` field for providers with
+    /// `supports_session_mcp_servers` (claude-code, codex, droid), using the
+    /// server list `create_agent` stashed on the handle. On a daemon respawn
+    /// the agent may already have a persisted `acpSessionId`:
     ///
     /// 1. Resume it via `session/load` when the agent advertised `loadSession` —
     ///    the agent keeps its prior context, so no history resend is needed.
@@ -1314,12 +1337,15 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        let conn = {
+        let (conn, session_mcp_servers) = {
             let map = self.handles.lock().unwrap();
-            map.get(agent_id)
-                .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?
-                .connection
-                .clone()
+            let handle = map
+                .get(agent_id)
+                .ok_or_else(|| Error::NotFound(format!("agent {agent_id}")))?;
+            (
+                handle.connection.clone(),
+                handle.session_mcp_servers.clone(),
+            )
         };
         // Load the agent session record once and reuse both `workspace_id` (for
         // the pre-handshake status hint) and `acp_session_id` (for the resume
@@ -1367,7 +1393,7 @@ impl AgentManager {
                     &handshake.initialize,
                     agent_id,
                     cwd.clone(),
-                    Vec::new(),
+                    session_mcp_servers.clone(),
                 )
                 .await
         } {
@@ -1414,7 +1440,13 @@ impl AgentManager {
         if let Some(expected_old) = stored_id {
             let opened = self
                 .services
-                .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
+                .recreate_acp_session(
+                    conn.as_ref(),
+                    agent_id,
+                    &expected_old,
+                    cwd,
+                    session_mcp_servers.clone(),
+                )
                 .await?;
             self.force_recreate.lock().unwrap().remove(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
@@ -1432,7 +1464,7 @@ impl AgentManager {
         // 3) Brand-new agent → open and persist the first session (write-once).
         let opened = self
             .services
-            .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
+            .open_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
             .await?;
         self.force_recreate.lock().unwrap().remove(agent_id);
         self.arm_first_turn_prepend(agent_id, provider);
