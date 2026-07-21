@@ -1,5 +1,5 @@
-//! Unit tests for the provider-model parsers — canned adapter payloads only,
-//! no live processes or network.
+//! Unit tests for the provider-model parsers (canned adapter payloads only,
+//! no network) and the codex probe's isolated-`CODEX_HOME` construction.
 
 use serde_json::json;
 
@@ -168,6 +168,67 @@ fn parse_opencode_models_nested_model_ids_keep_full_value() {
 fn parse_opencode_models_empty_output() {
     assert!(parse_opencode_models("").is_empty());
     assert!(parse_opencode_models("no models\n").is_empty());
+}
+
+#[test]
+fn isolated_codex_home_seeds_auth_but_never_config() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(
+        user.path().join("config.toml"),
+        "[mcp_servers.codebase-retrieval]\ncommand = \"auggie\"\n",
+    )
+    .unwrap();
+    std::fs::write(user.path().join("auth.json"), "{\"tokens\":{}}").unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    assert!(home.path().is_dir());
+    assert_ne!(home.path(), user.path());
+    assert!(home.path().join("auth.json").is_file());
+    assert!(!home.path().join("config.toml").exists());
+
+    let probe_home = home.path().to_path_buf();
+    drop(home);
+    assert!(!probe_home.exists());
+}
+
+#[test]
+fn isolated_codex_home_without_user_dir_is_empty() {
+    let home = super::isolated_codex_home(None).unwrap();
+    assert!(home.path().is_dir());
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn codex_probe_command_env_carries_isolated_codex_home() {
+    let cmd = super::probe::AcpProbeCommand::binary(std::path::PathBuf::from("codex-acp"), vec![]);
+    let (cmd, home) = super::codex_probe_with_isolated_home(cmd).unwrap();
+    let envs = cmd.env_vars();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].0, "CODEX_HOME");
+    assert_eq!(std::path::PathBuf::from(&envs[0].1), home.path());
+    if let Some(user_dir) = super::user_codex_dir() {
+        assert_ne!(std::path::PathBuf::from(&envs[0].1), user_dir);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_probe_child_receives_env_overrides() {
+    let out = tempfile::tempdir().unwrap();
+    let out_file = out.path().join("codex_home.txt");
+    let script = format!("printf %s \"$CODEX_HOME\" > '{}'", out_file.display());
+    let cmd = super::probe::AcpProbeCommand::binary(
+        std::path::PathBuf::from("/bin/sh"),
+        vec!["-c".to_string(), script],
+    )
+    .env("CODEX_HOME", "/tmp/intentd-test-isolated-codex-home");
+
+    // The shell exits immediately, so the handshake fails — the assertion is
+    // only that the env override reached the child.
+    let _ = super::probe::run_acp_probe(cmd, |_| Vec::new()).await;
+
+    let recorded = std::fs::read_to_string(&out_file).unwrap();
+    assert_eq!(recorded, "/tmp/intentd-test-isolated-codex-home");
 }
 
 #[test]

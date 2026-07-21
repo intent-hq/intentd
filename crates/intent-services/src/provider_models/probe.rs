@@ -7,6 +7,7 @@
 //! probe watches both. Every path is bounded by a hard overall timeout —
 //! the probe never hangs and never panics.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -31,6 +32,7 @@ const NOTIFICATION_GRACE: Duration = Duration::from_secs(2);
 pub(super) struct AcpProbeCommand {
     program: PathBuf,
     args: Vec<String>,
+    envs: Vec<(String, OsString)>,
 }
 
 impl AcpProbeCommand {
@@ -39,12 +41,28 @@ impl AcpProbeCommand {
         Self {
             program: npx,
             args: vec!["-y".to_string(), package.to_string()],
+            envs: Vec::new(),
         }
     }
 
     /// Run a resolved adapter binary with the given args.
     pub(super) fn binary(bin: PathBuf, args: Vec<String>) -> Self {
-        Self { program: bin, args }
+        Self {
+            program: bin,
+            args,
+            envs: Vec::new(),
+        }
+    }
+
+    /// Add an environment-variable override for the probe child.
+    pub(super) fn env(mut self, key: impl Into<String>, value: impl Into<OsString>) -> Self {
+        self.envs.push((key.into(), value.into()));
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn env_vars(&self) -> &[(String, OsString)] {
+        &self.envs
     }
 }
 
@@ -92,6 +110,9 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for (key, value) in &cmd.envs {
+        command.env(key, value);
+    }
     #[cfg(unix)]
     command.process_group(0);
 

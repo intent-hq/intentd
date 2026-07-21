@@ -30,7 +30,7 @@
 //! whose provider→source registry wires these five sources into `models.list`
 //! alongside them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use intent_providers::{find_npx, find_provider_binary};
@@ -121,6 +121,12 @@ pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
 
 /// codex: ACP probe via a resolved `codex-acp` binary, else the pinned npx
 /// fallback. Effort-variant base models expand into `{model}/{effort}` rows.
+///
+/// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
+/// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
+/// any `mcp_servers` it registers — is never loaded by the throwaway
+/// codex-acp process. Only `auth.json` is seeded into the isolated home so a
+/// logged-in codex stays logged in.
 pub async fn fetch_codex_models() -> ProviderModelsFetch {
     let cmd = if let Some(bin) = find_provider_binary("codex", "codex-acp", None) {
         AcpProbeCommand::binary(bin, Vec::new())
@@ -132,10 +138,59 @@ pub async fn fetch_codex_models() -> ProviderModelsFetch {
             "codex-acp binary not found and npx unavailable for the pinned fallback",
         );
     };
-    finish(
-        "codex",
-        run_acp_probe(cmd, parse::parse_codex_acp_models).await,
-    )
+    let (cmd, codex_home) = match codex_probe_with_isolated_home(cmd) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return ProviderModelsFetch::unavailable(
+                "codex",
+                format!("failed to create isolated CODEX_HOME: {e}"),
+            )
+        }
+    };
+    let outcome = run_acp_probe(cmd, parse::parse_codex_acp_models).await;
+    drop(codex_home);
+    finish("codex", outcome)
+}
+
+/// Attach a freshly created isolated `CODEX_HOME` to the codex probe command.
+/// The returned [`tempfile::TempDir`] must outlive the probe run; dropping it
+/// removes the throwaway home.
+fn codex_probe_with_isolated_home(
+    cmd: AcpProbeCommand,
+) -> std::io::Result<(AcpProbeCommand, tempfile::TempDir)> {
+    let home = isolated_codex_home(user_codex_dir().as_deref())?;
+    let cmd = cmd.env("CODEX_HOME", home.path().as_os_str());
+    Ok((cmd, home))
+}
+
+/// The user's real codex home: `$CODEX_HOME` when set, else `~/.codex`.
+fn user_codex_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home));
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    Some(home.join(".codex"))
+}
+
+/// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires
+/// the directory to exist). Only `auth.json` is copied from `user_codex_dir`;
+/// `config.toml` is deliberately NOT copied so user-configured `mcp_servers`
+/// never start under the probe.
+fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("intentd-codex-home-")
+        .tempdir()?;
+    if let Some(user_dir) = user_codex_dir {
+        let auth = user_dir.join("auth.json");
+        if auth.is_file() {
+            let _ = std::fs::copy(&auth, dir.path().join("auth.json"));
+        }
+    }
+    Ok(dir)
 }
 
 /// pi: ACP probe via the pinned npx adapter. Models may arrive under
