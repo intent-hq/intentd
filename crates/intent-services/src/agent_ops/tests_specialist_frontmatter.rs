@@ -10,7 +10,7 @@
 use intent_core::{AgentId, WorkspaceId};
 use intent_store::Store;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -31,7 +31,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     // settings registry (settings are TOML-backed, not SQLite-backed).
     let config_dir = TempDir::new().expect("temp config dir");
     let registry = Arc::new(
-        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
     let services = Services::new(store)
@@ -71,7 +71,7 @@ async fn create_agent(
 }
 
 /// Create a specialist file with frontmatter model in the user tier.
-fn create_user_specialist(dir: &PathBuf, id: &str, model: &str) {
+fn create_user_specialist(dir: &Path, id: &str, model: &str) {
     let content = format!(
         "---\nname: \"{}\"\ndescription: \"Test specialist\"\nmodel: \"{}\"\n---\n\nTest prompt",
         id, model
@@ -80,7 +80,7 @@ fn create_user_specialist(dir: &PathBuf, id: &str, model: &str) {
 }
 
 /// Create a specialist file without a model field.
-fn create_specialist_without_model(dir: &PathBuf, id: &str) {
+fn create_specialist_without_model(dir: &Path, id: &str) {
     let content = format!(
         "---\nname: \"{}\"\ndescription: \"Test specialist\"\n---\n\nTest prompt",
         id
@@ -94,11 +94,7 @@ async fn specialist_frontmatter_model_used_for_delegated_agent() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
-    create_user_specialist(
-        &specialists_dir.path().to_path_buf(),
-        "test-specialist",
-        "auggie:opus",
-    );
+    create_user_specialist(specialists_dir.path(), "test-specialist", "auggie:opus");
 
     // Create agent with specialist but no explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("test-specialist".into())).await;
@@ -114,11 +110,7 @@ async fn explicit_model_beats_specialist_frontmatter() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist with a frontmatter model
-    create_user_specialist(
-        &specialists_dir.path().to_path_buf(),
-        "test-specialist",
-        "auggie:opus",
-    );
+    create_user_specialist(specialists_dir.path(), "test-specialist", "auggie:opus");
 
     // Create agent with both explicit model and specialist
     let id = create_agent(
@@ -141,7 +133,7 @@ async fn missing_frontmatter_falls_through_to_settings() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
 
     // Create a specialist WITHOUT a frontmatter model
-    create_specialist_without_model(&specialists_dir.path().to_path_buf(), "test-specialist");
+    create_specialist_without_model(specialists_dir.path(), "test-specialist");
 
     // Set a background default in settings (via the wired registry)
     svc.settings_registry()

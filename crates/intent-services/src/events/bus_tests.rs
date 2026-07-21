@@ -248,8 +248,10 @@ async fn dropping_bus_flushes_buffered_batch_before_close() {
 async fn concurrent_burst_batches_events_correctly() {
     let (_tmp, bus) = bus().await;
     // Subscribe to capture all events (no batching for simpler per-publisher assertions).
-    let mut filter = SubscriptionFilter::default();
-    filter.batch_window = None;
+    let filter = SubscriptionFilter {
+        batch_window: None,
+        ..Default::default()
+    };
     let mut sub = bus.subscribe(filter);
 
     const PUBLISHERS: usize = 30;
@@ -375,8 +377,10 @@ async fn concurrent_burst_batches_events_correctly() {
 async fn insert_events_failure_resolves_oneshots_with_error() {
     let (_tmp, bus) = bus().await;
     // Subscribe to verify nothing is broadcast on failure.
-    let mut filter = SubscriptionFilter::default();
-    filter.batch_window = None;
+    let filter = SubscriptionFilter {
+        batch_window: None,
+        ..Default::default()
+    };
     let mut sub = bus.subscribe(filter);
 
     // Close the store's pools to force insert_events to fail.

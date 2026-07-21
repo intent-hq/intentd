@@ -4054,7 +4054,7 @@ mod merge_user_mcp_servers_tests {
         let secrets = Arc::new(InMemorySecretStore::default());
         let config_dir = tempfile::tempdir().expect("temp config dir");
         let registry = Arc::new(
-            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
                 .expect("load registry"),
         );
         let services = Services::new(store)

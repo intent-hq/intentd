@@ -854,7 +854,7 @@ mod tests {
             .unwrap();
 
         // Should have proposal and content items
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
         let proposal = result.get("proposal").unwrap();
         assert_eq!(
             proposal.get("kind").unwrap().as_str().unwrap(),
@@ -907,7 +907,7 @@ mod tests {
             .unwrap();
 
         // Should have proposal and content items
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
         let proposal = result.get("proposal").unwrap();
         assert_eq!(proposal.get("kind").unwrap().as_str().unwrap(), "bulk-op");
 
@@ -1175,8 +1175,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
-        assert_eq!(result.get("queued").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
+        assert!(result.get("queued").unwrap().as_bool().unwrap());
 
         // Assert event was published
         let events = fake.published_events();
@@ -1189,15 +1189,12 @@ mod tests {
             events[0].data.get("workspaceId").unwrap().as_str().unwrap(),
             "ws-1"
         );
-        assert_eq!(
-            events[0]
-                .data
-                .get("openInNewWindow")
-                .unwrap()
-                .as_bool()
-                .unwrap(),
-            false
-        );
+        assert!(!events[0]
+            .data
+            .get("openInNewWindow")
+            .unwrap()
+            .as_bool()
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1219,20 +1216,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
-        assert_eq!(result.get("queued").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
+        assert!(result.get("queued").unwrap().as_bool().unwrap());
 
         // Assert event includes openInNewWindow
         let events = fake.published_events();
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0]
-                .data
-                .get("openInNewWindow")
-                .unwrap()
-                .as_bool()
-                .unwrap(),
-            true
-        );
+        assert!(events[0]
+            .data
+            .get("openInNewWindow")
+            .unwrap()
+            .as_bool()
+            .unwrap());
     }
 }

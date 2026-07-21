@@ -990,7 +990,7 @@ mod tests {
     /// Fresh registry over a `config.toml` in a self-cleaning temp dir.
     fn temp_registry() -> (SettingsRegistry, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp config dir");
-        let reg = SettingsRegistry::load(&dir.path().join("config.toml")).expect("load registry");
+        let reg = SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
         (reg, dir)
     }
 

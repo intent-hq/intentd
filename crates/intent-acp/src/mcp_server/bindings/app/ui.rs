@@ -378,7 +378,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
         assert_eq!(result.get("route").unwrap().as_str().unwrap(), "/settings");
         assert_eq!(
             result.get("workspaceId").unwrap().as_str().unwrap(),
@@ -445,7 +445,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
         assert_eq!(result.get("id").unwrap().as_str().unwrap(), "agents");
         assert_eq!(
             result.get("workspaceId").unwrap().as_str().unwrap(),

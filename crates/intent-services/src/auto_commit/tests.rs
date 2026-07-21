@@ -290,7 +290,7 @@ async fn auto_commit_disabled_setting_is_silent_skip() {
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
     let config_dir = tempfile::tempdir().expect("temp config dir");
     let registry = std::sync::Arc::new(
-        crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+        crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
     registry

@@ -145,9 +145,11 @@ async fn start() -> Server {
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
     let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
-    let mut opts = WsOptions::default();
-    opts.base_port = 0;
-    opts.bind_address = Ipv4Addr::LOCALHOST.into();
+    let opts = WsOptions {
+        base_port: 0,
+        bind_address: Ipv4Addr::LOCALHOST.into(),
+        ..Default::default()
+    };
     let ws =
         WsApiServer::new(api.clone(), bus.clone(), &tls, token_store, opts, None).expect("server");
     let cfg = client_config(&tls.fingerprint256);

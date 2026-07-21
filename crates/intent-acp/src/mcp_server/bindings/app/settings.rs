@@ -447,7 +447,7 @@ mod tests {
             .unwrap();
 
         // Sensitive setting should have redacted value
-        assert_eq!(api_token.get("sensitive").unwrap().as_bool().unwrap(), true);
+        assert!(api_token.get("sensitive").unwrap().as_bool().unwrap());
         assert_eq!(
             api_token.get("value").unwrap().as_str().unwrap(),
             REDACTED_PLACEHOLDER
@@ -499,10 +499,7 @@ mod tests {
         // Check expected fields are present
         assert_eq!(result.get("path").unwrap().as_str().unwrap(), "user.name");
         assert_eq!(result.get("value").unwrap().as_str().unwrap(), "Alice");
-        assert_eq!(
-            result.get("valueRedacted").unwrap().as_bool().unwrap(),
-            false
-        );
+        assert!(!result.get("valueRedacted").unwrap().as_bool().unwrap());
         assert!(result.get("category").is_some());
         assert!(result.get("sensitive").is_some());
         assert!(result.get("type").is_some());
@@ -517,15 +514,12 @@ mod tests {
             .unwrap();
 
         // Sensitive setting should have redacted value and valueRedacted=true
-        assert_eq!(result.get("sensitive").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("sensitive").unwrap().as_bool().unwrap());
         assert_eq!(
             result.get("value").unwrap().as_str().unwrap(),
             REDACTED_PLACEHOLDER
         );
-        assert_eq!(
-            result.get("valueRedacted").unwrap().as_bool().unwrap(),
-            true
-        );
+        assert!(result.get("valueRedacted").unwrap().as_bool().unwrap());
     }
 
     #[tokio::test]
@@ -537,12 +531,9 @@ mod tests {
             .unwrap();
 
         // Non-sensitive setting should have real value and valueRedacted=false
-        assert_eq!(result.get("sensitive").unwrap().as_bool().unwrap(), false);
+        assert!(!result.get("sensitive").unwrap().as_bool().unwrap());
         assert_eq!(result.get("value").unwrap().as_str().unwrap(), "Alice");
-        assert_eq!(
-            result.get("valueRedacted").unwrap().as_bool().unwrap(),
-            false
-        );
+        assert!(!result.get("valueRedacted").unwrap().as_bool().unwrap());
     }
 
     // Proposal tests
@@ -635,7 +626,7 @@ mod tests {
         .unwrap();
 
         // Should have proposal and content items
-        assert_eq!(result.get("ok").unwrap().as_bool().unwrap(), true);
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
         let proposal = result.get("proposal").unwrap();
         assert_eq!(
             proposal.get("kind").unwrap().as_str().unwrap(),

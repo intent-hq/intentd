@@ -789,10 +789,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            result.get("includeToolCalls").unwrap().as_bool().unwrap(),
-            false
-        );
+        assert!(!result.get("includeToolCalls").unwrap().as_bool().unwrap());
         let messages = result.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 1);
         let blocks = messages[0]
@@ -842,10 +839,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            result.get("includeToolCalls").unwrap().as_bool().unwrap(),
-            true
-        );
+        assert!(result.get("includeToolCalls").unwrap().as_bool().unwrap());
         let messages = result.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 1);
         let blocks = messages[0]
