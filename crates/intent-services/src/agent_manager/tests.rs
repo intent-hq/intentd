@@ -117,7 +117,7 @@ fn compute_process_cap_lower_clamp_floors_at_4() {
     // Below the 8 GB reserve the subtraction saturates to 0 → clamp to 4.
     assert_eq!(compute_process_cap(0), 4);
     assert_eq!(compute_process_cap(4 * super::GB), 4);
-    // Just past the reserve, the raw budget (1..=4 GB) is still under the floor.
+    // Just past the reserve, the raw budget (1..=4 GB) is still at or below the floor.
     assert_eq!(compute_process_cap(12 * super::GB), 4);
     // First value above the floor.
     assert_eq!(compute_process_cap(13 * super::GB), 5);
