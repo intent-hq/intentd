@@ -16412,10 +16412,11 @@ pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
 
 /// POSIX-sh timing wrapper the setup script terminal runs via `/bin/sh -c`
 /// (`$1` is the script path): records the start epoch, runs the script through
-/// `/bin/sh`, appends a blank line plus a completion summary with elapsed
+/// `/bin/sh`, appends a newline-prefixed completion summary with elapsed
 /// seconds and the script's exit code — landing in the PTY scrollback so
 /// late-attaching clients see it via `terminal.getBuffer` — and exits with the
-/// script's own code.
+/// script's own code. The leading `\n` yields a blank separator line when the
+/// script's output ends with a newline (the common case).
 pub(crate) const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
 
 /// Write `contents` to a fresh file created with mode `0600` on unix (plain

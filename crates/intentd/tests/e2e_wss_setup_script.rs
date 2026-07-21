@@ -239,7 +239,8 @@ where
 }
 
 /// Poll `terminal.list` until the workspace's setup terminal (named "Setup
-/// Script") has finished executing, returning its list entry.
+/// Script") has finished executing, returning its list entry. Uses a generous
+/// deadline so slow CI machines don't flake.
 async fn await_setup_terminal<S>(
     ws: &mut WebSocketStream<S>,
     base_id: i64,
@@ -248,7 +249,9 @@ async fn await_setup_terminal<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    for attempt in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0;
+    while tokio::time::Instant::now() < deadline {
         let list_resp = wss_rpc(
             ws,
             base_id + attempt,
@@ -256,6 +259,7 @@ where
             json!({ "workspaceId": workspace_id }),
         )
         .await;
+        attempt += 1;
         let terminals = list_resp["result"].as_array().expect("terminal.list array");
         if let Some(entry) = terminals
             .iter()
@@ -266,6 +270,35 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("setup terminal named \"Setup Script\" never finished for {workspace_id}");
+}
+
+/// Poll `terminal.getBuffer` until the decoded scrollback contains `needle`,
+/// returning the buffer. The child process being reaped (which flips
+/// `isExecutingCommand` to false) has no ordering guarantee with the PTY
+/// reader thread appending the final output to scrollback, so a single read
+/// after `await_setup_terminal` could race it.
+async fn await_buffer_contains<S>(
+    ws: &mut WebSocketStream<S>,
+    base_id: i64,
+    terminal_id: &str,
+    needle: &str,
+) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempt = 0;
+    loop {
+        let buffer = terminal_buffer(ws, base_id + attempt, terminal_id).await;
+        attempt += 1;
+        if buffer.contains(needle) {
+            return buffer;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("buffer never contained {needle:?}: {buffer:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Fetch a terminal's decoded scrollback via `terminal.getBuffer`.
@@ -633,13 +666,9 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
     // scrollback ends with the completion summary (elapsed time + exit code)
     // even for a late-attaching client reading via terminal.getBuffer.
     let setup_terminal = await_setup_terminal(&mut wss, 100, &workspace_id).await;
-    assert_eq!(setup_terminal["name"], json!("Setup Script"));
     let terminal_id = setup_terminal["id"].as_str().expect("terminal id");
-    let buffer = terminal_buffer(&mut wss, 300, terminal_id).await;
-    assert!(
-        buffer.contains("Setup script completed in "),
-        "buffer should contain completion summary: {buffer:?}"
-    );
+    let buffer =
+        await_buffer_contains(&mut wss, 300, terminal_id, "Setup script completed in ").await;
     assert!(
         buffer.contains("(exit code 0)"),
         "buffer should report exit code 0: {buffer:?}"
@@ -677,11 +706,8 @@ exit 1
         .to_string();
     let failed_terminal = await_setup_terminal(&mut wss, 400, &workspace_id2).await;
     let failed_terminal_id = failed_terminal["id"].as_str().expect("terminal id");
-    let failed_buffer = terminal_buffer(&mut wss, 600, failed_terminal_id).await;
-    assert!(
-        failed_buffer.contains("Setup script failed in "),
-        "buffer should contain failure summary: {failed_buffer:?}"
-    );
+    let failed_buffer =
+        await_buffer_contains(&mut wss, 600, failed_terminal_id, "Setup script failed in ").await;
     assert!(
         failed_buffer.contains("(exit code 1)"),
         "buffer should report exit code 1: {failed_buffer:?}"

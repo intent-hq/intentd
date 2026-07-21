@@ -851,8 +851,9 @@ mod tests {
         kill(pty.as_ref(), &unnamed_id).await.unwrap();
     }
 
-    /// The setup script wrapper appends a blank line plus the completion
-    /// summary after the script's own output and preserves its exit code.
+    /// The setup script wrapper appends a newline-prefixed completion summary
+    /// after the script's own output (a blank separator line when the script's
+    /// output ends with a newline) and preserves its exit code.
     #[test]
     fn setup_wrapper_appends_summary_and_preserves_exit_code() {
         let run = |body: &str| {
