@@ -193,8 +193,11 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
 
     let trunk_started = std::time::Instant::now();
     let trunk_ref = resolve_trunk_ref(worktree, &trunk, has_remote);
-    let (ahead, behind) = intent_git::remote::ahead_behind(worktree, &trunk_ref)?;
     let trunk_ms = trunk_started.elapsed().as_millis() as u64;
+
+    let ahead_behind_started = std::time::Instant::now();
+    let (ahead, behind) = intent_git::remote::ahead_behind(worktree, &trunk_ref)?;
+    let ahead_behind_ms = ahead_behind_started.elapsed().as_millis() as u64;
 
     let history_started = std::time::Instant::now();
     let commits = intent_git::history::history_since(worktree, Some(&trunk_ref), 200)?;
@@ -222,6 +225,7 @@ pub(crate) fn build_git_status_value(worktree: &Path, ws: &Workspace) -> Result<
         status_ms,
         remote_ms,
         trunk_resolve_ms = trunk_ms,
+        ahead_behind_ms,
         history_walk_ms = history_ms,
         total_ms = started.elapsed().as_millis() as u64,
         "accept-changes.getStatus: status scan + remote/trunk resolve + history walk"
