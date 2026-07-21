@@ -1597,14 +1597,13 @@ mod tests {
     /// a placeholder or `null` when unset.
     #[test]
     fn new_secret_catalog_entries_are_sensitive() {
-        for path in ["accounts.sentry.token"] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert_eq!(def.path, path);
-            assert!(def.sensitive, "{path} must be a sensitive catalog entry");
-            assert!(!def.read_only, "{path} must not be read-only");
-            assert!(matches!(def.ty, SettingType::String));
-            assert!(def.default_value.is_none(), "{path} default is null");
-        }
+        let path = "accounts.sentry.token";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert_eq!(def.path, path);
+        assert!(def.sensitive, "{path} must be a sensitive catalog entry");
+        assert!(!def.read_only, "{path} must not be read-only");
+        assert!(matches!(def.ty, SettingType::String));
+        assert!(def.default_value.is_none(), "{path} default is null");
     }
 
     /// `workspace.sshKeyPath` is a **plain non-secret** path setting: the value
@@ -2008,6 +2007,55 @@ mod tests {
                 .expect("no-op import"),
             Vec::<String>::new()
         );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// A hand-edited file can carry the legacy key as a TOML table header
+    /// (`[model.workspaceOverrides]`) instead of an inline table. The capture
+    /// and strip paths must handle that form too — the one-shot migration
+    /// would otherwise lose the value from both the file and SQLite.
+    #[tokio::test]
+    async fn import_legacy_settings_handles_table_header_form() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyhdr-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyhdr-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[git]\nautoCommit = false\n\n[model.workspaceOverrides]\nws1 = \"m1\"\nws2 = \"m2\"\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy header form must load");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
+
+        let raw = store
+            .get_setting("model.workspaceOverrides")
+            .await
+            .expect("read settings table")
+            .expect("row present");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("json"),
+            json!({ "ws1": "m1", "ws2": "m2" })
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("workspaceOverrides"), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+        assert!(text.contains("autoCommit = false"), "{text}");
+
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

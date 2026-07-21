@@ -80,14 +80,24 @@ async fn resolve_default_model_from_settings(
     let settings = services.effective_settings();
 
     // 1. Check workspace-specific override (SQLite `settings` table blob;
-    //    read errors / malformed rows fall through to the next tier)
+    //    read errors / malformed rows are logged, then fall through to the
+    //    next tier)
     if let Some(model) = services
         .store()
         .get_setting("model.workspaceOverrides")
         .await
+        .inspect_err(
+            |e| tracing::warn!(error = %e, "model.workspaceOverrides read failed; skipping tier"),
+        )
         .ok()
         .flatten()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|raw| {
+            serde_json::from_str::<Value>(&raw)
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "model.workspaceOverrides row is malformed JSON; skipping tier");
+                })
+                .ok()
+        })
         .and_then(|v| {
             v.get(workspace_id.as_str())
                 .and_then(|m| m.as_str())
