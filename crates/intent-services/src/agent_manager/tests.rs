@@ -2901,10 +2901,11 @@ async fn send_message_direct_branch_minted_id_matches_persisted_row() {
 }
 
 /// An oversized client-supplied `messageId` is rejected with `-32602` BEFORE
-/// any persist (mirrors `agent_send_message_op`'s guard, now that the row is
-/// keyed on the client id) and the in-flight slot is released.
+/// any state change (mirrors `agent_send_message_op`'s unconditional guard,
+/// now that the row is keyed on the client id): no slot claim, no status
+/// flap, nothing persisted.
 #[tokio::test]
-async fn send_message_rejects_oversized_message_id_and_releases_slot() {
+async fn send_message_rejects_oversized_message_id_before_any_state_change() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-len"), AgentId::from("a-len"));
@@ -2921,7 +2922,10 @@ async fn send_message_rejects_oversized_message_id_and_releases_slot() {
         .await
         .expect_err("oversized id rejected");
     assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
-    assert!(!mgr.is_busy(&id), "slot released on validation failure");
+    assert!(
+        !mgr.is_busy(&id),
+        "slot never claimed on validation failure"
+    );
     let messages = mgr
         .services
         .store
@@ -2929,6 +2933,26 @@ async fn send_message_rejects_oversized_message_id_and_releases_slot() {
         .await
         .unwrap();
     assert!(messages.is_empty(), "nothing persisted");
+
+    // The guard is unconditional: a BUSY agent also rejects instead of
+    // silently queueing the oversized id.
+    assert!(mgr.try_begin(&id, &ws).await);
+    let err = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "still too big".to_string(),
+            Some("y".repeat(300)),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect_err("oversized id rejected while busy");
+    assert!(matches!(err, Error::InvalidParams(_)), "got {err:?}");
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        0,
+        "nothing queued for an oversized id"
+    );
 }
 
 /// When `send_message` hits the busy auto-queue fallback, the caller's

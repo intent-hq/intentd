@@ -2127,6 +2127,18 @@ impl AgentManager {
         message_id: Option<String>,
         options: TurnOptions,
     ) -> Result<Value> {
+        // Validate the caller-supplied id length BEFORE any state change
+        // (mirrors `agent_send_message_op`'s unconditional guard — the row id
+        // is now the client id). Hoisted above `try_begin` so a doomed
+        // request never claims the slot (no Active→RuntimeIdle status flap)
+        // and the busy branch never queues an oversized id.
+        if let Some(ref id) = message_id {
+            if id.len() > MAX_MESSAGE_ID_LEN {
+                return Err(Error::InvalidParams(format!(
+                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
+                )));
+            }
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
@@ -2142,16 +2154,6 @@ impl AgentManager {
             });
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(result);
-        }
-        // Validate the caller-supplied id length BEFORE persisting under it
-        // (mirrors `agent_send_message_op` — the row id is now the client id).
-        if let Some(ref id) = message_id {
-            if id.len() > MAX_MESSAGE_ID_LEN {
-                self.end_turn(&agent_id).await;
-                return Err(Error::InvalidParams(format!(
-                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
-                )));
-            }
         }
         let message_id = message_id.unwrap_or_else(new_message_id);
         // STAB-133: persist FE-supplied attachments alongside the text block so
