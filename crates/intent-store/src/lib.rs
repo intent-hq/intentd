@@ -101,7 +101,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Holds two pools over the same DB file: a single-connection **write pool**
 /// (max_connections=1) to serialize all mutations and eliminate in-process
 /// writer-vs-writer busy_timeout contention, and a **read pool** (32 connections)
-/// for concurrent SELECT-only queries. See `connect_read` for pool configuration.
+/// for concurrent SELECT-only queries. See `connect_write` / `connect_read` for
+/// the pool configurations.
 #[derive(Clone)]
 pub struct Store {
     write_pool: SqlitePool,
