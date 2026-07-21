@@ -49,7 +49,7 @@ fn temp_data_dir() -> PathBuf {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(60), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
