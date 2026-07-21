@@ -214,7 +214,11 @@ async fn run_opencode_models_cli(bin: PathBuf) -> Result<String, String> {
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr.trim().chars().take(200).collect();
+        let trimmed = stderr.trim();
+        let tail: String = trimmed
+            .chars()
+            .skip(trimmed.chars().count().saturating_sub(200))
+            .collect();
         return Err(format!(
             "opencode models exited with {}: {tail}",
             output.status

@@ -165,7 +165,7 @@ pub(super) fn parse_opencode_models(stdout: &str) -> Vec<Value> {
 fn title_case_model(model_id: &str) -> String {
     model_id
         .replace('-', " ")
-        .split(' ')
+        .split_whitespace()
         .map(capitalize)
         .collect::<Vec<_>>()
         .join(" ")
