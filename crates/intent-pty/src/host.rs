@@ -158,7 +158,8 @@ struct Fanout {
 
 /// A point-in-time view of a tracked PTY's metadata (`terminal.list` /
 /// `terminal.readOutput`). `cwd` is the working directory resolved at spawn;
-/// `alive` reflects whether the child has not yet exited.
+/// `alive` reflects whether the child has not yet exited; `name` is the
+/// optional display name given at spawn (`SpawnSpec::name`).
 #[derive(Clone, Debug)]
 pub struct PtyInfo {
     /// Lifetime scope the PTY was spawned under (workspace or session id).
