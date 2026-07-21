@@ -447,6 +447,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diff_summary_over_budget_serves_stale_value() {
+        let dir = seeded_dirty_repo();
+        // Zero TTL + zero budget: after the cache is backfilled once, every
+        // subsequent call sees a stale entry and an over-budget rollup, so it
+        // must serve the stale value rather than omit.
+        let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        assert!(cache
+            .diff_summary("ws-1", dir.path().to_path_buf())
+            .await
+            .is_none());
+        let mut backfilled = None;
+        for _ in 0..250 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            backfilled = cache.diff_summary("ws-1", dir.path().to_path_buf()).await;
+            if backfilled.is_some() {
+                break;
+            }
+        }
+        assert_eq!(backfilled.expect("stale value served").total_files, 1);
+    }
+
+    #[tokio::test]
+    async fn diff_summary_single_flight_non_winner_serves_last_known() {
+        let dir = seeded_dirty_repo();
+        let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        let key = dir.path().to_string_lossy().into_owned();
+        // Simulate an in-flight rollup: the non-winner must return the last
+        // known value (none yet) without waiting on or duplicating the diff.
+        let guard = try_begin(&cache.diff_in_flight, key.clone()).expect("claims slot");
+        assert!(cache
+            .diff_summary("ws-1", dir.path().to_path_buf())
+            .await
+            .is_none());
+        // Dropping the guard releases the slot (panic-safety path), after
+        // which a fresh call computes normally.
+        drop(guard);
+        assert!(!cache.diff_in_flight.lock().unwrap().contains(&key));
+        let summary = cache
+            .diff_summary("ws-1", dir.path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(summary.total_files, 1);
+    }
+
+    #[tokio::test]
     async fn diff_summary_non_repo_worktree_is_none() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Arc::new(WorkspaceAggregateCache::new());
