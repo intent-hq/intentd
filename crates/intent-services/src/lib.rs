@@ -6554,34 +6554,45 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let this = self.clone();
         Box::pin(async move {
-            let list = store.list_workspaces(include_archived).await?;
+            let mut list = store.list_workspaces(include_archived).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
-            // Enrichment fans out per workspace: store reads stay on the async
-            // pool while the git/FS rollups are offloaded, bounded, and cached
-            // inside `enrich_workspace_aggregates`, so list latency is bounded
-            // by the per-aggregate budget instead of O(workspaces × workdir diff).
+            // Enrichment fans out per workspace (bounded by a semaphore so a
+            // large workspace count doesn't burst-issue unbounded store reads):
+            // store reads stay on the async pool while the git/FS rollups are
+            // offloaded, bounded, and cached inside `enrich_workspace_aggregates`,
+            // so list latency is bounded by the per-aggregate budget instead of
+            // O(workspaces × workdir diff).
             let started = std::time::Instant::now();
             let count = list.len();
+            let enrich_gate = Arc::new(tokio::sync::Semaphore::new(
+                workspace_aggregates::MAX_CONCURRENT_ENRICHMENTS,
+            ));
             let mut join = tokio::task::JoinSet::new();
-            for (idx, mut ws) in list.into_iter().enumerate() {
+            for (idx, ws) in list.iter().enumerate() {
+                let mut ws = ws.clone();
                 let this = this.clone();
+                let enrich_gate = Arc::clone(&enrich_gate);
                 join.spawn(async move {
+                    let _permit = enrich_gate.acquire_owned().await;
                     ws.activity = this.workspace_activity(&ws.id);
                     this.enrich_workspace_aggregates(&mut ws).await;
                     (idx, ws)
                 });
             }
-            // Reassemble in store order (ORDER BY created_at) by index.
-            let mut slots: Vec<Option<Workspace>> = Vec::with_capacity(count);
-            slots.resize_with(count, || None);
+            // Merge back into store order (ORDER BY created_at) by index. If an
+            // enrichment task panics, degrade to the un-enriched base row —
+            // aggregates are advisory and optional on the wire, so one bad
+            // worktree must not fail the whole list call.
             while let Some(res) = join.join_next().await {
-                let (idx, ws) = res.map_err(|e| {
-                    Error::Internal(format!("workspace.list enrichment task failed: {e}"))
-                })?;
-                slots[idx] = Some(ws);
+                match res {
+                    Ok((idx, ws)) => list[idx] = ws,
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "workspace.list: enrichment task failed; serving base row"
+                    ),
+                }
             }
-            let list: Vec<Workspace> = slots.into_iter().flatten().collect();
             tracing::debug!(
                 workspaces = count,
                 total_ms = started.elapsed().as_millis() as u64,

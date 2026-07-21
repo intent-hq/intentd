@@ -21,11 +21,14 @@
 //!   poll picks the value up.
 //! - **CoW probe cache**: `cowSupported` is invariant per
 //!   `(repository_path, workspaces_root)` pair, so successful probes are
-//!   cached for the daemon's lifetime. Live probes are serialized because
-//!   concurrent probes into the same `workspaces_root` would collide on the
-//!   shared `.cow_probe_temp` file now that enrichment fans out in parallel.
+//!   cached for the daemon's lifetime (over-budget probes finish detached and
+//!   backfill the cache; failed probes are not cached so a later call
+//!   retries). Live probes are serialized because concurrent probes into the
+//!   same `workspaces_root` would collide on the shared `.cow_probe_temp`
+//!   file now that enrichment fans out in parallel.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +48,11 @@ const AGGREGATE_BUDGET: Duration = Duration::from_millis(1_500);
 /// list calls over many large repos cannot exhaust the blocking pool.
 const MAX_CONCURRENT_ROLLUPS: usize = 4;
 
+/// Cap on concurrent per-workspace enrichment tasks in `workspace.list`, so a
+/// large workspace count doesn't burst-issue unbounded concurrent store reads
+/// (the git/FS side is separately bounded by [`MAX_CONCURRENT_ROLLUPS`]).
+pub(crate) const MAX_CONCURRENT_ENRICHMENTS: usize = 8;
+
 /// One completed rollup for a worktree. `summary` is `None` for legitimate
 /// "no summary" outcomes (clean tree, not a git repo) — cached like any other
 /// result so those worktrees aren't re-scanned every call within the TTL.
@@ -60,15 +68,49 @@ pub(crate) struct WorkspaceAggregateCache {
     /// Last completed diff rollup per worktree path.
     diff: Mutex<HashMap<String, DiffCacheEntry>>,
     /// Worktrees with a rollup currently in flight (single-flight guard).
-    diff_in_flight: Mutex<HashSet<String>>,
+    diff_in_flight: Arc<Mutex<HashSet<String>>>,
     /// Bounds concurrent blocking rollups.
     gate: tokio::sync::Semaphore,
-    /// CoW support per `(repository_path, workspaces_root)` pair.
+    /// CoW support per `(repository_path, workspaces_root)` pair. This is a
+    /// second layer over `intent_git::cow_probe`'s own process-wide cache: a
+    /// hit here skips the `tokio::spawn` + probe-gate + `spawn_blocking`
+    /// round-trip entirely.
     cow: Mutex<HashMap<(String, PathBuf), bool>>,
+    /// Pairs with a probe currently in flight (single-flight guard).
+    cow_in_flight: Arc<Mutex<HashSet<(String, PathBuf)>>>,
     /// Serializes live CoW probes (shared `.cow_probe_temp` collision guard).
     cow_probe_gate: tokio::sync::Mutex<()>,
     ttl: Duration,
     budget: Duration,
+}
+
+/// RAII guard for a single-flight key: removes the key on drop, including on
+/// panic or task cancellation, so a failed computation can never wedge the
+/// single-flight state for the daemon's lifetime.
+struct InFlightGuard<K: Eq + Hash> {
+    set: Arc<Mutex<HashSet<K>>>,
+    key: K,
+}
+
+impl<K: Eq + Hash> Drop for InFlightGuard<K> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.key);
+    }
+}
+
+/// Claim the single-flight slot for `key`. Returns `None` when another caller
+/// already holds it.
+fn try_begin<K: Eq + Hash + Clone>(
+    set: &Arc<Mutex<HashSet<K>>>,
+    key: K,
+) -> Option<InFlightGuard<K>> {
+    set.lock()
+        .unwrap()
+        .insert(key.clone())
+        .then(|| InFlightGuard {
+            set: Arc::clone(set),
+            key,
+        })
 }
 
 impl WorkspaceAggregateCache {
@@ -81,9 +123,10 @@ impl WorkspaceAggregateCache {
     pub(crate) fn with_timing(ttl: Duration, budget: Duration) -> Self {
         Self {
             diff: Mutex::new(HashMap::new()),
-            diff_in_flight: Mutex::new(HashSet::new()),
+            diff_in_flight: Arc::new(Mutex::new(HashSet::new())),
             gate: tokio::sync::Semaphore::new(MAX_CONCURRENT_ROLLUPS),
             cow: Mutex::new(HashMap::new()),
+            cow_in_flight: Arc::new(Mutex::new(HashSet::new())),
             cow_probe_gate: tokio::sync::Mutex::new(()),
             ttl,
             budget,
@@ -105,16 +148,16 @@ impl WorkspaceAggregateCache {
         }
         // Single-flight: only the first caller spawns a rollup for this
         // worktree; concurrent callers serve the last completed value instead
-        // of stacking duplicate diffs.
-        if !self.diff_in_flight.lock().unwrap().insert(key.clone()) {
+        // of stacking duplicate diffs. The guard clears the key on drop even
+        // if the rollup panics, so the slot can never be wedged.
+        let Some(guard) = try_begin(&self.diff_in_flight, key.clone()) else {
             return self.lookup_diff(&key, false).flatten();
-        }
+        };
         let cache = Arc::clone(self);
         let task_key = key.clone();
         let handle = tokio::spawn(async move {
-            let summary = cache.rollup_and_store(&task_key, worktree).await;
-            cache.diff_in_flight.lock().unwrap().remove(&task_key);
-            summary
+            let _guard = guard;
+            cache.rollup_and_store(&task_key, worktree).await
         });
         match tokio::time::timeout(self.budget, handle).await {
             Ok(Ok(summary)) => summary,
@@ -188,10 +231,11 @@ impl WorkspaceAggregateCache {
     }
 
     /// Compute (or serve from cache) the `cowSupported` aggregate for a
-    /// `(repository_path, workspaces_root)` pair. Successful probes are cached
-    /// for the daemon's lifetime (support is invariant per pair); failures and
-    /// over-budget probes yield `None` (field omitted) without caching, so a
-    /// later call retries.
+    /// `(repository_path, workspaces_root)` pair. Completed probes are cached
+    /// for the daemon's lifetime (support is invariant per pair); an
+    /// over-budget probe yields `None` for this call but keeps running
+    /// detached and backfills the cache for the next poll. Failed probes are
+    /// not cached, so a later call retries.
     pub(crate) async fn cow_supported(
         self: &Arc<Self>,
         repository_path: String,
@@ -201,11 +245,16 @@ impl WorkspaceAggregateCache {
         if let Some(v) = self.cow.lock().unwrap().get(&key) {
             return Some(*v);
         }
+        // Single-flight per pair: while a probe is in flight, concurrent
+        // callers omit the field instead of queueing duplicate detached tasks
+        // behind the probe gate.
+        let guard = try_begin(&self.cow_in_flight, key.clone())?;
         let cache = Arc::clone(self);
         let handle = tokio::spawn(async move {
+            let _in_flight = guard;
             // Serialize live probes: concurrent probes into the same
             // workspaces_root collide on the shared `.cow_probe_temp` name.
-            let _guard = cache.cow_probe_gate.lock().await;
+            let _gate = cache.cow_probe_gate.lock().await;
             if let Some(v) = cache.cow.lock().unwrap().get(&key) {
                 return Some(*v);
             }
@@ -226,12 +275,42 @@ impl WorkspaceAggregateCache {
                     );
                     Some(supported)
                 }
-                _ => None,
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        repository_path = %key.0,
+                        error = %e,
+                        "workspace aggregates: cow probe failed; will retry on a later call"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repository_path = %key.0,
+                        error = %e,
+                        "workspace aggregates: cow probe blocking task failed"
+                    );
+                    None
+                }
             }
         });
         match tokio::time::timeout(self.budget, handle).await {
             Ok(Ok(v)) => v,
-            _ => None,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "workspace aggregates: cow probe task failed; omitting cowSupported"
+                );
+                None
+            }
+            Err(_) => {
+                // Over budget: the detached probe keeps running and backfills
+                // the cache for the next poll.
+                tracing::debug!(
+                    budget_ms = self.budget.as_millis() as u64,
+                    "workspace aggregates: cow probe over budget; omitting cowSupported"
+                );
+                None
+            }
         }
     }
 }
