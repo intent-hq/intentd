@@ -11,13 +11,20 @@
 //!
 //! Deliberately excluded from this schema:
 //! - **Secrets** (`mcp.servers`, `server.auth.token`, `sourceControl.github.
-//!   token`, `linear.token`, `accounts.sentry.token`, `ai.apiToken`) — they
+//!   token`, `linear.token`, `accounts.sentry.token`) — they
 //!   live in `secrets.json` ([`crate::FileSecretStore`]) and must never
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
 //!   `workspaceInitializer.state`, `repos.known`, `endUserRules`,
-//!   `permissions.rules`, `userRules`, `workspaceRules`) — high-churn state
-//!   that stays SQLite-backed.
+//!   `permissions.rules`, `userRules`, `workspaceRules`,
+//!   `model.workspaceOverrides`) — high-churn state that stays
+//!   SQLite-backed.
+//!
+//! Keys that older daemons **used to** persist here but that have since moved
+//! back to SQLite or been removed outright are listed in
+//! [`LEGACY_SETTINGS_PATHS`]. A file containing one of them still parses (the
+//! value is captured for a one-time boot import-or-discard-and-strip by the
+//! composition root); any other unknown key remains a hard parse error.
 //!
 //! When the file is absent, [`SettingsFile::load_or_init`] writes a
 //! fully-commented default file (every key with its default value plus its
@@ -47,7 +54,6 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub source_control: SourceControlSettings,
     pub accounts: AccountsSettings,
-    pub ai: AiSettings,
     pub context: ContextSettings,
     pub storage: StorageSettings,
     pub workspaces: WorkspacesSettings,
@@ -68,7 +74,9 @@ pub struct ProvidersSettings {
     pub paths: BTreeMap<String, String>,
 }
 
-/// `[model]` — model defaults (`model.*`).
+/// `[model]` — model defaults (`model.*`). Per-workspace model overrides
+/// (`model.workspaceOverrides`) are a SQLite-backed machine-state blob, not
+/// part of this file (see [`LEGACY_SETTINGS_PATHS`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelSettings {
@@ -76,8 +84,6 @@ pub struct ModelSettings {
     pub default: Option<String>,
     /// `model.providerDefaults` — default model per provider.
     pub provider_defaults: BTreeMap<String, String>,
-    /// `model.workspaceOverrides` — per-workspace model overrides.
-    pub workspace_overrides: BTreeMap<String, String>,
 }
 
 /// `[backgroundAgents]` — background-agent model config (`backgroundAgents.*`).
@@ -347,38 +353,6 @@ pub struct SentrySettings {
     pub organization: Option<String>,
 }
 
-/// `[ai]` — primary AI provider config (`ai.*`). The bearer token
-/// (`ai.apiToken`) is a secret and lives in `secrets.json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct AiSettings {
-    /// `ai.apiUrl` — base URL for the primary AI provider.
-    pub api_url: Option<String>,
-    /// `ai.model` — default AI model.
-    pub model: Option<String>,
-    /// `ai.temperature` — sampling temperature (0–2).
-    #[serde(deserialize_with = "de_lenient_f64")]
-    pub temperature: f64,
-    /// `ai.maxTokens` — maximum tokens per completion (>= 1).
-    pub max_tokens: u32,
-    /// `ai.streamingSpeed` — streaming pacing hint (tokens per second;
-    /// 0 = no throttle).
-    #[serde(deserialize_with = "de_lenient_f64")]
-    pub streaming_speed: f64,
-}
-
-impl Default for AiSettings {
-    fn default() -> Self {
-        Self {
-            api_url: None,
-            model: None,
-            temperature: 0.7,
-            max_tokens: 4096,
-            streaming_speed: 0.0,
-        }
-    }
-}
-
 /// `[context]` — context engine (`context.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -500,10 +474,25 @@ where
     deserializer.deserialize_any(V)
 }
 
+/// Dotted wire paths that older daemons persisted in `config.toml` but that
+/// have since moved back to the SQLite `settings` table or been removed from
+/// the product entirely. A file containing one of these still parses via
+/// [`SettingsFile::parse_str_with_legacy`] — the value is captured so the
+/// composition root can run a one-time import-into-SQLite (or discard, for
+/// keys with no catalog entry) + strip-from-file at boot. Any other unknown
+/// key remains a hard parse error. `ai` covers the whole retired `[ai]`
+/// table (the app drives AI via ACP agent providers, not a direct provider).
+pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides", "ai"];
+
+/// Legacy values captured during a tolerant parse: dotted wire path → the
+/// JSON shape of the TOML value found in the file.
+pub type LegacySettings = BTreeMap<String, serde_json::Value>;
+
 impl SettingsFile {
-    /// Parse `text` as a strict `config.toml`. Unknown keys, wrong types, and
-    /// bad enum values are rejected; the error message names the offending key
-    /// path (camelCase, dotted) plus the TOML line/column context.
+    /// Parse `text` as a strict `config.toml`. Unknown keys (including
+    /// [`LEGACY_SETTINGS_PATHS`]), wrong types, and bad enum values are
+    /// rejected; the error message names the offending key path (camelCase,
+    /// dotted) plus the TOML line/column context.
     pub fn parse_str(text: &str) -> Result<Self> {
         let de = toml::de::Deserializer::new(text);
         let file: SettingsFile = serde_path_to_error::deserialize(de).map_err(|e| {
@@ -518,6 +507,47 @@ impl SettingsFile {
         })?;
         file.validate()?;
         Ok(file)
+    }
+
+    /// Parse `text` like [`SettingsFile::parse_str`], but tolerate the known
+    /// [`LEGACY_SETTINGS_PATHS`]: their values are removed from the document
+    /// before the strict parse and returned in the legacy map (dotted wire
+    /// path → JSON value) so the caller can import them into SQLite and strip
+    /// the file. Every **other** unknown key is still a hard error.
+    pub fn parse_str_with_legacy(text: &str) -> Result<(Self, LegacySettings)> {
+        let raw: toml::Table = text.parse().map_err(|e: toml::de::Error| {
+            Error::InvalidInput(format!("invalid config.toml: {e}"))
+        })?;
+        let mut legacy = LegacySettings::new();
+        let mut pruned = raw;
+        for &path in LEGACY_SETTINGS_PATHS {
+            if let Some(value) = toml_table_remove(&mut pruned, path) {
+                let json = serde_json::to_value(&value).map_err(|e| {
+                    Error::InvalidInput(format!(
+                        "invalid config.toml at `{path}`: not representable as JSON: {e}"
+                    ))
+                })?;
+                legacy.insert(path.to_string(), json);
+            }
+        }
+        if legacy.is_empty() {
+            // Common case: no legacy keys — the plain strict parse keeps the
+            // precise TOML line/column error context.
+            return Ok((Self::parse_str(text)?, legacy));
+        }
+        let file: SettingsFile = serde_path_to_error::deserialize(toml::Value::Table(pruned))
+            .map_err(|e| {
+                let key_path = e.path().to_string();
+                let detail = e.into_inner().to_string();
+                let detail = detail.trim_end();
+                if key_path.is_empty() || key_path == "." {
+                    Error::InvalidInput(format!("invalid config.toml: {detail}"))
+                } else {
+                    Error::InvalidInput(format!("invalid config.toml at `{key_path}`: {detail}"))
+                }
+            })?;
+        file.validate()?;
+        Ok((file, legacy))
     }
 
     /// Range/semantic checks the type system cannot express. Errors name the
@@ -548,23 +578,6 @@ impl SettingsFile {
                 ),
             ));
         }
-        let t = self.ai.temperature;
-        if !(0.0..=2.0).contains(&t) {
-            return Err(bad(
-                "ai.temperature",
-                format!("must be between 0 and 2, got {t}"),
-            ));
-        }
-        if self.ai.max_tokens < 1 {
-            return Err(bad("ai.maxTokens", "must be at least 1".to_string()));
-        }
-        let s = self.ai.streaming_speed;
-        if !s.is_finite() || s < 0.0 {
-            return Err(bad(
-                "ai.streamingSpeed",
-                format!("must be a non-negative number, got {s}"),
-            ));
-        }
         if self.agents.max_concurrent > 200 {
             return Err(bad(
                 "agents.maxConcurrent",
@@ -579,11 +592,20 @@ impl SettingsFile {
 
     /// Load `config.toml` from `path`. When the file does not exist, write
     /// [`DEFAULT_CONFIG_TEMPLATE`] (creating parent directories) and return the
-    /// defaults. When it exists, parse it strictly — a malformed file is an
-    /// error, never silently ignored.
+    /// defaults. When it exists, parse it strictly except for the known
+    /// [`LEGACY_SETTINGS_PATHS`] (tolerated so a daemon upgrade can boot and
+    /// import them; see [`SettingsFile::load_or_init_with_legacy`]) — any
+    /// other malformed content is an error, never silently ignored.
     pub fn load_or_init(path: &Path) -> Result<Self> {
+        Self::load_or_init_with_legacy(path).map(|(file, _)| file)
+    }
+
+    /// Like [`SettingsFile::load_or_init`], but also return the captured
+    /// legacy values (dotted wire path → JSON value; empty when the file has
+    /// none) so the composition root can run the one-time import-and-strip.
+    pub fn load_or_init_with_legacy(path: &Path) -> Result<(Self, LegacySettings)> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse_str(&text).map_err(|e| match e {
+            Ok(text) => Self::parse_str_with_legacy(&text).map_err(|e| match e {
                 Error::InvalidInput(msg) => {
                     Error::InvalidInput(format!("{}: {msg}", path.display()))
                 }
@@ -604,7 +626,7 @@ impl SettingsFile {
                         path.display()
                     ))
                 })?;
-                Ok(Self::default())
+                Ok((Self::default(), LegacySettings::new()))
             }
             Err(err) => Err(Error::Internal(format!(
                 "could not read config {}: {err}",
@@ -612,6 +634,19 @@ impl SettingsFile {
             ))),
         }
     }
+}
+
+/// Remove a dotted path from a parsed TOML table, returning the value when it
+/// was present (no-op `None` otherwise). Empties left behind are kept — the
+/// comment-preserving file strip is the registry's concern, not this parse.
+fn toml_table_remove(table: &mut toml::Table, path: &str) -> Option<toml::Value> {
+    let segs: Vec<&str> = path.split('.').collect();
+    let (last, parents) = segs.split_last().expect("dotted path is never empty");
+    let mut cur = table;
+    for seg in parents {
+        cur = cur.get_mut(*seg)?.as_table_mut()?;
+    }
+    cur.remove(*last)
 }
 
 /// The fully-commented default `config.toml` written by
@@ -638,8 +673,6 @@ paths = {}
 # default = "claude-sonnet-4-5"
 # Provider default models -- default model per provider.
 providerDefaults = {}
-# Workspace model overrides -- per-workspace model overrides.
-workspaceOverrides = {}
 
 [backgroundAgents]
 # Background default model -- model for background agents.
@@ -736,19 +769,6 @@ apiBaseUrl = "https://api.github.com"
 # accounts.sentry.token secret).
 # organization = "my-org"
 
-[ai]
-# AI provider API URL -- base URL for the primary AI provider.
-# apiUrl = "https://api.example.com"
-# AI model -- default AI model.
-# model = "claude-sonnet-4-5"
-# AI temperature -- sampling temperature for the primary AI provider (0-2).
-temperature = 0.7
-# AI max tokens -- maximum tokens per completion for the primary AI provider.
-maxTokens = 4096
-# AI streaming speed -- streaming pacing hint (tokens per second; 0 = no
-# throttle).
-streamingSpeed = 0.0
-
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -843,9 +863,6 @@ mod tests {
             "https://api.github.com"
         );
         assert_eq!(d.accounts.sentry.organization, None);
-        assert_eq!(d.ai.temperature, 0.7);
-        assert_eq!(d.ai.max_tokens, 4096);
-        assert_eq!(d.ai.streaming_speed, 0.0);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
@@ -920,9 +937,6 @@ mod tests {
             ("[notifications]\nvolume = 1.5\n", "notifications.volume"),
             ("[server]\nport = 80\n", "server.port"),
             ("[server.wsApi]\nport = 80\n", "server.wsApi.port"),
-            ("[ai]\ntemperature = 3.0\n", "ai.temperature"),
-            ("[ai]\nmaxTokens = 0\n", "ai.maxTokens"),
-            ("[ai]\nstreamingSpeed = -1.0\n", "ai.streamingSpeed"),
             ("[agents]\nmaxConcurrent = 500\n", "agents.maxConcurrent"),
         ] {
             let err = SettingsFile::parse_str(body).unwrap_err();
@@ -935,11 +949,8 @@ mod tests {
 
     #[test]
     fn floats_accept_integer_literals() {
-        let parsed =
-            SettingsFile::parse_str("[notifications]\nvolume = 1\n\n[ai]\ntemperature = 2\n")
-                .unwrap();
+        let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);
-        assert_eq!(parsed.ai.temperature, 2.0);
     }
 
     #[test]
@@ -1014,5 +1025,100 @@ mod tests {
         let text = toml::to_string(&file).expect("serializes");
         let back = SettingsFile::parse_str(&text).expect("re-parses");
         assert_eq!(back, file);
+    }
+
+    #[test]
+    fn workspace_overrides_is_no_longer_a_schema_key() {
+        // Strict parse rejects the legacy key like any other unknown key.
+        let err = SettingsFile::parse_str("[model]\nworkspaceOverrides = { ws1 = \"m1\" }\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("workspaceOverrides"), "{err}");
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("workspaceOverrides"));
+    }
+
+    #[test]
+    fn ai_is_no_longer_a_schema_key() {
+        // Strict parse rejects the retired [ai] table like any unknown key.
+        let err = SettingsFile::parse_str("[ai]\nmodel = \"m1\"\n").unwrap_err();
+        assert!(err.to_string().contains("ai"), "{err}");
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("[ai]"));
+    }
+
+    #[test]
+    fn legacy_parse_captures_and_tolerates_ai_table() {
+        let text = "[ai]\napiUrl = \"https://api.example\"\nmodel = \"m1\"\ntemperature = 0.5\n\n[git]\nautoCommit = false\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert!(!file.git.auto_commit);
+        assert_eq!(
+            legacy.get("ai"),
+            Some(&serde_json::json!({
+                "apiUrl": "https://api.example",
+                "model": "m1",
+                "temperature": 0.5
+            }))
+        );
+        assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn legacy_parse_captures_and_tolerates_workspace_overrides() {
+        let text =
+            "[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\", ws2 = \"m2\" }\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert_eq!(file.model.default.as_deref(), Some("m0"));
+        assert_eq!(
+            legacy.get("model.workspaceOverrides"),
+            Some(&serde_json::json!({ "ws1": "m1", "ws2": "m2" }))
+        );
+        assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn legacy_parse_returns_empty_map_without_legacy_keys() {
+        let (file, legacy) =
+            SettingsFile::parse_str_with_legacy("[git]\nautoCommit = false\n").expect("parse");
+        assert!(!file.git.auto_commit);
+        assert!(legacy.is_empty());
+    }
+
+    #[test]
+    fn legacy_parse_still_rejects_other_unknown_keys() {
+        // An unrelated unknown key fails even when a legacy key is present.
+        let err = SettingsFile::parse_str_with_legacy(
+            "[model]\nworkspaceOverrides = {}\n\n[agents]\nbogusKey = 1\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bogusKey"), "{err}");
+        // …and without any legacy key too (delegates to the strict parse).
+        let err = SettingsFile::parse_str_with_legacy("[bogus]\nkey = 1\n").unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn legacy_parse_still_range_validates() {
+        let err = SettingsFile::parse_str_with_legacy(
+            "[model]\nworkspaceOverrides = {}\n\n[server]\nport = 80\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("server.port"), "{err}");
+    }
+
+    #[test]
+    fn load_or_init_with_legacy_reads_existing_file() {
+        let dir = temp_path("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[model]\nworkspaceOverrides = { ws1 = \"m1\" }\n\n[git]\nautoCommit = false\n",
+        )
+        .unwrap();
+        let (file, legacy) = SettingsFile::load_or_init_with_legacy(&path).expect("load");
+        assert!(!file.git.auto_commit);
+        assert_eq!(
+            legacy.get("model.workspaceOverrides"),
+            Some(&serde_json::json!({ "ws1": "m1" }))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

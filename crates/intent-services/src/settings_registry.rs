@@ -32,7 +32,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use intent_core::settings_file::SettingsFile;
+use intent_core::settings_file::{LegacySettings, SettingsFile};
 use intent_core::{Error, Result};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -47,7 +47,6 @@ pub const KNOWN_PATHS: &[&str] = &[
     "providers.paths",
     "model.default",
     "model.providerDefaults",
-    "model.workspaceOverrides",
     "backgroundAgents.defaultModel",
     "backgroundAgents.typeOverrides",
     "backgroundAgents.providerSettings",
@@ -79,11 +78,6 @@ pub const KNOWN_PATHS: &[&str] = &[
     "sourceControl.github.tokenSource",
     "sourceControl.github.apiBaseUrl",
     "accounts.sentry.organization",
-    "ai.apiUrl",
-    "ai.model",
-    "ai.temperature",
-    "ai.maxTokens",
-    "ai.streamingSpeed",
     "context.enabled",
     "context.auggiePath",
     "context.allowIndexing",
@@ -153,6 +147,10 @@ struct Inner {
     file: SettingsFile,
     /// Raw document for comment-preserving write-back.
     doc: DocumentMut,
+    /// Legacy values captured at load
+    /// ([`intent_core::settings_file::LEGACY_SETTINGS_PATHS`] keys found in
+    /// the file), pending the one-time boot import-and-strip.
+    legacy: LegacySettings,
     /// Boot-time pins keyed by dotted wire path.
     pins: BTreeMap<String, Pin>,
     /// Self-write generation counter.
@@ -206,10 +204,14 @@ pub struct SettingsRegistry {
 impl SettingsRegistry {
     /// Load (or initialize) `config.toml` at `path` and build the registry.
     /// Missing file ⇒ the fully-commented default template is written first
-    /// (via [`SettingsFile::load_or_init`]); malformed file ⇒ error.
+    /// (via [`SettingsFile::load_or_init_with_legacy`]); malformed file ⇒
+    /// error. Known [`intent_core::settings_file::LEGACY_SETTINGS_PATHS`]
+    /// keys are tolerated — their values are captured for the boot-time
+    /// import-and-strip
+    /// ([`SettingsRegistry::legacy_values`] / [`SettingsRegistry::strip_legacy`]).
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        let file = SettingsFile::load_or_init(&path)?;
+        let (file, legacy) = SettingsFile::load_or_init_with_legacy(&path)?;
         let text = std::fs::read_to_string(&path).map_err(|e| {
             Error::Internal(format!("could not read config {}: {e}", path.display()))
         })?;
@@ -219,6 +221,7 @@ impl SettingsRegistry {
         let inner = Inner {
             file,
             doc,
+            legacy,
             pins: BTreeMap::new(),
             generation: 0,
             last_write: None,
@@ -231,6 +234,49 @@ impl SettingsRegistry {
             snapshot: RwLock::new(snapshot),
             tx,
         })
+    }
+
+    /// Legacy values captured at load (dotted wire path → JSON value; empty
+    /// when the file had none). Non-empty until [`SettingsRegistry::strip_legacy`]
+    /// runs.
+    pub fn legacy_values(&self) -> LegacySettings {
+        self.inner
+            .lock()
+            .expect("settings registry lock poisoned")
+            .legacy
+            .clone()
+    }
+
+    /// One-time boot cleanup: remove every captured
+    /// [`intent_core::settings_file::LEGACY_SETTINGS_PATHS`] key from
+    /// `config.toml` with a comment-preserving rewrite (temp file +
+    /// rename; only the legacy keys change in the document) and clear the
+    /// captured map. No-op when nothing was captured. Returns the stripped
+    /// paths. Callers run this only **after** the captured values are safely
+    /// persisted elsewhere, so a failed import keeps the file intact for the
+    /// next boot to retry.
+    pub fn strip_legacy(&self) -> Result<Vec<String>> {
+        let mut inner = self.inner.lock().expect("settings registry lock poisoned");
+        if inner.legacy.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stripped: Vec<String> = inner.legacy.keys().cloned().collect();
+        // Strip on a clone and only swap it in after the write succeeds, so a
+        // failed rewrite leaves the in-memory document in sync with the file.
+        let mut doc = inner.doc.clone();
+        for path in &stripped {
+            doc_remove(&mut doc, path);
+        }
+        let text = doc.to_string();
+        atomic_write(&self.path, &text)?;
+        inner.doc = doc;
+        inner.generation += 1;
+        inner.last_write = Some(WriteStamp {
+            generation: inner.generation,
+            content_hash: content_hash(&text),
+        });
+        inner.legacy.clear();
+        Ok(stripped)
     }
 
     /// The `config.toml` path this registry reads and writes.
@@ -732,6 +778,7 @@ mod tests {
             "permissions.rules",
             "userRules",
             "workspaceRules",
+            "model.workspaceOverrides",
         ] {
             assert_eq!(reg.get(p), None, "`{p}` must be unknown");
             assert_eq!(reg.origin(p), None, "`{p}` must have no origin");
@@ -997,5 +1044,75 @@ mod tests {
         // the old snapshot is immutable; new reads see the new value
         assert!(!snap_before.effective.rtk.enabled);
         assert!(reg.snapshot().effective.rtk.enabled);
+    }
+
+    #[test]
+    fn load_tolerates_legacy_workspace_overrides_and_captures_them() {
+        let seed = "[model]\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\" }\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).expect("legacy key must not refuse load");
+        // The legacy key is not a registry path: unknown on the wire surface.
+        assert_eq!(reg.get("model.workspaceOverrides"), None);
+        assert_eq!(reg.origin("model.workspaceOverrides"), None);
+        // The rest of the file is effective as usual.
+        assert_eq!(reg.get("model.default"), Some(json!("m0")));
+        // The captured value is available for the boot import.
+        assert_eq!(
+            reg.legacy_values().get("model.workspaceOverrides"),
+            Some(&json!({ "ws1": "m1" }))
+        );
+    }
+
+    #[test]
+    fn strip_legacy_rewrites_file_preserving_comments() {
+        let seed = "# top comment\n\n[model]\n# my default\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\" }\n\n[git]\n# keep me\nautoCommit = false\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        let stripped = reg.strip_legacy().expect("strip");
+        assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(!text.contains("workspaceOverrides"), "{text}");
+        assert!(text.contains("# top comment"), "{text}");
+        assert!(text.contains("# my default"), "{text}");
+        assert!(text.contains("default = \"m0\""), "{text}");
+        assert!(text.contains("# keep me"), "{text}");
+        assert!(text.contains("autoCommit = false"), "{text}");
+
+        // The strip counts as a self-write for the live-reload watcher, and
+        // the captured map is cleared (second strip is a no-op).
+        assert!(reg.is_self_write(&text));
+        assert!(reg.legacy_values().is_empty());
+        assert_eq!(
+            reg.strip_legacy().expect("no-op strip"),
+            Vec::<String>::new()
+        );
+
+        // A fresh registry loads the stripped file cleanly with no legacy.
+        let reloaded = SettingsRegistry::load(&path).expect("clean reload");
+        assert!(reloaded.legacy_values().is_empty());
+        assert_eq!(reloaded.get("model.default"), Some(json!("m0")));
+    }
+
+    #[test]
+    fn strip_legacy_is_a_no_op_without_legacy_keys() {
+        let seed = "[git]\nautoCommit = false\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let reg = SettingsRegistry::load(&path).expect("load");
+        assert_eq!(reg.strip_legacy().expect("no-op"), Vec::<String>::new());
+        // The file was not rewritten at all.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), seed);
+        assert_eq!(reg.generation(), 0);
+    }
+
+    #[test]
+    fn load_still_rejects_other_unknown_keys() {
+        let seed = "[model]\nworkspaceOverrides = {}\n\n[agents]\nbogusKey = 1\n";
+        let (_dir, path) = temp_config(Some(seed));
+        let err = match SettingsRegistry::load(&path) {
+            Ok(_) => panic!("unknown key must refuse load"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("bogusKey"), "{err}");
     }
 }
