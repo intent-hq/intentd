@@ -1883,6 +1883,81 @@ async fn wss_git_commit_details_round_trip() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// `accept-changes.getStatus` over WSS: proves the wire shape from PROTOCOL
+/// §5.18 — `localCommits` entries are metadata-only (`hash`, `message`,
+/// `author`, `date`, `isPushed`) and omit `files`/`filesChanged`, which
+/// clients fetch on demand via `git.commitDetails`.
+#[tokio::test]
+async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a repo: one commit on main, then a feature branch with one commit.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssacgs-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    git(&["checkout", "-q", "-b", "feature/wss"]);
+    std::fs::write(repo.join("feat.txt"), "feat\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "add feat"]);
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS AC WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"accept-changes.getStatus","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let result = &resp["result"];
+    assert_eq!(result["branch"], "feature/wss");
+    assert_eq!(result["trunkBranch"], "main");
+    assert_eq!(result["hasRemote"], false);
+    assert_eq!(result["aheadOfTrunk"], 1);
+    assert_eq!(result["uncommittedCount"], 0);
+    assert_eq!(result["stagedCount"], 0);
+    let commits = result["localCommits"].as_array().expect("localCommits");
+    assert_eq!(commits.len(), 1);
+    let c = &commits[0];
+    assert!(c["hash"].is_string());
+    assert_eq!(c["message"], "add feat");
+    assert_eq!(c["author"], "Test");
+    assert!(c["date"].is_string());
+    assert_eq!(c["isPushed"], false);
+    // Metadata-only walk: no per-commit tree diffs in getStatus.
+    assert!(c.get("files").is_none());
+    assert!(c.get("filesChanged").is_none());
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// `file-tracking.loadCommits` with workspace boundary over WSS: proves the
 /// daemon returns `boundarySha` and bounds commits to `boundary..HEAD`, and
 /// the `includeOlder` parameter fetches pre-boundary commits.
