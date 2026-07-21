@@ -15,10 +15,13 @@
 //! are never logged, never carried in any `Debug`/`Serialize` shape, and the
 //! token never leaves this module — callers only see [`PollStatus`].
 
+use std::time::Duration;
+
 use intent_core::FileSecretStore;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::token::SECRET_ACCOUNT;
@@ -28,6 +31,12 @@ pub use intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID as DEFAULT_OA
 /// Extra seconds GitHub mandates after a `slow_down` response when the reply
 /// carries no explicit `interval` hint.
 const SLOW_DOWN_BUMP_SECS: u64 = 5;
+
+/// Bounded wait for a blocking secret-store write/delete before the caller
+/// gives up, mirroring the write budget in `intent-services`
+/// (`DEFAULT_WRITE_TIMEOUT`): a wedged backing filesystem must not hang the
+/// task or pile up blocking-pool threads.
+const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default scopes requested by the device flow (§spec: PR/issue/review work,
 /// org-repo listing, and workflow-file pushes).
@@ -69,7 +78,7 @@ pub enum PollStatus {
 pub struct DeviceFlow {
     crab: octocrab::Octocrab,
     client_id: SecretString,
-    device_code: String,
+    device_code: SecretString,
     interval: u64,
     store: FileSecretStore,
 }
@@ -101,7 +110,7 @@ pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorizat
     let flow = DeviceFlow {
         crab,
         client_id,
-        device_code: codes.device_code,
+        device_code: SecretString::from(codes.device_code),
         interval: codes.interval,
         store: FileSecretStore::new(),
     };
@@ -138,7 +147,7 @@ impl DeviceFlow {
                 "/login/oauth/access_token",
                 Some(&json!({
                     "client_id": self.client_id.expose_secret(),
-                    "device_code": self.device_code,
+                    "device_code": self.device_code.expose_secret(),
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 })),
             )
@@ -162,7 +171,7 @@ impl DeviceFlow {
 /// Classified device-token poll response (crate-private: the authorized arm
 /// carries the raw token, which must not escape this module).
 enum PollResponse {
-    Authorized { access_token: String },
+    Authorized { access_token: SecretString },
     Pending,
     SlowDown { interval: Option<u64> },
     Expired,
@@ -194,7 +203,7 @@ fn parse_poll_response(body: Value) -> Result<PollResponse> {
     if let Some(token) = body.get("access_token").and_then(Value::as_str) {
         if !token.is_empty() {
             return Ok(PollResponse::Authorized {
-                access_token: token.to_string(),
+                access_token: SecretString::from(token.to_string()),
             });
         }
     }
@@ -222,22 +231,39 @@ fn next_interval(current: u64, hinted: Option<u64>) -> u64 {
 
 /// Persist an access token into `store` under `sourceControl.github.token`
 /// (the first slot of the existing resolution chain). Runs on the blocking
-/// pool like the loads in [`crate::token`].
-pub async fn persist_token(store: FileSecretStore, token: String) -> Result<()> {
-    tokio::task::spawn_blocking(move || store.store(SECRET_ACCOUNT, &token))
-        .await
-        .map_err(|e| Error::Api(format!("secret-store write task failed: {e}")))?
-        .map_err(|e| Error::Api(format!("could not persist github token: {e}")))
+/// pool like the loads in [`crate::token`], bounded by
+/// [`SECRET_WRITE_TIMEOUT`] so a wedged filesystem cannot hang the caller.
+pub async fn persist_token(store: FileSecretStore, token: SecretString) -> Result<()> {
+    let handle =
+        tokio::task::spawn_blocking(move || store.store(SECRET_ACCOUNT, token.expose_secret()));
+    match timeout(SECRET_WRITE_TIMEOUT, handle).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(Error::Api(format!("could not persist github token: {e}"))),
+        Ok(Err(join_err)) => Err(Error::Api(format!(
+            "secret-store write task failed: {join_err}"
+        ))),
+        Err(_) => Err(Error::Api(
+            "secret-store write timed out for sourceControl.github.token".to_string(),
+        )),
+    }
 }
 
 /// Delete the stored `sourceControl.github.token` entry from `store` (revoke /
 /// disconnect). Absence is an idempotent success, mirroring
-/// [`FileSecretStore::delete`]. Env / `gh` fallbacks are untouched.
+/// [`FileSecretStore::delete`], and the blocking delete is bounded by
+/// [`SECRET_WRITE_TIMEOUT`]. Env / `gh` fallbacks are untouched.
 pub async fn revoke_token(store: FileSecretStore) -> Result<()> {
-    tokio::task::spawn_blocking(move || store.delete(SECRET_ACCOUNT))
-        .await
-        .map_err(|e| Error::Api(format!("secret-store delete task failed: {e}")))?
-        .map_err(|e| Error::Api(format!("could not delete github token: {e}")))
+    let handle = tokio::task::spawn_blocking(move || store.delete(SECRET_ACCOUNT));
+    match timeout(SECRET_WRITE_TIMEOUT, handle).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(Error::Api(format!("could not delete github token: {e}"))),
+        Ok(Err(join_err)) => Err(Error::Api(format!(
+            "secret-store delete task failed: {join_err}"
+        ))),
+        Err(_) => Err(Error::Api(
+            "secret-store delete timed out for sourceControl.github.token".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -257,7 +283,7 @@ mod tests {
         }));
         assert!(matches!(
             r,
-            PollResponse::Authorized { access_token } if access_token == "gho_test_value"
+            PollResponse::Authorized { access_token } if access_token.expose_secret() == "gho_test_value"
         ));
     }
 
@@ -325,7 +351,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileSecretStore::with_path(dir.path().join("secrets.json"));
 
-        persist_token(store.clone(), "gho_roundtrip".to_string())
+        persist_token(store.clone(), SecretString::from("gho_roundtrip"))
             .await
             .expect("persist");
         assert_eq!(
