@@ -5988,8 +5988,8 @@ mod pr {
         let before = svc.store().get_workspace(&ws_id).await.unwrap();
         assert_eq!(before.pr_number, None);
 
-        // Run the same sweep the background loop runs.
-        svc.refresh_all_workspace_prs().await;
+        // Run the same sweep the background loop runs (tick 0 = full sweep).
+        svc.refresh_all_workspace_prs(0).await;
 
         // After the sweep the workspace is linked to PR #42.
         let after = svc.store().get_workspace(&ws_id).await.unwrap();
@@ -6004,6 +6004,104 @@ mod pr {
             .unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data["prNumber"], 42);
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_idle_workspace_between_full_ticks() {
+        // Sweep trimming (§7.7): a workspace with no recent activity is not
+        // refreshed on an in-between tick — only on every
+        // `SWEEP_IDLE_TICK_MULTIPLE`-th (full-sweep) tick.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        // Age the workspace well past the active window.
+        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+        ws.updated_at =
+            intent_core::iso_minutes_ago(2 * crate::pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES);
+        ws.last_activity = None;
+        svc.store().update_workspace(&ws).await.unwrap();
+
+        // In-between tick: the idle workspace is skipped (no link, no event).
+        svc.refresh_all_workspace_prs(1).await;
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, None);
+        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
+        assert!(evs.is_empty());
+
+        // Full-sweep tick (multiple of SWEEP_IDLE_TICK_MULTIPLE): refreshed.
+        svc.refresh_all_workspace_prs(crate::pr_ops::SWEEP_IDLE_TICK_MULTIPLE)
+            .await;
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+    }
+
+    #[test]
+    fn sweep_due_tiers_by_recency_and_tick() {
+        use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
+        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
+        let cutoff = intent_core::parse_iso(&cutoff_str);
+        assert!(cutoff.is_some());
+        let ws_id = WorkspaceId::new();
+
+        // Recently active (updated_at = now): due on every tick.
+        let active = workspace(&ws_id);
+        assert!(sweep_due(&active, cutoff, 1));
+
+        // Idle (updated_at past the window, no last_activity): due only on
+        // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
+        let mut idle = workspace(&ws_id);
+        idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
+        assert!(!sweep_due(&idle, cutoff, 1));
+        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
+        assert!(sweep_due(&idle, cutoff, 0));
+        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
+        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
+
+        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
+        let mut boundary = workspace(&ws_id);
+        boundary.updated_at = cutoff_str.clone();
+        assert!(sweep_due(&boundary, cutoff, 1));
+
+        // A recent last_activity revives an otherwise-idle workspace.
+        let mut revived = idle.clone();
+        revived.last_activity = Some(now_iso());
+        assert!(sweep_due(&revived, cutoff, 1));
+
+        // Malformed timestamps fail open (count as active), on either field.
+        let mut malformed = idle.clone();
+        malformed.updated_at = "not-a-timestamp".to_string();
+        assert!(sweep_due(&malformed, cutoff, 1));
+        let mut malformed_la = idle.clone();
+        malformed_la.last_activity = Some(String::new());
+        assert!(sweep_due(&malformed_la, cutoff, 1));
+
+        // An unparseable cutoff fails open too.
+        assert!(sweep_due(&idle, None, 1));
+    }
+
+    #[tokio::test]
+    async fn sweep_refreshes_recently_active_workspace_every_tick() {
+        // Sweep trimming (§7.7): a workspace active within the window is
+        // refreshed even on an in-between tick. `refresh_setup` seeds
+        // `updated_at = now`, i.e. inside `SWEEP_ACTIVE_WINDOW_MINUTES`.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        svc.refresh_all_workspace_prs(1).await;
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
     }
 
     // ------------------------------------------------------------------------

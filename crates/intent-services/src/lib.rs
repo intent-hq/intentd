@@ -1622,28 +1622,43 @@ impl Services {
         }
     }
 
-    /// Refresh every active workspace's PR linkage: existing links are
-    /// re-fetched (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and
-    /// unlinked workspaces discover a matching open PR by head ref (branch-only
+    /// Refresh active workspaces' PR linkage: existing links are re-fetched
+    /// (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and unlinked
+    /// workspaces discover a matching open PR by head ref (branch-only
     /// matching per §7.6 — `pr.head.ref == workspace.branch`), persisting the
     /// link + emitting `pr:linked` on first match. Remote/archived workspaces and
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
-    async fn refresh_all_workspace_prs(&self) {
+    ///
+    /// To trim steady forge load (§7.7), the sweep is tiered by recency via
+    /// [`pr_ops::sweep_due`]: every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
+    /// `tick` (including tick 0) refreshes every workspace; ticks in between
+    /// refresh only workspaces active within
+    /// [`pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES`].
+    async fn refresh_all_workspace_prs(&self, tick: u64) {
+        let mut workspaces = match self.store.list_workspaces(false).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
+                return;
+            }
+        };
+        // Parse the cutoff once per sweep; `sweep_due` fails open on `None`.
+        let cutoff = intent_core::parse_iso(&intent_core::iso_minutes_ago(
+            pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES,
+        ));
+        workspaces.retain(|ws| pr_ops::sweep_due(ws, cutoff, tick));
         // Resolve the SourceControl provider once per sweep to avoid spamming
         // warnings when unconfigured and hitting keychain/gh on the blocking pool
-        // once per workspace (Copilot review comment on PR #131).
+        // once per workspace (Copilot review comment on PR #131). Resolved after
+        // the due filter so an all-idle tick performs no keychain/`gh` work.
+        if workspaces.is_empty() {
+            return;
+        }
         let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
             Ok(sc) => sc,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping sweep");
-                return;
-            }
-        };
-        let workspaces = match self.store.list_workspaces(false).await {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
                 return;
             }
         };
@@ -1661,13 +1676,18 @@ impl Services {
         }
     }
 
-    /// Spawn the background PR refresh loop (§7.6): every `interval` it refreshes
-    /// all active workspaces — discovering open PRs by head-ref match for
+    /// Spawn the background PR refresh loop (§7.6): every `interval` it sweeps
+    /// active workspaces — discovering open PRs by head-ref match for
     /// unlinked workspaces (emitting `pr:linked`) and updating linked PRs
     /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
-    /// `interval`. Missed ticks are skipped (no pile-up). No-op-safe when source
-    /// control is unconfigured (the sweep logs a single warning and returns).
-    /// Returns the task handle so the composition root can hold/abort it.
+    /// `interval` and refreshes every workspace (tick 0); thereafter the sweep
+    /// is tiered by recency (see [`Services::refresh_all_workspace_prs`]) so
+    /// idle workspaces only refresh every
+    /// [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th tick. Missed ticks are skipped
+    /// (no pile-up). No-op-safe when source control is unconfigured (a sweep
+    /// with due workspaces logs a single warning and returns; an all-idle tick
+    /// returns silently before resolving the provider). Returns the task
+    /// handle so the composition root can hold/abort it.
     pub fn spawn_pr_refresh_loop(
         &self,
         interval: std::time::Duration,
@@ -1678,9 +1698,11 @@ impl Services {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick so the loop waits one interval.
             ticker.tick().await;
+            let mut tick: u64 = 0;
             loop {
                 ticker.tick().await;
-                services.refresh_all_workspace_prs().await;
+                services.refresh_all_workspace_prs(tick).await;
+                tick = tick.wrapping_add(1);
             }
         })
     }

@@ -542,10 +542,13 @@ async fn cmd_serve(
         Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
         Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
     }
-    // Background PR refresh (§7.6): periodically re-fetch every linked PR,
-    // persist any change, and emit `pr:*` events so clients update without
-    // polling. Safe when source control is unconfigured (each refresh logs and
-    // swallows the missing-provider error). Aborted on clean shutdown.
+    // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
+    // discover/link PRs for workspaces without one), persist any change, and
+    // emit `pr:*` events so clients update without polling.
+    // Tiered by workspace recency to trim forge load (§7.7): recently-active
+    // workspaces refresh every 60s tick, idle ones only on every 10th tick.
+    // Safe when source control is unconfigured (a sweep with due workspaces
+    // logs and swallows the missing-provider error). Aborted on clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
     // Daemon-internal token-usage scan (§5.23/§19.1): periodically re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
