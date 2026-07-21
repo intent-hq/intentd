@@ -6,13 +6,15 @@
 #
 # <channel> is "stable" or "beta"; the manifest lands as an asset on the
 # `channel-<channel>` release (created with --latest=false so it never shadows
-# real releases). Requires: gh (authenticated via GH_TOKEN).
+# real releases). Requires: gh (authenticated via GH_TOKEN) and an explicit
+# GITHUB_REPOSITORY (owner/repo) — no default, so a local run can never push a
+# manifest to the upstream repo by accident.
 set -euo pipefail
 
 usage="usage: publish-channel-manifest.sh <channel> <manifest-file>"
 CHANNEL="${1:?$usage}"
 MANIFEST="${2:?$usage}"
-REPO="${GITHUB_REPOSITORY:-intent-hq/intentd}"
+REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set}"
 
 if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
   echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2

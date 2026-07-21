@@ -145,7 +145,8 @@ publishes a GitHub Release with per-platform archives, `.sha256` checksums, and 
 PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
 
-Channels follow a **promotion model** — there are no prerelease version suffixes:
+Channels follow a **promotion model** — channel routing does not depend on prerelease
+version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
 
 - **Beta**: every `vX.Y.Z` tag (e.g. `v0.1.0`) lands on the beta channel automatically.
 - **Stable**: a manual **promotion** of an existing release — run the
