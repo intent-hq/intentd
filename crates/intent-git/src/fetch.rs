@@ -9,6 +9,12 @@
 //! `git.pull` and `host.status` timeouts). `GIT_TERMINAL_PROMPT=0` forces fail-fast
 //! instead of a hidden prompt; a wall-clock deadline kills the child via
 //! `Child::kill` if the remote hangs.
+//!
+//! A caller-resolved GitHub token (if any) is offered to the child as a
+//! `credential.https://github.com.helper` scoped to github.com only, appended
+//! after any configured helpers so existing setups keep winning. The token
+//! value travels via an environment variable — never argv, so it cannot leak
+//! through process listings or error messages.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -27,12 +33,18 @@ const SHELL_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
 /// stays negligible for a long-running remote.
 const SHELL_FETCH_POLL: Duration = Duration::from_millis(50);
 
+/// Environment variable carrying the caller-resolved GitHub token into the
+/// child git's credential helper. The value never appears on the command line.
+const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
+
 /// Fetch a single `branch` from `remote` (typically `origin`), updating the local
-/// remote-tracking ref `refs/remotes/<remote>/<branch>`. Errors when the branch
+/// remote-tracking ref `refs/remotes/<remote>/<branch>`. `token` is an optional
+/// caller-resolved GitHub token used as the final credential-chain step for
+/// HTTPS github.com remotes (see [`crate::auth`]). Errors when the branch
 /// name is empty, `git` is not on PATH, the remote is unreachable, or the fetch
 /// exceeds [`SHELL_FETCH_TIMEOUT`].
-pub fn fetch(worktree_path: &Path, remote: &str, branch: &str) -> Result<()> {
-    fetch_with_timeout(worktree_path, remote, branch, SHELL_FETCH_TIMEOUT)
+pub fn fetch(worktree_path: &Path, remote: &str, branch: &str, token: Option<&str>) -> Result<()> {
+    fetch_with_timeout(worktree_path, remote, branch, token, SHELL_FETCH_TIMEOUT)
 }
 
 /// Timeout-parameterised body of [`fetch`], factored out so tests can drive
@@ -41,6 +53,7 @@ pub(crate) fn fetch_with_timeout(
     worktree_path: &Path,
     remote: &str,
     branch: &str,
+    token: Option<&str>,
     timeout: Duration,
 ) -> Result<()> {
     if branch.is_empty() {
@@ -57,9 +70,20 @@ pub(crate) fn fetch_with_timeout(
     // `git -C <path>` so the child cwd is not this crate's cwd (parity with the
     // reference TS handler); `GIT_TERMINAL_PROMPT=0` turns any credential prompt
     // into a fast error rather than a hidden hang.
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(worktree_path);
+    // Offer the resolved token as an extra credential helper scoped to
+    // github.com HTTPS only. `-c` helpers are appended after the configured
+    // ones, so an existing credential helper still wins (ssh-agent → helper →
+    // token order, matching `crate::auth`). The helper reads the secret from
+    // the environment — the argv below carries no token bytes.
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        cmd.arg("-c").arg(format!(
+            "credential.https://github.com.helper=!f() {{ test \"$1\" = get && printf 'username=x-access-token\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
+        ));
+        cmd.env(TOKEN_ENV, token);
+    }
+    let mut child = cmd
         .arg("fetch")
         .arg(remote)
         .arg(&refspec)
@@ -144,7 +168,7 @@ mod tests {
         src_repo
             .remote("origin", bare_dir.to_str().unwrap())
             .unwrap();
-        crate::push::push(src.path(), "origin", &branch, false).unwrap();
+        crate::push::push(src.path(), "origin", &branch, false, None).unwrap();
 
         // A second clone-like repo points at the same bare remote and fetches.
         let consumer = init_repo("fetch-consumer");
@@ -154,7 +178,7 @@ mod tests {
             .remote("origin", bare_dir.to_str().unwrap())
             .unwrap();
 
-        fetch(consumer.path(), "origin", &branch).unwrap();
+        fetch(consumer.path(), "origin", &branch, None).unwrap();
 
         let bare = Repository::open_bare(&bare_dir).unwrap();
         let remote_sha = bare
@@ -178,7 +202,7 @@ mod tests {
     fn empty_branch_is_rejected() {
         let dir = init_repo("fetch-empty-branch");
         commit_file(dir.path(), "a.txt", "x\n");
-        assert!(fetch(dir.path(), "origin", "").is_err());
+        assert!(fetch(dir.path(), "origin", "", None).is_err());
     }
 
     /// A missing / unreachable remote produces a structured `Err`, not a hang.
@@ -187,7 +211,7 @@ mod tests {
     fn missing_remote_errors_fast() {
         let dir = init_repo("fetch-no-remote");
         commit_file(dir.path(), "a.txt", "x\n");
-        let err = fetch(dir.path(), "origin", "main")
+        let err = fetch(dir.path(), "origin", "main", None)
             .expect_err("fetch against a missing remote must error");
         let msg = match err {
             Error::Internal(m) => m,
@@ -213,8 +237,14 @@ mod tests {
         repo.remote("origin", "https://192.0.2.1/repo.git").unwrap();
 
         let start = Instant::now();
-        let err = fetch_with_timeout(dir.path(), "origin", "main", Duration::from_millis(500))
-            .expect_err("fetch must time out against a non-routable remote");
+        let err = fetch_with_timeout(
+            dir.path(),
+            "origin",
+            "main",
+            None,
+            Duration::from_millis(500),
+        )
+        .expect_err("fetch must time out against a non-routable remote");
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(10),

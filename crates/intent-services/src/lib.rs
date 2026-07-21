@@ -4396,13 +4396,62 @@ where
 /// [`git_pull_bounded`] closes for `git.pull`. `intent_git::fetch::fetch` owns
 /// its own wall-clock deadline + `Child::kill`, so no outer timeout is needed
 /// here; the wrapper just moves the blocking call off the runtime worker.
-async fn git_fetch_bounded(worktree: &std::path::Path, remote: &str, branch: &str) -> Result<()> {
+async fn git_fetch_bounded(
+    worktree: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    token: Option<&str>,
+) -> Result<()> {
     let worktree = worktree.to_path_buf();
     let remote = remote.to_string();
     let branch = branch.to_string();
-    tokio::task::spawn_blocking(move || intent_git::fetch::fetch(&worktree, &remote, &branch))
-        .await
-        .map_err(|e| Error::Internal(format!("git.fetch task failed: {e}")))?
+    let token = token.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        intent_git::fetch::fetch(&worktree, &remote, &branch, token.as_deref())
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("git.fetch task failed: {e}")))?
+}
+
+/// The [`intent_sourcecontrol::TokenSource`] to use for git-credential token
+/// resolution. An explicitly configured `sourceControl.github.tokenSource`
+/// (file / flag origin) is respected; the schema default falls back to the
+/// full `Auto` chain (secrets store → env → `gh`) so a device-flow token in
+/// the secrets store is picked up without configuration.
+fn github_token_source(registry: Option<&SettingsRegistry>) -> intent_sourcecontrol::TokenSource {
+    use intent_sourcecontrol::TokenSource;
+    let Some(registry) = registry else {
+        return TokenSource::Auto;
+    };
+    let snapshot = registry.snapshot();
+    let path = "sourceControl.github.tokenSource";
+    if snapshot.origin(path) == Some(SettingOrigin::Default) {
+        return TokenSource::Auto;
+    }
+    let value = snapshot.get(path);
+    match value.as_ref().and_then(|v| v.as_str()) {
+        Some("env") => TokenSource::Env,
+        Some("gh-cli") => TokenSource::GhCli,
+        Some("explicit") => TokenSource::Explicit,
+        _ => TokenSource::Auto,
+    }
+}
+
+/// Resolve the GitHub token to offer the git credential chain for network
+/// operations against `worktree`'s `origin`: `Some` only when `origin` is an
+/// HTTPS `github.com` remote (the only shape the token step applies to — see
+/// `intent_git::auth`) and a token resolves per [`github_token_source`]. The
+/// gate avoids the bounded secrets-store / `gh` lookups entirely for SSH and
+/// non-GitHub remotes. The token value is never logged.
+async fn github_git_token(
+    registry: Option<&SettingsRegistry>,
+    worktree: &std::path::Path,
+) -> Option<String> {
+    let origin = intent_git::remote::origin_url(worktree).ok().flatten()?;
+    if !intent_git::auth::is_https_github_url(&origin) {
+        return None;
+    }
+    intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
 }
 
 /// Build a `git:pull` event for a completed pull inside a workspace worktree
@@ -10860,6 +10909,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let registry = self.settings_registry.clone();
         Box::pin(async move {
             let ws = store
                 .get_workspace(&workspace_id)
@@ -10868,6 +10918,10 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to push: workspace has no worktree".to_string())
             })?;
+            // Resolve the GitHub token outside the lock (bounded async lookups)
+            // so the credential chain can fall back to it for HTTPS github.com
+            // remotes (see `intent_git::auth`).
+            let token = github_git_token(registry.as_deref(), &worktree).await;
             // Resolve the currently-checked-out branch (FE parity — `git push`
             // with no args pushes HEAD's upstream, which for our worktrees is
             // the current branch on `origin`). Resolve inside the lock so a
@@ -10886,7 +10940,13 @@ impl WorkspaceApi for Services {
                                     .to_string(),
                             )
                         })?;
-                    let outcome = intent_git::push::push(&worktree, "origin", &branch, force)?;
+                    let outcome = intent_git::push::push(
+                        &worktree,
+                        "origin",
+                        &branch,
+                        force,
+                        token.as_deref(),
+                    )?;
                     let status = intent_git::status::status(&worktree)
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     let status_json =
@@ -10911,6 +10971,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
+        let registry = self.settings_registry.clone();
         Box::pin(async move {
             let ws = store
                 .get_workspace(&workspace_id)
@@ -10919,6 +10980,9 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to fetch: workspace has no worktree".to_string())
             })?;
+            // Token resolved outside the lock — see the matching note on
+            // `git_push` above.
+            let token = github_git_token(registry.as_deref(), &worktree).await;
             // Resolve HEAD's branch inside the lock so a concurrent
             // checkout/rename cannot change it between the read and the fetch.
             // The status snapshot is taken inside the lock too, so the
@@ -10935,7 +10999,7 @@ impl WorkspaceApi for Services {
                                     .to_string(),
                             )
                         })?;
-                    intent_git::fetch::fetch(&worktree, "origin", &branch)?;
+                    intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())?;
                     let status = intent_git::status::status(&worktree)
                         .unwrap_or_else(|_| intent_git::status::empty_status());
                     Ok::<_, Error>(serde_json::to_value(&status).unwrap_or(serde_json::Value::Null))
@@ -11149,6 +11213,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitPullResult>> {
         let store = self.store.clone();
         let event_bus = self.event_bus.clone();
+        let registry = self.settings_registry.clone();
         Box::pin(async move {
             // Path-based like `git_get_branches`: the workspace-create auto-pull
             // runs *before* the repo is registered, so any existing local git
@@ -11166,8 +11231,10 @@ impl WorkspaceApi for Services {
             // a JSON-RPC error — matching the TS PULL_BRANCH contract.
             let pull_path = std::path::PathBuf::from(&repo_path);
             let pull_branch = branch_name.clone();
+            let token =
+                github_git_token(registry.as_deref(), std::path::Path::new(&repo_path)).await;
             let outcome = git_pull_bounded(
-                move || intent_git::pull::pull_branch(&pull_path, &pull_branch),
+                move || intent_git::pull::pull_branch(&pull_path, &pull_branch, token.as_deref()),
                 GIT_PULL_TIMEOUT,
             )
             .await?;
@@ -15041,6 +15108,12 @@ impl Services {
         Ok(outcome.hash)
     }
 
+    /// The GitHub token (if any) to offer the git credential chain for network
+    /// operations against `worktree`'s `origin` — see [`github_git_token`].
+    async fn ac_git_token(&self, worktree: &Path) -> Option<String> {
+        github_git_token(self.settings_registry.as_deref(), worktree).await
+    }
+
     /// Push the branch to `origin`, restoring attribution (committed → pushed).
     async fn ac_push(
         &self,
@@ -15053,7 +15126,8 @@ impl Services {
                 "No remote configured for this repository".to_string(),
             ));
         }
-        let outcome = intent_git::push::push(worktree, "origin", branch, false)?;
+        let token = self.ac_git_token(worktree).await;
+        let outcome = intent_git::push::push(worktree, "origin", branch, false, token.as_deref())?;
         self.ac_move_stage(workspace_id, "committed", "pushed")
             .await;
         Ok(outcome.pushed_sha)
@@ -15363,7 +15437,10 @@ impl Services {
             ));
         };
 
-        if let Err(e) = intent_git::push::push_refspec(worktree, "origin", hash, branch, true) {
+        let token = self.ac_git_token(worktree).await;
+        if let Err(e) =
+            intent_git::push::push_refspec(worktree, "origin", hash, branch, true, token.as_deref())
+        {
             return Err(ac_step_failure(
                 steps.clone(),
                 "undo-push",
@@ -15376,7 +15453,7 @@ impl Services {
         // fetch (TS parity) is best-effort and never fails the undo. Driven
         // through `git_fetch_bounded` so a hung remote can't pin a runtime
         // worker for the shell-fetch inner deadline (100s).
-        let _ = git_fetch_bounded(worktree, "origin", branch).await;
+        let _ = git_fetch_bounded(worktree, "origin", branch, token.as_deref()).await;
 
         steps.push(accept_changes::step(
             "undo-push",
@@ -15437,7 +15514,8 @@ impl Services {
             .map(|u| u.is_some())
             .unwrap_or(false);
         if has_remote {
-            let _ = git_fetch_bounded(worktree, "origin", trunk).await;
+            let token = self.ac_git_token(worktree).await;
+            let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
         }
         let reset_target = if has_remote {
             format!("origin/{trunk}")
@@ -15518,7 +15596,8 @@ impl Services {
             trunk.to_string()
         };
         if has_remote {
-            let _ = git_fetch_bounded(worktree, "origin", trunk).await;
+            let token = self.ac_git_token(worktree).await;
+            let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
         }
 
         let has_conflicts =
@@ -15636,6 +15715,11 @@ impl Services {
         let has_remote = intent_git::remote::origin_url(worktree)
             .map(|u| u.is_some())
             .unwrap_or(false);
+        let token = if has_remote {
+            self.ac_git_token(worktree).await
+        } else {
+            None
+        };
         let is_pushed = has_remote
             && intent_git::remote::remote_tracking_exists(worktree, "origin", branch)
                 .unwrap_or(false);
@@ -15647,7 +15731,12 @@ impl Services {
         let has_remote_trunk = if extras.local_only || !has_remote {
             false
         } else {
-            match intent_git::remote::ls_remote_has_branch(worktree, "origin", trunk) {
+            match intent_git::remote::ls_remote_has_branch(
+                worktree,
+                "origin",
+                trunk,
+                token.as_deref(),
+            ) {
                 Ok(intent_git::remote::RemoteBranch::Present) => true,
                 Ok(intent_git::remote::RemoteBranch::Missing) => false,
                 Err(_) => {
@@ -15665,7 +15754,7 @@ impl Services {
         };
 
         if has_remote_trunk {
-            if let Err(e) = git_fetch_bounded(worktree, "origin", trunk).await {
+            if let Err(e) = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -15718,9 +15807,14 @@ impl Services {
         // diverged) so the remote feature ref matches local before the trunk move.
         if has_remote_trunk {
             let needs_force = (extras.rebase_first && is_pushed) || has_diverged;
-            if let Err(e) =
-                intent_git::push::push_refspec(worktree, "origin", "HEAD", branch, needs_force)
-            {
+            if let Err(e) = intent_git::push::push_refspec(
+                worktree,
+                "origin",
+                "HEAD",
+                branch,
+                needs_force,
+                token.as_deref(),
+            ) {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -15781,7 +15875,15 @@ impl Services {
             rebase_base_sha = captured;
 
             if has_remote_trunk
-                && intent_git::push::push_refspec(worktree, "origin", "HEAD", branch, true).is_err()
+                && intent_git::push::push_refspec(
+                    worktree,
+                    "origin",
+                    "HEAD",
+                    branch,
+                    true,
+                    token.as_deref(),
+                )
+                .is_err()
             {
                 return Err(ac_step_failure(
                     steps.clone(),
@@ -15896,7 +15998,15 @@ impl Services {
         has_remote_trunk: bool,
     ) -> Result<()> {
         if has_remote_trunk {
-            intent_git::push::push_refspec(worktree, "origin", sha, trunk, false)?;
+            let token = self.ac_git_token(worktree).await;
+            intent_git::push::push_refspec(
+                worktree,
+                "origin",
+                sha,
+                trunk,
+                false,
+                token.as_deref(),
+            )?;
         } else {
             intent_git::squash::update_ref(worktree, &format!("refs/heads/{trunk}"), sha)?;
         }

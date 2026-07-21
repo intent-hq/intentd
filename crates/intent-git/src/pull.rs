@@ -30,16 +30,21 @@ const POP_CONFLICT_MSG: &str = "Pull succeeded but your local changes conflict w
 
 /// Pull `branch_name` from `origin` for the repository at `repo_path`. See the
 /// module docs for the fetch-only vs pull-with-rebase split and the auto-stash
-/// workflow. Returns the outcome rather than an `Err` for the expected failure
-/// paths (matching the TS contract).
-pub fn pull_branch(repo_path: &Path, branch_name: &str) -> Result<GitPullResult> {
+/// workflow. `token` is an optional caller-resolved GitHub token forwarded to
+/// the fetch step (see [`crate::fetch::fetch`]). Returns the outcome rather
+/// than an `Err` for the expected failure paths (matching the TS contract).
+pub fn pull_branch(
+    repo_path: &Path,
+    branch_name: &str,
+    token: Option<&str>,
+) -> Result<GitPullResult> {
     let mut repo = Repository::open(repo_path).map_err(map_git_err)?;
     let current = crate::status::current_branch(&repo);
 
     // Branch not checked out → update the remote-tracking ref only (the TS
     // "fetch instead of pull" path used during workspace creation).
     if current != branch_name {
-        return Ok(match fetch(repo_path, "origin", branch_name) {
+        return Ok(match fetch(repo_path, "origin", branch_name, token) {
             Ok(()) => success(),
             Err(e) => failure(error_message(e)),
         });
@@ -47,7 +52,7 @@ pub fn pull_branch(repo_path: &Path, branch_name: &str) -> Result<GitPullResult>
 
     // `git pull --rebase origin <branch>` ≡ fetch then rebase HEAD onto the
     // updated remote-tracking ref.
-    if let Err(e) = fetch(repo_path, "origin", branch_name) {
+    if let Err(e) = fetch(repo_path, "origin", branch_name, token) {
         return Ok(failure(error_message(e)));
     }
 
@@ -177,7 +182,7 @@ mod tests {
         ));
         Repository::init_bare(&bare).unwrap();
         repo.remote("origin", bare.to_str().unwrap()).unwrap();
-        crate::push::push(dir.path(), "origin", &branch, false).unwrap();
+        crate::push::push(dir.path(), "origin", &branch, false, None).unwrap();
         (dir, bare, branch)
     }
 
@@ -190,7 +195,7 @@ mod tests {
         contents: &str,
     ) -> String {
         commit_file(dir, rel, contents);
-        crate::push::push(dir, "origin", branch, false).unwrap();
+        crate::push::push(dir, "origin", branch, false, None).unwrap();
         let repo = Repository::open(dir).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         let tip = head.id().to_string();
@@ -207,7 +212,7 @@ mod tests {
             advance_origin_and_fall_behind(dir.path(), &branch, "remote.txt", "from-remote\n");
         assert!(!dir.path().join("remote.txt").exists());
 
-        let result = pull_branch(dir.path(), &branch).unwrap();
+        let result = pull_branch(dir.path(), &branch, None).unwrap();
         assert!(result.ok, "expected pull to succeed, got {result:?}");
         assert!(result.error.is_none());
         assert!(dir.path().join("remote.txt").exists());
@@ -228,7 +233,7 @@ mod tests {
         let repo = Repository::open(dir.path()).unwrap();
         let head_before = repo.head().unwrap().target().unwrap();
 
-        let result = pull_branch(dir.path(), &branch).unwrap();
+        let result = pull_branch(dir.path(), &branch, None).unwrap();
         assert!(result.ok, "expected no-op pull to succeed, got {result:?}");
         assert!(result.error.is_none());
 
@@ -256,7 +261,7 @@ mod tests {
         // An untracked local change must survive the pull (auto-stash + pop).
         write_file(dir.path(), "local.txt", "uncommitted\n");
 
-        let result = pull_branch(dir.path(), &branch).unwrap();
+        let result = pull_branch(dir.path(), &branch, None).unwrap();
         assert!(result.ok, "expected pull to succeed, got {result:?}");
         assert!(dir.path().join("remote.txt").exists());
         assert_eq!(
@@ -281,7 +286,7 @@ mod tests {
             .delete()
             .unwrap();
 
-        let result = pull_branch(dir.path(), &branch).unwrap();
+        let result = pull_branch(dir.path(), &branch, None).unwrap();
         assert!(
             result.ok,
             "expected fetch-only pull to succeed, got {result:?}"
@@ -306,7 +311,7 @@ mod tests {
         let repo = Repository::open(dir.path()).unwrap();
         let branch = crate::status::current_branch(&repo);
 
-        let result = pull_branch(dir.path(), &branch).unwrap();
+        let result = pull_branch(dir.path(), &branch, None).unwrap();
         assert!(!result.ok);
         assert!(result.error.is_some());
     }
@@ -318,7 +323,7 @@ mod tests {
         advance_origin_and_fall_behind(dir.path(), &branch, "base.txt", "two\n");
         write_file(dir.path(), "base.txt", "local\n");
 
-        let result = pull_branch(dir.path(), &branch).unwrap();
+        let result = pull_branch(dir.path(), &branch, None).unwrap();
         assert!(!result.ok);
         assert_eq!(result.error.as_deref(), Some(POP_CONFLICT_MSG));
         // The stash entry is kept on a conflicted pop (git CLI parity), so the
@@ -375,7 +380,7 @@ mod tests {
             .remote("origin", sub_bare.to_str().unwrap())
             .unwrap();
         let sub_branch = crate::status::current_branch(&sub_repo);
-        crate::push::push(sub_dir.path(), "origin", &sub_branch, false).unwrap();
+        crate::push::push(sub_dir.path(), "origin", &sub_branch, false, None).unwrap();
         let sub_v1_sha = sub_repo.head().unwrap().target().unwrap().to_string();
 
         // Add the submodule to the parent repo using shell git (libgit2 submodule
@@ -415,11 +420,11 @@ mod tests {
                 &[&head_commit],
             )
             .unwrap();
-        crate::push::push(parent_dir.path(), "origin", &branch, false).unwrap();
+        crate::push::push(parent_dir.path(), "origin", &branch, false, None).unwrap();
 
         // Origin advances: submodule adds a new commit, parent bumps the gitlink.
         commit_file(sub_dir.path(), "sub.txt", "sub-v2\n");
-        crate::push::push(sub_dir.path(), "origin", &sub_branch, false).unwrap();
+        crate::push::push(sub_dir.path(), "origin", &sub_branch, false, None).unwrap();
 
         // Update the parent's submodule to point at the new commit.
         let output = std::process::Command::new("git")
@@ -449,7 +454,7 @@ mod tests {
 
         // Commit the gitlink bump + a parent file change.
         commit_file(parent_dir.path(), "parent.txt", "parent-updated\n");
-        crate::push::push(parent_dir.path(), "origin", &branch, false).unwrap();
+        crate::push::push(parent_dir.path(), "origin", &branch, false, None).unwrap();
 
         // Hard-reset the parent back one commit so it's behind origin with the
         // old gitlink.
@@ -484,7 +489,7 @@ mod tests {
         );
 
         // Pull the parent branch. The gitlink bump should not be treated as "dirty".
-        let result = pull_branch(parent_dir.path(), &branch).unwrap();
+        let result = pull_branch(parent_dir.path(), &branch, None).unwrap();
         assert!(
             result.ok,
             "pull with submodule gitlink bump must succeed, got {result:?}"

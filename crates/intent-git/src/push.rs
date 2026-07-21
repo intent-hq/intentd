@@ -3,9 +3,10 @@
 //! Ports the `git push origin <branch>` half of the TS accept-changes pipeline.
 //! libgit2 performs the push; for local/`file://` remotes (the test path) no
 //! credentials are needed. For real remotes a best-effort credential callback is
-//! installed (default → ssh-agent → credential helper); the interactive keychain
-//! consent flow the TS service drives is deferred (see the accept-changes parity
-//! notes in `intent-services`).
+//! installed (ssh-agent → credential helper → caller-resolved GitHub token for
+//! HTTPS github.com remotes); the interactive keychain consent flow the TS
+//! service drives is deferred (see the accept-changes parity notes in
+//! `intent-services`).
 //!
 //! libgit2's `push` does not update local remote-tracking refs, so after a
 //! successful push the local `refs/remotes/<remote>/<branch>` is fast-forwarded
@@ -29,9 +30,17 @@ pub struct PushOutcome {
 
 /// Push `branch` to `remote` (typically `origin`). When `force` is set the
 /// refspec is prefixed with `+` to allow a non-fast-forward update (mirroring the
-/// TS `git push --force` path used after a rebase). Errors when the branch has no
+/// TS `git push --force` path used after a rebase). `token` is an optional
+/// caller-resolved GitHub token used as the final credential-chain step for
+/// HTTPS github.com remotes (see [`crate::auth`]). Errors when the branch has no
 /// local commit or the remote rejects the push.
-pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Result<PushOutcome> {
+pub fn push(
+    worktree_path: &Path,
+    remote: &str,
+    branch: &str,
+    force: bool,
+    token: Option<&str>,
+) -> Result<PushOutcome> {
     if branch.is_empty() {
         return Err(Error::Internal(
             "cannot push: empty branch name".to_string(),
@@ -50,7 +59,7 @@ pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Re
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
 
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(remote_callbacks());
+    opts.remote_callbacks(remote_callbacks(token));
 
     let prefix = if force { "+" } else { "" };
     let refspec = format!("{prefix}{local_ref}:{local_ref}");
@@ -87,12 +96,15 @@ pub fn push(worktree_path: &Path, remote: &str, branch: &str, force: bool) -> Re
 /// `git push <sha>:<dst>` shortcut, nor `--force-with-lease`), so `src` is first
 /// resolved to its commit OID, written to a short-lived temporary ref that is
 /// deleted once the push returns, and pushed with a plain force when requested.
+/// `token` is an optional caller-resolved GitHub token used as the final
+/// credential-chain step for HTTPS github.com remotes (see [`crate::auth`]).
 pub fn push_refspec(
     worktree_path: &Path,
     remote: &str,
     src: &str,
     dst_branch: &str,
     force: bool,
+    token: Option<&str>,
 ) -> Result<String> {
     if dst_branch.is_empty() {
         return Err(Error::Internal(
@@ -119,7 +131,7 @@ pub fn push_refspec(
 
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(remote_callbacks());
+    opts.remote_callbacks(remote_callbacks(token));
     let prefix = if force { "+" } else { "" };
     let refspec = format!("{prefix}{tmp_ref}:refs/heads/{dst_branch}");
     let push_result = remote_handle.push(&[refspec.as_str()], Some(&mut opts));
@@ -167,7 +179,7 @@ mod tests {
         Repository::init_bare(&bare_dir).unwrap();
         repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
 
-        let out = push(dir.path(), "origin", &branch, false).unwrap();
+        let out = push(dir.path(), "origin", &branch, false, None).unwrap();
         assert_eq!(out.branch, branch);
         assert_eq!(out.pushed_sha.len(), 40);
 
@@ -197,7 +209,7 @@ mod tests {
     fn empty_branch_is_rejected() {
         let dir = init_repo("push-empty-branch");
         commit_file(dir.path(), "a.txt", "x\n");
-        assert!(push(dir.path(), "origin", "", false).is_err());
+        assert!(push(dir.path(), "origin", "", false, None).is_err());
     }
 
     /// Force-push an earlier commit SHA onto a branch (the `undo-push` shape):
@@ -222,12 +234,12 @@ mod tests {
         Repository::init_bare(&bare_dir).unwrap();
         repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
         // The remote starts at the latest commit.
-        let latest = push(dir.path(), "origin", &branch, false)
+        let latest = push(dir.path(), "origin", &branch, false, None)
             .unwrap()
             .pushed_sha;
 
         // Rewind the remote branch back to the first commit (force).
-        let pushed = push_refspec(dir.path(), "origin", &first, &branch, true).unwrap();
+        let pushed = push_refspec(dir.path(), "origin", &first, &branch, true, None).unwrap();
         assert_eq!(pushed, first);
         assert_ne!(pushed, latest);
 
