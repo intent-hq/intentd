@@ -13,7 +13,6 @@
 //!
 //! Gated by `node` + the mock script (the CI ACP gate); skips cleanly otherwise.
 
-#[allow(dead_code)]
 mod common;
 
 use std::path::PathBuf;

@@ -19,7 +19,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-#[allow(dead_code)]
 mod common;
 use common::DaemonGuard;
 

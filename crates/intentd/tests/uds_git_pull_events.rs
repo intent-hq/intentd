@@ -9,7 +9,6 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
 mod common;
 
 use std::path::{Path, PathBuf};

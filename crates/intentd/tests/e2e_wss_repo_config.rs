@@ -3,7 +3,6 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
 mod common;
 
 use std::net::Ipv4Addr;

@@ -12,7 +12,6 @@
 
 #![cfg(unix)]
 
-#[allow(dead_code)]
 mod common;
 use common::test_timeout;
 
