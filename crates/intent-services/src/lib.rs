@@ -56,6 +56,7 @@ mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
+mod config_watcher;
 mod crdt_notes;
 mod drafts;
 mod enhance_ops;
@@ -84,15 +85,20 @@ mod script_ops;
 mod search_ops;
 mod sentry_ops;
 mod settings;
+mod settings_registry;
 mod terminal_ops;
 pub mod tool_block;
 
 #[cfg(test)]
 mod tests;
 
+pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{max_concurrent_agents, InMemorySecretStore, SecretStore};
+pub use settings_registry::{
+    SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,
+};
 pub use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
@@ -151,6 +157,11 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Serializes [`agent_ops`] queue write-through persists. Each persist
+    /// snapshots the live queue *inside* this async lock, so the last write to
+    /// the `agent_queue` table always reflects the newest in-memory state — an
+    /// older snapshot can never overwrite a newer one out of mutation order.
+    agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last per-session stats snapshot observed by `agent.getSessionStats`
     /// (PROTOCOL §5.24). The `stats` field on `AgentSession` is derived/not
     /// persisted, so this in-memory cache lets a refresh detect a change and push
@@ -238,6 +249,12 @@ pub struct Services {
     /// backing call runs on the blocking pool with a bounded timeout + single-
     /// flight cache, keeping the async runtime free if the backing store stalls.
     secrets: Arc<settings::AsyncSecretStore>,
+    /// Layered `config.toml` registry backing the TOML-backed subset of
+    /// `settings.*` ([`KNOWN_PATHS`]). Wired by the composition root (and by
+    /// tests that exercise the file-backed path); `None` keeps the legacy
+    /// SQLite-only behavior for read-only/unit-test wiring. Shared across
+    /// clones so every handle reads/writes the same file + snapshot.
+    settings_registry: Option<Arc<SettingsRegistry>>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -267,6 +284,14 @@ pub struct Services {
     /// reads through it; this set is empty there. Shared across clones so a
     /// `set_test_busy` on one handle is visible to every other handle.
     test_busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Client-supplied agent ids currently claimed by an in-flight create flow
+    /// ([`Services::reserve_agent_id`]). Closes the check-then-act gap between
+    /// the duplicate-id preflight and the session insert so two overlapping
+    /// `workspace.create`/`agent.create` retries with the same requested id
+    /// cannot both pass the preflight and race provisioning — the loser fails
+    /// `-32602` before any side effect. Shared across clones so every service
+    /// handle observes the same reservations.
+    creating_agent_ids: Arc<Mutex<HashSet<AgentId>>>,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -347,6 +372,7 @@ impl Services {
             event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
             auggie_bin: None,
@@ -365,12 +391,14 @@ impl Services {
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
+            settings_registry: None,
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub: Arc::new(McpHub::new()),
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
+            creating_agent_ids: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -401,6 +429,32 @@ impl Services {
     pub fn with_secret_store(mut self, secrets: Arc<dyn settings::SecretStore>) -> Self {
         self.secrets = Arc::new(settings::AsyncSecretStore::new(secrets));
         self
+    }
+
+    /// Wire the layered [`SettingsRegistry`] (`config.toml`) backing the
+    /// TOML-backed subset of `settings.*` ([`KNOWN_PATHS`]). The composition
+    /// root always wires the registry it loaded at boot; test/read-only
+    /// wiring may leave it unset, keeping the legacy SQLite-only behavior.
+    pub fn with_settings_registry(mut self, registry: Arc<SettingsRegistry>) -> Self {
+        self.settings_registry = Some(registry);
+        self
+    }
+
+    /// Borrow the wired [`SettingsRegistry`], if any (composition-root /
+    /// live-reload watcher use).
+    pub fn settings_registry(&self) -> Option<Arc<SettingsRegistry>> {
+        self.settings_registry.clone()
+    }
+
+    /// The effective typed settings (defaults ⊕ `config.toml` ⊕ startup pins)
+    /// for internal readers. Falls back to the schema defaults when no
+    /// registry is wired (read-only / unit-test wiring), which matches the
+    /// legacy per-key fallback values.
+    pub(crate) fn effective_settings(&self) -> intent_core::settings_file::SettingsFile {
+        self.settings_registry
+            .as_ref()
+            .map(|r| r.snapshot().effective.clone())
+            .unwrap_or_default()
     }
 
     /// Override the **user** and **bundled** specialist directory roots (§18.2).
@@ -502,12 +556,17 @@ impl Services {
         }
     }
 
-    /// Build a [`SettingsService`](settings::SettingsService) view over the store
-    /// and secret store for one `settings.*` call. The secret store is cloned
-    /// as an `Arc` so `SettingsService` can move it into `spawn_blocking` for
-    /// non-blocking, timeout-guarded secret-store access.
+    /// Build a [`SettingsService`](settings::SettingsService) view over the
+    /// store, secret store, and (when wired) the `config.toml` registry for
+    /// one `settings.*` call. The secret store is cloned as an `Arc` so
+    /// `SettingsService` can move it into `spawn_blocking` for non-blocking,
+    /// timeout-guarded secret-store access.
     fn settings_service(&self) -> settings::SettingsService<'_> {
-        settings::SettingsService::new(&self.store, &self.secrets)
+        settings::SettingsService::new(
+            &self.store,
+            &self.secrets,
+            self.settings_registry.as_deref(),
+        )
     }
 
     /// Borrow the shared PTY host (composition root / ACP terminal-adapter use).
@@ -1367,9 +1426,13 @@ impl Services {
     }
 
     /// Build an [`McpServersService`](mcp_servers::McpServersService) view over the
-    /// store, secret store, and hub for one `mcp.servers.*` call.
+    /// settings registry, secret store, and hub for one `mcp.servers.*` call.
     fn mcp_servers_service(&self) -> mcp_servers::McpServersService<'_> {
-        mcp_servers::McpServersService::new(&self.store, &self.secrets, &self.mcp_hub)
+        mcp_servers::McpServersService::new(
+            self.settings_registry.as_deref(),
+            &self.secrets,
+            &self.mcp_hub,
+        )
     }
 
     /// Build an [`McpOauthService`](mcp_oauth::McpOauthService) view over the
@@ -1559,28 +1622,43 @@ impl Services {
         }
     }
 
-    /// Refresh every active workspace's PR linkage: existing links are
-    /// re-fetched (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and
-    /// unlinked workspaces discover a matching open PR by head ref (branch-only
+    /// Refresh active workspaces' PR linkage: existing links are re-fetched
+    /// (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and unlinked
+    /// workspaces discover a matching open PR by head ref (branch-only
     /// matching per §7.6 — `pr.head.ref == workspace.branch`), persisting the
     /// link + emitting `pr:linked` on first match. Remote/archived workspaces and
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
-    async fn refresh_all_workspace_prs(&self) {
+    ///
+    /// To trim steady forge load (§7.7), the sweep is tiered by recency via
+    /// [`pr_ops::sweep_due`]: every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
+    /// `tick` (including tick 0) refreshes every workspace; ticks in between
+    /// refresh only workspaces active within
+    /// [`pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES`].
+    async fn refresh_all_workspace_prs(&self, tick: u64) {
+        let mut workspaces = match self.store.list_workspaces(false).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
+                return;
+            }
+        };
+        // Parse the cutoff once per sweep; `sweep_due` fails open on `None`.
+        let cutoff = intent_core::parse_iso(&intent_core::iso_minutes_ago(
+            pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES,
+        ));
+        workspaces.retain(|ws| pr_ops::sweep_due(ws, cutoff, tick));
         // Resolve the SourceControl provider once per sweep to avoid spamming
         // warnings when unconfigured and hitting keychain/gh on the blocking pool
-        // once per workspace (Copilot review comment on PR #131).
+        // once per workspace (Copilot review comment on PR #131). Resolved after
+        // the due filter so an all-idle tick performs no keychain/`gh` work.
+        if workspaces.is_empty() {
+            return;
+        }
         let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
             Ok(sc) => sc,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping sweep");
-                return;
-            }
-        };
-        let workspaces = match self.store.list_workspaces(false).await {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
                 return;
             }
         };
@@ -1598,13 +1676,18 @@ impl Services {
         }
     }
 
-    /// Spawn the background PR refresh loop (§7.6): every `interval` it refreshes
-    /// all active workspaces — discovering open PRs by head-ref match for
+    /// Spawn the background PR refresh loop (§7.6): every `interval` it sweeps
+    /// active workspaces — discovering open PRs by head-ref match for
     /// unlinked workspaces (emitting `pr:linked`) and updating linked PRs
     /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
-    /// `interval`. Missed ticks are skipped (no pile-up). No-op-safe when source
-    /// control is unconfigured (the sweep logs a single warning and returns).
-    /// Returns the task handle so the composition root can hold/abort it.
+    /// `interval` and refreshes every workspace (tick 0); thereafter the sweep
+    /// is tiered by recency (see [`Services::refresh_all_workspace_prs`]) so
+    /// idle workspaces only refresh every
+    /// [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th tick. Missed ticks are skipped
+    /// (no pile-up). No-op-safe when source control is unconfigured (a sweep
+    /// with due workspaces logs a single warning and returns; an all-idle tick
+    /// returns silently before resolving the provider). Returns the task
+    /// handle so the composition root can hold/abort it.
     pub fn spawn_pr_refresh_loop(
         &self,
         interval: std::time::Duration,
@@ -1615,9 +1698,11 @@ impl Services {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Consume the immediate first tick so the loop waits one interval.
             ticker.tick().await;
+            let mut tick: u64 = 0;
             loop {
                 ticker.tick().await;
-                services.refresh_all_workspace_prs().await;
+                services.refresh_all_workspace_prs(tick).await;
+                tick = tick.wrapping_add(1);
             }
         })
     }
@@ -2229,6 +2314,7 @@ impl Services {
                         None, // messageId
                         None, // imageBlocks
                         None, // fileBlocks
+                        None, // messageMetadata
                     )
                     .await
                 {
@@ -5118,6 +5204,51 @@ impl Services {
         }
         Ok(())
     }
+
+    /// Apply an **externally driven** settings change (config.toml
+    /// live-reload): the registry has already adopted the new file layer, so
+    /// this runs the same server runtime hooks as `settings.update`
+    /// ([`Self::apply_server_setting_hooks`]) for the changed keys and emits
+    /// `settings:changed` with the effective values. Registry keys are
+    /// non-sensitive by construction (secrets are absent from [`KNOWN_PATHS`]),
+    /// so the payload needs no further redaction. A hook failure is logged
+    /// but not rolled back — there is no wire caller to answer and the user's
+    /// file edit is authoritative; the daemon keeps running on the new
+    /// effective values.
+    pub async fn apply_external_settings_change(&self, notice: &SettingsChanged) {
+        let Some(registry) = self.settings_registry.as_deref() else {
+            return;
+        };
+        if notice.changed.is_empty() {
+            return;
+        }
+        let snap = registry.snapshot();
+        let applied: Vec<serde_json::Value> = notice
+            .changed
+            .iter()
+            .map(|path| {
+                let raw = snap.get(path).unwrap_or(serde_json::Value::Null);
+                // Normalize number-typed values to the float wire shape so
+                // live-reload `settings:changed` payloads match what
+                // `settings.get`/`settings.list` report for the same key.
+                let value = match settings::find_definition(path) {
+                    Some(def) => settings::wire_value(&def, raw),
+                    None => raw,
+                };
+                serde_json::json!({ "path": path, "value": value })
+            })
+            .collect();
+        if let Some(control) = self.server_control.get() {
+            if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
+                tracing::warn!(
+                    error = %e,
+                    "config.toml live-reload: server runtime hook failed; effective \
+                     values kept, runtime state may differ until the file is corrected"
+                );
+            }
+        }
+        publish_event(&self.event_bus, settings_changed_event(applied)).await;
+    }
 }
 
 impl WorkspaceApi for Services {
@@ -5134,9 +5265,18 @@ impl WorkspaceApi for Services {
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            /// Which store a captured old value belongs to, so the rollback
+            /// path restores it through the same seam that persisted it.
+            enum OldStore {
+                Secret,
+                Db,
+                Registry,
+            }
             // Capture old values for ALL settings in the batch so we can rollback on hook failure.
-            // Store holds non-sensitive settings; secrets holds sensitive ones (§9.8).
+            // Registry holds the TOML-backed keys; store holds the remaining non-sensitive
+            // settings; secrets holds sensitive ones (§9.8).
             // Fail closed: any read error during snapshot capture aborts the whole batch.
+            let registry = self.settings_registry.as_deref();
             let old_values = if let Some(entries) = changes.as_array() {
                 let mut old = Vec::new();
                 for entry in entries {
@@ -5148,11 +5288,15 @@ impl WorkspaceApi for Services {
                                 // Fail closed: timeout/backing-error -> abort before applying anything.
                                 match self.secrets.load(path).await {
                                     Ok(Some(secret_val)) => {
-                                        old.push((path.to_string(), Some(secret_val), true));
+                                        old.push((
+                                            path.to_string(),
+                                            Some(secret_val),
+                                            OldStore::Secret,
+                                        ));
                                     }
                                     Ok(None) => {
                                         // Confirmed absent; mark for deletion on rollback.
-                                        old.push((path.to_string(), None, true));
+                                        old.push((path.to_string(), None, OldStore::Secret));
                                     }
                                     Err(e) => {
                                         return Err(Error::Internal(format!(
@@ -5160,15 +5304,32 @@ impl WorkspaceApi for Services {
                                         )));
                                     }
                                 }
+                            } else if let Some(reg) =
+                                registry.filter(|_| KNOWN_PATHS.contains(&path))
+                            {
+                                // TOML-backed setting: capture the file-layer
+                                // value from the registry snapshot. Origin
+                                // `file` → present (restore that value);
+                                // `default` → absent (rollback removes the
+                                // key). A pinned key rejects the apply, so it
+                                // never needs a rollback.
+                                let snap = reg.snapshot();
+                                let raw = match snap.origin(path) {
+                                    Some(SettingOrigin::File) => {
+                                        snap.get(path).map(|v| v.to_string())
+                                    }
+                                    _ => None,
+                                };
+                                old.push((path.to_string(), raw, OldStore::Registry));
                             } else {
                                 // Non-sensitive setting: capture from DB
                                 match self.store.get_setting(path).await {
                                     Ok(Some(raw)) => {
-                                        old.push((path.to_string(), Some(raw), false));
+                                        old.push((path.to_string(), Some(raw), OldStore::Db));
                                     }
                                     Ok(None) => {
                                         // Confirmed absent; mark for deletion on rollback.
-                                        old.push((path.to_string(), None, false));
+                                        old.push((path.to_string(), None, OldStore::Db));
                                     }
                                     Err(e) => {
                                         return Err(Error::Internal(format!(
@@ -5194,22 +5355,41 @@ impl WorkspaceApi for Services {
                     if let Err(e) = self.apply_server_setting_hooks(&applied, control).await {
                         // Rollback: restore old values for ALL settings in the batch.
                         // Log rollback failures but don't let them mask the original hook error.
+                        // Registry-backed restores are collected and applied as ONE batch
+                        // (a single config.toml rewrite + one change publication) instead of
+                        // per-key applies.
                         let mut rollback_failed = false;
                         let mut compensating_changes = Vec::new();
-                        for (path, old_val, is_sensitive) in old_values {
-                            let rollback_result = if is_sensitive {
-                                // Sensitive setting: restore to secrets store or delete
-                                if let Some(val) = &old_val {
-                                    self.secrets.store(&path, val).await
-                                } else {
-                                    self.secrets.delete(&path).await
+                        let mut registry_restores: Vec<(String, serde_json::Value)> = Vec::new();
+                        for (path, old_val, old_store) in old_values {
+                            let rollback_result = match old_store {
+                                OldStore::Secret => {
+                                    // Sensitive setting: restore to secrets store or delete
+                                    if let Some(val) = &old_val {
+                                        self.secrets.store(&path, val).await
+                                    } else {
+                                        self.secrets.delete(&path).await
+                                    }
                                 }
-                            } else {
-                                // Non-sensitive setting: restore to DB or delete
-                                if let Some(val) = &old_val {
-                                    self.store.set_setting(&path, val).await
-                                } else {
-                                    self.store.delete_setting(&path).await.map(|_| ())
+                                OldStore::Registry => {
+                                    // TOML-backed setting: restore the prior file
+                                    // value (or remove the key when it was absent);
+                                    // `Null` clears back to the schema default.
+                                    // Deferred into one registry batch below.
+                                    let value = old_val
+                                        .as_deref()
+                                        .and_then(|raw| serde_json::from_str(raw).ok())
+                                        .unwrap_or(serde_json::Value::Null);
+                                    registry_restores.push((path.clone(), value));
+                                    Ok(())
+                                }
+                                OldStore::Db => {
+                                    // Non-sensitive setting: restore to DB or delete
+                                    if let Some(val) = &old_val {
+                                        self.store.set_setting(&path, val).await
+                                    } else {
+                                        self.store.delete_setting(&path).await.map(|_| ())
+                                    }
                                 }
                             };
                             if let Err(rollback_err) = rollback_result {
@@ -5238,6 +5418,20 @@ impl WorkspaceApi for Services {
                                     "path": path,
                                     "value": val_json
                                 }));
+                            }
+                        }
+
+                        // Restore all TOML-backed keys as one atomic registry batch
+                        // (single config.toml rewrite, single change publication).
+                        if !registry_restores.is_empty() {
+                            if let Some(reg) = registry {
+                                if let Err(rollback_err) = reg.apply(&registry_restores) {
+                                    tracing::error!(
+                                        error = %rollback_err,
+                                        "settings.update registry rollback batch failed"
+                                    );
+                                    rollback_failed = true;
+                                }
                             }
                         }
 
@@ -6312,6 +6506,7 @@ impl WorkspaceApi for Services {
         let workspaces_root = self.workspaces_root.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
+        let settings_branch_prefix = settings::branch_prefix(&self.effective_settings());
         Box::pin(async move {
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
@@ -6328,6 +6523,34 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Fail fast on a bad client-supplied `initialAgent.agentId`
+                    // BEFORE any provisioning side effect (clone, worktree, row
+                    // insert, spec seed, `workspace:created`): a malformed or
+                    // duplicate id is `-32602` naming the problem and leaves no
+                    // partial workspace behind. Pre-fix, the duplicate only
+                    // surfaced as an opaque `-32603` UNIQUE(1555) from the
+                    // agent insert AFTER the workspace had been persisted,
+                    // orphaning a workspace per retry. The reservation guard
+                    // is held for the rest of the create flow so an
+                    // OVERLAPPING retry with the same id fails here too — not
+                    // at the agent insert after this request already
+                    // provisioned the workspace.
+                    let _initial_agent_id_reservation = match input
+                        .initial_agent
+                        .as_ref()
+                        .and_then(|a| a.agent_id.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        Some(requested) => {
+                            agent_ops::validate_client_agent_id(requested)?;
+                            let id = AgentId::from(requested);
+                            let guard = services.reserve_agent_id(&id)?;
+                            services.ensure_agent_id_available(&id).await?;
+                            Some(guard)
+                        }
+                        None => None,
+                    };
                     let workspaces_root =
                         workspaces_root.unwrap_or_else(default_workspaces_root);
                     // Workspace id derivation (TS `generateLocalSlug` parity):
@@ -6489,10 +6712,10 @@ impl WorkspaceApi for Services {
                                 let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
                                 match repo_config.branch_prefix.filter(|p| !p.is_empty()) {
                                     Some(p) => p,
-                                    None => settings::branch_prefix(&store).await,
+                                    None => settings_branch_prefix,
                                 }
                             } else {
-                                settings::branch_prefix(&store).await
+                                settings_branch_prefix
                             };
                             let desired = format!("{prefix}{slug}");
                             let git_repo = input
@@ -6824,8 +7047,12 @@ impl WorkspaceApi for Services {
                             is_background: Some(false),
                             ..Default::default()
                         };
+                        // Trim to match the preflight duplicate-id check above,
+                        // which validates the TRIMMED id: a whitespace-padded
+                        // valid id must not pass preflight and then fail inside
+                        // agent_create_op after provisioning side effects.
                         let requested = nonempty_owned(agent.agent_id)
-                            .map(|id| AgentId::from(id.as_str()));
+                            .map(|id| AgentId::from(id.trim()));
                         let created = services
                             .agent_create_op(
                                 ws.id.clone(),
@@ -6882,6 +7109,7 @@ impl WorkspaceApi for Services {
                                             prompt_text,
                                             None,
                                             created_image_blocks,
+                                            None,
                                             None,
                                         )
                                         .await
@@ -11061,6 +11289,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let settings = self.effective_settings();
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
@@ -11074,7 +11303,7 @@ impl WorkspaceApi for Services {
                 move || async move {
                     let store = op_store;
                     // TS `ws.git.commit` gates on auto-commit (no userRequested bypass).
-                    git_ops::assert_agent_commit_allowed(&store, false).await?;
+                    git_ops::assert_agent_commit_allowed(&settings, false)?;
                     // All commit failures surface as `-32603` (the TS handler wraps the
                     // whole path in INTERNAL_ERROR), so a missing workspace is `Internal`.
                     let ws = store
@@ -11123,9 +11352,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitAgentCommitResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let settings = self.effective_settings();
         Box::pin(async move {
             // userRequested bypasses the auto-commit gate (TS parity).
-            git_ops::assert_agent_commit_allowed(&store, user_requested).await?;
+            git_ops::assert_agent_commit_allowed(&settings, user_requested)?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -11683,6 +11913,19 @@ impl WorkspaceApi for Services {
                 idempotency_key,
                 "agent.create",
                 move || async move {
+                    // Claim the client-supplied id for the duration of the op
+                    // (front-door parity with the `workspace.create`
+                    // preflight): a concurrent create racing the same id fails
+                    // `-32602` here instead of at the insert. Inside the
+                    // idempotency closure so a key replay (which never
+                    // re-runs the body) cannot trip over its own reservation.
+                    let _reservation = match &requested_agent_id {
+                        Some(id) => {
+                            agent_ops::validate_client_agent_id(id.as_str())?;
+                            Some(self.reserve_agent_id(id)?)
+                        }
+                        None => None,
+                    };
                     self.agent_create_op(
                         workspace_id,
                         name,
@@ -11707,10 +11950,17 @@ impl WorkspaceApi for Services {
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_send_to_task_op(workspace_id, task_note_id, message, priority)
-                .await
+            self.agent_send_to_task_op(
+                workspace_id,
+                task_note_id,
+                message,
+                priority,
+                message_metadata,
+            )
+            .await
         })
     }
 
@@ -11762,20 +12012,18 @@ impl WorkspaceApi for Services {
                     }
                 }
                 None => {
-                    // Read-only fallback (no `agent_manager` wired): the
-                    // router has already extracted `messageMetadata`, but
-                    // the store-only op doesn't accept metadata since none
-                    // of its internal callers carry it; the payload is dropped
-                    // on this fallback path (metadata IS preserved on the
-                    // production `AgentManager::send_message` path above).
+                    // Read-only fallback (no `agent_manager` wired): plumb
+                    // `messageMetadata` through the store-only append so the
+                    // persisted row matches the production
+                    // `AgentManager::send_message` path above.
                     // STAB-7: image_blocks and file_blocks ARE forwarded now.
-                    let _ = message_metadata;
                     self.agent_send_message_op(
                         agent_id,
                         content,
                         message_id,
                         image_blocks,
                         file_blocks,
+                        message_metadata,
                     )
                     .await
                 }
@@ -11825,6 +12073,71 @@ impl WorkspaceApi for Services {
                         options.file_blocks,
                     )
                     .await
+                }
+            }
+        })
+    }
+
+    fn agent_edit_and_regenerate(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        model: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let options = crate::agent_manager::TurnOptions {
+                image_blocks,
+                file_blocks,
+                ..Default::default()
+            };
+            match self.agent_manager() {
+                Some(manager) => {
+                    manager
+                        .edit_and_regenerate(
+                            agent_id,
+                            workspace_id,
+                            message_id,
+                            content,
+                            model,
+                            options,
+                        )
+                        .await
+                }
+                None => {
+                    // Store-level fallback (no `agent_manager` wired — UDS unit
+                    // harnesses): validate + optional model switch + truncate +
+                    // persist the edited message, without the runtime
+                    // stop/recreate/regenerate orchestration (which requires a
+                    // live manager).
+                    self.agent_validate_edit_target_op(&agent_id, &message_id)
+                        .await?;
+                    if let Some(model_id) = model {
+                        self.agent_set_model_op(agent_id.clone(), model_id).await?;
+                    }
+                    let truncated_count =
+                        self.agent_edit_truncate_op(&agent_id, &message_id).await?;
+                    let result = self
+                        .agent_send_message_op(
+                            agent_id,
+                            content,
+                            None,
+                            options.image_blocks,
+                            options.file_blocks,
+                            None,
+                        )
+                        .await?;
+                    let mut result = result;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert(
+                            "truncatedCount".to_string(),
+                            serde_json::json!(truncated_count),
+                        );
+                    }
+                    Ok(result)
                 }
             }
         })
@@ -14677,7 +14990,7 @@ impl Services {
         stage_unstaged: bool,
     ) -> Result<String> {
         // accept-changes is a user-initiated action → bypass the auto-commit gate.
-        git_ops::assert_agent_commit_allowed(&self.store, true).await?;
+        git_ops::assert_agent_commit_allowed(&self.effective_settings(), true)?;
         let message = message
             .filter(|m| !m.trim().is_empty())
             .ok_or_else(|| Error::Internal("Commit message is required".to_string()))?;
@@ -16058,6 +16371,13 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
                 "hasNpxFallback".to_string(),
                 serde_json::json!(p.has_npx_fallback),
             );
+            obj.insert(
+                "npxOnly".to_string(),
+                serde_json::json!(p.npx_only_package.is_some()),
+            );
+            if let Some(pkg) = p.npx_only_package {
+                obj.insert("npxPackage".to_string(), serde_json::json!(pkg));
+            }
             serde_json::Value::Object(obj)
         })
         .collect();

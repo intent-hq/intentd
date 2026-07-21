@@ -3641,6 +3641,167 @@ mod change_event_parity {
         );
     }
 
+    /// A duplicate client-supplied `initialAgent.agentId` fails
+    /// `workspace.create` with `-32602` naming the id BEFORE any provisioning
+    /// side effect: no new workspace row is persisted and neither
+    /// `workspace:created` nor the seeded spec's `note:created` is published
+    /// (pre-fix, the create failed with an opaque `-32603` UNIQUE(1555) AFTER
+    /// the row/worktree/spec/event had all been persisted).
+    #[tokio::test]
+    async fn workspace_create_duplicate_initial_agent_id_fails_clean() {
+        use intent_core::{Error, WorkspaceCreate, WorkspaceCreateInitialAgent};
+        let h = harness().await;
+        // Persist a session at the requested id in the pre-seeded workspace.
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        h.services
+            .agent_create_op(
+                h.ws.clone(),
+                Some("Existing".into()),
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(AgentId::from(requested.as_str())),
+                Default::default(),
+            )
+            .await
+            .expect("seed agent");
+        let before = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list before")
+            .len();
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let err = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Poisoned retry".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        agent_id: Some(requested.clone()),
+                        prompt: Some("retry with stale id".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("duplicate initialAgent.agentId must fail the create");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&requested),
+                "error must name the duplicate id, got: {msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // No partial workspace: row count unchanged and no event published.
+        let after = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list after")
+            .len();
+        assert_eq!(after, before, "failed create must not persist a row");
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(none.is_err(), "failed create must not publish events");
+    }
+
+    /// A whitespace-padded but otherwise valid, non-duplicate
+    /// `initialAgent.agentId` succeeds: the preflight validates the TRIMMED id
+    /// and the create path adopts the same trimmed id, so the padded value
+    /// cannot pass preflight and then fail inside `agent_create_op` after
+    /// provisioning side effects.
+    #[tokio::test]
+    async fn workspace_create_trims_padded_initial_agent_id() {
+        use intent_core::{WorkspaceCreate, WorkspaceCreateInitialAgent};
+        let h = harness().await;
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let result = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Padded id".to_string()),
+                    initial_agent: Some(WorkspaceCreateInitialAgent {
+                        agent_id: Some(format!("  {requested}  ")),
+                        prompt: Some("hello".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("padded valid non-duplicate id must not fail the create");
+        let agent = result.initial_agent.expect("initial agent created");
+        assert_eq!(
+            agent["id"].as_str(),
+            Some(requested.as_str()),
+            "the trimmed id is adopted verbatim: {agent}"
+        );
+    }
+
+    /// Two OVERLAPPING `workspace.create` requests with the same
+    /// `initialAgent.agentId` (client retry while the first attempt is still
+    /// in flight): the in-process reservation makes the preflight atomic, so
+    /// exactly one create wins and the loser is `-32602` naming the id BEFORE
+    /// provisioning — no second row, no partial workspace. Pre-reservation,
+    /// both passed the SELECT preflight and the loser failed at the agent
+    /// insert AFTER persisting its workspace.
+    #[tokio::test]
+    async fn workspace_create_concurrent_duplicate_initial_agent_id_single_winner() {
+        use intent_core::{Error, WorkspaceCreate, WorkspaceCreateInitialAgent};
+        let h = harness().await;
+        let requested = format!("agent-{}", uuid::Uuid::new_v4());
+        let before = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list before")
+            .len();
+        let input = || WorkspaceCreate {
+            title: Some("Racing retry".to_string()),
+            initial_agent: Some(WorkspaceCreateInitialAgent {
+                agent_id: Some(requested.clone()),
+                prompt: Some("race the same id".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let svc_a = h.services.clone();
+        let svc_b = h.services.clone();
+        let (a, b) = tokio::join!(
+            svc_a.create_workspace(input(), None),
+            svc_b.create_workspace(input(), None),
+        );
+        let (ok, err) = match (a, b) {
+            (Ok(ok), Err(err)) | (Err(err), Ok(ok)) => (ok, err),
+            (Ok(_), Ok(_)) => panic!("both creates won the same agent id"),
+            (Err(a), Err(b)) => panic!("both creates failed: {a:?} / {b:?}"),
+        };
+        assert_eq!(
+            ok.initial_agent.expect("winner created the agent")["id"].as_str(),
+            Some(requested.as_str())
+        );
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(&requested),
+                "loser must name the contended id, got: {msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        // Exactly one new workspace row: the loser left no partial state.
+        let after = h
+            .store
+            .list_workspaces(true)
+            .await
+            .expect("list after")
+            .len();
+        assert_eq!(after, before + 1, "loser must not persist a row");
+    }
+
     /// Idempotency replay (design note TB-0 §5.3): a second `workspace.create`
     /// with the same key returns the ORIGINAL workspace without re-executing —
     /// so no second row, and neither the `workspace:created` nor the seeded
@@ -5827,8 +5988,8 @@ mod pr {
         let before = svc.store().get_workspace(&ws_id).await.unwrap();
         assert_eq!(before.pr_number, None);
 
-        // Run the same sweep the background loop runs.
-        svc.refresh_all_workspace_prs().await;
+        // Run the same sweep the background loop runs (tick 0 = full sweep).
+        svc.refresh_all_workspace_prs(0).await;
 
         // After the sweep the workspace is linked to PR #42.
         let after = svc.store().get_workspace(&ws_id).await.unwrap();
@@ -5843,6 +6004,104 @@ mod pr {
             .unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data["prNumber"], 42);
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_idle_workspace_between_full_ticks() {
+        // Sweep trimming (§7.7): a workspace with no recent activity is not
+        // refreshed on an in-between tick — only on every
+        // `SWEEP_IDLE_TICK_MULTIPLE`-th (full-sweep) tick.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        // Age the workspace well past the active window.
+        let mut ws = svc.store().get_workspace(&ws_id).await.unwrap();
+        ws.updated_at =
+            intent_core::iso_minutes_ago(2 * crate::pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES);
+        ws.last_activity = None;
+        svc.store().update_workspace(&ws).await.unwrap();
+
+        // In-between tick: the idle workspace is skipped (no link, no event).
+        svc.refresh_all_workspace_prs(1).await;
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, None);
+        let evs = svc.store().events_by_workspace(&ws_id, 10).await.unwrap();
+        assert!(evs.is_empty());
+
+        // Full-sweep tick (multiple of SWEEP_IDLE_TICK_MULTIPLE): refreshed.
+        svc.refresh_all_workspace_prs(crate::pr_ops::SWEEP_IDLE_TICK_MULTIPLE)
+            .await;
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+    }
+
+    #[test]
+    fn sweep_due_tiers_by_recency_and_tick() {
+        use crate::pr_ops::{sweep_due, SWEEP_ACTIVE_WINDOW_MINUTES, SWEEP_IDLE_TICK_MULTIPLE};
+        let cutoff_str = intent_core::iso_minutes_ago(SWEEP_ACTIVE_WINDOW_MINUTES);
+        let cutoff = intent_core::parse_iso(&cutoff_str);
+        assert!(cutoff.is_some());
+        let ws_id = WorkspaceId::new();
+
+        // Recently active (updated_at = now): due on every tick.
+        let active = workspace(&ws_id);
+        assert!(sweep_due(&active, cutoff, 1));
+
+        // Idle (updated_at past the window, no last_activity): due only on
+        // full-sweep ticks (multiples of SWEEP_IDLE_TICK_MULTIPLE, incl. 0).
+        let mut idle = workspace(&ws_id);
+        idle.updated_at = intent_core::iso_minutes_ago(2 * SWEEP_ACTIVE_WINDOW_MINUTES);
+        assert!(!sweep_due(&idle, cutoff, 1));
+        assert!(!sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE - 1));
+        assert!(sweep_due(&idle, cutoff, 0));
+        assert!(sweep_due(&idle, cutoff, SWEEP_IDLE_TICK_MULTIPLE));
+        assert!(sweep_due(&idle, cutoff, 3 * SWEEP_IDLE_TICK_MULTIPLE));
+
+        // Exact boundary: `ts == cutoff` counts as active (inclusive `>=`).
+        let mut boundary = workspace(&ws_id);
+        boundary.updated_at = cutoff_str.clone();
+        assert!(sweep_due(&boundary, cutoff, 1));
+
+        // A recent last_activity revives an otherwise-idle workspace.
+        let mut revived = idle.clone();
+        revived.last_activity = Some(now_iso());
+        assert!(sweep_due(&revived, cutoff, 1));
+
+        // Malformed timestamps fail open (count as active), on either field.
+        let mut malformed = idle.clone();
+        malformed.updated_at = "not-a-timestamp".to_string();
+        assert!(sweep_due(&malformed, cutoff, 1));
+        let mut malformed_la = idle.clone();
+        malformed_la.last_activity = Some(String::new());
+        assert!(sweep_due(&malformed_la, cutoff, 1));
+
+        // An unparseable cutoff fails open too.
+        assert!(sweep_due(&idle, None, 1));
+    }
+
+    #[tokio::test]
+    async fn sweep_refreshes_recently_active_workspace_every_tick() {
+        // Sweep trimming (§7.7): a workspace active within the window is
+        // refreshed even on an in-between tick. `refresh_setup` seeds
+        // `updated_at = now`, i.e. inside `SWEEP_ACTIVE_WINDOW_MINUTES`.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+
+        svc.refresh_all_workspace_prs(1).await;
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
     }
 
     // ------------------------------------------------------------------------
@@ -8497,6 +8756,7 @@ mod rules {
             None,
             false,
             false,
+            false,
             None,
             None,
         )
@@ -8535,6 +8795,7 @@ mod rules {
             Some(&tree.0),
             "task-loop",
             None,
+            false,
             false,
             false,
             None,
@@ -8612,6 +8873,7 @@ mod rules {
             None,
             true,
             false,
+            false,
             None,
             None,
         )
@@ -8656,6 +8918,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             None,
             None,
@@ -8705,6 +8968,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             None,
             None,
         )
@@ -8730,6 +8994,7 @@ mod rules {
             Some(&tree.0),
             "task-loop",
             None,
+            false,
             false,
             false,
             None,
@@ -8781,6 +9046,7 @@ mod rules {
             None,
             true,
             false,
+            false,
             None,
             None,
         )
@@ -8811,6 +9077,7 @@ mod rules {
             None,
             false,
             true,
+            false,
             None,
             None,
         )
@@ -8876,6 +9143,7 @@ mod rules {
             Some(&tree.0),
             "task-loop",
             None,
+            false,
             false,
             false,
             None,
@@ -8988,6 +9256,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             Some(&workspace),
             Some(&agent_session),
@@ -9113,6 +9382,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             Some(&workspace),
             Some(&agent_session),
         )
@@ -9227,6 +9497,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             Some(&workspace),
             Some(&agent_session),
         )
@@ -9337,6 +9608,7 @@ mod rules {
             Some(&injection),
             true,
             false,
+            false,
             Some(&workspace),
             Some(&agent_session),
         )
@@ -9446,6 +9718,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             Some(&workspace),
             Some(&agent_session),
@@ -9560,6 +9833,7 @@ mod rules {
             "task-loop",
             Some(&injection),
             true,
+            false,
             false,
             Some(&workspace),
             Some(&agent_session),
@@ -10294,13 +10568,22 @@ mod worktree_provisioning {
     async fn create_names_branch_from_prompt_with_prefix_and_suffix() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        store
-            .set_setting("workspace.branchPrefix", "\"aw/\"")
-            .await
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.branchPrefix".to_string(),
+                serde_json::json!("aw/"),
+            )])
             .expect("set prefix");
         let (repo_dir, _, head_branch) = seed_repo("intentd-wtslug-repo");
         let root = unique_dir("intentd-wtslug-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry);
 
         let create = |prompt: &str| WorkspaceCreate {
             repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
@@ -10333,12 +10616,21 @@ mod worktree_provisioning {
     async fn create_keeps_explicit_branch_untouched() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        store
-            .set_setting("workspace.branchPrefix", "\"aw/\"")
-            .await
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(&config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.branchPrefix".to_string(),
+                serde_json::json!("aw/"),
+            )])
             .expect("set prefix");
         let root = unique_dir("intentd-wtexpl-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry);
 
         let ws = svc
             .create_workspace(

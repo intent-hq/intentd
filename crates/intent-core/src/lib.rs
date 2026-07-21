@@ -15,6 +15,7 @@ pub mod model;
 pub mod path_utils;
 pub mod secrets;
 pub mod server_control;
+pub mod settings_file;
 pub mod slug;
 pub mod traits;
 
@@ -59,6 +60,7 @@ pub use model::{
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;
+pub use settings_file::{SettingsFile, DEFAULT_CONFIG_TEMPLATE};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,

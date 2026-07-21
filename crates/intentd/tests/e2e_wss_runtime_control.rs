@@ -412,7 +412,9 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Persist the port setting
+    // INTENTD_TCP_PORT pins server.wsApi.port at boot (§9.8 flag > file):
+    // the effective port already IS port_s, and settings.update on the pinned
+    // key must reject with -32602 naming the flag.
     let port_value: u64 = port_s.parse().unwrap();
     let set_port = uds_rpc(
         &socket,
@@ -421,9 +423,34 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
         json!({ "changes": [{ "path": "server.wsApi.port", "value": port_value }] }),
     )
     .await;
+    assert_eq!(
+        set_port["error"]["code"],
+        json!(-32602),
+        "pinned server.wsApi.port must reject settings.update: {set_port}"
+    );
     assert!(
-        set_port.get("error").is_none(),
-        "settings.update port should succeed: {set_port}"
+        set_port["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("INTENTD_TCP_PORT"),
+        "rejection names the pinning flag: {set_port}"
+    );
+    let get_port = uds_rpc(
+        &socket,
+        11,
+        "settings.get",
+        json!({ "path": "server.wsApi.port" }),
+    )
+    .await;
+    assert_eq!(
+        get_port["result"]["value"],
+        json!(port_value as f64),
+        "pinned value is effective: {get_port}"
+    );
+    assert_eq!(
+        get_port["result"]["origin"],
+        json!("flag"),
+        "pinned key reports origin=flag: {get_port}"
     );
 
     // Enable the WSS listener (this will start it at runtime)

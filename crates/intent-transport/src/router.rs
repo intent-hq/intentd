@@ -1007,8 +1007,11 @@ async fn dispatch(
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
             let message = require_str_param(params, "message")?;
             let priority = opt_str(params, "priority");
+            // Same opaque per-message payload as `agent.sendMessage` below
+            // (PROTOCOL §5.5) — persisted on the assignee's user row.
+            let message_metadata = opt_value(params, "messageMetadata");
             let result = api
-                .agent_send_to_task(ws, task_note_id, message, priority)
+                .agent_send_to_task(ws, task_note_id, message, priority, message_metadata)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -1087,6 +1090,28 @@ async fn dispatch(
                     stdin_context,
                     context_references,
                     message_metadata,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "agent.editAndRegenerate" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let content = require_str_param(params, "content")?;
+            let ws = require_ws_note(params)?;
+            let image_blocks = opt_value(params, "imageBlocks");
+            let file_blocks = opt_value(params, "fileBlocks");
+            let model = opt_str(params, "model");
+            let result = api
+                .agent_edit_and_regenerate(
+                    ws,
+                    agent_id,
+                    message_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    model,
                 )
                 .await
                 .map_err(domain_to_rpc)?;

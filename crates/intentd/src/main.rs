@@ -418,28 +418,43 @@ async fn cmd_serve(
     // Hold a store handle for the §5.4 idempotency reaper (same lifecycle root
     // as the retention sweep) before the store is moved into the services below.
     let idempotency_store = store.clone();
-    // Hold a store handle for reading persisted server.wsApi.enabled at boot.
-    let boot_settings_store = store.clone();
+    // Hold a store handle for the graceful close at shutdown.
+    let shutdown_store = store.clone();
     // REV-1: build the shared first-client-sticky reverse-dispatch registry
     // BEFORE the services surface + listeners so both sides observe the same
     // live-client set. Every accepted UDS/WSS connection registers its
     // per-connection `ReverseChannel` here; agent-initiated `browser.exec`
     // routes through the same registry via `Services::with_reverse_dispatch`.
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
-    // Resolve the concurrent agent cap: positive stored value → explicit override;
-    // 0/unset/invalid → auto (RAM-based default_process_cap). The setting applies
-    // on daemon restart (§9.8 agents.maxConcurrent). Must read before the store
-    // is moved into `services`.
-    let process_cap = max_concurrent_agents(&store)
-        .await
-        .unwrap_or_else(default_process_cap);
+    // Layered `config.toml` registry backing the TOML-backed `settings.*` keys
+    // (defaults < file < startup pins). `Config::resolve()` above already
+    // parsed the file strictly (malformed file → startup error), so a load
+    // failure here is unexpected and equally fatal.
+    let settings_registry = Arc::new(
+        intent_services::SettingsRegistry::load(&config.config_path)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    );
+    // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
+    // pinned keys take the flag value, report origin `flag` on the wire,
+    // reject `settings.update`, and ignore the file value on live-reload. An
+    // invalid pin value (e.g. out-of-range INTENTD_TCP_PORT) refuses startup.
+    apply_startup_pins(&settings_registry, listen, insecure)?;
+    // Snapshot of the effective boot settings for the boot-time reads below
+    // (agents.maxConcurrent, server.wsApi.enabled).
+    let boot_settings = settings_registry.snapshot();
+    // Resolve the concurrent agent cap: positive effective value → explicit
+    // override; 0 (the schema default) → auto (RAM-based default_process_cap).
+    // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
+    let process_cap =
+        max_concurrent_agents(&boot_settings.effective).unwrap_or_else(default_process_cap);
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
     let services = Services::new(store)
         .with_assets_root(config.data_dir.join("assets"))
         .with_event_bus(bus.clone())
-        .with_reverse_dispatch(reverse_registry.clone());
+        .with_reverse_dispatch(reverse_registry.clone())
+        .with_settings_registry(settings_registry.clone());
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -495,6 +510,17 @@ async fn cmd_serve(
         Ok(healed) => tracing::info!(healed, "healed stale in-flight agent sessions on startup"),
         Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
     }
+    // Rehydrate persisted agent send queues (write-through `agent_queue`
+    // table) into the in-memory map before any listener serves RPCs, so
+    // messages queued at the previous shutdown survive the restart. This only
+    // restores state — it never starts a turn; queued messages sit until an
+    // explicit kick (resume, sendMessage, queueMessage, retry). Best-effort:
+    // a failure is logged but never aborts startup.
+    match services.rehydrate_agent_queues().await {
+        Ok(0) => {}
+        Ok(rehydrated) => tracing::info!(rehydrated, "rehydrated persisted agent queue messages"),
+        Err(e) => tracing::warn!(error = %e, "agent queue rehydration failed"),
+    }
     // STAB-108: Rehydrate undelivered delegation groups on startup so groups
     // survive daemon restarts without requiring the resume path. Groups are
     // reconciled against current agent state (already-completed children are
@@ -516,10 +542,13 @@ async fn cmd_serve(
         Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
         Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
     }
-    // Background PR refresh (§7.6): periodically re-fetch every linked PR,
-    // persist any change, and emit `pr:*` events so clients update without
-    // polling. Safe when source control is unconfigured (each refresh logs and
-    // swallows the missing-provider error). Aborted on clean shutdown.
+    // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
+    // discover/link PRs for workspaces without one), persist any change, and
+    // emit `pr:*` events so clients update without polling.
+    // Tiered by workspace recency to trim forge load (§7.7): recently-active
+    // workspaces refresh every 60s tick, idle ones only on every 10th tick.
+    // Safe when source control is unconfigured (a sweep with due workspaces
+    // logs and swallows the missing-provider error). Aborted on clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
     // Daemon-internal token-usage scan (§5.23/§19.1): periodically re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
@@ -705,34 +734,48 @@ async fn cmd_serve(
     let server_control: Arc<dyn intent_core::ServerControl> = control.clone();
     services.attach_server_control(server_control);
 
+    // Live-reload of config.toml (§9.8): watch the file's parent directory
+    // (survives editor rename/atomic-save), debounce, and strictly re-parse.
+    // Valid external edits update the registry, run the same server runtime
+    // hooks as `settings.update`, and emit `settings:changed`; invalid edits
+    // keep last-good values. Held for the lifetime of `serve`; dropping it on
+    // return tears the watch down with the daemon.
+    let watcher_services = services.clone();
+    let _config_watcher =
+        match intent_services::ConfigWatcher::start(settings_registry.clone(), move |notice| {
+            let services = watcher_services.clone();
+            async move { services.apply_external_settings_change(&notice).await }
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "config.toml live-reload watcher failed to start; \
+                     external edits will require a daemon restart"
+                );
+                None
+            }
+        };
+
     // Boot-time WSS listener auto-start when persisted server.wsApi.enabled=true
     // AND --listen uds (sidecar/packaged posture). CLI --listen tcp/both already
     // started the listener above, so this only fires when !serve_tcp_enabled.
     // A bind failure at boot (port in use) is non-fatal: UDS stays up, setting
     // stays true, warning logged (UI shows "not running" via pairingInfo.port=null).
-    if !serve_tcp_enabled && !insecure {
-        if let Ok(Some(raw)) = boot_settings_store
-            .get_setting("server.wsApi.enabled")
-            .await
-        {
-            if let Ok(enabled) = serde_json::from_str::<bool>(&raw) {
-                if enabled {
-                    match control.start_ws_listener().await {
-                        Ok(port) => {
-                            tracing::info!(
-                                port,
-                                "WSS listener auto-started at boot (persisted server.wsApi.enabled=true)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "failed to auto-start WSS listener at boot (persisted enabled=true); \
-                                 UDS still serving, setting remains true, toggle OFF→ON to retry"
-                            );
-                        }
-                    }
-                }
+    if !serve_tcp_enabled && !insecure && boot_settings.effective.server.ws_api.enabled {
+        match control.start_ws_listener().await {
+            Ok(port) => {
+                tracing::info!(
+                    port,
+                    "WSS listener auto-started at boot (persisted server.wsApi.enabled=true)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to auto-start WSS listener at boot (persisted enabled=true); \
+                     UDS still serving, setting remains true, toggle OFF→ON to retry"
+                );
             }
         }
     }
@@ -864,10 +907,9 @@ async fn cmd_serve(
     // Stop the periodic WAL checkpoint task before closing the store.
     checkpoint_handle.abort();
 
-    // Close the store pool gracefully, checkpointing the WAL so settings and
-    // other persisted data are visible to the next daemon instance (regression:
-    // persisted server.wsApi.enabled must survive app relaunches in sidecar mode).
-    boot_settings_store.close().await;
+    // Close the store pool gracefully, checkpointing the WAL so persisted data
+    // is visible to the next daemon instance.
+    shutdown_store.close().await;
 
     Ok(())
 }
@@ -1187,6 +1229,73 @@ fn resolve_token_store() -> Arc<dyn TokenStore> {
         Ok(t) if !t.is_empty() => Arc::new(EnvTokenStore(t)),
         _ => Arc::new(FileTokenStore::default()),
     }
+}
+
+/// Pin `SettingsRegistry` keys from startup flags/env vars (§9.8 precedence:
+/// defaults < config.toml < pins). A pinned key takes the flag value for the
+/// process lifetime: the wire reports origin `flag`, `settings.update` /
+/// `settings.reset` reject with `-32602` naming the flag, and live-reload
+/// ignores the file value while pinned. An invalid pin value (e.g.
+/// out-of-range `INTENTD_TCP_PORT`) refuses startup. `INTENTD_TCP_PORT=0` is
+/// the E2E ephemeral-port seam, not a real port — it stays unpinned, exactly
+/// like an unparseable value (matching [`ws_options_from_env`]).
+fn apply_startup_pins(
+    registry: &intent_services::SettingsRegistry,
+    listen: &str,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    let pin = |path: &str, value: Value, flag: &str| {
+        registry
+            .pin(path, value, flag)
+            .map_err(|e| anyhow::anyhow!("invalid startup override {flag}: {e}"))
+    };
+    // `--listen` always pins: the CLI value (clap default `uds` included) is
+    // what the daemon actually serves this run, so the file value must never
+    // claim otherwise on the wire.
+    pin("server.listenMode", json!(listen), "--listen")?;
+    if insecure {
+        // Dev mode hard-disables TLS + bearer auth for the process lifetime.
+        pin("server.tls.enabled", json!(false), "--insecure")?;
+        pin("server.auth.enabled", json!(false), "--insecure")?;
+    }
+    if let Some(port) = std::env::var("INTENTD_TCP_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+    {
+        pin("server.wsApi.port", json!(port), "INTENTD_TCP_PORT")?;
+    }
+    for (env, path) in [
+        ("INTENTD_IDLE_REAP_MINUTES", "agents.idleReapMinutes"),
+        (
+            "INTENTD_STREAM_RETENTION_HOURS",
+            "events.streamRetentionHours",
+        ),
+    ] {
+        // Unset/unparseable falls through to the file value — the same
+        // semantics `Config::resolve` applies to these two knobs.
+        if let Some(v) = std::env::var(env)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            pin(path, json!(v), env)?;
+        }
+    }
+    if let Some(dir) = std::env::var_os("INTENTD_DATA_DIR") {
+        pin(
+            "storage.dataDir",
+            json!(dir.to_string_lossy()),
+            "INTENTD_DATA_DIR",
+        )?;
+    }
+    if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
+        pin(
+            "workspaces.root",
+            json!(dir.to_string_lossy()),
+            "INTENTD_WORKSPACES_DIR",
+        )?;
+    }
+    Ok(())
 }
 
 /// Build [`WsOptions`] from the production defaults plus an optional env seam:
@@ -1858,11 +1967,15 @@ impl Signaller for NixSignaller {
 }
 
 async fn cmd_doctor() -> ExitCode {
+    // `resolve_config` parses config.toml strictly — the same gate `serve`
+    // applies. A malformed file exits non-zero here with the offending key.
     let config = match resolve_config() {
         Ok(c) => c,
         Err(e) => return to_exit(Err(e)),
     };
     let mut ok = true;
+
+    report_config_status(&config);
 
     match check_data_dir_writable(&config) {
         Ok(()) => println!("[ok] data dir writable: {}", config.data_dir.display()),
@@ -2097,6 +2210,20 @@ async fn report_provider_availability() {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
         }
+        // npx-only providers (claude-code) never resolve a local binary; report
+        // npx availability instead (the auth probe would need a package
+        // download, so it is skipped — auth is the external `claude` CLI).
+        if let Some(pkg) = provider.npx_only_package {
+            match &provider.resolved_path {
+                Some(npx) => println!("  [ok] {} via npx: {} -y {pkg}", provider.id, npx.display()),
+                None => println!(
+                    "  [--] {} unavailable (npx not found — {} is required)",
+                    provider.id,
+                    intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT
+                ),
+            }
+            continue;
+        }
         if !provider.installed {
             println!(
                 "  [--] {} not installed ({} not on PATH)",
@@ -2132,6 +2259,60 @@ async fn check_provider_auth(command: &str, auth_check_args: Option<&[&str]>) ->
         Ok(Ok(_)) => " (not authenticated)".to_string(),
         Ok(Err(_)) => " (auth check failed)".to_string(),
         Err(_) => " (auth check timed out)".to_string(),
+    }
+}
+
+/// Doctor config section (§9.8): the file already parsed strictly via
+/// `resolve_config`, so report its path plus every env override that will pin
+/// a settings key at serve time (flag > file precedence). `--listen` /
+/// `--insecure` pins are serve-CLI-scoped and not visible here.
+fn report_config_status(config: &Config) {
+    println!("[ok] config.toml parsed: {}", config.config_path.display());
+    // Mirror `apply_startup_pins` exactly: a numeric env var only pins when
+    // it parses (and `INTENTD_TCP_PORT=0` is the ephemeral-port seam, never a
+    // pin); the two path overrides pin whenever set.
+    let tcp_port_pins = std::env::var("INTENTD_TCP_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .is_some_and(|p| p != 0);
+    let env_u32_pins = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .is_some()
+    };
+    let env_pins = [
+        ("INTENTD_TCP_PORT", "server.wsApi.port", tcp_port_pins),
+        (
+            "INTENTD_IDLE_REAP_MINUTES",
+            "agents.idleReapMinutes",
+            env_u32_pins("INTENTD_IDLE_REAP_MINUTES"),
+        ),
+        (
+            "INTENTD_STREAM_RETENTION_HOURS",
+            "events.streamRetentionHours",
+            env_u32_pins("INTENTD_STREAM_RETENTION_HOURS"),
+        ),
+        (
+            "INTENTD_DATA_DIR",
+            "storage.dataDir",
+            std::env::var_os("INTENTD_DATA_DIR").is_some(),
+        ),
+        (
+            "INTENTD_WORKSPACES_DIR",
+            "workspaces.root",
+            std::env::var_os("INTENTD_WORKSPACES_DIR").is_some(),
+        ),
+    ];
+    let mut any = false;
+    for (env, path, pins) in env_pins {
+        if pins {
+            println!("  [--] {path} pinned by {env} (file value ignored)");
+            any = true;
+        }
+    }
+    if !any {
+        println!("  [--] no env overrides; all settings follow config.toml");
     }
 }
 

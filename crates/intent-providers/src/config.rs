@@ -4,6 +4,38 @@
 //! (`src/shared/config/provider-config.ts`). Each entry is data; adding a
 //! provider is a config change, not a code change.
 
+/// Single source of truth for the pinned `@agentclientprotocol/claude-agent-acp`
+/// version (macro so the literal can feed both `CLAUDE_AGENT_ACP_VERSION` and
+/// the `concat!`-built package spec). Bumping the adapter is a deliberate,
+/// one-line code change here.
+macro_rules! claude_agent_acp_version {
+    () => {
+        "0.60.0"
+    };
+}
+
+/// Pinned version of the `@agentclientprotocol/claude-agent-acp` npm package
+/// the claude-code provider is spawned with (via `npx`).
+pub const CLAUDE_AGENT_ACP_VERSION: &str = claude_agent_acp_version!();
+
+/// Full pinned npx package spec for the claude-code adapter
+/// (`@agentclientprotocol/claude-agent-acp@<CLAUDE_AGENT_ACP_VERSION>`).
+pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
+    "@agentclientprotocol/claude-agent-acp@",
+    claude_agent_acp_version!()
+);
+
+/// Node.js version requirement for the pinned adapter, for user-facing
+/// messages. Must match the npm `engines.node` field of the pinned
+/// [`CLAUDE_AGENT_ACP_NPX_PACKAGE`] (currently `>=22`); re-check when bumping
+/// the pin.
+pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
+
+/// Pinned npx package spec for the codex ACP fallback. Matches the
+/// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
+/// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@zed-industries/codex-acp@0.16.0";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
@@ -99,8 +131,13 @@ pub struct ProviderConfig {
     pub login_docs_url: Option<&'static str>,
     /// When provider binary cannot be resolved, fall back to spawning this npm
     /// package via `npx -y <package>`. Only set for providers shipped as npm
-    /// packages (e.g. claude-code's `@agentclientprotocol/claude-agent-acp`).
+    /// packages (e.g. codex's `@agentclientprotocol/codex-acp`).
     pub fallback_npx_package: Option<&'static str>,
+    /// When set, the provider is ALWAYS spawned via `npx -y <package>` with a
+    /// version pinned by us — local binary discovery (settings path, managed
+    /// bin, PATH scan) is skipped entirely, so the adapter version is under our
+    /// release cadence (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
+    pub npx_only_package: Option<&'static str>,
 }
 
 impl ProviderConfig {
@@ -135,6 +172,7 @@ impl ProviderConfig {
             auth_check_args: None,
             login_docs_url: None,
             fallback_npx_package: None,
+            npx_only_package: None,
         }
     }
 }
@@ -181,7 +219,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
-        fallback_npx_package: Some("@agentclientprotocol/claude-agent-acp"),
+        npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
@@ -190,7 +228,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         injection_mechanism: InjectionMechanism::SessionMeta,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
-        fallback_npx_package: Some("@agentclientprotocol/codex-acp"),
+        fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {

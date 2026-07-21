@@ -193,6 +193,7 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             task_note.id.clone(),
             "Task message".into(),
             None,
+            None,
         )
         .await
         .expect("send to task");

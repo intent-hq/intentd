@@ -1233,15 +1233,24 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.sendToTask`: follow up with the agent assigned to a task note
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). `message_metadata` is the same opaque per-message
+    /// payload as `agent.sendMessage` (persisted on the user row; e.g. the
+    /// `agent_message` sender-attribution block for agent-to-agent sends).
     fn agent_send_to_task(
         &self,
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, task_note_id, message, priority);
+        let _ = (
+            workspace_id,
+            task_note_id,
+            message,
+            priority,
+            message_metadata,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_send_to_task not implemented".to_string(),
@@ -1334,6 +1343,41 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_force_message not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `agent.editAndRegenerate`: edit a past user message and regenerate from
+    /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
+    /// transcript to just before `message_id` (which must reference an existing
+    /// **user** message — otherwise `-32602`), forces a fresh ACP session on
+    /// the next prompt (the truncated history replays as `<supervisor>` XML so
+    /// the provider does not retain the truncated turns), then sends `content`
+    /// as a fresh user message with the same per-turn semantics as
+    /// `agent.sendMessage`.
+    #[allow(clippy::too_many_arguments)]
+    fn agent_edit_and_regenerate(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<serde_json::Value>,
+        file_blocks: Option<serde_json::Value>,
+        model: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            agent_id,
+            message_id,
+            content,
+            image_blocks,
+            file_blocks,
+            model,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_edit_and_regenerate not implemented".to_string(),
             ))
         })
     }
