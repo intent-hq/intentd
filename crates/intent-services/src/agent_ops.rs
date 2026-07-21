@@ -1983,10 +1983,17 @@ impl Services {
         }
     }
 
-    /// The legacy no-`providerId` `models.list` path, preserved byte-for-byte
-    /// for existing callers: 5-minute in-memory success cache over the auggie
-    /// CLI, static tier catalog fallback. `force_refresh` skips the cache
-    /// read; a successful probe still refills it.
+    /// The legacy no-`providerId` `models.list` path. With `force_refresh:
+    /// false` it is preserved byte-for-byte for existing callers: 5-minute
+    /// in-memory success cache over the auggie CLI, static tier catalog
+    /// fallback. `force_refresh: true` (a new param, so free to match the
+    /// per-provider contract) skips the cache read and awaits the fresh
+    /// probe; on probe failure it serves the last-good cached list labeled
+    /// `stale: true` + `warning` — never silently — before the static
+    /// fallback. Note this in-memory cache is separate from the persisted
+    /// per-provider [`crate::model_catalog`] cache that `providerId:
+    /// "auggie"` reads; the two can diverge within a TTL window (a follow-up
+    /// may route this path through the generic cache).
     async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
         if !force_refresh {
             if let Some(models) = self.cached_models() {
@@ -1996,6 +2003,16 @@ impl Services {
         if let Some(models) = fetch_auggie_models_rich().await {
             self.store_models_cache(models.clone());
             return Ok(json!({ "models": models, "source": "auggie" }));
+        }
+        if force_refresh {
+            if let Some(models) = self.last_good_models() {
+                return Ok(json!({
+                    "models": models,
+                    "source": "auggie",
+                    "stale": true,
+                    "warning": "auggie CLI unavailable or returned no models; serving last-good cached list",
+                }));
+            }
         }
         Ok(json!({ "models": static_models(), "source": "static" }))
     }
@@ -2007,6 +2024,16 @@ impl Services {
             .expect("models cache poisoned")
             .as_ref()
             .and_then(|(at, rows)| (at.elapsed() < MODELS_CACHE_TTL).then(|| rows.clone()))
+    }
+
+    /// The last successfully fetched `models.list` rows regardless of age
+    /// (the forced-refresh failure fallback).
+    fn last_good_models(&self) -> Option<Vec<Value>> {
+        self.models_cache
+            .lock()
+            .expect("models cache poisoned")
+            .as_ref()
+            .map(|(_, rows)| rows.clone())
     }
 
     /// Record a successful `models.list` CLI fetch for [`MODELS_CACHE_TTL`].

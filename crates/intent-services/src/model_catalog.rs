@@ -69,21 +69,31 @@ fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     })
 }
 
-/// cortex source: feature-code-gated static catalog. When the gate is closed
-/// the source succeeds with an empty list + warning (mirroring the reference
-/// FE's default-deny) so the tier catalog is never leaked past the gate; when
-/// open it serves the static tier rows — trivially always fresh, never stale.
+/// cortex source: feature-code-gated static catalog. The gate is closed
+/// whenever the provider config demands an env var that is unset or a feature
+/// code (the daemon stores no feature-code enablement, so a configured code
+/// always gates — today's cortex config always takes this path); closed means
+/// an empty list + warning (mirroring the reference FE's default-deny) so the
+/// tier catalog is never leaked past the gate. The static-rows branch below
+/// only serves once the provider config stops requiring a code.
 fn cortex_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
-        let gated = intent_providers::find_provider("cortex").and_then(|cfg| {
-            if let Some(var) = cfg.requires_env_var {
-                if std::env::var_os(var).is_none() {
-                    return Some(format!("requires env var {var}"));
+        // A missing provider config is treated as gated (explicit default-deny),
+        // not as an open gate.
+        let gated = match intent_providers::find_provider("cortex") {
+            None => Some("provider config missing".to_string()),
+            Some(cfg) => {
+                if let Some(var) = cfg
+                    .requires_env_var
+                    .filter(|v| std::env::var_os(v).is_none())
+                {
+                    Some(format!("requires env var {var}"))
+                } else {
+                    cfg.requires_feature_code
+                        .map(|code| format!("requires feature code {code}"))
                 }
             }
-            cfg.requires_feature_code
-                .map(|code| format!("requires feature code {code}"))
-        });
+        };
         match gated {
             Some(reason) => ModelFetchResult {
                 models: Some(Vec::new()),
@@ -188,27 +198,31 @@ impl ModelCatalogCache {
         (entry.version_key == version_key).then(|| entry.models.clone())
     }
 
-    /// Record a successful fetch and best-effort persist the snapshot.
+    /// Record a successful fetch and best-effort persist the snapshot. The
+    /// write happens under the entries lock (the file is tiny — a handful of
+    /// model rows) so concurrent stores for different providers cannot land
+    /// their snapshots on disk out of order; temp-file + rename keeps a crash
+    /// mid-write from corrupting the previous snapshot.
     fn store(&self, provider_id: &str, version_key: &str, models: Vec<Value>, now_ms: u64) {
-        let snapshot = {
-            let mut entries = self.entries.lock().expect("model catalog cache poisoned");
-            entries.insert(
-                provider_id.to_string(),
-                CacheEntry {
-                    version_key: version_key.to_string(),
-                    fetched_at_ms: now_ms,
-                    models,
-                },
-            );
-            entries.clone()
-        };
+        let mut entries = self.entries.lock().expect("model catalog cache poisoned");
+        entries.insert(
+            provider_id.to_string(),
+            CacheEntry {
+                version_key: version_key.to_string(),
+                fetched_at_ms: now_ms,
+                models,
+            },
+        );
         if let Some(path) = &self.persist_path {
             let persisted = PersistedCache {
                 version: PERSIST_VERSION,
-                entries: snapshot,
+                entries: entries.clone(),
             };
             if let Ok(bytes) = serde_json::to_vec(&persisted) {
-                let _ = std::fs::write(path, bytes);
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, path);
+                }
             }
         }
     }

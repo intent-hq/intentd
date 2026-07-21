@@ -2956,6 +2956,30 @@ async fn models_list_returns_non_empty_catalog_with_source() {
 }
 
 #[tokio::test]
+async fn models_list_legacy_force_refresh_bypasses_cache_and_labels_stale_fallback() {
+    let (_t, svc, _ws) = setup().await;
+    // Seed the legacy in-memory cache with a fresh sentinel entry.
+    let sentinel = vec![json!({ "id": "sentinel", "name": "Sentinel", "provider": "auggie" })];
+    svc.store_models_cache(sentinel.clone());
+    // Non-forced: the sentinel is served straight from the cache.
+    let cached = svc.models_list_op(None, false).await.expect("cached");
+    assert_eq!(cached["models"], json!(sentinel));
+    // Forced: the cache read is skipped and a fresh probe is awaited. The
+    // sentinel may only reappear as the last-good fallback after a failed
+    // probe — in which case it must be labeled stale + warning, never
+    // served silently as fresh.
+    let forced = svc.models_list_op(None, true).await.expect("forced");
+    if forced["models"] == json!(sentinel) {
+        assert_eq!(forced["stale"], true, "{forced}");
+        assert!(forced["warning"].is_string(), "{forced}");
+    } else {
+        assert!(forced.get("stale").is_none());
+        let source = forced["source"].as_str().unwrap();
+        assert!(source == "auggie" || source == "static", "source: {source}");
+    }
+}
+
+#[tokio::test]
 async fn models_list_unknown_provider_degrades_to_static_never_errors() {
     let (_t, svc, _ws) = setup().await;
     // Unregistered provider with no static tiers → empty list + warning.
