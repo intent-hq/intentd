@@ -37,8 +37,10 @@ if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
   echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
   exit 1
 fi
-if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
-  echo "error: tag must look like vX.Y.Z or vX.Y.Z-<prerelease>, got: $TAG" >&2
+# Leading v is optional to match dist's tag parsing (release.yml triggers on
+# bare X.Y.Z tags too).
+if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+  echo "error: tag must look like [v]X.Y.Z or [v]X.Y.Z-<prerelease>, got: $TAG" >&2
   exit 1
 fi
 VERSION="${TAG#v}"
