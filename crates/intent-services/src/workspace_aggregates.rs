@@ -324,7 +324,17 @@ fn compute_diff_summary_blocking(worktree: &Path) -> Option<WorkspaceDiffSummary
         return None;
     }
     let (total_files, total_additions, total_deletions) =
-        intent_git::diff::head_diff_rollup(worktree).ok()?;
+        match intent_git::diff::head_diff_rollup(worktree) {
+            Ok(rollup) => rollup,
+            Err(e) => {
+                tracing::debug!(
+                    worktree = %worktree.display(),
+                    error = %e,
+                    "workspace aggregates: head diff rollup errored; omitting diffSummary"
+                );
+                return None;
+            }
+        };
     if total_files == 0 {
         return None;
     }
