@@ -2668,11 +2668,12 @@ async fn periodic_wal_checkpoint_runs_and_stops() {
 }
 
 /// Smoke test: verify the two-pool split sizing (write pool max_connections=1,
-/// read pool max_connections=16) and that both pools support basic queries.
+/// read pool max_connections=32) and that both pools support basic queries.
 /// The write pool is single-connection to serialize all mutations and eliminate
-/// in-process writer-vs-writer busy_timeout contention. The read pool size (16)
+/// in-process writer-vs-writer busy_timeout contention. The read pool size (32)
 /// is sized to absorb the client-driven startup read burst without slow-acquire
-/// warnings (STAB-6, STAB-46).
+/// warnings (STAB-6, STAB-46), scaled up from 16 for the RAM-based agent
+/// process cap raise to 56 (intent-hq/intentd#296).
 #[tokio::test]
 async fn pool_smoke_test_with_explicit_config() {
     let tmp = TempDb::new();
@@ -2681,8 +2682,8 @@ async fn pool_smoke_test_with_explicit_config() {
     // Verify the write pool is single-connection.
     assert_eq!(store.write_pool().options().get_max_connections(), 1);
 
-    // Verify the read pool is 16 connections.
-    assert_eq!(store.read_pool().options().get_max_connections(), 16);
+    // Verify the read pool is 32 connections.
+    assert_eq!(store.read_pool().options().get_max_connections(), 32);
 
     // Verify both pools are usable and the configuration doesn't break basic ops.
     let row: (i64,) = sqlx::query_as("SELECT 1")
@@ -2697,7 +2698,7 @@ async fn pool_smoke_test_with_explicit_config() {
         .expect("basic query works on write pool");
     assert_eq!(row2.0, 1);
 
-    // Verify multiple concurrent acquires work on the read pool (max_connections=16).
+    // Verify multiple concurrent acquires work on the read pool (max_connections=32).
     let mut handles = Vec::new();
     for _ in 0..5 {
         let p = store.read_pool().clone();
