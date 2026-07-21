@@ -117,6 +117,9 @@ pub struct SpawnSpec {
     pub size: PtySize,
     /// Scrollback retention budget in bytes.
     pub scrollback_bytes: usize,
+    /// Optional display name surfaced through `terminal.list` (e.g. "Setup
+    /// Script"); `None` for unnamed terminals.
+    pub name: Option<String>,
 }
 
 impl SpawnSpec {
@@ -131,6 +134,7 @@ impl SpawnSpec {
             env_remove: Vec::new(),
             size: PtySize::default(),
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
+            name: None,
         }
     }
 }
@@ -163,10 +167,14 @@ pub struct PtyInfo {
     pub cwd: Option<String>,
     /// Whether the child process has not yet exited.
     pub alive: bool,
+    /// Display name given at spawn, if any (`SpawnSpec::name`).
+    pub name: Option<String>,
 }
 
 struct PtySession {
     scope: String,
+    /// Display name given at spawn (`SpawnSpec::name`), if any.
+    name: Option<String>,
     /// Working directory resolved at spawn (`spec.cwd`, else the daemon's cwd).
     cwd: Option<String>,
     pid: Option<u32>,
@@ -268,6 +276,7 @@ impl PtyHost {
 
         let session = Arc::new(PtySession {
             scope: spec.scope,
+            name: spec.name,
             cwd,
             pid,
             master: Mutex::new(Some(pair.master)),
@@ -376,8 +385,8 @@ impl PtyHost {
     }
 
     /// Metadata for one tracked PTY (`terminal.list` / `terminal.readOutput`):
-    /// its `scope`, working directory, and whether its child is still running.
-    /// `None` when the id is unknown.
+    /// its `scope`, display name, working directory, and whether its child is
+    /// still running. `None` when the id is unknown.
     pub fn info(&self, id: PtyId) -> Option<PtyInfo> {
         let session = self.sessions.lock().unwrap().get(&id).cloned()?;
         let alive = matches!(session.child.lock().unwrap().try_wait(), Ok(None));
@@ -385,6 +394,7 @@ impl PtyHost {
             scope: session.scope.clone(),
             cwd: session.cwd.clone(),
             alive,
+            name: session.name.clone(),
         })
     }
 
@@ -583,6 +593,25 @@ mod tests {
     /// Spec for `cat`, which echoes its stdin back through the PTY.
     fn cat_spec(scope: &str) -> SpawnSpec {
         SpawnSpec::new(scope, "cat")
+    }
+
+    /// `SpawnSpec::name` is surfaced through `info()`; unnamed PTYs stay `None`.
+    #[tokio::test]
+    async fn spawn_name_is_surfaced_through_info() {
+        let host = PtyHost::new();
+        let mut named = cat_spec("s");
+        named.name = Some("Setup Script".to_string());
+        let named_id = host.spawn(named).unwrap();
+        let unnamed_id = host.spawn(cat_spec("s")).unwrap();
+
+        assert_eq!(
+            host.info(named_id).unwrap().name.as_deref(),
+            Some("Setup Script")
+        );
+        assert_eq!(host.info(unnamed_id).unwrap().name, None);
+
+        host.kill(named_id).await;
+        host.kill(unnamed_id).await;
     }
 
     /// Every attached subscriber receives byte-identical fan-out (§12.1).

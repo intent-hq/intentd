@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -235,6 +236,56 @@ where
             other => panic!("expected text frame, got {other:?}"),
         }
     }
+}
+
+/// Poll `terminal.list` until the workspace's setup terminal (named "Setup
+/// Script") has finished executing, returning its list entry.
+async fn await_setup_terminal<S>(
+    ws: &mut WebSocketStream<S>,
+    base_id: i64,
+    workspace_id: &str,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for attempt in 0..100 {
+        let list_resp = wss_rpc(
+            ws,
+            base_id + attempt,
+            "terminal.list",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+        let terminals = list_resp["result"].as_array().expect("terminal.list array");
+        if let Some(entry) = terminals
+            .iter()
+            .find(|t| t["name"] == json!("Setup Script") && t["isExecutingCommand"] == json!(false))
+        {
+            return entry.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("setup terminal named \"Setup Script\" never finished for {workspace_id}");
+}
+
+/// Fetch a terminal's decoded scrollback via `terminal.getBuffer`.
+async fn terminal_buffer<S>(ws: &mut WebSocketStream<S>, id: i64, terminal_id: &str) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = wss_rpc(
+        ws,
+        id,
+        "terminal.getBuffer",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
+    assert_eq!(resp["result"]["terminalId"], json!(terminal_id));
+    let data = resp["result"]["data"].as_str().expect("base64 data");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .expect("valid base64 buffer");
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn create_test_repo() -> PathBuf {
@@ -537,7 +588,7 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
         "create should succeed even if script runs"
     );
 
-    let _workspace_id = create_resp["result"]["workspace"]["id"]
+    let workspace_id = create_resp["result"]["workspace"]["id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -578,6 +629,22 @@ touch "${{WORKTREE_PATH}}/.setup-ran-{}"
         "SOURCE_BRANCH should be set"
     );
 
+    // The setup terminal is named "Setup Script" in terminal.list, and its
+    // scrollback ends with the completion summary (elapsed time + exit code)
+    // even for a late-attaching client reading via terminal.getBuffer.
+    let setup_terminal = await_setup_terminal(&mut wss, 100, &workspace_id).await;
+    assert_eq!(setup_terminal["name"], json!("Setup Script"));
+    let terminal_id = setup_terminal["id"].as_str().expect("terminal id");
+    let buffer = terminal_buffer(&mut wss, 300, terminal_id).await;
+    assert!(
+        buffer.contains("Setup script completed in "),
+        "buffer should contain completion summary: {buffer:?}"
+    );
+    assert!(
+        buffer.contains("(exit code 0)"),
+        "buffer should report exit code 0: {buffer:?}"
+    );
+
     // Test that a failing script doesn't fail workspace.create
     let failing_script = r#"#!/bin/sh
 exit 1
@@ -600,6 +667,24 @@ exit 1
     assert!(
         create_resp2["result"]["workspace"]["id"].is_string(),
         "create should succeed even when setup script fails"
+    );
+
+    // The failing script's terminal reports the failure summary with its
+    // preserved (non-zero) exit code in the scrollback.
+    let workspace_id2 = create_resp2["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let failed_terminal = await_setup_terminal(&mut wss, 400, &workspace_id2).await;
+    let failed_terminal_id = failed_terminal["id"].as_str().expect("terminal id");
+    let failed_buffer = terminal_buffer(&mut wss, 600, failed_terminal_id).await;
+    assert!(
+        failed_buffer.contains("Setup script failed in "),
+        "buffer should contain failure summary: {failed_buffer:?}"
+    );
+    assert!(
+        failed_buffer.contains("(exit code 1)"),
+        "buffer should report exit code 1: {failed_buffer:?}"
     );
 
     // Test that skipWorktree workspace does not execute the script

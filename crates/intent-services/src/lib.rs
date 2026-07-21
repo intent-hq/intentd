@@ -7187,11 +7187,19 @@ impl WorkspaceApi for Services {
                                 );
                                 return;
                             }
-                            // Spawn via absolute /bin/sh (matching codebase fallback pattern)
+                            // Spawn via absolute /bin/sh (matching codebase fallback pattern),
+                            // through the timing wrapper so the scrollback ends with a
+                            // completion summary and the script's exit code is preserved.
                             let mut spec =
                                 intent_pty::SpawnSpec::new(workspace_id.as_str(), "/bin/sh");
-                            spec.args = vec![script_path.to_string_lossy().to_string()];
+                            spec.args = vec![
+                                "-c".to_string(),
+                                SETUP_SCRIPT_WRAPPER.to_string(),
+                                "sh".to_string(),
+                                script_path.to_string_lossy().to_string(),
+                            ];
                             spec.size = intent_pty::PtySize { rows: 24, cols: 80 };
+                            spec.name = Some(SETUP_TERMINAL_NAME.to_string());
                             spec.cwd = Some(worktree_for_read.clone());
                             spec.env = vec![
                                 ("MAIN_CHECKOUT".to_string(), repo_path),
@@ -16397,6 +16405,18 @@ fn parse_npx_version_ok(version_str: &str) -> bool {
         .and_then(|major| major.parse::<u32>().ok())
         .is_some_and(|maj| maj >= 7)
 }
+
+/// Display name of the workspace setup script terminal (`SpawnSpec::name`,
+/// surfaced through `terminal.list`).
+pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
+
+/// POSIX-sh timing wrapper the setup script terminal runs via `/bin/sh -c`
+/// (`$1` is the script path): records the start epoch, runs the script through
+/// `/bin/sh`, appends a blank line plus a completion summary with elapsed
+/// seconds and the script's exit code — landing in the PTY scrollback so
+/// late-attaching clients see it via `terminal.getBuffer` — and exits with the
+/// script's own code.
+pub(crate) const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
 
 /// Write `contents` to a fresh file created with mode `0600` on unix (plain
 /// write elsewhere), so the script file is never exposed with world-readable
