@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -132,13 +134,22 @@ fn workspace_row(id: &WorkspaceId, worktree: &Path, branch: &str) -> Workspace {
 }
 
 async fn connect_retry(socket: &Path) -> UnixStream {
-    for _ in 0..3000 {
-        if let Ok(s) = UnixStream::connect(socket).await {
-            return s;
+    let budget = common::daemon_startup_timeout();
+    tokio::time::timeout(budget, async {
+        loop {
+            if let Ok(s) = UnixStream::connect(socket).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("could not connect to {}", socket.display());
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "daemon startup timed out: no connection to {} within {budget:?}",
+            socket.display()
+        )
+    })
 }
 
 async fn send(w: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
