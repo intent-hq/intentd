@@ -1935,9 +1935,9 @@ impl AgentManager {
         self.interrupt_inner(agent_id, false).await
     }
 
-    /// Body of [`AgentManager::interrupt`] with one extra knob:
+    /// Shared body of [`AgentManager::interrupt`] with one extra knob:
     /// `suppress_idle_emit` skips the STAB-28 synthetic `agent:idle`
-    /// (reason: `interrupted`) emit. Used ONLY by
+    /// (reason: `interrupted`) emit. The only caller passing `true` is
     /// [`AgentManager::interrupt_send_message`] — an interrupt that carries a
     /// follow-up message is a preemption, not a settlement: the child is about
     /// to run the interrupt turn, so waking completion watches here would
@@ -2028,24 +2028,24 @@ impl AgentManager {
                 )
                 .await;
             // STAB-28: emit agent:idle after interrupt so completion watches fire.
-            // The aborted worker never reaches the worker-loop's idle-emit path
-            // (line ~2648), so we must emit here. Without this, a parent that
-            // re-messages via agent.send after the child settles registers a
-            // completion watch that never fires (no idle event → watch never
-            // delivered). Only emit when the agent has no queued ready-to-send
-            // messages (settlement coalescing: mirrors the worker-loop check)
-            // AND the interrupt is not part of interrupt-with-message
-            // (`suppress_idle_emit` — the follow-up content has not been queued
-            // yet at this point, so the ready-to-send check alone cannot see
-            // the imminent interrupt turn).
+            // The aborted worker never reaches the settlement idle-emit in
+            // `run_prompt_turn` (agent_session.rs), so we must emit here.
+            // Without this, a parent that re-messages via agent.send after the
+            // child settles registers a completion watch that never fires (no
+            // idle event → watch never delivered). Only emit when the agent has
+            // no queued ready-to-send messages (settlement coalescing: mirrors
+            // the `run_prompt_turn` check) AND the interrupt is not part of
+            // interrupt-with-message (`suppress_idle_emit` — the follow-up
+            // content has not been queued yet at this point, so the
+            // ready-to-send check alone cannot see the imminent interrupt turn).
             if !suppress_idle_emit && !self.services.has_ready_to_send(agent_id) {
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "interrupted",
                     "status": "idle",
                 });
-                // Enrich with agentName + completion report (reuse session loaded at
-                // line 1466; avoids duplicate I/O).
+                // Enrich with agentName + completion report (reuse the session
+                // loaded earlier in this method; avoids duplicate I/O).
                 if let Some(ref session) = session {
                     data["agentName"] = json!(session.name);
                     if let Some(ref report) = session.completion_report {
