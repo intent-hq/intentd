@@ -26,10 +26,17 @@ if [[ ! -f "$MANIFEST" ]]; then
 fi
 
 channel_tag="channel-$CHANNEL"
+# Pin the channel tag to a deterministic commit in CI (GITHUB_SHA); locally gh
+# falls back to the default branch HEAD. The tag itself is never consumed.
+target_args=()
+if [[ -n "${GITHUB_SHA:-}" ]]; then
+  target_args=(--target "$GITHUB_SHA")
+fi
 if ! gh release view "$channel_tag" --repo "$REPO" >/dev/null 2>&1; then
   if ! gh release create "$channel_tag" \
     --repo "$REPO" \
     --latest=false \
+    "${target_args[@]}" \
     --title "Channel manifest: $CHANNEL" \
     --notes "Machine-readable pointer to the latest $CHANNEL intentd release. Do not consume the tag itself; download the $CHANNEL.json asset."
   then

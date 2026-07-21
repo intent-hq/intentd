@@ -23,11 +23,16 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    # Serialize beta.json updates so two tags pushed close together cannot
+    # interleave and leave the manifest pointing at the older release.
+    concurrency:
+      group: intentd-beta-manifest-publish
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ inputs.plan }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Determine tag

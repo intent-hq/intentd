@@ -32,7 +32,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - name: Validate version format
@@ -43,14 +43,19 @@ jobs:
             exit 1
           fi
           echo "Version $VERSION is valid"
-      - name: Verify release exists
+      - name: Verify release exists and is a published non-prerelease
         shell: bash
         run: |
-          if ! gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if ! flags=$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv'); then
             echo "::error::Release v${VERSION} does not exist on $GITHUB_REPOSITORY"
             exit 1
           fi
-          echo "Release v${VERSION} exists"
+          if [[ "$flags" != "false"$'\t'"false" ]]; then
+            echo "::error::Release v${VERSION} is a draft or marked prerelease; only published stable releases can be promoted"
+            exit 1
+          fi
+          echo "Release v${VERSION} exists and is a published non-prerelease"
       - name: Build stable manifest
         shell: bash
         run: |
