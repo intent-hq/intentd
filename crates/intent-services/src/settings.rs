@@ -8,7 +8,7 @@
 //! `workspace.changeHistory` / `permissions.rules`) persist in the `settings`
 //! table (`intent-store`). Sensitive values (`mcp.servers`,
 //! `server.auth.token`, `sourceControl.github.token`, `linear.token`,
-//! `accounts.sentry.token`, `ai.apiToken`) live in the file-backed secrets
+//! `accounts.sentry.token`) live in the file-backed secrets
 //! store (`~/intent/secrets.json`, via [`intent_core::FileSecretStore`])
 //! behind the [`SecretStore`] seam and are **never** returned in plaintext
 //! over the wire — list/get redact them to presence/placeholder only, and
@@ -1029,51 +1029,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "accounts",
             None,
         ),
-        // --- Group A: primary AI provider config ------------------------------
-        // Ports the FE `workspace-config` `config.ai.*` blob so the daemon owns
-        // the provider knobs the FE previously stored in electron-store.
-        // `ai.apiToken` is a **secret**; the rest are plain settings.
-        secret(
-            "ai.apiToken",
-            "AI provider API token",
-            "Bearer token used by the primary AI provider",
-            "ai",
-        ),
-        string(
-            "ai.apiUrl",
-            "AI provider API URL",
-            "Base URL for the primary AI provider",
-            "ai",
-            None,
-        ),
-        string("ai.model", "AI model", "Default AI model", "ai", None),
-        number(
-            "ai.temperature",
-            "AI temperature",
-            "Sampling temperature for the primary AI provider",
-            "ai",
-            Some(0.0),
-            Some(2.0),
-            0.7,
-        ),
-        number(
-            "ai.maxTokens",
-            "AI max tokens",
-            "Maximum tokens per completion for the primary AI provider",
-            "ai",
-            Some(1.0),
-            None,
-            4096.0,
-        ),
-        number(
-            "ai.streamingSpeed",
-            "AI streaming speed",
-            "Streaming pacing hint (tokens per second; 0 = no throttle)",
-            "ai",
-            Some(0.0),
-            None,
-            0.0,
-        ),
         // --- Group A: persisted permission rules ------------------------------
         // Port of the FE `ConfigManager` `config.permissions.rules` bag: an array
         // of command allow/deny/ask entries with optional expiries. Structure is
@@ -1621,14 +1576,13 @@ mod tests {
         assert!(def.default_value.is_none());
     }
 
-    /// `accounts.sentry.token` and `ai.apiToken` — the two secret catalog gaps
-    /// closed for R0-4 — must be sensitive so `settings.update` persists them to
-    /// the shared secrets store under account = setting path (never the DB) and
-    /// every wire read (`settings.list` / `settings.get`) redacts them to a
-    /// placeholder or `null` when unset.
+    /// `accounts.sentry.token` must be sensitive so `settings.update` persists
+    /// it to the shared secrets store under account = setting path (never the
+    /// DB) and every wire read (`settings.list` / `settings.get`) redacts it to
+    /// a placeholder or `null` when unset.
     #[test]
     fn new_secret_catalog_entries_are_sensitive() {
-        for path in ["accounts.sentry.token", "ai.apiToken"] {
+        for path in ["accounts.sentry.token"] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert_eq!(def.path, path);
             assert!(def.sensitive, "{path} must be a sensitive catalog entry");
@@ -1669,47 +1623,24 @@ mod tests {
         assert!(def.default_value.is_none());
     }
 
-    /// The non-secret half of the `ai.*` group (URL / model / temperature /
-    /// maxTokens / streamingSpeed) ports the FE `workspace-config` `config.ai.*`
-    /// blob one-to-one; `temperature` carries the documented 0..=2 clamp and
-    /// `maxTokens` / `streamingSpeed` refuse negative values.
+    /// The `ai.*` group is retired: no catalog entry may remain for any of its
+    /// keys (the app drives AI via ACP agent providers, not a direct provider).
     #[test]
-    fn ai_non_secret_group_matches_fe_shape() {
-        for (path, default_present) in [
-            ("ai.apiUrl", false),
-            ("ai.model", false),
-            ("ai.temperature", true),
-            ("ai.maxTokens", true),
-            ("ai.streamingSpeed", true),
+    fn ai_group_is_gone_from_the_catalog() {
+        for path in [
+            "ai.apiToken",
+            "ai.apiUrl",
+            "ai.model",
+            "ai.temperature",
+            "ai.maxTokens",
+            "ai.streamingSpeed",
         ] {
-            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
-            assert!(!def.sensitive, "{path} is non-secret");
-            assert_eq!(def.category, "ai");
-            assert_eq!(
-                def.default_value.is_some(),
-                default_present,
-                "{path} default presence"
-            );
-        }
-        let temp = find_definition("ai.temperature").unwrap();
-        assert!(matches!(
-            temp.ty,
-            SettingType::Number {
-                min: Some(0.0),
-                max: Some(2.0),
-            }
-        ));
-        for path in ["ai.maxTokens", "ai.streamingSpeed"] {
-            let def = find_definition(path).unwrap();
-            let min = match def.ty {
-                SettingType::Number { min, .. } => min,
-                _ => panic!("{path} must be a Number"),
-            };
             assert!(
-                min.map(|m| m >= 0.0).unwrap_or(false),
-                "{path} must reject negative values"
+                find_definition(path).is_none(),
+                "{path} must not be in the catalog"
             );
         }
+        assert!(definitions().iter().all(|d| d.category != "ai"));
     }
 
     /// The non-secret gap entries live in the catalog as opaque `Object`
@@ -2103,6 +2034,64 @@ mod tests {
         );
         let text = std::fs::read_to_string(&config_path).expect("read config");
         assert!(!text.contains("workspaceOverrides"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// The retired `[ai]` table has no catalog entry at all: a config.toml
+    /// still carrying it boots (tolerated), the values are DISCARDED (never
+    /// imported into SQLite), and the whole table is stripped from the file
+    /// with comments and sibling keys preserved.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_and_strips_ai_table() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyai-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyai-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[git]\nautoCommit = false\n\n[ai]\napiUrl = \"https://api.example\"\nmodel = \"m1\"\ntemperature = 0.5\nmaxTokens = 2048\nstreamingSpeed = 10.0\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy [ai] must load");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        assert_eq!(stripped, vec!["ai".to_string()]);
+
+        // Nothing landed in SQLite — the whole group is discarded.
+        for path in [
+            "ai",
+            "ai.apiUrl",
+            "ai.model",
+            "ai.temperature",
+            "ai.maxTokens",
+            "ai.streamingSpeed",
+        ] {
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "{path} must not be imported"
+            );
+        }
+        // File stripped; comment + sibling table preserved.
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("[ai]"), "{text}");
+        assert!(!text.contains("apiUrl"), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+        assert!(text.contains("autoCommit = false"), "{text}");
+
+        // Second boot: clean load, import is a no-op.
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

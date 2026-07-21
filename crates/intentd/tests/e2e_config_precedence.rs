@@ -209,18 +209,19 @@ async fn listen_flag_pins_listen_mode() {
 }
 
 /// One-time legacy import: a config.toml carrying the retired
-/// `model.workspaceOverrides` key must NOT refuse startup — the daemon
-/// boots, imports the value into the SQLite settings blob (readable over
-/// the wire with no `origin` field), and strips the key from the file with
-/// a comment-preserving rewrite. A second boot then reads the clean file
-/// and the imported value survives.
+/// `model.workspaceOverrides` key and the retired `[ai]` table must NOT
+/// refuse startup — the daemon boots, imports `model.workspaceOverrides`
+/// into the SQLite settings blob (readable over the wire with no `origin`
+/// field), DISCARDS the `[ai]` values (no catalog entry remains), and strips
+/// both from the file with a comment-preserving rewrite. A second boot then
+/// reads the clean file and the imported value survives.
 #[tokio::test]
 async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
     let data_dir = temp_data_dir();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "# my config\n\n[model]\n# my default\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\" }\n\n[git]\nautoCommit = false\n",
+        "# my config\n\n[model]\n# my default\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\" }\n\n[git]\nautoCommit = false\n\n[ai]\napiUrl = \"https://api.example\"\nmodel = \"legacy-model\"\ntemperature = 0.5\n",
     )
     .expect("seed config.toml");
 
@@ -250,9 +251,19 @@ async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
             "state blob must carry no origin: {get}"
         );
 
+        // The retired [ai] table is discarded: no catalog entry, so the wire
+        // rejects the path as unknown rather than serving the file value.
+        let ai = uds_rpc(&socket, 2, "settings.get", json!({ "path": "ai.apiUrl" })).await;
+        assert!(
+            ai.get("error").is_some(),
+            "ai.apiUrl must be unknown after removal: {ai}"
+        );
+
         // The file was stripped with comments + sibling keys preserved.
         let text = std::fs::read_to_string(&config_path).expect("read config");
         assert!(!text.contains("workspaceOverrides"), "stripped: {text}");
+        assert!(!text.contains("[ai]"), "ai table stripped: {text}");
+        assert!(!text.contains("apiUrl"), "ai keys stripped: {text}");
         assert!(text.contains("# my config"), "comment preserved: {text}");
         assert!(text.contains("# my default"), "comment preserved: {text}");
         assert!(text.contains("default = \"m0\""), "{text}");

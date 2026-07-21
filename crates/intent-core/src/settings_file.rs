@@ -11,7 +11,7 @@
 //!
 //! Deliberately excluded from this schema:
 //! - **Secrets** (`mcp.servers`, `server.auth.token`, `sourceControl.github.
-//!   token`, `linear.token`, `accounts.sentry.token`, `ai.apiToken`) — they
+//!   token`, `linear.token`, `accounts.sentry.token`) — they
 //!   live in `secrets.json` ([`crate::FileSecretStore`]) and must never
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
@@ -54,7 +54,6 @@ pub struct SettingsFile {
     pub server: ServerSettings,
     pub source_control: SourceControlSettings,
     pub accounts: AccountsSettings,
-    pub ai: AiSettings,
     pub context: ContextSettings,
     pub storage: StorageSettings,
     pub workspaces: WorkspacesSettings,
@@ -351,38 +350,6 @@ pub struct SentrySettings {
     pub organization: Option<String>,
 }
 
-/// `[ai]` — primary AI provider config (`ai.*`). The bearer token
-/// (`ai.apiToken`) is a secret and lives in `secrets.json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct AiSettings {
-    /// `ai.apiUrl` — base URL for the primary AI provider.
-    pub api_url: Option<String>,
-    /// `ai.model` — default AI model.
-    pub model: Option<String>,
-    /// `ai.temperature` — sampling temperature (0–2).
-    #[serde(deserialize_with = "de_lenient_f64")]
-    pub temperature: f64,
-    /// `ai.maxTokens` — maximum tokens per completion (>= 1).
-    pub max_tokens: u32,
-    /// `ai.streamingSpeed` — streaming pacing hint (tokens per second;
-    /// 0 = no throttle).
-    #[serde(deserialize_with = "de_lenient_f64")]
-    pub streaming_speed: f64,
-}
-
-impl Default for AiSettings {
-    fn default() -> Self {
-        Self {
-            api_url: None,
-            model: None,
-            temperature: 0.7,
-            max_tokens: 4096,
-            streaming_speed: 0.0,
-        }
-    }
-}
-
 /// `[context]` — context engine (`context.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -510,8 +477,9 @@ where
 /// [`SettingsFile::parse_str_with_legacy`] — the value is captured so the
 /// composition root can run a one-time import-into-SQLite (or discard, for
 /// keys with no catalog entry) + strip-from-file at boot. Any other unknown
-/// key remains a hard parse error.
-pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides"];
+/// key remains a hard parse error. `ai` covers the whole retired `[ai]`
+/// table (the app drives AI via ACP agent providers, not a direct provider).
+pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides", "ai"];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
@@ -605,23 +573,6 @@ impl SettingsFile {
                     "must be between 1024 and 65535, got {}",
                     self.server.ws_api.port
                 ),
-            ));
-        }
-        let t = self.ai.temperature;
-        if !(0.0..=2.0).contains(&t) {
-            return Err(bad(
-                "ai.temperature",
-                format!("must be between 0 and 2, got {t}"),
-            ));
-        }
-        if self.ai.max_tokens < 1 {
-            return Err(bad("ai.maxTokens", "must be at least 1".to_string()));
-        }
-        let s = self.ai.streaming_speed;
-        if !s.is_finite() || s < 0.0 {
-            return Err(bad(
-                "ai.streamingSpeed",
-                format!("must be a non-negative number, got {s}"),
             ));
         }
         if self.agents.max_concurrent > 200 {
@@ -815,19 +766,6 @@ apiBaseUrl = "https://api.github.com"
 # accounts.sentry.token secret).
 # organization = "my-org"
 
-[ai]
-# AI provider API URL -- base URL for the primary AI provider.
-# apiUrl = "https://api.example.com"
-# AI model -- default AI model.
-# model = "claude-sonnet-4-5"
-# AI temperature -- sampling temperature for the primary AI provider (0-2).
-temperature = 0.7
-# AI max tokens -- maximum tokens per completion for the primary AI provider.
-maxTokens = 4096
-# AI streaming speed -- streaming pacing hint (tokens per second; 0 = no
-# throttle).
-streamingSpeed = 0.0
-
 [context]
 # Context engine -- enable the auggie context engine.
 enabled = true
@@ -922,9 +860,6 @@ mod tests {
             "https://api.github.com"
         );
         assert_eq!(d.accounts.sentry.organization, None);
-        assert_eq!(d.ai.temperature, 0.7);
-        assert_eq!(d.ai.max_tokens, 4096);
-        assert_eq!(d.ai.streaming_speed, 0.0);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);
         assert_eq!(d.logging.level, LogLevel::Info);
@@ -999,9 +934,6 @@ mod tests {
             ("[notifications]\nvolume = 1.5\n", "notifications.volume"),
             ("[server]\nport = 80\n", "server.port"),
             ("[server.wsApi]\nport = 80\n", "server.wsApi.port"),
-            ("[ai]\ntemperature = 3.0\n", "ai.temperature"),
-            ("[ai]\nmaxTokens = 0\n", "ai.maxTokens"),
-            ("[ai]\nstreamingSpeed = -1.0\n", "ai.streamingSpeed"),
             ("[agents]\nmaxConcurrent = 500\n", "agents.maxConcurrent"),
         ] {
             let err = SettingsFile::parse_str(body).unwrap_err();
@@ -1014,11 +946,8 @@ mod tests {
 
     #[test]
     fn floats_accept_integer_literals() {
-        let parsed =
-            SettingsFile::parse_str("[notifications]\nvolume = 1\n\n[ai]\ntemperature = 2\n")
-                .unwrap();
+        let parsed = SettingsFile::parse_str("[notifications]\nvolume = 1\n").unwrap();
         assert_eq!(parsed.notifications.volume, 1.0);
-        assert_eq!(parsed.ai.temperature, 2.0);
     }
 
     #[test]
@@ -1102,6 +1031,30 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("workspaceOverrides"), "{err}");
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("workspaceOverrides"));
+    }
+
+    #[test]
+    fn ai_is_no_longer_a_schema_key() {
+        // Strict parse rejects the retired [ai] table like any unknown key.
+        let err = SettingsFile::parse_str("[ai]\nmodel = \"m1\"\n").unwrap_err();
+        assert!(err.to_string().contains("ai"), "{err}");
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("[ai]"));
+    }
+
+    #[test]
+    fn legacy_parse_captures_and_tolerates_ai_table() {
+        let text = "[ai]\napiUrl = \"https://api.example\"\nmodel = \"m1\"\ntemperature = 0.5\n\n[git]\nautoCommit = false\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert!(!file.git.auto_commit);
+        assert_eq!(
+            legacy.get("ai"),
+            Some(&serde_json::json!({
+                "apiUrl": "https://api.example",
+                "model": "m1",
+                "temperature": 0.5
+            }))
+        );
+        assert_eq!(legacy.len(), 1);
     }
 
     #[test]
