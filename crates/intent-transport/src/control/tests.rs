@@ -28,6 +28,8 @@ impl FakeControl {
                 max_agents: 20,
                 version: "0.1.0".to_string(),
                 uptime_seconds: 123,
+                cpu_percent: 12.5,
+                memory_bytes: 104_857_600,
             },
             shutdown_called: AtomicBool::new(false),
         }
@@ -69,6 +71,8 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["maxAgents"], 20);
     assert_eq!(local["version"], "0.1.0");
     assert_eq!(local["uptimeSeconds"], 123);
+    assert_eq!(local["cpuPercent"], 12.5);
+    assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
     assert_eq!(local["protocolVersion"], "2.0");
     assert_eq!(local["host"]["os"], "macos");
@@ -96,6 +100,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
         max_agents: 8,
         version: "0.1.0".to_string(),
         uptime_seconds: 456,
+        cpu_percent: 0.0,
+        memory_bytes: 0,
     };
     let v = status_json(&status, true);
     assert_eq!(v["transports"], json!(["uds"]));

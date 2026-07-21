@@ -704,6 +704,13 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     assert!(r["maxAgents"].as_u64().unwrap() > 0, "maxAgents > 0: {r}");
     assert!(r["version"].is_string(), "version is string: {r}");
     assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {r}");
+    // Process resource sample: cpuPercent may be 0 right after start (sysinfo
+    // needs two refreshes), but memoryBytes must be live for a running daemon.
+    assert!(r["cpuPercent"].is_number(), "cpuPercent is number: {r}");
+    assert!(
+        r["memoryBytes"].as_u64().unwrap() > 0,
+        "memoryBytes > 0: {r}"
+    );
 }
 
 #[tokio::test]

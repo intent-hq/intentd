@@ -108,6 +108,13 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     );
     assert!(r["version"].is_string(), "version is string: {resp}");
     assert!(r["uptimeSeconds"].is_u64(), "uptimeSeconds is u64: {resp}");
+    // Process resource sample: cpuPercent may be 0 right after start (sysinfo
+    // needs two refreshes), but memoryBytes must be live for a running daemon.
+    assert!(r["cpuPercent"].is_number(), "cpuPercent is number: {resp}");
+    assert!(
+        r["memoryBytes"].as_u64().unwrap() > 0,
+        "memoryBytes > 0: {resp}"
+    );
 
     // host.status is the §5.14 capability probe, answered on the same UDS
     // connection with the resolved locality (UDS ⇒ local) and host fields.
