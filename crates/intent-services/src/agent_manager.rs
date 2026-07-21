@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::agent_ops::{new_message_id, user_message_blocks};
+use crate::agent_ops::{new_message_id, user_message_blocks, MAX_MESSAGE_ID_LEN};
 use crate::agent_session::agent_actor;
 use crate::events::EventBus;
 use crate::Services;
@@ -2112,10 +2112,13 @@ impl AgentManager {
 
     /// `agent.sendMessage` runtime path (§5.5/§6.8): when a turn is already in
     /// flight, enqueue (the worker flips it to in-flight when the current turn
-    /// ends); otherwise persist the user message and spawn a background worker
-    /// that lazily spawns the child on first turn, drives the ACP turn through
-    /// [`AgentManager::run_turn`], and drains the queue. Returns the TS-shaped
-    /// `{ success, queued, messageId | queuedMessage }`.
+    /// ends); otherwise persist the user message (under the client-supplied
+    /// `messageId` when given, else a minted `user-msg-{uuid}`), publish
+    /// `agent:message` (role=user) with the persisted row id, and spawn a
+    /// background worker that lazily spawns the child on first turn, drives
+    /// the ACP turn through [`AgentManager::run_turn`], and drains the queue.
+    /// Returns the TS-shaped `{ success, queued, messageId | queuedMessage }`
+    /// where `messageId` IS the persisted row id.
     pub async fn send_message(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -2140,6 +2143,16 @@ impl AgentManager {
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(result);
         }
+        // Validate the caller-supplied id length BEFORE persisting under it
+        // (mirrors `agent_send_message_op` — the row id is now the client id).
+        if let Some(ref id) = message_id {
+            if id.len() > MAX_MESSAGE_ID_LEN {
+                self.end_turn(&agent_id).await;
+                return Err(Error::InvalidParams(format!(
+                    "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN} bytes"
+                )));
+            }
+        }
         let message_id = message_id.unwrap_or_else(new_message_id);
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
@@ -2148,42 +2161,63 @@ impl AgentManager {
             options.image_blocks.as_ref(),
             options.file_blocks.as_ref(),
         );
-        if self
+        // Persist the row UNDER the resolved `message_id` so the RPC result's
+        // `messageId` and the `agent:message` event both name the actual
+        // transcript row (PROTOCOL §5.5 — previously the store minted its own
+        // UUIDv7 id and the result id named nothing).
+        let message = match self
             .services
             .store
-            .append_agent_message_with_metadata(
+            .append_agent_message_with_id(
                 &agent_id,
+                &message_id,
                 "user",
                 &blocks,
                 options.message_metadata.as_ref(),
                 &now_iso(),
             )
             .await
-            .is_err()
         {
-            // Store write failed (e.g. session not yet persisted) → auto-queue,
-            // matching the `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
-            // the slot we just released will be reclaimed below if the queue is
-            // ready and the agent is otherwise free.
-            self.end_turn(&agent_id).await;
-            let (queued, position) = self.services.enqueue_message(
+            Ok(message) => message,
+            Err(_) => {
+                // Store write failed (e.g. session not yet persisted) → auto-queue,
+                // matching the `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
+                // the slot we just released will be reclaimed below if the queue is
+                // ready and the agent is otherwise free.
+                self.end_turn(&agent_id).await;
+                let (queued, position) = self.services.enqueue_message(
+                    &agent_id,
+                    content,
+                    options.image_blocks.clone(),
+                    options.file_blocks.clone(),
+                    options.message_metadata.clone(),
+                );
+                let result = json!({
+                    "success": true,
+                    "queued": true,
+                    "queuedMessage": queued.to_value(position),
+                });
+                self.services.publish_queue_updated(&agent_id).await;
+                self.clone().try_drain_queue(agent_id, workspace_id).await;
+                return Ok(result);
+            }
+        };
+        // Emit `agent:message` (role=user) with the persisted row id — the
+        // direct-send branch previously emitted nothing, so an
+        // `agent.editAndRegenerate` regenerated user message never reached
+        // clients until a full reload (PROTOCOL §5.5 step 6: "the usual
+        // agent:message / agent:stream:* events follow"). Mirrors the
+        // queue-drain (`persist_user`) and wake-delivery emits.
+        self.services
+            .publish_agent_mutation_event(
+                &workspace_id,
                 &agent_id,
-                content,
-                options.image_blocks.clone(),
-                options.file_blocks.clone(),
-                options.message_metadata.clone(),
-            );
-            let result = json!({
-                "success": true,
-                "queued": true,
-                "queuedMessage": queued.to_value(position),
-            });
-            self.services.publish_queue_updated(&agent_id).await;
-            self.clone().try_drain_queue(agent_id, workspace_id).await;
-            return Ok(result);
-        }
+                intent_core::events::AGENT_MESSAGE,
+                json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+            )
+            .await;
         self.spawn_worker(agent_id, workspace_id, content, options);
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
     /// Self-drain entrypoint (PROTOCOL §5.5). Invoked from `agent.queueMessage`

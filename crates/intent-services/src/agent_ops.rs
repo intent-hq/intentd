@@ -24,7 +24,7 @@ const DEFAULT_STALE_RESPONDING_AFTER_MS: i64 = 10 * 60 * 1000;
 
 /// Maximum length for caller-supplied message IDs to prevent unbounded storage
 /// and DoS via oversized persisted IDs.
-const MAX_MESSAGE_ID_LEN: usize = 256;
+pub(crate) const MAX_MESSAGE_ID_LEN: usize = 256;
 
 use crate::agent_subscriptions::CompletionWatch;
 
