@@ -261,37 +261,45 @@ async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>) -> anyhow::Result<()> 
 
     if let Some(path) = png {
         let img = code.render::<image::Luma<u8>>().build();
-        // Always encode PNG regardless of the path's extension: `save()` would
-        // infer the format from the extension and fail confusingly otherwise.
-        img.save_with_format(path, image::ImageFormat::Png)
+        // Always encode PNG regardless of the path's extension: extension-based
+        // format inference would fail confusingly otherwise.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| anyhow::anyhow!("cannot encode PNG: {e}"))?;
+        write_secret_file(path, &buf.into_inner())
             .map_err(|e| anyhow::anyhow!("cannot write PNG to {}: {e}", path.display()))?;
-        restrict_permissions(path)?;
         eprintln!("wrote {}", path.display());
     }
     if let Some(path) = svg {
         let doc = code.render::<qrcode::render::svg::Color>().build();
-        std::fs::write(path, doc)
+        write_secret_file(path, doc.as_bytes())
             .map_err(|e| anyhow::anyhow!("cannot write SVG to {}: {e}", path.display()))?;
-        restrict_permissions(path)?;
         eprintln!("wrote {}", path.display());
     }
     Ok(())
 }
 
-/// Restrict an exported pairing image to owner read/write (0600): the QR code
-/// embeds the bearer token, so it deserves the same treatment as the secrets
-/// file. No-op outside Unix.
-fn restrict_permissions(path: &Path) -> anyhow::Result<()> {
+/// Write an exported pairing image with owner-only (0600) permissions: the QR
+/// code embeds the bearer token, so it deserves the same treatment as the
+/// secrets file. The file is created/truncated with restrictive permissions
+/// BEFORE the sensitive bytes are written — never exposed under the umask.
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // If the file pre-existed, `mode` above does not apply; enforce it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            anyhow::anyhow!("cannot restrict permissions on {}: {e}", path.display())
-        })?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    file.write_all(bytes)
 }
 
 /// Migrate a legacy Intent `userData` dir into intentd's SQLite store (§9.7).

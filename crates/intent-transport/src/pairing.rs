@@ -23,14 +23,37 @@ pub const PAIRING_PAYLOAD_VERSION: u32 = 1;
 /// Build the pairing payload URI:
 /// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>`.
 ///
-/// All values are URI-safe by construction — hosts are dotted-quad IPv4
-/// literals, the fingerprint is colon-separated hex, and the token is 64-char
-/// lowercase hex — so no percent-encoding is required.
+/// Query values are percent-encoded defensively. Generated values (dotted-quad
+/// IPv4 hosts, colon-separated hex fingerprints, 64-char hex tokens) pass
+/// through unchanged, but a token injected via `INTENTD_AUTH_TOKEN` may contain
+/// reserved characters (`&`, `=`, `%`, …) that would otherwise make the query
+/// string ambiguous.
 pub fn build_pairing_uri(hosts: &[String], port: u16, fingerprint: &str, token: &str) -> String {
+    let hosts = hosts
+        .iter()
+        .map(|h| encode_query_value(h))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "intent://pair?v={PAIRING_PAYLOAD_VERSION}&host={}&port={port}&fp={fingerprint}&token={token}",
-        hosts.join(",")
+        "intent://pair?v={PAIRING_PAYLOAD_VERSION}&host={hosts}&port={port}&fp={}&token={}",
+        encode_query_value(fingerprint),
+        encode_query_value(token)
     )
+}
+
+/// Percent-encode a query value, passing through unreserved characters
+/// (RFC 3986) plus `:` (valid in query strings; keeps fingerprints readable).
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// A classified `pairing.getInfo` request awaiting handling by the connection task.

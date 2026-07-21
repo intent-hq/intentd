@@ -94,6 +94,18 @@ fn build_uri_single_host() {
 }
 
 #[test]
+fn build_uri_percent_encodes_reserved_characters() {
+    // Generated values pass through unchanged (hex, colons, dots), but an
+    // env-injected token with reserved characters must not break the query.
+    let hosts = vec!["192.168.1.10".to_string()];
+    let uri = build_pairing_uri(&hosts, 443, "AA:BB", "a&b=c%d");
+    assert_eq!(
+        uri,
+        "intent://pair?v=1&host=192.168.1.10&port=443&fp=AA:BB&token=a%26b%3Dc%25d"
+    );
+}
+
+#[test]
 fn classify_get_info() {
     let req = json!({"jsonrpc": "2.0", "method": "pairing.getInfo", "id": 7});
     let r = classify(&req).unwrap();
