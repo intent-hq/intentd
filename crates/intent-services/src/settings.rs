@@ -1208,6 +1208,21 @@ pub async fn import_legacy_settings(
             tracing::warn!(path, error = %e, "legacy config.toml value is invalid; discarding");
             continue;
         }
+        // `SettingType::Object` tolerates arrays and arbitrary member types;
+        // the workspace-overrides consumer (`resolve_default_model_from_settings`)
+        // requires a workspaceId -> model-string map, so enforce that shape
+        // here rather than importing a blob that silently never applies.
+        if *path == "model.workspaceOverrides"
+            && !value
+                .as_object()
+                .is_some_and(|m| m.values().all(Value::is_string))
+        {
+            tracing::warn!(
+                path,
+                "legacy value is not an object of workspaceId -> model strings; discarding"
+            );
+            continue;
+        }
         let raw = serde_json::to_string(value)
             .map_err(|e| Error::Internal(format!("encode legacy setting {path} failed: {e}")))?;
         store.set_setting(path, &raw).await?;
@@ -2003,44 +2018,50 @@ mod tests {
         }
     }
 
-    /// A legacy value that fails catalog validation is discarded (never
-    /// imported) but still stripped so the daemon does not re-warn forever.
+    /// A legacy value that fails catalog validation — or the
+    /// workspaceId -> model-string shape the overrides consumer requires —
+    /// is discarded (never imported) but still stripped so the daemon does
+    /// not re-warn forever.
     #[tokio::test]
     async fn import_legacy_settings_discards_invalid_values() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacybad-{tag}.db"));
-        let store = Store::open(&tmp).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-settings-legacybad-{tag}.toml"));
-        // An object-typed catalog entry with a scalar value: invalid.
-        std::fs::write(
-            &config_path,
+        for body in [
+            // An object-typed catalog entry with a scalar value: invalid.
             "[model]\nworkspaceOverrides = \"not-an-object\"\n",
-        )
-        .expect("seed config");
-        let registry = SettingsRegistry::load(&config_path).expect("legacy key must load");
+            // Arrays pass SettingType::Object but not the map shape.
+            "[model]\nworkspaceOverrides = [\"m1\"]\n",
+            // Non-string member values are not model ids.
+            "[model]\nworkspaceOverrides = { ws1 = 42 }\n",
+        ] {
+            let tag = uuid::Uuid::new_v4();
+            let tmp = std::env::temp_dir().join(format!("intentd-settings-legacybad-{tag}.db"));
+            let store = Store::open(&tmp).await.expect("open store");
+            let config_path =
+                std::env::temp_dir().join(format!("intentd-settings-legacybad-{tag}.toml"));
+            std::fs::write(&config_path, body).expect("seed config");
+            let registry = SettingsRegistry::load(&config_path).expect("legacy key must load");
 
-        let stripped = import_legacy_settings(&registry, &store)
-            .await
-            .expect("import");
-        assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
-        assert_eq!(
-            store
-                .get_setting("model.workspaceOverrides")
+            let stripped = import_legacy_settings(&registry, &store)
                 .await
-                .expect("read settings table"),
-            None,
-            "invalid legacy value must be discarded, not imported"
-        );
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(!text.contains("workspaceOverrides"), "{text}");
+                .expect("import");
+            assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
+            assert_eq!(
+                store
+                    .get_setting("model.workspaceOverrides")
+                    .await
+                    .expect("read settings table"),
+                None,
+                "invalid legacy value must be discarded, not imported: {body}"
+            );
+            let text = std::fs::read_to_string(&config_path).expect("read config");
+            assert!(!text.contains("workspaceOverrides"), "{text}");
 
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
+            let _ = std::fs::remove_file(&config_path);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                    "{}{suffix}",
+                    tmp.display()
+                )));
+            }
         }
     }
 
