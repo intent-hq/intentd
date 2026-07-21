@@ -71,7 +71,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        // Hermetic token resolution: no env PAT / `gh` fallback noise.
+        // Reduce token-resolution noise: strip env PATs. The `gh` CLI
+        // fallback can still resolve on a developer machine, which is why the
+        // tests never assert on `isConfigured` — only on device-flow state
+        // and the daemon's own secrets file.
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .stdout(Stdio::null())
