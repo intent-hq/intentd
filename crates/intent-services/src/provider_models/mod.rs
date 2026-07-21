@@ -103,8 +103,10 @@ pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
 }
 
 /// claude-code: ACP probe via the pinned npx adapter. Models arrive in the
-/// `session/new` result (`models.availableModels`) or a `session/update`
-/// notification.
+/// `session/new` result — `configOptions[id="model"].options` on current
+/// adapters (≥ 0.60), `models.availableModels` on older ones — or a
+/// `session/update` notification. The adapter's real `default` row is
+/// returned as-is.
 pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
     let Some(npx) = find_npx() else {
         return ProviderModelsFetch::unavailable(
@@ -196,7 +198,8 @@ fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfil
 }
 
 /// pi: ACP probe via the pinned npx adapter. Models may arrive under
-/// `models.availableModels`, `availableModels`, or `models.available`.
+/// `models.availableModels`, `availableModels`, `models.available`, or
+/// `configOptions[id="model"].options`.
 pub async fn fetch_pi_models() -> ProviderModelsFetch {
     let Some(npx) = find_npx() else {
         return ProviderModelsFetch::unavailable(

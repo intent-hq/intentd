@@ -3,9 +3,11 @@
 
 use serde_json::json;
 
+use super::finish;
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
+use super::probe::ProbeError;
 
 #[test]
 fn parse_acp_models_from_session_new_result() {
@@ -94,6 +96,106 @@ fn parse_acp_models_empty_payloads_yield_no_rows() {
 }
 
 #[test]
+fn parse_acp_models_from_claude_code_config_options() {
+    // Canned from a live claude-agent-acp@0.60.0 session/new result
+    // (2026-07-21): models live in configOptions[id="model"].options; the
+    // sibling mode/effort/fast select options must be ignored, and values are
+    // preserved verbatim (including effort-suffixed ids like "opus[1m]").
+    let payload = json!({
+        "sessionId": "sess_1",
+        "modes": { "currentModeId": "acceptEdits", "availableModes": [] },
+        "configOptions": [
+            { "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+              "currentValue": "acceptEdits",
+              "options": [ { "value": "auto", "name": "Auto" },
+                           { "value": "acceptEdits", "name": "Accept Edits" } ] },
+            { "id": "model", "name": "Model", "description": "AI model to use",
+              "category": "model", "type": "select", "currentValue": "opus[1m]",
+              "options": [
+                { "value": "default", "name": "Default (recommended)",
+                  "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "opus[1m]", "name": "Opus",
+                  "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "claude-fable-5[1m]", "name": "Fable",
+                  "description": "Fable 5 · Most capable for your hardest and longest-running tasks" },
+                { "value": "sonnet", "name": "Sonnet",
+                  "description": "Sonnet 5 · Efficient for routine tasks" },
+                { "value": "haiku", "name": "Haiku",
+                  "description": "Haiku 4.5 · Fastest for quick answers" }
+              ] },
+            { "id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
+              "currentValue": "default",
+              "options": [ { "value": "default", "name": "Default" },
+                           { "value": "low", "name": "Low" } ] },
+            { "id": "fast", "name": "Fast mode", "category": "model_config", "type": "select",
+              "currentValue": "off",
+              "options": [ { "value": "on", "name": "On" }, { "value": "off", "name": "Off" } ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        [
+            "default",
+            "opus[1m]",
+            "claude-fable-5[1m]",
+            "sonnet",
+            "haiku"
+        ]
+    );
+    assert_eq!(
+        rows[0],
+        json!({ "id": "default", "name": "Default (recommended)", "provider": "claude-code",
+                "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" })
+    );
+    assert_eq!(rows[2]["name"], "Fable");
+    assert!(rows.iter().all(|r| r["provider"] == "claude-code"));
+}
+
+#[test]
+fn parse_config_options_wrapped_in_session_update() {
+    let wrapped = json!({
+        "update": {
+            "configOptions": [
+                { "id": "model", "options": [ { "value": "sonnet", "name": "Sonnet" } ] }
+            ]
+        }
+    });
+    let rows = parse_acp_models(&wrapped, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "sonnet");
+}
+
+#[test]
+fn parse_config_options_falls_back_to_model_category() {
+    let payload = json!({
+        "configOptions": [
+            { "id": "primary-model", "category": "model",
+              "options": [ { "value": "m1", "name": "M1" } ] }
+        ]
+    });
+    assert_eq!(parse_acp_models(&payload, "claude-code").len(), 1);
+}
+
+#[test]
+fn parse_config_options_without_model_entry_yields_no_rows() {
+    // Only non-model select options: extraction must not grab mode values.
+    let no_model = json!({
+        "configOptions": [
+            { "id": "mode", "category": "mode",
+              "options": [ { "value": "auto", "name": "Auto" } ] }
+        ]
+    });
+    assert!(parse_acp_models(&no_model, "claude-code").is_empty());
+
+    let empty_options = json!({
+        "configOptions": [ { "id": "model", "options": [] } ]
+    });
+    assert!(parse_acp_models(&empty_options, "claude-code").is_empty());
+}
+
+#[test]
 fn parse_codex_models_expands_effort_variants() {
     let payload = json!({
         "models": {
@@ -129,6 +231,69 @@ fn parse_codex_models_effort_variant_without_description() {
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[1]["id"], "gpt-5.2-codex/medium");
     assert_eq!(rows[1]["description"], "Balanced speed and reasoning depth");
+}
+
+#[test]
+fn parse_codex_models_from_config_options() {
+    // Canned from a live codex-acp@0.16.0 session/new result (2026-07-21):
+    // same configOptions[id="model"].options shape as claude-code. None of
+    // these ids are effort-variant base models, so no expansion happens.
+    let payload = json!({
+        "sessionId": "sess_2",
+        "modes": { "currentModeId": "auto", "availableModes": [] },
+        "configOptions": [
+            { "id": "mode", "name": "Approval Preset", "category": "mode", "type": "select",
+              "currentValue": "auto",
+              "options": [ { "value": "read-only", "name": "Read Only" },
+                           { "value": "auto", "name": "Default" } ] },
+            { "id": "model", "name": "Model",
+              "description": "Choose which model Codex should use",
+              "category": "model", "type": "select", "currentValue": "gpt-5.6-sol",
+              "options": [
+                { "value": "gpt-5.6-sol", "name": "gpt-5.6-sol" },
+                { "value": "gpt-5.5", "name": "GPT-5.5",
+                  "description": "Frontier model for complex coding, research, and real-world work." },
+                { "value": "gpt-5.4", "name": "GPT-5.4",
+                  "description": "Strong model for everyday coding." },
+                { "value": "gpt-5.4-mini", "name": "GPT-5.4-Mini",
+                  "description": "Small, fast, and cost-efficient model for simpler coding tasks." },
+                { "value": "gpt-5.3-codex-spark", "name": "GPT-5.3-Codex-Spark",
+                  "description": "Ultra-fast coding model." }
+              ] }
+        ]
+    });
+    let rows = parse_codex_acp_models(&payload);
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids,
+        [
+            "gpt-5.6-sol",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex-spark"
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        json!({ "id": "gpt-5.5", "name": "GPT-5.5", "provider": "codex",
+                "description": "Frontier model for complex coding, research, and real-world work." })
+    );
+}
+
+#[test]
+fn parse_codex_config_options_expand_effort_variants() {
+    // Effort-variant base models expand even when reported via configOptions.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model",
+              "options": [ { "value": "gpt-5.3-codex", "name": "GPT-5.3 Codex" } ] }
+        ]
+    });
+    let rows = parse_codex_acp_models(&payload);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["id"], "gpt-5.3-codex/low");
+    assert_eq!(rows[3]["id"], "gpt-5.3-codex/xhigh");
 }
 
 #[test]
@@ -229,6 +394,35 @@ async fn acp_probe_child_receives_env_overrides() {
 
     let recorded = std::fs::read_to_string(&out_file).unwrap();
     assert_eq!(recorded, "/tmp/intentd-test-isolated-codex-home");
+}
+
+#[test]
+fn probe_ok_but_zero_models_degrades_with_warning() {
+    // A successful handshake that reports zero models must still degrade to
+    // an unavailable fetch with a provider-attributed warning.
+    let fetch = finish("claude-code", Err(ProbeError::Empty));
+    assert!(fetch.models.is_none());
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("claude-code: no models reported")
+    );
+}
+
+#[test]
+fn early_adapter_exit_is_surfaced_in_warning() {
+    // A dead adapter (e.g. corrupt npx cache → ENOENT) must be attributed in
+    // the warning text instead of a generic "no models reported".
+    let fetch = finish(
+        "codex",
+        Err(ProbeError::Exited(
+            "exit status: 1; stderr: npm error enoent ENOENT: no such file or directory"
+                .to_string(),
+        )),
+    );
+    assert!(fetch.models.is_none());
+    let warning = fetch.warning.expect("warning present");
+    assert!(warning.starts_with("codex: adapter exited before reporting models"));
+    assert!(warning.contains("enoent"));
 }
 
 #[test]
