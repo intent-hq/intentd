@@ -12,21 +12,15 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+use common::test_timeout;
+
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Apply timeout multiplier from environment for coverage instrumentation.
-/// Reads INTENTD_TEST_TIMEOUT_MULTIPLIER (defaults to 1.0).
-fn test_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(1.0);
-    base.mul_f64(multiplier.max(1.0))
-}
 
 use futures_util::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -87,7 +81,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(test_timeout(Duration::from_secs(20)), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;

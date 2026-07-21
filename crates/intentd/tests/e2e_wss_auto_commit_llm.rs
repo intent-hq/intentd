@@ -12,6 +12,9 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -123,7 +126,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
 }
 
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(60), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;

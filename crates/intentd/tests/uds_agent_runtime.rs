@@ -13,6 +13,9 @@
 //!
 //! Gated by `node` + the mock script (the CI ACP gate); skips cleanly otherwise.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -87,13 +90,16 @@ impl Drop for Daemon {
 }
 
 async fn connect_retry(socket: &PathBuf) -> UnixStream {
-    for _ in 0..2400 {
-        if let Ok(s) = UnixStream::connect(socket).await {
-            return s;
+    tokio::time::timeout(common::daemon_startup_timeout(), async {
+        loop {
+            if let Ok(s) = UnixStream::connect(socket).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("could not connect to {}", socket.display());
+    })
+    .await
+    .unwrap_or_else(|_| panic!("could not connect to {}", socket.display()))
 }
 
 async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: Value) {

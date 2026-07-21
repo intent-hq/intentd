@@ -8,6 +8,9 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -47,7 +50,7 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
 }
 
 async fn await_socket(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(60), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
