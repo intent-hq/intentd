@@ -1183,12 +1183,22 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
 
     // Preemption ordering: terminal stream:end for the cancelled first turn →
     // the interrupt message streams `turn=2` on the SAME child → its own end.
+    // Regression guard: the preemption must NOT emit the STAB-28 synthetic
+    // `agent:idle` (reason: "interrupted") on the wire — an interrupt that
+    // carries a follow-up message is a preemption, not a settlement, and the
+    // synthetic idle would wake parent completion watches mid-preemption.
     let mut saw_preempt_end = false;
     let mut saw_interrupt_chunk = false;
     let mut saw_interrupt_end = false;
+    let mut interrupted_idles = 0usize;
     for _ in 0..80 {
         let frame = wss_event(&mut sub, 30).await;
         match frame["params"]["event"]["type"].as_str() {
+            Some("agent:idle")
+                if frame["params"]["event"]["data"]["reason"].as_str() == Some("interrupted") =>
+            {
+                interrupted_idles += 1;
+            }
             Some("agent:stream:end") if !saw_preempt_end => {
                 assert_eq!(
                     frame["params"]["event"]["data"]["agentId"]
@@ -1230,6 +1240,11 @@ async fn interrupt_priority_send_preempts_turn_keep_alive_over_wss() {
     assert!(
         saw_interrupt_end,
         "interrupt turn emits its own terminal stream:end"
+    );
+    assert_eq!(
+        interrupted_idles, 0,
+        "interrupt-with-message preemption must not emit the synthetic \
+         agent:idle (reason: interrupted) on the wire"
     );
 
     // Idle fall-through + liveness: another interrupt-priority send now behaves
