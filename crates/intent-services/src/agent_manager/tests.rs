@@ -104,12 +104,45 @@ fn title_case_ascii_already_capitalized_unchanged() {
 }
 
 #[test]
-fn compute_process_cap_matches_ts_thresholds() {
+fn compute_process_cap_reserves_8gb_and_budgets_1gb_per_agent() {
     assert_eq!(compute_process_cap(8 * super::GB), 4);
     assert_eq!(compute_process_cap(16 * super::GB), 8);
-    assert_eq!(compute_process_cap(32 * super::GB), 20);
-    assert_eq!(compute_process_cap(64 * super::GB), 30);
+    assert_eq!(compute_process_cap(32 * super::GB), 24);
+    assert_eq!(compute_process_cap(64 * super::GB), 56);
     assert_eq!(compute_process_cap(128 * super::GB), 100);
+}
+
+#[test]
+fn compute_process_cap_lower_clamp_floors_at_4() {
+    // Below the 8 GB reserve the subtraction saturates to 0 → clamp to 4.
+    assert_eq!(compute_process_cap(0), 4);
+    assert_eq!(compute_process_cap(4 * super::GB), 4);
+    // Just past the reserve, the raw budget (1..=4 GB) is still at or below the floor.
+    assert_eq!(compute_process_cap(12 * super::GB), 4);
+    // First value above the floor.
+    assert_eq!(compute_process_cap(13 * super::GB), 5);
+}
+
+#[test]
+fn compute_process_cap_upper_clamp_caps_at_100() {
+    // 108 GB is the first size to hit the ceiling: (108 - 8) / 1 = 100.
+    assert_eq!(compute_process_cap(107 * super::GB), 99);
+    assert_eq!(compute_process_cap(108 * super::GB), 100);
+    assert_eq!(compute_process_cap(256 * super::GB), 100);
+    assert_eq!(compute_process_cap(u64::MAX), 100);
+}
+
+#[test]
+fn compute_process_cap_is_monotonic_with_no_cliffs() {
+    // The old step table jumped 30 → 100 between 64 and 65 GB; the smooth
+    // formula must grow by at most 1 per GB.
+    let mut prev = compute_process_cap(0);
+    for gb in 1..=160 {
+        let cap = compute_process_cap(gb * super::GB);
+        assert!(cap >= prev, "cap must be monotonic at {gb} GB");
+        assert!(cap - prev <= 1, "cap must not cliff at {gb} GB");
+        prev = cap;
+    }
 }
 
 #[test]
