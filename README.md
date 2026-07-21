@@ -137,6 +137,49 @@ For the authoritative, dated progress log see
 
 - The Tauri/Svelte desktop frontend (not yet a submodule; will live in the monorepo).
 
+## Releases & channels
+
+Releases are tag-driven and built by [dist (cargo-dist)](https://axodotdev.github.io/cargo-dist/)
+(`dist-workspace.toml` + the generated `.github/workflows/release.yml`). Pushing a tag
+publishes a GitHub Release with per-platform archives, `.sha256` checksums, and shell /
+PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
+
+- **Stable**: `vX.Y.Z` tags (e.g. `v0.9.0`).
+- **Beta**: `vX.Y.Z-beta.N` tags (e.g. `v0.9.0-beta.1`) — published as GitHub prereleases.
+
+To cut a release: bump `version` in `crates/intentd/Cargo.toml` to match, commit, then
+push the tag.
+
+### Channel manifests
+
+After each release, CI updates a machine-readable channel manifest on a fixed release
+(`.github/workflows/publish-channel-manifest.yml`): stable tags update the `stable.json`
+asset on the `channel-stable` release; prerelease tags update `beta.json` on
+`channel-beta`. Consumers (e.g. cloudlands-fe pin-bump automation, installer scripts)
+resolve "latest per channel" from these fixed URLs. Schema (version 1):
+
+```json
+{
+  "schema": 1,
+  "channel": "stable",
+  "version": "0.9.0",
+  "tag": "v0.9.0",
+  "published_at": "2026-07-21T00:00:00Z",
+  "platforms": {
+    "aarch64-apple-darwin": {
+      "asset": "intentd-aarch64-apple-darwin.tar.xz",
+      "url": "https://github.com/intent-hq/intentd/releases/download/v0.9.0/intentd-aarch64-apple-darwin.tar.xz",
+      "sha256": "<hex digest of the archive>"
+    }
+  }
+}
+```
+
+`platforms` is keyed by Rust target triple. While this repo is private, download the
+manifest and artifacts via the GitHub API with a token (the `url` fields work unauthenticated
+once the repo is public).
+
 ## Development
 
 ```bash
