@@ -354,6 +354,7 @@ pub(crate) const DEFAULT_TOOLS: &[&str] = &[
     "codex",
     "codex-acp",
     "cortex",
+    "grok",
     "git",
     "code",
 ];

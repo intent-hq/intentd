@@ -107,6 +107,9 @@ fn gated_reason(provider: &ProviderConfig) -> Option<String> {
 /// order. Gated providers report `gated_off` and are not probed on `PATH`.
 /// npx-only providers (claude-code) are probed for `npx` availability instead
 /// of a local provider binary — there is no local-binary path for them.
+/// grok prefers its native installer location (`~/.grok/bin/grok`) over the
+/// `PATH` scan because npm-global wrappers can emit update banners before
+/// real stdout (parity with `grok-resolver.ts`).
 pub fn discover_providers() -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
@@ -116,6 +119,8 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
                 None
             } else if provider.npx_only_package.is_some() {
                 find_npx()
+            } else if provider.id == "grok" {
+                find_grok_native_binary().or_else(|| resolve_on_path(provider.command))
             } else {
                 resolve_on_path(provider.command)
             };
@@ -177,7 +182,16 @@ pub fn find_provider_binary(
         }
     }
 
-    // 2. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
+    // 2a. grok's native installer location (`~/.grok/bin/grok`) is preferred
+    // over any PATH-resolved npm-global wrapper (parity with `grok-resolver.ts`:
+    // wrappers can emit update banners before real stdout).
+    if provider_id == "grok" {
+        if let Some(native) = find_grok_native_binary() {
+            return Some(native);
+        }
+    }
+
+    // 2b. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
     if let Some(managed) = managed_binary_path(command) {
         if is_executable_file(&managed) {
             return Some(managed);
@@ -186,6 +200,27 @@ pub fn find_provider_binary(
 
     // 3. Scan enhanced PATH directories
     find_in_enhanced_dirs(command)
+}
+
+/// Candidate paths for grok's native installer location under `home`
+/// (`~/.grok/bin/grok`, plus `.exe`/`.cmd` variants on Windows). Port of
+/// `GROK_NATIVE_PATHS` from `grok-resolver.ts`.
+fn grok_native_candidates(home: &std::path::Path) -> Vec<PathBuf> {
+    let bin = home.join(".grok").join("bin");
+    let mut candidates = vec![bin.join("grok")];
+    if cfg!(windows) {
+        candidates.push(bin.join("grok.exe"));
+        candidates.push(bin.join("grok.cmd"));
+    }
+    candidates
+}
+
+/// Resolve grok's native installer binary (`~/.grok/bin/grok`), or `None`.
+fn find_grok_native_binary() -> Option<PathBuf> {
+    let home = home_dir()?;
+    grok_native_candidates(&home)
+        .into_iter()
+        .find(|p| is_executable_file(p))
 }
 
 /// The auggie binary path (`~/.augment/bin/<command>[.exe]`). This is auggie's
@@ -434,6 +469,39 @@ mod find_provider_binary_tests {
         for p in providers.iter().filter(|p| p.id != "claude-code") {
             assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
         }
+    }
+
+    #[test]
+    fn grok_native_candidates_prefer_home_grok_bin() {
+        let home = PathBuf::from("/home/tester");
+        let candidates = grok_native_candidates(&home);
+        assert_eq!(
+            candidates[0],
+            home.join(".grok").join("bin").join("grok"),
+            "native installer path must be the first candidate"
+        );
+        if cfg!(windows) {
+            assert!(candidates
+                .iter()
+                .any(|p| p.ends_with(PathBuf::from("bin").join("grok.exe"))));
+            assert!(candidates
+                .iter()
+                .any(|p| p.ends_with(PathBuf::from("bin").join("grok.cmd"))));
+        } else {
+            assert_eq!(candidates.len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_grok_native_binary_requires_executable_file() {
+        // A non-executable file at the native path must not resolve.
+        let dir = unique_temp_dir("grok-nonexec");
+        let bin = dir.join("grok");
+        fs::write(&bin, "not executable").unwrap();
+        assert!(!is_executable_file(&bin));
+        make_executable(&bin);
+        assert!(is_executable_file(&bin));
     }
 
     #[test]

@@ -1321,6 +1321,11 @@ impl AgentManager {
             .await
             .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
 
+        // The persisted model (bare part of a compound id) feeds the
+        // post-session `session/set_model` for providers with no CLI model
+        // flag (grok) — see `maybe_apply_session_model`.
+        let stored_model = session_record.model.clone();
+
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
@@ -1374,6 +1379,13 @@ impl AgentManager {
                     opened.modes.as_ref(),
                 )
                 .await;
+                Self::maybe_apply_session_model(
+                    conn.as_ref(),
+                    provider,
+                    &opened.session_id,
+                    stored_model.as_deref(),
+                )
+                .await;
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
@@ -1405,6 +1417,13 @@ impl AgentManager {
                 opened.modes.as_ref(),
             )
             .await;
+            Self::maybe_apply_session_model(
+                conn.as_ref(),
+                provider,
+                &opened.session_id,
+                stored_model.as_deref(),
+            )
+            .await;
             return Ok(opened.session_id);
         }
 
@@ -1422,7 +1441,56 @@ impl AgentManager {
             opened.modes.as_ref(),
         )
         .await;
+        Self::maybe_apply_session_model(
+            conn.as_ref(),
+            provider,
+            &opened.session_id,
+            stored_model.as_deref(),
+        )
+        .await;
         Ok(opened.session_id)
+    }
+
+    /// Best-effort post-session `session/set_model` for providers whose ACP
+    /// subcommand has no CLI model flag (`supports_set_model`; grok today —
+    /// parity with the reference acp-provider, which applies the selected
+    /// model via `session/set_model` after session creation for such
+    /// providers). The bare model id is stripped from the persisted compound
+    /// id; the `default` sentinel and empty ids are no-ops. Failures are
+    /// logged at WARN and never fail session startup.
+    async fn maybe_apply_session_model(
+        conn: &Connection,
+        provider: &ProviderConfig,
+        acp_session_id: &str,
+        stored_model: Option<&str>,
+    ) {
+        if !provider.supports_set_model {
+            return;
+        }
+        let Some(model) = stored_model else { return };
+        let model_id = intent_providers::parse_compound_model_id(model).1;
+        if model_id.is_empty() || model_id == "default" {
+            return;
+        }
+        match intent_acp::session::set_session_model(conn, acp_session_id, &model_id).await {
+            Ok(()) => {
+                tracing::debug!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    "session/set_model accepted"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = provider.id,
+                    session_id = acp_session_id,
+                    model = %model_id,
+                    error = %e,
+                    "session/set_model failed; provider keeps its default model"
+                );
+            }
+        }
     }
 
     /// Under the shipped `AllowAll` policy, best-effort ask the provider to run

@@ -33,7 +33,9 @@ pub use discover::{
 pub use models::{
     create_compound_model_id, default_model_for_provider, fuzzy_match_model_in_pool,
     is_model_valid_for_provider, model_tier_from_model, normalize_model_override,
-    parse_codex_reasoning_effort, parse_compound_model_id, resolve_preferred_model, tiers_for,
+    parse_codex_reasoning_effort, parse_compound_model_id, parse_grok_initialize_models,
+    parse_grok_initialize_response_from_stdout, parse_grok_models_command_output,
+    resolve_preferred_model, tiers_for, GrokModel, GrokModelsCommandOutput, GrokParsedModels,
     ModelTier, ModelTiers, PROVIDER_MODEL_TIERS,
 };
 
