@@ -5322,6 +5322,31 @@ mod pr {
     }
 
     #[tokio::test]
+    async fn github_cancel_auth_preserves_a_terminal_flow_outcome() {
+        // Only a PENDING flow is cancellable: cancel after a terminal
+        // transition (denied here) must leave the slot intact so authStatus
+        // keeps surfacing the outcome until the next connect replaces it.
+        let (_t, svc) = github_svc().await;
+        {
+            let mut slot = svc.github_auth_flow.lock().await;
+            *slot = Some(crate::github_auth_ops::FlowSlot {
+                flow_id: crate::github_auth_ops::next_flow_id(),
+                user_code: "WXYZ-9876".into(),
+                verification_uri: "https://github.com/login/device".into(),
+                interval: 5,
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                phase: crate::github_auth_ops::FlowPhase::Denied,
+                task: None,
+            });
+        }
+        let c = svc.github_cancel_auth().await.expect("cancel");
+        assert_eq!(c["ok"], true);
+        assert_eq!(c["cancelled"], false);
+        let v = svc.github_auth_status().await.expect("auth");
+        assert_eq!(v["deviceFlow"]["status"], "denied");
+    }
+
+    #[tokio::test]
     async fn github_revoke_deletes_the_stored_token_and_clears_the_flow() {
         let (_t, svc) = github_svc().await;
         let mem = Arc::new(crate::settings::InMemorySecretStore::default());

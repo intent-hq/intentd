@@ -13969,14 +13969,19 @@ impl WorkspaceApi for Services {
         let state = self.github_auth_flow.clone();
         Box::pin(async move {
             let mut slot = state.lock().await;
-            let cancelled = match slot.take() {
-                Some(s) => {
-                    if let Some(task) = s.task {
-                        task.abort();
+            // Only a pending flow is cancellable. A terminal slot (expired /
+            // denied / error) is left intact so authStatus keeps surfacing
+            // the outcome until the next connect replaces it.
+            let cancelled = match slot.as_ref() {
+                Some(s) if s.phase == github_auth_ops::FlowPhase::Pending => {
+                    if let Some(s) = slot.take() {
+                        if let Some(task) = s.task {
+                            task.abort();
+                        }
                     }
-                    s.phase == github_auth_ops::FlowPhase::Pending
+                    true
                 }
-                None => false,
+                _ => false,
             };
             Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
         })
