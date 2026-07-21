@@ -1724,12 +1724,16 @@ pub struct AgentMessage {
 pub const USER_APP_MESSAGE_ID_KEY: &str = "userAppMessageId";
 
 /// Lift the client-supplied app-message id out of a persisted `metadata`
-/// payload: `Some` only when the metadata is an object carrying a non-empty
-/// string under [`USER_APP_MESSAGE_ID_KEY`].
+/// payload: `Some` only when the metadata is an object carrying a non-empty,
+/// non-whitespace string under [`USER_APP_MESSAGE_ID_KEY`]. Trimmed to match
+/// the router's fold-side normalization, so a padded or whitespace-only value
+/// smuggled directly through `messageMetadata` never surfaces as a
+/// meaningless `appMessageId` on reads/events.
 pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<String> {
     metadata
         .and_then(|m| m.get(USER_APP_MESSAGE_ID_KEY))
         .and_then(serde_json::Value::as_str)
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
 }
@@ -3339,6 +3343,14 @@ mod tests {
         assert_eq!(
             lift_app_message_id(Some(&json!({ "userAppMessageId": "" }))),
             None
+        );
+        assert_eq!(
+            lift_app_message_id(Some(&json!({ "userAppMessageId": "   " }))),
+            None
+        );
+        assert_eq!(
+            lift_app_message_id(Some(&json!({ "userAppMessageId": " padded " }))),
+            Some("padded".to_string())
         );
         assert_eq!(
             lift_app_message_id(Some(&json!({ "userAppMessageId": 42 }))),

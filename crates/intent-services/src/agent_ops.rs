@@ -2312,6 +2312,9 @@ impl Services {
 
     /// `agent.forceMessage`: stop the current stream (best-effort) then deliver
     /// immediately with the caller-supplied `messageId` (PROTOCOL §5.5).
+    /// `message_metadata` is persisted on the row (parity with the runtime
+    /// `AgentManager::force_message` path) so a folded `userAppMessageId`
+    /// round-trips on transcript reads from the store-only fallback too.
     pub(crate) async fn agent_force_message_op(
         &self,
         agent_id: AgentId,
@@ -2319,6 +2322,7 @@ impl Services {
         content: String,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if message_id.len() > MAX_MESSAGE_ID_LEN {
@@ -2338,7 +2342,7 @@ impl Services {
                 &message_id,
                 "user",
                 &blocks,
-                None,
+                message_metadata.as_ref(),
                 &created_at,
             )
             .await?;

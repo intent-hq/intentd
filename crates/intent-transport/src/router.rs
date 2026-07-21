@@ -3039,7 +3039,12 @@ fn merge_user_app_message_id(
     params: &Map<String, Value>,
     message_metadata: Option<Value>,
 ) -> Result<Option<Value>, RpcErr> {
-    let Some(id) = opt_nonempty_str(params, intent_core::USER_APP_MESSAGE_ID_KEY) else {
+    // Trim before folding (symmetric with `lift_app_message_id`): padding
+    // must not persist verbatim or count against the length cap, and a
+    // whitespace-only id reads as absent.
+    let Some(id) = opt_nonempty_str(params, intent_core::USER_APP_MESSAGE_ID_KEY)
+        .map(|s| s.trim().to_string())
+    else {
         return Ok(message_metadata);
     };
     if id.len() > MAX_USER_APP_MESSAGE_ID_LEN {

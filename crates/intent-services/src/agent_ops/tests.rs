@@ -2799,6 +2799,7 @@ async fn force_message_op_persists_attachment_blocks_in_transcript() {
             "forced with image".into(),
             Some(image_blocks),
             None,
+            None,
         )
         .await
         .expect("force");
@@ -6990,6 +6991,7 @@ async fn agent_force_message_emits_agent_message_event() {
             id.clone(),
             "msg-123".into(),
             "forced content".into(),
+            None,
             None,
             None,
         )

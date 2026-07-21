@@ -4968,6 +4968,15 @@ mod merge_user_app_message_id {
     }
 
     #[test]
+    fn padded_id_is_trimmed_before_fold() {
+        let p = params(json!({ "userAppMessageId": "  app-msg-1  " }));
+        assert_eq!(
+            merge_ok(&p, None),
+            Some(json!({ "userAppMessageId": "app-msg-1" }))
+        );
+    }
+
+    #[test]
     fn id_folds_into_fresh_metadata_object() {
         let p = params(json!({ "userAppMessageId": "app-msg-1" }));
         assert_eq!(

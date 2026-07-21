@@ -3883,8 +3883,12 @@ async fn run_message_worker(
 /// `messageMetadata` (parity with `deliver_wake_message`'s in-block tag) AND on
 /// the row-level `metadata` column (parity with the direct `agent.sendMessage`
 /// persist) — so transcript consumers find the tag regardless of which field
-/// they read. Best-effort; a store or publish error is logged and the turn
-/// still proceeds.
+/// they read. The client-identity `userAppMessageId` key is excluded from the
+/// in-block copy (it stays row-level only): the block embed exists for
+/// attribution tags that history replay should surface, and a queued send's
+/// content block should not diverge from its direct-send counterpart just
+/// because a dedup id rode along. Best-effort; a store or publish error is
+/// logged and the turn still proceeds.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -3896,9 +3900,17 @@ async fn persist_user(
 ) {
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
-    if let Some(md) = message_metadata {
+    let block_md = message_metadata.and_then(|md| match md {
+        Value::Object(m) => {
+            let mut m = m.clone();
+            m.remove(intent_core::USER_APP_MESSAGE_ID_KEY);
+            (!m.is_empty()).then_some(Value::Object(m))
+        }
+        other => Some(other.clone()),
+    });
+    if let Some(md) = block_md {
         if let Some(text_block) = blocks.get_mut(0).and_then(Value::as_object_mut) {
-            text_block.insert("messageMetadata".into(), md.clone());
+            text_block.insert("messageMetadata".into(), md);
         }
     }
     match mgr

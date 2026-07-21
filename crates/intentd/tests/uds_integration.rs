@@ -680,6 +680,36 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 
+    // (s0b) agent.forceMessage with `userAppMessageId` → the store-only
+    // fallback persists the folded metadata too, so the id round-trips the
+    // same way as sendMessage (PROTOCOL §5.5).
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":254,"method":"agent.forceMessage","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","messageId":"m3","content":"forced tagged","userAppMessageId":"app-msg-e2e-2"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":255,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let forced = resp["result"]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"] == json!("m3"))
+        .expect("forced user row present");
+    assert_eq!(forced["appMessageId"], json!("app-msg-e2e-2"));
+    assert_eq!(
+        forced["metadata"]["userAppMessageId"],
+        json!("app-msg-e2e-2")
+    );
+
     // (s1a) agent.getSession → full `AgentSession` (superset of AgentLite):
     // `messages` is present as an array (the field AgentLite strips). Confirms
     // the C1d/C1e loadAgent rehydration RPC returns the full shape (§5.5).
