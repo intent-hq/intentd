@@ -74,10 +74,12 @@ mod github_browse_ops;
 mod history_xml;
 mod line_attribution;
 mod linear_ops;
+mod model_catalog;
 mod note_ops;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
+pub mod provider_models;
 pub mod repo_config;
 mod rtk;
 mod sandbox_ops;
@@ -172,6 +174,11 @@ pub struct Services {
     /// successful auggie CLI fetch is cached; the static fallback is recomputed
     /// per call. Shared across clones so every handle sees the same window.
     models_cache: agent_ops::ModelsCache,
+    /// Generic per-provider model cache backing `models.list { providerId }`
+    /// (PROTOCOL §5.30): entries keyed by provider id + version key, 5-minute
+    /// TTL, persisted in the daemon data dir when configured via
+    /// [`Services::with_models_cache_dir`]. Shared across clones.
+    models_catalog: Arc<model_catalog::ModelCatalogCache>,
     /// Test-only override for the auggie binary the one-shot CLI RPCs
     /// (`agent.enhancePrompt` §5.31, `agent.completeOnce` §5.32) spawn.
     /// Production composition leaves this `None` and the ops resolve the CLI
@@ -367,6 +374,7 @@ impl Services {
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
+            models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
@@ -1355,6 +1363,16 @@ impl Services {
 
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Persist the per-provider `models.list` cache (PROTOCOL §5.30) under
+    /// `dir` (the daemon data dir), reloading any current-version snapshot.
+    /// Composition-root only — call before the surface is shared/cloned.
+    pub fn with_models_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.models_catalog = Arc::new(model_catalog::ModelCatalogCache::new(Some(
+            dir.join(model_catalog::MODELS_CACHE_FILE),
+        )));
         self
     }
 
@@ -10571,8 +10589,13 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(intent_git::status::empty_status());
             }
+            // Run the libgit2 status scan on the blocking pool so a slow scan
+            // on a big repo cannot stall other RPCs (same runtime-saturation
+            // vector `git_fetch_bounded` closes for `git.fetch`).
             let started = std::time::Instant::now();
-            let status = intent_git::status::status(&path);
+            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
+                .await
+                .map_err(|e| Error::Internal(format!("git.status task failed: {e}")))?;
             if let Ok(s) = &status {
                 tracing::debug!(
                     workspace_id = %workspace_id.as_str(),
@@ -11539,9 +11562,23 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            // Fetch one past the page window to decide whether older commits remain.
-            let commits = intent_git::history::history(&worktree, skip + limit + 1)?;
-            let has_more = commits.len() > skip + limit;
+            // Fetch one past the page window to decide whether older commits
+            // remain. `skip` comes from a client-provided token; treat window
+            // math that would overflow as an empty page *before* doing any
+            // git work (a saturated window would otherwise force a walk of
+            // the entire history). The libgit2 revwalk runs on the blocking
+            // pool so a slow walk on a big repo cannot stall other RPCs.
+            let Some((page_end, fetch)) = skip
+                .checked_add(limit)
+                .and_then(|end| end.checked_add(1).map(|fetch| (end, fetch)))
+            else {
+                return Ok(empty);
+            };
+            let commits =
+                tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
+                    .await
+                    .map_err(|e| Error::Internal(format!("git.commits task failed: {e}")))??;
+            let has_more = commits.len() > page_end;
             let items: Vec<serde_json::Value> = commits
                 .iter()
                 .skip(skip)
@@ -11549,7 +11586,7 @@ impl WorkspaceApi for Services {
                 .map(git_ops::commit_to_commit_info)
                 .collect();
             let next_token = if has_more {
-                serde_json::Value::String(pagination::offset_token(skip + limit))
+                serde_json::Value::String(pagination::offset_token(page_end))
             } else {
                 serde_json::Value::Null
             };
@@ -12169,8 +12206,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.agent_get_models_op().await })
     }
 
-    fn models_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { self.models_list_op().await })
+    fn models_list(
+        &self,
+        provider_id: Option<String>,
+        force_refresh: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.models_list_op(provider_id, force_refresh).await })
     }
 
     fn agent_enhance_prompt(
@@ -14191,6 +14232,17 @@ impl WorkspaceApi for Services {
                 "nextToken": serde_json::Value::Null,
                 "boundarySha": serde_json::Value::Null
             });
+            // Fetch one past the page window to decide whether older commits
+            // remain. `skip` comes from a client-provided token; treat window
+            // math that would overflow as an empty page *before* doing any
+            // git work (a saturated window would otherwise force a walk of
+            // the entire bounded history).
+            let Some((page_end, fetch)) = skip
+                .checked_add(limit)
+                .and_then(|end| end.checked_add(1).map(|fetch| (end, fetch)))
+            else {
+                return Ok(empty);
+            };
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
@@ -14205,32 +14257,46 @@ impl WorkspaceApi for Services {
                 return Ok(empty);
             }
 
-            // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
-            let boundary_started = std::time::Instant::now();
-            let boundary_sha = intent_git::history::resolve_workspace_boundary(
-                &worktree,
-                ws.base_ref.as_deref(),
-                ws.base_commit_sha.as_deref(),
-            )?;
-            let boundary_ms = boundary_started.elapsed().as_millis() as u64;
+            // Boundary resolve + history walk are libgit2 work; run both on
+            // the blocking pool so a slow walk on a big repo cannot stall
+            // other RPCs.
+            let base_ref = ws.base_ref.clone();
+            let base_commit_sha = ws.base_commit_sha.clone();
+            let walked = tokio::task::spawn_blocking(move || -> Result<_> {
+                // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
+                let boundary_started = std::time::Instant::now();
+                let boundary_sha = intent_git::history::resolve_workspace_boundary(
+                    &worktree,
+                    base_ref.as_deref(),
+                    base_commit_sha.as_deref(),
+                )?;
+                let boundary_ms = boundary_started.elapsed().as_millis() as u64;
 
-            // If boundary info exists but nothing resolved, return empty (safety net
-            // to avoid showing arbitrary base-branch commits). This holds regardless
-            // of includeOlder to prevent leaking arbitrary base-branch history.
-            if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary_sha.is_none() {
+                // If boundary info exists but nothing resolved, return empty (safety net
+                // to avoid showing arbitrary base-branch commits). This holds regardless
+                // of includeOlder to prevent leaking arbitrary base-branch history.
+                if (base_ref.is_some() || base_commit_sha.is_some()) && boundary_sha.is_none() {
+                    return Ok(None);
+                }
+
+                let walk_started = std::time::Instant::now();
+                let commits = intent_git::history::history_bounded(
+                    &worktree,
+                    boundary_sha.as_deref(),
+                    fetch,
+                    include_older,
+                )?;
+                let walk_ms = walk_started.elapsed().as_millis() as u64;
+                Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
+            })
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("file-tracking.loadCommits task failed: {e}"))
+            })??;
+            let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
                 return Ok(empty);
-            }
-
-            // Fetch one past the page window to decide whether older commits remain.
-            let walk_started = std::time::Instant::now();
-            let commits = intent_git::history::history_bounded(
-                &worktree,
-                boundary_sha.as_deref(),
-                skip + limit + 1,
-                include_older,
-            )?;
-            let walk_ms = walk_started.elapsed().as_millis() as u64;
-            let has_more = commits.len() > skip + limit;
+            };
+            let has_more = commits.len() > page_end;
             let values: Vec<serde_json::Value> = commits
                 .iter()
                 .skip(skip)
@@ -14249,7 +14315,7 @@ impl WorkspaceApi for Services {
                 "file-tracking.loadCommits: boundary resolve + history walk"
             );
             let next_token = if has_more {
-                serde_json::Value::String(pagination::offset_token(skip + limit))
+                serde_json::Value::String(pagination::offset_token(page_end))
             } else {
                 serde_json::Value::Null
             };
@@ -14610,7 +14676,14 @@ impl Services {
             return Ok(accept_changes::minimal_status_value(&ws, &trunk));
         }
         match git_ops::worktree_path(&ws) {
-            Some(worktree) => accept_changes::build_git_status_value(&worktree, &ws),
+            // `build_git_status_value` runs a full status scan plus a bounded
+            // history walk (libgit2); run it on the blocking pool so a slow
+            // scan on a big repo cannot stall other RPCs.
+            Some(worktree) => tokio::task::spawn_blocking(move || {
+                accept_changes::build_git_status_value(&worktree, &ws)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("accept-changes.getStatus task failed: {e}")))?,
             None => Ok(accept_changes::minimal_status_value(&ws, &trunk)),
         }
     }

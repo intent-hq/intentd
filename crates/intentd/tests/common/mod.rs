@@ -1,10 +1,36 @@
 //! Shared test utilities for intentd integration tests.
 //!
 //! This module provides RAII guards for spawned daemon processes to prevent
-//! process leaks when tests panic or fail to clean up explicitly.
+//! process leaks when tests panic or fail to clean up explicitly, plus
+//! multiplier-aware timeout helpers so budgets are centrally tunable.
+
+// Each integration test binary compiles this module independently and only
+// uses a subset of it, so unused items are expected.
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::process::Child;
+use std::time::Duration;
+
+/// Apply the timeout multiplier from the environment for coverage
+/// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
+/// non-finite values are ignored and values below 1.0 are clamped so budgets
+/// can only be extended; overflow saturates to `Duration::MAX`).
+pub fn test_timeout(base: Duration) -> Duration {
+    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|m| m.is_finite())
+        .unwrap_or(1.0);
+    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+}
+
+/// Shared budget for waiting on daemon startup (UDS/socket ready): 60s base,
+/// scaled by `INTENTD_TEST_TIMEOUT_MULTIPLIER`. The generous budget absorbs
+/// coverage-instrumented startup on oversubscribed CI runners.
+pub fn daemon_startup_timeout() -> Duration {
+    test_timeout(Duration::from_secs(60))
+}
 
 /// RAII guard for a spawned `intentd serve` process.
 ///

@@ -160,8 +160,14 @@ pub(crate) fn validate_repo_path(repo_path: &str) -> Result<()> {
 
 /// Build the wire `CommitInfo` (§8.9) for a history record: `files` is the list
 /// of changed paths, `sha` the short hash, and the optional agent/note linkage
-/// is included only when present.
+/// is included only when present. Callers must pass records from a
+/// file-including walk (`git.commits` uses `history()` → `include_files =
+/// true`); `files == None` would silently serialize as `[]` on the wire.
 pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Value {
+    debug_assert!(
+        c.files.is_some(),
+        "commit_to_commit_info requires a file-including history walk"
+    );
     let mut obj = Map::new();
     obj.insert("hash".to_string(), json!(c.hash));
     obj.insert(
@@ -172,7 +178,10 @@ pub(crate) fn commit_to_commit_info(c: &intent_git::history::CommitRecord) -> Va
     obj.insert("email".to_string(), json!(c.author_email));
     obj.insert("date".to_string(), json!(c.date));
     obj.insert("message".to_string(), json!(c.message));
-    obj.insert("files".to_string(), json!(c.files));
+    obj.insert(
+        "files".to_string(),
+        json!(c.files.as_deref().unwrap_or_default()),
+    );
     if let Some(agent_id) = &c.agent_id {
         obj.insert("agentId".to_string(), json!(agent_id));
     }

@@ -287,7 +287,7 @@ fn provider_runtimes() {
 
 #[test]
 fn env_assembly_quirks() {
-    let cortex = build_provider_env(find_provider("cortex").unwrap(), None, None);
+    let cortex = build_provider_env(find_provider("cortex").unwrap(), None, None, None);
     assert_eq!(
         cortex.get("ELECTRON_RUN_AS_NODE").map(String::as_str),
         Some("1")
@@ -295,7 +295,7 @@ fn env_assembly_quirks() {
 
     let opencode = find_provider("opencode").unwrap();
     // With model: permission.task=deny is merged with the model key.
-    let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+    let oc_with_model = build_provider_env(opencode, Some("claude-sonnet-4"), None, None);
     assert_eq!(
         oc_with_model
             .get("OPENCODE_CONFIG_CONTENT")
@@ -303,7 +303,7 @@ fn env_assembly_quirks() {
         Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4"}"#)
     );
     // No model, no rules file: permission.task=deny is still emitted.
-    let oc_no_model_no_rules = build_provider_env(opencode, None, None);
+    let oc_no_model_no_rules = build_provider_env(opencode, None, None, None);
     assert_eq!(
         oc_no_model_no_rules
             .get("OPENCODE_CONFIG_CONTENT")
@@ -317,7 +317,7 @@ fn opencode_model_sentinel_filtered_from_env() {
     let opencode = find_provider("opencode").unwrap();
 
     // Model sentinel "default" alone → permission.task=deny only (model filtered).
-    let sentinel_only = build_provider_env(opencode, Some("default"), None);
+    let sentinel_only = build_provider_env(opencode, Some("default"), None, None);
     assert_eq!(
         sentinel_only
             .get("OPENCODE_CONFIG_CONTENT")
@@ -326,7 +326,7 @@ fn opencode_model_sentinel_filtered_from_env() {
     );
 
     // Rules file alone (no model) → permission + instructions.
-    let rules_only = build_provider_env(opencode, None, Some("/tmp/rules.md"));
+    let rules_only = build_provider_env(opencode, None, Some("/tmp/rules.md"), None);
     assert_eq!(
         rules_only
             .get("OPENCODE_CONFIG_CONTENT")
@@ -335,14 +335,15 @@ fn opencode_model_sentinel_filtered_from_env() {
     );
 
     // Real model + rules file → all three fields.
-    let both = build_provider_env(opencode, Some("gpt-4"), Some("/tmp/rules.md"));
+    let both = build_provider_env(opencode, Some("gpt-4"), Some("/tmp/rules.md"), None);
     assert_eq!(
         both.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"permission":{"task":"deny"},"model":"gpt-4","instructions":["/tmp/rules.md"]}"#)
     );
 
     // Sentinel model + rules file → permission + instructions (model filtered).
-    let sentinel_with_rules = build_provider_env(opencode, Some("default"), Some("/tmp/rules.md"));
+    let sentinel_with_rules =
+        build_provider_env(opencode, Some("default"), Some("/tmp/rules.md"), None);
     assert_eq!(
         sentinel_with_rules
             .get("OPENCODE_CONFIG_CONTENT")
@@ -447,7 +448,7 @@ fn v8_runtime_node_options_heap_cap() {
         None
     );
 
-    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None, None);
+    let env_for = |id: &str| build_provider_env(find_provider(id).unwrap(), None, None, None);
 
     // Env-driven scenarios (serialized within this single test).
     std::env::remove_var("NODE_OPTIONS");
@@ -863,7 +864,12 @@ fn droid_arg_assembly_includes_append_system_prompt_file() {
 #[test]
 fn opencode_env_includes_instructions_with_model() {
     let opencode = find_provider("opencode").unwrap();
-    let env = build_provider_env(opencode, Some("claude-sonnet-4"), Some("/tmp/rules.md"));
+    let env = build_provider_env(
+        opencode,
+        Some("claude-sonnet-4"),
+        Some("/tmp/rules.md"),
+        None,
+    );
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(
@@ -875,7 +881,7 @@ fn opencode_env_includes_instructions_with_model() {
 #[test]
 fn opencode_env_includes_instructions_without_model() {
     let opencode = find_provider("opencode").unwrap();
-    let env = build_provider_env(opencode, None, Some("/tmp/rules.md"));
+    let env = build_provider_env(opencode, None, Some("/tmp/rules.md"), None);
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/rules.md"]}"#)
@@ -885,7 +891,7 @@ fn opencode_env_includes_instructions_without_model() {
 #[test]
 fn opencode_env_model_only_no_instructions() {
     let opencode = find_provider("opencode").unwrap();
-    let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
+    let env = build_provider_env(opencode, Some("claude-sonnet-4"), None, None);
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"permission":{"task":"deny"},"model":"claude-sonnet-4"}"#)
@@ -895,7 +901,7 @@ fn opencode_env_model_only_no_instructions() {
 #[test]
 fn opencode_env_escapes_json_in_instructions_path() {
     let opencode = find_provider("opencode").unwrap();
-    let env = build_provider_env(opencode, None, Some(r#"/tmp/"rules".md"#));
+    let env = build_provider_env(opencode, None, Some(r#"/tmp/"rules".md"#), None);
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/\"rules\".md"]}"#)
@@ -913,6 +919,49 @@ fn auggie_mechanism_unchanged() {
     assert_eq!(auggie.rules_flag, Some("--rules"));
 
     // Env assembly doesn't add OPENCODE_CONFIG_CONTENT for auggie
-    let env = build_provider_env(auggie, Some("sonnet4.5"), Some("/tmp/rules.md"));
+    let env = build_provider_env(auggie, Some("sonnet4.5"), Some("/tmp/rules.md"), None);
     assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
+}
+
+#[test]
+fn opencode_env_merges_mcp_block_preserving_other_keys() {
+    let opencode = find_provider("opencode").unwrap();
+    let mcp = r#"{"workspace-mcp":{"type":"local","command":["intentd","mcp-bridge","--connect","127.0.0.1:9999"],"enabled":true,"environment":{}}}"#;
+    let env = build_provider_env(
+        opencode,
+        Some("claude-sonnet-4"),
+        Some("/tmp/rules.md"),
+        Some(mcp),
+    );
+    // permission, model, and instructions all survive; mcp is spliced last.
+    let expected = format!(
+        r#"{{"permission":{{"task":"deny"}},"model":"claude-sonnet-4","instructions":["/tmp/rules.md"],"mcp":{mcp}}}"#
+    );
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(expected.as_str())
+    );
+
+    // Empty or whitespace-only mcp json is ignored rather than emitting
+    // invalid JSON.
+    for blank in ["", " ", "\n\t "] {
+        let env = build_provider_env(opencode, None, None, Some(blank));
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some(r#"{"permission":{"task":"deny"}}"#),
+            "mcp json {blank:?} must be ignored"
+        );
+    }
+}
+
+#[test]
+fn non_env_config_providers_ignore_mcp_json() {
+    let mcp = r#"{"workspace-mcp":{"type":"local","command":["x"],"enabled":true}}"#;
+    for id in ["auggie", "claude-code", "codex", "droid"] {
+        let env = build_provider_env(find_provider(id).unwrap(), None, None, Some(mcp));
+        assert!(
+            !env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "{id} unexpectedly emitted OPENCODE_CONFIG_CONTENT"
+        );
+    }
 }
