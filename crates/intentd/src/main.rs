@@ -755,6 +755,7 @@ async fn cmd_serve(
     // teardown as an OS signal, so `stop` can ask politely before escalating.
     // Must be built BEFORE the WSS server so it can be passed to the constructor.
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let proc_usage = spawn_proc_usage_sampler();
     let control = Arc::new(DaemonControl {
         listen_mode: listen.to_string(),
         uds: serve_uds_enabled,
@@ -763,6 +764,7 @@ async fn cmd_serve(
         shutdown: shutdown_notify.clone(),
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
+        proc_usage,
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -1028,6 +1030,75 @@ struct DaemonControl {
     ws_runtime: Arc<WsRuntimeControl>,
     /// Daemon start time (Instant) for uptime calculation.
     start_time: std::time::Instant,
+    /// Latest own-process CPU/memory sample from the background sampler.
+    proc_usage: Arc<ProcUsage>,
+}
+
+/// Latest own-process resource sample for `system.status`, written by the
+/// background sampler task (~1s tick) and read lock-free from `status()`.
+/// `cpu_percent` follows the raw `sysinfo` convention (100 = one full core,
+/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory.
+#[derive(Default)]
+struct ProcUsage {
+    /// `f32` CPU percent stored as raw bits (`f32::to_bits`).
+    cpu_bits: std::sync::atomic::AtomicU32,
+    memory_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl ProcUsage {
+    fn store(&self, cpu_percent: f32, memory_bytes: u64) {
+        use std::sync::atomic::Ordering;
+        self.cpu_bits
+            .store(cpu_percent.to_bits(), Ordering::Relaxed);
+        self.memory_bytes.store(memory_bytes, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> (f32, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            f32::from_bits(self.cpu_bits.load(Ordering::Relaxed)),
+            self.memory_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Spawn the own-process CPU/memory sampler backing `system.status` (§5.7).
+/// Takes one synchronous sample first so `memoryBytes` is populated before the
+/// listeners come up (the first CPU reading may legitimately be 0 — sysinfo
+/// needs two refreshes to compute a delta), then refreshes on a ~1s tick.
+/// Refreshes are scoped to the daemon's own PID — never a full-system scan.
+fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let usage = Arc::new(ProcUsage::default());
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        tracing::warn!("cannot resolve own pid; cpu/memory sampling disabled");
+        return usage;
+    };
+    let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+    let mut sys = System::new();
+    let sample = move |sys: &mut System, usage: &ProcUsage| {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh_kind);
+        if let Some(proc) = sys.process(pid) {
+            usage.store(proc.cpu_usage(), proc.memory());
+        }
+    };
+    sample(&mut sys, &usage);
+
+    let task_usage = usage.clone();
+    tokio::spawn(async move {
+        // Start one period out: `interval`'s first tick fires immediately,
+        // which would re-refresh right after the startup sample — under
+        // sysinfo's MINIMUM_CPU_UPDATE_INTERVAL, yielding an unreliable delta.
+        let period = Duration::from_secs(1);
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            sample(&mut sys, &task_usage);
+        }
+    });
+    usage
 }
 
 /// Runtime control for the WSS listener, shared between DaemonControl and
@@ -1108,6 +1179,7 @@ impl SystemControl for DaemonControl {
             (None, None, 0)
         };
 
+        let (cpu_percent, memory_bytes) = self.proc_usage.load();
         SystemStatus {
             listen_mode: self.listen_mode.clone(),
             uds: self.uds,
@@ -1122,6 +1194,8 @@ impl SystemControl for DaemonControl {
             max_agents: self.manager.registry().cap(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
+            cpu_percent,
+            memory_bytes,
         }
     }
 
@@ -1874,6 +1948,11 @@ fn print_status(config: &Config, r: &Value) {
     }
     println!("  clients: {}", r["clients"].as_u64().unwrap_or(0));
     println!("  agents: {}", r["agents"].as_u64().unwrap_or(0));
+    println!(
+        "  cpuPercent: {:.1}",
+        r["cpuPercent"].as_f64().unwrap_or(0.0)
+    );
+    println!("  memoryBytes: {}", r["memoryBytes"].as_u64().unwrap_or(0));
     match r["fingerprint"].as_str() {
         Some(fp) => println!("  fingerprint: {fp}"),
         None => println!("  fingerprint: (none)"),

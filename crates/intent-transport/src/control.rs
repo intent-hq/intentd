@@ -44,6 +44,12 @@ pub struct SystemStatus {
     pub version: String,
     /// Uptime in seconds since daemon start.
     pub uptime_seconds: u64,
+    /// CPU usage of the daemon process, raw `sysinfo` convention: 100 = one
+    /// full core, so values may exceed 100 on multi-core hosts. The first
+    /// sample after startup may legitimately read 0.
+    pub cpu_percent: f32,
+    /// Resident memory of the daemon process, in bytes.
+    pub memory_bytes: u64,
 }
 
 /// Live daemon control surface implemented by the composition root (`intentd`).
@@ -118,6 +124,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
         "maxAgents": status.max_agents,
         "version": status.version,
         "uptimeSeconds": status.uptime_seconds,
+        "cpuPercent": status.cpu_percent,
+        "memoryBytes": status.memory_bytes,
         "fingerprint": status.fingerprint,
         "protocolVersion": PROTOCOL_VERSION,
         "host": {
