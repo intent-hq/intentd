@@ -122,8 +122,23 @@ where
         .await
         .unwrap_or(Err(ProbeError::Timeout));
 
-    let _ = child.kill().await;
+    reap_child(&mut child).await;
     result
+}
+
+/// Kill the probe child and reap it. Signals the whole process group (the
+/// child is its own group leader via `process_group(0)`) so grandchildren
+/// (e.g. `npx` → `node`) die too, then waits briefly so the child does not
+/// linger as a zombie. `kill_on_drop(true)` back-stops any wait timeout.
+async fn reap_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        use nix::sys::signal::{killpg, Signal};
+        use nix::unistd::Pid;
+        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+    let _ = child.kill().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
 }
 
 /// `initialize` → `session/new`, watching for model rows in either the
@@ -156,17 +171,24 @@ where
     // of) including it in the session/new result.
     let session_new = conn.request_timeout("session/new", session_params, SESSION_NEW_TIMEOUT);
     tokio::pin!(session_new);
+    let mut notifications_open = true;
     let session_result = loop {
         tokio::select! {
             resp = &mut session_new => break resp,
-            note = notifications.recv() => {
-                if let Some(note) = note {
-                    if is_model_update_method(&note.method) {
-                        let models = extract(&note.params);
-                        if !models.is_empty() {
-                            return Ok(models);
+            note = notifications.recv(), if notifications_open => {
+                match note {
+                    Some(note) => {
+                        if is_model_update_method(&note.method) {
+                            let models = extract(&note.params);
+                            if !models.is_empty() {
+                                return Ok(models);
+                            }
                         }
                     }
+                    // Channel closed (connection dropped the sender): disable
+                    // this branch so the select! cannot busy-spin and the
+                    // session/new future still resolves (or times out).
+                    None => notifications_open = false,
                 }
             }
         }
