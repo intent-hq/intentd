@@ -923,6 +923,31 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         ["models", "providerId", "source", "warning"],
         "{resp}"
     );
+
+    // Legacy path with only `forceRefresh` (no providerId): still routes and
+    // keeps the legacy shape. On a fresh daemon there is no last-good cache
+    // entry, so a failed forced probe degrades straight to the static catalog
+    // — exactly `{ models, source }`, no providerId/stale/warning fields.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":10,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 10);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert!(!resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    let source = resp["result"]["source"].as_str().expect("source");
+    assert!(source == "auggie" || source == "static", "source: {source}");
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source"], "{resp}");
     srv.ws.stop().await;
 }
 
