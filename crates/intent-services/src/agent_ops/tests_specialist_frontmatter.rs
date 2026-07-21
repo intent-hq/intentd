@@ -63,7 +63,6 @@ async fn create_agent(
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -222,7 +221,6 @@ async fn spoofed_workspace_path_ignored() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await

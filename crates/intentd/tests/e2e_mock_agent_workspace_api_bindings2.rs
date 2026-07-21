@@ -110,7 +110,6 @@ async fn event_bindings_recent_files_and_query() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -219,7 +218,6 @@ async fn file_bindings_read_write_list() {
         .agent_create(
             ws.clone(),
             Some("E2E File".into()),
-            None,
             None,
             None,
             None,
@@ -354,7 +352,6 @@ async fn agent_bindings_list_and_status() {
         .agent_create(
             ws.clone(),
             Some("E2E Agent".into()),
-            None,
             None,
             None,
             None,
@@ -514,7 +511,6 @@ async fn git_bindings_status_stage_commit() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -638,7 +634,6 @@ async fn note_bindings_edit_and_edit_lines() {
         .agent_create(
             ws.clone(),
             Some("E2E Note".into()),
-            None,
             None,
             None,
             None,

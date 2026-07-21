@@ -131,7 +131,6 @@ async fn agent_diagnostics_returns_workspace_snapshot() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -162,7 +161,6 @@ async fn agent_status_returns_full_metadata() {
         .agent_create(
             ws.clone(),
             Some("StatusTest".into()),
-            None,
             None,
             None,
             None,
@@ -204,7 +202,6 @@ async fn agent_list_returns_created_agents() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -215,7 +212,6 @@ async fn agent_list_returns_created_agents() {
         .agent_create(
             ws.clone(),
             Some("ListTest2".into()),
-            None,
             None,
             None,
             None,
@@ -247,7 +243,6 @@ async fn agent_read_conversation_returns_messages() {
         .agent_create(
             ws.clone(),
             Some("ConvTest".into()),
-            None,
             None,
             None,
             None,
@@ -310,7 +305,6 @@ async fn agent_summary_returns_shape() {
         .agent_create(
             ws.clone(),
             Some("SummTest".into()),
-            None,
             None,
             None,
             None,

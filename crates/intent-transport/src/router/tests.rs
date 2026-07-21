@@ -1992,6 +1992,59 @@ async fn workspace_create_returns_workspace_object() {
     );
 }
 
+/// Agent ids are server-assigned: a stale client that still sends
+/// `agentId` on `agent.create` is rejected up front with `-32602` before
+/// the request ever reaches the service.
+#[tokio::test]
+async fn agent_create_rejects_client_supplied_agent_id() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","name":"A","agentId":"agent-11111111-1111-1111-1111-111111111111"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("server-assigned"),
+        "error message should say agent IDs are server-assigned: {v}"
+    );
+}
+
+/// Same guard for `workspace.create`: `initialAgent.agentId` is no longer
+/// accepted — reject with `-32602` before dispatching to the service.
+#[tokio::test]
+async fn workspace_create_rejects_initial_agent_agent_id() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WS","initialAgent":{"agentId":"agent-11111111-1111-1111-1111-111111111111","prompt":"hi"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("server-assigned"),
+        "error message should say agent IDs are server-assigned: {v}"
+    );
+}
+
+/// `initialAgent` without an `agentId` still passes through the guard.
+#[tokio::test]
+async fn workspace_create_with_initial_agent_sans_agent_id_is_accepted() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WS","initialAgent":{"prompt":"hi"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        v["result"]["workspace"].is_object(),
+        "create without agentId succeeds: {v}"
+    );
+}
+
 #[tokio::test]
 async fn workspace_update_returns_workspace_object() {
     let v = call(

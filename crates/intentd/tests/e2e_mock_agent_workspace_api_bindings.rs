@@ -128,7 +128,6 @@ async fn task_bindings_update_status_and_get() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -262,7 +261,6 @@ async fn comment_bindings_add_and_list() {
         .agent_create(
             ws.clone(),
             Some("E2E Comment".into()),
-            None,
             None,
             None,
             None,
