@@ -308,7 +308,8 @@ pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
-/// `_meta` injection (auggie, droid, opencode, cortex, mock use other mechanisms).
+/// `_meta` injection (auggie, droid, opencode, cortex, grok, mock use other
+/// mechanisms).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
 ///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)

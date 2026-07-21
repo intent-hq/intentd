@@ -2238,19 +2238,60 @@ async fn report_provider_availability() {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let auth = check_provider_auth(provider.command, provider.auth_check_args).await;
+        // Spawn via the resolved path when available (grok's binary may live
+        // outside PATH at ~/.grok/bin/grok), else the bare command.
+        let program = provider
+            .resolved_path
+            .as_ref()
+            .map(|p| p.as_os_str().to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(provider.command));
+        let auth = check_provider_auth(provider.id, &program, provider.auth_check_args).await;
         println!("  [ok] {} installed: {path}{auth}", provider.id);
     }
 }
 
 /// Best-effort authentication probe for an installed provider: run its
-/// `auth_check_args` (exit 0 ⇒ authenticated) with a short timeout. Returns a
-/// trailing status fragment for the doctor line, or empty when no probe applies.
-async fn check_provider_auth(command: &str, auth_check_args: Option<&[&str]>) -> String {
+/// `auth_check_args` with a short timeout and report auth status. Most
+/// providers signal auth via the exit code (0 ⇒ authenticated); grok's
+/// `models` probe exits 0 in both auth states, so its stdout is parsed for
+/// the explicit auth markers instead. Returns a trailing status fragment for
+/// the doctor line, or empty when no probe applies.
+async fn check_provider_auth(
+    provider_id: &str,
+    program: &std::ffi::OsStr,
+    auth_check_args: Option<&[&str]>,
+) -> String {
     let Some(args) = auth_check_args else {
         return String::new();
     };
-    let run = tokio::process::Command::new(command)
+    if provider_id == "grok" {
+        let run = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        return match tokio::time::timeout(std::time::Duration::from_secs(8), run).await {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let parsed = intent_providers::parse_grok_models_command_output(&stdout);
+                match (parsed.authenticated, parsed.models.is_empty()) {
+                    (Some(true), _) => " (authenticated)".to_string(),
+                    (Some(false), _) => " (not authenticated)".to_string(),
+                    // No explicit marker but a parsed model list ⇒ the CLI is
+                    // serving models, treat as authenticated.
+                    (None, false) => " (authenticated)".to_string(),
+                    // No markers, no models: distinguish a probe that ran but
+                    // said nothing from one that failed outright (broken
+                    // install exits non-zero with empty/garbage stdout).
+                    (None, true) if output.status.success() => " (auth status unknown)".to_string(),
+                    (None, true) => " (auth check failed)".to_string(),
+                }
+            }
+            Ok(Err(_)) => " (auth check failed)".to_string(),
+            Err(_) => " (auth check timed out)".to_string(),
+        };
+    }
+    let run = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
