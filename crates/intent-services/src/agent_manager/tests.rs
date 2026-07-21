@@ -3716,6 +3716,34 @@ mod merge_user_mcp_servers_tests {
         assert!(out.is_empty());
     }
 
+    /// The opencode env config carries the same `workspace-mcp` bridge entry
+    /// (in OpenCode `mcp` block shape) that the auggie `--mcp-config` path
+    /// generates, pointing at the same bridge endpoint.
+    #[tokio::test]
+    async fn opencode_env_mcp_config_includes_bridge_server() {
+        let (_tmp, mgr, _secrets, _cfg) = manager_with_secrets().await;
+        let json = mgr
+            .opencode_env_mcp_config("127.0.0.1:9999".to_string())
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let bridge = &parsed["workspace-mcp"];
+        assert_eq!(bridge["type"], "local");
+        assert_eq!(bridge["enabled"], true);
+        let command: Vec<String> =
+            serde_json::from_value(bridge["command"].clone()).expect("command array");
+        assert_eq!(
+            &command[1..],
+            ["mcp-bridge", "--connect", "127.0.0.1:9999"],
+            "bridge args must match the auggie --mcp-config path"
+        );
+        assert_eq!(
+            command[0],
+            mgr.mcp_bridge_exe.to_string_lossy(),
+            "bridge command must be the daemon's mcp-bridge executable"
+        );
+    }
+
     // Prevent dead-code warnings for `manager` when this module compiles alone.
     #[allow(dead_code)]
     async fn _use_manager() {
