@@ -65,14 +65,19 @@ jobs:
         run: |
           channel_tag="channel-$CHANNEL"
           if ! gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # Tolerate a lost create race (two same-channel tags close together);
-            # the --clobber upload below is the source of truth.
-            gh release create "$channel_tag" \
+            if ! gh release create "$channel_tag" \
               --repo "$GITHUB_REPOSITORY" \
               --latest=false \
               --title "Channel manifest: $CHANNEL" \
-              --notes "Machine-readable pointer to the latest $CHANNEL intentd release. Do not consume the tag itself; download the $CHANNEL.json asset." \
-              || true
+              --notes "Machine-readable pointer to the latest $CHANNEL intentd release. Do not consume the tag itself; download the $CHANNEL.json asset."
+            then
+              # Tolerate only a lost create race (two same-channel tags close
+              # together): the release must exist now; otherwise fail loudly.
+              if ! gh release view "$channel_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "error: failed to create release $channel_tag and it does not exist" >&2
+                exit 1
+              fi
+            fi
           fi
           gh release upload "$channel_tag" \
             "$CHANNEL.json" \
