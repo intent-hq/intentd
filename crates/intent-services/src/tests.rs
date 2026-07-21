@@ -5283,7 +5283,6 @@ mod pr {
                 interval: 5,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
                 phase: crate::github_auth_ops::FlowPhase::Pending,
-                task: None,
             });
         }
         let c = svc.github_connect().await.expect("connect");
@@ -5307,7 +5306,6 @@ mod pr {
                 interval: 5,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
                 phase: crate::github_auth_ops::FlowPhase::Pending,
-                task: None,
             });
         }
         let c = svc.github_cancel_auth().await.expect("cancel");
@@ -5336,7 +5334,6 @@ mod pr {
                 interval: 5,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
                 phase: crate::github_auth_ops::FlowPhase::Denied,
-                task: None,
             });
         }
         let c = svc.github_cancel_auth().await.expect("cancel");
@@ -5362,7 +5359,6 @@ mod pr {
                 interval: 5,
                 deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
                 phase: crate::github_auth_ops::FlowPhase::Pending,
-                task: None,
             });
         }
         let r = svc.github_revoke().await.expect("revoke");

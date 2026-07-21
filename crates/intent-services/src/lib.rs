@@ -13896,6 +13896,7 @@ impl WorkspaceApi for Services {
         // persisted server-side by the engine and never crosses the wire.
         let state = self.github_auth_flow.clone();
         let bus = self.event_bus.clone();
+        let secrets = self.secrets.clone();
         let client_id = self
             .effective_settings()
             .source_control
@@ -13916,12 +13917,9 @@ impl WorkspaceApi for Services {
                         return Ok(github_auth_ops::connect_response(s));
                     }
                 }
-                // Replace any terminal/expired slot: abort a lingering task.
-                if let Some(s) = slot.take() {
-                    if let Some(task) = s.task {
-                        task.abort();
-                    }
-                }
+                // Replace any terminal/expired slot; its poll task (if any)
+                // exits cooperatively once its generation is gone.
+                *slot = None;
             }
             let (auth, flow) = intent_sourcecontrol::device_flow::start_at(
                 &base_uri,
@@ -13942,9 +13940,10 @@ impl WorkspaceApi for Services {
             let flow_id = github_auth_ops::next_flow_id();
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_secs(auth.expires_in);
-            let task = tokio::spawn(github_auth_ops::run_poll_loop(
+            tokio::spawn(github_auth_ops::run_poll_loop(
                 state.clone(),
                 bus,
+                secrets,
                 flow_id,
                 flow,
                 deadline,
@@ -13956,7 +13955,6 @@ impl WorkspaceApi for Services {
                 interval: auth.interval,
                 deadline,
                 phase: github_auth_ops::FlowPhase::Pending,
-                task: Some(task.abort_handle()),
             };
             let resp = github_auth_ops::connect_response(&new_slot);
             *slot = Some(new_slot);
@@ -13971,14 +13969,13 @@ impl WorkspaceApi for Services {
             let mut slot = state.lock().await;
             // Only a pending flow is cancellable. A terminal slot (expired /
             // denied / error) is left intact so authStatus keeps surfacing
-            // the outcome until the next connect replaces it.
+            // the outcome until the next connect replaces it. Removing the
+            // slot orphans the poll task, which exits cooperatively at its
+            // next tick (and reconciles a raced authorize by deleting the
+            // just-persisted token — see `github_auth_ops::FlowSlot`).
             let cancelled = match slot.as_ref() {
                 Some(s) if s.phase == github_auth_ops::FlowPhase::Pending => {
-                    if let Some(s) = slot.take() {
-                        if let Some(task) = s.task {
-                            task.abort();
-                        }
-                    }
+                    *slot = None;
                     true
                 }
                 _ => false,
@@ -13989,25 +13986,18 @@ impl WorkspaceApi for Services {
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         // Delete the stored `sourceControl.github.token` (device-flow slot of
-        // the resolution chain) and abort any in-flight flow. Env / `gh` CLI
-        // fallbacks are untouched — authStatus reflects them on next probe.
+        // the resolution chain) and orphan any in-flight flow (its poll task
+        // exits cooperatively and reconciles a raced authorize by deleting
+        // the just-persisted token). Env / `gh` CLI fallbacks are untouched —
+        // authStatus reflects them on next probe.
         let state = self.github_auth_flow.clone();
         let secrets = self.secrets.clone();
         let bus = self.event_bus.clone();
         Box::pin(async move {
             {
                 let mut slot = state.lock().await;
-                if let Some(s) = slot.take() {
-                    if let Some(task) = s.task {
-                        task.abort();
-                    }
-                }
+                *slot = None;
             }
-            // Known narrow race: `abort()` cannot cancel a token write the
-            // engine already handed to `spawn_blocking`, so a poll that
-            // authorized in this exact window can re-materialize the token
-            // after the delete below. The next authStatus probe / explicit
-            // revoke reconciles it — not worth a drain barrier here.
             github_auth_ops::delete_stored_token(&secrets).await?;
             publish_event(&bus, github_auth_ops::auth_changed_event("revoked")).await;
             Ok(serde_json::json!({ "ok": true }))

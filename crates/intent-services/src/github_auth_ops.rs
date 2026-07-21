@@ -59,9 +59,16 @@ impl FlowPhase {
 
 /// The single in-flight / last-terminal device-flow slot. Holds only the
 /// user-facing codes (never `device_code` or the token).
+///
+/// Cancellation is **cooperative**: cancel/revoke/connect-replace remove or
+/// replace the slot, and the background poll task exits at its next tick when
+/// its generation is no longer resident. No `abort()` — a hard abort could
+/// land while the engine's non-cancellable `spawn_blocking` token write is in
+/// flight, leaving a token on disk that a revoke meant to prevent; the
+/// cooperative task instead reconciles (deletes) such a write itself.
 pub(crate) struct FlowSlot {
-    /// Generation guard: a poll task only mutates the slot while its own
-    /// flow is still the resident one (a newer `connect` replaces it).
+    /// Generation guard: a poll task only polls/mutates while its own flow
+    /// is still the resident one (cancel/revoke/a newer `connect` orphan it).
     pub(crate) flow_id: u64,
     pub(crate) user_code: String,
     pub(crate) verification_uri: String,
@@ -72,8 +79,6 @@ pub(crate) struct FlowSlot {
     /// When the codes expire (`start` + `expires_in`).
     pub(crate) deadline: Instant,
     pub(crate) phase: FlowPhase,
-    /// Abort handle of the background poll task while pending.
-    pub(crate) task: Option<tokio::task::AbortHandle>,
 }
 
 impl FlowSlot {
@@ -117,15 +122,24 @@ pub(crate) fn auth_changed_event(status: &str) -> NewEvent {
     }
 }
 
+/// True iff this task's flow is still the resident slot.
+async fn is_resident(state: &FlowState, flow_id: u64) -> bool {
+    let slot = state.lock().await;
+    matches!(slot.as_ref(), Some(s) if s.flow_id == flow_id)
+}
+
 /// The daemon-owned poll loop `github.connect` spawns: polls GitHub at the
 /// engine's cadence until a terminal transition, then updates the slot (iff
-/// its generation still matches — a newer `connect` orphans this task) and
-/// emits `github:auth-changed`. On `Authorized` the engine has already
-/// persisted the token, so the slot is cleared and `github.authStatus`
-/// reflects the configured token from then on.
+/// its generation still matches — cancel/revoke/a newer `connect` orphan this
+/// task) and emits `github:auth-changed`. On `Authorized` the engine has
+/// already persisted the token, so the slot is cleared and
+/// `github.authStatus` reflects the configured token from then on. If the
+/// flow was orphaned while the authorizing poll was in flight, the persisted
+/// token is deleted again (see [`FlowSlot`] on cooperative cancellation).
 pub(crate) async fn run_poll_loop(
     state: FlowState,
     bus: Option<EventBus>,
+    secrets: Arc<crate::settings::AsyncSecretStore>,
     flow_id: u64,
     mut flow: DeviceFlow,
     deadline: Instant,
@@ -133,10 +147,21 @@ pub(crate) async fn run_poll_loop(
     let mut consecutive_errors: u32 = 0;
     // `None` = authorized (slot cleared); `Some(phase)` = terminal failure.
     let outcome: Option<FlowPhase> = loop {
-        tokio::time::sleep(poll_sleep(flow.interval_secs())).await;
-        if Instant::now() >= deadline {
+        // Sleep the engine cadence, capped at the deadline so a grown
+        // (`slow_down`) interval can never delay the expiry transition.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             // GitHub kept answering pending past `expires_in`; expire locally
             // so the loop cannot poll forever.
+            break Some(FlowPhase::Expired);
+        }
+        tokio::time::sleep(poll_sleep(flow.interval_secs()).min(remaining)).await;
+        // Cooperative cancellation: stop before touching the network once
+        // cancel/revoke/a newer connect removed or replaced the slot.
+        if !is_resident(&state, flow_id).await {
+            return;
+        }
+        if Instant::now() >= deadline {
             break Some(FlowPhase::Expired);
         }
         match flow.poll_once().await {
@@ -163,12 +188,22 @@ pub(crate) async fn run_poll_loop(
             // Only touch the slot while this task's flow is still resident.
             Some(s) if s.flow_id == flow_id => match outcome {
                 None => *slot = None,
-                Some(phase) => {
-                    s.phase = phase;
-                    s.task = None;
-                }
+                Some(phase) => s.phase = phase,
             },
-            _ => return,
+            _ => {
+                // Orphaned while the last poll was in flight. If that poll
+                // authorized, the engine persisted a token a concurrent
+                // cancel/revoke meant to prevent — reconcile by deleting it.
+                if outcome.is_none() {
+                    if let Err(e) = secrets.delete(SECRET_ACCOUNT).await {
+                        tracing::warn!(
+                            error = %e,
+                            "could not delete github token after orphaned authorize"
+                        );
+                    }
+                }
+                return;
+            }
         }
     }
     let status = outcome.map_or("authorized", FlowPhase::as_wire);
@@ -253,7 +288,6 @@ mod tests {
             interval: 5,
             deadline: Instant::now() + remaining,
             phase,
-            task: None,
         }
     }
 
