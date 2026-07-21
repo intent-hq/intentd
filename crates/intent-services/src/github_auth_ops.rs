@@ -217,10 +217,13 @@ pub(crate) async fn delete_stored_token(secrets: &crate::settings::AsyncSecretSt
     secrets.delete(SECRET_ACCOUNT).await
 }
 
-/// Resolve the login host: test/builder override → env override → github.com.
+/// Resolve the login host. The builder override wins over the env override
+/// (the env is only consulted when no builder override is set); the winning
+/// candidate is then safety-checked — an unsafe value falls back directly to
+/// the `github.com` default, it does NOT fall through to the other override.
 /// 🔒 Cleartext `http://` overrides are only honored for loopback hosts (the
 /// hermetic-test seam); anything else would hand the access token to an
-/// unencrypted non-local endpoint, so it is ignored in favor of the default.
+/// unencrypted non-local endpoint.
 pub(crate) fn resolve_login_base_uri(override_uri: Option<&str>) -> String {
     override_uri
         .map(str::to_string)
