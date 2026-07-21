@@ -37,6 +37,18 @@ const SHELL_FETCH_POLL: Duration = Duration::from_millis(50);
 /// child git's credential helper. The value never appears on the command line.
 const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
 
+/// The `git -c` config entry offering the resolved token as a github.com-scoped
+/// credential helper. Note the `{{`/`}}`/`{TOKEN_ENV}` are **Rust** `format!`
+/// escapes and interpolation — the shell sees a plain
+/// `"$INTENT_GIT_GITHUB_TOKEN"` expansion (no token bytes in the string
+/// itself). `|| exit 0` keeps the helper silent-but-successful for the
+/// `store`/`erase` ops git may also invoke.
+fn token_helper_config() -> String {
+    format!(
+        "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username=x-access-token\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
+    )
+}
+
 /// Fetch a single `branch` from `remote` (typically `origin`), updating the local
 /// remote-tracking ref `refs/remotes/<remote>/<branch>`. `token` is an optional
 /// caller-resolved GitHub token used as the final credential-chain step for
@@ -78,9 +90,7 @@ pub(crate) fn fetch_with_timeout(
     // token order, matching `crate::auth`). The helper reads the secret from
     // the environment — the argv below carries no token bytes.
     if let Some(token) = token.filter(|t| !t.is_empty()) {
-        cmd.arg("-c").arg(format!(
-            "credential.https://github.com.helper=!f() {{ test \"$1\" = get && printf 'username=x-access-token\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
-        ));
+        cmd.arg("-c").arg(token_helper_config());
         cmd.env(TOKEN_ENV, token);
     }
     let mut child = cmd
@@ -221,6 +231,48 @@ mod tests {
             msg.contains("git fetch failed"),
             "unexpected error message: {msg}"
         );
+    }
+
+    /// The `-c` credential-helper config never contains token bytes (the token
+    /// travels via the environment), and the snippet emits the expected
+    /// `username=`/`password=` lines when driven exactly as git drives a
+    /// `!`-helper (`sh -c '<snippet> get'` with the env var set).
+    #[test]
+    fn token_helper_config_is_token_free_and_emits_credentials() {
+        let config = token_helper_config();
+        let token = "tok%$\"weird";
+        assert!(
+            !config.contains(token),
+            "helper config must not embed the token"
+        );
+        // The shell must see `"$INTENT_GIT_GITHUB_TOKEN"`, not Rust's
+        // `{TOKEN_ENV}` placeholder.
+        assert!(config.contains(&format!("\"${TOKEN_ENV}\"")));
+
+        let snippet = config
+            .strip_prefix("credential.https://github.com.helper=!")
+            .expect("config must be a github.com-scoped ! helper");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{snippet} get"))
+            .env(TOKEN_ENV, token)
+            .output()
+            .expect("sh must run the helper snippet");
+        assert!(out.status.success());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout,
+            format!("username=x-access-token\npassword={token}\n")
+        );
+        // Non-`get` ops exit 0 with no output (store/erase must not fail).
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{snippet} store"))
+            .env(TOKEN_ENV, token)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
     }
 
     /// The wall-clock timeout kills the child and returns a structured error

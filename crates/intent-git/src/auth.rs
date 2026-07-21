@@ -74,8 +74,14 @@ pub(crate) fn token_fallback(
 /// walks the ssh-agent → credential-helper → resolved-token chain and errors
 /// when nothing is usable. The token step is last so existing ssh-agent /
 /// credential-helper setups are untouched, and it only applies to HTTPS
-/// `github.com` remotes (see [`token_fallback`]). Pure of the closure state so
-/// unit tests can drive the bound directly.
+/// `github.com` remotes (see [`token_fallback`]).
+///
+/// libgit2 only re-enters the callback after the server *rejected* the
+/// previous answer, so on re-entry (`attempt >= 1`) the credential-helper step
+/// is skipped: a stale helper credential (e.g. an expired PAT in the OS
+/// keychain) would otherwise be returned identically on every attempt,
+/// starving the token step of its turn. Pure of the closure state so unit
+/// tests can drive the bound directly.
 pub(crate) fn resolve_credential(
     url: &str,
     username: Option<&str>,
@@ -94,7 +100,7 @@ pub(crate) fn resolve_credential(
             return Ok(cred);
         }
     }
-    if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+    if attempt == 0 && allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
         if let Ok(config) = git2::Config::open_default() {
             if let Ok(cred) = Cred::credential_helper(&config, url, username) {
                 return Ok(cred);
@@ -290,6 +296,27 @@ mod tests {
             // never the token (the token step requires USER_PASS_PLAINTEXT).
             drop(cred);
         }
+    }
+
+    /// On re-entry (the server rejected the previous answer) the credential
+    /// helper is skipped, so a stale helper credential cannot starve the token
+    /// step: attempt 1 for a userpass github.com ask must answer with the
+    /// token deterministically, regardless of the developer's helper state.
+    #[test]
+    fn reentry_skips_helper_and_reaches_token() {
+        let res = resolve_credential(
+            "https://github.com/o/r.git",
+            None,
+            git2::CredentialType::USER_PASS_PLAINTEXT,
+            1,
+            MAX_CREDENTIAL_ATTEMPTS,
+            Some("tok"),
+        );
+        assert!(
+            res.is_ok(),
+            "attempt 1 must reach the token step: {:?}",
+            res.err().map(|e| e.message().to_string())
+        );
     }
 
     /// Without a token the resolver errors exactly as before for a userpass

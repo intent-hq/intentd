@@ -4414,27 +4414,17 @@ async fn git_fetch_bounded(
 }
 
 /// The [`intent_sourcecontrol::TokenSource`] to use for git-credential token
-/// resolution. An explicitly configured `sourceControl.github.tokenSource`
-/// (file / flag origin) is respected; the schema default falls back to the
-/// full `Auto` chain (secrets store → env → `gh`) so a device-flow token in
-/// the secrets store is picked up without configuration.
+/// resolution: the effective `sourceControl.github.tokenSource`, deserialized
+/// via the `TokenSource` serde derive (kebab-case, same wire spelling as the
+/// settings enum) so the mapping can never drift. Defaults to the full `Auto`
+/// chain (secrets store → env → `gh`) so a device-flow token in the secrets
+/// store is picked up without configuration.
 fn github_token_source(registry: Option<&SettingsRegistry>) -> intent_sourcecontrol::TokenSource {
     use intent_sourcecontrol::TokenSource;
-    let Some(registry) = registry else {
-        return TokenSource::Auto;
-    };
-    let snapshot = registry.snapshot();
-    let path = "sourceControl.github.tokenSource";
-    if snapshot.origin(path) == Some(SettingOrigin::Default) {
-        return TokenSource::Auto;
-    }
-    let value = snapshot.get(path);
-    match value.as_ref().and_then(|v| v.as_str()) {
-        Some("env") => TokenSource::Env,
-        Some("gh-cli") => TokenSource::GhCli,
-        Some("explicit") => TokenSource::Explicit,
-        _ => TokenSource::Auto,
-    }
+    registry
+        .and_then(|r| r.snapshot().get("sourceControl.github.tokenSource"))
+        .and_then(|v| serde_json::from_value::<TokenSource>(v).ok())
+        .unwrap_or(TokenSource::Auto)
 }
 
 /// Resolve the GitHub token to offer the git credential chain for network
@@ -4452,6 +4442,58 @@ async fn github_git_token(
         return None;
     }
     intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
+}
+
+#[cfg(test)]
+mod github_token_source_tests {
+    use super::*;
+    use intent_sourcecontrol::TokenSource;
+
+    fn registry_with(value: Option<&str>) -> Arc<SettingsRegistry> {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let registry =
+            SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
+        if let Some(v) = value {
+            registry
+                .apply(&[(
+                    "sourceControl.github.tokenSource".to_string(),
+                    serde_json::json!(v),
+                )])
+                .expect("apply tokenSource");
+        }
+        // Leak the tempdir so the config file outlives the registry handle.
+        std::mem::forget(dir);
+        Arc::new(registry)
+    }
+
+    /// No registry and the schema default both resolve to the full `Auto`
+    /// chain, so a device-flow token in the secrets store is found without
+    /// configuration.
+    #[test]
+    fn defaults_to_auto() {
+        assert_eq!(github_token_source(None), TokenSource::Auto);
+        let registry = registry_with(None);
+        assert_eq!(github_token_source(Some(&registry)), TokenSource::Auto);
+    }
+
+    /// Each configured wire value maps to its `TokenSource` variant via the
+    /// serde derive — the settings enum and the resolver can't drift.
+    #[test]
+    fn configured_values_map_via_serde() {
+        for (wire, expected) in [
+            ("auto", TokenSource::Auto),
+            ("env", TokenSource::Env),
+            ("gh-cli", TokenSource::GhCli),
+            ("explicit", TokenSource::Explicit),
+        ] {
+            let registry = registry_with(Some(wire));
+            assert_eq!(
+                github_token_source(Some(&registry)),
+                expected,
+                "wire value {wire:?}"
+            );
+        }
+    }
 }
 
 /// Build a `git:pull` event for a completed pull inside a workspace worktree
