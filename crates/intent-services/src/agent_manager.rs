@@ -3253,6 +3253,12 @@ impl AgentManager {
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 
+/// Short bounded window after the SIGKILL sweep in [`kill_child_trees`] during
+/// which the reap tasks are awaited so killed children are actually `wait()`ed
+/// before returning (SIGKILLed children reap almost instantly).
+#[cfg(unix)]
+const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
+
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
@@ -3302,9 +3308,7 @@ async fn kill_child_trees(children: Vec<Child>) {
                 let pgid = Pid::from_raw(pid as i32);
                 let _ = killpg(pgid, Signal::SIGTERM);
                 pgids.push(pgid);
-                // Reap on a task so all waits run concurrently; the task keeps
-                // running past the timeout below and reaps the child after the
-                // SIGKILL sweep (no zombies).
+                // Reap on a task so all waits run concurrently.
                 waits.push(tokio::spawn(async move {
                     let _ = child.wait().await;
                 }));
@@ -3315,17 +3319,28 @@ async fn kill_child_trees(children: Vec<Child>) {
             }
         }
     }
-    // Phase 2: ONE shared grace window over the whole batch.
-    let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, async {
-        for w in waits {
-            let _ = w.await;
+    // Phase 2: ONE shared grace window over the whole batch. Handles that
+    // don't finish in time are kept so they can be awaited again after the
+    // SIGKILL sweep.
+    let deadline = tokio::time::Instant::now() + PROCESS_GROUP_TERM_GRACE;
+    let mut pending = Vec::new();
+    for mut w in waits {
+        if tokio::time::timeout_at(deadline, &mut w).await.is_err() {
+            pending.push(w);
         }
-    })
-    .await;
+    }
     // Phase 3: concurrent SIGKILL sweep for anything that ignored SIGTERM
     // (no-op on groups that already exited).
     for pgid in pgids {
         let _ = killpg(pgid, Signal::SIGKILL);
+    }
+    // Phase 4: bounded reap — await the remaining wait tasks briefly so
+    // SIGKILLed children are actually `wait()`ed before returning. Any
+    // straggler past this window is still reaped by its background task; the
+    // bound just keeps total shutdown within budget.
+    let reap_deadline = tokio::time::Instant::now() + KILL_SWEEP_REAP_GRACE;
+    for mut w in pending {
+        let _ = tokio::time::timeout_at(reap_deadline, &mut w).await;
     }
 }
 

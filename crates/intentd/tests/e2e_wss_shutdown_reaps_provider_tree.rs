@@ -2,8 +2,8 @@
 //!
 //! Boots a real `intentd serve --listen both` against the mock ACP provider,
 //! which (via `MOCK_AGENT_TREE_PID_FILE`) spawns a long-lived grandchild
-//! (`sleep 300`) in its own process group — the bridge-style tree a real
-//! provider produces (e.g. an npx-launched MCP bridge). The agent parks
+//! (`sleep 300`) that inherits the provider's process group — the bridge-style
+//! tree a real provider produces (e.g. an npx-launched MCP bridge). The agent parks
 //! mid-turn so the child is guaranteed live, then `system.shutdown` triggers
 //! the graceful teardown path and the test asserts BOTH the provider child AND
 //! its grandchild are dead within the bounded kill-sweep window (<4s) — the

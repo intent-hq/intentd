@@ -168,7 +168,7 @@ async fn run_auggie(
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| ContextError::Spawn(e.to_string()))?,
         Err(_) => {
-            // Reap the whole process group (pgid == pid via `process_group`);
+            // Kill the whole process group (pgid == pid via `process_group`);
             // the dropped `wait_with_output` future's `kill_on_drop` covers
             // the direct child on non-unix.
             #[cfg(unix)]

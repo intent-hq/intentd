@@ -196,7 +196,16 @@ impl SpawnedAgent {
             use nix::unistd::Pid;
             let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
-        self.child.kill().await
+        // The group SIGKILL above may already have terminated the direct child,
+        // making `start_kill` report a spurious "already exited" error
+        // (InvalidInput) — tolerate it, then `wait()` so the child is actually
+        // reaped instead of lingering as a zombie.
+        match self.child.start_kill() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(e) => return Err(e),
+        }
+        self.child.wait().await.map(|_| ())
     }
 
     /// Decompose into the child and connection (e.g. to store separately).
