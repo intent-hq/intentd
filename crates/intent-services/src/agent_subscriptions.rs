@@ -489,11 +489,15 @@ impl Services {
     /// `true` iff this call newly recorded the child in memory (STAB-160: the
     /// immediate failure-wake dedup guard keys off this); `false` when the
     /// child is not expected or already recorded, or the group no longer
-    /// exists.
+    /// exists. The return reflects the in-memory recording only — it is still
+    /// `true` when the best-effort persist below fails.
     ///
     /// DURABILITY: Awaits the persist before returning so the completion is durable
     /// before the event is observable (fixes race where daemon kill between event
-    /// publish and spawned persist loses the completion across restart).
+    /// publish and spawned persist loses the completion across restart). The
+    /// persist is best-effort: a serialization or upsert failure is logged and
+    /// the in-memory recording stands (recovery across restart then relies on
+    /// the STAB-108 rehydration reconciliation).
     pub(crate) async fn record_group_child_completion(
         &self,
         workspace_id: &WorkspaceId,

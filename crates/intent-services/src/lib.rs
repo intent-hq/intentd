@@ -4926,7 +4926,11 @@ pub(crate) fn format_group_child_line(
 /// `completed` — failures count toward `partial` just like deletions.
 fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     let total = group.expected_agent_ids.len();
-    let partial = !group.deleted_agent_ids.is_empty() || !failed_group_children(group).is_empty();
+    let any_failed = group
+        .raw_events
+        .iter()
+        .any(|e| e.event_type == AGENT_FAILED);
+    let partial = !group.deleted_agent_ids.is_empty() || any_failed;
     let status = if partial { "partial" } else { "completed" };
     let mut msg = format!(
         "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
