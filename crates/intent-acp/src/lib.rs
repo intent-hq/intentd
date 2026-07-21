@@ -41,8 +41,8 @@ pub use handshake::{handshake, HandshakeResult};
 pub use mcp_bridge::{run_stdio_bridge, serve_workspace_mcp_tcp, McpBridge};
 pub use mcp_config::{
     apply_baseline_env_to_stdio_servers, normalize_mcp_servers, to_acp_mcp_servers,
-    to_auggie_mcp_config, to_claude_mcp_json, to_codex_mcp_overrides, to_opencode_mcp_config,
-    CodexConfigOverride, NormalizedMcpServer, NormalizedMcpServers,
+    to_acp_session_mcp_servers, to_auggie_mcp_config, to_claude_mcp_json, to_codex_mcp_overrides,
+    to_opencode_mcp_config, CodexConfigOverride, NormalizedMcpServer, NormalizedMcpServers,
 };
 pub use mcp_env::{
     build_baseline_mcp_env, build_baseline_mcp_env_from_process, is_likely_secret_env_key,

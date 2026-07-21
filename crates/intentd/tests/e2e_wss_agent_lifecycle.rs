@@ -579,6 +579,136 @@ async fn mock_agent_full_turn_over_wss() {
     assert!(mc >= 1, "assistant message persisted (messageCount={mc})");
 }
 
+/// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
+/// `mcpServers`), the wire path claude-code/codex/droid use. Same full turn as
+/// [`mock_agent_full_turn_over_wss`], but `MOCK_AGENT_SESSION_MCP=1` flips the
+/// mock provider to `supports_session_mcp_servers` with NO `--mcp-config`
+/// flag: the only way the mock child can reach the workspace bridge is the
+/// `mcpServers` array the daemon put in the `session/new` request. The mock
+/// spawns the bridge command from that entry and mutates a note through it, so
+/// a successful marker assertion proves the field rode the real WSS→daemon→
+/// ACP wire and the bridge endpoint it carried actually works.
+#[tokio::test]
+async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
+    let Some(script) = gate("WSS session-mcpServers E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    let js = format!(
+        "return await ws.note.add({}, {{ content: {} }});",
+        json!(note_id),
+        json!(MARKER),
+    );
+    let behavior = json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "WSS session-mcp E2E ws.note.add" },
+        },
+        "response": "added via session/new mcpServers",
+    })
+    .to_string();
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_SESSION_MCP", "1"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "note:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-SessionMCP", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "please add" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Wait for the terminal stream:end; the note:updated event proves the MCP
+    // tool call went through the bridge the session/new request delivered.
+    let mut ends = 0u32;
+    let mut saw_note_updated = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:end") => {
+                ends += 1;
+                break;
+            }
+            Some("note:updated") => saw_note_updated = true,
+            _ => {}
+        }
+    }
+    assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
+    assert!(
+        saw_note_updated,
+        "tool's note:updated domain event delivered over WSS"
+    );
+
+    // The note mutated — reachable ONLY through the session/new-delivered
+    // bridge entry (the mock provider got no --mcp-config in this mode).
+    let note = wss_rpc(
+        &mut rpc,
+        13,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert!(
+        note["note"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(MARKER)
+            || note["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(MARKER),
+        "note mutated via the session/new-delivered workspace-MCP bridge: {note}"
+    );
+}
+
 /// Session-status lifecycle persistence (P0 — chat-spinner clear). A normal
 /// `agent.sendMessage` turn must drive the persisted `agent_session.status`
 /// through `Idle → active → idle` and emit the matching

@@ -102,6 +102,24 @@ fn registry_field_parity() {
     assert_eq!(mock.requires_env_var, Some("MOCK_AGENT_SCRIPT_PATH"));
 }
 
+/// Exactly claude-code, codex, and droid consume MCP servers from the ACP
+/// `session/new` / `session/load` `mcpServers` field; every other provider
+/// receives MCP config out-of-band (auggie `--mcp-config`, opencode env
+/// config) or not at all. Asserted over the full registry so a newly added
+/// provider can't accidentally opt in without updating this partition.
+#[test]
+fn session_mcp_servers_partition() {
+    let opted_in = ["claude-code", "codex", "droid"];
+    for id in all_provider_ids() {
+        let p = find_provider(id).unwrap();
+        assert_eq!(
+            p.supports_session_mcp_servers,
+            opted_in.contains(&id),
+            "{id}: supports_session_mcp_servers must match the pinned opt-in set {opted_in:?}"
+        );
+    }
+}
+
 #[test]
 fn auth_error_pattern_matching() {
     assert!(is_provider_authentication_error(

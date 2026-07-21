@@ -33,6 +33,12 @@ const cancelledToolCallIds = [];
 let nextClientCallId = 1;
 const pendingClientCalls = new Map();
 
+// MCP servers delivered in the `session/new` request's `mcpServers` field
+// (STAB-156): providers like claude-code/codex/droid consume MCP servers from
+// the ACP session setup instead of a `--mcp-config` file. Stashed here so
+// `callWorkspaceTool` can spawn the bridge from either delivery mechanism.
+let sessionMcpServers = [];
+
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
@@ -57,10 +63,26 @@ function mcpConfigPath() {
 // so the test fails loudly rather than silently skipping the mutation.
 function callWorkspaceTool(toolCall) {
   return new Promise((resolve, reject) => {
+    let srv = null;
     const path = mcpConfigPath();
-    if (!path) return reject(new Error('no --mcp-config provided'));
-    const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
-    const srv = cfg.mcpServers && cfg.mcpServers['workspace-mcp'];
+    if (path) {
+      const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
+      srv = (cfg.mcpServers && cfg.mcpServers['workspace-mcp']) || null;
+    }
+    if (!srv) {
+      // ACP session-setup delivery: the `session/new` `mcpServers` array
+      // carries untagged stdio entries { name, command, args, env: [{name,value}] }.
+      // Also the fallback when an `--mcp-config` file exists but lacks the
+      // bridge entry, so either delivery mechanism can win.
+      const entry = sessionMcpServers.find((s) => s && s.name === 'workspace-mcp');
+      if (entry) {
+        srv = {
+          command: entry.command,
+          args: entry.args || [],
+          env: Object.fromEntries((entry.env || []).map((e) => [e.name, e.value])),
+        };
+      }
+    }
     if (!srv) return reject(new Error('no workspace-mcp server in config'));
     log(`spawning bridge: ${srv.command} ${(srv.args || []).join(' ')}`);
     const child = spawn(srv.command, srv.args || [], {
@@ -432,9 +454,22 @@ async function dispatch(msg) {
           return;
         }
       }
+      // Stash the session-setup-delivered MCP servers (STAB-156) so
+      // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.
+      // Always overwritten (defaulting to []) so a later session/new that
+      // omits the field can't silently reuse a stale server list.
+      sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
+        ? msg.params.mcpServers
+        : [];
       return result(msg.id, { sessionId: SESSION_ID });
     }
     case 'session/load':
+      // Mirror session/new's stash-overwrite so a future loadSession-capable
+      // fixture (or a test sending session/load first) can't observe a stale
+      // list; the load itself is still rejected (loadSession: false).
+      sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
+        ? msg.params.mcpServers
+        : [];
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
       // Accept any mode change request (no-op for the mock).

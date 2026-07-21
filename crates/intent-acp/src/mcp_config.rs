@@ -8,6 +8,9 @@
 
 use std::collections::BTreeMap;
 
+use agent_client_protocol::schema::{
+    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
+};
 use serde_json::{json, Map, Value};
 
 use crate::mcp_env::{merge_mcp_env, EnvMap};
@@ -266,6 +269,53 @@ fn acp_remote(
 ) -> Value {
     let headers = headers.clone().unwrap_or_default();
     json!({ "name": name, "type": kind, "url": url, "headers": pairs_array(&headers) })
+}
+
+/// Convert to the typed ACP schema [`McpServer`] list carried in the
+/// `session/new` / `session/load` request for providers that consume MCP
+/// servers from the ACP session setup (claude-code, codex, droid). Same wire
+/// shape as [`to_acp_mcp_servers`] — stdio entries serialize untagged (no
+/// `type` field), remotes carry `type: http|sse` — but typed so the session
+/// lifecycle helpers take `Vec<McpServer>` directly.
+pub fn to_acp_session_mcp_servers(normalized: &NormalizedMcpServers) -> Vec<McpServer> {
+    let mut servers = Vec::new();
+    for (name, server) in normalized {
+        match server {
+            NormalizedMcpServer::Stdio { command, args, env } => {
+                servers.push(McpServer::Stdio(
+                    McpServerStdio::new(name.clone(), command.clone())
+                        .args(args.clone())
+                        .env(
+                            env.iter()
+                                .map(|(k, v)| EnvVariable::new(k.clone(), v.clone()))
+                                .collect(),
+                        ),
+                ));
+            }
+            NormalizedMcpServer::Http { url, headers } => {
+                servers.push(McpServer::Http(
+                    McpServerHttp::new(name.clone(), url.clone()).headers(header_pairs(headers)),
+                ));
+            }
+            NormalizedMcpServer::Sse { url, headers } => {
+                servers.push(McpServer::Sse(
+                    McpServerSse::new(name.clone(), url.clone()).headers(header_pairs(headers)),
+                ));
+            }
+        }
+    }
+    servers
+}
+
+fn header_pairs(headers: &Option<BTreeMap<String, String>>) -> Vec<HttpHeader> {
+    headers
+        .as_ref()
+        .map(|h| {
+            h.iter()
+                .map(|(k, v)| HttpHeader::new(k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A single Codex `-c key=value` config override.

@@ -98,6 +98,9 @@ pub struct ProviderConfig {
     pub supports_set_model: bool,
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
+    /// Whether the provider consumes MCP servers from the ACP `session/new` /
+    /// `session/load` request's `mcpServers` field (claude-code, codex, droid).
+    pub supports_session_mcp_servers: bool,
     /// Whether the provider supports rules files via CLI args.
     pub supports_rules_file: bool,
     /// Flag for the rules file (e.g., `--rules`).
@@ -160,6 +163,7 @@ impl ProviderConfig {
             supports_set_mode: false,
             supports_set_model: false,
             supports_mcp_config: false,
+            supports_session_mcp_servers: false,
             supports_rules_file: false,
             rules_flag: None,
             injection_mechanism: InjectionMechanism::None,
@@ -220,6 +224,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::SessionMeta,
+        // The pinned claude-agent-acp adapter maps `session/new` `mcpServers`
+        // (stdio entries without a `type` tag) into the Claude Agent SDK's
+        // `options.mcpServers`, so the workspace bridge rides the ACP request.
+        supports_session_mcp_servers: true,
         auth_check_args: Some(&["auth", "status"]),
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
@@ -231,6 +239,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::SessionMeta,
+        // codex-acp folds `session/new` `mcpServers` (stdio + http) into its
+        // session config (`build_session_config`), so the workspace bridge
+        // rides the ACP request rather than `-c mcp_servers.*` overrides.
+        supports_session_mcp_servers: true,
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
@@ -262,6 +274,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_rules_file: true,
         rules_flag: Some("--append-system-prompt-file"),
         injection_mechanism: InjectionMechanism::RulesFileFlag,
+        // droid's ACP mode accepts `session/new` `mcpServers` (the standard
+        // ACP session-setup field); the CLI has no per-spawn MCP flag, so the
+        // ACP request is the only spawn-scoped delivery mechanism.
+        supports_session_mcp_servers: true,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
