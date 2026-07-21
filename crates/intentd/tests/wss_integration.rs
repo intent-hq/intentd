@@ -333,6 +333,10 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
+        sess[0]["result"]["protocolVersion"], "2.0",
+        "explicit top-level protocolVersion in the client.hello result (§5.17)"
+    );
+    assert_eq!(
         sess[0]["result"]["server"]["locality"], "remote",
         "WSS ⇒ remote in the client.hello server block (§5.14/§5.17)"
     );

@@ -320,6 +320,13 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     assert!(png.starts_with(b"\x89PNG"), "valid PNG magic bytes");
     let svg = std::fs::read_to_string(&svg_path).expect("SVG file written");
     assert!(svg.contains("<svg"), "valid SVG document");
+
+    // Exported images embed the bearer token — must be owner-only (0600).
+    use std::os::unix::fs::PermissionsExt;
+    for path in [&png_path, &svg_path] {
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{} should be 0600", path.display());
+    }
 }
 
 #[tokio::test]

@@ -263,14 +263,32 @@ async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>) -> anyhow::Result<()> 
         let img = code.render::<image::Luma<u8>>().build();
         img.save(path)
             .map_err(|e| anyhow::anyhow!("cannot write PNG to {}: {e}", path.display()))?;
+        restrict_permissions(path)?;
         eprintln!("wrote {}", path.display());
     }
     if let Some(path) = svg {
         let doc = code.render::<qrcode::render::svg::Color>().build();
         std::fs::write(path, doc)
             .map_err(|e| anyhow::anyhow!("cannot write SVG to {}: {e}", path.display()))?;
+        restrict_permissions(path)?;
         eprintln!("wrote {}", path.display());
     }
+    Ok(())
+}
+
+/// Restrict an exported pairing image to owner read/write (0600): the QR code
+/// embeds the bearer token, so it deserves the same treatment as the secrets
+/// file. No-op outside Unix.
+fn restrict_permissions(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            anyhow::anyhow!("cannot restrict permissions on {}: {e}", path.display())
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

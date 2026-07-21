@@ -106,6 +106,12 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let token = crate::get_or_create_token(provider.token_store()).await?;
     let cert = crate::ensure_tls_certificate(provider.data_dir())?;
     let hosts = collect_local_ips();
+    if hosts.is_empty() {
+        return Err(Error::Unsupported(
+            "no non-loopback IPv4 address found — connect this machine to a network before pairing"
+                .to_string(),
+        ));
+    }
     let uri = build_pairing_uri(&hosts, port, &cert.fingerprint256, &token);
     Ok(json!({
         "uri": uri,
