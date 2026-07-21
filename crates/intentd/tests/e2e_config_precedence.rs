@@ -208,14 +208,95 @@ async fn listen_flag_pins_listen_mode() {
     );
 }
 
+/// One-time legacy import: a config.toml carrying the retired
+/// `model.workspaceOverrides` key must NOT refuse startup — the daemon
+/// boots, imports the value into the SQLite settings blob (readable over
+/// the wire with no `origin` field), and strips the key from the file with
+/// a comment-preserving rewrite. A second boot then reads the clean file
+/// and the imported value survives.
+#[tokio::test]
+async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
+    let data_dir = temp_data_dir();
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        "# my config\n\n[model]\n# my default\ndefault = \"m0\"\nworkspaceOverrides = { ws1 = \"m1\" }\n\n[git]\nautoCommit = false\n",
+    )
+    .expect("seed config.toml");
+
+    // First boot: tolerated + imported + stripped.
+    let child = spawn_serve(&data_dir, &[]);
+    let socket = data_dir.join("intentd.sock");
+    {
+        let _daemon = DaemonGuard::new(child, data_dir.clone(), false);
+        assert!(await_uds(&socket).await, "daemon did not start");
+
+        // The imported blob reads over the wire with no origin field
+        // (SQLite-backed state, not a TOML-backed key).
+        let get = uds_rpc(
+            &socket,
+            1,
+            "settings.get",
+            json!({ "path": "model.workspaceOverrides" }),
+        )
+        .await;
+        assert_eq!(
+            get["result"]["value"],
+            json!({ "ws1": "m1" }),
+            "imported value: {get}"
+        );
+        assert!(
+            get["result"].get("origin").is_none(),
+            "state blob must carry no origin: {get}"
+        );
+
+        // The file was stripped with comments + sibling keys preserved.
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("workspaceOverrides"), "stripped: {text}");
+        assert!(text.contains("# my config"), "comment preserved: {text}");
+        assert!(text.contains("# my default"), "comment preserved: {text}");
+        assert!(text.contains("default = \"m0\""), "{text}");
+        assert!(text.contains("autoCommit = false"), "{text}");
+    } // guard drop kills the first daemon
+
+    // Second boot: clean file, imported value still served from SQLite.
+    let stripped_text = std::fs::read_to_string(&config_path).expect("read config");
+    let child = spawn_serve(&data_dir, &[]);
+    let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
+    assert!(await_uds(&socket).await, "second boot did not start");
+    let get = uds_rpc(
+        &socket,
+        3,
+        "settings.get",
+        json!({ "path": "model.workspaceOverrides" }),
+    )
+    .await;
+    assert_eq!(
+        get["result"]["value"],
+        json!({ "ws1": "m1" }),
+        "value survives restart: {get}"
+    );
+    // The clean second boot did not rewrite the file again.
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        stripped_text,
+        "second boot must not touch the file"
+    );
+}
+
 /// A malformed config.toml (unknown key) refuses startup: non-zero exit and
 /// a stderr error naming the offending key. A wrong-typed value refuses the
-/// same way.
+/// same way. The legacy-tolerated key does not weaken strictness for other
+/// unknown keys, even when both appear in the same file.
 #[test]
 fn invalid_config_refuses_startup_with_key_in_error() {
     for (body, needle) in [
         ("[agents]\nbogusKey = 1\n", "bogusKey"),
         ("[git]\nautoCommit = \"nope\"\n", "git.autoCommit"),
+        (
+            "[model]\nworkspaceOverrides = {}\n\n[agents]\nbogusKey = 1\n",
+            "bogusKey",
+        ),
     ] {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.join("config.toml"), body).expect("seed config.toml");

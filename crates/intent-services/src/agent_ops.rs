@@ -61,7 +61,7 @@ mod tests_specialist_frontmatter;
 
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (documented in the task):
-/// 1. `model.workspaceOverrides[workspaceId]`
+/// 1. `model.workspaceOverrides[workspaceId]` — SQLite-backed state blob
 /// 2. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
 /// 3. `model.providerDefaults[resolved provider]`
 /// 4. `model.default`
@@ -70,7 +70,7 @@ mod tests_specialist_frontmatter;
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
-fn resolve_default_model_from_settings(
+async fn resolve_default_model_from_settings(
     services: &Services,
     workspace_id: &WorkspaceId,
     is_background: bool,
@@ -79,14 +79,23 @@ fn resolve_default_model_from_settings(
 ) -> Option<String> {
     let settings = services.effective_settings();
 
-    // 1. Check workspace-specific override
-    if let Some(model) = settings
-        .model
-        .workspace_overrides
-        .get(workspace_id.as_str())
+    // 1. Check workspace-specific override (SQLite `settings` table blob;
+    //    read errors / malformed rows fall through to the next tier)
+    if let Some(model) = services
+        .store()
+        .get_setting("model.workspaceOverrides")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| {
+            v.get(workspace_id.as_str())
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
     {
         if !model.is_empty() {
-            return Some(model.clone());
+            return Some(model);
         }
     }
 
@@ -1279,6 +1288,7 @@ impl Services {
                             specialist.as_deref(),
                             provider.as_deref(),
                         )
+                        .await
                     }
                 }
             }

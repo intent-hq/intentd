@@ -434,6 +434,14 @@ async fn cmd_serve(
         intent_services::SettingsRegistry::load(&config.config_path)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     );
+    // One-time legacy import: keys that moved from config.toml back to SQLite
+    // (e.g. `model.workspaceOverrides`) were tolerated + captured by the load
+    // above; persist them to the settings table, then strip them from the
+    // file with a comment-preserving rewrite. A failed import keeps the file
+    // intact so the next boot retries.
+    intent_services::import_legacy_settings(&settings_registry, &store)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
     // pinned keys take the flag value, report origin `flag` on the wire,
     // reject `settings.update`, and ignore the file value on live-reload. An
