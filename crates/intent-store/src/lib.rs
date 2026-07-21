@@ -100,8 +100,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 ///
 /// Holds two pools over the same DB file: a single-connection **write pool**
 /// (max_connections=1) to serialize all mutations and eliminate in-process
-/// writer-vs-writer busy_timeout contention, and a **read pool** (16 connections)
-/// for concurrent SELECT-only queries. See `connect` for pool configuration.
+/// writer-vs-writer busy_timeout contention, and a **read pool** (32 connections)
+/// for concurrent SELECT-only queries. See `connect_read` for pool configuration.
 #[derive(Clone)]
 pub struct Store {
     write_pool: SqlitePool,
@@ -110,7 +110,7 @@ pub struct Store {
 
 impl Store {
     /// Open (creating if needed) the database at `db_path` and run migrations.
-    /// Builds two pools: a single-connection write pool and a 16-connection read pool.
+    /// Builds two pools: a single-connection write pool and a 32-connection read pool.
     pub async fn open(db_path: &Path) -> Result<Self> {
         let write_pool = connect_write(db_path).await?;
         let read_pool = connect_read(db_path).await?;
@@ -139,7 +139,7 @@ impl Store {
         &self.write_pool
     }
 
-    /// Borrow the read pool (16 connections, for SELECT-only queries).
+    /// Borrow the read pool (32 connections, for SELECT-only queries).
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
     }
@@ -255,15 +255,19 @@ pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
         })
 }
 
-/// Open a WAL-mode SQLite **read pool** with `max_connections=16` (§9.4).
+/// Open a WAL-mode SQLite **read pool** with `max_connections=32` (§9.4).
 /// The read pool serves SELECT-only queries and supports concurrent readers
 /// without contention (SQLite WAL mode allows many simultaneous readers).
 ///
 /// The PRAGMAs match the write pool: `journal_mode = WAL`, `foreign_keys = ON`,
-/// `busy_timeout = 5000`, `synchronous = NORMAL`. The read pool size (16) is
+/// `busy_timeout = 5000`, `synchronous = NORMAL`. The read pool size (32) is
 /// sized to absorb the client-driven startup burst (FE rehydrating several
 /// workspaces at once) without saturating the pool and tripping sqlx's
-/// `slow_acquire_threshold` warnings (STAB-6, STAB-46).
+/// `slow_acquire_threshold` warnings (STAB-6, STAB-46). The original size of
+/// 16 was tuned against the fixed agent process cap of 30; the RAM-based cap
+/// raise to 56 (intent-hq/intentd#296) roughly doubles the potential
+/// concurrent-agent read load, so the pool doubles to 32 to preserve the
+/// pool/agent-cap headroom ratio.
 pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
@@ -274,7 +278,7 @@ pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     SqlitePoolOptions::new()
-        .max_connections(16)
+        .max_connections(32)
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(opts)
         .await
