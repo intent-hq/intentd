@@ -1186,8 +1186,12 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// the file value is the user's most recent intent) or discarded with a
 /// warning when it does not, and the keys are then stripped from the file
 /// with a comment-preserving rewrite. Nothing is stripped when a SQLite
-/// write fails, so the next boot retries the import. Returns the stripped
-/// paths (empty when the file had no legacy keys).
+/// write fails, so the next boot retries the import. The strip itself is
+/// best-effort: once the values are safely in SQLite, a failed file rewrite
+/// (read-only file, perms, full disk) is logged and startup continues — the
+/// next boot re-runs the import, which idempotently overwrites the same
+/// rows and retries the strip. Returns the stripped paths (empty when the
+/// file had no legacy keys or the rewrite failed).
 pub async fn import_legacy_settings(
     registry: &SettingsRegistry,
     store: &Store,
@@ -1228,7 +1232,16 @@ pub async fn import_legacy_settings(
         store.set_setting(path, &raw).await?;
         tracing::info!(path, "imported legacy config.toml key into SQLite");
     }
-    let stripped = registry.strip_legacy()?;
+    let stripped = match registry.strip_legacy() {
+        Ok(stripped) => stripped,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to strip legacy keys from config.toml; continuing with imported values (next boot retries)"
+            );
+            Vec::new()
+        }
+    };
     if !stripped.is_empty() {
         tracing::info!(?stripped, "stripped legacy keys from config.toml");
     }
@@ -2058,6 +2071,63 @@ mod tests {
         assert!(registry2.legacy_values().is_empty());
 
         let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// The strip step is best-effort: once the legacy values are safely in
+    /// SQLite, a failed file rewrite (e.g. unwritable config directory) must
+    /// not fail the import — the daemon continues with the imported state
+    /// and the next boot retries the strip. The rewrite is an atomic
+    /// temp-file + rename in the config's directory, so a read-only
+    /// directory makes it fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_legacy_settings_tolerates_strip_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyro-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_dir = std::env::temp_dir().join(format!("intentd-settings-legacyro-{tag}"));
+        std::fs::create_dir(&config_dir).expect("mkdir");
+        let config_path = config_dir.join("config.toml");
+        let body = "[model]\nworkspaceOverrides = { ws1 = \"m1\" }\n";
+        std::fs::write(&config_path, body).expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("legacy key must load");
+
+        // Make the directory read-only so the temp-file rewrite fails.
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod dir read-only");
+
+        let stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import must succeed despite strip failure");
+        assert_eq!(stripped, Vec::<String>::new(), "nothing was stripped");
+
+        // The value still landed in SQLite…
+        let raw = store
+            .get_setting("model.workspaceOverrides")
+            .await
+            .expect("read settings table")
+            .expect("row present");
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).expect("json"),
+            json!({ "ws1": "m1" })
+        );
+        // …and the file is untouched for the next-boot retry.
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            body
+        );
+
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod dir back");
+        let _ = std::fs::remove_dir_all(&config_dir);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
                 "{}{suffix}",
