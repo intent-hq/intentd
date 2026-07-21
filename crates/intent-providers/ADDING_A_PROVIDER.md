@@ -4,7 +4,7 @@ A checklist for wiring a new ACP (Agent Client Protocol) provider into intentd. 
 cites the file/symbol it refers to; the code is the source of truth — audit it rather than
 trusting this document if the two ever disagree.
 
-Provider quirks are **data, not code**: most of the work is a new [`ProviderConfig`]
+Provider quirks are **data, not code**: most of the work is a new `ProviderConfig`
 registry entry plus deciding which existing delivery mechanism each capability rides on.
 The areas below are everything the opencode/claude-code/codex/droid parity effort had to
 touch; treat the full list as the definition of done for a new provider.
@@ -87,7 +87,7 @@ intentd assembles one effective system prompt per agent (`assemble_system_prompt
 | `RulesFileFlag` | auggie (`--rules`), droid (`--append-system-prompt-file`) | `create_agent` writes a temp rules file; `build_provider_args` (`crates/intent-providers/src/args.rs`) appends `rules_flag` + path, gated on `supports_rules_file`. |
 | `SessionMeta` | claude-code, codex | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta` sent on `session/new` **and** `session/load` (and the recreate path): claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": … } }`; codex `{ "developerInstructions": … }`. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
 | `EnvConfig` | opencode | `build_provider_env` (`crates/intent-providers/src/args.rs`) emits `OPENCODE_CONFIG_CONTENT` with an `instructions: [<rules file path>]` key (plus `model`, `permission`, `mcp` — see §3b and §6). |
-| `FirstTurnPrepend` | cortex, grok (fallback) | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
+| `FirstTurnPrepend` | cortex, grok (fallback), plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
 | `None` | — | Provider gets no system prompt. Avoid if at all possible. |
 
 Add a new mechanism only if the provider genuinely supports none of these; prefer reusing
@@ -124,7 +124,7 @@ per provider — pick exactly one delivery path:
 
 **Verify tools actually reach the agent** — adapters differ in which session-setup fields
 they honor; do not assume wiring works because the spawn succeeded. Unit-test the
-translator output (`crates/intent-acp/src/mcp_config.rs` tests), integration-test with the
+translator output (tests in `crates/intent-acp/src/tests.rs`), integration-test with the
 mock fixtures (`crates/intentd/tests/fixtures/mock-acp-agent.mjs`, `mock-mcp-server.mjs`),
 and dogfood: ask the new agent to list its tools and to call `set_workspace_title` (§8).
 
@@ -201,7 +201,7 @@ Per-area expectations (all in the intentd repo):
 
 - Registry/args/env/discovery/models: `crates/intent-providers/src/tests.rs`.
 - Spawn command assembly (args, env merge, PATH): `crates/intent-acp/src/spawn.rs` tests.
-- MCP translator output: `crates/intent-acp/src/mcp_config.rs` tests.
+- MCP translator output: `crates/intent-acp/src/tests.rs`.
 - Tool-name/kind mapping from captured payloads: `crates/intent-acp/src/tests.rs`.
 - `_meta` shapes + provider resolution: `crates/intent-services/src/agent_session/tests_meta.rs`.
 - Naming nudge: `crates/intent-services/src/agent_manager/tests.rs`.
