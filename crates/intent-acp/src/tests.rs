@@ -729,6 +729,223 @@ mod session_tests {
     }
 
     #[test]
+    fn derive_tool_name_strips_opencode_mcp_prefix() {
+        // Opencode names MCP tools `<server>_<tool>` (leading prefix), the
+        // mirror image of auggie's trailing suffix. Captured from opencode
+        // 1.18.3: `workspace-mcp_echo` with kind "other" and empty rawInput.
+        assert_eq!(
+            session::derive_tool_name("workspace-mcp_echo", Some(&json!({}))),
+            "echo"
+        );
+        assert_eq!(
+            session::derive_tool_name("workspace-mcp_add_to_note", None),
+            "add_to_note"
+        );
+        // Doubled prefix strips repeatedly, like the doubled suffix.
+        assert_eq!(
+            session::derive_tool_name("workspace-mcp_workspace-mcp_read_note", None),
+            "read_note"
+        );
+        // A bare affix never strips to the empty string.
+        assert_eq!(
+            session::derive_tool_name("workspace-mcp_", None),
+            "workspace-mcp_"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_recognizes_opencode_input_shapes() {
+        // Captured from opencode 1.18.3: once arguments stream in, titles
+        // turn into raw prose (the command line, a file path, a regex), so
+        // the camelCase rawInput shapes identify the tool.
+        // filePath + oldString/newString → edit.
+        assert_eq!(
+            session::derive_tool_name(
+                "edit",
+                Some(&json!({
+                    "filePath": "/tmp/sandbox/notes.txt",
+                    "oldString": "test note",
+                    "newString": "edited note",
+                })),
+            ),
+            "edit"
+        );
+        // filePath + content → write.
+        assert_eq!(
+            session::derive_tool_name(
+                "write",
+                Some(&json!({ "filePath": "/tmp/sandbox/notes.txt", "content": "test note" })),
+            ),
+            "write"
+        );
+        // filePath alone → read, even when the title is the raw path.
+        assert_eq!(
+            session::derive_tool_name(
+                "private/tmp/sandbox/sample.txt",
+                Some(&json!({ "filePath": "/private/tmp/sandbox/sample.txt" })),
+            ),
+            "read"
+        );
+        // command (string) + cwd → bash; opencode titles the call with the
+        // raw command line itself.
+        assert_eq!(
+            session::derive_tool_name(
+                "echo hello-from-bash",
+                Some(&json!({ "command": "echo hello-from-bash", "cwd": "/tmp/sandbox" })),
+            ),
+            "bash"
+        );
+        // url → web-fetch.
+        assert_eq!(
+            session::derive_tool_name(
+                "https://example.com/ (text/html)",
+                Some(&json!({ "url": "https://example.com/" })),
+            ),
+            "web-fetch"
+        );
+        // A bare `webfetch` title (opencode's first tool_call frame carries
+        // an empty rawInput) normalizes to the canonical builtin name.
+        assert_eq!(
+            session::derive_tool_name("webfetch", Some(&json!({}))),
+            "web-fetch"
+        );
+    }
+
+    #[test]
+    fn derive_tool_name_opencode_shapes_do_not_capture_other_providers() {
+        // Auggie's launch-process also carries a string `command` + `cwd`,
+        // but always with `wait`/`max_wait_seconds` — it must not become
+        // `bash`.
+        assert_eq!(
+            session::derive_tool_name(
+                "Run tests",
+                Some(&json!({
+                    "command": "cargo test",
+                    "cwd": "/repo",
+                    "wait": true,
+                    "max_wait_seconds": 300,
+                })),
+            ),
+            "Run tests"
+        );
+        // Codex sends `command` as an array — the string check rejects it.
+        assert_eq!(
+            session::derive_tool_name(
+                "Run tests",
+                Some(&json!({ "command": ["bash", "-lc", "cargo test"], "cwd": "/repo" })),
+            ),
+            "Run tests"
+        );
+        // Auggie's snake_case `path` shapes stay on the existing rules and
+        // never hit the camelCase branch.
+        assert_eq!(
+            session::derive_tool_name("Edit src/lib.rs", Some(&json!({ "path": "src/lib.rs" }))),
+            "Edit src/lib.rs"
+        );
+        // JS-truthy semantics on filePath: null/empty falls through.
+        assert_eq!(
+            session::derive_tool_name("read", Some(&json!({ "filePath": null }))),
+            "read"
+        );
+        // cwd must be a non-empty string too; a null cwd is not bash.
+        assert_eq!(
+            session::derive_tool_name(
+                "echo hi",
+                Some(&json!({ "command": "echo hi", "cwd": null })),
+            ),
+            "echo hi"
+        );
+        // Pattern-only inputs (grep/glob) intentionally derive nothing; the
+        // bare title already names the tool.
+        assert_eq!(
+            session::derive_tool_name("grep", Some(&json!({ "pattern": "findme" }))),
+            "grep"
+        );
+    }
+
+    #[test]
+    fn maps_opencode_tool_calls_with_names_and_kinds() {
+        // Full mapping for the captured opencode frames: real tool names AND
+        // FE-taxonomy kinds so the chat stops rendering wrench-icon `other`
+        // entries with raw prose titles.
+        let read = ToolCall::new("t1", "read")
+            .kind(ToolKind::Read)
+            .raw_input(json!({ "filePath": "/tmp/sandbox/sample.txt" }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(read)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "read");
+        assert_eq!(tc.tool_kind, "file");
+
+        let edit = ToolCall::new("t2", "edit").kind(ToolKind::Edit).raw_input(
+            json!({ "filePath": "/tmp/sandbox/notes.txt", "oldString": "a", "newString": "b" }),
+        );
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(edit)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "edit");
+        assert_eq!(tc.tool_kind, "file");
+
+        // Mid-flight bash update: the title is the raw command line.
+        let bash = ToolCallUpdate::new(
+            "t3",
+            ToolCallUpdateFields::new()
+                .title("echo hello-from-bash")
+                .kind(ToolKind::Execute)
+                .raw_input(json!({ "command": "echo hello-from-bash", "cwd": "/tmp/sandbox" })),
+        );
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCallUpdate(bash)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "bash");
+        assert_eq!(tc.tool_kind, "terminal");
+
+        let grep = ToolCall::new("t4", "grep")
+            .kind(ToolKind::Search)
+            .raw_input(json!({ "pattern": "findme" }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(grep)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "grep");
+        assert_eq!(tc.tool_kind, "search");
+
+        // webfetch: name normalizes to web-fetch; ToolKind::Fetch has no
+        // dedicated word in the file|terminal|search|note|git|other taxonomy
+        // and stays "other" (the FE picks its fetch display by tool name).
+        let fetch = ToolCall::new("t5", "webfetch")
+            .kind(ToolKind::Fetch)
+            .raw_input(json!({}));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(fetch)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "web-fetch");
+        assert_eq!(tc.tool_kind, "other");
+
+        // Opencode-prefixed MCP tool: name recovers the registry tool and the
+        // note-name inference kicks in for the kind.
+        let mcp = ToolCall::new("t6", "workspace-mcp_add_to_note")
+            .kind(ToolKind::Other)
+            .raw_input(json!({}));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(mcp)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "add_to_note");
+        assert_eq!(tc.tool_kind, "note");
+    }
+
+    #[test]
     fn derive_tool_name_title_prefix_wins_over_input_derivation() {
         // Even when raw_input matches an input-derivation shape, an
         // unambiguous `<name>: <desc>` title prefix takes precedence — the
@@ -1450,20 +1667,7 @@ mod mcp_tests {
         use intent_providers::{build_provider_env, find_provider};
         use std::collections::BTreeMap;
 
-        // Build opencode's env with permission.task=deny (with model set)
-        let opencode = find_provider("opencode").unwrap();
-        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None);
-        let config_content = env
-            .get("OPENCODE_CONFIG_CONTENT")
-            .expect("OPENCODE_CONFIG_CONTENT must be set");
-
-        // Parse the initial config (should have model + permission keys)
-        let mut config: Value = serde_json::from_str(config_content)
-            .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
-        assert_eq!(config["model"], json!("claude-sonnet-4"));
-        assert_eq!(config["permission"]["task"], json!("deny"));
-
-        // Simulate the workspace-MCP merge path: prepare a normalized MCP server list
+        // Prepare a normalized MCP server list and its opencode `mcp` block.
         let mut servers = BTreeMap::new();
         servers.insert(
             "ws".to_string(),
@@ -1473,14 +1677,20 @@ mod mcp_tests {
                 env: BTreeMap::new(),
             },
         );
-
-        // Convert normalized servers to opencode mcp block
         let mcp_block = to_opencode_mcp_config(&servers);
+        let mcp_json = serde_json::to_string(&mcp_block).unwrap();
 
-        // Merge the mcp block into the existing config (opencode's env merge logic)
-        // This simulates what happens when the daemon merges workspace MCP servers
-        // into the provider's OPENCODE_CONFIG_CONTENT at spawn time.
-        config["mcp"] = mcp_block;
+        // Build opencode's env with the mcp block merged at spawn time — the
+        // real daemon path (agent_manager passes the serialized block through
+        // SpawnOptions::env_mcp_config into build_provider_env).
+        let opencode = find_provider("opencode").unwrap();
+        let env = build_provider_env(opencode, Some("claude-sonnet-4"), None, Some(&mcp_json));
+        let config_content = env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("OPENCODE_CONFIG_CONTENT must be set");
+
+        let config: Value = serde_json::from_str(config_content)
+            .expect("OPENCODE_CONFIG_CONTENT must be valid JSON");
 
         // Assert: permission.task=deny must still be present after the merge
         assert_eq!(

@@ -22,10 +22,10 @@ use intent_acp::session::{ContentBlock, SessionModeState, StopReason};
 use intent_acp::{
     apply_baseline_env_to_stdio_servers, build_baseline_mcp_env_from_process, handshake,
     normalize_mcp_servers, serve_workspace_mcp_tcp, spawn_provider, to_auggie_mcp_config,
-    ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink, FileService,
-    IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer, NormalizedMcpServers,
-    PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData, SinkEvent,
-    SpawnOptions, WorkspaceMcpServer,
+    to_opencode_mcp_config, ClientRequestHandler, Connection, ConnectionHooks, EnvMap, EventSink,
+    FileService, IncomingNotification, IncomingRequest, McpBridge, NormalizedMcpServer,
+    NormalizedMcpServers, PermissionOutcome, PermissionPolicy, PermissionRegistry,
+    PermissionRequestData, SinkEvent, SpawnOptions, WorkspaceMcpServer,
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
@@ -927,6 +927,15 @@ impl AgentManager {
             mcp_config = Some(TempConfigFile { path });
         }
 
+        // For env-config providers (opencode), the same normalized server set
+        // (workspace bridge + user servers) rides in `OPENCODE_CONFIG_CONTENT`
+        // as an `mcp` block instead of an `--mcp-config` file, pointing at the
+        // same bridge endpoint.
+        let mut env_mcp_config: Option<String> = None;
+        if opts.provider.injection_mechanism == InjectionMechanism::EnvConfig {
+            env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
+        }
+
         // Assemble the effective system prompt (the §18.1 injection pipeline:
         // base/specialization/workspace user overrides + live workspace rule
         // files, plus — for specialist agents — the PP-1 `<specialist_role>`
@@ -1003,6 +1012,7 @@ impl AgentManager {
         if let Some(ref p) = mcp_config_path {
             spawn_opts.mcp_config_file = Some(p.as_str());
         }
+        spawn_opts.env_mcp_config = env_mcp_config.as_deref();
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
@@ -1095,16 +1105,33 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape): the
-    /// `workspace-mcp` server is the `intentd mcp-bridge --connect <addr>`
-    /// subcommand, with the user's `mcp.servers` catalog merged in and the safe
-    /// baseline env injected across every stdio entry (§6.8, §18.4). Mirrors
-    /// the FE `mergeUserMcpServersWithAuth` path: honours the
-    /// `mcp.enableUserServers` gate, filters out globally-disabled servers, and
-    /// — for http/sse transports — injects an `Authorization` header from the
-    /// persisted OAuth token bag when the catalog entry does not already set
-    /// one. `workspace-mcp` is reserved and never overridden.
+    /// Build the generated `--mcp-config` (auggie `{ mcpServers }` shape) from
+    /// the normalized spawn server set ([`Self::normalized_mcp_servers`]).
     async fn generate_mcp_config(&self, bridge: &McpBridge) -> Result<serde_json::Value> {
+        let servers = self.normalized_mcp_servers(bridge.connect_addr()).await?;
+        Ok(to_auggie_mcp_config(&servers))
+    }
+
+    /// Serialize the same normalized spawn server set as the OpenCode config
+    /// `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` at spawn for
+    /// env-config providers. The bridge entry points at the same endpoint the
+    /// auggie `--mcp-config` path uses.
+    async fn opencode_env_mcp_config(&self, connect_addr: String) -> Result<String> {
+        let servers = self.normalized_mcp_servers(connect_addr).await?;
+        serde_json::to_string(&to_opencode_mcp_config(&servers))
+            .map_err(|e| Error::Internal(format!("serialize opencode mcp config failed: {e}")))
+    }
+
+    /// Normalized MCP server set for a spawn: the `workspace-mcp` server is
+    /// the `intentd mcp-bridge --connect <addr>` subcommand, with the user's
+    /// `mcp.servers` catalog merged in and the safe baseline env injected
+    /// across every stdio entry (§6.8, §18.4). Mirrors the FE
+    /// `mergeUserMcpServersWithAuth` path: honours the `mcp.enableUserServers`
+    /// gate, filters out globally-disabled servers, and — for http/sse
+    /// transports — injects an `Authorization` header from the persisted OAuth
+    /// token bag when the catalog entry does not already set one.
+    /// `workspace-mcp` is reserved and never overridden.
+    async fn normalized_mcp_servers(&self, connect_addr: String) -> Result<NormalizedMcpServers> {
         let mut servers = NormalizedMcpServers::new();
         servers.insert(
             "workspace-mcp".to_string(),
@@ -1113,15 +1140,14 @@ impl AgentManager {
                 args: vec![
                     "mcp-bridge".to_string(),
                     "--connect".to_string(),
-                    bridge.connect_addr(),
+                    connect_addr,
                 ],
                 env: EnvMap::new(),
             },
         );
         self.merge_user_mcp_servers(&mut servers).await?;
         let baseline = build_baseline_mcp_env_from_process();
-        let servers = apply_baseline_env_to_stdio_servers(&servers, &baseline);
-        Ok(to_auggie_mcp_config(&servers))
+        Ok(apply_baseline_env_to_stdio_servers(&servers, &baseline))
     }
 
     /// Fold user-configured MCP servers (sensitive `mcp.servers` secret) into
