@@ -57,6 +57,12 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
     /// append messages via [`Store::append_agent_message`].
+    ///
+    /// A UNIQUE violation on the id (a concurrent create raced past the
+    /// service-layer availability precheck) is `Error::InvalidParams` naming
+    /// the id — the same `-32602` contract as the precheck — so the
+    /// duplicate-id behavior stays robust under concurrency instead of
+    /// degrading to an opaque `-32603`.
     pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
@@ -94,7 +100,18 @@ impl Store {
             .bind(&s.stop_reason)
             .execute(self.write_pool())
             .await
-            .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
+            .map_err(|e| {
+                if e.as_database_error()
+                    .is_some_and(|d| d.is_unique_violation())
+                {
+                    Error::InvalidParams(format!(
+                        "agentId {} already exists; supply a fresh agent-{{uuid}} per create attempt",
+                        s.id
+                    ))
+                } else {
+                    Error::Internal(format!("insert agent session failed: {e}"))
+                }
+            })?;
         Ok(())
     }
 
@@ -1139,6 +1156,110 @@ where
 mod tests {
     use super::*;
     use crate::Store;
+
+    /// A UNIQUE violation on the session id (concurrent create racing past the
+    /// service-layer availability precheck) maps to `InvalidParams` naming the
+    /// id — not the opaque `Internal` the raw sqlx error would surface as —
+    /// so the "duplicate id => -32602" contract holds under concurrency.
+    #[tokio::test]
+    async fn insert_agent_session_duplicate_id_is_invalid_params() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-test".to_string());
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+        let session = AgentSession {
+            id: AgentId(format!("agent-{}", Uuid::new_v4())),
+            workspace_id: ws_id,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "First".to_string(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            messages: vec![],
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            stats: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+        };
+        store.insert_agent_session(&session).await.expect("insert");
+        let err = store
+            .insert_agent_session(&session)
+            .await
+            .expect_err("duplicate id must be rejected");
+        match &err {
+            Error::InvalidParams(msg) => assert!(
+                msg.contains(session.id.0.as_str()),
+                "error must name the duplicate id, got: {msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
 
     #[tokio::test]
     async fn re_interruption_resets_resolution() {

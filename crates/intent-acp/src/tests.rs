@@ -1154,6 +1154,7 @@ mod mcp_tests {
             _task_note_id: NoteId,
             _message: String,
             _priority: Option<String>,
+            _message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
             Box::pin(async {
                 Ok(json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }))
@@ -5658,7 +5659,7 @@ mod wsapi4_bindings_tests {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture,
+        AgentDelegateInput, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
         EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, Result,
         WorkspaceApi, WorkspaceId,
     };
@@ -5666,7 +5667,8 @@ mod wsapi4_bindings_tests {
 
     use crate::WorkspaceMcpServer;
 
-    type SendCall = (String, String, Option<String>);
+    type SendCall = (String, String, Option<String>, Option<Value>);
+    type SendToTaskCall = (String, String, Option<Value>);
     type WatchSenderCall = (String, String);
     type SubscribeCall = (Vec<String>, Option<bool>, Option<i64>);
     type DelegateCall = (Option<String>, Option<String>);
@@ -5677,6 +5679,7 @@ mod wsapi4_bindings_tests {
         agent_list_calls: Mutex<u32>,
         agent_get_calls: Mutex<Vec<String>>,
         agent_send_calls: Mutex<Vec<SendCall>>,
+        agent_send_to_task_calls: Mutex<Vec<SendToTaskCall>>,
         agent_delegate_calls: Mutex<Vec<DelegateCall>>,
         agent_subscribe_calls: Mutex<Vec<SubscribeCall>>,
         agent_unsubscribe_calls: Mutex<Vec<String>>,
@@ -5686,6 +5689,8 @@ mod wsapi4_bindings_tests {
         event_recent_files_calls: Mutex<Vec<Option<i64>>>,
         event_query_calls: Mutex<Vec<EventQueryParams>>,
         event_dir_calls: Mutex<Vec<DirCall>>,
+        /// When set, `agent_get` fails with this error (name-lookup failure path).
+        agent_get_error: Mutex<Option<String>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -5750,7 +5755,13 @@ mod wsapi4_bindings_tests {
             let id = agent_id.as_str().to_string();
             self.agent_get_calls.lock().unwrap().push(id.clone());
             let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string("amber-forest"));
-            Box::pin(async move { Ok(stub_agent(&id, &ws)) })
+            let error = self.agent_get_error.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(e) = error {
+                    return Err(Error::NotFound(e));
+                }
+                Ok(stub_agent(&id, &ws))
+            })
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -5766,14 +5777,57 @@ mod wsapi4_bindings_tests {
             _note_ids: Option<Value>,
             _stdin_context: Option<String>,
             _context_references: Option<Value>,
-            _message_metadata: Option<Value>,
+            message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
             self.agent_send_calls.lock().unwrap().push((
                 agent_id.as_str().to_string(),
                 content,
                 priority,
+                message_metadata,
             ));
             Box::pin(async move { Ok(json!({ "success": true, "queued": false })) })
+        }
+
+        fn agent_send_to_task(
+            &self,
+            _ws: WorkspaceId,
+            task_note_id: intent_core::NoteId,
+            message: String,
+            _priority: Option<String>,
+            message_metadata: Option<Value>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_send_to_task_calls.lock().unwrap().push((
+                task_note_id.as_str().to_string(),
+                message,
+                message_metadata,
+            ));
+            Box::pin(async move {
+                Ok(json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }))
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn agent_create(
+            &self,
+            _ws: WorkspaceId,
+            _name: Option<String>,
+            _model: Option<String>,
+            _specialist_id: Option<String>,
+            _parent_agent_id: Option<AgentId>,
+            _idempotency_key: Option<String>,
+            _requested_agent_id: Option<AgentId>,
+            _extra: intent_core::AgentCreateExtra,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
+        }
+
+        fn agent_watch_completion(
+            &self,
+            _ws: WorkspaceId,
+            _parent_agent_id: AgentId,
+            _child_agent_id: AgentId,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move { Ok(json!({ "ok": true, "subscriptionId": "watch-1" })) })
         }
 
         fn agent_delegate(
@@ -6023,6 +6077,146 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.agent.send('a-1');").await;
         assert_eq!(resp["result"]["isError"], json!(true));
         assert!(text(&resp).contains("message is required"));
+    }
+
+    /// Agent-to-agent sends carry the `agent_message` sender-attribution
+    /// metadata (`fromAgentId` + `fromAgentName` resolved via `agent_get`).
+    #[tokio::test]
+    async fn agent_send_with_caller_tags_sender_metadata() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
+    }
+
+    /// The attribution schema stays stable when the caller name lookup fails:
+    /// `fromAgentName` is present but `null`, never omitted.
+    #[tokio::test]
+    async fn agent_send_name_lookup_failure_keeps_null_from_agent_name() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.agent_get_error.lock().unwrap() = Some("agent not found".to_string());
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": null,
+            }))
+        );
+    }
+
+    /// Caller-less (FE/RPC front door) sends stay untagged — human sends must
+    /// not grow an `agent_message` block.
+    #[tokio::test]
+    async fn agent_send_without_caller_has_no_sender_metadata() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.send('a-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].3, None);
+    }
+
+    /// `sendToTask` threads the same sender-attribution metadata through the
+    /// new `agent_send_to_task` metadata parameter.
+    #[tokio::test]
+    async fn agent_send_to_task_with_caller_tags_sender_metadata() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_to_task_calls.lock().unwrap();
+        assert_eq!(calls[0].0, "tn-1");
+        assert_eq!(
+            calls[0].2,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_send_to_task_without_caller_has_no_sender_metadata() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.sendToTask('tn-1', 'hi');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_to_task_calls.lock().unwrap();
+        assert_eq!(calls[0].2, None);
+    }
+
+    /// `create()`'s initial-message delivery to the child is also an
+    /// agent-originated send and carries the same attribution block.
+    #[tokio::test]
+    async fn agent_create_initial_message_tags_sender_metadata() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.agent.create('child', 'go');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].0, "child-1");
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
+    }
+
+    /// Explicit `messageMetadata` on `send` wins over the auto-tag — we never
+    /// overwrite metadata the caller supplied.
+    #[tokio::test]
+    async fn agent_send_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('a-1', 'hi', null, { type: 'custom', reason: 'x' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].3, Some(json!({ "type": "custom", "reason": "x" })));
+    }
+
+    /// Explicit `messageMetadata` on `sendToTask` wins over the auto-tag.
+    #[tokio::test]
+    async fn agent_send_to_task_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('tn-1', 'hi', null, { type: 'custom' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_to_task_calls.lock().unwrap();
+        assert_eq!(calls[0].2, Some(json!({ "type": "custom" })));
+    }
+
+    /// Explicit `messageMetadata` in `create()` opts wins over the auto-tag on
+    /// the kickoff delivery.
+    #[tokio::test]
+    async fn agent_create_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('child', 'go', { messageMetadata: { type: 'custom' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_send_calls.lock().unwrap();
+        assert_eq!(calls[0].0, "child-1");
+        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
     }
 
     #[tokio::test]

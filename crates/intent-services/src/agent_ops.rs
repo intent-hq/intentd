@@ -7,7 +7,7 @@
 //! [`parse_model_list_output`] port the `agent.getModels` static-tier fallback
 //! and auggie CLI parser respectively.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -70,21 +70,23 @@ mod tests_specialist_frontmatter;
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
-async fn resolve_default_model_from_settings(
+fn resolve_default_model_from_settings(
     services: &Services,
     workspace_id: &WorkspaceId,
     is_background: bool,
     agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
+    let settings = services.effective_settings();
+
     // 1. Check workspace-specific override
-    if let Ok(Some(raw)) = services.store.get_setting("model.workspaceOverrides").await {
-        if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
-            if let Some(model) = overrides.get(workspace_id.as_str()).and_then(Value::as_str) {
-                if !model.is_empty() {
-                    return Some(model.to_string());
-                }
-            }
+    if let Some(model) = settings
+        .model
+        .workspace_overrides
+        .get(workspace_id.as_str())
+    {
+        if !model.is_empty() {
+            return Some(model.clone());
         }
     }
 
@@ -92,58 +94,56 @@ async fn resolve_default_model_from_settings(
     if is_background {
         // 2a. Check agent type override
         if let Some(typ) = agent_type {
-            if let Ok(Some(raw)) = services
-                .store
-                .get_setting("backgroundAgents.typeOverrides")
-                .await
-            {
-                if let Ok(Value::Object(overrides)) = serde_json::from_str::<Value>(&raw) {
-                    if let Some(model) = overrides.get(typ).and_then(Value::as_str) {
-                        if !model.is_empty() {
-                            return Some(model.to_string());
-                        }
-                    }
+            if let Some(model) = settings.background_agents.type_overrides.get(typ) {
+                if !model.is_empty() {
+                    return Some(model.clone());
                 }
             }
         }
 
         // 2b. Check background agents default
-        if let Ok(Some(raw)) = services
-            .store
-            .get_setting("backgroundAgents.defaultModel")
-            .await
+        if let Some(model) = settings
+            .background_agents
+            .default_model
+            .as_deref()
+            .filter(|m| !m.is_empty())
         {
-            if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
-                if !model.is_empty() {
-                    return Some(model);
-                }
-            }
+            return Some(model.to_string());
         }
     }
 
     // 3. Check provider defaults
     let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
-    if let Ok(Some(raw)) = services.store.get_setting("model.providerDefaults").await {
-        if let Ok(Value::Object(defaults)) = serde_json::from_str::<Value>(&raw) {
-            if let Some(model) = defaults.get(provider_key).and_then(Value::as_str) {
-                if !model.is_empty() {
-                    return Some(model.to_string());
-                }
-            }
+    if let Some(model) = settings.model.provider_defaults.get(provider_key) {
+        if !model.is_empty() {
+            return Some(model.clone());
         }
     }
 
     // 4. Check global default
-    if let Ok(Some(raw)) = services.store.get_setting("model.default").await {
-        if let Ok(Value::String(model)) = serde_json::from_str::<Value>(&raw) {
-            if !model.is_empty() {
-                return Some(model);
-            }
-        }
+    if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
+        return Some(model.to_string());
     }
 
     // 5. None → CLI default (session.model stays None)
     None
+}
+
+/// RAII claim on a client-supplied agent id while a create flow is in flight
+/// (see [`Services::reserve_agent_id`]). Dropping the guard — on success or
+/// failure — releases the id so a later legitimate create is not blocked.
+pub(crate) struct AgentIdReservation {
+    set: Arc<Mutex<HashSet<AgentId>>>,
+    id: AgentId,
+}
+
+impl Drop for AgentIdReservation {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
 }
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
@@ -152,23 +152,32 @@ async fn resolve_default_model_from_settings(
 /// queue so the drain skips it (PROTOCOL §5.5/§6.5). The agent may go idle only
 /// when every remaining queued entry has `editing == true`; setting `editing`
 /// back to `false` re-includes the message and self-drains.
-#[derive(Debug, Clone)]
+///
+/// Serializes to camelCase JSON as the durable `agent_queue.payload` shape
+/// (write-through persistence; see [`Services::persist_queue_snapshot`]). The
+/// bool fields take `#[serde(default)]` so older payloads missing a later
+/// flag still rehydrate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
     pub id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
     pub queued_at: String,
+    #[serde(default)]
     pub editing: bool,
     /// `true` when the user-message row already reached the transcript before
     /// this entry was (re)queued — set by both the terminal-failure requeue
     /// (STAB-112) and the interrupt zero-output requeue (STAB-114). Drain paths
     /// skip `persist_user` for such entries so a retry does not duplicate the
     /// user message in chat history.
+    #[serde(default)]
     pub persisted: bool,
     /// `true` when this is a terminal-failure requeue (STAB-112); `to_value`
     /// emits `requeuedAfterFailure: true` on the wire. Interrupt requeues
     /// (STAB-114) leave this `false` so the FE does not show "failed — will retry".
+    #[serde(default)]
     pub requeued_after_failure: bool,
     /// Per-message `messageMetadata` captured at enqueue time (e.g. the
     /// `event_notification` payload of a parent wake that arrived while a turn
@@ -1133,6 +1142,48 @@ impl Services {
         .await;
     }
 
+    /// Reject a client-supplied agent id that already names a persisted
+    /// session (PROTOCOL §5.5): a duplicate is `-32602` naming the id, so a
+    /// retrying client sees a clear validation error instead of the opaque
+    /// `-32603` SQLite UNIQUE(1555) insert failure — and callers like
+    /// `workspace.create` can pre-validate BEFORE running provisioning side
+    /// effects.
+    pub(crate) async fn ensure_agent_id_available(&self, id: &AgentId) -> Result<()> {
+        match self.store.get_agent_session_status(id).await {
+            Ok(_) => Err(Error::InvalidParams(format!(
+                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
+            ))),
+            Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Atomically claim a client-supplied agent id for the duration of a
+    /// create flow, closing the check-then-act gap left by
+    /// [`ensure_agent_id_available`]: two overlapping `workspace.create`
+    /// retries with the same `initialAgent.agentId` would otherwise BOTH pass
+    /// the preflight SELECT, run expensive provisioning (clone, worktree, row
+    /// insert, `workspace:created`), and then one would lose at the agent
+    /// insert — orphaning a partial workspace. The loser now fails the same
+    /// `-32602` at preflight, before any side effect. The reservation is
+    /// in-process only (the daemon is the sole writer of its SQLite store)
+    /// and releases on [`AgentIdReservation`] drop — success or failure.
+    pub(crate) fn reserve_agent_id(&self, id: &AgentId) -> Result<AgentIdReservation> {
+        let mut set = self
+            .creating_agent_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !set.insert(id.clone()) {
+            return Err(Error::InvalidParams(format!(
+                "agentId {id} already exists; supply a fresh agent-{{uuid}} per create attempt"
+            )));
+        }
+        Ok(AgentIdReservation {
+            set: Arc::clone(&self.creating_agent_ids),
+            id: id.clone(),
+        })
+    }
+
     /// `agent.create`: persist a new session; the process spawns lazily on first
     /// turn (PROTOCOL §5.5). `task_note_id`/`skip_auto_commit` are set by
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
@@ -1141,8 +1192,9 @@ impl Services {
     /// `requested_agent_id` is honored verbatim when it is a well-formed
     /// `agent-{uuid}`, so the FE can create + address the session under an id
     /// it already minted (fixes the UI create→sendMessage "not found: agent
-    /// session" race). Malformed values surface as `-32602`; when `None` a
-    /// fresh id is generated (existing behavior).
+    /// session" race). Malformed values surface as `-32602`, and so does a
+    /// duplicate id that already names a persisted session (naming the id);
+    /// when `None` a fresh id is generated (existing behavior).
     ///
     /// `extra` carries the widened FE-facing spawn hints. `provider` lands on
     /// the persisted [`AgentSession`]; `metadata` is harvested for the
@@ -1204,6 +1256,7 @@ impl Services {
         let id = match requested_agent_id {
             Some(requested) => {
                 validate_client_agent_id(requested.as_str())?;
+                self.ensure_agent_id_available(&requested).await?;
                 requested
             }
             None => AgentId(format!("agent-{}", Uuid::new_v4())),
@@ -1292,7 +1345,6 @@ impl Services {
                             specialist.as_deref(),
                             provider.as_deref(),
                         )
-                        .await
                     }
                 }
             }
@@ -1847,6 +1899,90 @@ impl Services {
         Ok(json!({ "success": true, "messages": inserted }))
     }
 
+    /// Locate the `agent.editAndRegenerate` target in an already-fetched
+    /// transcript: `message_id` must reference an existing **user** message.
+    /// Returns its 0-based index into `messages`; `InvalidParams` (→ `-32602`)
+    /// otherwise. Pure, so validate + truncate can share ONE transcript fetch
+    /// (no TOCTOU between the index and the slice it cuts).
+    fn find_edit_target(messages: &[intent_core::AgentMessage], message_id: &str) -> Result<usize> {
+        let idx = messages
+            .iter()
+            .position(|m| m.id == message_id)
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "agent.editAndRegenerate: messageId {message_id} not found in transcript"
+                ))
+            })?;
+        if messages[idx].role != "user" {
+            return Err(Error::InvalidParams(format!(
+                "agent.editAndRegenerate: messageId {message_id} is not a user message (role: {})",
+                messages[idx].role
+            )));
+        }
+        Ok(idx)
+    }
+
+    /// Validate the `agent.editAndRegenerate` target: `message_id` must
+    /// reference an existing **user** message in the agent's transcript.
+    /// Returns the 0-based index of that message. Read-only, so the caller can
+    /// reject a bad `messageId` with `-32602` BEFORE stopping an in-flight
+    /// turn or mutating any state (PROTOCOL §5.5).
+    pub(crate) async fn agent_validate_edit_target_op(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<usize> {
+        let messages = self.store.get_agent_messages(agent_id, None).await?;
+        Self::find_edit_target(&messages, message_id)
+    }
+
+    /// `agent.editAndRegenerate` truncation step: atomically truncate the
+    /// transcript to just BEFORE the (already validated) user message
+    /// `message_id`, dropping it and everything after it. Reuses the
+    /// replaceMessages store machinery (fresh row ids / 0-based `seq`).
+    /// Emits `agent:updated` with `{ truncatedCount, remainingCount }`.
+    /// Returns the number of messages removed.
+    ///
+    /// Re-validates against the SAME transcript fetch it slices (single read;
+    /// no index/slice divergence). If the target vanished between the caller's
+    /// pre-stop validation and this call (concurrent `agent.replaceMessages`),
+    /// this fails with `-32602` after the stop already happened — the
+    /// "reject before any state change" contract covers the pre-stop check;
+    /// the transcript itself is still untouched here.
+    pub(crate) async fn agent_edit_truncate_op(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Result<usize> {
+        let session = self.store.get_agent_session(agent_id).await?;
+        let messages = self.store.get_agent_messages(agent_id, None).await?;
+        let idx = Self::find_edit_target(&messages, message_id)?;
+        let keep = &messages[..idx];
+        let batch: Vec<intent_store::ReplaceMessage<'_>> = keep
+            .iter()
+            .map(|m| intent_store::ReplaceMessage {
+                role: m.role.as_str(),
+                content: &m.content,
+                metadata: m.metadata.as_ref(),
+                created_at: m.created_at.as_str(),
+            })
+            .collect();
+        let inserted = self.store.replace_agent_messages(agent_id, &batch).await?;
+        let truncated_count = messages.len() - inserted.len();
+        self.publish_agent_mutation_event(
+            &session.workspace_id,
+            agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "truncatedCount": truncated_count,
+                "remainingCount": inserted.len(),
+            }),
+        )
+        .await;
+        Ok(truncated_count)
+    }
+
     /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
         let models = match fetch_auggie_models().await? {
@@ -2024,6 +2160,7 @@ impl Services {
         message_id: Option<String>,
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         // Validate message_id length to prevent unbounded storage.
         if let Some(ref id) = message_id {
@@ -2046,14 +2183,20 @@ impl Services {
                         &id,
                         "user",
                         &blocks,
-                        None,
+                        message_metadata.as_ref(),
                         &created_at,
                     )
                     .await
             }
             None => {
                 self.store
-                    .append_agent_message(&agent_id, "user", &blocks, &created_at)
+                    .append_agent_message_with_metadata(
+                        &agent_id,
+                        "user",
+                        &blocks,
+                        message_metadata.as_ref(),
+                        &created_at,
+                    )
                     .await
             }
         };
@@ -2832,7 +2975,7 @@ impl Services {
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, None)
                         .await
                 }
             };
@@ -3480,6 +3623,7 @@ impl Services {
         task_note_id: NoteId,
         message: String,
         priority: Option<String>,
+        message_metadata: Option<Value>,
     ) -> Result<Value> {
         let task = self.get_my_task(workspace_id.clone(), task_note_id).await?;
         let Some(agent) = task.assigned_agents.first().cloned() else {
@@ -3494,35 +3638,38 @@ impl Services {
         // `agent_send_message` (WorkspaceApi) routing: the manager path
         // spawns the turn worker; only the read-only wiring with no
         // manager falls back to the store-only op.
+        let options = crate::agent_manager::TurnOptions {
+            message_metadata,
+            ..crate::agent_manager::TurnOptions::default()
+        };
         let result = match (
             self.agent_manager(),
             is_interrupt_priority(priority.as_deref()),
         ) {
             (Some(manager), true) => {
                 manager
-                    .interrupt_send_message(
-                        agent.clone(),
-                        workspace_id,
-                        message,
-                        None,
-                        crate::agent_manager::TurnOptions::default(),
-                    )
+                    .interrupt_send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
             (Some(manager), false) => {
                 manager
-                    .send_message(
-                        agent.clone(),
-                        workspace_id,
-                        message,
-                        None,
-                        crate::agent_manager::TurnOptions::default(),
-                    )
+                    .send_message(agent.clone(), workspace_id, message, None, options)
                     .await?
             }
             (None, _) => {
-                self.agent_send_message_op(agent.clone(), message, None, None, None)
-                    .await?
+                // Read-only fallback (no `agent_manager` wired): mirrors
+                // `agent_send_message` — plumb the metadata through the
+                // store-only append so attribution is consistent across
+                // deployments with and without a runtime manager.
+                self.agent_send_message_op(
+                    agent.clone(),
+                    message,
+                    None,
+                    None,
+                    None,
+                    options.message_metadata,
+                )
+                .await?
             }
         };
         Ok(json!({ "ok": true, "agentId": agent, "result": result }))
@@ -4220,6 +4367,88 @@ impl Services {
             .unwrap_or_default()
     }
 
+    /// Write-through persistence of an agent's queue: snapshot the in-memory
+    /// queue (brief lock, dropped before the await) and replace the agent's
+    /// `agent_queue` rows with it. Best-effort — a store failure is logged at
+    /// WARN and never fails the calling RPC; the in-memory queue remains the
+    /// live source of truth and the next mutation re-snapshots.
+    ///
+    /// Persists are serialized through `agent_queue_persist_gate`, and the
+    /// snapshot is taken *inside* that gate: concurrent mutations cannot
+    /// commit snapshots out of mutation order, because whichever persist runs
+    /// later re-reads the live queue (which already includes the earlier
+    /// mutation). Once this returns, the DB holds this mutation's state or a
+    /// newer superset — never an older snapshot.
+    pub(crate) async fn persist_queue_snapshot(&self, agent_id: &AgentId) {
+        let _gate = self.agent_queue_persist_gate.lock().await;
+        let rows: Vec<intent_store::AgentQueueRow> = {
+            let guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            guard
+                .get(agent_id)
+                .map(|q| {
+                    q.iter()
+                        .enumerate()
+                        .map(|(i, m)| intent_store::AgentQueueRow {
+                            id: m.id.clone(),
+                            agent_id: agent_id.clone(),
+                            position: i as i64,
+                            payload: serde_json::to_value(m).unwrap_or(Value::Null),
+                            created_at: m.queued_at.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        if let Err(e) = self.store.replace_agent_queue(agent_id, &rows).await {
+            tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
+        }
+    }
+
+    /// Rehydrate every persisted agent queue into the in-memory map at daemon
+    /// startup (before RPCs are served). Entries left `editing: true` at
+    /// shutdown come back ready-to-send (`editing: false`) — the editing
+    /// client's hold is gone; `persisted` / `requeuedAfterFailure` flags are
+    /// preserved so a later drain does not double-append transcript rows
+    /// (STAB-114/STAB-52). Rehydration never kicks `try_drain_queue`: messages
+    /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
+    /// Returns the number of messages actually inserted into the in-memory
+    /// map (agents that already hold a live queue are skipped, not counted).
+    pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
+        let rows = self.store.load_all_agent_queues().await?;
+        let mut map: HashMap<AgentId, Vec<QueuedMessage>> = HashMap::new();
+        for row in rows {
+            match serde_json::from_value::<QueuedMessage>(row.payload) {
+                Ok(mut message) => {
+                    message.editing = false;
+                    map.entry(row.agent_id).or_default().push(message);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %row.agent_id,
+                        message_id = %row.id,
+                        error = %e,
+                        "skipping undecodable persisted queue entry"
+                    );
+                }
+            }
+        }
+        let mut count = 0;
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        for (agent_id, queue) in map {
+            if let std::collections::hash_map::Entry::Vacant(entry) = guard.entry(agent_id) {
+                count += queue.len();
+                entry.insert(queue);
+            }
+        }
+        Ok(count)
+    }
+
     /// Publish `agent:queue:updated` with the **current** queue snapshot.
     /// Looks up the owning workspace from the agent session — when the session
     /// row is missing (e.g. an idempotent remove on an unknown agent) or no bus
@@ -4228,13 +4457,16 @@ impl Services {
     ///
     /// The queue snapshot is taken **outside** the mutex it lives behind, but
     /// since this method only reads (under a brief lock that is dropped before
-    /// the await) it never holds the queue lock across an `await` point.
+    /// the await) it never holds the queue lock across an `await` point. The
+    /// snapshot is taken after the session lookup so the event payload and the
+    /// write-through snapshot in [`publish_queue_updated_for`] reflect queue
+    /// state from (nearly) the same moment.
     pub(crate) async fn publish_queue_updated(&self, agent_id: &AgentId) {
-        let queue = self.queue_snapshot(agent_id);
         let workspace_id = match self.store.get_agent_session(agent_id).await {
             Ok(s) => s.workspace_id,
             Err(_) => return,
         };
+        let queue = self.queue_snapshot(agent_id);
         self.publish_queue_updated_for(agent_id, &workspace_id, queue)
             .await;
     }
@@ -4242,12 +4474,18 @@ impl Services {
     /// Like [`publish_queue_updated`] but takes the workspace id directly —
     /// used by call sites (the turn worker, `force_message`) that already hold
     /// it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    ///
+    /// Every queue mutation flows through here (or through
+    /// [`publish_queue_updated`], which delegates here), so this is also the
+    /// single write-through choke point: the durable `agent_queue` snapshot is
+    /// refreshed before the event is published.
     pub(crate) async fn publish_queue_updated_for(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         queue: Vec<Value>,
     ) {
+        self.persist_queue_snapshot(agent_id).await;
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
@@ -4518,6 +4756,55 @@ impl Services {
                         });
                 }
             }
+        }
+
+        // Append a system interruption marker BEFORE the continuation so the
+        // transcript shows the interruption boundary (same shape as the abandon
+        // path; the FE InterruptionNotice keys off `meta.kind == "interruption"`).
+        // Idempotent on retry: if a prior resume attempt appended the marker but
+        // failed delivering the continuation (row reset to pending), the marker
+        // is already the transcript tail — skip the duplicate append. A failed
+        // append is treated like a failed continuation delivery: reset the row
+        // to pending and surface the error.
+        let marker_text =
+            "The previous turn was interrupted because the harness shut down. Continuing below.";
+        let marker_content = json!([{
+            "type": "text",
+            "text": marker_text,
+            "meta": { "kind": "interruption" }
+        }]);
+        let already_marked = session
+            .messages
+            .last()
+            .is_some_and(|m| m.role == "system" && m.content == marker_content);
+        if !already_marked {
+            let marker = match self
+                .store
+                .append_agent_message(agent_id, "system", &marker_content, &now_iso())
+                .await
+            {
+                Ok(message) => message,
+                Err(e) => {
+                    reset_to_pending().await;
+                    return Err(e);
+                }
+            };
+
+            // Emit agent:message + agent:updated so live UIs render the marker.
+            self.publish_agent_mutation_event(
+                &workspace_id,
+                agent_id,
+                AGENT_MESSAGE,
+                json!({ "agentId": agent_id.0, "messageId": marker.id, "role": "system" }),
+            )
+            .await;
+            self.publish_agent_mutation_event(
+                &workspace_id,
+                agent_id,
+                AGENT_UPDATED,
+                json!({ "agentId": agent_id.0 }),
+            )
+            .await;
         }
 
         // Deliver continuation message

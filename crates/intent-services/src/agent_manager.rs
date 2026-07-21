@@ -729,6 +729,28 @@ pub struct AgentManager {
     /// exactly once — the duplicate is acknowledged idempotently instead of
     /// cancelling the interrupt turn it raced and re-persisting the message.
     interrupt_ids: Arc<Mutex<HashMap<AgentId, String>>>,
+    /// Agents whose NEXT session establishment must SKIP the `session/load`
+    /// resume and open a fresh `session/new` instead — armed by
+    /// [`AgentManager::edit_and_regenerate`] (immediately after target
+    /// validation, before the stop) because a resumed provider session would
+    /// retain the truncated turns in its context. Deliberately NOT cleared by
+    /// [`AgentManager::stop`] (unlike `recreated`/`prepend_pending`): the
+    /// truncation is already persisted, so the stale provider history must
+    /// never be resumed regardless of intervening stops. Enforced at BOTH
+    /// establishment points — [`AgentManager::start_session`] skips the
+    /// resume, and [`AgentManager::ensure_started`]'s live-child reuse path
+    /// tears the child down when armed — and consumed only when a fresh
+    /// session is successfully opened, so spawn retries keep the flag.
+    ///
+    /// KNOWN LIMITATION: in-memory only, like `recreated` (and the same gap
+    /// `agent.replaceMessages` has today). If the daemon restarts before the
+    /// regenerated turn opens its fresh session (e.g. the spawn failed
+    /// terminally and the agent parked in `Error` awaiting `agent.retry`),
+    /// the intent is lost and the next spawn may resume the stale provider
+    /// session via `session/load`. Persisting a needs-recreate marker on the
+    /// session row would close this; not done here to keep parity with the
+    /// existing replaceMessages semantics.
+    force_recreate: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AgentManager {
@@ -789,6 +811,7 @@ impl AgentManager {
             recreated: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
+            force_recreate: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -923,10 +946,11 @@ impl AgentManager {
                 .services
                 .agent_specialist_injection(&agent_id, Some(&cwd))
                 .await;
-            // `git.autoCommit` is a global (non-workspace-scoped) setting, so
-            // this lookup is independent of the session and cheap to do here.
-            let auto_commit_enabled =
-                crate::settings::auto_commit_enabled(&self.services.store).await;
+            // `git.autoCommit` / `rtk.enabled` are global (non-workspace-scoped)
+            // settings, so this snapshot is independent of the session and
+            // cheap to take here.
+            let settings = self.services.effective_settings();
+            let auto_commit_enabled = settings.git.auto_commit;
             // Sub-agent gating: delegated children (`parent_agent_id` set) and
             // background workers (`is_background`) skip the suggested-prompts
             // directive, matching the reference `isSubAgent` derivation. The
@@ -945,6 +969,7 @@ impl AgentManager {
                 specialist.as_ref(),
                 is_sub_agent,
                 auto_commit_enabled,
+                settings.rtk.enabled,
                 workspace.as_ref(),
                 Some(&session),
             )
@@ -1111,14 +1136,15 @@ impl AgentManager {
     /// already set one. Any config that collides with a reserved built-in name
     /// (e.g. `workspace-mcp`) is skipped so the bridge cannot be shadowed.
     async fn merge_user_mcp_servers(&self, out: &mut NormalizedMcpServers) -> Result<()> {
-        if !crate::mcp_servers::enable_user_servers(&self.services.store).await {
+        let settings = self.services.effective_settings();
+        if !crate::mcp_servers::enable_user_servers(&settings) {
             return Ok(());
         }
         let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
         if configs.is_empty() {
             return Ok(());
         }
-        let disabled = crate::mcp_servers::disabled_servers(&self.services.store).await;
+        let disabled = crate::mcp_servers::disabled_servers(&settings);
         let disabled: HashSet<&str> = disabled.iter().map(String::as_str).collect();
 
         let mut reshaped = serde_json::Map::new();
@@ -1300,18 +1326,30 @@ impl AgentManager {
         // (CAS-replacing exactly this id) and resends history.
         let stored_id = session_record.acp_session_id;
 
+        // Forced recreate (`agent.editAndRegenerate`): the transcript was
+        // truncated, so resuming the provider session would retain the
+        // truncated turns in its context. Skip the `session/load` attempt and
+        // fall through to the recreate/new branches, which open a fresh
+        // `session/new` and replay the truncated history as `<supervisor>`
+        // XML. Peeked here and consumed only after a fresh session is
+        // successfully opened, so a failed spawn attempt retries with the
+        // flag still armed instead of resuming the stale session.
+        let forced = self.force_recreate.lock().unwrap().contains(agent_id);
+
         // 1) Try to resume the persisted session (gated on stored id + capability).
-        match self
-            .services
-            .resume_acp_session(
-                conn.as_ref(),
-                &handshake.initialize,
-                agent_id,
-                cwd.clone(),
-                Vec::new(),
-            )
-            .await
-        {
+        match if forced {
+            Ok(None)
+        } else {
+            self.services
+                .resume_acp_session(
+                    conn.as_ref(),
+                    &handshake.initialize,
+                    agent_id,
+                    cwd.clone(),
+                    Vec::new(),
+                )
+                .await
+        } {
             Ok(Some(opened)) => {
                 // `session/load` replays the prior conversation as a buffered
                 // `session/update` burst; discard it before the first turn so it
@@ -1357,6 +1395,7 @@ impl AgentManager {
                 .services
                 .recreate_acp_session(conn.as_ref(), agent_id, &expected_old, cwd, Vec::new())
                 .await?;
+            self.force_recreate.lock().unwrap().remove(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
             self.arm_first_turn_prepend(agent_id, provider);
             self.maybe_bypass_permissions(
@@ -1374,6 +1413,7 @@ impl AgentManager {
             .services
             .open_acp_session(conn.as_ref(), agent_id, cwd, Vec::new())
             .await?;
+        self.force_recreate.lock().unwrap().remove(agent_id);
         self.arm_first_turn_prepend(agent_id, provider);
         self.maybe_bypass_permissions(
             conn.as_ref(),
@@ -2285,6 +2325,85 @@ impl AgentManager {
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
+    /// `agent.editAndRegenerate` runtime path (§5.5): edit a past user message
+    /// and regenerate from that point. Orchestrates, in order:
+    ///
+    /// 1. Validate `message_id` refers to an existing **user** message
+    ///    (read-only, BEFORE any state changes — a bad id surfaces `-32602`
+    ///    without stopping the turn or touching the transcript).
+    /// 2. Stop any in-flight turn (same hard-cancel + queue-discard semantics
+    ///    as [`AgentManager::force_message`]).
+    /// 3. Optionally switch the model (the `model` param, via `agent.setModel`
+    ///    semantics) before the regenerated turn spawns.
+    /// 4. Truncate the transcript to just before the edited message (emits
+    ///    `agent:updated` with `{ truncatedCount, remainingCount }`).
+    /// 5. Arm the forced-recreate flag so the next prompt SKIPS `session/load`
+    ///    and opens a fresh `session/new` (the provider must not retain the
+    ///    truncated turns), plus the `recreated` flag so the truncated history
+    ///    replays as `<supervisor>` XML on that prompt.
+    /// 6. Send `content` as a fresh user message (normal
+    ///    [`AgentManager::send_message`] path; stream events follow).
+    pub async fn edit_and_regenerate(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        content: String,
+        model: Option<String>,
+        options: TurnOptions,
+    ) -> Result<Value> {
+        self.services
+            .agent_validate_edit_target_op(&agent_id, &message_id)
+            .await?;
+        // Arm `force_recreate` IMMEDIATELY after validation — before `stop()`
+        // — to shrink the window where a concurrent turn could establish a
+        // resumed session between the stop and the arm. It survives `stop()`
+        // by design, and a spuriously-armed flag is safe (worst case: one
+        // unnecessary fresh session + history replay). `ensure_started` also
+        // consults it on the live-child reuse path, so an interleaved turn
+        // that does establish a session before the truncation still gets torn
+        // down and recreated on the next prompt.
+        self.force_recreate.lock().unwrap().insert(agent_id.clone());
+        self.stop(&agent_id).await;
+        if self.services.clear_queue(&agent_id) {
+            self.services
+                .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
+                .await;
+        }
+        // Until the truncation actually lands, a failure must DISARM the
+        // flag: nothing was truncated, so leaving it set would force an
+        // unnecessary session recreate (lost provider warm state) on the next
+        // unrelated turn. After the truncation persists, the flag must stay
+        // armed no matter what fails later.
+        let pre_truncate = async {
+            if let Some(model_id) = model {
+                self.services
+                    .agent_set_model_op(agent_id.clone(), model_id)
+                    .await?;
+            }
+            self.services
+                .agent_edit_truncate_op(&agent_id, &message_id)
+                .await
+        };
+        let truncated_count = match pre_truncate.await {
+            Ok(count) => count,
+            Err(e) => {
+                self.force_recreate.lock().unwrap().remove(&agent_id);
+                return Err(e);
+            }
+        };
+        // Arm `recreated` AFTER `stop` (which clears it): it makes the next
+        // turn prepend the truncated history as `<supervisor>` XML.
+        self.recreated.lock().unwrap().insert(agent_id.clone());
+        let mut result = self
+            .send_message(agent_id, workspace_id, content, None, options)
+            .await?;
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("truncatedCount".to_string(), json!(truncated_count));
+        }
+        Ok(result)
+    }
+
     /// `agent.sendMessage` with `priority: "interrupt"` (§5.5): preempt the
     /// in-flight turn instead of queueing behind it, then deliver `content`
     /// immediately as a fresh turn on the SAME live session. The preemption is
@@ -2646,7 +2765,11 @@ impl AgentManager {
     ) -> Result<String> {
         let session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
-        let resolved = resolve_spawn(&session, workspace.as_ref(), &self.services.store).await?;
+        let resolved = resolve_spawn(
+            &session,
+            workspace.as_ref(),
+            &self.services.effective_settings(),
+        )?;
 
         // Check if the agent's model/provider has changed (via agent.setModel).
         // If so, tear down the existing child and force a respawn with the new model.
@@ -2666,7 +2789,16 @@ impl AgentManager {
                 }
             };
 
-            if needs_respawn {
+            // Forced recreate (`agent.editAndRegenerate`): the live child's
+            // provider session predates the truncation, so it must not be
+            // reused OR resumed — tear it down and let `start_session` open a
+            // fresh `session/new`. Checking here (not just in `start_session`)
+            // makes `ensure_started` the single enforcement point regardless
+            // of how an edit interleaves with concurrent turns: without it,
+            // the live-child reuse branch below would return the stale session
+            // with the armed flag sitting unconsumed.
+            let forced = self.force_recreate.lock().unwrap().contains(agent_id);
+            if needs_respawn || forced {
                 // Tear down the existing child (preserving the acpSessionId so
                 // start_session can try session/load for providers that support it).
                 // This is narrower than stop() — only kills the child/handle, no
@@ -2729,6 +2861,28 @@ impl AgentManager {
                 Some(ws) => ws,
                 None => continue, // Stale busy entry (should not happen).
             };
+            // Snapshot the live-turn slot BEFORE aborting the worker: the abort
+            // drops the worker future and with it the LiveTurnGuard, which
+            // clears the slot — reading after the abort would race that drop
+            // and frequently lose the partial content.
+            let partial_turn = self.services.live_turn(id);
+            // Abort the turn worker BEFORE flushing so it cannot race the
+            // partial flush by persisting the full turn under the same minted
+            // message id (which would leave the transcript stuck on the partial
+            // snapshot while the worker's own append errors on the UNIQUE id).
+            // stop() below removes the (already-gone) worker entry harmlessly.
+            if let Some(worker) = self.workers.lock().unwrap().remove(id) {
+                worker.abort();
+            }
+            // Best-effort: persist any partial in-flight assistant content from
+            // the snapshot so the transcript keeps the streamed-so-far output
+            // across the restart. Runs before the status guards below so a
+            // degenerate status read/encode failure never drops the content.
+            if let Some(live) = partial_turn {
+                self.services
+                    .flush_partial_turn_on_interruption(id, live)
+                    .await;
+            }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -3066,13 +3220,15 @@ fn derive_agent_type(
 /// id, else the default provider. The `mock` provider (E2E) reads its script
 /// from `MOCK_AGENT_SCRIPT_PATH` and enables `--mcp-config` so a daemon-spawned
 /// child reaches the per-agent workspace MCP server, forwarding
-/// `MOCK_AGENT_BEHAVIOR` to the child. Resolves the provider binary to an
-/// absolute path using the precedence: `providers.paths` map →
-/// `~/.augment/bin/<command>` (for auggie) → enhanced PATH scan.
-async fn resolve_spawn(
+/// `MOCK_AGENT_BEHAVIOR` to the child. npx-only providers (claude-code) are
+/// always spawned via `npx -y <pinned package>` — no local-binary discovery.
+/// Other providers resolve their binary to an absolute path using the
+/// precedence: `providers.paths` map → `~/.augment/bin/<command>` (for auggie)
+/// → enhanced PATH scan.
+fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
-    store: &intent_store::Store,
+    settings: &intent_core::settings_file::SettingsFile,
 ) -> Result<ResolvedSpawn> {
     // Provider precedence: when the model carries an explicit `provider:` prefix
     // (e.g., "opencode:kimi-k3"), that prefix wins over session.provider,
@@ -3151,8 +3307,31 @@ async fn resolve_spawn(
 
     let provider = *intent_providers::provider_config(&provider_id);
 
+    // npx-only providers (claude-code) are spawned exclusively via
+    // `npx -y <pinned package>`; local-binary discovery (settings path /
+    // managed bin / PATH scan) is skipped entirely.
+    if provider.npx_only_package.is_some() {
+        if read_provider_path_setting(settings, &provider_id).is_some() {
+            tracing::warn!(
+                provider_id = provider_id,
+                "providers.paths override ignored: {} always spawns via pinned npx",
+                provider_id
+            );
+        }
+        let (npx_binary, npx_package) = resolve_npx_only(&provider, intent_providers::find_npx())?;
+        return Ok(ResolvedSpawn {
+            provider,
+            model,
+            cwd,
+            provider_binary: None,
+            extra_env,
+            npx_fallback_binary: Some(npx_binary),
+            npx_fallback_package: Some(npx_package),
+        });
+    }
+
     // Resolve provider binary using the precedence: setting → managed → PATH
-    let explicit_path = read_provider_path_setting(store, &provider_id).await;
+    let explicit_path = read_provider_path_setting(settings, &provider_id);
     let provider_binary = intent_providers::find_provider_binary(
         &provider_id,
         provider.command,
@@ -3192,15 +3371,44 @@ async fn resolve_spawn(
     })
 }
 
+/// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
+/// caller-supplied `find_npx()` result (parameterized as a test seam). Missing
+/// npx is a hard, user-facing error — there is no local-binary fallback.
+fn resolve_npx_only(
+    provider: &ProviderConfig,
+    npx_path: Option<PathBuf>,
+) -> Result<(PathBuf, &'static str)> {
+    let pkg = provider.npx_only_package.ok_or_else(|| {
+        Error::Internal(format!(
+            "provider {} is not configured for npx-only spawning",
+            provider.id
+        ))
+    })?;
+    let npx = npx_path.ok_or_else(|| {
+        // InvalidInput (not Internal): this is an environment misconfiguration,
+        // and its Display survives the JSON-RPC envelope (`domain_to_rpc` masks
+        // Internal messages behind a literal "Internal error").
+        Error::InvalidInput(format!(
+            "npx not found — {} is required to run {}. Install Node.js (which provides npx) and try again.",
+            intent_providers::CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
+            provider.display_name
+        ))
+    })?;
+    tracing::info!(
+        provider_id = provider.id,
+        npx_path = ?npx,
+        package = pkg,
+        "spawning npx-only provider via pinned npx package"
+    );
+    Ok((npx, pkg))
+}
+
 /// Read the provider path from the `providers.paths` map setting, if set.
-async fn read_provider_path_setting(
-    store: &intent_store::Store,
+fn read_provider_path_setting(
+    settings: &intent_core::settings_file::SettingsFile,
     provider_id: &str,
 ) -> Option<String> {
-    let json_str = store.get_setting("providers.paths").await.ok()??;
-    let value: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-    let map = value.as_object()?;
-    let path = map.get(provider_id)?.as_str()?;
+    let path = settings.providers.paths.get(provider_id)?;
     let trimmed = path.trim();
     if trimmed.is_empty() {
         None
@@ -3970,6 +4178,27 @@ mod role_reminder_tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
+    /// MUST keep `force_recreate` armed: an `agent.editAndRegenerate`
+    /// truncation is already persisted, so the stale provider session must
+    /// never be resumed no matter how many stops intervene before the next
+    /// turn.
+    #[tokio::test]
+    async fn stop_preserves_force_recreate_but_clears_recreated() {
+        let (mgr, agent_id) = manager_with(None, None).await;
+        mgr.force_recreate.lock().unwrap().insert(agent_id.clone());
+        mgr.recreated.lock().unwrap().insert(agent_id.clone());
+        mgr.stop(&agent_id).await;
+        assert!(
+            mgr.force_recreate.lock().unwrap().contains(&agent_id),
+            "force_recreate survives stop()"
+        );
+        assert!(
+            !mgr.recreated.lock().unwrap().contains(&agent_id),
+            "recreated cleared by stop()"
+        );
     }
 
     #[tokio::test]

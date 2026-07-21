@@ -459,12 +459,12 @@ async fn resolve_interrupted_resume_and_abandon() {
         .get_agent_session(&resume_agent_id)
         .await
         .expect("get resumed session");
-    let last_user_msg = resumed_session
+    let last_user_idx = resumed_session
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
+        .rposition(|m| m.role == "user")
         .expect("expected user continuation message on resumed session");
+    let last_user_msg = &resumed_session.messages[last_user_idx];
     let resumed_blocks = last_user_msg.content.as_array().expect("content blocks");
     assert_eq!(resumed_blocks[0]["type"], "text");
     let continuation_text = resumed_blocks[0]["text"].as_str().expect("text block");
@@ -477,6 +477,43 @@ async fn resolve_interrupted_resume_and_abandon() {
     assert!(
         !continuation_text.contains("intentd"),
         "continuation must not mention intentd, got: {continuation_text}"
+    );
+
+    // Phase 5b: the resume path also appends a system interruption marker
+    // (same shape as the abandon marker, meta.kind == "interruption") and it
+    // must sit IMMEDIATELY BEFORE the continuation user message. Locate it by
+    // its exact shape (not "first system message") so unrelated system rows
+    // can't shadow it.
+    let is_interruption_marker = |m: &intent_core::AgentMessage| {
+        m.role == "system"
+            && m.content.as_array().is_some_and(|blocks| {
+                blocks.len() == 1
+                    && blocks[0]["type"] == "text"
+                    && blocks[0]["text"]
+                        == "The previous turn was interrupted because the harness shut down. \
+                            Continuing below."
+                    && blocks[0]["meta"]["kind"] == "interruption"
+            })
+    };
+    let marker_idx = resumed_session
+        .messages
+        .iter()
+        .position(is_interruption_marker)
+        .expect("expected system interruption marker on resumed session");
+    assert_eq!(
+        marker_idx + 1,
+        last_user_idx,
+        "system marker (index {marker_idx}) must sit immediately before the \
+         continuation user message (index {last_user_idx})"
+    );
+    assert_eq!(
+        resumed_session
+            .messages
+            .iter()
+            .filter(|m| is_interruption_marker(m))
+            .count(),
+        1,
+        "exactly one interruption marker on the resumed session"
     );
 
     // Phase 6: Verify the abandoned agent has a system message
