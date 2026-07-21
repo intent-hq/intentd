@@ -2254,6 +2254,76 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .contains("urgent"));
 }
 
+/// Regression: interrupt-WITH-message preemption must NOT emit the STAB-28
+/// synthetic `agent:idle`. The child is not settling — it is about to run the
+/// interrupt turn — so an idle emit here would fire completion watches and
+/// deliver a spurious "child settled" wake to the parent mid-preemption.
+/// Contrast `interrupt_emits_terminal_stream_end_and_idle_when_no_queue`
+/// above: the plain `interrupt()` / `agent.stop` path still emits idle so
+/// watches fire on a real cancellation. The ready-to-send queue is EMPTY here
+/// (the follow-up content is not queued yet at interrupt time), so only the
+/// `suppress_idle_emit` knob — not the queue check — prevents the emit.
+#[tokio::test]
+async fn interrupt_send_message_suppresses_synthetic_idle() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-noidle"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // Keep the preemption on the keep-alive interrupt path (no session →
+    // `interrupt` would fall back to the kill path).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-noidle")
+        .await
+        .unwrap();
+    // Claim the in-flight slot so the send preempts a busy (mid-turn) agent.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent follow-up".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("interrupt send");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(false));
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"agent:stream:end"),
+        "preemption still emits the terminal stream:end (got {types:?})"
+    );
+    // Split idles by reason: the synthetic `interrupted` idle must be gone,
+    // while the interrupt turn (run against the mock agent, which resolves
+    // `session/prompt` immediately) still settles with exactly one normal
+    // `stream_complete` idle — the parent wake is deferred, not dropped.
+    let idle_reasons: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:idle")
+        .map(|e| e.data["reason"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        !idle_reasons.contains(&"interrupted"),
+        "interrupt-with-message must NOT emit the synthetic agent:idle — the \
+         child is being preempted, not settling (got idles {idle_reasons:?})"
+    );
+    assert_eq!(
+        idle_reasons,
+        vec!["stream_complete"],
+        "exactly one settlement idle after the interrupt turn completes"
+    );
+}
+
 /// Interrupt-priority delivery to an IDLE agent falls through to the plain
 /// `send_message` path unchanged: `{ success, queued: false, messageId }`.
 #[tokio::test]

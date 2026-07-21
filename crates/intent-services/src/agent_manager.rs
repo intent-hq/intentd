@@ -1932,6 +1932,20 @@ impl AgentManager {
     /// the Rust analog of TS reserving the kill for `killProcess: true`. Returns
     /// whether an agent was found.
     pub async fn interrupt(&self, agent_id: &AgentId) -> bool {
+        self.interrupt_inner(agent_id, false).await
+    }
+
+    /// Body of [`AgentManager::interrupt`] with one extra knob:
+    /// `suppress_idle_emit` skips the STAB-28 synthetic `agent:idle`
+    /// (reason: `interrupted`) emit. Used ONLY by
+    /// [`AgentManager::interrupt_send_message`] — an interrupt that carries a
+    /// follow-up message is a preemption, not a settlement: the child is about
+    /// to run the interrupt turn, so waking completion watches here would
+    /// deliver a spurious "child settled" report to the parent. The plain
+    /// `interrupt()` / `agent.stop` keep-alive path passes `false` so STAB-28
+    /// behavior (watches fire on interrupt) is preserved. `agent:stream:end`
+    /// is emitted unconditionally in both paths.
+    async fn interrupt_inner(&self, agent_id: &AgentId, suppress_idle_emit: bool) -> bool {
         // The live connection is the interrupt capability; grab it WITHOUT
         // removing the handle so the child stays alive for resume.
         let conn = self
@@ -2019,8 +2033,12 @@ impl AgentManager {
             // re-messages via agent.send after the child settles registers a
             // completion watch that never fires (no idle event → watch never
             // delivered). Only emit when the agent has no queued ready-to-send
-            // messages (settlement coalescing: mirrors the worker-loop check).
-            if !self.services.has_ready_to_send(agent_id) {
+            // messages (settlement coalescing: mirrors the worker-loop check)
+            // AND the interrupt is not part of interrupt-with-message
+            // (`suppress_idle_emit` — the follow-up content has not been queued
+            // yet at this point, so the ready-to-send check alone cannot see
+            // the imminent interrupt turn).
+            if !suppress_idle_emit && !self.services.has_ready_to_send(agent_id) {
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "interrupted",
@@ -2654,8 +2672,12 @@ impl AgentManager {
 
                 // Cancel the turn IMMEDIATELY to prevent it from finishing while
                 // we prepare the re-queue logic below. This releases the in-flight
-                // slot and aborts the draining worker.
-                self.interrupt(&agent_id).await;
+                // slot and aborts the draining worker. The STAB-28 synthetic
+                // `agent:idle` is suppressed: this interrupt carries a
+                // follow-up message (the child is being preempted, not
+                // settling), so completion watches must not report "child
+                // settled" to the parent here.
+                self.interrupt_inner(&agent_id, true).await;
 
                 if !has_output {
                     // Zero-output condition: re-queue the preempted message.
