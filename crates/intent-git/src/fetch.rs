@@ -90,7 +90,7 @@ pub(crate) fn fetch_with_timeout(
     // ones, so an existing credential helper still wins (ssh-agent → helper →
     // token order, matching `crate::auth`). The helper reads the secret from
     // the environment — the argv below carries no token bytes.
-    if let Some(token) = token.filter(|t| !t.is_empty()) {
+    if let Some(token) = crate::auth::usable_token(token) {
         cmd.arg("-c").arg(token_helper_config());
         cmd.env(TOKEN_ENV, token);
     }

@@ -48,11 +48,25 @@ pub fn is_https_github_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("github.com")
 }
 
+/// Trim the resolved token and reject values that cannot travel as an HTTPS
+/// basic-auth password or through the line-oriented git-credential protocol
+/// (control characters — `\n`/`\r`/`\0` and friends — would corrupt either).
+/// `None`/empty/invalid all normalize to `None` so every consumer applies the
+/// same "no usable token" rule. The token value is never logged.
+pub(crate) fn usable_token(token: Option<&str>) -> Option<&str> {
+    let token = token?.trim();
+    if token.is_empty() || token.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(token)
+}
+
 /// Final chain step: the caller-resolved GitHub token as an HTTPS basic-auth
 /// credential (username [`TOKEN_USERNAME`]). Applies only when libgit2 allows
 /// userpass credentials, the remote is an HTTPS `github.com` URL, and a
-/// non-empty token was resolved; otherwise `None` so the caller falls through
-/// to the no-credential error. The token value is never logged.
+/// usable token was resolved (see [`usable_token`]); otherwise `None` so the
+/// caller falls through to the no-credential error. The token value is never
+/// logged.
 pub(crate) fn token_fallback(
     url: &str,
     allowed: git2::CredentialType,
@@ -64,10 +78,7 @@ pub(crate) fn token_fallback(
     if !is_https_github_url(url) {
         return None;
     }
-    let token = token?;
-    if token.is_empty() {
-        return None;
-    }
+    let token = usable_token(token)?;
     Cred::userpass_plaintext(TOKEN_USERNAME, token).ok()
 }
 
@@ -115,9 +126,12 @@ pub(crate) fn resolve_credential(
     // No credential source produced a usable `Cred` — return `Err` rather than
     // falling through to `Cred::default()` (an anonymous credential libgit2
     // would silently retry, driving the auth-failure loop this module bounds).
-    // The token step only ever applies to HTTPS github.com remotes, so only
-    // mention it where it was actually in play.
-    let sources = if is_https_github_url(url) {
+    // Mention the token step only where it was actually in play: an HTTPS
+    // github.com remote with a usable token and a userpass-capable ask.
+    let token_in_play = is_https_github_url(url)
+        && usable_token(token).is_some()
+        && allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT);
+    let sources = if token_in_play {
         "ssh-agent / credential helper / GitHub token"
     } else {
         "ssh-agent / credential helper"
@@ -305,6 +319,21 @@ mod tests {
             // never the token (the token step requires USER_PASS_PLAINTEXT).
             drop(cred);
         }
+    }
+
+    /// Token normalization: whitespace is trimmed, and empty or
+    /// control-character-bearing values (which would corrupt basic-auth or the
+    /// git-credential protocol) are rejected outright.
+    #[test]
+    fn usable_token_normalizes_and_rejects_invalid() {
+        assert_eq!(usable_token(Some("tok")), Some("tok"));
+        assert_eq!(usable_token(Some("  tok\n")), Some("tok"));
+        assert_eq!(usable_token(None), None);
+        assert_eq!(usable_token(Some("")), None);
+        assert_eq!(usable_token(Some("   ")), None);
+        assert_eq!(usable_token(Some("to\nk")), None);
+        assert_eq!(usable_token(Some("to\rk")), None);
+        assert_eq!(usable_token(Some("to\0k")), None);
     }
 
     /// On re-entry (the server rejected the previous answer) the credential

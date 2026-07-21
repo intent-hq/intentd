@@ -15969,7 +15969,13 @@ impl Services {
                 }
             };
             if let Err(e) = self
-                .ac_advance_trunk(worktree, trunk, &commit_hash, has_remote_trunk)
+                .ac_advance_trunk(
+                    worktree,
+                    trunk,
+                    &commit_hash,
+                    has_remote_trunk,
+                    token.as_deref(),
+                )
                 .await
             {
                 return Err(ac_step_failure(
@@ -15995,7 +16001,13 @@ impl Services {
                 }
             };
             if let Err(e) = self
-                .ac_advance_trunk(worktree, trunk, &current, has_remote_trunk)
+                .ac_advance_trunk(
+                    worktree,
+                    trunk,
+                    &current,
+                    has_remote_trunk,
+                    token.as_deref(),
+                )
                 .await
             {
                 return Err(ac_step_failure(
@@ -16031,23 +16043,18 @@ impl Services {
 
     /// Advance the trunk branch to `sha`: a fast-forward refspec push to the remote
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
+    /// `token` is the caller-resolved GitHub token (the merge flow resolves it
+    /// once via [`Self::ac_git_token`] and threads it through).
     async fn ac_advance_trunk(
         &self,
         worktree: &Path,
         trunk: &str,
         sha: &str,
         has_remote_trunk: bool,
+        token: Option<&str>,
     ) -> Result<()> {
         if has_remote_trunk {
-            let token = self.ac_git_token(worktree).await;
-            intent_git::push::push_refspec(
-                worktree,
-                "origin",
-                sha,
-                trunk,
-                false,
-                token.as_deref(),
-            )?;
+            intent_git::push::push_refspec(worktree, "origin", sha, trunk, false, token)?;
         } else {
             intent_git::squash::update_ref(worktree, &format!("refs/heads/{trunk}"), sha)?;
         }
