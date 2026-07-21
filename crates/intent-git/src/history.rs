@@ -28,7 +28,9 @@ pub struct CommitRecord {
     /// Changed-file paths (a tree diff vs the first parent), or `None` when the
     /// caller skipped the per-commit diff (`include_files = false`).
     pub files: Option<Vec<String>>,
-    /// `files.len()` when computed; `0` when the diff was skipped.
+    /// `files.len()` when `files` is `Some`; `0` when the diff was skipped
+    /// (`files == None` is the signal that the diff didn't run — an empty
+    /// commit also yields `0` here with `files == Some([])`).
     pub files_changed: usize,
     pub is_pushed: bool,
     pub agent_id: Option<String>,
@@ -90,15 +92,16 @@ pub fn history_since(
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
-        let diff_started = timing_enabled.then(Instant::now);
         let files = if include_files {
-            Some(changed_files(&repo, &commit)?)
+            let diff_started = timing_enabled.then(Instant::now);
+            let files = changed_files(&repo, &commit)?;
+            if let Some(t) = diff_started {
+                diff_elapsed += t.elapsed();
+            }
+            Some(files)
         } else {
             None
         };
-        if let Some(t) = diff_started {
-            diff_elapsed += t.elapsed();
-        }
         let files_changed = files.as_ref().map_or(0, Vec::len);
         let author = commit.author();
         out.push(CommitRecord {
