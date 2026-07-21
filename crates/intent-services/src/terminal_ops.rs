@@ -164,15 +164,12 @@ pub(crate) fn list(pty: &PtyHost, workspace_id: &WorkspaceId) -> Result<Value> {
         .map(|id| {
             let id_str = id.to_string();
             let info = pty.info(id);
-            let cwd = info
-                .as_ref()
-                .and_then(|i| i.cwd.clone())
-                .unwrap_or_default();
+            let cwd = info.as_ref().and_then(|i| i.cwd.as_deref()).unwrap_or("");
             let name = info
                 .as_ref()
-                .and_then(|i| i.name.clone())
-                .unwrap_or_else(|| "Terminal".to_string());
-            let is_executing = info.map(|i| i.alive).unwrap_or(false);
+                .and_then(|i| i.name.as_deref())
+                .unwrap_or("Terminal");
+            let is_executing = info.as_ref().map(|i| i.alive).unwrap_or(false);
             let value = json!({
                 "id": id_str,
                 "name": name,
