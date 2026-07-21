@@ -19,7 +19,6 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
-#[allow(dead_code)]
 mod common;
 use common::DaemonGuard;
 
@@ -51,10 +50,10 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     cmd.spawn().expect("spawn intentd serve")
 }
 
-/// Wait (up to 60s) for the daemon's UDS to accept connections. The generous
-/// budget absorbs coverage-instrumented startup on oversubscribed CI runners.
+/// Wait for the daemon's UDS to accept connections, up to the shared
+/// daemon-startup budget (see `common::daemon_startup_timeout`).
 async fn await_uds(socket: &Path) -> bool {
-    timeout(Duration::from_secs(60), async {
+    timeout(common::daemon_startup_timeout(), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
