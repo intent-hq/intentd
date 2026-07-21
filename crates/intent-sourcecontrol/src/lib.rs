@@ -10,6 +10,7 @@
 //! No `pr.*` wire methods or routing live here — those map onto this trait in a
 //! later milestone (§7.5).
 
+pub mod device_flow;
 pub mod error;
 pub mod github;
 pub mod model;
@@ -18,6 +19,7 @@ pub mod token;
 
 use async_trait::async_trait;
 
+pub use device_flow::{DeviceAuthorization, DeviceFlow, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
 pub use model::{
