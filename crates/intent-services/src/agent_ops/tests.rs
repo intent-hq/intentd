@@ -2936,7 +2936,7 @@ fn finalize_model_rows_filters_legacy_and_sorts() {
 #[tokio::test]
 async fn models_list_returns_non_empty_catalog_with_source() {
     let (_t, svc, _ws) = setup().await;
-    let res = svc.models_list_op().await.expect("models.list");
+    let res = svc.models_list_op(None, false).await.expect("models.list");
     let models = res["models"].as_array().unwrap();
     assert!(!models.is_empty());
     assert!(models[0].get("id").is_some());
@@ -2944,10 +2944,68 @@ async fn models_list_returns_non_empty_catalog_with_source() {
     assert!(models[0].get("provider").is_some());
     let source = res["source"].as_str().unwrap();
     assert!(source == "auggie" || source == "static", "source: {source}");
+    // No providerId → legacy shape: no providerId/warning/stale fields.
+    assert!(res.get("providerId").is_none());
     // A second call is served from the cache (auggie) or recomputed statics —
     // either way the result is stable within the TTL window.
-    let again = svc.models_list_op().await.expect("models.list again");
+    let again = svc
+        .models_list_op(None, false)
+        .await
+        .expect("models.list again");
     assert_eq!(res, again);
+}
+
+#[tokio::test]
+async fn models_list_legacy_force_refresh_bypasses_cache_and_labels_stale_fallback() {
+    let (_t, svc, _ws) = setup().await;
+    // Seed the legacy in-memory cache with a fresh sentinel entry.
+    let sentinel = vec![json!({ "id": "sentinel", "name": "Sentinel", "provider": "auggie" })];
+    svc.store_models_cache(sentinel.clone());
+    // Non-forced: the sentinel is served straight from the cache.
+    let cached = svc.models_list_op(None, false).await.expect("cached");
+    assert_eq!(cached["models"], json!(sentinel));
+    // Forced: the cache read is skipped and a fresh probe is awaited. The
+    // sentinel may only reappear as the last-good fallback after a failed
+    // probe — in which case it must be labeled stale + warning, never
+    // served silently as fresh.
+    let forced = svc.models_list_op(None, true).await.expect("forced");
+    if forced["models"] == json!(sentinel) {
+        assert_eq!(forced["stale"], true, "{forced}");
+        assert!(forced["warning"].is_string(), "{forced}");
+    } else {
+        assert!(forced.get("stale").is_none());
+        let source = forced["source"].as_str().unwrap();
+        assert!(source == "auggie" || source == "static", "source: {source}");
+    }
+}
+
+#[tokio::test]
+async fn models_list_unknown_provider_degrades_to_static_never_errors() {
+    let (_t, svc, _ws) = setup().await;
+    // Unregistered provider with no static tiers → empty list + warning.
+    let res = svc
+        .models_list_op(Some("no-such-provider".to_string()), false)
+        .await
+        .expect("models.list must not error on unknown providers");
+    assert_eq!(res["providerId"], "no-such-provider");
+    assert_eq!(res["source"], "static");
+    assert!(res["models"].as_array().unwrap().is_empty());
+    assert!(res["warning"].is_string());
+}
+
+#[tokio::test]
+async fn models_list_cortex_is_feature_code_gated() {
+    let (_t, svc, _ws) = setup().await;
+    // cortex is registered but feature-code gated: empty list + warning under
+    // its own source tag — the static tier catalog must not leak past the gate.
+    let res = svc
+        .models_list_op(Some("cortex".to_string()), true)
+        .await
+        .expect("models.list cortex");
+    assert_eq!(res["providerId"], "cortex");
+    assert_eq!(res["source"], "cortex");
+    assert!(res["models"].as_array().unwrap().is_empty());
+    assert!(res["warning"].as_str().unwrap().contains("Cortex"));
 }
 
 #[tokio::test]
