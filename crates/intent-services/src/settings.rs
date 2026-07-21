@@ -988,8 +988,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "GitHub token source",
             "Where the GitHub token comes from",
             "sourceControl",
-            &["env", "gh-cli", "explicit"],
-            "gh-cli",
+            &["auto", "env", "gh-cli", "explicit"],
+            "auto",
         ),
         secret(
             "sourceControl.github.token",

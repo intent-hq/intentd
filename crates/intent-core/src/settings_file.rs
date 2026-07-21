@@ -318,19 +318,23 @@ pub struct GithubSettings {
 impl Default for GithubSettings {
     fn default() -> Self {
         Self {
-            token_source: GithubTokenSource::GhCli,
+            token_source: GithubTokenSource::Auto,
             api_base_url: "https://api.github.com".to_string(),
             oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_string(),
         }
     }
 }
 
-/// `sourceControl.github.tokenSource` values.
+/// `sourceControl.github.tokenSource` values. Mirrors
+/// `intent-sourcecontrol`'s `TokenSource`: `auto` (the default) tries the
+/// secrets store (where the OAuth device flow persists its token), then env,
+/// then the `gh` CLI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GithubTokenSource {
-    Env,
     #[default]
+    Auto,
+    Env,
     GhCli,
     Explicit,
 }
@@ -731,9 +735,9 @@ enabled = true
 activeProvider = "github"
 
 [sourceControl.github]
-# GitHub token source -- where the GitHub token comes from: "env", "gh-cli",
-# or "explicit".
-tokenSource = "gh-cli"
+# GitHub token source -- where the GitHub token comes from: "auto" (secrets
+# store, then env, then gh CLI), "env", "gh-cli", or "explicit".
+tokenSource = "auto"
 # GitHub API base URL -- GitHub (Enterprise) API base.
 apiBaseUrl = "https://api.github.com"
 # GitHub OAuth client ID -- OAuth App client id for the device flow (public,
@@ -845,7 +849,7 @@ mod tests {
         );
         assert_eq!(
             d.source_control.github.token_source,
-            GithubTokenSource::GhCli
+            GithubTokenSource::Auto
         );
         assert_eq!(
             d.source_control.github.api_base_url,

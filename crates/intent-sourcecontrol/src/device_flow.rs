@@ -34,8 +34,9 @@ const SLOW_DOWN_BUMP_SECS: u64 = 5;
 
 /// Bounded wait for a blocking secret-store write/delete before the caller
 /// gives up, mirroring the write budget in `intent-services`
-/// (`DEFAULT_WRITE_TIMEOUT`): a wedged backing filesystem must not hang the
-/// task or pile up blocking-pool threads.
+/// (`DEFAULT_WRITE_TIMEOUT`): callers never wait indefinitely on a wedged
+/// backing filesystem (the stuck blocking task itself is abandoned, not
+/// cancelled — `spawn_blocking` closures cannot be interrupted).
 const SECRET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default scopes requested by the device flow (§spec: PR/issue/review work,
@@ -98,6 +99,13 @@ fn login_client() -> Result<octocrab::Octocrab> {
 /// client id, e.g. [`DEFAULT_OAUTH_CLIENT_ID`]) and the given `scopes`.
 /// Returns the user-facing codes plus the opaque poll handle.
 pub async fn start(client_id: &str, scopes: &[&str]) -> Result<(DeviceAuthorization, DeviceFlow)> {
+    if client_id.trim().is_empty() {
+        return Err(Error::Config(
+            "github device flow requires a non-empty oauth client id \
+             (sourceControl.github.oauthClientId)"
+                .to_string(),
+        ));
+    }
     let crab = login_client()?;
     let client_id = SecretString::from(client_id.to_string());
     let codes = crab.authenticate_as_device(&client_id, scopes).await?;
@@ -221,19 +229,19 @@ fn parse_poll_response(body: Value) -> Result<PollResponse> {
     }
 }
 
-/// Next poll interval after a `slow_down`: the hinted `interval` when GitHub
-/// provides one, otherwise the mandated current + 5s — never shrinking.
+/// Next poll interval after a `slow_down`: at least the mandated
+/// current + 5s, growing further to GitHub's hinted `interval` when the hint
+/// is larger — never shrinking below the mandated bump.
 fn next_interval(current: u64, hinted: Option<u64>) -> u64 {
-    hinted
-        .unwrap_or(current + SLOW_DOWN_BUMP_SECS)
-        .max(current + SLOW_DOWN_BUMP_SECS)
+    let bumped = current.saturating_add(SLOW_DOWN_BUMP_SECS);
+    hinted.unwrap_or(bumped).max(bumped)
 }
 
 /// Persist an access token into `store` under `sourceControl.github.token`
 /// (the first slot of the existing resolution chain). Runs on the blocking
 /// pool like the loads in [`crate::token`], bounded by
 /// [`SECRET_WRITE_TIMEOUT`] so a wedged filesystem cannot hang the caller.
-pub async fn persist_token(store: FileSecretStore, token: SecretString) -> Result<()> {
+async fn persist_token(store: FileSecretStore, token: SecretString) -> Result<()> {
     let handle =
         tokio::task::spawn_blocking(move || store.store(SECRET_ACCOUNT, token.expose_secret()));
     match timeout(SECRET_WRITE_TIMEOUT, handle).await {
