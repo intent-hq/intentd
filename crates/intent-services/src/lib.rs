@@ -6574,7 +6574,12 @@ impl WorkspaceApi for Services {
                 let this = this.clone();
                 let enrich_gate = Arc::clone(&enrich_gate);
                 join.spawn(async move {
-                    let _permit = enrich_gate.acquire_owned().await;
+                    // The semaphore is never closed, so acquisition can only
+                    // fail on a bug; fail loudly rather than dropping the bound.
+                    let _permit = enrich_gate
+                        .acquire_owned()
+                        .await
+                        .expect("enrichment semaphore closed");
                     ws.activity = this.workspace_activity(&ws.id);
                     this.enrich_workspace_aggregates(&mut ws).await;
                     (idx, ws)

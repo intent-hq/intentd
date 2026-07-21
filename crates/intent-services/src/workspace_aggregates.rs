@@ -191,7 +191,7 @@ impl WorkspaceAggregateCache {
     fn lookup_diff(&self, key: &str, fresh_only: bool) -> Option<Option<WorkspaceDiffSummary>> {
         let map = self.diff.lock().unwrap();
         map.get(key)
-            .filter(|e| !fresh_only || e.computed_at.elapsed() <= self.ttl)
+            .filter(|e| !fresh_only || e.computed_at.elapsed() < self.ttl)
             .map(|e| e.summary.clone())
     }
 
