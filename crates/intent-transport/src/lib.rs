@@ -24,6 +24,7 @@ pub use host::{
 };
 pub use host_env::{detect_display_server, detect_has_display};
 pub use listener::{serve_uds, serve_uds_with_reverse};
+pub use pairing::{build_pairing_uri, PAIRING_PAYLOAD_VERSION};
 pub use protocol::PROTOCOL_VERSION;
 pub use reverse::{
     PrimaryReverseGuard, PrimaryReverseRegistry, ReverseChannel, ReverseError,
@@ -49,6 +50,7 @@ pub mod host_env;
 mod host_ops;
 pub mod lifecycle;
 pub mod listener;
+pub mod pairing;
 mod protocol;
 pub mod reverse;
 pub mod router;

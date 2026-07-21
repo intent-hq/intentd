@@ -91,8 +91,10 @@ pub(crate) fn server_json(
 
 /// Handle a classified `client.hello`: resolve (or mint) the `clientId`, persist
 /// the logical `client` row, set the connection's `client_id` binding, and reply
-/// with `{ clientId, server }`. A non-string `clientId` is `-32602`; a
-/// persistence failure is `-32603`. Idempotent: re-sending updates name /
+/// with `{ clientId, protocolVersion, server }`. The top-level `protocolVersion`
+/// is an explicit copy of `server.protocolVersion` so clients can version-check
+/// without digging into the `server` block. A non-string `clientId` is `-32602`;
+/// a persistence failure is `-32603`. Idempotent: re-sending updates name /
 /// capabilities and re-returns the same `server` block (PROTOCOL §5.17).
 pub(crate) async fn handle(
     req: ClientRequest,
@@ -125,7 +127,11 @@ pub(crate) async fn handle(
     frame(
         req.id_present,
         req.id_echo,
-        Ok(json!({ "clientId": resolved.as_str(), "server": server })),
+        Ok(json!({
+            "clientId": resolved.as_str(),
+            "protocolVersion": PROTOCOL_VERSION,
+            "server": server,
+        })),
     )
 }
 

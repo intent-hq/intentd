@@ -290,11 +290,12 @@ pub const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 28 methods are handled by dedicated fast-path modules (`events.rs`,
-/// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`)
-/// before reaching the main router. They share the same JSON-RPC envelope
-/// validation but are dispatched earlier in the connection task for performance
-/// or to access per-connection state (e.g., `client_id` binding for drafts).
+/// These 29 methods are handled by dedicated fast-path modules (`events.rs`,
+/// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
+/// `pairing.rs`) before reaching the main router. They share the same JSON-RPC
+/// envelope validation but are dispatched earlier in the connection task for
+/// performance or to access per-connection state (e.g., `client_id` binding for
+/// drafts).
 pub const FASTPATH_METHODS: &[&str] = &[
     "browser.exec",
     "client.hello",
@@ -322,6 +323,7 @@ pub const FASTPATH_METHODS: &[&str] = &[
     "host.providerDiscovery",
     "host.status",
     "host.toolAvailability",
+    "pairing.getInfo",
     "system.shutdown",
     "system.status",
 ];

@@ -147,7 +147,8 @@ async fn rotate_token_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
 
 /// Collect local IP addresses (non-loopback IPv4) for pairing. Mirrors the logic
 /// from `tls::collect_san` but returns only the local IPs (no localhost/loopback).
-fn collect_local_ips() -> Vec<String> {
+/// Shared with the `pairing.getInfo` fast-path so both surfaces report the same hosts.
+pub(crate) fn collect_local_ips() -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {
