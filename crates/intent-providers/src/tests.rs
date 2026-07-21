@@ -942,12 +942,16 @@ fn opencode_env_merges_mcp_block_preserving_other_keys() {
         Some(expected.as_str())
     );
 
-    // Empty mcp json is ignored rather than emitting invalid JSON.
-    let env = build_provider_env(opencode, None, None, Some(""));
-    assert_eq!(
-        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
-        Some(r#"{"permission":{"task":"deny"}}"#)
-    );
+    // Empty or whitespace-only mcp json is ignored rather than emitting
+    // invalid JSON.
+    for blank in ["", " ", "\n\t "] {
+        let env = build_provider_env(opencode, None, None, Some(blank));
+        assert_eq!(
+            env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+            Some(r#"{"permission":{"task":"deny"}}"#),
+            "mcp json {blank:?} must be ignored"
+        );
+    }
 }
 
 #[test]

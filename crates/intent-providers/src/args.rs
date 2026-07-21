@@ -222,7 +222,7 @@ pub fn build_provider_env(
             if let Some(path) = rules_file {
                 parts.push(format!("\"instructions\":[\"{}\"]", json_escape(path)));
             }
-            if let Some(mcp) = mcp_config_json {
+            if let Some(mcp) = mcp_config_json.map(str::trim) {
                 if !mcp.is_empty() {
                     parts.push(format!("\"mcp\":{mcp}"));
                 }
