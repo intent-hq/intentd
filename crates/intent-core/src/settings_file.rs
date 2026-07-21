@@ -297,6 +297,11 @@ pub enum SourceControlProvider {
     Github,
 }
 
+/// Default `sourceControl.github.oauthClientId`: the intent-hq OAuth App
+/// registered for the device flow. OAuth device-flow client ids are public by
+/// design (no client secret exists or is used), so baking it in is safe.
+pub const DEFAULT_GITHUB_OAUTH_CLIENT_ID: &str = "Ov23li8bvmPsd4B4pW38";
+
 /// `[sourceControl.github]` — GitHub client config (`sourceControl.github.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -305,6 +310,9 @@ pub struct GithubSettings {
     pub token_source: GithubTokenSource,
     /// `sourceControl.github.apiBaseUrl` — GitHub (Enterprise) API base.
     pub api_base_url: String,
+    /// `sourceControl.github.oauthClientId` — OAuth App client id for the
+    /// device flow (public, not a secret).
+    pub oauth_client_id: String,
 }
 
 impl Default for GithubSettings {
@@ -312,6 +320,7 @@ impl Default for GithubSettings {
         Self {
             token_source: GithubTokenSource::GhCli,
             api_base_url: "https://api.github.com".to_string(),
+            oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_string(),
         }
     }
 }
@@ -727,6 +736,9 @@ activeProvider = "github"
 tokenSource = "gh-cli"
 # GitHub API base URL -- GitHub (Enterprise) API base.
 apiBaseUrl = "https://api.github.com"
+# GitHub OAuth client ID -- OAuth App client id for the device flow (public,
+# not a secret).
+oauthClientId = "Ov23li8bvmPsd4B4pW38"
 
 [accounts.sentry]
 # Sentry organization -- Sentry organization slug (non-secret companion of the
@@ -838,6 +850,10 @@ mod tests {
         assert_eq!(
             d.source_control.github.api_base_url,
             "https://api.github.com"
+        );
+        assert_eq!(
+            d.source_control.github.oauth_client_id,
+            DEFAULT_GITHUB_OAUTH_CLIENT_ID
         );
         assert_eq!(d.accounts.sentry.organization, None);
         assert_eq!(d.ai.temperature, 0.7);

@@ -78,6 +78,7 @@ pub const KNOWN_PATHS: &[&str] = &[
     "sourceControl.activeProvider",
     "sourceControl.github.tokenSource",
     "sourceControl.github.apiBaseUrl",
+    "sourceControl.github.oauthClientId",
     "accounts.sentry.organization",
     "ai.apiUrl",
     "ai.model",

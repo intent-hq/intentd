@@ -1004,6 +1004,13 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "sourceControl",
             Some("https://api.github.com"),
         ),
+        string(
+            "sourceControl.github.oauthClientId",
+            "GitHub OAuth client ID",
+            "OAuth App client id for the device flow (public, not a secret)",
+            "sourceControl",
+            Some(intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID),
+        ),
         // --- Group A: Linear integration --------------------------------------
         secret(
             "linear.token",
