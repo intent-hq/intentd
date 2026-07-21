@@ -146,7 +146,8 @@ PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
 
 - **Stable**: `vX.Y.Z` tags (e.g. `v0.9.0`).
-- **Beta**: `vX.Y.Z-beta.N` tags (e.g. `v0.9.0-beta.1`) — published as GitHub prereleases.
+- **Beta**: any prerelease tag `vX.Y.Z-<suffix>` (e.g. `v0.9.0-beta.1`, `v0.9.0-rc.1`) —
+  published as GitHub prereleases; all of them update the beta channel.
 
 To cut a release: bump `version` in `crates/intentd/Cargo.toml` to match, commit, then
 push the tag.
