@@ -1704,8 +1704,34 @@ pub struct AgentMessage {
     /// for messages without caller-supplied metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Client-minted logical message identity (`userAppMessageId`, PROTOCOL
+    /// §5.5): the FE mints an `app-msg-*` id for its optimistic user message
+    /// and the daemon round-trips it so clients can match the canonical row
+    /// against the optimistic insert (dedup guard). Persisted inside the row
+    /// `metadata` JSON under `userAppMessageId` (no schema migration) and
+    /// lifted to this top-level wire field (`appMessageId`, matching the TS
+    /// `AgentMessage`) on reads. `None` for messages without a client id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_message_id: Option<String>,
     #[serde(rename = "timestamp")]
     pub created_at: String,
+}
+
+/// Metadata key under which the client-supplied `userAppMessageId` is
+/// persisted on the `agent_message.metadata` JSON (PROTOCOL §5.5). Shared by
+/// the router (which folds the top-level param into `messageMetadata`) and
+/// the store (which lifts it back out as [`AgentMessage::app_message_id`]).
+pub const USER_APP_MESSAGE_ID_KEY: &str = "userAppMessageId";
+
+/// Lift the client-supplied app-message id out of a persisted `metadata`
+/// payload: `Some` only when the metadata is an object carrying a non-empty
+/// string under [`USER_APP_MESSAGE_ID_KEY`].
+pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata
+        .and_then(|m| m.get(USER_APP_MESSAGE_ID_KEY))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Maximum delegation depth to prevent unbounded recursive agent creation
@@ -3194,6 +3220,7 @@ mod tests {
                 role: "user".to_string(),
                 content: json!([{ "type": "text", "text": "hi" }]),
                 metadata: None,
+                app_message_id: None,
                 created_at: "t0".to_string(),
             }],
             stats: None,
@@ -3256,6 +3283,7 @@ mod tests {
             role: "user".to_string(),
             content: json!([{ "type": "text", "text": "hi" }]),
             metadata: None,
+            app_message_id: None,
             created_at: "t0".to_string(),
         };
         let value = serde_json::to_value(&message).unwrap();
@@ -3275,8 +3303,47 @@ mod tests {
         assert!(obj.contains_key("timestamp"));
         assert!(!obj.contains_key("content"));
         assert!(!obj.contains_key("createdAt"));
+        // Absent client id stays off the wire (backward compatible).
+        assert!(!obj.contains_key("appMessageId"));
         let back: AgentMessage = serde_json::from_value(value).unwrap();
         assert_eq!(back, message);
+    }
+
+    /// `appMessageId` (PROTOCOL §5.5): the client-minted `userAppMessageId`
+    /// serializes under the TS wire name `appMessageId` when present, and
+    /// [`lift_app_message_id`] extracts it from a persisted row `metadata`
+    /// payload (object with a non-empty string) only.
+    #[test]
+    fn agent_message_app_message_id_wire_parity_and_lift() {
+        let message = AgentMessage {
+            id: "msg-1".to_string(),
+            agent_id: AgentId::from("agent-1"),
+            seq: 0,
+            role: "user".to_string(),
+            content: json!([{ "type": "text", "text": "hi" }]),
+            metadata: Some(json!({ "userAppMessageId": "app-msg-1" })),
+            app_message_id: Some("app-msg-1".to_string()),
+            created_at: "t0".to_string(),
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["appMessageId"], json!("app-msg-1"));
+        let back: AgentMessage = serde_json::from_value(value).unwrap();
+        assert_eq!(back, message);
+
+        assert_eq!(
+            lift_app_message_id(Some(&json!({ "userAppMessageId": "app-msg-1" }))),
+            Some("app-msg-1".to_string())
+        );
+        assert_eq!(lift_app_message_id(None), None);
+        assert_eq!(lift_app_message_id(Some(&json!({ "other": 1 }))), None);
+        assert_eq!(
+            lift_app_message_id(Some(&json!({ "userAppMessageId": "" }))),
+            None
+        );
+        assert_eq!(
+            lift_app_message_id(Some(&json!({ "userAppMessageId": 42 }))),
+            None
+        );
     }
 
     #[test]

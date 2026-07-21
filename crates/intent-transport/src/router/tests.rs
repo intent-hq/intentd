@@ -4930,3 +4930,71 @@ mod edit_and_regenerate {
         );
     }
 }
+
+/// `merge_user_app_message_id` (PROTOCOL §5.5): the top-level
+/// `userAppMessageId` param folds into `messageMetadata` under the shared
+/// `USER_APP_MESSAGE_ID_KEY`, stays backward compatible when absent, and
+/// rejects oversized ids / non-object metadata.
+mod merge_user_app_message_id {
+    use serde_json::{json, Map, Value};
+
+    use super::super::merge_user_app_message_id;
+
+    fn params(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    /// Unwrap the merge result, panicking with the RpcErr message on failure
+    /// (`RpcErr` intentionally has no `Debug` impl).
+    fn merge_ok(p: &Map<String, Value>, md: Option<Value>) -> Option<Value> {
+        match merge_user_app_message_id(p, md) {
+            Ok(v) => v,
+            Err(e) => panic!("unexpected merge error: {}", e.message),
+        }
+    }
+
+    #[test]
+    fn absent_id_passes_metadata_through_unchanged() {
+        let p = params(json!({}));
+        assert_eq!(merge_ok(&p, None), None);
+        let md = json!({ "source": "system" });
+        assert_eq!(merge_ok(&p, Some(md.clone())), Some(md));
+    }
+
+    #[test]
+    fn empty_or_whitespace_id_is_ignored() {
+        let p = params(json!({ "userAppMessageId": "  " }));
+        assert_eq!(merge_ok(&p, None), None);
+    }
+
+    #[test]
+    fn id_folds_into_fresh_metadata_object() {
+        let p = params(json!({ "userAppMessageId": "app-msg-1" }));
+        assert_eq!(
+            merge_ok(&p, None),
+            Some(json!({ "userAppMessageId": "app-msg-1" }))
+        );
+    }
+
+    #[test]
+    fn id_folds_into_existing_metadata_and_top_level_wins() {
+        let p = params(json!({ "userAppMessageId": "app-msg-1" }));
+        let md = json!({ "source": "system", "userAppMessageId": "stale" });
+        assert_eq!(
+            merge_ok(&p, Some(md)),
+            Some(json!({ "source": "system", "userAppMessageId": "app-msg-1" }))
+        );
+    }
+
+    #[test]
+    fn oversized_id_is_invalid_params() {
+        let p = params(json!({ "userAppMessageId": "x".repeat(257) }));
+        assert!(merge_user_app_message_id(&p, None).is_err());
+    }
+
+    #[test]
+    fn non_object_metadata_with_id_is_invalid_params() {
+        let p = params(json!({ "userAppMessageId": "app-msg-1" }));
+        assert!(merge_user_app_message_id(&p, Some(json!("opaque"))).is_err());
+    }
+}

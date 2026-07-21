@@ -2409,7 +2409,7 @@ impl AgentManager {
                 &workspace_id,
                 &agent_id,
                 intent_core::events::AGENT_MESSAGE,
-                json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                crate::agent_ops::agent_message_event_payload(&agent_id, &message),
             )
             .await;
         self.spawn_worker(agent_id, workspace_id, content, options);
@@ -3933,7 +3933,7 @@ async fn persist_user(
                     workspace_id,
                     agent_id,
                     intent_core::events::AGENT_MESSAGE,
-                    serde_json::json!({ "agentId": agent_id.0, "messageId": message.id, "role": message.role }),
+                    crate::agent_ops::agent_message_event_payload(agent_id, &message),
                 )
                 .await;
         }

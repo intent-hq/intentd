@@ -4011,6 +4011,163 @@ async fn queued_message_metadata_survives_drain_over_wss() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// userAppMessageId round-trip (PROTOCOL §5.5, activates the FE dedup guard):
+// a direct `agent.sendMessage` carrying the client-minted id must (a) echo it
+// as `appMessageId` on the `agent:message` (role=user) event so a live FE can
+// match its optimistic insert, (b) persist it inside the row metadata and
+// surface it as `appMessageId` on `agent.getConversation`, and (c) survive
+// the busy-agent queue fallback so the drained row and its `agent:message`
+// event carry the same id.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn user_app_message_id_round_trips_over_wss() {
+    let Some(script) = gate("WSS userAppMessageId E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // First turn is slow so the SECOND tagged send lands on a busy agent and
+    // exercises the queue fallback path.
+    let behavior = json!({ "response": "mock reply", "firstTurnDelayMs": 2000 }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — collect `agent:message` echoes and turn boundaries.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:message", "agent:stream:end"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "AppIds", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // (a) Direct send with a userAppMessageId — the agent is idle so this
+    // takes the direct-delivery path and must echo on agent:message.
+    let send1 = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "first tagged message",
+            "userAppMessageId": "app-msg-direct-1",
+        }),
+    )
+    .await;
+    assert_eq!(send1["success"], true);
+    assert_eq!(send1["queued"], false);
+    sleep(Duration::from_millis(200)).await;
+
+    // (c) Second tagged send while the slow first turn is running → queues.
+    let send2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "queued tagged message",
+            "userAppMessageId": "app-msg-queued-2",
+        }),
+    )
+    .await;
+    assert_eq!(send2["success"], true);
+    assert_eq!(send2["queued"], true, "second send should queue: {send2}");
+    // The queue entry captured the id inside messageMetadata so the drained
+    // re-persist keeps it.
+    assert_eq!(
+        send2["queuedMessage"]["messageMetadata"]["userAppMessageId"], "app-msg-queued-2",
+        "queued entry must capture userAppMessageId: {send2}"
+    );
+
+    // Watch the event stream until both turns finish, collecting the
+    // user-role agent:message echoes along the way.
+    let mut user_echoes: Vec<Value> = Vec::new();
+    let mut stream_end_count = 0;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["type"] == "agent:message" && event["data"]["role"] == "user" {
+            user_echoes.push(event["data"].clone());
+        }
+        if event["type"] == "agent:stream:end" {
+            stream_end_count += 1;
+            if stream_end_count >= 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(stream_end_count, 2, "both turns must complete");
+    // (a) The direct send's echo carries its appMessageId.
+    let direct = user_echoes
+        .iter()
+        .find(|d| d["appMessageId"] == "app-msg-direct-1")
+        .unwrap_or_else(|| panic!("direct send must echo appMessageId: {user_echoes:?}"));
+    assert!(direct["messageId"].is_string());
+    // (c) The drained queued send's echo carries its appMessageId too.
+    assert!(
+        user_echoes
+            .iter()
+            .any(|d| d["appMessageId"] == "app-msg-queued-2"),
+        "drained queued send must echo appMessageId: {user_echoes:?}"
+    );
+
+    // (b) Both persisted rows surface `appMessageId` on conversation reads.
+    let convo = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let messages = convo["messages"].as_array().expect("messages array");
+    let row1 = messages
+        .iter()
+        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "first tagged message")
+        .expect("direct user row present");
+    assert_eq!(row1["appMessageId"], "app-msg-direct-1");
+    assert_eq!(row1["metadata"]["userAppMessageId"], "app-msg-direct-1");
+    let row2 = messages
+        .iter()
+        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued tagged message")
+        .expect("drained user row present");
+    assert_eq!(row2["appMessageId"], "app-msg-queued-2");
+    assert_eq!(row2["metadata"]["userAppMessageId"], "app-msg-queued-2");
+}
+
 #[tokio::test]
 async fn remove_queued_message_is_idempotent_over_wss() {
     // No mock-agent needed — `agent.removeQueuedMessage` is a pure router arm

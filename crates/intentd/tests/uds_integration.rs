@@ -634,6 +634,51 @@ async fn uds_slice_end_to_end() {
     assert!(message["timestamp"].is_string());
     assert!(message.get("content").is_none());
     assert!(message.get("createdAt").is_none());
+    // No client id was supplied, so `appMessageId` stays off the wire
+    // (backward compatible — PROTOCOL §5.5).
+    assert!(message.get("appMessageId").is_none());
+
+    // (s0) agent.sendMessage with `userAppMessageId` → the id folds into the
+    // row metadata and round-trips as `appMessageId` on the conversation read
+    // (activates the FE dedup guard, PROTOCOL §5.5).
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":251,"method":"agent.sendMessage","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","content":"tagged send","messageId":"m2","userAppMessageId":"app-msg-e2e-1"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["messageId"], json!("m2"));
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":252,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let tagged = resp["result"]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"] == json!("m2"))
+        .expect("tagged user row present");
+    assert_eq!(tagged["appMessageId"], json!("app-msg-e2e-1"));
+    assert_eq!(
+        tagged["metadata"]["userAppMessageId"],
+        json!("app-msg-e2e-1")
+    );
+
+    // (s0a) An oversized `userAppMessageId` is rejected at the router → -32602.
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":253,"method":"agent.sendMessage","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","content":"too big","userAppMessageId":"{big_id}"}}}}"#,
+            big_id = "x".repeat(300)
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
 
     // (s1a) agent.getSession → full `AgentSession` (superset of AgentLite):
     // `messages` is present as an array (the field AgentLite strips). Confirms

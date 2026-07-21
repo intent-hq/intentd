@@ -863,6 +863,7 @@ impl Store {
             seq,
             role: role.to_string(),
             content: content.clone(),
+            app_message_id: intent_core::lift_app_message_id(metadata),
             metadata: metadata.cloned(),
             created_at: created_at.to_string(),
         })
@@ -983,6 +984,7 @@ impl Store {
                     seq,
                     role: role.clone(),
                     content: content.clone(),
+                    app_message_id: intent_core::lift_app_message_id(metadata.as_ref()),
                     metadata: metadata.clone(),
                     created_at: created_at.clone(),
                 });
@@ -1142,6 +1144,7 @@ fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
         seq: col(row, "seq")?,
         role: col(row, "role")?,
         content,
+        app_message_id: intent_core::lift_app_message_id(metadata.as_ref()),
         metadata,
         created_at: col(row, "created_at")?,
     })
