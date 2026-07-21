@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use git2::{Commit, Patch, Repository, Sort};
 use intent_core::{iso_from_unix_secs, Error, Result};
@@ -46,13 +47,16 @@ pub fn history_since(
     base_ref: Option<&str>,
     limit: usize,
 ) -> Result<Vec<CommitRecord>> {
+    let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     if repo.head().ok().and_then(|h| h.target()).is_none() {
         return Ok(Vec::new());
     }
 
     let branch = current_branch(&repo);
+    let unpushed_started = Instant::now();
     let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
+    let unpushed_elapsed = unpushed_started.elapsed();
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -64,6 +68,8 @@ pub fn history_since(
     walk.simplify_first_parent().map_err(map_git_err)?;
     walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
 
+    let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
+    let mut diff_elapsed = Duration::ZERO;
     let mut out = Vec::new();
     for oid in walk {
         if out.len() >= limit {
@@ -78,7 +84,11 @@ pub fn history_since(
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
+        let diff_started = timing_enabled.then(Instant::now);
         let files = changed_files(&repo, &commit)?;
+        if let Some(t) = diff_started {
+            diff_elapsed += t.elapsed();
+        }
         let files_changed = files.len();
         let author = commit.author();
         out.push(CommitRecord {
@@ -94,6 +104,20 @@ pub fn history_since(
             linked_note_id,
         });
     }
+    let total = started.elapsed();
+    tracing::debug!(
+        commits = out.len(),
+        limit,
+        base_ref = base_ref.unwrap_or(""),
+        unpushed_ms = unpushed_elapsed.as_millis() as u64,
+        per_commit_diff_ms = diff_elapsed.as_millis() as u64,
+        other_ms = total
+            .saturating_sub(diff_elapsed)
+            .saturating_sub(unpushed_elapsed)
+            .as_millis() as u64,
+        total_ms = total.as_millis() as u64,
+        "history_since: revwalk + per-commit tree diffs"
+    );
     Ok(out)
 }
 
@@ -243,6 +267,24 @@ pub fn resolve_workspace_boundary(
     base_ref: Option<&str>,
     base_commit_sha: Option<&str>,
 ) -> Result<Option<String>> {
+    let started = Instant::now();
+    let out = resolve_workspace_boundary_inner(worktree_path, base_ref, base_commit_sha);
+    if let Ok(boundary) = &out {
+        tracing::debug!(
+            resolved = boundary.is_some(),
+            base_ref = base_ref.unwrap_or(""),
+            total_ms = started.elapsed().as_millis() as u64,
+            "resolve_workspace_boundary"
+        );
+    }
+    out
+}
+
+fn resolve_workspace_boundary_inner(
+    worktree_path: &Path,
+    base_ref: Option<&str>,
+    base_commit_sha: Option<&str>,
+) -> Result<Option<String>> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
 
     // Get HEAD first - if unavailable, no boundary can be resolved
@@ -289,13 +331,16 @@ pub fn history_bounded(
     limit: usize,
     include_older: bool,
 ) -> Result<Vec<CommitRecord>> {
+    let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     if repo.head().ok().and_then(|h| h.target()).is_none() {
         return Ok(Vec::new());
     }
 
     let branch = current_branch(&repo);
+    let unpushed_started = Instant::now();
     let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
+    let unpushed_elapsed = unpushed_started.elapsed();
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -316,6 +361,8 @@ pub fn history_bounded(
     walk.simplify_first_parent().map_err(map_git_err)?;
     walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
 
+    let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
+    let mut diff_elapsed = Duration::ZERO;
     let mut out = Vec::new();
     for oid in walk {
         if out.len() >= limit {
@@ -330,7 +377,11 @@ pub fn history_bounded(
         let hash = oid.to_string();
         let is_pushed = has_upstream && !unpushed.contains(&hash);
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
+        let diff_started = timing_enabled.then(Instant::now);
         let files = changed_files(&repo, &commit)?;
+        if let Some(t) = diff_started {
+            diff_elapsed += t.elapsed();
+        }
         let files_changed = files.len();
         let author = commit.author();
         out.push(CommitRecord {
@@ -346,6 +397,21 @@ pub fn history_bounded(
             linked_note_id,
         });
     }
+    let total = started.elapsed();
+    tracing::debug!(
+        commits = out.len(),
+        limit,
+        include_older,
+        bounded = boundary_sha.is_some(),
+        unpushed_ms = unpushed_elapsed.as_millis() as u64,
+        per_commit_diff_ms = diff_elapsed.as_millis() as u64,
+        other_ms = total
+            .saturating_sub(diff_elapsed)
+            .saturating_sub(unpushed_elapsed)
+            .as_millis() as u64,
+        total_ms = total.as_millis() as u64,
+        "history_bounded: revwalk + per-commit tree diffs"
+    );
     Ok(out)
 }
 
