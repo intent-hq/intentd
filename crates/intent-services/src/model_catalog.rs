@@ -118,11 +118,18 @@ fn from_provider_fetch(fetched: crate::provider_models::ProviderModelsFetch) -> 
     }
 }
 
+/// Probe a [`crate::provider_models`] source through its
+/// [`crate::provider_models::fetch_provider_models`] dispatcher — the single
+/// provider→fetch mapping, so the registry cannot drift from it.
+fn provider_models_fetch(provider_id: &'static str) -> BoxFuture<'static, ModelFetchResult> {
+    Box::pin(async move {
+        from_provider_fetch(crate::provider_models::fetch_provider_models(provider_id).await)
+    })
+}
+
 /// claude-code source: ACP probe via the pinned npx adapter.
 fn claude_code_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    Box::pin(async {
-        from_provider_fetch(crate::provider_models::fetch_claude_code_models().await)
-    })
+    provider_models_fetch("claude-code")
 }
 
 /// claude-code cache entries are keyed to the adapter pin so a version bump
@@ -134,12 +141,16 @@ fn claude_code_version() -> String {
 /// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
 /// npx fallback.
 fn codex_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    Box::pin(async { from_provider_fetch(crate::provider_models::fetch_codex_models().await) })
+    provider_models_fetch("codex")
 }
 
 /// codex is pinned only when the probe falls back to the npx adapter; a
 /// resolved `codex-acp` binary has no pin (mirrors the fetch dispatch in
-/// [`crate::provider_models::fetch_codex_models`]).
+/// [`crate::provider_models::fetch_codex_models`]). The binary is resolved
+/// here and again inside the fetch — intentionally independent: the two
+/// resolutions are milliseconds apart, so at worst an install/uninstall
+/// mid-request stores one cache entry under the other branch's key, which
+/// the next request's key mismatch simply treats as a miss.
 fn codex_version() -> String {
     if intent_providers::find_provider_binary("codex", "codex-acp", None).is_some() {
         String::new()
@@ -150,7 +161,7 @@ fn codex_version() -> String {
 
 /// pi source: ACP probe via the pinned npx adapter.
 fn pi_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    Box::pin(async { from_provider_fetch(crate::provider_models::fetch_pi_models().await) })
+    provider_models_fetch("pi")
 }
 
 /// pi cache entries are keyed to the adapter pin (the probe always runs the
@@ -161,12 +172,12 @@ fn pi_version() -> String {
 
 /// droid source: ACP probe via a resolved `droid` binary (no adapter pin).
 fn droid_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    Box::pin(async { from_provider_fetch(crate::provider_models::fetch_droid_models().await) })
+    provider_models_fetch("droid")
 }
 
 /// opencode source: native `opencode models` CLI (no adapter pin).
 fn opencode_fetch() -> BoxFuture<'static, ModelFetchResult> {
-    Box::pin(async { from_provider_fetch(crate::provider_models::fetch_opencode_models().await) })
+    provider_models_fetch("opencode")
 }
 
 /// The provider→source registry: every provider with a daemon-side model

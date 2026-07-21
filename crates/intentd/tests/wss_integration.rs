@@ -948,6 +948,31 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source"], "{resp}");
+
+    // A newly registered discovery provider (opencode: native CLI probe).
+    // The probe's outcome depends on the host — either branch must be a
+    // documented §5.30 shape, never an error: dynamic rows tagged with the
+    // provider's own source, or the static fallback + warning when the
+    // binary is unavailable.
+    let frame = r#"{"jsonrpc":"2.0","id":11,"method":"models.list","params":{"providerId":"opencode","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 11);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "opencode");
+    let models = resp["result"]["models"].as_array().expect("models");
+    match resp["result"]["source"].as_str().expect("source") {
+        "opencode" => {
+            assert!(!models.is_empty(), "{resp}");
+            for m in models {
+                assert!(m["id"].is_string(), "{m}");
+                assert!(m["name"].is_string(), "{m}");
+                assert!(m["provider"].is_string(), "{m}");
+            }
+        }
+        "static" => assert!(resp["result"]["warning"].is_string(), "{resp}"),
+        other => panic!("unexpected source '{other}': {resp}"),
+    }
     srv.ws.stop().await;
 }
 
