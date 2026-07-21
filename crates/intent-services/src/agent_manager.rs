@@ -1368,6 +1368,23 @@ impl AgentManager {
             .await
             .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
 
+        // Per the ACP schema, http/sse `McpServer` entries are only valid when
+        // the agent advertised `mcpCapabilities.http`/`sse` in `initialize` —
+        // an agent that didn't may reject the whole `session/new`. Filter here
+        // (post-handshake) so a user-configured http/sse catalog entry can't
+        // break agent spawn; stdio (the workspace bridge) is mandatory per
+        // spec and always passes.
+        let mcp_caps = &handshake.initialize.agent_capabilities.mcp_capabilities;
+        let session_mcp_servers: Vec<McpServer> = session_mcp_servers
+            .into_iter()
+            .filter(|s| match s {
+                McpServer::Stdio(_) => true,
+                McpServer::Http(_) => mcp_caps.http,
+                McpServer::Sse(_) => mcp_caps.sse,
+                _ => false,
+            })
+            .collect();
+
         // The persisted id (if any) decides the no-resume branch: a brand-new
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.

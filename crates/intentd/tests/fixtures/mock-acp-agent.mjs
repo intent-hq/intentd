@@ -67,10 +67,13 @@ function callWorkspaceTool(toolCall) {
     const path = mcpConfigPath();
     if (path) {
       const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
-      srv = cfg.mcpServers && cfg.mcpServers['workspace-mcp'];
-    } else {
+      srv = (cfg.mcpServers && cfg.mcpServers['workspace-mcp']) || null;
+    }
+    if (!srv) {
       // ACP session-setup delivery: the `session/new` `mcpServers` array
       // carries untagged stdio entries { name, command, args, env: [{name,value}] }.
+      // Also the fallback when an `--mcp-config` file exists but lacks the
+      // bridge entry, so either delivery mechanism can win.
       const entry = sessionMcpServers.find((s) => s && s.name === 'workspace-mcp');
       if (entry) {
         srv = {

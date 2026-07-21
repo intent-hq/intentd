@@ -1774,6 +1774,15 @@ mod mcp_tests {
         assert_eq!(remote["type"], json!("sse"));
         assert_eq!(remote["url"], json!("https://h"));
         assert_eq!(remote["headers"], json!([{ "name": "X", "value": "y" }]));
+
+        // Pin the parity invariant directly: the two converters are parallel
+        // implementations of the same wire shape, so serialized output must be
+        // byte-equivalent (Value equality is key-order-insensitive).
+        assert_eq!(
+            wire,
+            to_acp_mcp_servers(&normalized),
+            "typed converter must not drift from to_acp_mcp_servers"
+        );
     }
 
     #[test]

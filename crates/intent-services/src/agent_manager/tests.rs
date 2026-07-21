@@ -1394,6 +1394,59 @@ async fn start_session_carries_session_mcp_servers_on_session_new() {
     );
 }
 
+/// Per the ACP schema, http/sse `McpServer` entries are only valid when the
+/// agent advertised `mcpCapabilities.http`/`sse` in `initialize`. The scripted
+/// mock advertises neither (serde defaults ⇒ false), so `start_session` must
+/// drop the http/sse entries and keep only the mandatory-per-spec stdio bridge
+/// — a user-configured remote catalog entry can't break agent spawn.
+#[tokio::test]
+async fn start_session_filters_remote_mcp_servers_without_capability() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-mcp-filter"));
+    seed_agent(&mgr, &ws, &id).await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    let mut servers = intent_acp::NormalizedMcpServers::new();
+    servers.insert(
+        "remote-http".to_string(),
+        intent_acp::NormalizedMcpServer::Http {
+            url: "https://h".into(),
+            headers: None,
+        },
+    );
+    servers.insert(
+        "remote-sse".to_string(),
+        intent_acp::NormalizedMcpServer::Sse {
+            url: "https://s".into(),
+            headers: None,
+        },
+    );
+    let mut stash = test_session_mcp_servers();
+    stash.extend(intent_acp::to_acp_session_mcp_servers(&servers));
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .session_mcp_servers = stash;
+
+    mgr.start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .expect("first session");
+
+    let log = log.lock().unwrap();
+    let (_, params) = log
+        .iter()
+        .find(|(m, _)| m == "session/new")
+        .expect("session/new sent");
+    let sent = params["mcpServers"].as_array().expect("mcpServers array");
+    assert_eq!(
+        sent.len(),
+        1,
+        "http/sse entries dropped without advertised capability: {sent:?}"
+    );
+    assert_eq!(sent[0]["name"], json!("workspace-mcp"));
+}
+
 /// The same stashed server list rides `session/load` on the resume path, so a
 /// resumed session reconnects the workspace-MCP bridge of the NEW child (the
 /// old child's bridge died with it).
