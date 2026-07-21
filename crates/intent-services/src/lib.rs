@@ -11545,12 +11545,23 @@ impl WorkspaceApi for Services {
                 return Ok(empty);
             }
             // Fetch one past the page window to decide whether older commits
-            // remain. `skip` comes from a client-provided token, so saturate
-            // the window math (a huge token degrades to an empty page rather
-            // than overflowing). The libgit2 revwalk runs on the blocking pool
-            // so a slow walk on a big repo cannot stall other RPCs.
-            let page_end = skip.saturating_add(limit);
-            let fetch = page_end.saturating_add(1);
+            // remain. `skip` comes from a client-provided token; treat window
+            // math that would overflow as an empty page *before* doing any
+            // git work (a saturated window would otherwise force a walk of
+            // the entire history). The libgit2 revwalk runs on the blocking
+            // pool so a slow walk on a big repo cannot stall other RPCs.
+            let (page_end, fetch) = match skip
+                .checked_add(limit)
+                .and_then(|end| end.checked_add(1).map(|fetch| (end, fetch)))
+            {
+                Some(v) => v,
+                None => {
+                    return Ok(serde_json::json!({
+                        "items": [],
+                        "nextToken": serde_json::Value::Null
+                    }));
+                }
+            };
             let commits =
                 tokio::task::spawn_blocking(move || intent_git::history::history(&worktree, fetch))
                     .await
@@ -14205,6 +14216,17 @@ impl WorkspaceApi for Services {
                 "nextToken": serde_json::Value::Null,
                 "boundarySha": serde_json::Value::Null
             });
+            // Fetch one past the page window to decide whether older commits
+            // remain. `skip` comes from a client-provided token; treat window
+            // math that would overflow as an empty page *before* doing any
+            // git work (a saturated window would otherwise force a walk of
+            // the entire bounded history).
+            let Some((page_end, fetch)) = skip
+                .checked_add(limit)
+                .and_then(|end| end.checked_add(1).map(|fetch| (end, fetch)))
+            else {
+                return Ok(empty);
+            };
             let ws = match store.get_workspace(&workspace_id).await {
                 Ok(w) => w,
                 Err(_) => return Ok(empty),
@@ -14241,15 +14263,11 @@ impl WorkspaceApi for Services {
                     return Ok(None);
                 }
 
-                // Fetch one past the page window to decide whether older
-                // commits remain. `skip` comes from a client-provided token,
-                // so saturate the window math (a huge token degrades to an
-                // empty page rather than overflowing).
                 let walk_started = std::time::Instant::now();
                 let commits = intent_git::history::history_bounded(
                     &worktree,
                     boundary_sha.as_deref(),
-                    skip.saturating_add(limit).saturating_add(1),
+                    fetch,
                     include_older,
                 )?;
                 let walk_ms = walk_started.elapsed().as_millis() as u64;
@@ -14262,7 +14280,6 @@ impl WorkspaceApi for Services {
             let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
                 return Ok(empty);
             };
-            let page_end = skip.saturating_add(limit);
             let has_more = commits.len() > page_end;
             let values: Vec<serde_json::Value> = commits
                 .iter()
