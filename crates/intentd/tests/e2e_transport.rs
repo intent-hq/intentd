@@ -110,9 +110,10 @@ fn run_cli_with_env(
     cmd.output().expect("run intentd subcommand")
 }
 
-/// Wait (up to 10s) for the daemon's UDS to accept connections.
+/// Wait (up to 60s) for the daemon's UDS to accept connections. The generous
+/// budget absorbs coverage-instrumented startup on oversubscribed CI runners.
 async fn await_uds(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(60), async {
         loop {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
