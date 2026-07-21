@@ -1,0 +1,79 @@
+# Manual promotion of an existing vX.Y.Z release to the stable channel.
+#
+# Every tagged release automatically updates beta.json on `channel-beta`
+# (publish-channel-manifest.yml, run as a dist post-announce hook). Stable is
+# promotion-only: run this workflow with the version of an existing release to
+# rebuild stable.json from that release's assets and upload it to the fixed
+# `channel-stable` release. Consumers (e.g. cloudlands-fe pin-bump automation,
+# installer scripts) discover the latest stable release from that manifest.
+name: Promote stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Released version to promote to stable (e.g. 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# Never cancel a promotion in progress
+concurrency:
+  group: intentd-stable-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote-to-stable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Validate version format
+        shell: bash
+        run: |
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            # Deliberately not echoing the raw input: it is unvalidated and could
+            # contain workflow-command sequences (log injection).
+            echo "::error::Invalid version input. Expected X.Y.Z (e.g. 0.1.0); prerelease/build suffixes are not allowed."
+            exit 1
+          fi
+          echo "Version $VERSION is valid"
+      - name: Verify release exists and is a published non-prerelease
+        shell: bash
+        run: |
+          if ! flags=$(gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv'); then
+            echo "::error::Release v${VERSION} does not exist on $GITHUB_REPOSITORY"
+            exit 1
+          fi
+          if [[ "$flags" != "false"$'\t'"false" ]]; then
+            echo "::error::Release v${VERSION} is a draft or marked prerelease; only published stable releases can be promoted"
+            exit 1
+          fi
+          echo "Release v${VERSION} exists and is a published non-prerelease"
+      - name: Build stable manifest
+        shell: bash
+        run: |
+          ./scripts/make-channel-manifest.sh "v${VERSION}" stable stable.json
+      - name: Publish manifest to channel-stable
+        shell: bash
+        run: |
+          ./scripts/publish-channel-manifest.sh stable stable.json
+      - name: Post summary
+        shell: bash
+        run: |
+          {
+            echo "## Stable promotion"
+            echo ""
+            echo "**Promoted version:** v$VERSION"
+            echo ""
+            echo "- [channel-stable release](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-stable)"
+            echo "- [stable.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-stable/stable.json)"
+          } >> "$GITHUB_STEP_SUMMARY"

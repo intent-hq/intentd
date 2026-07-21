@@ -145,32 +145,39 @@ publishes a GitHub Release with per-platform archives, `.sha256` checksums, and 
 PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
 
-- **Stable**: `vX.Y.Z` tags (e.g. `v0.9.0`).
-- **Beta**: any prerelease tag `vX.Y.Z-<suffix>` (e.g. `v0.9.0-beta.1`, `v0.9.0-rc.1`) —
-  published as GitHub prereleases; all of them update the beta channel.
+Channels follow a **promotion model** — channel routing does not depend on prerelease
+version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
+
+- **Beta**: every `vX.Y.Z` tag (e.g. `v0.1.0`) lands on the beta channel automatically.
+- **Stable**: a manual **promotion** of an existing release — run the
+  [Promote stable](.github/workflows/promote-stable.yml) workflow (Actions → Promote
+  stable) with the version to promote; it validates that the release exists and updates
+  the stable channel manifest to point at it.
 
 To cut a release: bump `version` in `crates/intentd/Cargo.toml` to match, commit, then
 push the tag.
 
 ### Channel manifests
 
-After each release, CI updates a machine-readable channel manifest on a fixed release
-(`.github/workflows/publish-channel-manifest.yml`): stable tags update the `stable.json`
-asset on the `channel-stable` release; prerelease tags update `beta.json` on
-`channel-beta`. Consumers (e.g. cloudlands-fe pin-bump automation, installer scripts)
-resolve "latest per channel" from these fixed URLs. Schema (version 1):
+After each release, CI updates a machine-readable channel manifest on a fixed release:
+every tag updates the `beta.json` asset on the `channel-beta` release
+(`.github/workflows/publish-channel-manifest.yml`, run as a dist post-announce hook),
+and promoting a version updates `stable.json` on `channel-stable`
+(`.github/workflows/promote-stable.yml`). Consumers (e.g. cloudlands-fe pin-bump
+automation, installer scripts) resolve "latest per channel" from these fixed URLs.
+Schema (version 1):
 
 ```json
 {
   "schema": 1,
   "channel": "stable",
-  "version": "0.9.0",
-  "tag": "v0.9.0",
+  "version": "0.1.0",
+  "tag": "v0.1.0",
   "published_at": "2026-07-21T00:00:00Z",
   "platforms": {
     "aarch64-apple-darwin": {
       "asset": "intentd-aarch64-apple-darwin.tar.xz",
-      "url": "https://github.com/intent-hq/intentd/releases/download/v0.9.0/intentd-aarch64-apple-darwin.tar.xz",
+      "url": "https://github.com/intent-hq/intentd/releases/download/v0.1.0/intentd-aarch64-apple-darwin.tar.xz",
       "sha256": "<hex digest of the archive>"
     }
   }
