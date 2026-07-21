@@ -1,6 +1,7 @@
 # Post-announce hook for the dist Release pipeline (see dist-workspace.toml
-# `post-announce-jobs`). After a vX.Y.Z release is published, this builds a
-# channel manifest from the release's artifacts and uploads it as beta.json on
+# `post-announce-jobs`). After a tagged release is published (any tag the dist
+# pipeline accepts, including prerelease-suffixed ones), this builds a channel
+# manifest from the release's artifacts and uploads it as beta.json on
 # the fixed `channel-beta` release. Every release lands on the beta channel;
 # stable is a manual promotion of an existing release via the "Promote stable"
 # workflow (promote-stable.yml), which updates stable.json on `channel-stable`.
