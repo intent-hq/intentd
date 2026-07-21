@@ -188,7 +188,9 @@ impl SpawnedAgent {
 
     /// Kill the child process and, on unix, its whole process group — the
     /// child is its own group leader (`process_group(0)` in [`build_command`]),
-    /// so `killpg` reaps grandchildren a bare `kill()` would orphan.
+    /// so `killpg` terminates grandchildren a bare `kill()` would orphan (the
+    /// direct child is reaped via `wait()` below; grandchildren are reaped by
+    /// init).
     pub async fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
@@ -288,9 +290,10 @@ mod kill_tests {
     use super::*;
     use std::time::Duration;
 
-    /// `SpawnedAgent::kill` must reap the WHOLE process group: a `sh` child
-    /// that forks a `sleep 30` grandchild (writing its pid to a file) leaves
-    /// no survivor after `kill()` — a direct-child-only kill would orphan it.
+    /// `SpawnedAgent::kill` must terminate the WHOLE process group: a `sh`
+    /// child that forks a `sleep 30` grandchild (writing its pid to a file)
+    /// leaves no survivor after `kill()` — a direct-child-only kill would
+    /// orphan it (the grandchild is reaped by init once killed).
     #[tokio::test]
     async fn kill_reaps_grandchildren_via_process_group() {
         let pidfile =
