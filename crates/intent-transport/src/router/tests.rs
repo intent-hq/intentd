@@ -923,16 +923,29 @@ impl WorkspaceApi for FakeApi {
                 "oauthUrl": "",
                 "configuredButNeedsUpdate": false,
                 "updatedScopes": "",
+                "deviceFlow": Value::Null,
             }))
         })
     }
 
     fn github_connect(&self) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async { Ok(serde_json::json!({ "ok": false, "guidance": "set GITHUB_TOKEN" })) })
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "ok": true,
+                "userCode": "ABCD-1234",
+                "verificationUri": "https://github.com/login/device",
+                "expiresIn": 900,
+                "interval": 5,
+            }))
+        })
+    }
+
+    fn github_cancel_auth(&self) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async { Ok(serde_json::json!({ "ok": true, "cancelled": true })) })
     }
 
     fn github_revoke(&self) -> BoxFuture<'_, Result<Value>> {
-        Box::pin(async { Ok(serde_json::json!({ "ok": false, "guidance": "nothing to revoke" })) })
+        Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
     }
 
     fn github_get_user(&self) -> BoxFuture<'_, Result<Value>> {
@@ -3292,16 +3305,31 @@ async fn github_auth_status_connect_revoke_get_user_route_without_params() {
         .await
         .unwrap();
     assert_eq!(auth["result"]["isConfigured"], serde_json::json!(true));
+    assert_eq!(auth["result"]["deviceFlow"], Value::Null);
 
     let connect = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.connect","params":{}}"#)
         .await
         .unwrap();
-    assert_eq!(connect["result"]["ok"], serde_json::json!(false));
+    assert_eq!(connect["result"]["ok"], serde_json::json!(true));
+    assert_eq!(
+        connect["result"]["userCode"],
+        serde_json::json!("ABCD-1234")
+    );
+    assert_eq!(
+        connect["result"]["verificationUri"],
+        serde_json::json!("https://github.com/login/device")
+    );
+
+    let cancel = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.cancelAuth","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(cancel["result"]["ok"], serde_json::json!(true));
+    assert_eq!(cancel["result"]["cancelled"], serde_json::json!(true));
 
     let revoke = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.revoke","params":{}}"#)
         .await
         .unwrap();
-    assert_eq!(revoke["result"]["ok"], serde_json::json!(false));
+    assert_eq!(revoke["result"]["ok"], serde_json::json!(true));
 
     let user = call(r#"{"jsonrpc":"2.0","id":1,"method":"github.getUser","params":{}}"#)
         .await

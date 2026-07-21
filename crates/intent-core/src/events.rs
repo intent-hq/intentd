@@ -272,6 +272,14 @@ pub const MCP_SERVERS_STATUS_CHANGED: &str = "mcp.servers:status-changed";
 // in sync without leaking secrets.
 pub const SETTINGS_CHANGED: &str = "settings:changed";
 
+// GitHub auth events (new in intentd; PROTOCOL §5.27). Emitted by the
+// daemon-owned device-flow poller on terminal transitions (authorized /
+// expired / denied / error) and by `github.revoke`. Global like
+// `settings:changed` (empty workspace id). The self-sufficient payload
+// `{ status }` carries only the transition — never a token, user code, or
+// device code — so subscribers refresh via `github.authStatus`.
+pub const GITHUB_AUTH_CHANGED: &str = "github:auth-changed";
+
 // App-UI events (new in intentd; daemon-owned UI-driving surface for the
 // chief workspace). `app:ui-navigate` → `{ route, workspaceId, highlightId?,
 // durationMs? }`, `app:ui-highlight` → `{ id, workspaceId, durationMs? }`,
@@ -392,6 +400,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
+    GITHUB_AUTH_CHANGED,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
