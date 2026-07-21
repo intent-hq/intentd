@@ -53,9 +53,15 @@ if [[ -z "$published_at" ]]; then
 fi
 
 # Platform archives look like intentd-<target-triple>.tar.xz / .tar.gz / .zip.
-mapfile -t archives < <(jq -r \
+# Capture jq output via command substitution (not process substitution) so a
+# jq parse error stops the script instead of looking like "no archives".
+archive_names=$(jq -r \
   '.assets[].name | select(test("^intentd-[a-z0-9_]+-[a-z0-9-]+\\.(tar\\.xz|tar\\.gz|zip)$"))' \
   <<<"$release_json")
+mapfile -t archives <<<"$archive_names"
+if [[ ${#archives[@]} -eq 1 && -z "${archives[0]}" ]]; then
+  archives=()
+fi
 
 if [[ ${#archives[@]} -eq 0 ]]; then
   echo "error: no intentd platform archives found on release $TAG" >&2
