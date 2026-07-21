@@ -3253,15 +3253,12 @@ fn derive_agent_type(
 /// carries an explicit `provider:` prefix (e.g., "opencode:kimi-k3"), that
 /// prefix wins over `session.provider`, because a cross-provider model switch
 /// should spawn the new provider's binary. `session.provider` is only used as
-/// a fallback for bare model ids, then the default provider.
+/// a fallback for bare model ids, then the default provider. Delegates to
+/// [`crate::agent_session::resolve_provider_id`], which also guards against
+/// malformed compound ids like `:sonnet` (empty prefixes fall through to the
+/// provider field / default).
 fn session_provider_id(session: &AgentSession) -> String {
-    session
-        .model
-        .as_ref()
-        .filter(|m| m.contains(':'))
-        .map(|m| intent_providers::parse_compound_model_id(m).0)
-        .or_else(|| session.provider.clone())
-        .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
+    crate::agent_session::resolve_provider_id(session.model.as_deref(), session.provider.as_deref())
 }
 
 /// Fallback phrasing for the workspace-naming nudge when the provider's MCP

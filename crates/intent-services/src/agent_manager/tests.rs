@@ -1805,6 +1805,49 @@ async fn build_turn_prompt_naming_instruction_prefers_model_provider_prefix() {
     );
 }
 
+/// A malformed compound model id (`:sonnet` — empty provider prefix) must not
+/// shadow `session.provider`: the empty prefix falls through and the session's
+/// provider spelling is used (guard in `agent_session::resolve_provider_id`).
+#[tokio::test]
+async fn build_turn_prompt_naming_instruction_ignores_empty_compound_prefix() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-malformed"),
+        AgentId::from("a-malformed"),
+    );
+    seed_agent_with_title(&mgr, &ws, &id, "amber-fox").await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("auggie".to_string());
+    session.model = Some(":sonnet".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hello" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await;
+    let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("`set_workspace_title_workspace-mcp`"),
+        "empty compound prefix must fall through to session.provider: {text:?}"
+    );
+}
+
 /// Providers with unknown MCP tool naming (claude-code here; also codex/droid
 /// until their workspace-MCP wiring lands) → the nudge falls back to the
 /// generic phrasing instead of guessing an affixed tool name.
