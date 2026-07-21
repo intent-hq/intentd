@@ -3,8 +3,9 @@
 #
 # Usage: make-channel-manifest.sh <tag> <channel> <output-file>
 #
-# <channel> is "stable" or "beta". The caller decides the routing (CI derives
-# it from dist's announcement_is_prerelease, the authoritative prerelease bit).
+# <channel> is "stable" or "beta". The caller decides the routing: CI writes
+# beta.json for every release (publish-channel-manifest.yml) and stable.json
+# when a release is promoted (promote-stable.yml).
 #
 # Reads the GitHub Release for <tag> (via `gh`), pairs every platform archive
 # (intentd-<target>.tar.xz / .tar.gz / .zip) with its .sha256 sidecar, and writes
@@ -14,8 +15,8 @@
 # {
 #   "schema": 1,
 #   "channel": "stable" | "beta",
-#   "version": "0.9.0",
-#   "tag": "v0.9.0",
+#   "version": "0.1.0",
+#   "tag": "v0.1.0",
 #   "published_at": "2026-07-21T00:00:00Z",
 #   "platforms": {
 #     "<rust-target-triple>": {
