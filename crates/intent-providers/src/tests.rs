@@ -1089,6 +1089,21 @@ fn grok_models_command_detects_logged_out_state() {
 }
 
 #[test]
+fn grok_initialize_models_null_model_state_falls_through() {
+    // An explicit `"modelState": null` must fall through to top-level model
+    // containers (TS nullish-coalescing parity).
+    let result = serde_json::json!({
+        "modelState": null,
+        "currentModelId": "grok-4.5",
+        "availableModels": [ { "modelId": "grok-4.5" } ]
+    });
+    let parsed = parse_grok_initialize_models(&result);
+    assert_eq!(parsed.current_model_id.as_deref(), Some("grok-4.5"));
+    assert_eq!(parsed.models.len(), 1);
+    assert_eq!(parsed.models[0].model_id, "grok-4.5");
+}
+
+#[test]
 fn grok_initialize_stdout_skips_errors_and_unrelated_ids() {
     // Error responses and other ids are skipped; a missing match yields None.
     let stdout = format!(

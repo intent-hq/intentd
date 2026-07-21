@@ -387,9 +387,12 @@ fn grok_models_from_value(value: &Value) -> Vec<GrokModel> {
 /// Parse the model list + current model out of a Grok ACP `initialize` (or
 /// `session/new`) result. Port of `parseGrokInitializeModels`.
 pub fn parse_grok_initialize_models(result: &Value) -> GrokParsedModels {
+    // Explicit JSON nulls fall through like the TS nullish-coalescing chain
+    // (`res?.modelState ?? res?.models ?? res`).
     let model_state = result
         .get("modelState")
-        .or_else(|| result.get("models"))
+        .filter(|v| !v.is_null())
+        .or_else(|| result.get("models").filter(|v| !v.is_null()))
         .unwrap_or(result);
     let current_model_id = model_state
         .get("currentModelId")
