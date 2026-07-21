@@ -79,9 +79,12 @@ async fn resolve_default_model_from_settings(
 ) -> Option<String> {
     let settings = services.effective_settings();
 
-    // 1. Check workspace-specific override (SQLite `settings` table blob;
-    //    read errors / malformed rows are logged, then fall through to the
-    //    next tier)
+    // 1. Check workspace-specific override (SQLite `settings` table blob).
+    //    DB read errors and non-JSON rows are logged before falling through
+    //    to the next tier; a parseable row without a string entry for this
+    //    workspace (including a non-object shape, which the legacy import
+    //    guards against) falls through silently as the normal
+    //    no-override case.
     if let Some(model) = services
         .store()
         .get_setting("model.workspaceOverrides")
