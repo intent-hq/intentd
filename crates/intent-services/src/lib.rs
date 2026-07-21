@@ -1971,15 +1971,45 @@ impl Services {
                     .ok()
                     .and_then(|s| s.completion_report);
                 let summary = format_group_child_line(child_id, event, report.as_deref());
-                self.record_group_child_completion(
-                    workspace_id,
-                    &gid,
-                    child_id,
-                    deleted,
-                    summary,
-                    event.clone(),
-                )
-                .await;
+                let newly_recorded = self
+                    .record_group_child_completion(
+                        workspace_id,
+                        &gid,
+                        child_id,
+                        deleted,
+                        summary,
+                        event.clone(),
+                    )
+                    .await;
+                // STAB-160: a grouped child's failure must wake the parent
+                // immediately — a failed child is parked in Error and never
+                // auto-redriven (STAB-52), so deferring the notification until
+                // the whole group settles stalls the batch for as long as the
+                // remaining siblings run. The group watch stays in place and
+                // the group still owns settlement (its later aggregated wake
+                // may repeat the failure line, which is acceptable). The
+                // `newly_recorded` guard ensures a reprocessed duplicate
+                // `agent:failed` cannot deliver a second immediate wake.
+                if newly_recorded && event.event_type == AGENT_FAILED {
+                    let wake = format_completion_wake(child_id, event);
+                    let metadata = build_event_notification_metadata(&[event]);
+                    if let Err(e) = self
+                        .deliver_parent_wake(
+                            workspace_id,
+                            watch.parent_agent_id.clone(),
+                            wake,
+                            Some(metadata),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            parent = %watch.parent_agent_id.0,
+                            child = %child_id.0,
+                            "failed to deliver immediate grouped-failure wake to parent"
+                        );
+                    }
+                }
                 self.try_fire_group(workspace_id, &gid).await;
                 continue;
             }
@@ -4890,11 +4920,13 @@ pub(crate) fn format_group_child_line(
 }
 
 /// Build the single aggregated wake for a settled after_all delegation group: a
-/// header with the child count and completionStatus (`partial` when any child was
-/// deleted, else `completed`) followed by the accumulated per-child lines.
+/// header with the child count and completionStatus (`partial` when any child
+/// was deleted or failed, else `completed`) followed by the accumulated
+/// per-child lines. STAB-160: a failed member must not be reported as
+/// `completed` — failures count toward `partial` just like deletions.
 fn format_group_wake(group: &agent_subscriptions::DelegationGroup) -> String {
     let total = group.expected_agent_ids.len();
-    let partial = !group.deleted_agent_ids.is_empty();
+    let partial = !group.deleted_agent_ids.is_empty() || !failed_group_children(group).is_empty();
     let status = if partial { "partial" } else { "completed" };
     let mut msg = format!(
         "[WORKSPACE EVENTS] All {total} delegated child agent(s) settled (completionStatus: {status})."
