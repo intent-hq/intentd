@@ -113,6 +113,18 @@ enum Command {
         #[arg(long)]
         rotate: bool,
     },
+    /// Render the LAN pairing QR code in the terminal plus the plaintext
+    /// `intent://pair?…` payload URI. Requires a running daemon with the TCP
+    /// (WSS) listener up: queries `pairing.getInfo` over UDS so the payload
+    /// uses the exact same host/fingerprint/token sources as `intentd token`.
+    Pair {
+        /// Also write the QR code as a PNG image to this path.
+        #[arg(long, value_name = "PATH")]
+        png: Option<PathBuf>,
+        /// Also write the QR code as an SVG document to this path.
+        #[arg(long, value_name = "PATH")]
+        svg: Option<PathBuf>,
+    },
     /// WSAPI-1 spike: evaluate an `(async () => { <code> })()` snippet in an
     /// isolated QuickJS context with a wall-clock timeout, and print the
     /// JSON-serialized result. Present only when built with `--features js-engine`.
@@ -157,6 +169,7 @@ async fn main() -> ExitCode {
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
+        Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
         #[cfg(feature = "js-engine")]
         Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
     }
@@ -213,6 +226,51 @@ async fn cmd_token(rotate: bool) -> anyhow::Result<()> {
         ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     println!("token:       {token}");
     println!("fingerprint: {}", tls.fingerprint256);
+    Ok(())
+}
+
+/// Render the LAN pairing QR code in the terminal (§5.2). Queries
+/// `pairing.getInfo` over UDS — so the payload embeds the exact same
+/// hosts/fingerprint/token the daemon serves via `server.pairingInfo` and
+/// `intentd token` — then renders the `intent://pair?…` payload URI as a QR
+/// code in half-height unicode blocks, followed by the plaintext URI.
+async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    let response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        let msg = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("pairing.getInfo failed: {msg}");
+    }
+    let result = &response["result"];
+    let uri = result["uri"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `uri`"))?;
+
+    let code = qrcode::QrCode::new(uri.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot encode pairing payload as a QR code: {e}"))?;
+    let art = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    println!("{art}");
+    println!();
+    println!("{uri}");
+
+    if let Some(path) = png {
+        let img = code.render::<image::Luma<u8>>().build();
+        img.save(path)
+            .map_err(|e| anyhow::anyhow!("cannot write PNG to {}: {e}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
+    if let Some(path) = svg {
+        let doc = code.render::<qrcode::render::svg::Color>().build();
+        std::fs::write(path, doc)
+            .map_err(|e| anyhow::anyhow!("cannot write SVG to {}: {e}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
     Ok(())
 }
 

@@ -1,5 +1,5 @@
-//! E2E tests for CLI subcommands (status, stop, doctor, token) to exercise intentd
-//! binary coverage through daemon control paths.
+//! E2E tests for CLI subcommands (status, stop, doctor, token, pair) to exercise
+//! intentd binary coverage through daemon control paths.
 
 #![cfg(unix)]
 
@@ -241,6 +241,140 @@ async fn token_rotate_flag_generates_new_token() {
         .expect("extract token2");
 
     assert_ne!(token1, token2, "rotated token should be different");
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Spawn a daemon with both UDS and TCP (WSS) listeners and a fixed token, as
+/// `intentd pair` requires a running TCP listener to build the payload.
+fn spawn_daemon_both(data_dir: &PathBuf, token: &str) -> Child {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let secrets_file = data_dir.join("secrets.json");
+    Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .arg("--listen")
+        .arg("both")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_SECRETS_FILE", &secrets_file)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env("INTENTD_TCP_PORT", "0")
+        .env("INTENTD_AUTH_TOKEN", token)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn intentd serve --listen both")
+}
+
+#[tokio::test]
+async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+    let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+    let child = spawn_daemon_both(&data_dir, token);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let png_path = data_dir.join("pair.png");
+    let svg_path = data_dir.join("pair.svg");
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .arg("--png")
+        .arg(&png_path)
+        .arg("--svg")
+        .arg(&svg_path)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .output()
+        .expect("run intentd pair");
+
+    assert!(
+        output.status.success(),
+        "pair command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("intent://pair?v=1&host="),
+        "pair output should include the payload URI: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("token={token}")),
+        "payload URI should embed the token"
+    );
+    // The ANSI QR rendering uses unicode block characters.
+    assert!(
+        stdout.contains('\u{2588}'),
+        "pair output should render a QR code in unicode blocks"
+    );
+
+    let png = std::fs::read(&png_path).expect("PNG file written");
+    assert!(png.starts_with(b"\x89PNG"), "valid PNG magic bytes");
+    let svg = std::fs::read_to_string(&svg_path).expect("SVG file written");
+    assert!(svg.contains("<svg"), "valid SVG document");
+}
+
+#[tokio::test]
+async fn pair_fails_without_tcp_listener() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let socket = data_dir.join("intentd.sock");
+
+    // UDS-only daemon: pairing is impossible without a TCP port.
+    let child = spawn_daemon(&data_dir);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_socket(&socket).await, "daemon did not start");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .output()
+        .expect("run intentd pair");
+
+    assert!(
+        !output.status.success(),
+        "pair should fail without a TCP listener"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("TCP listener is not running"),
+        "should explain the TCP listener is required: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn pair_fails_when_daemon_down() {
+    let id = Uuid::new_v4().simple().to_string();
+    let data_dir = PathBuf::from("/tmp").join(format!("itdc-{}", &id[..8]));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .output()
+        .expect("run intentd pair");
+
+    assert!(
+        !output.status.success(),
+        "pair should fail when the daemon is down"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot connect to daemon"),
+        "should report the daemon is unreachable: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }

@@ -1,4 +1,5 @@
-//! WSS e2e for `server.pairingInfo` and `server.rotateToken` (§5.2).
+//! WSS e2e for `server.pairingInfo`, `server.rotateToken`, and
+//! `pairing.getInfo` (§5.2).
 //!
 //! Drives the real WSS transport with TLS + bearer auth to prove:
 //! - WSS (TCP) connections are rejected with -32001 (local-only gating)
@@ -298,6 +299,60 @@ async fn server_pairing_info_over_wss_rejects() {
     // server.pairingInfo over WSS (TCP) is rejected with -32001
     let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "server.pairingInfo", "params": {} })
         .to_string();
+    let response = wss_call(port, cfg.clone(), &frame).await;
+    let error = &response["error"];
+
+    assert_eq!(error["code"].as_i64().unwrap(), -32001);
+    assert!(error["message"].as_str().unwrap().contains("local"));
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn pairing_get_info_over_uds() {
+    let data_dir = temp_data_dir();
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir).await;
+    let socket = data_dir.join("intentd.sock");
+
+    // pairing.getInfo over UDS (local) returns the structured QR payload
+    let response = uds_rpc(&socket, 2, "pairing.getInfo", json!({})).await;
+    let result = &response["result"];
+
+    assert_eq!(result["token"].as_str().unwrap(), TOKEN);
+    assert_eq!(result["fingerprint"].as_str().unwrap(), fp);
+    assert_eq!(result["port"].as_u64().unwrap(), port as u64);
+    assert_eq!(result["version"].as_u64().unwrap(), 1);
+    assert!(result["hosts"].is_array());
+
+    // The uri field is consistent with the component fields
+    let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
+    let expected_uri = format!(
+        "intent://pair?v=1&host={}&port={port}&fp={fp}&token={TOKEN}",
+        hosts.join(",")
+    );
+    assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn pairing_get_info_over_wss_rejects() {
+    let data_dir = temp_data_dir();
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir).await;
+    let cfg = client_config(&fp);
+
+    // pairing.getInfo over WSS (TCP) is rejected with -32001: the payload
+    // embeds the bearer token, so it never crosses the network.
+    let frame =
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "pairing.getInfo", "params": {} }).to_string();
     let response = wss_call(port, cfg.clone(), &frame).await;
     let error = &response["error"];
 

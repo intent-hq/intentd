@@ -29,6 +29,8 @@ intent-pty = { path = "../intent-pty" }
 intent-search = { path = "../intent-search" }
 intent-transport = { path = "../intent-transport" }
 intent-js = { path = "../intent-js", optional = true }
+qrcode = "0.14.1"
+image = { version = "0.25.6", default-features = false, features = ["png"] }
 
 [features]
 default = []
