@@ -550,13 +550,13 @@ pub struct WorkspaceCreate {
 
 /// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Full
 /// agent payload mirroring `agent.create` (§5.5) so the daemon can own
-/// initial-agent creation and prompt delivery inside the create op; `agentId`
-/// is honored verbatim when supplied (like `agent.create`), and `prompt`
-/// doubles as the branch-slug seed (TS `generateLocalSlug` parity).
+/// initial-agent creation and prompt delivery inside the create op; agent ids
+/// are server-assigned (a client-supplied `agentId` is rejected `-32602` at
+/// the transport boundary), and `prompt` doubles as the branch-slug seed (TS
+/// `generateLocalSlug` parity).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceCreateInitialAgent {
-    pub agent_id: Option<String>,
     pub prompt: Option<String>,
     pub name: Option<String>,
     pub model: Option<String>,
@@ -3286,7 +3286,6 @@ mod tests {
         let input: WorkspaceCreate = serde_json::from_value(json!({
             "title": "WS",
             "initialAgent": {
-                "agentId": "agent-1",
                 "prompt": "fix the auth flow",
                 "name": "Auth fixer",
                 "model": "opus",
@@ -3301,7 +3300,6 @@ mod tests {
         }))
         .unwrap();
         let agent = input.initial_agent.expect("initialAgent");
-        assert_eq!(agent.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(agent.prompt.as_deref(), Some("fix the auth flow"));
         assert_eq!(agent.name.as_deref(), Some("Auth fixer"));
         assert_eq!(agent.model.as_deref(), Some("opus"));
@@ -3327,7 +3325,6 @@ mod tests {
             serde_json::from_value(json!({ "initialAgent": { "prompt": "p" } })).unwrap();
         let bare = bare.initial_agent.expect("initialAgent");
         assert_eq!(bare.prompt.as_deref(), Some("p"));
-        assert!(bare.agent_id.is_none());
         assert!(bare.specialist.is_none());
         assert!(bare.metadata.is_none());
     }

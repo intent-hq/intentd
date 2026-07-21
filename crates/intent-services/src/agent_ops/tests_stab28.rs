@@ -32,7 +32,6 @@ async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await

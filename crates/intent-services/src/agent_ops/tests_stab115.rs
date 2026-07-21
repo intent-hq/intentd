@@ -52,7 +52,6 @@ async fn create_agent(
             None,
             None,
             false,
-            None,
             Default::default(),
         )
         .await
@@ -120,7 +119,6 @@ async fn agent_create_background_agent_uses_background_default() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -188,7 +186,6 @@ async fn agent_create_uses_provider_defaults_for_explicit_provider() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await
@@ -245,7 +242,6 @@ async fn agent_create_background_default_beats_provider_defaults() {
             None,
             None,
             false,
-            None,
             extra,
         )
         .await

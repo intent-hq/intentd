@@ -99,7 +99,6 @@ async fn agent_send_message_persists_without_manager() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -174,7 +173,6 @@ async fn agent_send_to_task_delivers_to_assigned_agent() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -217,7 +215,6 @@ async fn agent_cancel_subscriptions_idempotent() {
         .agent_create(
             ws.clone(),
             Some("TestAgent".into()),
-            None,
             None,
             None,
             None,
@@ -312,7 +309,6 @@ async fn agent_get_subscriptions_returns_empty_for_new_agent() {
         .agent_create(
             ws.clone(),
             Some("GetSubsAgent".into()),
-            None,
             None,
             None,
             None,

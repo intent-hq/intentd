@@ -104,8 +104,11 @@ impl Store {
                 if e.as_database_error()
                     .is_some_and(|d| d.is_unique_violation())
                 {
-                    Error::InvalidParams(format!(
-                        "agentId {} already exists; supply a fresh agent-{{uuid}} per create attempt",
+                    // Agent ids are server-minted (`agent-{uuid}`), so a
+                    // UNIQUE(id) violation is a server-side anomaly, not a
+                    // client params error.
+                    Error::Internal(format!(
+                        "server-minted agent id {} collided with an existing session",
                         s.id
                     ))
                 } else {
@@ -1157,12 +1160,12 @@ mod tests {
     use super::*;
     use crate::Store;
 
-    /// A UNIQUE violation on the session id (concurrent create racing past the
-    /// service-layer availability precheck) maps to `InvalidParams` naming the
-    /// id — not the opaque `Internal` the raw sqlx error would surface as —
-    /// so the "duplicate id => -32602" contract holds under concurrency.
+    /// A UNIQUE violation on the session id maps to `Internal` naming the
+    /// colliding id. Agent ids are server-minted (`agent-{uuid}`), so a
+    /// duplicate insert is a server-side anomaly — never a client params
+    /// error — and must not surface the retired "supply a fresh id" guidance.
     #[tokio::test]
-    async fn insert_agent_session_duplicate_id_is_invalid_params() {
+    async fn insert_agent_session_duplicate_id_is_internal_error() {
         use intent_core::{
             now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
         };
@@ -1252,11 +1255,11 @@ mod tests {
             .await
             .expect_err("duplicate id must be rejected");
         match &err {
-            Error::InvalidParams(msg) => assert!(
-                msg.contains(session.id.0.as_str()),
-                "error must name the duplicate id, got: {msg}"
+            Error::Internal(msg) => assert!(
+                msg.contains(session.id.0.as_str()) && msg.contains("collided"),
+                "error must name the colliding server-minted id, got: {msg}"
             ),
-            other => panic!("expected InvalidParams, got {other:?}"),
+            other => panic!("expected Internal, got {other:?}"),
         }
         let _ = std::fs::remove_file(&tmp);
     }

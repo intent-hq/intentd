@@ -103,7 +103,6 @@ async fn agent_queue_add_get_remove_lifecycle() {
             None,
             None,
             None,
-            None,
             Default::default(),
         )
         .await
@@ -176,7 +175,6 @@ async fn agent_conversation_and_summary() {
         .agent_create(
             ws.clone(),
             Some("ConvTest".into()),
-            None,
             None,
             None,
             None,
@@ -254,7 +252,6 @@ async fn agent_diagnostics_baseline() {
         .agent_create(
             ws.clone(),
             Some("DiagTest".into()),
-            None,
             None,
             None,
             None,
