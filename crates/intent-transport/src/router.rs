@@ -1186,9 +1186,10 @@ async fn dispatch(
         }
         "models.list" => {
             // Additive rich model catalog (PROTOCOL §5.30); optional
-            // `providerId` (omitted → backward-compatible auggie path) and
-            // `forceRefresh` (skip the cache read, await a fresh probe).
-            let provider_id = opt_str(params, "providerId");
+            // `providerId` (omitted or empty/whitespace → backward-compatible
+            // auggie path) and `forceRefresh` (skip the cache read, await a
+            // fresh probe).
+            let provider_id = opt_nonempty_str(params, "providerId");
             let force_refresh = opt_bool(params, "forceRefresh").unwrap_or(false);
             let result = api
                 .models_list(provider_id, force_refresh)

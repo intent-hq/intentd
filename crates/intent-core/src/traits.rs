@@ -1511,9 +1511,11 @@ pub trait WorkspaceApi: Send + Sync {
     /// backward-compatible auggie path —
     /// `{ models: [ModelInfo…], source: "auggie" | "static" }` from
     /// `auggie model list --json` (plain-text fallback) with the static tier
-    /// catalog when the CLI is unavailable. With a `provider_id` the catalog
-    /// comes from that provider's registered source through the generic
-    /// per-provider cache (5-minute TTL, version-keyed), returning
+    /// catalog when the CLI is unavailable — except that `force_refresh` with
+    /// a failed probe may serve the last-good cached list with `stale`/
+    /// `warning` fields added. With a `provider_id` the catalog comes from
+    /// that provider's registered source through the generic per-provider
+    /// cache (5-minute TTL, version-keyed), returning
     /// `{ providerId, models, source, stale?, warning? }`. `force_refresh`
     /// skips the cache read and awaits a fresh probe.
     fn models_list(

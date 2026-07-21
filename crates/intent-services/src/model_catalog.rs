@@ -2,10 +2,11 @@
 //!
 //! One cache implementation serves every provider: entries are keyed by
 //! provider id and carry a version key (e.g. a pinned ACP adapter version) so
-//! a pin bump invalidates the cached list automatically. Successful fetches
-//! are persisted in the daemon data dir and stay fresh for
-//! [`crate::agent_ops::MODELS_CACHE_TTL`]; expired reads await a fresh probe
-//! (no stale-while-revalidate) and fall back to the last-good list — labeled
+//! a pin bump invalidates the cached list automatically. Successful non-empty
+//! fetches are persisted in the daemon data dir and stay fresh for
+//! [`crate::agent_ops::MODELS_CACHE_TTL`] (empty-but-successful results are
+//! served but not cached); expired reads await a fresh probe (no
+//! stale-while-revalidate) and fall back to the last-good list — labeled
 //! with a `warning` — only when the probe fails.
 //!
 //! The registry lists the sources that exist today (auggie via the rich CLI
@@ -179,14 +180,16 @@ impl ModelCatalogCache {
     }
 
     /// The cached rows when still within TTL **and** fetched under
-    /// `version_key` — a version-pin bump invalidates automatically.
+    /// `version_key` — a version-pin bump invalidates automatically. An entry
+    /// fetched in the future (system clock moved backwards) is not fresh, so
+    /// a persisted entry can never outlive the TTL through clock adjustments.
     fn fresh(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<Vec<Value>> {
         let entries = self.entries.lock().expect("model catalog cache poisoned");
         let entry = entries.get(provider_id)?;
-        if entry.version_key != version_key {
+        if entry.version_key != version_key || now_ms < entry.fetched_at_ms {
             return None;
         }
-        let age = now_ms.saturating_sub(entry.fetched_at_ms);
+        let age = now_ms - entry.fetched_at_ms;
         (age < MODELS_CACHE_TTL.as_millis() as u64).then(|| entry.models.clone())
     }
 
@@ -251,8 +254,10 @@ pub(crate) struct ResolvedModels {
 /// The single cache policy every provider goes through (PROTOCOL §5.30):
 /// non-forced reads within TTL serve the cache; expired or forced reads await
 /// the fresh probe (`force_refresh` skips the cache read entirely); a
-/// successful probe is stored; a failed probe falls back to the last-good
-/// list labeled `stale` + `warning`, or reports nothing to serve.
+/// successful non-empty probe is stored (empty successes are served but not
+/// cached, so they never masquerade as a last-good list); a failed probe
+/// falls back to the last-good list labeled `stale` + `warning`, or reports
+/// nothing to serve.
 pub(crate) async fn resolve_with_cache<F>(
     cache: &ModelCatalogCache,
     provider_id: &str,

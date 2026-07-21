@@ -57,6 +57,17 @@ async fn fresh_cache_hit_within_ttl_skips_fetch() {
 }
 
 #[tokio::test]
+async fn entry_fetched_in_the_future_is_not_fresh() {
+    // System clock moved backwards: an entry stamped ahead of `now` must not
+    // be served as fresh (it could otherwise outlive the TTL indefinitely).
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("future"), 10_000);
+    let r = resolve_with_cache(&cache, "p", "v1", false, 5_000, ok_fetch("probed")).await;
+    assert_eq!(r.models, Some(rows("probed")));
+    assert!(!r.stale);
+}
+
+#[tokio::test]
 async fn expired_cache_awaits_fresh_probe_and_stores() {
     let cache = ModelCatalogCache::new(None);
     cache.store("p", "v1", rows("old"), 1_000);
