@@ -200,8 +200,6 @@ pub struct RtkSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ServerSettings {
-    /// `server.listenMode` — transport(s) the daemon serves.
-    pub listen_mode: ListenMode,
     /// `server.socketPath` — Unix socket path for the UDS listener.
     pub socket_path: Option<String>,
     /// `server.bindAddress` — address the TCP listener binds.
@@ -221,7 +219,6 @@ pub struct ServerSettings {
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
-            listen_mode: ListenMode::Uds,
             socket_path: None,
             bind_address: "0.0.0.0".to_string(),
             port: 5181,
@@ -231,16 +228,6 @@ impl Default for ServerSettings {
             auth: AuthSettings::default(),
         }
     }
-}
-
-/// `server.listenMode` values.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ListenMode {
-    #[default]
-    Uds,
-    Tcp,
-    Both,
 }
 
 /// `[server.wsApi]` — WSS listener runtime toggle (`server.wsApi.*`).
@@ -491,7 +478,10 @@ where
 /// keys with no catalog entry) + strip-from-file at boot. Any other unknown
 /// key remains a hard parse error. `ai` covers the whole retired `[ai]`
 /// table (the app drives AI via ACP agent providers, not a direct provider).
-pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides", "ai"];
+/// `server.listenMode` is retired outright: the daemon always serves UDS and
+/// the TCP/WSS listener is governed by `server.wsApi.enabled` — the value is
+/// discarded (no catalog entry remains) and stripped from the file.
+pub const LEGACY_SETTINGS_PATHS: &[&str] = &["model.workspaceOverrides", "ai", "server.listenMode"];
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
@@ -736,8 +726,6 @@ volume = 0.5
 enabled = false
 
 [server]
-# Listen mode -- transport(s) the daemon serves: "uds", "tcp", or "both".
-listenMode = "uds"
 # Socket path -- Unix socket path for the UDS listener.
 # socketPath = "/path/to/intentd.sock"
 # Bind address -- address the TCP listener binds.
@@ -854,7 +842,6 @@ mod tests {
         assert!(d.notifications.sound_only_when_unfocused);
         assert_eq!(d.notifications.volume, 0.5);
         assert!(!d.rtk.enabled);
-        assert_eq!(d.server.listen_mode, ListenMode::Uds);
         assert_eq!(d.server.bind_address, "0.0.0.0");
         assert_eq!(d.server.port, 5181);
         assert_eq!(d.server.origin_allow_list, None);
@@ -935,10 +922,10 @@ mod tests {
 
     #[test]
     fn bad_enum_value_is_rejected() {
-        let err = SettingsFile::parse_str("[server]\nlistenMode = \"quic\"\n").unwrap_err();
+        let err = SettingsFile::parse_str("[logging]\nlevel = \"loud\"\n").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("server.listenMode"), "names the key: {msg}");
-        assert!(msg.contains("uds"), "lists the variants: {msg}");
+        assert!(msg.contains("logging.level"), "names the key: {msg}");
+        assert!(msg.contains("info"), "lists the variants: {msg}");
     }
 
     #[test]
@@ -1036,7 +1023,7 @@ mod tests {
     fn round_trips_through_toml() {
         let mut file = SettingsFile::default();
         file.providers.active = Some("claude-code".to_string());
-        file.server.listen_mode = ListenMode::Both;
+        file.server.ws_api.enabled = true;
         file.agents.idle_reap_minutes = 15;
         let text = toml::to_string(&file).expect("serializes");
         let back = SettingsFile::parse_str(&text).expect("re-parses");
@@ -1058,6 +1045,26 @@ mod tests {
         let err = SettingsFile::parse_str("[ai]\nmodel = \"m1\"\n").unwrap_err();
         assert!(err.to_string().contains("ai"), "{err}");
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("[ai]"));
+    }
+
+    #[test]
+    fn listen_mode_is_no_longer_a_schema_key() {
+        // Strict parse rejects the retired key like any other unknown key.
+        let err = SettingsFile::parse_str("[server]\nlistenMode = \"uds\"\n").unwrap_err();
+        assert!(err.to_string().contains("listenMode"), "{err}");
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("listenMode"));
+    }
+
+    #[test]
+    fn legacy_parse_captures_and_tolerates_listen_mode() {
+        let text = "[server]\nlistenMode = \"both\"\nport = 5181\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert_eq!(file.server.port, 5181);
+        assert_eq!(
+            legacy.get("server.listenMode"),
+            Some(&serde_json::json!("both"))
+        );
+        assert_eq!(legacy.len(), 1);
     }
 
     #[test]

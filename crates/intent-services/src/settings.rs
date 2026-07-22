@@ -909,14 +909,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             false,
         ),
         // --- Group B: server / transport ------------------------------------
-        enumerated(
-            "server.listenMode",
-            "Listen mode",
-            "Transport(s) the daemon serves",
-            "server",
-            &["uds", "tcp", "both"],
-            "uds",
-        ),
         string(
             "server.socketPath",
             "Socket path",
@@ -1676,6 +1668,17 @@ mod tests {
             );
         }
         assert!(definitions().iter().all(|d| d.category != "ai"));
+    }
+
+    /// `server.listenMode` is retired: the daemon always serves UDS and the
+    /// TCP/WSS listener is governed by `server.wsApi.enabled`, so no catalog
+    /// entry may remain for the old key.
+    #[test]
+    fn listen_mode_is_gone_from_the_catalog() {
+        assert!(
+            find_definition("server.listenMode").is_none(),
+            "server.listenMode must not be in the catalog"
+        );
     }
 
     /// The non-secret gap entries live in the catalog as opaque `Object`
