@@ -48,7 +48,7 @@ fn registry_field_parity() {
     assert_eq!(auggie.remove_tool_flag, Some("--remove-tool"));
     assert!(auggie.supports_authenticate && auggie.supports_set_mode);
     assert!(auggie.supports_mcp_config && auggie.supports_rules_file);
-    assert!(!auggie.can_be_disabled);
+    assert!(auggie.can_be_disabled);
     assert_eq!(auggie.login_command_hint, Some("auggie login"));
 
     let cc = find_provider("claude-code").unwrap();
@@ -118,6 +118,34 @@ fn session_mcp_servers_partition() {
             "{id}: supports_session_mcp_servers must match the pinned opt-in set {opted_in:?}"
         );
     }
+}
+
+/// Exactly claude-code applies the stored model post-session via
+/// `session/set_config_option { configId: "model" }` (its pinned adapter
+/// exposes the model as a `configOptions[id="model"]` select and has no CLI
+/// model flag). Asserted over the full registry so a newly added provider
+/// can't accidentally opt in without updating this partition.
+#[test]
+fn config_option_model_partition() {
+    let opted_in = ["claude-code"];
+    for id in all_provider_ids() {
+        let p = find_provider(id).unwrap();
+        assert_eq!(
+            p.supports_config_option_model,
+            opted_in.contains(&id),
+            "{id}: supports_config_option_model must match the pinned opt-in set {opted_in:?}"
+        );
+        // The two post-session model paths are mutually exclusive for EVERY
+        // provider: `maybe_apply_session_model` would issue both calls for a
+        // provider carrying both flags.
+        assert!(
+            !(p.supports_set_model && p.supports_config_option_model),
+            "{id}: supports_set_model and supports_config_option_model are mutually exclusive"
+        );
+    }
+    // claude-code additionally has no CLI model flag and no set_model path.
+    let cc = find_provider("claude-code").unwrap();
+    assert!(cc.model_flag.is_none() && !cc.supports_set_model);
 }
 
 #[test]
@@ -770,6 +798,7 @@ fn disableable_and_always_enabled_partition_registry() {
     assert_eq!(
         disableable,
         vec![
+            "auggie",
             "claude-code",
             "codex",
             "cortex",
@@ -781,8 +810,9 @@ fn disableable_and_always_enabled_partition_registry() {
     );
     assert!(disableable_providers().iter().all(|p| p.can_be_disabled));
 
+    // Every provider — auggie included — is now disableable.
     let always: Vec<&str> = always_enabled_providers().iter().map(|p| p.id).collect();
-    assert_eq!(always, vec!["auggie"]);
+    assert!(always.is_empty());
     assert!(always_enabled_providers()
         .iter()
         .all(|p| !p.can_be_disabled));

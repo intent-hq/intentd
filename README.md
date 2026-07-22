@@ -21,15 +21,16 @@ This repo is consumed as a git submodule by [intent-hq/monorepo](https://github.
 
 ## Architecture
 
-A single cargo **workspace** with 12 crates. Dependency direction is enforced per
-`IMPLEMENTATION_SPEC.md` §3.2: `intent-core` is the leaf, `intent-transport` depends only on
-`intent-services` (never on `intent-store`), and the `intentd` binary is the only composition
-root that wires concrete implementations together.
+A single cargo **workspace** with 12 crates. Dependency direction is enforced per the
+"Dependency-direction rules" in the monorepo's `docs/ARCHITECTURE.md`: `intent-core` is
+the leaf, `intent-transport` depends only on `intent-services` (never on `intent-store`),
+and the `intentd` binary is the only composition root that wires concrete
+implementations together.
 
 ```text
                        ┌──────────────────────────────┐
                        │     intentd (bin)            │  CLI: serve / call / status / stop / doctor / …
-                       │   composition root (§3.2)    │  wires store → services → transport
+                       │   composition root           │  wires store → services → transport
                        └───────────────┬──────────────┘
                                        │
         ┌──────────────────────────────┼──────────────────────────────┐
@@ -57,7 +58,7 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 | `intent-store` | SQLite persistence via `sqlx` + embedded migrations. |
 | `intent-services` | `WorkspaceApi` implementation (the shared service surface) + the `AgentManager`, MCP callback server, and per-domain ops. |
 | `intent-transport` | JSON-RPC router + UDS listener, the WSS/TLS listener, bearer auth + origin allow-list, and heartbeat. |
-| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`service`/`mcp-bridge`). |
+| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`mcp-bridge`). |
 | `intent-acp` | ACP client core + `AgentManager` orchestration, agent→BE MCP callback server, and the loopback MCP bridge. |
 | `intent-providers` | Provider registry + model resolution for spawning agent runtimes. |
 | `intent-sourcecontrol` | GitHub/PR via `octocrab` (REST + GraphQL), token resolution, GHE support. |
@@ -102,6 +103,20 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/intent-hq/intentd/relea
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/intent-hq/intentd/releases/latest/download/intentd-installer.ps1 | iex"
 ```
 
+### Debian / Ubuntu (.deb)
+
+Every release also ships Debian packages (`intentd_<version>_amd64.deb` and
+`intentd_<version>_arm64.deb`, built by `.github/workflows/build-deb.yml`) installing
+the binary at `/usr/bin/intentd` and a systemd **user** unit at
+`/usr/lib/systemd/user/intentd.service`. Download the .deb for your architecture from
+the [releases page](https://github.com/intent-hq/intentd/releases), then:
+
+```sh
+sudo apt install ./intentd_<version>_amd64.deb
+# The package does not auto-enable the unit (it is per-user); start it at login with:
+systemctl --user enable --now intentd
+```
+
 ## Quickstart
 
 ```bash
@@ -109,7 +124,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/intent-hq/intentd/
 cargo build --workspace
 
 # 2. Start the daemon (UDS) in one shell
-cargo run -p intentd -- serve --listen uds
+cargo run -p intentd -- serve
 #   intentd listening on UDS path=~/Library/Application Support/intentd/intentd.sock
 
 # 3. In another shell, make a JSON-RPC call
@@ -131,8 +146,8 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 The backend port is well past a vertical slice: Milestones 1–10 are implemented, plus the
 recent-repository registry, ACP session resume-on-respawn, and iOS-driven wire-parity fixes.
-For the authoritative, dated progress log see
-`docs/00_initial_porting/BREADCRUMBS.md` in the monorepo.
+The initial porting effort concluded on 2026-07-13; its dated progress log is preserved
+in the monorepo's git history.
 
 **Implemented**
 
@@ -157,8 +172,9 @@ For the authoritative, dated progress log see
   / accept-changes pipeline, and ripgrep-backed search.
 - **Terminals & scripts:** a unified `intent-pty` host backing both interactive terminals and
   scripts (back-fill-then-tail scrollback, multi-client fan-out, process-group reaping).
-- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, `service install|uninstall|status`,
-  and `mcp-bridge`.
+- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, and `mcp-bridge`. The daemon
+  does not manage its own service unit: supervision is owned by the platform package manager —
+  `brew services start intentd` on macOS, and the distro package (future .deb) on Linux.
 - **Persistence:** SQLite via `sqlx` with embedded migrations through `0012_known_repo`
   (WAL, `foreign_keys`, `busy_timeout`).
 - Standard JSON-RPC error codes: `-32700`, `-32600`, `-32601`, `-32602`, `-32603`.
@@ -244,11 +260,12 @@ cargo test --workspace
 
 ## Documentation
 
-The design lives in the monorepo under `docs/00_initial_porting/`:
+The design docs live in the monorepo under `docs/`:
 
-- `IMPLEMENTATION_SPEC.md` — architecture, crate layout (§3), persistence, roadmap.
-- `PROTOCOL.md` — the wire contract: transport, JSON-RPC envelope, full method catalog,
-  events, and error codes.
+- `ARCHITECTURE.md` — system overview, crate layout, module responsibilities, and
+  dependency-direction rules.
+- `PROTOCOL.md` — the canonical wire contract (protocol v2.0): transport, JSON-RPC
+  envelope, full method catalog, events, and error codes.
 
 ## Related Repositories
 

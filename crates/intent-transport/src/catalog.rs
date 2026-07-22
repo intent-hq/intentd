@@ -11,7 +11,7 @@ mod tests;
 
 /// Router methods (canonical, dispatched via `router::dispatch`).
 ///
-/// These are the 261 canonical methods routed through the main dispatch match in
+/// These are the 263 canonical methods routed through the main dispatch match in
 /// `router.rs` (aliases are listed separately in `METHOD_ALIASES`; the dispatch
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
@@ -173,6 +173,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "note.setContent",
     "note.update",
     "note.updateMetadata",
+    "pr.capabilities",
     "pr.createReview",
     "pr.getReviews",
     "pr.listCheckRuns",
@@ -291,7 +292,7 @@ pub const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 29 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 30 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -321,6 +322,7 @@ pub const FASTPATH_METHODS: &[&str] = &[
     "host.listDirectory",
     "host.listInstalledEditors",
     "host.openInEditor",
+    "host.providerAuthStatus",
     "host.providerDiscovery",
     "host.status",
     "host.toolAvailability",

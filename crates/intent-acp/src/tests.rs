@@ -3677,11 +3677,14 @@ mod workspace_api_tool_tests {
 
     #[tokio::test]
     async fn workspace_api_hot_loop_hits_timeout() {
-        // Fail-safe: if the engine's interrupt handler regresses, the test
-        // must bail out well before the 30s tool timeout instead of hanging.
-        let srv = server("amber-forest", None);
+        // Compressed tool budget so the timeout path runs in milliseconds
+        // instead of the 30s production default. Fail-safe: if the engine's
+        // interrupt handler regresses, the test must bail out well before the
+        // tool timeout instead of hanging.
+        let srv =
+            server("amber-forest", None).with_workspace_api_timeout(Duration::from_millis(250));
         let resp = tokio::time::timeout(
-            Duration::from_secs(45),
+            Duration::from_secs(5),
             call_workspace_api(&srv, "while (true) {}"),
         )
         .await

@@ -337,7 +337,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
         vec![
             r#"{"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"cli-wss","name":"WSS"}}"#.to_string(),
             format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"drafts.set","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss","text":"wss draft"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":3,"method":"drafts.set","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss","text":"wss draft","attachments":[{{"type":"image","imageData":"aGk=","imageMimeType":"image/png"}}]}}}}"#
             ),
             format!(
                 r#"{{"jsonrpc":"2.0","id":4,"method":"drafts.get","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss"}}}}"#
@@ -347,7 +347,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.0",
+        sess[0]["result"]["protocolVersion"], "2.1",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -357,6 +357,11 @@ async fn wss_client_hello_and_drafts_round_trip() {
     assert_eq!(sess[1]["result"]["ok"], true);
     assert!(sess[1]["result"]["updatedAt"].is_string());
     assert_eq!(sess[2]["result"]["text"], "wss draft");
+    assert_eq!(
+        sess[2]["result"]["attachments"],
+        serde_json::json!([{ "type": "image", "imageData": "aGk=", "imageMimeType": "image/png" }]),
+        "attachments round-trip verbatim (§5.16)"
+    );
 
     // Reconnect with the same clientId restores the persisted draft.
     let sess = wss_session(
@@ -373,6 +378,10 @@ async fn wss_client_hello_and_drafts_round_trip() {
     assert_eq!(
         sess[1]["result"]["text"], "wss draft",
         "reconnect restores the draft"
+    );
+    assert_eq!(
+        sess[1]["result"]["attachments"][0]["imageData"], "aGk=",
+        "reconnect restores the attachments"
     );
     srv.ws.stop().await;
 }
@@ -986,6 +995,29 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
                 assert!(m["id"].is_string(), "{m}");
                 assert!(m["name"].is_string(), "{m}");
                 assert!(m["provider"].is_string(), "{m}");
+            }
+        }
+        "static" => assert!(resp["result"]["warning"].is_string(), "{resp}"),
+        other => panic!("unexpected source '{other}': {resp}"),
+    }
+
+    // grok (native `grok models` CLI probe): same host-dependent contract —
+    // dynamic rows under `source: "grok"`, or the static fallback + warning
+    // when the CLI is missing/unauthenticated. Never an error.
+    let frame = r#"{"jsonrpc":"2.0","id":12,"method":"models.list","params":{"providerId":"grok","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 12);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "grok");
+    let models = resp["result"]["models"].as_array().expect("models");
+    match resp["result"]["source"].as_str().expect("source") {
+        "grok" => {
+            assert!(!models.is_empty(), "{resp}");
+            for m in models {
+                assert!(m["id"].is_string(), "{m}");
+                assert!(m["name"].is_string(), "{m}");
+                assert_eq!(m["provider"], "grok", "{m}");
             }
         }
         "static" => assert!(resp["result"]["warning"].is_string(), "{resp}"),

@@ -433,17 +433,33 @@ mod tests {
         assert_eq!(second.total_files, 2);
     }
 
+    /// Claim every rollup permit so an in-flight rollup cannot complete,
+    /// forcing the over-budget path deterministically. A zero budget alone is
+    /// not enough: `tokio::time::timeout` polls the rollup once per wakeup,
+    /// so an ultra-fast diff can occasionally land within "zero" budget.
+    async fn hold_all_rollup_permits(
+        cache: &WorkspaceAggregateCache,
+    ) -> tokio::sync::SemaphorePermit<'_> {
+        cache
+            .gate
+            .acquire_many(MAX_CONCURRENT_ROLLUPS as u32)
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn diff_summary_over_budget_omits_then_backfills_cache() {
         let dir = seeded_dirty_repo();
-        // Zero budget: the first call always times out and omits the aggregate,
+        // Zero budget: the first call times out and omits the aggregate,
         // while the detached rollup completes and fills the cache for later calls.
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
             Duration::from_secs(60),
             Duration::ZERO,
         ));
+        let permits = hold_all_rollup_permits(&cache).await;
         let first = cache.diff_summary("ws-1", dir.path().to_path_buf()).await;
         assert!(first.is_none());
+        drop(permits);
 
         let mut result = None;
         for _ in 0..250 {
@@ -459,17 +475,19 @@ mod tests {
     #[tokio::test]
     async fn diff_summary_over_budget_serves_stale_value() {
         let dir = seeded_dirty_repo();
-        // Zero TTL + zero budget: after the cache is backfilled once, every
-        // subsequent call sees a stale entry and an over-budget rollup, so it
-        // must serve the stale value rather than omit.
+        // Zero TTL + zero budget: after the cache is backfilled once, a call
+        // that sees a stale entry and an over-budget rollup must serve the
+        // stale value rather than omit.
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
             Duration::ZERO,
             Duration::ZERO,
         ));
+        let permits = hold_all_rollup_permits(&cache).await;
         assert!(cache
             .diff_summary("ws-1", dir.path().to_path_buf())
             .await
             .is_none());
+        drop(permits);
         let mut backfilled = None;
         for _ in 0..250 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -478,7 +496,14 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(backfilled.expect("stale value served").total_files, 1);
+        assert_eq!(backfilled.expect("cache backfilled").total_files, 1);
+
+        // Cache primed and rollups blocked: the over-budget call must serve
+        // the stale entry.
+        let permits = hold_all_rollup_permits(&cache).await;
+        let stale = cache.diff_summary("ws-1", dir.path().to_path_buf()).await;
+        drop(permits);
+        assert_eq!(stale.expect("stale value served").total_files, 1);
     }
 
     #[tokio::test]

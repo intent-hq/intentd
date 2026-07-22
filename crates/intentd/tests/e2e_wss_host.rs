@@ -1,7 +1,7 @@
 //! WSS end-to-end host-services (AUDIT-P2-1 / -P2-4): drives the additive
 //! `host.*` detection methods — `host.findBinary`, `host.toolAvailability`,
 //! `host.env`, `host.findApp`, and `host.listInstalledEditors` — over a real
-//! pinned-TLS WebSocket against a live `intentd serve --listen both`. These
+//! pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via config). These
 //! methods resolve binaries / PATH / environment / GUI apps on the daemon host
 //! so a remote client sees what actually lives where workspaces run; this
 //! suite proves the §5.14 wire contract end-to-end (HTTPS upgrade → JSON-RPC
@@ -63,10 +63,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -217,12 +218,31 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    wss_rpc_with_timeout(ws, id, method, params, Duration::from_secs(15)).await
+}
+
+/// [`wss_rpc`] with a caller-chosen deadline, for methods whose legitimate
+/// worst case exceeds the default 15s (e.g. `host.providerAuthStatus` on a
+/// host with providers installed — each probe carries its own budget).
+async fn wss_rpc_with_timeout<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+    deadline: Duration,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string()))
         .await
         .expect("send rpc frame");
+    // One overall budget: unrelated frames (events, pings) consume the same
+    // deadline rather than resetting it per iteration.
+    let deadline = tokio::time::Instant::now() + deadline;
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = tokio::time::timeout_at(deadline, ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
@@ -242,7 +262,7 @@ where
     }
 }
 
-/// Boot a daemon over `--listen both` and return the live handle + a pinned WSS
+/// Boot a daemon with the WSS listener enabled and return the live handle + a pinned WSS
 /// client config plus the bound TCP port (discovered via UDS `system.status`).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = temp_data_dir();
@@ -441,6 +461,89 @@ async fn host_app_detection_services_over_wss() {
             );
         }
     }
+}
+
+/// host.providerAuthStatus over the real WSS wire: full sweep, scoped call,
+/// and the unknown-provider invalid-params error (PROTOCOL §9).
+#[tokio::test]
+async fn host_provider_auth_status_over_wss() {
+    let (_daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Full sweep: every probe-able provider appears exactly once, in order,
+    // with `authenticated: true | false | null`. On a host without providers
+    // every entry short-circuits to null without probing; with providers
+    // installed the parallel probes are bounded by their own budgets, so give
+    // the sweep a generous overall deadline.
+    let result = wss_rpc_with_timeout(
+        &mut ws,
+        300,
+        "host.providerAuthStatus",
+        json!({}),
+        Duration::from_secs(120),
+    )
+    .await;
+    let providers = result["providers"].as_array().expect("providers array");
+    let expected_ids = [
+        "auggie",
+        "claude-code",
+        "codex",
+        "opencode",
+        "droid",
+        "grok",
+        "pi",
+    ];
+    assert_eq!(
+        providers.len(),
+        expected_ids.len(),
+        "one entry per probe-able provider: {result}"
+    );
+    for (entry, expected_id) in providers.iter().zip(expected_ids) {
+        assert_eq!(
+            entry["id"], expected_id,
+            "response order is fixed: {result}"
+        );
+        assert!(
+            entry["authenticated"].is_boolean() || entry["authenticated"].is_null(),
+            "authenticated is true|false|null: {entry}"
+        );
+    }
+
+    // Scoped call: `providerId` narrows the sweep to one provider. This also
+    // exercises the cache — the sweep above already probed (or skipped) grok,
+    // so this read is served without a fresh probe.
+    let scoped = wss_rpc(
+        &mut ws,
+        301,
+        "host.providerAuthStatus",
+        json!({ "providerId": "grok" }),
+    )
+    .await;
+    let scoped_providers = scoped["providers"].as_array().expect("providers array");
+    assert_eq!(
+        scoped_providers.len(),
+        1,
+        "scoped to one provider: {scoped}"
+    );
+    assert_eq!(scoped_providers[0]["id"], "grok");
+    assert!(
+        scoped_providers[0]["authenticated"].is_boolean()
+            || scoped_providers[0]["authenticated"].is_null()
+    );
+
+    // Unknown providerId ⇒ -32602 invalid params (PROTOCOL §9).
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 302,
+        "method": "host.providerAuthStatus",
+        "params": { "providerId": "not-a-provider" }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 302).await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "unknown providerId ⇒ -32602: {err}"
+    );
 }
 
 /// Seed one workspace with a filesystem root so `host.exec` can enforce the

@@ -27,7 +27,6 @@ use sqlx::Row;
 
 mod client;
 mod import;
-mod service;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -44,15 +43,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Start the daemon and serve JSON-RPC. `--listen` selects the transport(s):
-    /// `uds` (default), `tcp` (HTTPS+WSS on 0.0.0.0:5181), or `both`. The TCP
-    /// listener binds exactly that port and exits non-zero on any bind error
-    /// (no port walking). `--insecure` (or `INTENTD_INSECURE=1`) serves plain
-    /// `ws://` on the TCP path with no TLS and no bearer-token auth — dev only.
+    /// Start the daemon and serve JSON-RPC. The UDS listener always serves;
+    /// the HTTPS+WSS listener (0.0.0.0, port from `server.wsApi.port` /
+    /// `INTENTD_TCP_PORT`, default 5181) boot-starts iff the effective
+    /// `server.wsApi.enabled` setting is true (config.toml or runtime toggle).
+    /// The TCP listener binds exactly that port — no port walking. A WSS
+    /// bind failure at boot is non-fatal (UDS keeps serving; toggle the
+    /// setting to retry). `--insecure` (or `INTENTD_INSECURE=1`) always
+    /// starts the TCP listener, serving plain `ws://` with no TLS and no
+    /// bearer-token auth — dev only; its bind errors are fatal.
     Serve {
-        /// Transport to listen on: `uds`, `tcp`, or `both`.
-        #[arg(long, default_value = "uds")]
-        listen: String,
         /// Force connection locality (§5.14): `local` or `remote`. Overrides the
         /// transport default (UDS ⇒ local, TCP/WSS ⇒ remote) for `host.status`.
         /// Omit to infer from the transport.
@@ -84,12 +84,6 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
-    /// Install/uninstall/validate the platform service unit (launchd/systemd,
-    /// §5.8) so the daemon runs unattended under the OS service manager.
-    Service {
-        #[command(subcommand)]
-        action: ServiceAction,
-    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -139,33 +133,20 @@ enum Command {
     },
 }
 
-/// Sub-actions for `intentd service` (daemonization, §5.8).
-#[derive(Debug, Subcommand)]
-enum ServiceAction {
-    /// Install (or refresh) the launchd/systemd user unit.
-    Install,
-    /// Remove the installed unit.
-    Uninstall,
-    /// Report whether the unit is installed and current (non-zero if not).
-    Status,
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
     install_panic_hook();
     match Cli::parse().command {
         Command::Serve {
-            listen,
             mode,
             insecure,
             resume_all,
-        } => to_exit(cmd_serve(&listen, mode.as_deref(), insecure, resume_all).await),
+        } => to_exit(cmd_serve(mode.as_deref(), insecure, resume_all).await),
         Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
-        Command::Service { action } => to_exit(cmd_service(&action)),
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
@@ -452,18 +433,7 @@ fn resolve_config() -> anyhow::Result<Config> {
     Config::resolve().map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
-async fn cmd_serve(
-    listen: &str,
-    mode: Option<&str>,
-    insecure: bool,
-    resume_all: bool,
-) -> anyhow::Result<()> {
-    let (serve_uds_enabled, serve_tcp_enabled) = match listen {
-        "uds" => (true, false),
-        "tcp" => (false, true),
-        "both" => (true, true),
-        other => anyhow::bail!("unsupported --listen '{other}'; expected uds|tcp|both"),
-    };
+async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyhow::Result<()> {
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
@@ -487,7 +457,7 @@ async fn cmd_serve(
     // Single-instance guard (§5.6): refuse to start if a live daemon owns the
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
-    let _pidfile = acquire_single_instance(&config, serve_uds_enabled).await?;
+    let _pidfile = acquire_single_instance(&config).await?;
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -532,7 +502,7 @@ async fn cmd_serve(
     // pinned keys take the flag value, report origin `flag` on the wire,
     // reject `settings.update`, and ignore the file value on live-reload. An
     // invalid pin value (e.g. out-of-range INTENTD_TCP_PORT) refuses startup.
-    apply_startup_pins(&settings_registry, listen, insecure)?;
+    apply_startup_pins(&settings_registry, insecure)?;
     // Snapshot of the effective boot settings for the boot-time reads below
     // (agents.maxConcurrent, server.wsApi.enabled).
     let boot_settings = settings_registry.snapshot();
@@ -704,18 +674,20 @@ async fn cmd_serve(
     let _skills_watcher = start_skills_watcher(&bus, api.as_ref()).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
-    // construction args ALWAYS (regardless of --listen mode) so settings can
-    // toggle the listener on/off at runtime. Boot-time auto-start of the listener:
-    // CLI --listen tcp/both → always starts; CLI --listen uds → starts ONLY if
-    // persisted server.wsApi.enabled=true (sidecar/packaged posture honors user
-    // toggle state across app relaunches). CLI flags and env (INTENTD_TCP_PORT)
-    // take precedence over persisted settings. With --insecure: no TLS/auth.
+    // construction args ALWAYS so settings can toggle the listener on/off at
+    // runtime. Boot-time auto-start of the listener (see [`boot_ws_listener`]):
+    // `--insecure` → the plain-ws TCP listener always starts (dev posture);
+    // otherwise the WSS listener starts ONLY if the effective
+    // server.wsApi.enabled is true (config.toml / persisted toggle state
+    // honored across relaunches). Env (INTENTD_TCP_PORT) takes precedence
+    // over persisted settings for the port.
     let mut ws_options = ws_options_from_env();
     ws_options.locality_override = locality_override;
 
     // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
     // the token store for auth layers (§5.2/§5.3). Always provision for runtime
-    // toggle, even under --listen uds (listener can be started later via settings).
+    // toggle, even when the listener is not boot-started (it can be started
+    // later via settings).
     let (tls_cert, token_store) = if insecure {
         tracing::warn!(
             "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
@@ -733,7 +705,7 @@ async fn cmd_serve(
         (Some(tls), Some(async_token_store))
     };
 
-    // Build runtime control struct (always, regardless of --listen mode)
+    // Build runtime control struct (always, regardless of boot listener state)
     let runtime = Arc::new(WsRuntimeControl {
         api: api.clone(),
         bus: bus.clone(),
@@ -757,9 +729,6 @@ async fn cmd_serve(
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let proc_usage = spawn_proc_usage_sampler();
     let control = Arc::new(DaemonControl {
-        listen_mode: listen.to_string(),
-        uds: serve_uds_enabled,
-        tcp: serve_tcp_enabled,
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
         ws_runtime: runtime.clone(),
@@ -774,58 +743,35 @@ async fn cmd_serve(
         panic!("control OnceLock should only be set once");
     }
 
-    // Boot-time auto-start of the listener ONLY when --listen tcp/both
-    // (CLI --listen wins over persisted settings)
-    let (_ws_server, _ws_port) = if serve_tcp_enabled {
+    // Resolve the boot-time TCP listener decision once: `--insecure` always
+    // starts the plain-ws listener; otherwise the secure WSS listener starts
+    // iff the effective server.wsApi.enabled is true (handled further below,
+    // after the config watcher is up).
+    let boot_listener = boot_ws_listener(insecure, boot_settings.effective.server.ws_api.enabled);
+
+    // Boot-time plain-ws listener start under --insecure (dev posture): binds
+    // exactly ws_options.base_port (INTENTD_TCP_PORT honored, 0 = ephemeral)
+    // and any bind error is fatal (no port walking). No pairing provider —
+    // pairing is a secure-mode surface.
+    if boot_listener == BootWsListener::InsecurePlainWs {
         let system_control: Arc<dyn SystemControl> = control.clone();
-        let mut server = if insecure {
-            WsApiServer::new_insecure_with_reverse(
-                api.clone(),
-                bus.clone(),
-                ws_options.clone(),
-                reverse_registry.clone(),
-                Some(system_control.clone()),
-            )
-        } else {
-            WsApiServer::new_with_reverse(
-                api.clone(),
-                bus.clone(),
-                tls_cert.as_ref().unwrap(),
-                token_store.clone().unwrap(),
-                ws_options.clone(),
-                reverse_registry.clone(),
-                Some(system_control.clone()),
-            )
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        };
-
-        // Install pairing info provider on the server (§5.2) if in secure mode
-        if !insecure {
-            let pairing_provider = Arc::new(DaemonPairingInfo {
-                data_dir: config.data_dir.clone(),
-                token_store: token_store.clone().unwrap(),
-                ws_runtime: runtime.clone(),
-            });
-            server.install_pairing_info(pairing_provider);
-        }
-
+        let server = WsApiServer::new_insecure_with_reverse(
+            api.clone(),
+            bus.clone(),
+            ws_options.clone(),
+            reverse_registry.clone(),
+            Some(system_control),
+        );
         let port = server.start().await?;
-        match server.fingerprint() {
-            Some(fp) => tracing::info!(port, fingerprint = %fp, "intentd WSS listening"),
-            None => tracing::info!(port, "intentd WS listening (insecure, no TLS)"),
-        }
+        tracing::info!(port, "intentd WS listening (insecure, no TLS)");
 
         // Store the server in runtime state
         {
             let mut state = runtime.state.lock().await;
-            state.ws_server = Some(server.clone());
+            state.ws_server = Some(server);
             state.port = Some(port);
         }
-
-        (Some(server), Some(port))
-    } else {
-        (None, None)
-    };
+    }
 
     // Wire ServerControl to Services for settings-driven runtime control (§5.12).
     // The control is attached after the api Arc is built via the `OnceLock` seam.
@@ -855,12 +801,11 @@ async fn cmd_serve(
             }
         };
 
-    // Boot-time WSS listener auto-start when persisted server.wsApi.enabled=true
-    // AND --listen uds (sidecar/packaged posture). CLI --listen tcp/both already
-    // started the listener above, so this only fires when !serve_tcp_enabled.
+    // Boot-time secure WSS listener auto-start when the effective
+    // server.wsApi.enabled is true (config.toml or persisted runtime toggle).
     // A bind failure at boot (port in use) is non-fatal: UDS stays up, setting
     // stays true, warning logged (UI shows "not running" via pairingInfo.port=null).
-    if !serve_tcp_enabled && !insecure && boot_settings.effective.server.ws_api.enabled {
+    if boot_listener == BootWsListener::SecureWss {
         match control.start_ws_listener().await {
             Ok(port) => {
                 tracing::info!(
@@ -958,25 +903,20 @@ async fn cmd_serve(
         });
     }
 
-    if serve_uds_enabled {
-        tracing::info!(socket = %config.socket_path.display(), "starting intentd");
-        let system_control: Arc<dyn SystemControl> = control.clone();
-        serve_uds_with_reverse(
-            api,
-            bus,
-            &config.socket_path,
-            Some(system_control),
-            pairing_info,
-            reverse_registry.clone(),
-            shutdown,
-        )
-        .await?;
-    } else {
-        // TCP-only: no local control transport, but the shutdown notify is still
-        // wired so a future control path could trigger it. Wait for a signal.
-        let _ = control;
-        shutdown.await;
-    }
+    // UDS always serves — it is the local control transport every deployment
+    // relies on (status/stop/doctor, FE sidecar, pairing RPCs).
+    tracing::info!(socket = %config.socket_path.display(), "starting intentd");
+    let system_control: Arc<dyn SystemControl> = control.clone();
+    serve_uds_with_reverse(
+        api,
+        bus,
+        &config.socket_path,
+        Some(system_control),
+        pairing_info,
+        reverse_registry.clone(),
+        shutdown,
+    )
+    .await?;
 
     // Clean shutdown: stop the WSS listener (graceful close + port release),
     // stop the PR refresh loop, then kill every spawned agent child and clear
@@ -1018,15 +958,12 @@ async fn cmd_serve(
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
-    listen_mode: String,
-    uds: bool,
-    tcp: bool,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
     /// WsApiServer construction args so `start_ws_listener` can build a fresh
-    /// server when toggled on. Always present (constructed regardless of --listen
-    /// mode so runtime toggle works for all modes, including --listen uds).
+    /// server when toggled on. Always present so the runtime toggle works
+    /// whether or not the listener was boot-started.
     ws_runtime: Arc<WsRuntimeControl>,
     /// Daemon start time (Instant) for uptime calculation.
     start_time: std::time::Instant,
@@ -1132,9 +1069,9 @@ struct DaemonPairingInfo {
     data_dir: PathBuf,
     token_store: Arc<AsyncTokenStore>,
     /// Runtime control reference to read the current bound port. Always present
-    /// (WsRuntimeControl is constructed for all listen modes; the listener is
-    /// auto-started at boot only for --listen tcp/both, but can be started at
-    /// runtime for all modes including --listen uds).
+    /// (WsRuntimeControl is always constructed; the WSS listener boot-starts
+    /// only when server.wsApi.enabled is true, but can be started at runtime
+    /// via settings regardless).
     ws_runtime: Arc<WsRuntimeControl>,
 }
 
@@ -1180,10 +1117,18 @@ impl SystemControl for DaemonControl {
         };
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
+        // Derived transport surface: UDS always serves; `tcp`/`listenMode`
+        // reflect the live TCP listener state (runtime toggles included), so
+        // `listenMode` is `both` while the listener is up and `uds` otherwise.
+        // Under try_lock contention above `port` reads `None`, so a status
+        // call racing a listener start/stop may transiently report `uds` —
+        // matching the port/fingerprint/clients fallback, and self-correcting
+        // on the next call.
+        let tcp = port.is_some();
         SystemStatus {
-            listen_mode: self.listen_mode.clone(),
-            uds: self.uds,
-            tcp: self.tcp,
+            listen_mode: if tcp { "both" } else { "uds" }.to_string(),
+            uds: true,
+            tcp,
             port,
             clients,
             agents: self.manager.registry().size(),
@@ -1378,8 +1323,8 @@ impl intent_core::ServerControl for DaemonControl {
 
 /// Fixed-token [`TokenStore`] selected only when `INTENTD_AUTH_TOKEN` is set.
 /// TEST-ONLY SEAM (§13.1 E2E): lets the E2E suite authenticate a real `intentd
-/// serve --listen tcp/both` daemon hermetically, without touching the shared
-/// secrets file. Production always uses [`FileTokenStore`].
+/// serve` daemon (WSS listener enabled) hermetically, without touching the
+/// shared secrets file. Production always uses [`FileTokenStore`].
 struct EnvTokenStore(String);
 
 impl TokenStore for EnvTokenStore {
@@ -1411,7 +1356,6 @@ fn resolve_token_store() -> Arc<dyn TokenStore> {
 /// like an unparseable value (matching [`ws_options_from_env`]).
 fn apply_startup_pins(
     registry: &intent_services::SettingsRegistry,
-    listen: &str,
     insecure: bool,
 ) -> anyhow::Result<()> {
     let pin = |path: &str, value: Value, flag: &str| {
@@ -1419,10 +1363,6 @@ fn apply_startup_pins(
             .pin(path, value, flag)
             .map_err(|e| anyhow::anyhow!("invalid startup override {flag}: {e}"))
     };
-    // `--listen` always pins: the CLI value (clap default `uds` included) is
-    // what the daemon actually serves this run, so the file value must never
-    // claim otherwise on the wire.
-    pin("server.listenMode", json!(listen), "--listen")?;
     if insecure {
         // Dev mode hard-disables TLS + bearer auth for the process lifetime.
         pin("server.tls.enabled", json!(false), "--insecure")?;
@@ -1466,6 +1406,32 @@ fn apply_startup_pins(
         )?;
     }
     Ok(())
+}
+
+/// The boot-time TCP listener decision for `serve` (UDS always serves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootWsListener {
+    /// No TCP listener at boot; the WSS listener may still be started later
+    /// via the `server.wsApi.enabled` runtime toggle.
+    None,
+    /// `--insecure`: plain-ws TCP listener, no TLS, no bearer auth (dev only).
+    InsecurePlainWs,
+    /// Effective `server.wsApi.enabled` is true: secure HTTPS+WSS listener.
+    SecureWss,
+}
+
+/// Resolve the boot-time TCP listener decision: `--insecure` always starts the
+/// plain-ws listener (dev posture, overrides the setting); otherwise the
+/// secure WSS listener boot-starts iff the effective `server.wsApi.enabled`
+/// is true.
+fn boot_ws_listener(insecure: bool, ws_api_enabled: bool) -> BootWsListener {
+    if insecure {
+        BootWsListener::InsecurePlainWs
+    } else if ws_api_enabled {
+        BootWsListener::SecureWss
+    } else {
+        BootWsListener::None
+    }
 }
 
 /// Build [`WsOptions`] from the production defaults plus an optional env seam:
@@ -1586,11 +1552,8 @@ async fn uds_is_live(_socket_path: &Path) -> bool {
 /// Enforce single-instance startup (§5.6). Refuses to start when a live daemon
 /// owns the UDS or a live pid holds the pidfile; otherwise removes a stale
 /// socket/pidfile whose owner is gone and claims the pidfile with our pid.
-async fn acquire_single_instance(
-    config: &Config,
-    serve_uds_enabled: bool,
-) -> anyhow::Result<PidFile> {
-    if serve_uds_enabled && config.socket_path.exists() {
+async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
+    if config.socket_path.exists() {
         if uds_is_live(&config.socket_path).await {
             anyhow::bail!(
                 "intentd is already running on {} — refusing to start a second instance",
@@ -2038,22 +2001,6 @@ async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
     }
 }
 
-/// Install/uninstall/validate the platform service unit (§5.8).
-fn cmd_service(action: &ServiceAction) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    match action {
-        ServiceAction::Install => service::install(&config),
-        ServiceAction::Uninstall => service::uninstall(&config),
-        ServiceAction::Status => {
-            if service::status(&config)? {
-                Ok(())
-            } else {
-                anyhow::bail!("service unit not installed or stale")
-            }
-        }
-    }
-}
-
 /// The terminal result of a stop escalation (§5.7).
 #[derive(Debug, PartialEq, Eq)]
 enum StopOutcome {
@@ -2259,7 +2206,7 @@ fn check_ports_free() -> bool {
 fn check_cert_validity(config: &Config) -> bool {
     match intent_transport::inspect_cert(&config.data_dir) {
         CertStatus::Missing => {
-            println!("[ok] TLS cert: none yet (generated on first `serve --listen tcp`)");
+            println!("[ok] TLS cert: none yet (generated on first secure `serve`)");
             true
         }
         CertStatus::Valid { fingerprint } => {
@@ -2424,64 +2371,33 @@ async fn report_provider_availability() {
 }
 
 /// Best-effort authentication probe for an installed provider: run its
-/// `auth_check_args` with a short timeout and report auth status. Most
-/// providers signal auth via the exit code (0 ⇒ authenticated); grok's
-/// `models` probe exits 0 in both auth states, so its stdout is parsed for
-/// the explicit auth markers instead. Returns a trailing status fragment for
-/// the doctor line, or empty when no probe applies.
+/// `auth_check_args` via the shared CLI probe
+/// (`intent_services::provider_auth::check_provider_auth_cli` — the same
+/// implementation backing `host.providerAuthStatus`, so doctor and the RPC
+/// cannot drift). Returns a trailing status fragment for the doctor line, or
+/// empty when no probe applies.
 async fn check_provider_auth(
     provider_id: &str,
     program: &std::ffi::OsStr,
     auth_check_args: Option<&[&str]>,
 ) -> String {
+    use intent_services::provider_auth::{check_provider_auth_cli, CliAuthProbe};
     let Some(args) = auth_check_args else {
         return String::new();
     };
-    if provider_id == "grok" {
-        let run = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
-        return match tokio::time::timeout(std::time::Duration::from_secs(8), run).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parsed = intent_providers::parse_grok_models_command_output(&stdout);
-                match (parsed.authenticated, parsed.models.is_empty()) {
-                    (Some(true), _) => " (authenticated)".to_string(),
-                    (Some(false), _) => " (not authenticated)".to_string(),
-                    // No explicit marker but a parsed model list ⇒ the CLI is
-                    // serving models, treat as authenticated.
-                    (None, false) => " (authenticated)".to_string(),
-                    // No markers, no models: distinguish a probe that ran but
-                    // said nothing from one that failed outright (broken
-                    // install exits non-zero with empty/garbage stdout).
-                    (None, true) if output.status.success() => " (auth status unknown)".to_string(),
-                    (None, true) => " (auth check failed)".to_string(),
-                }
-            }
-            Ok(Err(_)) => " (auth check failed)".to_string(),
-            Err(_) => " (auth check timed out)".to_string(),
-        };
-    }
-    let run = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match tokio::time::timeout(std::time::Duration::from_secs(8), run).await {
-        Ok(Ok(status)) if status.success() => " (authenticated)".to_string(),
-        Ok(Ok(_)) => " (not authenticated)".to_string(),
-        Ok(Err(_)) => " (auth check failed)".to_string(),
-        Err(_) => " (auth check timed out)".to_string(),
+    match check_provider_auth_cli(provider_id, program, args).await {
+        CliAuthProbe::Authenticated => " (authenticated)".to_string(),
+        CliAuthProbe::NotAuthenticated => " (not authenticated)".to_string(),
+        CliAuthProbe::StatusUnknown => " (auth status unknown)".to_string(),
+        CliAuthProbe::Failed => " (auth check failed)".to_string(),
+        CliAuthProbe::TimedOut => " (auth check timed out)".to_string(),
     }
 }
 
 /// Doctor config section (§9.8): the file already parsed strictly via
 /// `resolve_config`, so report its path plus every env override that will pin
-/// a settings key at serve time (flag > file precedence). `--listen` /
-/// `--insecure` pins are serve-CLI-scoped and not visible here.
+/// a settings key at serve time (flag > file precedence). `--insecure` pins
+/// are serve-CLI-scoped and not visible here.
 fn report_config_status(config: &Config) {
     println!("[ok] config.toml parsed: {}", config.config_path.display());
     // Mirror `apply_startup_pins` exactly: a numeric env var only pins when
@@ -2689,7 +2605,7 @@ mod tests {
         let config = temp_config();
         // pid 1 (init/launchd) is always alive; a signal-0 probe yields EPERM.
         std::fs::write(&config.pid_path, "1").unwrap();
-        let result = acquire_single_instance(&config, false).await;
+        let result = acquire_single_instance(&config).await;
         assert!(result.is_err(), "a live pidfile owner must refuse startup");
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
@@ -2699,7 +2615,7 @@ mod tests {
         let config = temp_config();
         // A pid essentially guaranteed not to be running.
         std::fs::write(&config.pid_path, "2147483640").unwrap();
-        let guard = acquire_single_instance(&config, false)
+        let guard = acquire_single_instance(&config)
             .await
             .expect("startup proceeds past a stale pidfile");
         assert_eq!(
@@ -2720,7 +2636,7 @@ mod tests {
         let config = temp_config();
         // A leftover socket path with nothing listening → connect refused → stale.
         std::fs::write(&config.socket_path, b"").unwrap();
-        let _guard = acquire_single_instance(&config, true)
+        let _guard = acquire_single_instance(&config)
             .await
             .expect("startup proceeds past a stale socket");
         assert!(!config.socket_path.exists(), "stale socket removed");
@@ -2732,11 +2648,30 @@ mod tests {
     async fn refuses_when_uds_is_live() {
         let config = temp_config();
         let listener = tokio::net::UnixListener::bind(&config.socket_path).expect("bind live uds");
-        let result = acquire_single_instance(&config, true).await;
+        let result = acquire_single_instance(&config).await;
         assert!(result.is_err(), "a live UDS owner must refuse startup");
         drop(listener);
         std::fs::remove_file(&config.socket_path).ok();
         std::fs::remove_dir_all(&config.data_dir).ok();
+    }
+
+    #[test]
+    fn boot_ws_listener_insecure_always_starts_plain_ws() {
+        // --insecure overrides the setting in both directions.
+        assert_eq!(
+            boot_ws_listener(true, false),
+            BootWsListener::InsecurePlainWs
+        );
+        assert_eq!(
+            boot_ws_listener(true, true),
+            BootWsListener::InsecurePlainWs
+        );
+    }
+
+    #[test]
+    fn boot_ws_listener_follows_ws_api_enabled_when_secure() {
+        assert_eq!(boot_ws_listener(false, true), BootWsListener::SecureWss);
+        assert_eq!(boot_ws_listener(false, false), BootWsListener::None);
     }
 
     #[cfg(unix)]

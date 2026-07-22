@@ -2392,8 +2392,10 @@ pub struct Client {
 
 /// Per-client chat draft (§9.10, §15), keyed by `(workspaceId, agentId,
 /// clientId)` so concurrent clients never clobber one another. Persisted to the
-/// `draft` table; an empty draft is represented by the row's absence (an empty
-/// `drafts.set` clears it).
+/// `draft` table; an empty draft is represented by the row's absence (a
+/// `drafts.set` with empty text and no attachments clears it). `attachments`
+/// is an opaque, FE-authored JSON array stored verbatim (like workspace
+/// context items); `None` when the draft has none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Draft {
@@ -2401,6 +2403,8 @@ pub struct Draft {
     pub agent_id: AgentId,
     pub client_id: ClientId,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<serde_json::Value>,
     pub updated_at: String,
 }
 

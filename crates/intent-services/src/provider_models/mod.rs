@@ -24,10 +24,13 @@
 //!   (`droid exec --output-format acp`), with auth-required detection.
 //! - `opencode` — native CLI: `opencode models`, one `provider/model` per
 //!   line.
+//! - `grok` — native CLI: `grok models` parsed via
+//!   [`intent_providers::parse_grok_models_command_output`] (auth markers +
+//!   JSON payload + text rows; the exit code is never trusted).
 //!
 //! auggie (existing CLI path in `agent_ops`) and cortex (static catalog) are
 //! deliberately NOT implemented here — they live in [`crate::model_catalog`],
-//! whose provider→source registry wires these five sources into `models.list`
+//! whose provider→source registry wires these six sources into `models.list`
 //! alongside them.
 
 use std::path::{Path, PathBuf};
@@ -48,6 +51,9 @@ pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.31";
 
 /// Timeout for the one-shot `opencode models` CLI invocation.
 const OPENCODE_CLI_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for the one-shot `grok models` CLI invocation.
+const GROK_CLI_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Result of a provider model-catalog fetch.
 ///
@@ -98,6 +104,7 @@ pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
         "pi" => fetch_pi_models().await,
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
+        "grok" => fetch_grok_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
 }
@@ -127,8 +134,10 @@ pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
 /// any `mcp_servers` it registers — is never loaded by the throwaway
-/// codex-acp process. Only `auth.json` is seeded into the isolated home so a
-/// logged-in codex stays logged in.
+/// codex-acp process. `auth.json` is seeded into the isolated home so a
+/// logged-in codex stays logged in, plus a minimal `config.toml` carrying
+/// only the user's configured `model` / `model_reasoning_effort` so that
+/// model appears in the reported catalog.
 pub async fn fetch_codex_models() -> ProviderModelsFetch {
     let cmd = if let Some(bin) = find_provider_binary("codex", "codex-acp", None) {
         AcpProbeCommand::binary(bin, Vec::new())
@@ -176,10 +185,23 @@ fn user_codex_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex"))
 }
 
+/// Top-level scalar keys copied from the user's `config.toml` into the
+/// isolated probe home. `model` (and its effort) is what surfaces
+/// user-configured models (e.g. a newer model than the adapter presets) in
+/// codex-acp's reported catalog. Everything else — notably `mcp_servers` —
+/// is deliberately never copied. Known limitation: a model configured only
+/// via a codex profile (`profile = "x"` + `[profiles.x].model`) or backed by
+/// a custom `[model_providers.*]` entry is not seeded — only top-level
+/// scalars are read.
+const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort"];
+
 /// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires
-/// the directory to exist). Only `auth.json` is copied from `user_codex_dir`;
-/// `config.toml` is deliberately NOT copied so user-configured `mcp_servers`
-/// never start under the probe.
+/// the directory to exist). `auth.json` is copied from `user_codex_dir` so a
+/// logged-in codex stays logged in, and a minimal `config.toml` holding only
+/// the [`CODEX_CONFIG_SEED_KEYS`] scalars is seeded so the user's configured
+/// model shows up in the probe's catalog. The user's full `config.toml` is
+/// deliberately NOT copied so user-configured `mcp_servers` never start under
+/// the probe.
 fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix("intentd-codex-home-")
@@ -193,8 +215,48 @@ fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfil
                 );
             }
         }
+        if let Some(seed) = minimal_codex_config_seed(&user_dir.join("config.toml")) {
+            if let Err(e) = std::fs::write(dir.path().join("config.toml"), seed) {
+                tracing::warn!(
+                    "failed to seed minimal config.toml into isolated CODEX_HOME (probe will use adapter presets): {e}"
+                );
+            }
+        }
     }
     Ok(dir)
+}
+
+/// Build the minimal `config.toml` text to seed into the isolated probe home:
+/// only the [`CODEX_CONFIG_SEED_KEYS`] top-level string values from the
+/// user's config at `path`. Returns `None` — seed nothing, the probe still
+/// works with adapter presets — when the file is absent, unreadable, or
+/// malformed, or when none of the allowlisted keys hold a string.
+fn minimal_codex_config_seed(path: &Path) -> Option<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("could not read user codex config.toml; seeding nothing: {e}");
+            return None;
+        }
+    };
+    let doc: toml_edit::DocumentMut = match text.parse() {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!("user codex config.toml is malformed; seeding nothing: {e}");
+            return None;
+        }
+    };
+    let mut seed = toml_edit::DocumentMut::new();
+    for key in CODEX_CONFIG_SEED_KEYS {
+        if let Some(value) = doc.get(key).and_then(|item| item.as_str()) {
+            seed[key] = toml_edit::value(value);
+        }
+    }
+    if seed.as_table().is_empty() {
+        return None;
+    }
+    Some(seed.to_string())
 }
 
 /// pi: ACP probe via the pinned npx adapter. Models may arrive under
@@ -235,6 +297,53 @@ pub async fn fetch_droid_models() -> ProviderModelsFetch {
             ProviderModelsFetch::unavailable("droid", "authentication required")
         }
         other => finish("droid", other),
+    }
+}
+
+/// droid auth probe (`host.providerAuthStatus`): the same ACP probe as
+/// [`fetch_droid_models`], mapped to auth semantics (parity with the FE
+/// `checkDroidReady`) — a non-empty model list ⇒ authenticated, an explicit
+/// auth-required error ⇒ not authenticated, anything else (timeout, spawn
+/// failure, empty catalog) ⇒ unknown. `bin` is the caller-resolved `droid`
+/// binary (the caller's install gate).
+pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
+    let args = vec![
+        "exec".to_string(),
+        "--output-format".to_string(),
+        "acp".to_string(),
+    ];
+    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
+        parse::parse_acp_models(v, "droid")
+    })
+    .await;
+    match outcome {
+        Ok(models) if !models.is_empty() => Some(true),
+        Ok(_) => None,
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
+/// pi auth probe (`host.providerAuthStatus`): the same pinned-adapter ACP
+/// probe as [`fetch_pi_models`], mapped to auth semantics — a non-empty
+/// model list ⇒ authenticated; an empty list or an explicit auth-required
+/// error ⇒ not authenticated (pi's adapter serves only credentialed models);
+/// spawn failure / timeout / transport error ⇒ unknown. The caller gates on
+/// the `pi` CLI being installed; the probe itself runs the pinned npx
+/// adapter.
+pub(crate) async fn probe_pi_auth() -> Option<bool> {
+    let npx = find_npx()?;
+    let cmd = AcpProbeCommand::npx(npx, PI_ACP_NPX_PACKAGE);
+    let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "pi")).await;
+    match outcome {
+        Ok(models) if !models.is_empty() => Some(true),
+        Ok(_) | Err(ProbeError::Empty) => Some(false),
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        Err(_) => None,
     }
 }
 
@@ -281,17 +390,91 @@ async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<Stri
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let trimmed = stderr.trim();
-        let tail: String = trimmed
-            .chars()
-            .skip(trimmed.chars().count().saturating_sub(200))
-            .collect();
         return Err(format!(
-            "opencode models exited with {}: {tail}",
-            output.status
+            "opencode models exited with {}: {}",
+            output.status,
+            stderr_tail(&stderr)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The last ~200 chars of a trimmed stderr, for warning attribution. Walks
+/// backwards from the end so the cost is bounded by the tail length, not the
+/// full stderr size.
+fn stderr_tail(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    let start = trimmed.char_indices().rev().nth(199).map_or(0, |(i, _)| i);
+    trimmed[start..].to_string()
+}
+
+/// grok: native CLI — run `grok models` and parse stdout via
+/// [`intent_providers::parse_grok_models_command_output`] (auth markers, then
+/// a JSON payload, then text rows — parity with the FE grok probe).
+pub async fn fetch_grok_models() -> ProviderModelsFetch {
+    let Some(bin) = find_provider_binary("grok", "grok", None) else {
+        return ProviderModelsFetch::unavailable("grok", "grok binary not found");
+    };
+    match run_grok_models_cli(bin, GROK_CLI_TIMEOUT).await {
+        Ok(output) => grok_fetch_outcome(
+            &String::from_utf8_lossy(&output.stdout),
+            output.status,
+            &String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(reason) => ProviderModelsFetch::unavailable("grok", reason),
+    }
+}
+
+/// Map one `grok models` run onto the fetch contract (the pure seam unit
+/// tests drive without a real CLI). The exit code is never trusted for auth —
+/// the CLI exits 0 in both auth states — so stdout is parsed regardless: an
+/// explicit logged-out marker degrades to "authentication required", parsed
+/// rows win otherwise, and only a run that produced neither is attributed to
+/// its exit state (status + stderr tail, matching the opencode warning).
+fn grok_fetch_outcome(
+    stdout: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> ProviderModelsFetch {
+    let parsed = intent_providers::parse_grok_models_command_output(stdout);
+    if parsed.authenticated == Some(false) {
+        return ProviderModelsFetch::unavailable("grok", "authentication required");
+    }
+    let rows = parse::grok_wire_rows(&parsed.models);
+    if !rows.is_empty() {
+        ProviderModelsFetch::ok(rows)
+    } else if status.success() {
+        ProviderModelsFetch::unavailable("grok", "no models reported")
+    } else {
+        ProviderModelsFetch::unavailable(
+            "grok",
+            format!("grok models exited with {status}: {}", stderr_tail(stderr)),
+        )
+    }
+}
+
+/// Run `grok models` with a hard timeout, returning the raw output (stdout is
+/// parsed by the caller — the exit code alone is never a failure signal). On
+/// timeout the `output()` future is dropped and `kill_on_drop` reaps the
+/// child. The timeout is injectable for tests; production passes
+/// [`GROK_CLI_TIMEOUT`]. The child runs with the enhanced PATH (binary's
+/// parent dir prepended, matching the opencode CLI and ACP probe spawns).
+async fn run_grok_models_cli(
+    bin: PathBuf,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("models")
+        .env("PATH", intent_providers::enhanced_path(Some(&bin)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("failed to run grok models: {e}")),
+        Err(_) => Err("grok models timed out".to_string()),
+    }
 }
 
 #[cfg(test)]

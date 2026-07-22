@@ -1818,6 +1818,13 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "pr.capabilities" => {
+            // §5.7 extension: requires a resolvable provider but NOT an
+            // active PR — the FE gates UI on the flags before any PR exists.
+            let ws = require_ws_note(params)?;
+            let r = api.pr_capabilities(ws).await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "pr.status" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;

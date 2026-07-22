@@ -5,6 +5,8 @@
 //! Covers mixed batches (server.* + non-server keys), single-key failures, and
 //! successful batches (no rollback).
 
+mod common;
+
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -125,7 +127,8 @@ async fn mixed_batch_full_rollback_on_hook_failure() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     // Attach a mock ServerControl that always fails start_ws_listener
     services.attach_server_control(Arc::new(FailingServerControl));
@@ -256,7 +259,8 @@ async fn successful_mixed_batch_persists_all() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     // No ServerControl attached, so no hooks run → success
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -322,7 +326,8 @@ async fn single_key_failure_reverts() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     services.attach_server_control(Arc::new(FailingServerControl));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -378,7 +383,8 @@ async fn mixed_batch_with_sensitive_setting_full_rollback() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     services.attach_server_control(Arc::new(FailingServerControl));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -501,7 +507,8 @@ async fn db_read_error_during_capture_fails_batch() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 

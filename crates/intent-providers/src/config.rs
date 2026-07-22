@@ -96,6 +96,11 @@ pub struct ProviderConfig {
     /// after session creation. Set for providers whose ACP subcommand has no
     /// CLI model flag (grok's `agent stdio`).
     pub supports_set_model: bool,
+    /// Whether the provider exposes the model as an ACP session config option
+    /// (`configOptions[id="model"]` in the `session/new` result) and applies
+    /// it via `session/set_config_option` after session establishment
+    /// (claude-code's pinned adapter).
+    pub supports_config_option_model: bool,
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
@@ -162,6 +167,7 @@ impl ProviderConfig {
             supports_authenticate: false,
             supports_set_mode: false,
             supports_set_model: false,
+            supports_config_option_model: false,
             supports_mcp_config: false,
             supports_session_mcp_servers: false,
             supports_rules_file: false,
@@ -202,6 +208,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Node,
         base_args: &["--acp", "--allow-indexing"],
         model_flag: Some("--model"),
+        can_be_disabled: true,
         supports_authenticate: true,
         supports_set_mode: true,
         supports_mcp_config: true,
@@ -228,6 +235,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // (stdio entries without a `type` tag) into the Claude Agent SDK's
         // `options.mcpServers`, so the workspace bridge rides the ACP request.
         supports_session_mcp_servers: true,
+        // The adapter's `session/new` result advertises the model as a
+        // `configOptions[id="model"]` select; the stored model is applied
+        // post-session via `session/set_config_option` (there is no CLI
+        // model flag on the pinned adapter).
+        supports_config_option_model: true,
         auth_check_args: Some(&["auth", "status"]),
         login_docs_url: Some(
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",

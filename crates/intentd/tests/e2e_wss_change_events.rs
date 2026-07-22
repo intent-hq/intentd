@@ -1,6 +1,6 @@
 //! WSS end-to-end change-event emissions for the workspace-lifecycle
 //! mutations (FIX 2 parity): drives a real pinned-TLS WebSocket against a
-//! live `intentd serve --listen both` and asserts that `workspace.update`
+//! live `intentd serve` (WSS listener enabled via config) and asserts that `workspace.update`
 //! and `workspace.delete` publish `workspace:updated` / `workspace:deleted`
 //! (PROTOCOL.md §6.5) so a subscribed client sees the mutation without a
 //! follow-up read. The `git:commit` emission is exercised over UDS in
@@ -59,10 +59,9 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    common::enable_ws_api(data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -1347,6 +1346,81 @@ async fn comment_add_plaintext_context_anchors_over_wss() {
             "<!--anchor:{comment_id}:start-->bold words<!--anchor:{comment_id}:end-->"
         )),
         "anchor markers missing: {content}"
+    );
+}
+
+/// End-to-end: `comment.add` from a *stale* editor doc — the note gained a
+/// paragraph on the server after the editor loaded it, so the ±50-char
+/// `searchContext` includes text that no longer neighbors the selection. The
+/// target-rescue path still anchors the (unique) `commentTarget`.
+#[tokio::test]
+async fn comment_add_stale_context_target_rescue_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "StaleAnchors", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Note",
+            // Server copy already has the "Status" paragraph inserted between
+            // Goal and Diagnosis; the client context below predates it.
+            "content": "## Goal\nOld goal paragraph tail.\n\n**Status:** new paragraph the editor never saw.\n\n## Diagnosis\n\n**Symptom:** things broke badly.",
+        }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            // Stale plain-text context: Goal tail joined directly to the
+            // Diagnosis heading (the Status paragraph is missing).
+            "searchContext": "Old goal paragraph tail.DiagnosisSymptom: things broke badly.",
+            "commentTarget": "DiagnosisSymptom: things broke",
+            "comment": "cross-block comment",
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], json!(true), "response: {add}");
+    assert_eq!(add["anchored"], json!(true));
+    let comment_id = add["commentId"].as_str().expect("comment id").to_string();
+
+    let read = wss_rpc(
+        &mut rpc,
+        2,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = read["note"]["content"].as_str().expect("content");
+    assert!(
+        content.contains(&format!("<!--anchor:{comment_id}:start-->Diagnosis")),
+        "start marker missing before the heading text: {content}"
+    );
+    assert!(
+        content.contains(&format!("things broke<!--anchor:{comment_id}:end-->")),
+        "end marker missing after the target text: {content}"
     );
 }
 

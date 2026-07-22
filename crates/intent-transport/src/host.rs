@@ -48,6 +48,10 @@ pub(crate) enum HostMethod {
     FindApp,
     ListInstalledEditors,
     ProviderDiscovery,
+    /// Daemon-owned provider auth probes (`host.providerAuthStatus`, §5.14):
+    /// `{ providerId?, force? }` → `{ providers: [{ id, authenticated }] }`
+    /// with `authenticated: true | false | null`.
+    ProviderAuthStatus,
     /// Client-callable editor-open trigger (`host.openInEditor`, §5.14):
     /// dispatched to [`open_in_editor`], which short-circuits locally on a
     /// local connection and re-dispatches to the connected FE as the
@@ -104,6 +108,7 @@ pub(crate) fn classify(value: &Value) -> Option<HostRequest> {
         "host.findApp" => HostMethod::FindApp,
         "host.listInstalledEditors" => HostMethod::ListInstalledEditors,
         "host.providerDiscovery" => HostMethod::ProviderDiscovery,
+        "host.providerAuthStatus" => HostMethod::ProviderAuthStatus,
         "host.openInEditor" => HostMethod::OpenInEditor,
         "host.exec" => HostMethod::Exec,
         "host.execStream" => HostMethod::ExecStream,
@@ -285,6 +290,45 @@ pub(crate) async fn handle(
                     json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
                 });
             success_frame(id_echo, result)
+        }
+        HostMethod::ProviderAuthStatus => {
+            let provider_id = match params.get("providerId") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(_) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Invalid parameter: providerId must be a non-empty string",
+                    ));
+                }
+            };
+            let force = match params.get("force") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Invalid parameter: force must be a boolean",
+                    ));
+                }
+            };
+            match intent_services::provider_auth::provider_auth_status(
+                provider_id.as_deref(),
+                force,
+            )
+            .await
+            {
+                Ok(result) => success_frame(id_echo, result),
+                Err(msg) => error_frame(id_echo, -32602, &msg),
+            }
         }
         HostMethod::Env => {
             let result = tokio::task::spawn_blocking(host_ops::env_probe)

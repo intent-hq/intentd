@@ -1,6 +1,6 @@
 //! WSS end-to-end: graceful shutdown reaps the FULL provider process tree.
 //!
-//! Boots a real `intentd serve --listen both` against the mock ACP provider,
+//! Boots a real `intentd serve` (WSS listener enabled via config) against the mock ACP provider,
 //! which (via `MOCK_AGENT_TREE_PID_FILE`) spawns a long-lived grandchild
 //! (`sleep 300`) that inherits the provider's process group — the bridge-style
 //! tree a real provider produces (e.g. an npx-launched MCP bridge). The agent parks
@@ -323,10 +323,9 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
 
     let pid_file = data_dir.join("tree-pids.json");
     let behavior = json!({ "blockUntilCancel": true }).to_string();
+    common::enable_ws_api(&data_dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg("both")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")

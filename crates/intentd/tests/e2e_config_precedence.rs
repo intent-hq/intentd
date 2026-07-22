@@ -30,15 +30,13 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-/// Spawn `intentd serve --listen uds` with the hermetic env seams plus `env`.
+/// Spawn `intentd serve` (UDS always serves) with the hermetic env seams plus `env`.
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg("uds")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -160,23 +158,24 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     assert!(ok_update.get("error").is_none(), "{ok_update}");
 }
 
-/// `--listen` pins `server.listenMode`: the wire reports the CLI value with
-/// origin `flag` even when the file claims otherwise, and mutation rejects
-/// naming `--listen`.
+/// `server.listenMode` is retired as a settings key: a config.toml still
+/// carrying it must NOT refuse startup — the daemon boots, DISCARDS the value
+/// (no catalog entry remains, so `settings.get` rejects the path), strips the
+/// key from the file, and the live `system.status` `listenMode` stays derived
+/// from the actual listener state (UDS-only boot ⇒ `uds`) regardless of the
+/// legacy file value.
 #[tokio::test]
-async fn listen_flag_pins_listen_mode() {
+async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
     let data_dir = temp_data_dir();
-    std::fs::write(
-        data_dir.join("config.toml"),
-        "[server]\nlistenMode = \"both\"\n",
-    )
-    .expect("seed config.toml");
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(&config_path, "[server]\nlistenMode = \"both\"\n").expect("seed config.toml");
 
     let child = spawn_serve(&data_dir, &[]);
     let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // The retired key has no catalog entry: settings.get rejects the path.
     let get = uds_rpc(
         &socket,
         1,
@@ -184,28 +183,30 @@ async fn listen_flag_pins_listen_mode() {
         json!({ "path": "server.listenMode" }),
     )
     .await;
-    assert_eq!(
-        get["result"]["value"],
-        json!("uds"),
-        "CLI beats file: {get}"
-    );
-    assert_eq!(get["result"]["origin"], json!("flag"), "{get}");
+    assert_eq!(get["error"]["code"], json!(-32602), "{get}");
 
+    // …and so does settings.update — the key is gone from the wire surface.
     let update = uds_rpc(
         &socket,
-        2,
+        3,
         "settings.update",
-        json!({ "changes": [{ "path": "server.listenMode", "value": "tcp" }] }),
+        json!({ "changes": [{ "path": "server.listenMode", "value": "uds" }] }),
     )
     .await;
     assert_eq!(update["error"]["code"], json!(-32602), "{update}");
+
+    // The legacy key was stripped from the file on boot.
+    let rewritten = std::fs::read_to_string(&config_path).expect("config.toml readable");
     assert!(
-        update["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("--listen"),
-        "rejection names --listen: {update}"
+        !rewritten.contains("listenMode"),
+        "legacy key stripped: {rewritten}"
     );
+
+    // system.status listenMode is derived from live listener state, not the
+    // legacy value: no WSS listener is up (server.wsApi.enabled=false), so
+    // `uds`.
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    assert_eq!(status["result"]["listenMode"], json!("uds"), "{status}");
 }
 
 /// One-time legacy import: a config.toml carrying the retired
@@ -312,7 +313,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.join("config.toml"), body).expect("seed config.toml");
         let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args(["serve", "--listen", "uds"])
+            .args(["serve"])
             .env("INTENTD_DATA_DIR", &data_dir)
             .output()
             .expect("run intentd serve");
@@ -340,7 +341,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
     let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["serve", "--listen", "uds"])
+        .args(["serve"])
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_TCP_PORT", "80")
         .output()

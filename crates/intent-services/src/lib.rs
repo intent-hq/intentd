@@ -80,6 +80,7 @@ mod note_ops;
 mod pagination;
 mod pr_ops;
 mod primitive_ops;
+pub mod provider_auth;
 pub mod provider_models;
 pub mod repo_config;
 mod rtk;
@@ -188,6 +189,11 @@ pub struct Services {
     /// via `intent_context::discovery::find_auggie`; tests point it at a
     /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
+    /// Test-only override (milliseconds) for the auto-commit message
+    /// generation timeout. Production composition leaves this `None` and the
+    /// idle auto-commit path uses its ~30s default; tests compress it so the
+    /// timeout-fallback path completes in milliseconds.
+    auto_commit_timeout_ms: Option<u64>,
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
@@ -398,6 +404,7 @@ impl Services {
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
+            auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
@@ -1437,6 +1444,14 @@ impl Services {
     /// so the one-shot CLI path is deterministic.
     pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
         self.auggie_bin = Some(bin);
+        self
+    }
+
+    /// Override the auto-commit message generation timeout (defaults to the
+    /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
+    /// the timeout-fallback path completes in milliseconds.
+    pub fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
+        self.auto_commit_timeout_ms = Some(ms);
         self
     }
 
@@ -3766,33 +3781,46 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Blocking `workspace.delete` cleanup (ports the TS `removeGitWorktree`
-/// body): capture the checked-out branch, remove the linked worktree (with
-/// the manual-rm fallback and prune inside [`intent_git::worktree::remove_worktree`]),
-/// drop the now-empty `<root>/<workspaceId>` parent directory, and delete the
-/// workspace branch only when it passes every guard — it must be the branch
-/// currently checked out there, it must be the branch the daemon
-/// auto-generated at create time (never a caller-supplied branch), and never
-/// `main`/`master` or a detached HEAD. Best-effort throughout.
-fn cleanup_workspace_worktree(
+/// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
+/// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
+/// does git-metadata work only: capture the checked-out branch, detach the
+/// linked worktree (prune the registration and rename the checkout to a
+/// trash path via [`intent_git::worktree::detach_worktree`] — the recursive
+/// delete happens under the lock only in the rare rename-failure fallback),
+/// drop the `.workspace` metadata dir and the now-empty
+/// `<root>/<workspaceId>` parent directory, and delete the workspace branch
+/// only when it passes every guard — it must be the branch currently checked
+/// out there, it must be the branch the daemon auto-generated at create time
+/// (never a caller-supplied branch), and never `main`/`master` or a detached
+/// HEAD. Best-effort throughout. Returns the detached trash path still
+/// awaiting recursive removal, which the caller must pass to
+/// [`cleanup_detached_worktree`] after releasing the lock.
+fn cleanup_workspace_worktree_locked(
     repo: &Path,
     worktree: &Path,
     branch: &str,
     branch_auto_generated: bool,
-) {
+) -> Option<PathBuf> {
     let checked_out = intent_git::worktree::worktree_branch(worktree);
-    if let Err(e) = intent_git::worktree::remove_worktree(repo, worktree) {
-        tracing::warn!(
-            error = %e,
-            worktree = %worktree.display(),
-            "failed to remove git worktree"
-        );
-    }
+    let trash = match intent_git::worktree::detach_worktree(repo, worktree) {
+        Ok(trash) => trash,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree.display(),
+                "failed to detach git worktree"
+            );
+            None
+        }
+    };
     // The provisioned layout is `<root>/<workspaceId>/<repo-slug>` alongside
     // the daemon-written `<root>/<workspaceId>/.workspace/` metadata dir.
     // Remove the metadata dir first so the subsequent parent `remove_dir`
     // (which only deletes empty directories) can succeed. A caller-supplied
-    // path shared with other content is still never destroyed.
+    // path shared with other content is still never destroyed. The trash
+    // rename target is a sibling in the same parent, so the `remove_dir`
+    // fails while it exists — the caller retries it (again under the
+    // per-repo lock) after [`cleanup_detached_worktree`] removes the trash.
     if let Some(parent) = worktree.parent() {
         let _ = std::fs::remove_dir_all(parent.join(".workspace"));
         let _ = std::fs::remove_dir(parent);
@@ -3809,6 +3837,24 @@ fn cleanup_workspace_worktree(
         tracing::info!(
             branch = %checked_out,
             "skipping branch deletion - not the auto-generated workspace branch"
+        );
+    }
+    trash
+}
+
+/// Unlocked phase of the `workspace.delete` cleanup: recursively remove the
+/// checkout that [`cleanup_workspace_worktree_locked`] renamed to a trash
+/// path. Runs after the per-repo lock is released so a multi-GB
+/// `remove_dir_all` never starves concurrent `workspace.create` provisioning.
+/// The empty-only parent `remove_dir` retry that the trash sibling blocked is
+/// the caller's job, back under the lock — doing it here unlocked could race
+/// a same-slug recreate's `create_dir_all(parent)`.
+fn cleanup_detached_worktree(trash: &Path) {
+    if let Err(e) = intent_git::worktree::remove_detached_worktree(trash) {
+        tracing::warn!(
+            error = %e,
+            path = %trash.display(),
+            "failed to remove detached worktree dir"
         );
     }
 }
@@ -4029,7 +4075,7 @@ fn ready_tasks_changed_event(
 }
 
 /// Build a `workspace:activity-changed` change event with the self-sufficient
-/// payload `{ workspaceId, activity }` (PROTOCOL §6.5 / IMPLEMENTATION_SPEC §10.1).
+/// payload `{ workspaceId, activity }` (PROTOCOL §6.5).
 fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivity) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -4048,7 +4094,7 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
 }
 
 /// Build a `workspace:attention-changed` change event with the self-sufficient
-/// payload `{ workspaceId, attention }` (PROTOCOL §6.5 / IMPLEMENTATION_SPEC §10.1).
+/// payload `{ workspaceId, attention }` (PROTOCOL §6.5).
 fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAttention) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -7749,8 +7795,9 @@ impl WorkspaceApi for Services {
             //
             // Same-slug-recreate race guard: the `create` path already takes
             // the per-repo worktree lock before provisioning, so a recreate
-            // cannot run its `add_worktree` while this cleanup's
-            // `remove_worktree` is still in progress for the same repo.
+            // cannot run its `add_worktree` while this cleanup's locked phase
+            // (registration prune + rename to a trash path) is still in
+            // progress for the same repo.
             // Residual risk: if a recreate runs *before* the background task
             // fires (row is deleted, event is sent, response is ACKed, but the
             // spawn hasn't yet grabbed the worktree lock), the recreate could
@@ -7797,25 +7844,65 @@ impl WorkspaceApi for Services {
                                 let branch = ws_cleanup.branch.clone();
                                 let repo = repo_dir.clone();
                                 let branch_flag = branch_auto_generated_bg;
-                                worktree_locks_bg
+                                let wt_locked = wt.clone();
+                                // Under the per-repo lock: git-metadata work
+                                // only (registration prune, rename of the
+                                // checkout to a trash path, branch-delete
+                                // guard). On the rename-success path the
+                                // multi-GB recursive removal runs below,
+                                // after the lock is released, so concurrent
+                                // `workspace.create` provisioning on the same
+                                // repo is not starved by bulk deletes; only
+                                // the rare rename-failure fallback removes
+                                // in place under the lock.
+                                let trash = worktree_locks_bg
                                     .with_lock(&repo_dir, move || async move {
                                         let task = tokio::task::spawn_blocking(move || {
-                                            cleanup_workspace_worktree(
+                                            cleanup_workspace_worktree_locked(
                                                 &repo,
-                                                &wt,
+                                                &wt_locked,
                                                 &branch,
                                                 branch_flag,
-                                            );
+                                            )
                                         })
                                         .await;
-                                        if let Err(e) = task {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "background worktree cleanup task failed"
-                                            );
+                                        match task {
+                                            Ok(trash) => trash,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "background worktree cleanup task failed"
+                                                );
+                                                None
+                                            }
                                         }
                                     })
                                     .await;
+                                if let Some(trash) = trash {
+                                    let removal = tokio::task::spawn_blocking(move || {
+                                        cleanup_detached_worktree(&trash)
+                                    })
+                                    .await;
+                                    if let Err(e) = removal {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "background detached-worktree removal task failed"
+                                        );
+                                    }
+                                    // Retry the empty-only parent `remove_dir`
+                                    // the trash sibling blocked — back under
+                                    // the per-repo lock, so it can't race a
+                                    // same-slug recreate's freshly created
+                                    // parent between its `create_dir_all` and
+                                    // `git worktree add`. O(1) while held.
+                                    if let Some(parent) = wt.parent().map(Path::to_path_buf) {
+                                        worktree_locks_bg
+                                            .with_lock(&repo_dir, move || async move {
+                                                let _ = std::fs::remove_dir(&parent);
+                                            })
+                                            .await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -12912,6 +12999,26 @@ impl WorkspaceApi for Services {
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
     // ========================================================================
 
+    fn pr_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // Requires a resolvable provider but NOT an active PR — the FE
+            // gates UI on the flags before any PR exists (§5.7 extension).
+            // Workspace existence is still validated so a bogus id fails like
+            // every other workspace-scoped method.
+            store.get_workspace(&workspace_id).await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            Ok(serde_json::json!({
+                "provider": sc.provider_id(),
+                "capabilities": sc.capabilities(),
+            }))
+        })
+    }
+
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
@@ -13005,16 +13112,8 @@ impl WorkspaceApi for Services {
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match sc
-                .get_review_threads(
-                    &repo_ref,
-                    number,
-                    intent_sourcecontrol::PageParams::first(100),
-                )
-                .await
-            {
-                Ok(page) => {
-                    let mut threads = page.items;
+            match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, number, p)).await {
+                Ok((mut threads, pages_fetched, has_more)) => {
                     let total = threads.len() as i64;
                     if status == "resolved" {
                         threads.retain(|t| t.is_resolved);
@@ -13029,21 +13128,16 @@ impl WorkspaceApi for Services {
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": false,
-                        "pagination": { "totalCount": total, "pagesFetched": 1, "hasMore": false },
+                        "pagination": { "totalCount": total, "pagesFetched": pages_fetched, "hasMore": has_more },
                         "filter": { "path": path, "status": status },
                         "note": serde_json::Value::Null,
                     }))
                 }
                 Err(_) => {
-                    let comments = sc
-                        .list_review_comments(
-                            &repo_ref,
-                            number,
-                            intent_sourcecontrol::PageParams::first(100),
-                        )
-                        .await
-                        .map_err(pr_ops::map_sc_err)?
-                        .items;
+                    let (comments, pages_fetched, has_more) =
+                        pr_ops::fetch_all_pages(|p| sc.list_review_comments(&repo_ref, number, p))
+                            .await
+                            .map_err(pr_ops::map_sc_err)?;
                     let total_fetched = comments.len() as i64;
                     let mut threads = pr_ops::fallback_threads(comments);
                     if let Some(p) = &path {
@@ -13063,7 +13157,7 @@ impl WorkspaceApi for Services {
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": true,
-                        "pagination": { "totalFetched": total_fetched, "pagesFetched": 1, "hasMore": false },
+                        "pagination": { "totalFetched": total_fetched, "pagesFetched": pages_fetched, "hasMore": has_more },
                         "filter": { "path": path, "status": status },
                         "note": note,
                     }))
@@ -13115,6 +13209,7 @@ impl WorkspaceApi for Services {
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
+            pr_ops::require_capability(sc.capabilities().check_runs, "check runs")?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let git_ref = match git_ref {
                 Some(r) => r,
@@ -13176,6 +13271,16 @@ impl WorkspaceApi for Services {
                     let (owner, repo) = pr_ops::repo_of(&ws)?;
                     let number = pr_ops::active_pr_number(&ws)?;
                     let sc = pr_ops::resolve_source_control(injected).await?;
+                    let caps = sc.capabilities();
+                    match method {
+                        intent_sourcecontrol::MergeMethod::Squash => {
+                            pr_ops::require_capability(caps.squash_merge, "squash merge")?
+                        }
+                        intent_sourcecontrol::MergeMethod::Rebase => {
+                            pr_ops::require_capability(caps.rebase_merge, "rebase merge")?
+                        }
+                        intent_sourcecontrol::MergeMethod::Merge => {}
+                    }
                     let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
                     let pr = sc
                         .get_pr(&repo_ref, number)
@@ -13377,6 +13482,12 @@ impl WorkspaceApi for Services {
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
+            if verdict == intent_sourcecontrol::ReviewVerdict::RequestChanges {
+                pr_ops::require_capability(
+                    sc.capabilities().review_required_changes,
+                    "request-changes review",
+                )?;
+            }
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let review = sc
                 .submit_review(&repo_ref, number, verdict, body)
@@ -14900,10 +15011,11 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         client_id: ClientId,
         text: String,
+        attachments: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         let svc = self.clone();
         Box::pin(async move {
-            svc.drafts_set(workspace_id, agent_id, client_id, text)
+            svc.drafts_set(workspace_id, agent_id, client_id, text, attachments)
                 .await
         })
     }

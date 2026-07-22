@@ -8,13 +8,14 @@
 //! stays unit-testable without a network.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, PrState, PullRequest, Review, ReviewComment, ReviewThread,
-    ReviewThreadComment, ReviewVerdict, SourceControl, SourceControlRegistry,
-    SourceControlSettings,
+    CheckRun, CheckState, MergeMethod, Page, PageParams, PrState, PullRequest, Review,
+    ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, SourceControl,
+    SourceControlRegistry, SourceControlSettings,
 };
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -25,8 +26,29 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// Map a forge error onto the domain `Internal` error (→ `-32603`): the TS
 /// `pr.*` handlers wrap every underlying throw in `INTERNAL_ERROR` (§5.7), and
 /// the graceful "not configured" path (§8.3) surfaces the same way.
+/// `Unsupported` (§7.2/§7.4 capability gating) maps onto a stable wire message
+/// with the `unsupported by provider:` prefix so clients can match on it.
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
-    Error::Internal(e.to_string())
+    match e {
+        intent_sourcecontrol::Error::Unsupported(msg) => {
+            Error::Internal(format!("unsupported by provider: {msg}"))
+        }
+        other => Error::Internal(other.to_string()),
+    }
+}
+
+/// Runtime capability gate (§7.2/§7.4): `supported` is the relevant
+/// [`intent_sourcecontrol::ScCapabilities`] flag of the active host; `false`
+/// surfaces [`intent_sourcecontrol::Error::Unsupported`] through
+/// [`map_sc_err`] (stable `unsupported by provider:` message, code `-32603`).
+pub(crate) fn require_capability(supported: bool, operation: &str) -> Result<()> {
+    if supported {
+        Ok(())
+    } else {
+        Err(map_sc_err(intent_sourcecontrol::Error::Unsupported(
+            operation.to_string(),
+        )))
+    }
 }
 
 /// Resolve the active [`SourceControl`]: the injected handle (tests / explicit
@@ -103,9 +125,8 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 // workspace's OWN branch (`pr.head.ref === workspace.branch`), NOT `baseRef`.
 //
 // PARITY NOTE: the TS `performBackgroundEnrichment` additionally accepts a
-// `baseRef` match (`matchesBaseRef`); IMPLEMENTATION_SPEC §626 mandates
-// branch-only matching ("the workspace's own branch, NOT baseRef"), so this
-// port follows the SPEC and ignores `baseRef`.
+// `baseRef` match (`matchesBaseRef`); this port intentionally does branch-only
+// matching (the workspace's own branch, NOT `baseRef`) and ignores `baseRef`.
 // ===========================================================================
 
 /// Outcome of a single workspace PR refresh (§7.6). Drives which `pr:*` event
@@ -388,6 +409,44 @@ pub(crate) fn clamp_count(count: Option<i64>) -> usize {
     count.unwrap_or(20).clamp(1, 100) as usize
 }
 
+/// Page size for the exhaustive `pr.listReviewComments` fetch.
+pub(crate) const REVIEW_FETCH_PAGE_LIMIT: u8 = 100;
+
+/// Page cap for the exhaustive `pr.listReviewComments` fetch: at most 10 pages
+/// (× [`REVIEW_FETCH_PAGE_LIMIT`] items) per request; when the cap stops the
+/// loop early the reply reports `hasMore: true`.
+pub(crate) const REVIEW_FETCH_MAX_PAGES: usize = 10;
+
+/// Drain a cursor-paginated forge read for `pr.listReviewComments`: fetch
+/// pages of [`REVIEW_FETCH_PAGE_LIMIT`] via `next_cursor` until exhausted or
+/// [`REVIEW_FETCH_MAX_PAGES`] is hit. Returns `(items, pages_fetched,
+/// has_more)`, `has_more` being true iff the cap stopped the loop early.
+pub(crate) async fn fetch_all_pages<T, F, Fut>(
+    mut fetch: F,
+) -> std::result::Result<(Vec<T>, usize, bool), intent_sourcecontrol::Error>
+where
+    F: FnMut(PageParams) -> Fut,
+    Fut: Future<Output = std::result::Result<Page<T>, intent_sourcecontrol::Error>>,
+{
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages_fetched = 0;
+    while pages_fetched < REVIEW_FETCH_MAX_PAGES {
+        let page = fetch(PageParams {
+            limit: REVIEW_FETCH_PAGE_LIMIT,
+            cursor: cursor.take(),
+        })
+        .await?;
+        pages_fetched += 1;
+        items.extend(page.items);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok((items, pages_fetched, false)),
+        }
+    }
+    Ok((items, pages_fetched, true))
+}
+
 /// Render review threads to the wire shape (`author` nested as `{ login }`).
 pub(crate) fn thread_list_json(threads: &[ReviewThread]) -> Vec<Value> {
     threads
@@ -461,7 +520,7 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
 }
 
 // ===========================================================================
-// `pr.*` write/action glue (PROTOCOL §5.7, IMPLEMENTATION_SPEC §7.5).
+// `pr.*` write/action glue (PROTOCOL §5.7).
 // ===========================================================================
 
 /// `pr.waitForChanges` safety padding (TS `SAFETY_PADDING_SECONDS`).

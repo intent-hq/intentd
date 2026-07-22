@@ -199,6 +199,16 @@ pub(super) fn parse_opencode_models(stdout: &str) -> Vec<Value> {
     rows
 }
 
+/// Map parsed [`intent_providers::GrokModel`] rows onto the PROTOCOL §5.30
+/// wire shape (the id/name/description work is already done by the shared
+/// grok parser in `intent-providers`).
+pub(super) fn grok_wire_rows(models: &[intent_providers::GrokModel]) -> Vec<Value> {
+    models
+        .iter()
+        .map(|m| wire_row(&m.model_id, &m.name, "grok", m.description.as_deref()))
+        .collect()
+}
+
 /// FE `formatModelLabel` parity: hyphens become spaces and each word is
 /// capitalized (`claude-sonnet-4` → `Claude Sonnet 4`).
 fn title_case_model(model_id: &str) -> String {
