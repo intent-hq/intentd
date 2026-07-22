@@ -1521,51 +1521,78 @@ impl AgentManager {
         Ok(opened.session_id)
     }
 
-    /// Best-effort post-session `session/set_model` for providers whose ACP
-    /// subcommand has no CLI model flag (`supports_set_model`; grok today —
-    /// parity with the reference acp-provider, which applies the selected
-    /// model via `session/set_model` after session creation for such
-    /// providers). Compound ids are honored only when their provider prefix
-    /// matches the running provider (a stale id from a pre-spawn provider
-    /// switch must not be sent to grok); bare ids are treated as
-    /// provider-local. The `default` sentinel and empty ids are no-ops.
-    /// Failures are logged at WARN and never fail session startup.
+    /// Best-effort post-session model application, gated per provider
+    /// capability (parity with the reference acp-provider): `session/set_model`
+    /// for providers whose ACP subcommand has no CLI model flag
+    /// (`supports_set_model`; grok today), and
+    /// `session/set_config_option { configId: "model" }` for providers that
+    /// expose the model as a session config option
+    /// (`supports_config_option_model`; claude-code today). Compound ids are
+    /// honored only when their provider prefix matches the running provider (a
+    /// stale id from a pre-spawn provider switch must not be sent); bare ids
+    /// are treated as provider-local. The `default` sentinel and empty ids are
+    /// no-ops. Failures are logged at WARN and never fail session startup.
     async fn maybe_apply_session_model(
         conn: &Connection,
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
     ) {
-        let Some(model_id) = Self::set_model_target(provider, stored_model) else {
-            return;
-        };
-        match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
-            Ok(()) => {
-                tracing::debug!(
-                    provider = provider.id,
-                    session_id = acp_session_id,
-                    model = %model_id,
-                    "session/set_model accepted"
-                );
+        if let Some(model_id) = Self::set_model_target(provider, stored_model) {
+            match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        "session/set_model accepted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        error = %e,
+                        "session/set_model failed; provider keeps its default model"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    provider = provider.id,
-                    session_id = acp_session_id,
-                    model = %model_id,
-                    error = %e,
-                    "session/set_model failed; provider keeps its default model"
-                );
+        }
+        if let Some(model_id) = Self::config_option_model_target(provider, stored_model) {
+            match intent_acp::session::set_session_config_option(
+                conn,
+                acp_session_id,
+                "model",
+                model_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::debug!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        "session/set_config_option accepted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        error = %e,
+                        "session/set_config_option failed; provider keeps its default model"
+                    );
+                }
             }
         }
     }
 
-    /// Resolve the model id `maybe_apply_session_model` should send, or `None`
-    /// when no `session/set_model` should be issued: providers without
-    /// `supports_set_model`, absent/empty models, the `default` sentinel, and
-    /// compound ids whose provider prefix does not match the running provider
-    /// (a stale id from a pre-spawn provider switch must not be sent to grok).
-    /// Bare ids are treated as provider-local.
+    /// Resolve the model id `maybe_apply_session_model` should send via
+    /// `session/set_model`, or `None` when the call should not be issued:
+    /// providers without `supports_set_model`, or ids rejected by
+    /// [`Self::provider_local_model_target`].
     fn set_model_target<'m>(
         provider: &ProviderConfig,
         stored_model: Option<&'m str>,
@@ -1573,6 +1600,33 @@ impl AgentManager {
         if !provider.supports_set_model {
             return None;
         }
+        Self::provider_local_model_target(provider, stored_model)
+    }
+
+    /// Resolve the model id `maybe_apply_session_model` should send via
+    /// `session/set_config_option { configId: "model" }`, or `None` when the
+    /// call should not be issued: providers without
+    /// `supports_config_option_model`, or ids rejected by
+    /// [`Self::provider_local_model_target`].
+    fn config_option_model_target<'m>(
+        provider: &ProviderConfig,
+        stored_model: Option<&'m str>,
+    ) -> Option<&'m str> {
+        if !provider.supports_config_option_model {
+            return None;
+        }
+        Self::provider_local_model_target(provider, stored_model)
+    }
+
+    /// Shared gating for the post-session model-application paths: `None` for
+    /// absent/empty models, the `default` sentinel, and compound ids whose
+    /// provider prefix does not match the running provider (a stale id from a
+    /// pre-spawn provider switch must not be sent). Bare ids are treated as
+    /// provider-local; compound ids are stripped to their bare part.
+    fn provider_local_model_target<'m>(
+        provider: &ProviderConfig,
+        stored_model: Option<&'m str>,
+    ) -> Option<&'m str> {
         let model = stored_model?;
         let model_id = match model.split_once(':') {
             Some((prefix, bare)) if prefix == provider.id => bare,
@@ -3734,6 +3788,12 @@ fn resolve_spawn(
         // so the E2E suite can exercise the claude-code/codex/droid wire path
         // (STAB-156) against the real daemon.
         let session_mcp = std::env::var("MOCK_AGENT_SESSION_MCP").is_ok_and(|v| v == "1");
+        // `MOCK_AGENT_CONFIG_OPTION_MODEL=1` marks the mock as a
+        // config-option-model provider (claude-code-like), so the E2E suite
+        // can exercise the post-session `session/set_config_option` model
+        // application against the real daemon.
+        let config_option_model =
+            std::env::var("MOCK_AGENT_CONFIG_OPTION_MODEL").is_ok_and(|v| v == "1");
         let provider = ProviderConfig {
             command: "node",
             base_args,
@@ -3745,6 +3805,7 @@ fn resolve_spawn(
                 Some("--mcp-config")
             },
             supports_session_mcp_servers: session_mcp,
+            supports_config_option_model: config_option_model,
             ..*base
         };
         return Ok(ResolvedSpawn {
@@ -4998,6 +5059,51 @@ mod role_reminder_tests {
         // switch) must not be sent to grok.
         assert_eq!(
             AgentManager::set_model_target(grok, Some("opencode:kimi-k3")),
+            None
+        );
+    }
+
+    #[test]
+    fn config_option_model_target_gates_provider_sentinel_and_compound_prefix() {
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let grok = intent_providers::find_provider("grok").unwrap();
+
+        // Providers without supports_config_option_model never produce a
+        // target (grok uses session/set_model instead) — and vice versa,
+        // claude-code never produces a session/set_model target.
+        assert_eq!(
+            AgentManager::config_option_model_target(grok, Some("sonnet")),
+            None
+        );
+        assert_eq!(AgentManager::set_model_target(claude, Some("sonnet")), None);
+        // Absent / empty / sentinel models are no-ops.
+        assert_eq!(AgentManager::config_option_model_target(claude, None), None);
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("default")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("claude-code:default")),
+            None
+        );
+        // Bare ids are provider-local.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("sonnet")),
+            Some("sonnet")
+        );
+        // Matching compound prefix strips to the bare id.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("claude-code:opus")),
+            Some("opus")
+        );
+        // A compound id for a DIFFERENT provider (stale pre-spawn provider
+        // switch) must not be sent to claude-code.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("grok:grok-4.5")),
             None
         );
     }

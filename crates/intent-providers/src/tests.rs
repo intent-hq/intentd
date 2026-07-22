@@ -120,6 +120,28 @@ fn session_mcp_servers_partition() {
     }
 }
 
+/// Exactly claude-code applies the stored model post-session via
+/// `session/set_config_option { configId: "model" }` (its pinned adapter
+/// exposes the model as a `configOptions[id="model"]` select and has no CLI
+/// model flag). Asserted over the full registry so a newly added provider
+/// can't accidentally opt in without updating this partition.
+#[test]
+fn config_option_model_partition() {
+    let opted_in = ["claude-code"];
+    for id in all_provider_ids() {
+        let p = find_provider(id).unwrap();
+        assert_eq!(
+            p.supports_config_option_model,
+            opted_in.contains(&id),
+            "{id}: supports_config_option_model must match the pinned opt-in set {opted_in:?}"
+        );
+    }
+    // The two post-session model paths are mutually exclusive: claude-code
+    // must not also issue session/set_model.
+    let cc = find_provider("claude-code").unwrap();
+    assert!(cc.model_flag.is_none() && !cc.supports_set_model);
+}
+
 #[test]
 fn auth_error_pattern_matching() {
     assert!(is_provider_authentication_error(
