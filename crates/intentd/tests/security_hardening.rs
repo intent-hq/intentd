@@ -126,7 +126,12 @@ async fn uds_oversized_line_rejected_and_connection_closed() {
     let _ = write_half.flush().await;
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    reader.read_line(&mut line).await.expect("read error frame");
+    // Bounded reads: a regression in the oversized-frame path must fail the
+    // test fast instead of stalling the whole suite.
+    tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut line))
+        .await
+        .expect("timed out waiting for error frame")
+        .expect("read error frame");
     let v: Value = serde_json::from_str(line.trim()).expect("error frame json");
     assert_eq!(
         v["error"]["code"].as_i64(),
@@ -135,7 +140,10 @@ async fn uds_oversized_line_rejected_and_connection_closed() {
     );
     assert!(v["id"].is_null(), "unparsed request ⇒ id null: {v}");
     let mut rest = String::new();
-    let n = reader.read_line(&mut rest).await.expect("read eof");
+    let n = tokio::time::timeout(Duration::from_secs(30), reader.read_line(&mut rest))
+        .await
+        .expect("timed out waiting for connection close")
+        .expect("read eof");
     assert_eq!(n, 0, "connection must close after the oversized frame");
 
     // Under-limit: a fresh connection still round-trips a frame.
