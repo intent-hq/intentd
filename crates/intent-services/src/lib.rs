@@ -3808,8 +3808,8 @@ fn cleanup_workspace_worktree_locked(
     // (which only deletes empty directories) can succeed. A caller-supplied
     // path shared with other content is still never destroyed. The trash
     // rename target is a sibling in the same parent, so the `remove_dir`
-    // fails while it exists — [`cleanup_detached_worktree`] retries it after
-    // the recursive removal.
+    // fails while it exists — the caller retries it (again under the
+    // per-repo lock) after [`cleanup_detached_worktree`] removes the trash.
     if let Some(parent) = worktree.parent() {
         let _ = std::fs::remove_dir_all(parent.join(".workspace"));
         let _ = std::fs::remove_dir(parent);
@@ -3833,19 +3833,18 @@ fn cleanup_workspace_worktree_locked(
 
 /// Unlocked phase of the `workspace.delete` cleanup: recursively remove the
 /// checkout that [`cleanup_workspace_worktree_locked`] renamed to a trash
-/// path, then retry the empty-only parent `remove_dir` that the trash sibling
-/// blocked. Runs after the per-repo lock is released so a multi-GB
+/// path. Runs after the per-repo lock is released so a multi-GB
 /// `remove_dir_all` never starves concurrent `workspace.create` provisioning.
-fn cleanup_detached_worktree(worktree: &Path, trash: &Path) {
+/// The empty-only parent `remove_dir` retry that the trash sibling blocked is
+/// the caller's job, back under the lock — doing it here unlocked could race
+/// a same-slug recreate's `create_dir_all(parent)`.
+fn cleanup_detached_worktree(trash: &Path) {
     if let Err(e) = intent_git::worktree::remove_detached_worktree(trash) {
         tracing::warn!(
             error = %e,
             path = %trash.display(),
             "failed to remove detached worktree dir"
         );
-    }
-    if let Some(parent) = worktree.parent() {
-        let _ = std::fs::remove_dir(parent);
     }
 }
 
@@ -7860,7 +7859,7 @@ impl WorkspaceApi for Services {
                                     .await;
                                 if let Some(trash) = trash {
                                     let removal = tokio::task::spawn_blocking(move || {
-                                        cleanup_detached_worktree(&wt, &trash)
+                                        cleanup_detached_worktree(&trash)
                                     })
                                     .await;
                                     if let Err(e) = removal {
@@ -7868,6 +7867,19 @@ impl WorkspaceApi for Services {
                                             error = %e,
                                             "background detached-worktree removal task failed"
                                         );
+                                    }
+                                    // Retry the empty-only parent `remove_dir`
+                                    // the trash sibling blocked — back under
+                                    // the per-repo lock, so it can't race a
+                                    // same-slug recreate's freshly created
+                                    // parent between its `create_dir_all` and
+                                    // `git worktree add`. O(1) while held.
+                                    if let Some(parent) = wt.parent().map(Path::to_path_buf) {
+                                        worktree_locks_bg
+                                            .with_lock(&repo_dir, move || async move {
+                                                let _ = std::fs::remove_dir(&parent);
+                                            })
+                                            .await;
                                     }
                                 }
                             }

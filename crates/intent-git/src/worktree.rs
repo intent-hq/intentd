@@ -1,8 +1,9 @@
 //! Worktree create + lock (§9.5; internal — Cycle C consumes it).
 //!
-//! [`WorktreeLocks`] ports `withGitWorktreeLock`: a per-worktree async mutex
-//! (keyed by worktree path) so concurrent agents/operations on the same worktree
-//! never corrupt the index. [`create_worktree`] wraps `git worktree add`;
+//! [`WorktreeLocks`] ports `withGitWorktreeLock`: an async mutex per
+//! caller-provided key path — `intent-services` keys it by repository dir for
+//! a per-repository lock — so concurrent agents/operations on the same keyed
+//! path never corrupt the index. [`create_worktree`] wraps `git worktree add`;
 //! [`remove_worktree`] ports the TS `removeGitWorktree` (registration prune +
 //! directory removal), split into [`detach_worktree`] /
 //! [`remove_detached_worktree`] so the recursive delete can run outside locks.
@@ -17,9 +18,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::map_git_err;
 
-/// A per-worktree async-mutex map. Cheap to clone (shared inner map). Each
-/// distinct worktree path gets its own lock, so operations on different
-/// worktrees never contend.
+/// An async-mutex map keyed by caller-provided path (e.g. the repository
+/// directory for a per-repository lock). Cheap to clone (shared inner map).
+/// Each distinct key path gets its own lock, so operations under different
+/// keys never contend.
 #[derive(Clone, Default)]
 pub struct WorktreeLocks {
     locks: Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>,
@@ -256,7 +258,14 @@ fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
             Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {
                 continue;
             }
-            Err(_) => break,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    worktree = %worktree_path.display(),
+                    "rename to trash path failed; falling back to in-place removal"
+                );
+                break;
+            }
         }
     }
     match std::fs::remove_dir_all(worktree_path) {
@@ -583,9 +592,16 @@ mod tests {
             .await
             .expect("trash path awaiting removal");
         // The lock is free here while the detached directory still exists —
-        // the expensive removal has not run yet.
+        // the expensive removal has not run yet. Bound the acquire with a
+        // timeout so a regression fails fast instead of hanging the test.
         assert!(trash.exists());
-        assert!(locks.with_lock(&repo_path, || async { true }).await);
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(5),
+            locks.with_lock(&repo_path, || async { true }),
+        )
+        .await
+        .expect("per-repo lock still held after detach phase");
+        assert!(acquired);
 
         remove_detached_worktree(&trash).unwrap();
         assert!(!trash.exists());
