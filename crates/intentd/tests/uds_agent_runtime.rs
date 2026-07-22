@@ -143,28 +143,12 @@ async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Dae
         .stderr(Stdio::from(log))
         .spawn()
         .expect("spawn intentd serve");
-    let daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
-    if timeout(Duration::from_secs(10), async {
-        loop {
-            if UnixStream::connect(&socket).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let logs = std::fs::read_to_string(&log_path).unwrap_or_default();
-        panic!(
-            "daemon never listened on {}\n--- daemon log ---\n{logs}",
-            socket.display()
-        );
-    }
+    common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
     (daemon, socket)
 }
 
@@ -274,28 +258,12 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
         .stderr(Stdio::from(log))
         .spawn()
         .expect("spawn intentd serve");
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
-    if timeout(Duration::from_secs(10), async {
-        loop {
-            if UnixStream::connect(&socket).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .is_err()
-    {
-        let logs = std::fs::read_to_string(&log_path).unwrap_or_default();
-        panic!(
-            "daemon never listened on {}\n--- daemon log ---\n{logs}",
-            socket.display()
-        );
-    }
+    common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
 
     // Subscriber connection (events.event notifications) — established BEFORE the
     // turn so no events are missed.

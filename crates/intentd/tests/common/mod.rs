@@ -8,7 +8,7 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
@@ -40,6 +40,35 @@ pub fn daemon_startup_timeout() -> Duration {
 /// layer, so this helper only reserves a unique path.
 pub fn hermetic_workspaces_root() -> PathBuf {
     std::env::temp_dir().join(format!("itd-ws-{}", uuid::Uuid::new_v4()))
+}
+
+/// Wait until a freshly spawned `intentd serve` child accepts connections on
+/// its UDS `socket`, budgeted by [`daemon_startup_timeout`]. Fails fast —
+/// panicking with the daemon log — if the child exits before listening, so
+/// tests don't keep polling a dead daemon for the full window.
+pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: &Path) {
+    let budget = daemon_startup_timeout();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let logs = std::fs::read_to_string(log_path).unwrap_or_default();
+            panic!(
+                "daemon exited ({status}) before listening on {}\n--- daemon log ---\n{logs}",
+                socket.display()
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let logs = std::fs::read_to_string(log_path).unwrap_or_default();
+            panic!(
+                "daemon never listened on {} within {budget:?}\n--- daemon log ---\n{logs}",
+                socket.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding

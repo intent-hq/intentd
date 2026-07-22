@@ -189,6 +189,11 @@ pub struct Services {
     /// via `intent_context::discovery::find_auggie`; tests point it at a
     /// deterministic fixture script.
     auggie_bin: Option<PathBuf>,
+    /// Test-only override (milliseconds) for the auto-commit message
+    /// generation timeout. Production composition leaves this `None` and the
+    /// idle auto-commit path uses its ~30s default; tests compress it so the
+    /// timeout-fallback path completes in milliseconds.
+    auto_commit_timeout_ms: Option<u64>,
     /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
     /// workspace. A oneShot watch is registered when an agent delegates with
     /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
@@ -396,6 +401,7 @@ impl Services {
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
+            auto_commit_timeout_ms: None,
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
@@ -1433,6 +1439,14 @@ impl Services {
     /// so the one-shot CLI path is deterministic.
     pub fn with_auggie_bin(mut self, bin: PathBuf) -> Self {
         self.auggie_bin = Some(bin);
+        self
+    }
+
+    /// Override the auto-commit message generation timeout (defaults to the
+    /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
+    /// the timeout-fallback path completes in milliseconds.
+    pub fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
+        self.auto_commit_timeout_ms = Some(ms);
         self
     }
 

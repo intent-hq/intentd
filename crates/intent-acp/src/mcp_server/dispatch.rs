@@ -14,8 +14,9 @@ use serde_json::{json, Value};
 use super::WorkspaceMcpServer;
 
 /// Wall-clock budget for one `workspace_api` invocation — matches the 30s
-/// timeout in the reference `workspace-js-api-tool.ts`.
-const WORKSPACE_API_TIMEOUT: Duration = Duration::from_secs(30);
+/// timeout in the reference `workspace-js-api-tool.ts`. Tests override it via
+/// [`WorkspaceMcpServer::with_workspace_api_timeout`].
+pub(super) const WORKSPACE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl WorkspaceMcpServer {
     /// WSAPI-2 dispatch: evaluate agent-supplied JavaScript against the
@@ -47,7 +48,7 @@ impl WorkspaceMcpServer {
              return {{ __k: __wsapi_user === undefined ? 'u' : 'v', __v: __wsapi_user }};"
         );
         let opts = EvalOptions {
-            timeout: WORKSPACE_API_TIMEOUT,
+            timeout: self.workspace_api_timeout,
             ..EvalOptions::default()
         };
         match js_eval(&full_code, &opts, Some(host)).await {

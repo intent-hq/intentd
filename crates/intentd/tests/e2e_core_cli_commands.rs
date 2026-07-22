@@ -5,11 +5,9 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tokio::net::UnixStream;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 struct Daemon {
@@ -44,17 +42,12 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
         .expect("spawn intentd serve")
 }
 
-async fn await_socket(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if UnixStream::connect(socket).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .is_ok()
+/// Wait for the daemon UDS to accept, failing fast (with the daemon log) if
+/// the child dies first. Shares the coverage-aware startup budget with the
+/// other e2e harnesses via `common::await_daemon_listening`.
+async fn await_socket(daemon: &mut Daemon, socket: &Path) {
+    let log_path = daemon.data_dir.join("daemon.log");
+    common::await_daemon_listening(&mut daemon.child, socket, &log_path).await;
 }
 
 #[tokio::test]
@@ -65,11 +58,11 @@ async fn doctor_checks_data_dir_and_migrations() {
     let socket = data_dir.join("intentd.sock");
 
     let child = spawn_daemon(&data_dir);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    assert!(await_socket(&socket).await, "daemon did not start");
+    await_socket(&mut daemon, &socket).await;
 
     // Run `intentd doctor` command
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -279,11 +272,11 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
     let child = spawn_daemon_both(&data_dir, token);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    assert!(await_socket(&socket).await, "daemon did not start");
+    await_socket(&mut daemon, &socket).await;
 
     // `pair` needs the WSS listener, which binds asynchronously after the UDS
     // socket accepts; retry until it is up (bounded by the startup budget).
@@ -349,11 +342,11 @@ async fn pair_fails_without_tcp_listener() {
 
     // UDS-only daemon: pairing is impossible without a TCP port.
     let child = spawn_daemon(&data_dir);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    assert!(await_socket(&socket).await, "daemon did not start");
+    await_socket(&mut daemon, &socket).await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")

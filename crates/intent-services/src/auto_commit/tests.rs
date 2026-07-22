@@ -433,7 +433,9 @@ async fn generation_timeout_falls_back_to_subject() {
     let repo = init_git_repo();
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
     let bin = fake_auggie("timeout", "sleep 60");
-    let svc = svc.with_auggie_bin(bin);
+    // Compressed generation budget so the timeout-fallback path runs in
+    // milliseconds; the hung CLI is group-reaped when the budget elapses.
+    let svc = svc.with_auggie_bin(bin).with_auto_commit_timeout_ms(250);
     let agent = session("agent-t1", &ws_id, None, false, "Timeout Agent", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
