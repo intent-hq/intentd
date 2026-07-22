@@ -31,7 +31,7 @@ use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::auth::{extract_token, is_allowed_origin, validate_token, AsyncTokenStore};
@@ -455,7 +455,17 @@ impl WsInner {
         );
         stream.write_all(response.as_bytes()).await?;
         stream.flush().await?;
-        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+        // Explicit inbound size limits (monorepo#472): cap a whole message at
+        // the shared transport limit, and raise `max_frame_size` (tungstenite
+        // default 16 MiB) to the same value so a legitimate large payload sent
+        // as a single unfragmented frame is still accepted. Over-limit frames
+        // fail fast on the frame header, without buffering the payload.
+        let config = WebSocketConfig {
+            max_message_size: Some(crate::MAX_INBOUND_MESSAGE_BYTES),
+            max_frame_size: Some(crate::MAX_INBOUND_MESSAGE_BYTES),
+            ..Default::default()
+        };
+        let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
         self.spawn_connection(ws);
         Ok(())
     }

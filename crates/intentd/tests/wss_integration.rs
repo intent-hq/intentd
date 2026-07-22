@@ -22,6 +22,7 @@ use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
     ensure_tls_certificate, serve_uds, AsyncTokenStore, TokenStore, WsApiServer, WsOptions,
+    MAX_INBOUND_MESSAGE_BYTES,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
@@ -374,6 +375,61 @@ async fn wss_client_hello_and_drafts_round_trip() {
         sess[1]["result"]["text"], "wss draft",
         "reconnect restores the draft"
     );
+    srv.ws.stop().await;
+}
+
+/// Transport size-limit regression (monorepo#472): a text message past the
+/// 40 MiB cap terminates the connection (tungstenite capacity error on the
+/// frame header, never buffering the payload); a large-but-legit single-frame
+/// message above tungstenite's 16 MiB default frame size still round-trips,
+/// as does a normal request on a fresh connection.
+#[tokio::test]
+async fn wss_oversized_message_terminates_connection() {
+    let srv = start(WsOptions::default()).await;
+
+    // Over-limit: the server must drop the connection without a response.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    let oversized = "a".repeat(MAX_INBOUND_MESSAGE_BYTES + 1024);
+    // The server stops reading once the frame header exceeds the cap and
+    // closes the socket; the send itself may fail mid-write.
+    let _ = ws.send(Message::Text(oversized)).await;
+    let closed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "oversized message must terminate the connection"
+    );
+
+    // Under-limit but above the 16 MiB tungstenite default frame size: the
+    // raised `max_frame_size` must let a single-frame message through to the
+    // router (unknown method ⇒ -32601 proves the full round-trip).
+    let pad = "a".repeat(20 * 1024 * 1024);
+    let large_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"nosuch.method","params":{{"pad":"{pad}"}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &large_frame).await;
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32601),
+        "20 MiB single-frame message must reach the router: {}",
+        resp["error"]
+    );
+
+    // A normal-size request on a fresh connection still works.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"cli-size"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["clientId"], "cli-size");
     srv.ws.stop().await;
 }
 
