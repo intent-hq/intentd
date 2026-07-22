@@ -5,6 +5,8 @@
 //! toggle works under `--listen uds`; that requires a real composition-root daemon
 //! and is covered by e2e_wss_runtime_control.rs (see the placeholder test below).
 
+mod common;
+
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -126,7 +128,8 @@ async fn settings_rollback_on_failed_listener_start() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     // Attach a mock ServerControl that always fails start_ws_listener
     services.attach_server_control(Arc::new(FailingServerControl));

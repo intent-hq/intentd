@@ -78,7 +78,8 @@ async fn slow_host_exec_does_not_block_fast_workspace_list() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
