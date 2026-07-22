@@ -2902,6 +2902,24 @@ impl Services {
                 )));
             }
         }
+        // Run the watch scope gate BEFORE any side-effectful work (child
+        // creation, group enrollment) so a rejection — a non-chief parent
+        // delegating outside its home workspace — is side-effect free: no
+        // orphaned Pending child, no partially-initialized delegation group.
+        // Gated on the same condition as the registration block below
+        // (caller present and not deleted); `register_completion_watch`
+        // re-checks the same gate as the shared enforcement point.
+        if parent_agent_id.is_some() {
+            if let Some(session) = parent_session
+                .as_ref()
+                .filter(|s| s.status != AgentStatus::Deleted)
+            {
+                crate::agent_subscriptions::check_watch_scope(
+                    &session.workspace_id,
+                    &workspace_id,
+                )?;
+            }
+        }
         let delegation_depth = parent_agent_id.as_ref().map(|_| {
             parent_session
                 .as_ref()
@@ -3081,12 +3099,9 @@ impl Services {
                     .unwrap_or_else(|| workspace_id.clone());
                 let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
-                // Run the scope gate BEFORE any side-effectful registration so
-                // a rejection (non-chief parent delegating outside its
-                // workspace) never leaves behind a partially-initialized
-                // delegation group; it surfaces as a clear error to the
-                // caller. `register_completion_watch` re-checks the same gate.
-                crate::agent_subscriptions::check_watch_scope(&parent_home_ws, &workspace_id)?;
+                // The scope gate already ran up front (before child creation),
+                // so `register_completion_watch`'s re-check cannot reject here
+                // and the group creation below is safe from partial state.
                 if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
                     // Enroll the child in the parent's after_all delegation group
                     // and register a group watch (group_id = Some, not oneShot) so

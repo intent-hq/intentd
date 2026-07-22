@@ -418,8 +418,9 @@ async fn register_watch_scope_gate_rejects_non_chief_cross_workspace_parent() {
 }
 
 /// A scope-gate rejection in the after_all delegate path is side-effect free:
-/// the gate runs before the delegation group is created/enrolled, so a denied
-/// non-chief cross-workspace delegate leaves no group (or watch) behind.
+/// the gate runs before the child is created and before the delegation group
+/// is created/enrolled, so a denied non-chief cross-workspace delegate leaves
+/// no group, no watch, and no orphaned Pending child behind.
 #[tokio::test]
 async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
     let (_t, svc, ws_a) = setup().await;
@@ -446,6 +447,15 @@ async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
         "rejection must not leave a partially-initialized group"
     );
     assert!(svc.list_watches_for_parent(&parent).is_empty());
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws_b)
+        .await
+        .expect("list ws-b sessions");
+    assert!(
+        sessions.is_empty(),
+        "rejection must not leave an orphaned child agent"
+    );
 }
 
 /// Chief-anchored after_all group: children in a regular workspace, group
