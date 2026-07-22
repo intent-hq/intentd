@@ -7750,3 +7750,210 @@ async fn edit_and_regenerate_rejects_bad_message_ids_over_wss() {
         "transcript untouched by rejected edits: {conv}"
     );
 }
+
+/// Regression: a user interrupt (`agent.stop`) mid-stream persists the partial
+/// assistant turn, so the chat channel's terminal reconcile KEEPS the streamed
+/// blocks instead of removing them. Drives the real wire path: `chat.subscribe`
+/// over WSS → mock streams a chunk then parks (`blockUntilCancel`) →
+/// `agent.stop` → the terminal `subscription.push` delta carries the streamed
+/// block with `streamingComplete: true` and an EMPTY `removedIds`, and a fresh
+/// `agent.getConversation` holds the interrupted partial assistant row tagged
+/// `metadata.interrupted = true` + `stopReason = "interrupted"`.
+///
+/// Before the fix, the abort dropped the live-turn slot unflushed: the
+/// persisted transcript had no assistant row, so the reconcile emitted the
+/// streamed block id in `removedIds` and the FE erased the partial output.
+#[tokio::test]
+async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
+    let Some(script) = gate("WSS interrupt partial-flush E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // The mock's first turn streams one chunk ("streaming-before-cancel") then
+    // parks until session/cancel — a deterministic mid-stream state.
+    let behavior = json!({ "blockUntilCancel": true }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent:* events, to observe the mid-stream chunk.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    // RPC conn — create the agent.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Interruptee", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // CHAT conn — subscribe BEFORE the turn so every stream delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "start" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The agent is observably mid-stream once the chunk event lands. The whole
+    // wait is bounded by a single deadline (per-frame reads inside `wss_event`
+    // would otherwise reset on heartbeat Pings and hang on a missing chunk).
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("mock streamed its pre-park chunk");
+
+    // The chat channel saw the streamed block too — capture its id so the
+    // terminal assertions below key off the exact block that streamed live.
+    // Single total deadline, same rationale as above.
+    let streamed_block_id = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = &frame["params"]["delta"];
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("streaming-before-cancel"))
+                })
+            {
+                return entity["block"]["id"].as_str().map(String::from);
+            }
+        }
+    })
+    .await
+    .expect("streamed text block reached chat channel in time")
+    .expect("streamed text block carries an id");
+
+    // User interrupt mid-stream.
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+
+    // Terminal reconcile: the streamed block survives (added or updated with
+    // `streamingComplete: true`) and NOTHING is removed. Single total deadline.
+    let terminal = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = frame["params"]["delta"].clone();
+            let is_terminal = ["added", "updated"].iter().any(|key| {
+                delta[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+            });
+            if is_terminal {
+                return delta;
+            }
+        }
+    })
+    .await
+    .expect("terminal (streamingComplete) delta arrived");
+    assert_eq!(
+        terminal["removedIds"],
+        json!([]),
+        "the interrupted partial's blocks are NOT removed: {terminal}"
+    );
+    assert!(
+        ["added", "updated"].iter().any(|key| {
+            terminal[*key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["block"]["id"].as_str() == Some(streamed_block_id.as_str()))
+        }),
+        "the streamed block {streamed_block_id} is reconciled as kept: {terminal}"
+    );
+
+    // The transcript holds the interrupted partial assistant row.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("interrupted partial assistant row persisted");
+    assert_eq!(
+        assistant["metadata"]["interrupted"],
+        json!(true),
+        "assistant row: {assistant}"
+    );
+    assert_eq!(
+        assistant["metadata"]["stopReason"],
+        json!("interrupted"),
+        "assistant row: {assistant}"
+    );
+    assert!(
+        serde_json::to_string(&assistant["contentBlocks"])
+            .unwrap()
+            .contains("streaming-before-cancel"),
+        "the streamed-so-far text persisted: {assistant}"
+    );
+}

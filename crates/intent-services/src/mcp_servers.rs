@@ -533,11 +533,15 @@ async fn ping(conn: &Connection) -> bool {
 }
 
 /// Terminate a server's whole process group (SIGTERM → grace → SIGKILL), then
-/// let the [`Connection`] drop to abort its reader/writer tasks.
+/// let the [`Connection`] drop to abort its reader/writer tasks. Descendants
+/// that escaped into their OWN process groups survive the group kill, so they
+/// are snapshotted before signalling and swept afterwards
+/// (`intent_acp::descendant_sweep`).
 async fn reap(rs: &mut RunningServer) {
     #[cfg(unix)]
     {
         if let Some(pid) = rs.pid {
+            let descendants = intent_acp::descendant_pids(pid).await;
             let _ = kill_group(pid, nix::sys::signal::Signal::SIGTERM);
             let mut exited = false;
             let iters = (TERM_GRACE.as_millis() / REAP_POLL.as_millis()).max(1);
@@ -551,6 +555,7 @@ async fn reap(rs: &mut RunningServer) {
             if !exited {
                 let _ = kill_group(pid, nix::sys::signal::Signal::SIGKILL);
             }
+            intent_acp::sweep_escaped_descendants(&descendants).await;
         } else {
             let _ = rs.child.kill().await;
         }

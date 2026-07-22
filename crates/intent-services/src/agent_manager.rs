@@ -1914,8 +1914,23 @@ impl AgentManager {
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
     async fn detach(&self, agent_id: &AgentId) -> (bool, Option<Child>) {
+        // Snapshot the live-turn slot BEFORE aborting the worker (the abort
+        // drops LiveTurnGuard, clearing the slot), then flush the partial
+        // in-flight assistant content AFTER the abort — same convention as
+        // the graceful-shutdown flush. A worker append already in flight at
+        // abort time can still land, but the `agent_message.id` PK keeps the
+        // outcome convergent (exactly one row; the UNIQUE collision is
+        // absorbed inside the flush). No-op when the slot is empty or was
+        // already flushed by a caller (e.g. shutdown(), which flushes before
+        // delegating here).
+        let partial_turn = self.services.live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+        }
+        if let Some(live) = partial_turn {
+            self.services
+                .flush_partial_turn_on_interruption(agent_id, live)
+                .await;
         }
         // Drop any pending recreate/prepend flags: the next spawn re-decides
         // resume vs recreate from scratch, so stale flags must not survive a
@@ -1977,10 +1992,29 @@ impl AgentManager {
         let Some(acp_session_id) = acp_session_id else {
             return self.stop(agent_id).await;
         };
+        // Snapshot the live-turn slot BEFORE aborting the worker: the abort
+        // drops the worker future and with it the LiveTurnGuard, which clears
+        // the slot — reading after the abort would race that drop and
+        // frequently lose the partial content.
+        let partial_turn = self.services.live_turn(agent_id);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+        }
+        // Persist the streamed-so-far assistant content as an interrupted
+        // assistant row (no-op for empty blocks, so the STAB-114 zero-output
+        // requeue in `interrupt_send_message` never sees a phantom row). Runs
+        // AFTER the abort (a worker append already in flight can still land,
+        // but the `agent_message.id` PK keeps the outcome convergent — the
+        // flush absorbs the UNIQUE collision) and BEFORE the terminal
+        // `agent:stream:end` emit below so the chat-channel terminal
+        // reconcile sees the persisted row and keeps the blocks instead of
+        // removing them.
+        if let Some(live) = partial_turn {
+            self.services
+                .flush_partial_turn_on_interruption(agent_id, live)
+                .await;
         }
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
@@ -2525,8 +2559,10 @@ impl AgentManager {
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
-    /// the worker + kill the child), discard the pending queue, then deliver the
-    /// forced message immediately as a fresh turn.
+    /// the worker + kill the child — the preempted turn's streamed-so-far
+    /// output persists as an interrupted assistant row via the `detach` flush),
+    /// discard the pending queue, then deliver the forced message immediately
+    /// as a fresh turn.
     pub async fn force_message(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -3263,9 +3299,12 @@ const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
 /// orphaning grandchildren. SIGTERM first for a clean exit, then SIGKILL after a
-/// grace period to sweep anything that ignored it.
+/// grace period to sweep anything that ignored it. Descendants that escaped
+/// into their OWN process groups survive the `killpg`, so they are snapshotted
+/// before the kill and swept afterwards (`intent_acp::descendant_sweep`).
 #[cfg(unix)]
 async fn kill_child_tree(mut child: Child) {
+    use intent_acp::{descendant_pids, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -3273,12 +3312,14 @@ async fn kill_child_tree(mut child: Child) {
         let _ = child.start_kill();
         return;
     };
+    let descendants = descendant_pids(pid).await;
     let pgid = Pid::from_raw(pid as i32);
     let _ = killpg(pgid, Signal::SIGTERM);
     // Wait briefly for the group to drain, then SIGKILL the whole group so any
     // grandchild that ignored SIGTERM is still removed.
     let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, child.wait()).await;
     let _ = killpg(pgid, Signal::SIGKILL);
+    sweep_escaped_descendants(&descendants).await;
 }
 
 /// Non-unix fallback: no process groups, so fall back to killing the direct
@@ -3293,11 +3334,22 @@ async fn kill_child_tree(mut child: Child) {
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
 /// still-live group is SIGKILLed — so total teardown is ~one grace period
 /// regardless of how many agents were running (unlike per-child
-/// [`kill_child_tree`], which serialises one grace window per tree).
+/// [`kill_child_tree`], which serialises one grace window per tree). The
+/// pre-kill descendant snapshot (bounded at 2s for a hung `ps`) and the
+/// post-kill escape sweep (one extra grace window when something escaped)
+/// add hard-bounded overhead on top of that shared window.
 #[cfg(unix)]
 async fn kill_child_trees(children: Vec<Child>) {
+    use intent_acp::{descendant_pids_many, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
+
+    // Phase 0: snapshot every tree's descendants BEFORE signalling (one shared
+    // `ps` for the whole batch) so descendants that escaped into their own
+    // process groups can be swept after the group kills — post-kill they
+    // reparent to init and become invisible (`intent_acp::descendant_sweep`).
+    let roots: Vec<u32> = children.iter().filter_map(|c| c.id()).collect();
+    let descendants = descendant_pids_many(&roots).await;
 
     // Phase 1: SIGTERM every group up-front so all trees start exiting at once.
     let mut pgids = Vec::new();
@@ -3342,6 +3394,10 @@ async fn kill_child_trees(children: Vec<Child>) {
     for mut w in pending {
         let _ = tokio::time::timeout_at(reap_deadline, &mut w).await;
     }
+    // Phase 5: sweep snapshotted descendants that survived the group kills
+    // (foreign process groups). No-cost when nothing escaped; otherwise one
+    // extra bounded SIGTERM→grace→SIGKILL pass over the survivors.
+    sweep_escaped_descendants(&descendants).await;
 }
 
 /// Non-unix fallback: no process groups, so kill each direct child; the kills

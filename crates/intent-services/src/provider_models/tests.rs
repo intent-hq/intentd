@@ -560,6 +560,78 @@ async fn probe_rpc_error_survives_dead_child() {
     assert_eq!(rpc.message, "Authentication required");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
+    // A wedged `opencode models` must be reaped when the timeout elapses and
+    // the failure must be attributable as a timeout. The fake CLI records its
+    // PID first thing, then sleeps far past the injected timeout — a 500ms
+    // budget leaves slow runners ample time to write the PID file before the
+    // deadline while keeping the test fast.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let bin = dir.path().join("opencode");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pid_file.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let start = std::time::Instant::now();
+    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_millis(500))
+        .await
+        .unwrap_err();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "timeout must cut the wedged CLI short"
+    );
+    assert_eq!(err, "opencode models timed out");
+
+    // kill_on_drop reaps the child when the timed-out output future drops:
+    // signal `None` (sig 0) probes liveness without touching the process.
+    // (A recycled PID within the 5s window would false-positive the probe;
+    // accepted as vanishingly unlikely.)
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .expect("fake CLI must have started")
+        .trim()
+        .parse()
+        .expect("pid");
+    let pid = nix::unistd::Pid::from_raw(pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while nix::sys::signal::kill(pid, None).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} must be killed after the timeout"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_timeout_flows_into_attributed_warning() {
+    // The timeout reason must surface through the fetch result attribution
+    // (`opencode: ...`), matching what models.list callers see.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("opencode");
+    std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fetch = super::ProviderModelsFetch::unavailable(
+        "opencode",
+        super::run_opencode_models_cli(bin, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err(),
+    );
+    assert!(fetch.models.is_none());
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("opencode: opencode models timed out")
+    );
+}
+
 #[test]
 fn auth_required_detection() {
     assert!(is_auth_required_error(401, "whatever"));

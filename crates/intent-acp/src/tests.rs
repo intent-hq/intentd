@@ -3148,26 +3148,24 @@ mod mcp_bridge_tests {
             .await
             .unwrap();
         let addr = bridge.connect_addr();
+        // Sanity: the listener accepts while the bridge handle is alive.
+        TcpStream::connect(&addr).await.unwrap();
+        let accept_loop = bridge.accept_loop_handle();
         drop(bridge);
-        // Give the abort a moment to tear down the listener, then a fresh
-        // connection attempt must fail (refused or reset). We retry briefly.
-        let mut last_err = None;
-        for _ in 0..20 {
-            match TcpStream::connect(&addr).await {
-                Ok(_) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    break;
-                }
-            }
+        // Drop aborts the accept-loop task; await its completion, which drops
+        // (and closes) the TcpListener it owns. Probing the port with fresh
+        // connects instead is racy under a parallel test run: once the
+        // ephemeral port is freed, a concurrent test binding 127.0.0.1:0 can
+        // be handed the same port, making connects succeed against an
+        // unrelated listener.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !accept_loop.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "accept loop still running 5s after McpBridge drop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            last_err.is_some(),
-            "listener still accepting after McpBridge drop"
-        );
     }
 }
 
