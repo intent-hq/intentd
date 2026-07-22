@@ -1,9 +1,10 @@
 //! Completion-watch repository: CRUD for persisted parent→child completion
 //! watches (one-shot and grouped).
 //!
-//! Registration writes the row durable-before-observable; firing a one-shot
-//! watch, cancellation, and deadline expiry delete it. On startup the daemon
-//! rehydrates surviving rows into the in-memory registry
+//! Registration persists the row via a best-effort async write-through (NOT
+//! durable-before-observable — see `Services::persist_completion_watch`);
+//! firing a one-shot watch, cancellation, and deadline expiry delete it. On
+//! startup the daemon rehydrates surviving rows into the in-memory registry
 //! (`agent_subscriptions.rs`) so a watch registered before a restart still
 //! wakes the parent when the child completes after the restart.
 

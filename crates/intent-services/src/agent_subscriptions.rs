@@ -245,7 +245,7 @@ impl Services {
         new_parent_name: Option<String>,
         resolved_parent_workspace_id: Option<&WorkspaceId>,
     ) -> Option<String> {
-        let (id, name, home_ws) = {
+        let (id, name, home_ws, changed) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
@@ -256,9 +256,11 @@ impl Services {
                     && &s.parent_agent_id == parent_agent_id
                     && &s.child_agent_id == child_agent_id
             })?;
+            let mut changed = false;
             if let Some(new_name) = new_parent_name {
                 if watch.parent_agent_name != new_name {
                     watch.parent_agent_name = new_name;
+                    changed = true;
                 }
             }
             if let Some(home_ws) = resolved_parent_workspace_id {
@@ -266,25 +268,36 @@ impl Services {
                     && check_watch_scope(home_ws, &watch.child_workspace_id).is_ok()
                 {
                     watch.parent_workspace_id = home_ws.clone();
+                    changed = true;
                 }
             }
             (
                 watch.id.clone(),
                 watch.parent_agent_name.clone(),
                 watch.parent_workspace_id.clone(),
+                changed,
             )
         };
-        // Best-effort DB sync of the refreshed name/anchor (restart durability).
-        let store = self.store.clone();
-        let watch_id = id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = store
-                .update_completion_watch_parent(&watch_id, &name, &home_ws)
-                .await
-            {
-                tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
-            }
-        });
+        // Best-effort DB sync of the refreshed name/anchor (restart
+        // durability), skipped when nothing changed (the common
+        // waitFor-called-twice case). Like the registration-time upsert this
+        // is a spawned task, so a register→fast-fire sequence can order the
+        // fired watch's delete before a pending upsert and resurrect the row
+        // as an orphan; rehydration then reconciles it into at most one
+        // duplicate wake after a restart — accepted, mirroring the
+        // `persist_delegation_group` durability note.
+        if changed {
+            let store = self.store.clone();
+            let watch_id = id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store
+                    .update_completion_watch_parent(&watch_id, &name, &home_ws)
+                    .await
+                {
+                    tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
+                }
+            });
+        }
         Some(id)
     }
 
@@ -918,12 +931,15 @@ impl Services {
     }
 
     /// Rehydrate persisted completion watches at daemon startup: load every
-    /// surviving row, prune rows whose parent or child agent is gone (deleted
-    /// or missing — no wake could ever fire or be delivered), and load the
-    /// rest into the in-memory registry. Grouped watches whose delegation
+    /// surviving row, prune rows whose PARENT agent is gone (deleted or
+    /// missing — no wake could ever be delivered) and load the rest into the
+    /// in-memory registry. A gone/deleted CHILD is NOT pruned: that is a
+    /// completion signal for the parent, handled by the reconciliation pass
+    /// below (synthetic `agent:deleted`). Grouped watches whose delegation
     /// group no longer exists in memory (it fired or was never rehydrated)
-    /// are pruned too — group settlement owns their lifecycle. Idempotent:
-    /// watches already present in memory (by id) are skipped.
+    /// are pruned too — group settlement owns their lifecycle — as are rows
+    /// whose leak-guard deadline already elapsed. Idempotent: watches already
+    /// present in memory (by id) are skipped.
     ///
     /// A rehydrated watch with a persisted leak-guard deadline re-arms its
     /// cleanup timer with the remaining wall-clock time (an already-elapsed
@@ -1041,13 +1057,15 @@ impl Services {
         }
     }
 
-    /// Reconcile one rehydrated watch's child against current agent state
-    /// (mirrors the STAB-108 group reconciliation): if the child already
-    /// completed / failed / was deleted while the daemon was down, synthesize
-    /// the matching completion event and route it through
-    /// [`Services::deliver_completion_to_watches`] so the parent wakes now
-    /// instead of waiting for an event that already fired.
-    async fn reconcile_watch_child_on_rehydration(
+    /// Reconcile one watch's child against current agent state (mirrors the
+    /// STAB-108 group reconciliation): if the child already completed /
+    /// failed / was deleted, synthesize the matching completion event and
+    /// route it through [`Services::deliver_completion_to_watches`] so the
+    /// parent wakes now instead of waiting for an event that already fired.
+    /// Used both at startup rehydration (child settled while the daemon was
+    /// down) and at `app.agents.waitFor` registration time (target settled
+    /// before — or concurrently with — the registration).
+    pub(crate) async fn reconcile_watch_child_on_rehydration(
         &self,
         child_id: &AgentId,
         fallback_ws: &WorkspaceId,

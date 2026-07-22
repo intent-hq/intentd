@@ -1252,9 +1252,16 @@ async fn chief_waitfor_immediate_cross_workspace_over_wss() {
     )
     .await;
 
-    // Re-register (targets are Completed, not Deleted, so waitFor accepts
-    // them again) → 2 fresh watches → `agent.cancelSubscriptions` removes
-    // them all over the wire.
+    // Re-register waits on the settled targets. They are `RuntimeIdle`
+    // WITHOUT a completion report (plain turns, no `agent.reportToParent`),
+    // so the conservative registration-time reconciliation predicate — the
+    // same one rehydration uses — treats them as re-waitable rather than
+    // settled: the fresh watches stay armed and would fire on the targets'
+    // NEXT turn end. (Terminal Completed/Error targets DO reconcile into an
+    // immediate synthetic wake — covered by the
+    // `app_agents_wait_*_reconciles_already_settled_target*` unit tests.)
+    // → 2 fresh watches → `agent.cancelSubscriptions` removes them all over
+    // the wire.
     let resp = wss_rpc_envelope(
         &mut rpc,
         30,

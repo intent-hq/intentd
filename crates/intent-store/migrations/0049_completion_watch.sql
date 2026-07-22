@@ -1,9 +1,11 @@
 -- Completion-watch persistence: one-shot (and grouped) parent→child
 -- completion watches survive daemon restarts. In-memory `CompletionWatch`
--- records (agent_subscriptions.rs) are written durable-before-observable on
--- registration and deleted when the watch fires, is cancelled, or expires,
--- so a restarted daemon can rehydrate still-armed watches and wake the
--- parent when the child completes after the restart.
+-- records (agent_subscriptions.rs) are persisted via a best-effort async
+-- write-through on registration (NOT durable-before-observable — a crash in
+-- the milliseconds between in-memory registration and commit loses the row;
+-- the parent can re-register) and deleted when the watch fires, is
+-- cancelled, or expires, so a restarted daemon can rehydrate still-armed
+-- watches and wake the parent when the child completes after the restart.
 --
 -- No FK to workspace(id): `parent_workspace_id` may be the reserved
 -- `__chief__` anchor, which has no workspace row.

@@ -3327,6 +3327,15 @@ impl Services {
     /// callers — enforced by the shared `check_watch_scope` gate, which runs
     /// for every target BEFORE any side-effectful registration so a rejection
     /// leaves no partial group or watches behind.
+    ///
+    /// After registration every target is reconciled against current agent
+    /// state (same [`Services::reconcile_watch_child_on_rehydration`] path the
+    /// startup rehydration uses): a target that already settled — Completed /
+    /// Error / genuinely idle with a completion report — delivers its
+    /// synthetic completion immediately instead of leaving a watch armed for
+    /// an event that fired long ago. This also closes the TOCTOU window where
+    /// a target settles between the validation loop above and the watch
+    /// registration (its live event would dispatch before the watch exists).
     pub(crate) async fn app_agents_wait_op(
         &self,
         workspace_id: WorkspaceId,
@@ -3400,6 +3409,10 @@ impl Services {
             crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
             resolved.push((target, session.name, session.workspace_id));
         }
+        let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved
+            .iter()
+            .map(|(t, _, ws)| (t.clone(), ws.clone()))
+            .collect();
         let mut results = Vec::with_capacity(resolved.len());
         if wait_mode == WAIT_MODE_AFTER_ALL {
             // Enroll every target in the caller's open after_all group and
@@ -3458,6 +3471,13 @@ impl Services {
         }
         self.publish_subscriptions_changed(&caller_home_ws, &caller_agent_id)
             .await;
+        // Reconcile already-settled targets NOW (immediate: fires the fresh
+        // oneShot watch right away; after_all: records the completion in the
+        // still-open group, which fires once it seals on the caller's idle).
+        for (target, target_ws) in reconcile_targets {
+            self.reconcile_watch_child_on_rehydration(&target, &target_ws)
+                .await;
+        }
         Ok(json!({ "ok": true, "waitMode": wait_mode, "results": results }))
     }
 

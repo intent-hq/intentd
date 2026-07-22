@@ -693,6 +693,103 @@ async fn app_agents_wait_immediate_dedupes_live_watch() {
     assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 }
 
+/// Registration-time reconciliation (immediate mode): waitFor on a target
+/// that ALREADY settled (Completed) delivers the synthetic wake right away
+/// and consumes the fresh oneShot watch, instead of arming a watch for an
+/// `agent:idle` event that fired long ago.
+#[tokio::test]
+async fn app_agents_wait_immediate_reconciles_already_settled_target() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::Completed;
+    s.completion_report = Some("finished earlier".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark target settled");
+
+    let out = svc
+        .app_agents_wait_op(ws.clone(), caller.clone(), vec![target.0.clone()], None)
+        .await
+        .expect("waitFor on settled target");
+    assert_eq!(out["ok"], json!(true));
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "immediate synthetic wake");
+    assert!(
+        svc.list_watches_for_parent(&caller).is_empty(),
+        "reconciled oneShot watch consumed"
+    );
+}
+
+/// Registration-time reconciliation (after_all mode): waitFor on targets
+/// that ALREADY settled records their completions in the still-open group,
+/// so once the caller idles (sealing the group) the single aggregated wake
+/// fires instead of the group hanging forever.
+#[tokio::test]
+async fn app_agents_wait_after_all_reconciles_already_settled_targets() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let t1 = create_agent(&svc, &ws, "TargetA").await;
+    let t2 = create_agent(&svc, &ws, "TargetB").await;
+    for (target, report) in [(&t1, "one done"), (&t2, "two done")] {
+        let mut s = svc
+            .store()
+            .get_agent_session(target)
+            .await
+            .expect("target session");
+        s.status = intent_core::AgentStatus::Completed;
+        s.completion_report = Some(report.into());
+        svc.store()
+            .update_agent_session(&ws, &s)
+            .await
+            .expect("mark target settled");
+    }
+
+    let out = svc
+        .app_agents_wait_op(
+            ws.clone(),
+            caller.clone(),
+            vec![t1.0.clone(), t2.0.clone()],
+            Some("after_all".into()),
+        )
+        .await
+        .expect("waitFor after_all on settled targets");
+    assert_eq!(out["ok"], json!(true));
+
+    // The caller idles: group seals with both completions already recorded
+    // by registration-time reconciliation → one aggregated wake.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
+    let text = session.messages[0].content.to_string();
+    assert!(text.contains(&t1.0), "wake covers first settled target");
+    assert!(text.contains(&t2.0), "wake covers second settled target");
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+    assert!(svc.delegation_group_for_parent(&caller).is_none());
+}
+
 /// after_all from a chief caller with targets in TWO different workspaces:
 /// both targets share one chief-anchored group; sealing on the caller's idle
 /// and completing both targets fires ONE aggregated wake.
