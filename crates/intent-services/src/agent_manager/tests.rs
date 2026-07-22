@@ -2342,6 +2342,67 @@ async fn stop_flushes_partial_live_turn_as_interrupted_assistant_row() {
     assert_eq!(metadata["stopReason"], "interrupted");
 }
 
+/// `agent.forceMessage` preempts via `stop()`, so the preempted turn's
+/// streamed-so-far output now persists as an interrupted assistant row BEFORE
+/// the forced message's user row — a deliberate transcript-shape change from
+/// the detach-path flush (previously the partial output was dropped).
+#[tokio::test]
+async fn force_message_persists_preempted_partial_turn_before_forced_row() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-force-flush"));
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let blocks = vec![json!({ "type": "text", "id": "msg-force-flush:0", "text": "partial…" })];
+    mgr.services
+        .set_live_turn(&id, "msg-force-flush", blocks.clone());
+
+    let result = mgr
+        .force_message(
+            id.clone(),
+            ws.clone(),
+            "forced-mid".to_string(),
+            "urgent override".to_string(),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("force message");
+    assert_eq!(result["success"], json!(true));
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let flushed = messages
+        .iter()
+        .find(|m| m.id == "msg-force-flush")
+        .expect("preempted partial persisted as interrupted assistant row");
+    assert_eq!(flushed.role, "assistant");
+    assert_eq!(flushed.content, Value::Array(blocks));
+    let metadata = flushed.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    let forced_pos = messages
+        .iter()
+        .position(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("urgent")
+        })
+        .expect("forced user row persisted");
+    let flushed_pos = messages
+        .iter()
+        .position(|m| m.id == "msg-force-flush")
+        .unwrap();
+    assert!(
+        flushed_pos < forced_pos,
+        "interrupted partial precedes the forced message: {messages:?}"
+    );
+}
+
 /// STAB-114/126 guard: a zero-output interrupt (live-turn slot open but no
 /// assistant blocks streamed yet) must NOT persist an assistant row — the
 /// flush is a no-op for empty blocks — so the requeue's "non-user messages

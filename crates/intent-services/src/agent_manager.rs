@@ -1916,10 +1916,13 @@ impl AgentManager {
     async fn detach(&self, agent_id: &AgentId) -> (bool, Option<Child>) {
         // Snapshot the live-turn slot BEFORE aborting the worker (the abort
         // drops LiveTurnGuard, clearing the slot), then flush the partial
-        // in-flight assistant content AFTER the abort so the worker cannot
-        // race the append — same convention as the graceful-shutdown flush.
-        // No-op when the slot is empty or was already flushed by a caller
-        // (e.g. shutdown(), which flushes before delegating here).
+        // in-flight assistant content AFTER the abort — same convention as
+        // the graceful-shutdown flush. A worker append already in flight at
+        // abort time can still land, but the `agent_message.id` PK keeps the
+        // outcome convergent (exactly one row; the UNIQUE collision is
+        // absorbed inside the flush). No-op when the slot is empty or was
+        // already flushed by a caller (e.g. shutdown(), which flushes before
+        // delegating here).
         let partial_turn = self.services.live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
@@ -2002,8 +2005,10 @@ impl AgentManager {
         // Persist the streamed-so-far assistant content as an interrupted
         // assistant row (no-op for empty blocks, so the STAB-114 zero-output
         // requeue in `interrupt_send_message` never sees a phantom row). Runs
-        // AFTER the abort so the worker cannot race the append, and BEFORE the
-        // terminal `agent:stream:end` emit below so the chat-channel terminal
+        // AFTER the abort (a worker append already in flight can still land,
+        // but the `agent_message.id` PK keeps the outcome convergent — the
+        // flush absorbs the UNIQUE collision) and BEFORE the terminal
+        // `agent:stream:end` emit below so the chat-channel terminal
         // reconcile sees the persisted row and keeps the blocks instead of
         // removing them.
         if let Some(live) = partial_turn {
@@ -2554,8 +2559,10 @@ impl AgentManager {
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
-    /// the worker + kill the child), discard the pending queue, then deliver the
-    /// forced message immediately as a fresh turn.
+    /// the worker + kill the child — the preempted turn's streamed-so-far
+    /// output persists as an interrupted assistant row via the `detach` flush),
+    /// discard the pending queue, then deliver the forced message immediately
+    /// as a fresh turn.
     pub async fn force_message(
         self: &Arc<Self>,
         agent_id: AgentId,
