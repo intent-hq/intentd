@@ -109,6 +109,10 @@ enum Command {
         /// Scan only this directory instead of the default legacy roots.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Legacy Electron app-level dir holding `config.json` /
+        /// `repo-registry.json`; defaults to the platform userData dir.
+        #[arg(long)]
+        app_dir: Option<PathBuf>,
         /// Print the per-workspace plan without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -168,9 +172,10 @@ async fn main() -> ExitCode {
         Command::Import { from } => to_exit(cmd_import(&from).await),
         Command::ImportLegacy {
             root,
+            app_dir,
             dry_run,
             force,
-        } => to_exit(cmd_import_legacy(root.as_deref(), dry_run, force).await),
+        } => to_exit(cmd_import_legacy(root.as_deref(), app_dir, dry_run, force).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
         Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
         #[cfg(feature = "js-engine")]
@@ -325,7 +330,12 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
 /// completion writes the first-boot marker so `serve` never re-imports.
 /// Per-workspace problems are soft (reported, exit 0); only an unusable
 /// explicit `--root` or a store-open failure exits non-zero.
-async fn cmd_import_legacy(root: Option<&Path>, dry_run: bool, force: bool) -> anyhow::Result<()> {
+async fn cmd_import_legacy(
+    root: Option<&Path>,
+    app_dir: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<()> {
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
     let roots = match root {
@@ -337,6 +347,7 @@ async fn cmd_import_legacy(root: Option<&Path>, dry_run: bool, force: bool) -> a
         }
         None => legacy_import::default_roots(),
     };
+    let app_dir = app_dir.or_else(legacy_import::default_app_dir);
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -346,6 +357,8 @@ async fn cmd_import_legacy(root: Option<&Path>, dry_run: bool, force: bool) -> a
             roots,
             dry_run,
             force,
+            assets_root: Some(config.data_dir.join("assets")),
+            app_dir,
         },
     )
     .await?;
@@ -527,8 +540,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // marker, scan the legacy roots and import `.workspace/workspace.json`
     // workspaces. Runs after migrations (inside `Store::open`) and before any
     // transport serves RPCs; never fails startup.
-    legacy_import::maybe_import_on_first_boot(&store, db_existed, legacy_import::default_roots())
-        .await;
+    legacy_import::maybe_import_on_first_boot(
+        &store,
+        db_existed,
+        legacy_import::default_roots(),
+        Some(config.data_dir.join("assets")),
+        legacy_import::default_app_dir(),
+    )
+    .await;
     // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
     // WAL growth when continuous readers hold long-lived transactions. Aborted
     // during shutdown before Store::close().

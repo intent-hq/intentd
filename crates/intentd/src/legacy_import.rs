@@ -30,6 +30,16 @@
 //! legacy FE `AgentSession` shape) become `agent_session` rows plus ordered
 //! `agent_message` rows — always as terminal `Completed` historical sessions
 //! that the startup interrupted-agent heal sweep never touches.
+//! Note assets follow: `.workspace/assets/{assetId}` files (plus their
+//! `.meta.json` sidecars) are copied into intentd's asset root
+//! (`<assets_root>/<workspaceId>/<assetId>`, the layout `note.readAsset`
+//! resolves) so `workspace-asset://<wsId>/<assetId>` references in imported
+//! notes keep working. Finally, app-level electron-store blobs import once
+//! per run (non-dry-run only): `config.json` `changeHistory` →
+//! `workspace.changeHistory` and `repo-registry.json` `knownRepos` →
+//! `repos.known`, both write-only-when-absent (an existing non-empty setting
+//! is never clobbered) and `changeHistory` filtered to workspace ids that
+//! were imported or already exist in the DB.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -61,6 +71,12 @@ pub struct Options {
     pub dry_run: bool,
     /// Update rows whose id already exists instead of skipping them.
     pub force: bool,
+    /// Destination asset root (`<root>/<workspaceId>/<assetId>`, the layout
+    /// `note.readAsset` resolves). `None` disables the asset copy.
+    pub assets_root: Option<PathBuf>,
+    /// Legacy Electron app-level dir holding `config.json` /
+    /// `repo-registry.json`. `None` disables the app-level blob import.
+    pub app_dir: Option<PathBuf>,
 }
 
 /// Outcome for one candidate workspace directory.
@@ -136,6 +152,49 @@ impl AgentCounts {
     }
 }
 
+/// Per-workspace asset-copy counters (part of [`WorkspaceReport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssetCounts {
+    /// Asset files copied into the intentd asset root.
+    pub imported: usize,
+    /// Files already present at the destination (idempotent skip).
+    pub skipped: usize,
+    /// Files that could not be read or copied (logged, never fatal).
+    pub failed: usize,
+}
+
+impl AssetCounts {
+    fn total(&self) -> usize {
+        self.imported + self.skipped + self.failed
+    }
+}
+
+/// Once-per-run app-level blob import counters (part of [`Report`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppSettingCounts {
+    /// `knownRepos` entries written to the `repos.known` setting.
+    pub repos_imported: usize,
+    /// An existing non-empty `repos.known` setting was left untouched.
+    pub repos_preserved: bool,
+    /// `changeHistory` entries written to `workspace.changeHistory`.
+    pub history_imported: usize,
+    /// `changeHistory` entries dropped because their workspace id is neither
+    /// imported nor present in the DB.
+    pub history_filtered: usize,
+    /// An existing non-empty `workspace.changeHistory` setting was left
+    /// untouched.
+    pub history_preserved: bool,
+    /// Unreadable/malformed source files or failed setting writes (logged,
+    /// never fatal).
+    pub failed: usize,
+}
+
+impl AppSettingCounts {
+    fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
 /// Per-workspace line of the final report.
 #[derive(Debug, Clone)]
 pub struct WorkspaceReport {
@@ -145,13 +204,17 @@ pub struct WorkspaceReport {
     pub notes: NoteCounts,
     pub comments: CommentCounts,
     pub agents: AgentCounts,
+    pub assets: AssetCounts,
 }
 
-/// Full report of one run: one entry per candidate workspace directory.
+/// Full report of one run: one entry per candidate workspace directory, plus
+/// the once-per-run app-level blob outcome (`None` when no app dir was
+/// configured or the run was a dry-run).
 #[derive(Debug, Default)]
 pub struct Report {
     pub entries: Vec<WorkspaceReport>,
     pub dry_run: bool,
+    pub app_settings: Option<AppSettingCounts>,
 }
 
 impl Report {
@@ -193,6 +256,11 @@ impl Report {
             .sum()
     }
 
+    /// Total asset files copied across all workspaces.
+    pub fn assets_imported(&self) -> usize {
+        self.entries.iter().map(|e| e.assets.imported).sum()
+    }
+
     fn count(&self, pred: impl Fn(&Outcome) -> bool) -> usize {
         self.entries.iter().filter(|e| pred(&e.outcome)).count()
     }
@@ -205,6 +273,7 @@ impl Report {
             notes: NoteCounts::default(),
             comments: CommentCounts::default(),
             agents: AgentCounts::default(),
+            assets: AssetCounts::default(),
         });
     }
 }
@@ -259,24 +328,55 @@ impl fmt::Display for Report {
             } else {
                 String::new()
             };
+            let assets = if entry.assets.total() > 0 {
+                format!(
+                    ", assets: {} imported, {} skipped, {} failed",
+                    entry.assets.imported, entry.assets.skipped, entry.assets.failed
+                )
+            } else {
+                String::new()
+            };
             writeln!(
                 f,
-                "  {}  {}{notes}{comments}{agents} ({})",
+                "  {}  {}{notes}{comments}{agents}{assets} ({})",
                 entry.id,
                 outcome,
                 entry.dir.display()
             )?;
         }
+        if let Some(app) = &self.app_settings {
+            if app.any() {
+                let repos = if app.repos_preserved {
+                    "preserved existing".to_string()
+                } else {
+                    format!("{} imported", app.repos_imported)
+                };
+                let history = if app.history_preserved {
+                    "preserved existing".to_string()
+                } else {
+                    format!(
+                        "{} imported, {} filtered",
+                        app.history_imported, app.history_filtered
+                    )
+                };
+                writeln!(
+                    f,
+                    "  app settings: repos.known {repos}; workspace.changeHistory {history}; {} failed",
+                    app.failed
+                )?;
+            }
+        }
         write!(
             f,
-            "summary: {} imported, {} updated, {} skipped, {} notes imported, {} comments imported, {} agent sessions imported, {} agent messages imported",
+            "summary: {} imported, {} updated, {} skipped, {} notes imported, {} comments imported, {} agent sessions imported, {} agent messages imported, {} assets imported",
             self.imported(),
             self.updated(),
             self.skipped(),
             self.notes_imported(),
             self.comments_imported(),
             self.agent_sessions_imported(),
-            self.agent_messages_imported()
+            self.agent_messages_imported(),
+            self.assets_imported()
         )
     }
 }
@@ -304,10 +404,38 @@ pub fn default_roots() -> Vec<PathBuf> {
     ]
 }
 
+/// Default legacy Electron app-level dir (the electron-store `userData` dir
+/// holding `config.json` / `repo-registry.json`). `INTENTD_LEGACY_APP_DIR`
+/// overrides (empty disables); under the hermetic test harness
+/// (`INTENTD_ASSERT_HERMETIC_ROOT`) with no override the import is disabled so
+/// tests can never read the developer's real app dir.
+pub fn default_app_dir() -> Option<PathBuf> {
+    if let Some(spec) = std::env::var_os("INTENTD_LEGACY_APP_DIR") {
+        if spec.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(spec));
+    }
+    if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if cfg!(target_os = "macos") {
+        Some(
+            home.join("Library")
+                .join("Application Support")
+                .join("intent"),
+        )
+    } else {
+        Some(home.join(".config").join("intent"))
+    }
+}
+
 /// Scan `opts.roots` in order and import every legacy workspace found. Missing
 /// or unreadable roots are skipped silently (the default roots may simply not
 /// exist); per-workspace problems are soft and reported as [`Outcome::Skipped`].
-/// The run is read-only toward the source directories.
+/// The run is read-only toward the source directories. App-level blobs import
+/// once at the end (non-dry-run only, when `opts.app_dir` is set).
 pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
     let mut report = Report {
         dry_run: opts.dry_run,
@@ -329,6 +457,17 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
                 continue;
             }
             import_one(store, &dir, &manifest, opts, &mut seen, &mut report).await;
+        }
+    }
+    if !opts.dry_run {
+        if let Some(app_dir) = &opts.app_dir {
+            let landed: HashSet<String> = report
+                .entries
+                .iter()
+                .filter(|e| matches!(e.outcome, Outcome::Imported | Outcome::Updated))
+                .map(|e| e.id.clone())
+                .collect();
+            report.app_settings = Some(import_app_settings(store, app_dir, &landed).await);
         }
     }
     Ok(report)
@@ -426,9 +565,10 @@ async fn import_one(
         notes: NoteCounts::default(),
         comments: CommentCounts::default(),
         agents: AgentCounts::default(),
+        assets: AssetCounts::default(),
     };
     if landed && !opts.dry_run {
-        import_workspace_extras(store, &ws, dir, &mut entry).await;
+        import_workspace_extras(store, &ws, dir, opts.assets_root.as_deref(), &mut entry).await;
     }
     report.entries.push(entry);
 }
@@ -436,16 +576,74 @@ async fn import_one(
 /// Extension seam for the per-workspace importers: called once per
 /// imported/updated workspace with its legacy directory (`<root>/<id>`,
 /// containing `.workspace/…`). Imports notes, then comments (after notes, so
-/// comments can attach to just-imported note rows), then agent transcripts.
+/// comments can attach to just-imported note rows), then agent transcripts,
+/// then assets (a plain file copy — no store dependency).
 async fn import_workspace_extras(
     store: &Store,
     workspace: &Workspace,
     legacy_dir: &Path,
+    assets_root: Option<&Path>,
     entry: &mut WorkspaceReport,
 ) {
     entry.notes = import_workspace_notes(store, workspace, legacy_dir).await;
     entry.comments = import_workspace_comments(store, workspace, legacy_dir).await;
     entry.agents = import_workspace_agents(store, workspace, legacy_dir).await;
+    if let Some(root) = assets_root {
+        entry.assets = import_workspace_assets(workspace, legacy_dir, root);
+    }
+}
+
+/// Copy legacy `.workspace/assets/{assetId}` files (plus their `.meta.json`
+/// sidecars) into intentd's asset root at `<root>/<workspaceId>/<assetId>` —
+/// the exact layout `note.readAsset`/`note.saveAsset` use — so
+/// `workspace-asset://<wsId>/<assetId>` references in imported notes resolve.
+/// Best-effort and idempotent: files already present at the destination are
+/// skipped (never overwritten), unreadable/uncopyable files are logged and
+/// counted as `failed`, and subdirectories/dotfiles are ignored.
+fn import_workspace_assets(workspace: &Workspace, legacy_dir: &Path, root: &Path) -> AssetCounts {
+    let mut counts = AssetCounts::default();
+    let assets_dir = legacy_dir.join(".workspace").join("assets");
+    let Ok(entries) = std::fs::read_dir(&assets_dir) else {
+        return counts; // no assets dir — nothing to import
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return counts;
+    }
+    let dest_dir = root.join(workspace.id.as_str());
+    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        tracing::warn!(dir = %dest_dir.display(), error = %e, "legacy assets destination unusable; skipping asset copy");
+        counts.failed = files.len();
+        return counts;
+    }
+    for path in files {
+        let Some(name) = path.file_name() else {
+            counts.failed += 1;
+            continue;
+        };
+        let dest = dest_dir.join(name);
+        if dest.exists() {
+            counts.skipped += 1;
+            continue;
+        }
+        match std::fs::copy(&path, &dest) {
+            Ok(_) => counts.imported += 1,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy asset copy failed; skipping");
+                counts.failed += 1;
+            }
+        }
+    }
+    counts
 }
 
 /// Import legacy `.workspace/notes/*.md` files as note rows. Best-effort and
@@ -1279,6 +1477,150 @@ fn workspace_from_legacy_json(mut obj: Map<String, Value>) -> Result<Workspace, 
     Ok(ws)
 }
 
+/// Settings key backing the FE repo registry (see
+/// `intent-services::settings_registry`, default `[]`).
+const REPOS_KNOWN_KEY: &str = "repos.known";
+
+/// Settings key backing the FE persisted change history (default `{}`).
+const CHANGE_HISTORY_KEY: &str = "workspace.changeHistory";
+
+/// True when a raw settings value is absent or semantically empty (null /
+/// empty array / empty object / empty string) — i.e. safe to overwrite
+/// without clobbering user data.
+fn setting_is_empty(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Null) => true,
+        Ok(Value::Array(a)) => a.is_empty(),
+        Ok(Value::Object(o)) => o.is_empty(),
+        Ok(Value::String(s)) => s.is_empty(),
+        Ok(_) => false,
+        Err(_) => true, // unparseable → treat as absent
+    }
+}
+
+/// Read `<dir>/<name>` as a JSON object, distinguishing "file absent" (`None`,
+/// silently fine — the legacy store may simply never have been created) from
+/// "present but unreadable/malformed" (`Err`, counted as a failure).
+fn read_json_object(dir: &Path, name: &str) -> Result<Option<Map<String, Value>>, String> {
+    let path = dir.join(name);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {name}: {e}"))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(o)) => Ok(Some(o)),
+        Ok(_) => Err(format!("{name} is not a JSON object")),
+        Err(e) => Err(format!("invalid JSON in {name}: {e}")),
+    }
+}
+
+/// Import the app-level electron-store blobs once per run:
+/// `repo-registry.json` `knownRepos` → the `repos.known` setting and
+/// `config.json` `changeHistory` → `workspace.changeHistory`. Both writes are
+/// **write-only-when-absent**: an existing non-empty setting is preserved
+/// untouched. `changeHistory` entries are filtered to workspace ids that
+/// landed this run (`landed`) or already exist in the DB, so the setting never
+/// references unknown workspaces. Best-effort throughout: unreadable files and
+/// failed writes are logged and counted, never fatal.
+async fn import_app_settings(
+    store: &Store,
+    app_dir: &Path,
+    landed: &HashSet<String>,
+) -> AppSettingCounts {
+    let mut counts = AppSettingCounts::default();
+
+    // repos.known ← repo-registry.json `knownRepos`
+    match read_json_object(app_dir, "repo-registry.json") {
+        Ok(Some(obj)) => {
+            if let Some(Value::Array(repos)) = obj.get("knownRepos") {
+                if !repos.is_empty() {
+                    match store.get_setting(REPOS_KNOWN_KEY).await {
+                        Ok(existing) if !setting_is_empty(existing.as_deref()) => {
+                            counts.repos_preserved = true;
+                        }
+                        Ok(_) => match store
+                            .set_setting(REPOS_KNOWN_KEY, &Value::Array(repos.clone()).to_string())
+                            .await
+                        {
+                            Ok(()) => counts.repos_imported = repos.len(),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "legacy repos.known write failed");
+                                counts.failed += 1;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "legacy repos.known read failed; skipping");
+                            counts.failed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            tracing::warn!(dir = %app_dir.display(), %reason, "legacy repo-registry.json unusable");
+            counts.failed += 1;
+        }
+    }
+
+    // workspace.changeHistory ← config.json `changeHistory`
+    match read_json_object(app_dir, "config.json") {
+        Ok(Some(obj)) => {
+            if let Some(Value::Object(history)) = obj.get("changeHistory") {
+                if !history.is_empty() {
+                    let mut kept = Map::new();
+                    for (ws_id, chunks) in history {
+                        let known = landed.contains(ws_id)
+                            || store
+                                .get_workspace(&intent_core::WorkspaceId::from(ws_id.as_str()))
+                                .await
+                                .is_ok();
+                        if known {
+                            kept.insert(ws_id.clone(), chunks.clone());
+                        } else {
+                            counts.history_filtered += 1;
+                        }
+                    }
+                    if !kept.is_empty() {
+                        match store.get_setting(CHANGE_HISTORY_KEY).await {
+                            Ok(existing) if !setting_is_empty(existing.as_deref()) => {
+                                counts.history_preserved = true;
+                            }
+                            Ok(_) => match store
+                                .set_setting(
+                                    CHANGE_HISTORY_KEY,
+                                    &Value::Object(kept.clone()).to_string(),
+                                )
+                                .await
+                            {
+                                Ok(()) => counts.history_imported = kept.len(),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "legacy workspace.changeHistory write failed");
+                                    counts.failed += 1;
+                                }
+                            },
+                            Err(e) => {
+                                tracing::warn!(error = %e, "legacy workspace.changeHistory read failed; skipping");
+                                counts.failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(reason) => {
+            tracing::warn!(dir = %app_dir.display(), %reason, "legacy config.json unusable");
+            counts.failed += 1;
+        }
+    }
+
+    counts
+}
+
 /// Write the [`LEGACY_IMPORT_MARKER_KEY`] settings row (a JSON string
 /// timestamp) recording that a full import completed successfully.
 pub async fn write_completion_marker(store: &Store) -> anyhow::Result<()> {
@@ -1293,7 +1635,13 @@ pub async fn write_completion_marker(store: &Store) -> anyhow::Result<()> {
 /// after migrations (inside `Store::open`) and before any transport serves
 /// RPCs. Never fails startup — every failure is logged and swallowed; the
 /// marker is written only when the run completes.
-pub async fn maybe_import_on_first_boot(store: &Store, db_existed: bool, roots: Vec<PathBuf>) {
+pub async fn maybe_import_on_first_boot(
+    store: &Store,
+    db_existed: bool,
+    roots: Vec<PathBuf>,
+    assets_root: Option<PathBuf>,
+    app_dir: Option<PathBuf>,
+) {
     if db_existed {
         return;
     }
@@ -1309,6 +1657,8 @@ pub async fn maybe_import_on_first_boot(store: &Store, db_existed: bool, roots: 
         roots,
         dry_run: false,
         force: false,
+        assets_root,
+        app_dir,
     };
     match run(store, &opts).await {
         Ok(report) => {
@@ -1319,6 +1669,7 @@ pub async fn maybe_import_on_first_boot(store: &Store, db_existed: bool, roots: 
                 comments = report.comments_imported(),
                 agent_sessions = report.agent_sessions_imported(),
                 agent_messages = report.agent_messages_imported(),
+                assets = report.assets_imported(),
                 "first-boot legacy workspace import complete"
             );
             for entry in &report.entries {
@@ -1390,8 +1741,7 @@ mod tests {
     fn opts(roots: Vec<PathBuf>) -> Options {
         Options {
             roots,
-            dry_run: false,
-            force: false,
+            ..Options::default()
         }
     }
 
@@ -1448,7 +1798,7 @@ mod tests {
             &Options {
                 roots: vec![root.clone()],
                 dry_run: true,
-                force: false,
+                ..Options::default()
             },
         )
         .await
@@ -1479,8 +1829,8 @@ mod tests {
             &store,
             &Options {
                 roots: vec![root.clone()],
-                dry_run: false,
                 force: true,
+                ..Options::default()
             },
         )
         .await
@@ -1574,7 +1924,7 @@ mod tests {
         let store = open_store().await;
 
         // Fresh DB, no marker → import runs and the marker is written.
-        maybe_import_on_first_boot(&store, false, vec![root.clone()]).await;
+        maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
         let marker = store.get_setting(LEGACY_IMPORT_MARKER_KEY).await.unwrap();
         assert!(
@@ -1584,7 +1934,7 @@ mod tests {
 
         // Marker present → the hook is a no-op even on a "fresh" DB signal.
         write_legacy_workspace(&root, "ws-later", json!({}));
-        maybe_import_on_first_boot(&store, false, vec![root.clone()]).await;
+        maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
 
         std::fs::remove_dir_all(&root).ok();
@@ -1596,7 +1946,7 @@ mod tests {
         write_legacy_workspace(&root, "ws-pre", json!({}));
         let store = open_store().await;
 
-        maybe_import_on_first_boot(&store, true, vec![root.clone()]).await;
+        maybe_import_on_first_boot(&store, true, vec![root.clone()], None, None).await;
         assert!(store.list_workspaces(true).await.unwrap().is_empty());
         assert!(store
             .get_setting(LEGACY_IMPORT_MARKER_KEY)
@@ -1759,8 +2109,8 @@ mod tests {
             &store,
             &Options {
                 roots: vec![root.clone()],
-                dry_run: false,
                 force: true,
+                ..Options::default()
             },
         )
         .await
@@ -1962,8 +2312,8 @@ mod tests {
             &store,
             &Options {
                 roots: vec![root.clone()],
-                dry_run: false,
                 force: true,
+                ..Options::default()
             },
         )
         .await
@@ -2236,8 +2586,8 @@ mod tests {
             &store,
             &Options {
                 roots: vec![root.clone()],
-                dry_run: false,
                 force: true,
+                ..Options::default()
             },
         )
         .await
@@ -2278,5 +2628,280 @@ mod tests {
         assert!(!session.is_active);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn imports_assets_into_workspace_scoped_root() {
+        let root = temp_root("assets");
+        let assets_root = temp_root("assets-dest");
+        let ws_dir = write_legacy_workspace(&root, "ws-assets", json!({}));
+        let src = ws_dir.join(".workspace").join("assets");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("img1.png"), b"png-bytes").unwrap();
+        std::fs::write(
+            src.join("img1.png.meta.json"),
+            "{\"mimeType\":\"image/png\"}",
+        )
+        .unwrap();
+        // Dotfiles and subdirectories are ignored.
+        std::fs::write(src.join(".DS_Store"), "x").unwrap();
+        std::fs::create_dir_all(src.join("subdir")).unwrap();
+        let store = open_store().await;
+
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                assets_root: Some(assets_root.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.entries[0].assets.imported, 2, "{report}");
+        assert_eq!(report.entries[0].assets.failed, 0, "{report}");
+        let dest = assets_root.join("ws-assets");
+        assert_eq!(std::fs::read(dest.join("img1.png")).unwrap(), b"png-bytes");
+        assert!(dest.join("img1.png.meta.json").is_file());
+        assert!(!dest.join(".DS_Store").exists());
+        assert!(!dest.join("subdir").exists());
+
+        // Re-run with force: existing destination files are skipped, never
+        // overwritten.
+        std::fs::write(dest.join("img1.png"), b"already-migrated").unwrap();
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                force: true,
+                assets_root: Some(assets_root.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.entries[0].assets.imported, 0, "{report}");
+        assert_eq!(report.entries[0].assets.skipped, 2, "{report}");
+        assert_eq!(
+            std::fs::read(dest.join("img1.png")).unwrap(),
+            b"already-migrated"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&assets_root).ok();
+    }
+
+    #[tokio::test]
+    async fn no_assets_dir_or_root_is_a_noop() {
+        let root = temp_root("assets-none");
+        write_legacy_workspace(&root, "ws-no-assets", json!({}));
+        let store = open_store().await;
+        // assets_root set but the legacy workspace has no assets dir.
+        let assets_root = temp_root("assets-none-dest");
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                assets_root: Some(assets_root.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.entries[0].assets, AssetCounts::default(), "{report}");
+        assert!(!assets_root.join("ws-no-assets").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&assets_root).ok();
+    }
+
+    /// Write app-level `repo-registry.json` / `config.json` fixtures into a dir.
+    fn write_app_file(dir: &Path, name: &str, value: &Value) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), value.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn imports_app_level_blobs_when_absent() {
+        let root = temp_root("app-blobs");
+        let app_dir = temp_root("app-dir");
+        write_legacy_workspace(&root, "ws-hist", json!({}));
+        write_app_file(
+            &app_dir,
+            "repo-registry.json",
+            &json!({"knownRepos": [
+                {"path": "/tmp/repo-a", "name": "repo-a", "addedAt": "2025-01-01T00:00:00Z", "lastUsedAt": "2025-06-01T00:00:00Z"},
+                {"path": "/tmp/repo-b", "name": "repo-b", "addedAt": "2025-02-01T00:00:00Z", "lastUsedAt": "2025-05-01T00:00:00Z"}
+            ]}),
+        );
+        write_app_file(
+            &app_dir,
+            "config.json",
+            &json!({"changeHistory": {
+                "ws-hist": [{"file": "a.rs", "summary": "changed"}],
+                "ws-unknown": [{"file": "b.rs", "summary": "dropped"}]
+            }}),
+        );
+        let store = open_store().await;
+
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                app_dir: Some(app_dir.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = report.app_settings.expect("app settings ran");
+        assert_eq!(app.repos_imported, 2, "{report}");
+        assert_eq!(app.history_imported, 1, "{report}");
+        assert_eq!(app.history_filtered, 1, "{report}");
+        assert_eq!(app.failed, 0, "{report}");
+
+        let repos: Value =
+            serde_json::from_str(&store.get_setting("repos.known").await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(repos.as_array().unwrap().len(), 2);
+        let history: Value = serde_json::from_str(
+            &store
+                .get_setting("workspace.changeHistory")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(history.get("ws-hist").is_some());
+        assert!(history.get("ws-unknown").is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&app_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn app_level_blobs_never_clobber_existing_settings() {
+        let root = temp_root("app-preserve");
+        let app_dir = temp_root("app-preserve-dir");
+        write_legacy_workspace(&root, "ws-keep", json!({}));
+        write_app_file(
+            &app_dir,
+            "repo-registry.json",
+            &json!({"knownRepos": [{"path": "/tmp/new", "name": "new"}]}),
+        );
+        write_app_file(
+            &app_dir,
+            "config.json",
+            &json!({"changeHistory": {"ws-keep": [{"file": "x"}]}}),
+        );
+        let store = open_store().await;
+        store
+            .set_setting("repos.known", &json!([{"path": "/tmp/mine"}]).to_string())
+            .await
+            .unwrap();
+        store
+            .set_setting(
+                "workspace.changeHistory",
+                &json!({"ws-mine": []}).to_string(),
+            )
+            .await
+            .unwrap();
+
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                app_dir: Some(app_dir.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = report.app_settings.expect("app settings ran");
+        assert!(app.repos_preserved, "{report}");
+        assert!(app.history_preserved, "{report}");
+        assert_eq!(app.repos_imported, 0, "{report}");
+        assert_eq!(app.history_imported, 0, "{report}");
+
+        let repos: Value =
+            serde_json::from_str(&store.get_setting("repos.known").await.unwrap().unwrap())
+                .unwrap();
+        assert_eq!(repos[0]["path"], json!("/tmp/mine"));
+        let history: Value = serde_json::from_str(
+            &store
+                .get_setting("workspace.changeHistory")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(history.get("ws-mine").is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&app_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn app_dir_dry_run_missing_or_malformed_files() {
+        let root = temp_root("app-edge");
+        write_legacy_workspace(&root, "ws-edge", json!({}));
+        let store = open_store().await;
+
+        // Dry-run never touches app settings even with an app_dir configured.
+        let app_dir = temp_root("app-edge-dir");
+        write_app_file(
+            &app_dir,
+            "repo-registry.json",
+            &json!({"knownRepos": [{"path": "/tmp/x"}]}),
+        );
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                dry_run: true,
+                app_dir: Some(app_dir.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(report.app_settings.is_none(), "{report}");
+        assert!(store.get_setting("repos.known").await.unwrap().is_none());
+
+        // Missing files: soft no-op. Malformed files: counted failed.
+        std::fs::remove_dir_all(&app_dir).ok();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.json"), "{ nope").unwrap();
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                force: true,
+                app_dir: Some(app_dir.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = report.app_settings.expect("app settings ran");
+        assert_eq!(app.failed, 1, "{report}");
+        assert_eq!(app.repos_imported, 0, "{report}");
+        assert!(store.get_setting("repos.known").await.unwrap().is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&app_dir).ok();
+    }
+
+    #[test]
+    fn setting_emptiness_probe() {
+        assert!(setting_is_empty(None));
+        assert!(setting_is_empty(Some("null")));
+        assert!(setting_is_empty(Some("[]")));
+        assert!(setting_is_empty(Some("{}")));
+        assert!(setting_is_empty(Some("\"\"")));
+        assert!(setting_is_empty(Some("not json")));
+        assert!(!setting_is_empty(Some("[1]")));
+        assert!(!setting_is_empty(Some("{\"a\":1}")));
+        assert!(!setting_is_empty(Some("\"x\"")));
     }
 }
