@@ -52,8 +52,8 @@ pub const AUTH_PROBE_PROVIDERS: &[&str] = &[
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
 /// `grok models` / `auggie model list`). Matches the doctor's historical 8s
-/// budget; opencode and the ACP probes carry their own budgets in
-/// [`crate::provider_models`].
+/// budget; opencode uses [`OPENCODE_READY_TIMEOUT`] and the droid/pi ACP
+/// probes carry their own budgets in [`crate::provider_models`].
 const CLI_AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long one provider's probe outcome is served from cache. Auth state
