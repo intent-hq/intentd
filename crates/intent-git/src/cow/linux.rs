@@ -9,9 +9,10 @@ use std::path::Path;
 
 use super::CowSupport;
 
-// FICLONE ioctl number from linux/fs.h
+// FICLONE ioctl number from linux/fs.h. libc::Ioctl is the target's ioctl
+// request type (c_ulong on glibc, c_int on musl).
 #[cfg(target_os = "linux")]
-const FICLONE: libc::c_ulong = 0x40049409;
+const FICLONE: libc::Ioctl = 0x40049409;
 
 /// Get volume IDs (st_dev) for both paths as a cache key.
 pub(super) fn get_volume_id_pair(src: &Path, dst: &Path) -> Option<(u64, u64)> {
