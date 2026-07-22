@@ -57,7 +57,7 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 | `intent-store` | SQLite persistence via `sqlx` + embedded migrations. |
 | `intent-services` | `WorkspaceApi` implementation (the shared service surface) + the `AgentManager`, MCP callback server, and per-domain ops. |
 | `intent-transport` | JSON-RPC router + UDS listener, the WSS/TLS listener, bearer auth + origin allow-list, and heartbeat. |
-| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`service`/`mcp-bridge`). |
+| `intentd` | Binary composition root + CLI (`serve`/`call`/`status`/`stop`/`doctor`/`import`/`mcp-bridge`). |
 | `intent-acp` | ACP client core + `AgentManager` orchestration, agent→BE MCP callback server, and the loopback MCP bridge. |
 | `intent-providers` | Provider registry + model resolution for spawning agent runtimes. |
 | `intent-sourcecontrol` | GitHub/PR via `octocrab` (REST + GraphQL), token resolution, GHE support. |
@@ -157,8 +157,9 @@ For the authoritative, dated progress log see
   / accept-changes pipeline, and ripgrep-backed search.
 - **Terminals & scripts:** a unified `intent-pty` host backing both interactive terminals and
   scripts (back-fill-then-tail scrollback, multi-client fan-out, process-group reaping).
-- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, `service install|uninstall|status`,
-  and `mcp-bridge`.
+- **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, and `mcp-bridge`. The daemon
+  does not manage its own service unit: supervision is owned by the platform package manager —
+  `brew services start intentd` on macOS, and the distro package (future .deb) on Linux.
 - **Persistence:** SQLite via `sqlx` with embedded migrations through `0012_known_repo`
   (WAL, `foreign_keys`, `busy_timeout`).
 - Standard JSON-RPC error codes: `-32700`, `-32600`, `-32601`, `-32602`, `-32603`.
