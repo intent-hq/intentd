@@ -256,7 +256,7 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
                 .auth_status()
         }
         "opencode" => check_opencode_auth(&program).await,
-        "droid" => crate::provider_models::probe_droid_auth().await,
+        "droid" => crate::provider_models::probe_droid_auth(program.into()).await,
         "pi" => crate::provider_models::probe_pi_auth().await,
         _ => None,
     }

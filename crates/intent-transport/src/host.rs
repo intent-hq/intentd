@@ -306,10 +306,20 @@ pub(crate) async fn handle(
                     ));
                 }
             };
-            let force = params
-                .get("force")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let force = match params.get("force") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        id_echo,
+                        -32602,
+                        "Invalid parameter: force must be a boolean",
+                    ));
+                }
+            };
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
                 force,

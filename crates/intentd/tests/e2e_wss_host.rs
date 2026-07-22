@@ -237,8 +237,11 @@ where
     ws.send(Message::Text(frame.to_string()))
         .await
         .expect("send rpc frame");
+    // One overall budget: unrelated frames (events, pings) consume the same
+    // deadline rather than resetting it per iteration.
+    let deadline = tokio::time::Instant::now() + deadline;
     loop {
-        let next = timeout(deadline, ws.next())
+        let next = tokio::time::timeout_at(deadline, ws.next())
             .await
             .expect("wss rpc timed out");
         match next {

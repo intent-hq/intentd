@@ -242,10 +242,9 @@ pub async fn fetch_droid_models() -> ProviderModelsFetch {
 /// [`fetch_droid_models`], mapped to auth semantics (parity with the FE
 /// `checkDroidReady`) — a non-empty model list ⇒ authenticated, an explicit
 /// auth-required error ⇒ not authenticated, anything else (timeout, spawn
-/// failure, empty catalog) ⇒ unknown. The caller gates on the `droid` binary
-/// being installed.
-pub async fn probe_droid_auth() -> Option<bool> {
-    let bin = find_provider_binary("droid", "droid", None)?;
+/// failure, empty catalog) ⇒ unknown. `bin` is the caller-resolved `droid`
+/// binary (the caller's install gate).
+pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
     let args = vec![
         "exec".to_string(),
         "--output-format".to_string(),
@@ -270,8 +269,9 @@ pub async fn probe_droid_auth() -> Option<bool> {
 /// model list ⇒ authenticated; an empty list or an explicit auth-required
 /// error ⇒ not authenticated (pi's adapter serves only credentialed models);
 /// spawn failure / timeout / transport error ⇒ unknown. The caller gates on
-/// the `pi` CLI being installed.
-pub async fn probe_pi_auth() -> Option<bool> {
+/// the `pi` CLI being installed; the probe itself runs the pinned npx
+/// adapter.
+pub(crate) async fn probe_pi_auth() -> Option<bool> {
     let npx = find_npx()?;
     let cmd = AcpProbeCommand::npx(npx, PI_ACP_NPX_PACKAGE);
     let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "pi")).await;

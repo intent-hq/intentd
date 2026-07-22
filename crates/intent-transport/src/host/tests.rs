@@ -464,6 +464,23 @@ async fn handle_provider_auth_status_rejects_non_string_provider_id() {
 }
 
 #[tokio::test]
+async fn handle_provider_auth_status_rejects_non_bool_force() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 27,
+        "method": "host.providerAuthStatus",
+        "params": { "force": "yes" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("non-boolean force produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 27);
+    assert_eq!(parsed["error"]["code"], -32602);
+}
+
+#[tokio::test]
 async fn handle_provider_auth_status_scoped_to_grok_returns_one_entry() {
     // grok's install gate is a pure filesystem check; on hosts without grok
     // the probe never spawns and `authenticated` is null — the shape holds
