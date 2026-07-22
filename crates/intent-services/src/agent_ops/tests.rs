@@ -851,6 +851,269 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     assert!(restarted.delegation_group_for_parent(&caller).is_none());
 }
 
+/// Poll until the persisted completion_watch table reaches `expected` rows
+/// (registration/removal persistence is spawned, not awaited).
+async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("list persisted watches");
+        if rows.len() == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {expected} persisted completion_watch rows, found {}",
+            rows.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Restart durability: a oneShot completion watch registered before a daemon
+/// restart is rehydrated by `heal_completion_watches_on_startup` and still
+/// wakes the parent when the child completes AFTER the restart; the fired
+/// watch's persisted row is removed.
+#[tokio::test]
+async fn completion_watch_survives_restart_and_fires_post_restart() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child)
+    }; // old Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "one watch rehydrated");
+
+    // Child completes post-restart → the rehydrated watch wakes the parent.
+    restarted
+        .handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({ "agentId": child.0, "lastResponseSummary": "shipped it" }),
+        ))
+        .await;
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "exactly one wake post-restart");
+    assert!(restarted.find_watches_for_child(&child).is_empty());
+    wait_for_persisted_watches(&restarted, 0).await;
+}
+
+/// Rehydration reconciliation: a child that completed while the daemon was
+/// down (Completed + completion report) delivers its wake immediately on
+/// startup instead of leaving the parent waiting forever.
+#[tokio::test]
+async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        (parent, child)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // The child finished during the downtime (STAB-108 predicate: Completed
+    // with a completion report).
+    let mut s = store
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.status = intent_core::AgentStatus::Completed;
+    s.completion_report = Some("done while down".into());
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark child");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 1, "watch rehydrated before reconciliation");
+
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "reconciliation delivered the wake"
+    );
+    assert!(
+        restarted.find_watches_for_child(&child).is_empty(),
+        "fired oneShot watch removed after reconciliation"
+    );
+    wait_for_persisted_watches(&restarted, 0).await;
+}
+
+/// Rehydration pruning: rows whose parent is gone, whose delegation group no
+/// longer exists, or whose leak-guard deadline already elapsed are pruned
+/// (deleted from the DB) instead of being loaded.
+#[tokio::test]
+async fn completion_watch_rehydration_prunes_dead_rows() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (gone_parent, live_parent) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let gone_parent = create_agent(&svc, &ws, "GoneParent").await;
+        let live_parent = create_agent(&svc, &ws, "LiveParent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        // Watch 1: parent will be Deleted before the restart.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            gone_parent.clone(),
+            "GoneParent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register watch 1");
+        // Watch 2: grouped, but its delegation group never persisted (fired),
+        // so post-restart the group is gone from memory.
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            live_parent.clone(),
+            "LiveParent".into(),
+            child.clone(),
+            false,
+            Some("group-gone".into()),
+        )
+        .expect("register watch 2");
+        wait_for_persisted_watches(&svc, 2).await;
+        (gone_parent, live_parent)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let mut s = store
+        .get_agent_session(&gone_parent)
+        .await
+        .expect("gone parent session");
+    s.status = intent_core::AgentStatus::Deleted;
+    store
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("mark parent deleted");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 0, "both rows pruned, nothing rehydrated");
+    assert!(restarted.list_watches_for_parent(&gone_parent).is_empty());
+    assert!(restarted.list_watches_for_parent(&live_parent).is_empty());
+    // Pruned rows are deleted, so a second startup pass is a no-op.
+    wait_for_persisted_watches(&restarted, 0).await;
+    let again = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("second heal");
+    assert_eq!(again, 0);
+}
+
+/// No double delivery: a oneShot watch that FIRED before the restart deleted
+/// its persisted row, so rehydration loads nothing and the parent keeps
+/// exactly the one pre-restart wake.
+#[tokio::test]
+async fn fired_completion_watch_does_not_rehydrate() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (parent, child) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
+        wait_for_persisted_watches(&svc, 1).await;
+        // Fire before the restart: delivery removes the watch + its row.
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &child,
+            json!({ "agentId": child.0, "lastResponseSummary": "shipped it" }),
+        ))
+        .await;
+        wait_for_persisted_watches(&svc, 0).await;
+        (parent, child)
+    };
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let loaded = restarted
+        .heal_completion_watches_on_startup()
+        .await
+        .expect("heal watches");
+    assert_eq!(loaded, 0, "fired watch must not rehydrate");
+    assert!(restarted.find_watches_for_child(&child).is_empty());
+    let session = restarted
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "only the pre-restart wake");
+}
+
 /// Scope gate: a non-chief caller may not wait on a target outside its own
 /// workspace — rejected for BOTH modes and side-effect free (no watches, no
 /// group), even when a same-workspace target precedes the offending one.

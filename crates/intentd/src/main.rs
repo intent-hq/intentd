@@ -600,6 +600,16 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         ),
         Err(e) => tracing::warn!(error = %e, "delegation group startup rehydration failed"),
     }
+    // Rehydrate persisted completion watches AFTER delegation groups so
+    // grouped watches can find their live groups (a grouped watch whose group
+    // is gone is pruned). Watches whose child completed during the downtime
+    // wake the parent immediately. Best-effort: a failure is logged but never
+    // aborts startup.
+    match services.heal_completion_watches_on_startup().await {
+        Ok(0) => {}
+        Ok(loaded) => tracing::info!(loaded, "rehydrated persisted completion watches on startup"),
+        Err(e) => tracing::warn!(error = %e, "completion watch startup rehydration failed"),
+    }
     // Hydrate the script registry from the persisted definitions (§5.8) so
     // `script.*` survives daemon restarts. Best-effort: a failure is logged
     // but never aborts startup (scripts can still be re-created live).
