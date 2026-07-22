@@ -285,12 +285,37 @@ fn stderr_tail(stderr: &[String]) -> Option<String> {
 /// (mirrors `host_exec::TERM_GRACE` / `mcp_servers::reap`).
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
+/// Bound on how many descendant pids the pre-kill snapshot tracks — keeps the
+/// backstop sweep cheap even against a pathological fork storm.
+#[cfg(unix)]
+const DESCENDANT_SWEEP_CAP: usize = 64;
+/// Timeout on the `ps` snapshot used for the descendant sweep; a hung `ps`
+/// must not stall probe reaping.
+#[cfg(unix)]
+const PS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Kill the probe child and reap it. Signals the whole process group (the
 /// child is its own group leader via `process_group(0)`) so grandchildren
 /// (e.g. `npx` → `node`) die too, following the crate's SIGTERM → grace →
 /// SIGKILL pattern, then waits briefly so the child does not linger as a
 /// zombie. `kill_on_drop(true)` back-stops any wait timeout.
+///
+/// Group signalling alone is not enough: adapters can start MCP servers that
+/// move into their OWN process groups (observed live: codex-acp's auggie MCP
+/// server ran as its own group leader, so `killpg` on the probe group never
+/// reached it and it survived orphaned). As a backstop, the child's
+/// descendant pids are snapshotted *before* killing and any survivors are
+/// swept afterwards, regardless of process group. Snapshot-before-kill is
+/// the only viable ordering (post-kill, escaped descendants reparent to init
+/// and are invisible to a ppid walk), so anything the adapter spawns between
+/// the snapshot and the kill is missed — accepted for a best-effort backstop.
+/// The happy path pays one short-lived `ps` per probe teardown for this.
 async fn reap_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    let descendants = match child.id() {
+        Some(pid) => descendant_pids(pid).await,
+        None => Vec::new(),
+    };
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         use nix::sys::signal::{killpg, Signal};
@@ -304,6 +329,102 @@ async fn reap_child(child: &mut tokio::process::Child) {
     }
     let _ = child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    #[cfg(unix)]
+    sweep_escaped_descendants(&descendants).await;
+}
+
+/// Snapshot the probe child's descendant pids by walking the system
+/// `pid → ppid` table (`ps -axo pid=,ppid=`, portable across macOS and
+/// Linux). Best-effort: any failure (spawn error, timeout, unparseable
+/// output) yields an empty snapshot rather than an error — the sweep is a
+/// backstop, never a probe failure.
+#[cfg(unix)]
+async fn descendant_pids(root: u32) -> Vec<i32> {
+    let Ok(root) = i32::try_from(root) else {
+        return Vec::new();
+    };
+    let mut ps = tokio::process::Command::new("ps");
+    ps.args(["-axo", "pid=,ppid="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(PS_SNAPSHOT_TIMEOUT, async {
+        ps.spawn()?.wait_with_output().await
+    })
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => out.stdout,
+        _ => return Vec::new(),
+    };
+    let table: Vec<(i32, i32)> = String::from_utf8_lossy(&output)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.parse().ok()?;
+            Some((pid, ppid))
+        })
+        .collect();
+    descendants_in_table(&table, root)
+}
+
+/// Breadth-first walk of a `(pid, ppid)` table from `root`, returning up to
+/// [`DESCENDANT_SWEEP_CAP`] descendant pids (children, grandchildren, …).
+/// Cycle-safe via a visited set even though real ppid tables are acyclic.
+#[cfg(unix)]
+fn descendants_in_table(table: &[(i32, i32)], root: i32) -> Vec<i32> {
+    use std::collections::{HashSet, VecDeque};
+    let mut out = Vec::new();
+    let mut seen: HashSet<i32> = HashSet::from([root]);
+    let mut queue = VecDeque::from([root]);
+    while let Some(parent) = queue.pop_front() {
+        for &(pid, ppid) in table {
+            if ppid == parent && seen.insert(pid) {
+                out.push(pid);
+                queue.push_back(pid);
+                if out.len() >= DESCENDANT_SWEEP_CAP {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// SIGTERM → grace → SIGKILL any snapshotted descendants that survived the
+/// group kill (i.e. escaped into a foreign process group). Pids that already
+/// died — or whose pid was recycled into the daemon's own process group — are
+/// skipped, and the SIGKILL pass only revisits pids that were alive at the
+/// SIGTERM pass. This bounds (but, like any pid-based sweep, cannot fully
+/// eliminate) the window in which a recycled pid could be signalled.
+#[cfg(unix)]
+async fn sweep_escaped_descendants(pids: &[i32]) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::{getpgid, Pid};
+    let own_pgid = getpgid(None).ok();
+    let survivor = |pid: i32| -> Option<Pid> {
+        if pid <= 1 {
+            return None;
+        }
+        let pid = Pid::from_raw(pid);
+        let pgid = getpgid(Some(pid)).ok()?;
+        if Some(pgid) == own_pgid {
+            return None;
+        }
+        Some(pid)
+    };
+    let survivors: Vec<Pid> = pids.iter().filter_map(|&p| survivor(p)).collect();
+    if survivors.is_empty() {
+        return;
+    }
+    for pid in &survivors {
+        let _ = kill(*pid, Signal::SIGTERM);
+    }
+    tokio::time::sleep(TERM_GRACE).await;
+    for pid in survivors.iter().filter_map(|p| survivor(p.as_raw())) {
+        let _ = kill(pid, Signal::SIGKILL);
+    }
 }
 
 /// `initialize` → `session/new`, watching for model rows in either the
@@ -402,5 +523,103 @@ fn map_acp_error(err: intent_acp::AcpError) -> ProbeError {
         }
         intent_acp::AcpError::Rpc(e) => ProbeError::Rpc(e),
         other => ProbeError::Transport(other.to_string()),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod reap_tests {
+    use super::*;
+
+    #[test]
+    fn descendants_in_table_walks_transitively() {
+        let table = [(10, 1), (11, 10), (12, 10), (13, 11), (99, 98)];
+        let mut got = descendants_in_table(&table, 10);
+        got.sort_unstable();
+        assert_eq!(got, vec![11, 12, 13]);
+    }
+
+    #[test]
+    fn descendants_in_table_is_cycle_safe_and_capped() {
+        let cycle = [(11, 10), (10, 11)];
+        assert_eq!(descendants_in_table(&cycle, 10), vec![11]);
+
+        let wide: Vec<(i32, i32)> = (0..200).map(|i| (100 + i, 10)).collect();
+        assert_eq!(
+            descendants_in_table(&wide, 10).len(),
+            DESCENDANT_SWEEP_CAP,
+            "snapshot must stay bounded"
+        );
+    }
+
+    /// Regression for the live escape: an MCP-server-style grandchild that
+    /// moves into its OWN process group survives `killpg` on the probe group
+    /// (observed: codex-acp's auggie ran with pgid == its own pid); the
+    /// descendant sweep must still reap it. Mirrors intent-acp's
+    /// `kill_reaps_grandchildren_via_process_group`, except the grandchild
+    /// escapes the group via `set -m` job control (background jobs become
+    /// their own group leaders).
+    #[tokio::test]
+    async fn reap_child_sweeps_grandchild_in_foreign_process_group() {
+        use nix::unistd::{getpgid, Pid};
+
+        let pidfile =
+            std::env::temp_dir().join(format!("intent-probe-sweep-{}.pid", uuid::Uuid::new_v4()));
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(r#"set -m; sleep 300 & echo $! > "$INTENT_TEST_PIDFILE"; wait"#)
+            .env("INTENT_TEST_PIDFILE", &pidfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn bash child");
+
+        let mut grandchild_pid = None;
+        for _ in 0..250 {
+            if let Ok(s) = tokio::fs::read_to_string(&pidfile).await {
+                if let Ok(pid) = s.trim().parse::<i32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid written");
+
+        // Prove the grandchild actually escaped the probe's process group —
+        // otherwise killpg would reach it and the test would be vacuous.
+        let child_pgid = getpgid(Some(Pid::from_raw(child.id().expect("child pid") as i32)))
+            .expect("child pgid");
+        let grandchild_pgid =
+            getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
+        assert_ne!(
+            grandchild_pgid, child_pgid,
+            "grandchild must be in a foreign process group for this regression test"
+        );
+
+        // Distinct failure signal for the snapshot path: if `ps` stalls past
+        // its budget on a loaded runner the snapshot comes back empty and the
+        // sweep silently no-ops — fail here, not at the terminal panic below.
+        let snapshot = descendant_pids(child.id().expect("child pid")).await;
+        assert!(
+            snapshot.contains(&grandchild_pid),
+            "descendant snapshot {snapshot:?} must include grandchild {grandchild_pid} \
+             (empty/partial snapshot ⇒ `ps` walk failed, not the sweep)"
+        );
+
+        reap_child(&mut child).await;
+        tokio::fs::remove_file(&pidfile).await.ok();
+
+        // `kill(pid, 0)` returns ESRCH once the pid is gone (the grandchild
+        // is not our direct child, so init reaps it after the sweep's kill).
+        for _ in 0..100 {
+            if nix::sys::signal::kill(Pid::from_raw(grandchild_pid), None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild pid {grandchild_pid} still alive after reap_child sweep");
     }
 }
