@@ -69,7 +69,7 @@ client depends on, and only an e2e test exercises it.
     origin allow-list, fingerprint pinning all in play).
   - Sends the JSON-RPC **request** envelope for each new method.
   - Asserts the **response** envelope shape — `id`, `jsonrpc`, `result` / `error` —
-    matches what `docs/PROTOCOL.md` defines for that method, byte-for-byte.
+    matches what `../../docs/PROTOCOL.md` defines for that method, byte-for-byte.
   - For methods that emit events, subscribes via `events.subscribe`, drives the action,
     and asserts the resulting `events.event` notifications.
 - Crate-level unit tests for non-trivial logic stay alongside the implementation; the WSS
@@ -106,7 +106,7 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
 
 ### Asserting the protocol contract
 
-`docs/PROTOCOL.md` in the monorepo is the single source of truth for the wire
+`../../docs/PROTOCOL.md` in the monorepo is the single source of truth for the wire
 contract. When adding or changing a method, the WSS e2e is what proves the daemon meets
 that contract:
 
