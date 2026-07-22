@@ -4034,7 +4034,7 @@ fn ready_tasks_changed_event(
 }
 
 /// Build a `workspace:activity-changed` change event with the self-sufficient
-/// payload `{ workspaceId, activity }` (PROTOCOL §6.5 / IMPLEMENTATION_SPEC §10.1).
+/// payload `{ workspaceId, activity }` (PROTOCOL §6.5).
 fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivity) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -4053,7 +4053,7 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
 }
 
 /// Build a `workspace:attention-changed` change event with the self-sufficient
-/// payload `{ workspaceId, attention }` (PROTOCOL §6.5 / IMPLEMENTATION_SPEC §10.1).
+/// payload `{ workspaceId, attention }` (PROTOCOL §6.5).
 fn attention_changed_event(workspace_id: &WorkspaceId, attention: WorkspaceAttention) -> NewEvent {
     NewEvent {
         workspace_id: workspace_id.clone(),

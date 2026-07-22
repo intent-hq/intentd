@@ -35,17 +35,16 @@ crates/
 ```
 
 The `intentd` binary is the only composition root that wires concrete implementations
-together. Dependency direction is enforced per `docs/00_initial_porting/IMPLEMENTATION_SPEC.md`
-§3.2 — `intent-core` is the leaf and `intent-transport` depends only on `intent-services`,
-never on `intent-store`.
+together. Dependency direction is enforced per the "Dependency-direction rules" in
+`../../docs/ARCHITECTURE.md` — `intent-core` is the leaf and `intent-transport` depends
+only on `intent-services`, never on `intent-store`.
 
 ## Where to look
 
 | Working on…                  | Open                                                         |
 | ---------------------------- | ------------------------------------------------------------ |
-| wire protocol / envelopes    | `../../docs/00_initial_porting/PROTOCOL.md`                  |
-| architecture / crate map     | `../../docs/00_initial_porting/IMPLEMENTATION_SPEC.md`       |
-| porting progress             | `../../docs/00_initial_porting/BREADCRUMBS.md`               |
+| wire protocol / envelopes    | `../../docs/PROTOCOL.md`                                     |
+| architecture / crate map     | `../../docs/ARCHITECTURE.md`                                 |
 | UDS JSON-RPC router          | `crates/intent-transport/`                                   |
 | WSS / TLS                    | `crates/intent-transport/` (WSS listener, fingerprint)      |
 | domain logic / `WorkspaceApi`| `crates/intent-services/`                                    |
@@ -70,7 +69,7 @@ client depends on, and only an e2e test exercises it.
     origin allow-list, fingerprint pinning all in play).
   - Sends the JSON-RPC **request** envelope for each new method.
   - Asserts the **response** envelope shape — `id`, `jsonrpc`, `result` / `error` —
-    matches what `docs/00_initial_porting/PROTOCOL.md` defines for that method, byte-for-byte.
+    matches what `../../docs/PROTOCOL.md` defines for that method, byte-for-byte.
   - For methods that emit events, subscribes via `events.subscribe`, drives the action,
     and asserts the resulting `events.event` notifications.
 - Crate-level unit tests for non-trivial logic stay alongside the implementation; the WSS
@@ -107,7 +106,7 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
 
 ### Asserting the protocol contract
 
-`docs/00_initial_porting/PROTOCOL.md` is the single source of truth for the wire
+`../../docs/PROTOCOL.md` in the monorepo is the single source of truth for the wire
 contract. When adding or changing a method, the WSS e2e is what proves the daemon meets
 that contract:
 
