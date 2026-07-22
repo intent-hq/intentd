@@ -26,8 +26,29 @@ pub(crate) const NO_ACTIVE_PR: &str = "No active PR";
 /// Map a forge error onto the domain `Internal` error (→ `-32603`): the TS
 /// `pr.*` handlers wrap every underlying throw in `INTERNAL_ERROR` (§5.7), and
 /// the graceful "not configured" path (§8.3) surfaces the same way.
+/// `Unsupported` (§7.2/§7.4 capability gating) maps onto a stable wire message
+/// with the `unsupported by provider:` prefix so clients can match on it.
 pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
-    Error::Internal(e.to_string())
+    match e {
+        intent_sourcecontrol::Error::Unsupported(msg) => {
+            Error::Internal(format!("unsupported by provider: {msg}"))
+        }
+        other => Error::Internal(other.to_string()),
+    }
+}
+
+/// Runtime capability gate (§7.2/§7.4): `supported` is the relevant
+/// [`intent_sourcecontrol::ScCapabilities`] flag of the active host; `false`
+/// surfaces [`intent_sourcecontrol::Error::Unsupported`] through
+/// [`map_sc_err`] (stable `unsupported by provider:` message, code `-32603`).
+pub(crate) fn require_capability(supported: bool, operation: &str) -> Result<()> {
+    if supported {
+        Ok(())
+    } else {
+        Err(map_sc_err(intent_sourcecontrol::Error::Unsupported(
+            operation.to_string(),
+        )))
+    }
 }
 
 /// Resolve the active [`SourceControl`]: the injected handle (tests / explicit

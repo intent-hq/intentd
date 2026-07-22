@@ -12995,6 +12995,26 @@ impl WorkspaceApi for Services {
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
     // ========================================================================
 
+    fn pr_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // Requires a resolvable provider but NOT an active PR — the FE
+            // gates UI on the flags before any PR exists (§5.7 extension).
+            // Workspace existence is still validated so a bogus id fails like
+            // every other workspace-scoped method.
+            store.get_workspace(&workspace_id).await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            Ok(serde_json::json!({
+                "provider": sc.provider_id(),
+                "capabilities": sc.capabilities(),
+            }))
+        })
+    }
+
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
@@ -13185,6 +13205,7 @@ impl WorkspaceApi for Services {
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
+            pr_ops::require_capability(sc.capabilities().check_runs, "check runs")?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let git_ref = match git_ref {
                 Some(r) => r,
@@ -13246,6 +13267,16 @@ impl WorkspaceApi for Services {
                     let (owner, repo) = pr_ops::repo_of(&ws)?;
                     let number = pr_ops::active_pr_number(&ws)?;
                     let sc = pr_ops::resolve_source_control(injected).await?;
+                    let caps = sc.capabilities();
+                    match method {
+                        intent_sourcecontrol::MergeMethod::Squash => {
+                            pr_ops::require_capability(caps.squash_merge, "squash merge")?
+                        }
+                        intent_sourcecontrol::MergeMethod::Rebase => {
+                            pr_ops::require_capability(caps.rebase_merge, "rebase merge")?
+                        }
+                        intent_sourcecontrol::MergeMethod::Merge => {}
+                    }
                     let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
                     let pr = sc
                         .get_pr(&repo_ref, number)
@@ -13447,6 +13478,12 @@ impl WorkspaceApi for Services {
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
+            if verdict == intent_sourcecontrol::ReviewVerdict::RequestChanges {
+                pr_ops::require_capability(
+                    sc.capabilities().review_required_changes,
+                    "request-changes review",
+                )?;
+            }
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let review = sc
                 .submit_review(&repo_ref, number, verdict, body)

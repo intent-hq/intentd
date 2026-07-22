@@ -4931,6 +4931,10 @@ mod pr {
         /// driven by a numeric cursor (comment id `n` on page `n`, no reply
         /// parent), exercising the multi-page REST fallback.
         review_comment_pages: u64,
+        /// When set, overrides the advertised [`ScCapabilities`] (default is
+        /// all-true), exercising the `pr.capabilities` surface + runtime
+        /// gating of `pr.merge` / `pr.createReview` / `pr.listCheckRuns`.
+        capabilities: Option<ScCapabilities>,
         head_seq: AtomicU64,
         /// Notified on the first `get_pr` call — the point at which
         /// `pr.waitForChanges` has finished its one SQLite read and is past it.
@@ -4964,14 +4968,14 @@ mod pr {
             "stub"
         }
         fn capabilities(&self) -> ScCapabilities {
-            ScCapabilities {
+            self.capabilities.unwrap_or(ScCapabilities {
                 draft_prs: true,
                 squash_merge: true,
                 rebase_merge: true,
                 review_required_changes: true,
                 check_runs: true,
                 issues: true,
-            }
+            })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
             Ok(AuthStatus {
@@ -5905,6 +5909,163 @@ mod pr {
         let v = svc.pr_update_branch(ws).await.expect("update branch");
         assert_eq!(v["method"], "merge");
         assert_eq!(v["alreadyUpToDate"], false);
+    }
+
+    // ---- pr.capabilities + runtime gating (§5.7 extension, §7.2/§7.4) ------
+
+    /// All capability flags disabled except plain merge (which is never gated).
+    fn no_caps() -> ScCapabilities {
+        ScCapabilities {
+            draft_prs: false,
+            squash_merge: false,
+            rebase_merge: false,
+            review_required_changes: false,
+            check_runs: false,
+            issues: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn capabilities_returns_provider_and_camel_case_flags() {
+        // `with_pr: false` — pr.capabilities must NOT require an active PR.
+        let (_t, svc, ws) = setup(false, false).await;
+        let v = svc.pr_capabilities(ws).await.expect("capabilities");
+        assert_eq!(v["provider"], "stub");
+        let caps = &v["capabilities"];
+        assert_eq!(caps["draftPrs"], true);
+        assert_eq!(caps["squashMerge"], true);
+        assert_eq!(caps["rebaseMerge"], true);
+        assert_eq!(caps["reviewRequiredChanges"], true);
+        assert_eq!(caps["checkRuns"], true);
+        assert_eq!(caps["issues"], true);
+    }
+
+    #[tokio::test]
+    async fn capabilities_reflects_provider_flags() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let v = svc.pr_capabilities(ws).await.expect("capabilities");
+        assert_eq!(v["capabilities"]["squashMerge"], false);
+        assert_eq!(v["capabilities"]["checkRuns"], false);
+    }
+
+    #[tokio::test]
+    async fn capabilities_unknown_workspace_is_not_found() {
+        let (_t, svc, _ws) = setup(false, false).await;
+        let err = svc
+            .pr_capabilities(WorkspaceId::from_string("nope"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn merge_gated_when_squash_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc
+            .pr_merge(ws, Some("squash".into()), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_gated_when_rebase_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc
+            .pr_merge(ws, Some("rebase".into()), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
+    }
+
+    #[tokio::test]
+    async fn plain_merge_not_gated_by_capabilities() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_merge(ws, None, None, None, None)
+            .await
+            .expect("merge");
+        assert_eq!(v["merged"], true);
+        assert_eq!(v["mergeMethod"], "merge");
+    }
+
+    #[tokio::test]
+    async fn create_review_gated_when_request_changes_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc
+            .pr_create_review(ws, "request-changes".into(), Some("needs work".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
+    }
+
+    #[tokio::test]
+    async fn create_review_approve_not_gated() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_create_review(ws, "approve".into(), None)
+            .await
+            .expect("review");
+        assert_eq!(v["review"]["verdict"], "approve");
+    }
+
+    #[tokio::test]
+    async fn list_check_runs_gated_when_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc.pr_list_check_runs(ws, None).await.unwrap_err();
+        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
     }
 
     #[tokio::test]
