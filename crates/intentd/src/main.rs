@@ -27,7 +27,6 @@ use sqlx::Row;
 
 mod client;
 mod import;
-mod service;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -84,12 +83,6 @@ enum Command {
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
     Doctor,
-    /// Install/uninstall/validate the platform service unit (launchd/systemd,
-    /// §5.8) so the daemon runs unattended under the OS service manager.
-    Service {
-        #[command(subcommand)]
-        action: ServiceAction,
-    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -139,17 +132,6 @@ enum Command {
     },
 }
 
-/// Sub-actions for `intentd service` (daemonization, §5.8).
-#[derive(Debug, Subcommand)]
-enum ServiceAction {
-    /// Install (or refresh) the launchd/systemd user unit.
-    Install,
-    /// Remove the installed unit.
-    Uninstall,
-    /// Report whether the unit is installed and current (non-zero if not).
-    Status,
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -165,7 +147,6 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
-        Command::Service { action } => to_exit(cmd_service(&action)),
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
@@ -2035,22 +2016,6 @@ async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
     {
         let _ = (pid, graceful);
         StopOutcome::Failed
-    }
-}
-
-/// Install/uninstall/validate the platform service unit (§5.8).
-fn cmd_service(action: &ServiceAction) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    match action {
-        ServiceAction::Install => service::install(&config),
-        ServiceAction::Uninstall => service::uninstall(&config),
-        ServiceAction::Status => {
-            if service::status(&config)? {
-                Ok(())
-            } else {
-                anyhow::bail!("service unit not installed or stale")
-            }
-        }
     }
 }
 
