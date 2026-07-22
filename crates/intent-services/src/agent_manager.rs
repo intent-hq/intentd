@@ -1914,8 +1914,20 @@ impl AgentManager {
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
     async fn detach(&self, agent_id: &AgentId) -> (bool, Option<Child>) {
+        // Snapshot the live-turn slot BEFORE aborting the worker (the abort
+        // drops LiveTurnGuard, clearing the slot), then flush the partial
+        // in-flight assistant content AFTER the abort so the worker cannot
+        // race the append — same convention as the graceful-shutdown flush.
+        // No-op when the slot is empty or was already flushed by a caller
+        // (e.g. shutdown(), which flushes before delegating here).
+        let partial_turn = self.services.live_turn(agent_id);
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+        }
+        if let Some(live) = partial_turn {
+            self.services
+                .flush_partial_turn_on_interruption(agent_id, live)
+                .await;
         }
         // Drop any pending recreate/prepend flags: the next spawn re-decides
         // resume vs recreate from scratch, so stale flags must not survive a
@@ -1977,10 +1989,27 @@ impl AgentManager {
         let Some(acp_session_id) = acp_session_id else {
             return self.stop(agent_id).await;
         };
+        // Snapshot the live-turn slot BEFORE aborting the worker: the abort
+        // drops the worker future and with it the LiveTurnGuard, which clears
+        // the slot — reading after the abort would race that drop and
+        // frequently lose the partial content.
+        let partial_turn = self.services.live_turn(agent_id);
         // Abort the in-flight worker so it stops draining the turn/queue; the
         // child is kept alive (unlike `stop`, which also kills the child).
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
+        }
+        // Persist the streamed-so-far assistant content as an interrupted
+        // assistant row (no-op for empty blocks, so the STAB-114 zero-output
+        // requeue in `interrupt_send_message` never sees a phantom row). Runs
+        // AFTER the abort so the worker cannot race the append, and BEFORE the
+        // terminal `agent:stream:end` emit below so the chat-channel terminal
+        // reconcile sees the persisted row and keeps the blocks instead of
+        // removing them.
+        if let Some(live) = partial_turn {
+            self.services
+                .flush_partial_turn_on_interruption(agent_id, live)
+                .await;
         }
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
