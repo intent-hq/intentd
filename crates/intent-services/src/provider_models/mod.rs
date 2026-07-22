@@ -164,16 +164,14 @@ fn codex_probe_with_isolated_home(
 }
 
 /// The user's real codex home: `$CODEX_HOME` when set, else `~/.codex`.
+/// Env vars that are set but empty are treated as unset.
 fn user_codex_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("CODEX_HOME") {
-        if !home.is_empty() {
-            return Some(PathBuf::from(home));
-        }
+    let non_empty = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
+    if let Some(home) = non_empty("CODEX_HOME") {
+        return Some(PathBuf::from(home));
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)?;
-    Some(home.join(".codex"))
+    let home = non_empty("HOME").or_else(|| non_empty("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".codex"))
 }
 
 /// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires
