@@ -546,7 +546,22 @@ impl WsInner {
         loop {
             tokio::select! {
                 incoming = stream.next() => match incoming {
-                    None | Some(Err(_)) => break,
+                    None => break,
+                    Some(Err(e)) => {
+                        // Over-limit inbound message or frame (monorepo#495):
+                        // tell the client why with a 1009 (Message Too Big)
+                        // close frame before terminating; other read errors
+                        // keep the bare drop.
+                        if matches!(e, tokio_tungstenite::tungstenite::Error::Capacity(_)) {
+                            let _ = sink
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Size,
+                                    reason: "message exceeds inbound size limit".into(),
+                                })))
+                                .await;
+                        }
+                        break;
+                    }
                     Some(Ok(Message::Text(text))) => {
                         // The WSS transport does not expose the `system.*` control
                         // surface (those are served over the local UDS); pass `None`.

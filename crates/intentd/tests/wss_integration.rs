@@ -387,20 +387,55 @@ async fn wss_client_hello_and_drafts_round_trip() {
     srv.ws.stop().await;
 }
 
-/// Transport size-limit regression (monorepo#472): a text message past the
-/// 40 MiB cap terminates the connection (tungstenite capacity error on the
-/// frame header, never buffering the payload); a large-but-legit single-frame
-/// message above tungstenite's 16 MiB default frame size still round-trips,
-/// as does a normal request on a fresh connection.
+/// Transport size-limit regression (monorepo#472, monorepo#495): a text
+/// message past the 40 MiB cap terminates the connection with a 1009
+/// (Message Too Big) close frame; a large-but-legit single-frame message
+/// above tungstenite's 16 MiB default frame size still round-trips, as does
+/// a normal request on a fresh connection.
 #[tokio::test]
 async fn wss_oversized_message_terminates_connection() {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+
     let srv = start(WsOptions::default()).await;
 
-    // Over-limit: the server must drop the connection without a response.
+    // Over-limit fragmented message: the first fragment sits exactly at the
+    // cap (legal on its own), the continuation pushes the accumulated size
+    // past it, surfacing tungstenite's message-capacity error after the
+    // client has finished writing — so the 1009 close frame the server sends
+    // is reliably delivered (no bytes left in flight to reset the socket).
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    let first = Frame::message(
+        "a".repeat(MAX_INBOUND_MESSAGE_BYTES).into_bytes(),
+        OpCode::Data(Data::Text),
+        false,
+    );
+    let last = Frame::message(vec![b'a'; 1024], OpCode::Data(Data::Continue), true);
+    ws.send(Message::Frame(first)).await.expect("send first");
+    ws.send(Message::Frame(last)).await.expect("send last");
+    let close_code = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) => break None,
+                Some(Ok(Message::Close(frame))) => break frame.map(|f| f.code),
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .expect("oversized message must terminate the connection");
+    assert_eq!(
+        close_code,
+        Some(CloseCode::Size),
+        "oversized message must be rejected with close code 1009"
+    );
+
+    // Over-limit single frame: rejected fast on the frame header (payload is
+    // never buffered) and the connection terminates. The client is usually
+    // still mid-write, so the 1009 close frame may be lost to the reset —
+    // only termination is asserted here.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let oversized = "a".repeat(MAX_INBOUND_MESSAGE_BYTES + 1024);
-    // The server stops reading once the frame header exceeds the cap and
-    // closes the socket; the send itself may fail mid-write.
     let _ = ws.send(Message::Text(oversized)).await;
     let closed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
