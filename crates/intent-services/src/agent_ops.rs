@@ -603,6 +603,7 @@ async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::p
         tokio::process::Command::new(auggie)
             .args(args)
             .env("PATH", intent_context::discovery::exec_path(auggie))
+            .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output(),
     )
