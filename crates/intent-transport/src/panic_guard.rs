@@ -308,10 +308,14 @@ mod tests {
         let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
+        let prev_env = std::env::var("INTENTD_TEST_PANIC_METHOD").ok();
         std::env::set_var("INTENTD_TEST_PANIC_METHOD", "p.one , p.two");
         let hit = std::panic::catch_unwind(|| maybe_inject_panic("p.two")).is_err();
         let miss = std::panic::catch_unwind(|| maybe_inject_panic("p.three")).is_ok();
-        std::env::remove_var("INTENTD_TEST_PANIC_METHOD");
+        match prev_env {
+            Some(v) => std::env::set_var("INTENTD_TEST_PANIC_METHOD", v),
+            None => std::env::remove_var("INTENTD_TEST_PANIC_METHOD"),
+        }
         std::panic::set_hook(prev);
         assert!(hit, "listed method must panic");
         assert!(miss, "unlisted method must not panic");
