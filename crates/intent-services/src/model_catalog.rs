@@ -69,10 +69,12 @@ fn no_version() -> String {
     String::new()
 }
 
-/// auggie source: the rich CLI fetch already backing `models.list`.
+/// auggie source: the rich CLI fetch already backing `models.list` (PATH
+/// lookup — registry sources are plain fns with no `Services` handle for the
+/// `auggie_bin` test seam).
 fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
-        match crate::agent_ops::fetch_auggie_models_rich().await {
+        match crate::agent_ops::fetch_auggie_models_rich(None).await {
             Some(models) => ModelFetchResult {
                 models: Some(models),
                 warning: None,
@@ -282,6 +284,9 @@ pub(crate) struct ModelCatalogCache {
     entries: Mutex<HashMap<String, CacheEntry>>,
     persist_path: Option<PathBuf>,
     /// Per-provider negative entries (probe failures); in-memory only.
+    /// Keyed by provider id — mirroring `entries` — because at most one
+    /// version key is live per provider at a time (keys come from
+    /// process-wide adapter pins); a key bump simply replaces the entry.
     negative: Mutex<HashMap<String, NegativeEntry>>,
     /// In-flight probes keyed by (provider id, version key).
     inflight: Mutex<HashMap<(String, String), InflightCell>>,
@@ -403,6 +408,10 @@ impl ModelCatalogCache {
     /// Join (or create) the in-flight probe slot for `(provider_id,
     /// version_key)`. All concurrent callers get the same cell, so
     /// `get_or_init` runs exactly one fetch and everyone shares its result.
+    /// Two coalescing consequences, both accepted: a `force_refresh` caller
+    /// may join a probe that started *before* its request, and a caller
+    /// landing in the record→[`Self::finish_inflight`] window joins an
+    /// already-resolved cell and returns its result without a new probe.
     fn join_inflight(&self, provider_id: &str, version_key: &str) -> InflightCell {
         let mut inflight = self.inflight.lock().expect("model inflight map poisoned");
         inflight
@@ -478,32 +487,47 @@ where
         }
     }
     let cell = cache.join_inflight(provider_id, version_key);
-    let fetched = cell.get_or_init(fetch).await.clone();
-    // Record the outcome before releasing the in-flight slot so a caller
-    // arriving in between hits the success or negative cache, never a gap
-    // that would re-spawn the probe.
-    let resolved = match fetched.models {
-        Some(models) => {
-            cache.clear_negative(provider_id);
-            if !models.is_empty() {
-                cache.store(provider_id, version_key, models.clone(), now_ms);
+    // Recording happens inside the initializer, so exactly one waiter — the
+    // one whose fetch actually runs — records the outcome, and it does so
+    // before the in-flight slot is released. Followers only consume the
+    // shared result: a late-scheduled follower can never re-record a stale
+    // outcome over a newer probe's caches.
+    let fetched = cell
+        .get_or_init(|| async {
+            let fetched = fetch().await;
+            match &fetched.models {
+                Some(models) => {
+                    cache.clear_negative(provider_id);
+                    if !models.is_empty() {
+                        cache.store(provider_id, version_key, models.clone(), now_ms);
+                    }
+                }
+                None => {
+                    let reason = fetched
+                        .warning
+                        .clone()
+                        .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+                    cache.store_negative(provider_id, version_key, reason, now_ms);
+                }
             }
-            ResolvedModels {
-                models: Some(models),
-                stale: false,
-                warning: fetched.warning,
-            }
-        }
+            fetched
+        })
+        .await
+        .clone();
+    cache.finish_inflight(provider_id, version_key, &cell);
+    match fetched.models {
+        Some(models) => ResolvedModels {
+            models: Some(models),
+            stale: false,
+            warning: fetched.warning,
+        },
         None => {
             let reason = fetched
                 .warning
                 .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-            cache.store_negative(provider_id, version_key, reason.clone(), now_ms);
             failure_fallback(cache, provider_id, version_key, reason)
         }
-    };
-    cache.finish_inflight(provider_id, version_key, &cell);
-    resolved
+    }
 }
 
 /// What a failed (or negatively cached) probe serves: the last-good list

@@ -379,6 +379,36 @@ async fn force_refresh_bypasses_negative_window() {
 }
 
 #[tokio::test]
+async fn only_the_leader_records_the_probe_outcome() {
+    // Followers must not re-record the shared result: a late-scheduled
+    // follower of a failed probe would otherwise re-arm the negative window
+    // after a newer forced probe succeeded and cleared it. Recording lives
+    // inside the get_or_init initializer, so a pre-resolved cell (follower's
+    // view) must leave the caches untouched.
+    let cache = ModelCatalogCache::new(None);
+    let cell = cache.join_inflight("p", "v1");
+    assert!(cell
+        .set(ModelFetchResult {
+            models: None,
+            warning: Some("stale failure".to_string()),
+        })
+        .is_ok());
+    // Simulate the newer probe's success landing first.
+    cache.store("p", "v1", rows("recovered"), 1_000);
+    // The "follower" resolves against the pre-resolved cell: it serves the
+    // shared failure view but must not write a negative entry.
+    let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("recovered")));
+    assert!(r.stale);
+    assert!(
+        cache.negative_reason("p", "v1", 1_001).is_none(),
+        "follower must not record a negative entry"
+    );
+    // And the recovered rows were not clobbered.
+    assert_eq!(cache.fresh("p", "v1", 1_001), Some(rows("recovered")));
+}
+
+#[tokio::test]
 async fn negative_entry_is_version_key_scoped() {
     let cache = ModelCatalogCache::new(None);
     let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;

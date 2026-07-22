@@ -573,28 +573,44 @@ pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
     kept
 }
 
+/// Upper bound on one auggie CLI model-list invocation. The fetch is
+/// single-flighted, so a wedged CLI (e.g. blocked on a TTY prompt) would
+/// otherwise stall every `models.list` caller — including `forceRefresh` —
+/// daemon-wide instead of just its own. Matches the bounded ACP
+/// (15s overall) and opencode (10s) probe sources.
+const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// [`tokio::process::Command::output`] bounded by
+/// [`AUGGIE_MODELS_TIMEOUT`]; a timeout counts as fetch failure (`None`).
+async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
+    tokio::time::timeout(
+        AUGGIE_MODELS_TIMEOUT,
+        tokio::process::Command::new(auggie).args(args).output(),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
 /// Best-effort `models.list` dynamic fetch (PROTOCOL §5.30), porting the
 /// reference `fetchAuggieModels`: try `auggie model list --json` for the rich
 /// rows, fall back to the plain-text parser ([`parse_model_list_output`]),
 /// then filter legacy models and sort ([`finalize_model_rows`]). Returns
-/// `None` when the CLI is unavailable or yields nothing parseable, so the
-/// caller can fall back to [`static_models`].
-pub(crate) async fn fetch_auggie_models_rich() -> Option<Vec<Value>> {
+/// `None` when the CLI is unavailable, hangs past
+/// [`AUGGIE_MODELS_TIMEOUT`], or yields nothing parseable, so the caller can
+/// fall back to [`static_models`]. `auggie_bin` overrides the PATH lookup
+/// (the [`crate::Services::with_auggie_bin`] test seam).
+pub(crate) async fn fetch_auggie_models_rich(
+    auggie_bin: Option<std::path::PathBuf>,
+) -> Option<Vec<Value>> {
+    let auggie = auggie_bin.unwrap_or_else(|| std::path::PathBuf::from("auggie"));
     let mut rows: Option<Vec<Value>> = None;
-    if let Ok(output) = tokio::process::Command::new("auggie")
-        .args(["model", "list", "--json"])
-        .output()
-        .await
-    {
+    if let Some(output) = auggie_output(&auggie, &["model", "list", "--json"]).await {
         rows = parse_model_list_json(&String::from_utf8_lossy(&output.stdout))
             .filter(|r| !r.is_empty());
     }
     if rows.is_none() {
-        let output = tokio::process::Command::new("auggie")
-            .args(["model", "list"])
-            .output()
-            .await
-            .ok()?;
+        let output = auggie_output(&auggie, &["model", "list"]).await?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut parsed = parse_model_list_output(&stdout);
         if parsed.is_empty() {
@@ -2048,8 +2064,11 @@ impl Services {
     /// "auggie"` reads; the two can diverge within a TTL window (a follow-up
     /// may route this path through the generic cache).
     async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
-        self.models_list_auggie_with(force_refresh, || Box::pin(fetch_auggie_models_rich()))
-            .await
+        let auggie_bin = self.auggie_bin.clone();
+        self.models_list_auggie_with(force_refresh, || {
+            Box::pin(fetch_auggie_models_rich(auggie_bin))
+        })
+        .await
     }
 
     /// [`Self::models_list_auggie_op`] with an injectable fetch, carrying the
@@ -2080,21 +2099,32 @@ impl Services {
             slot.get_or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
                 .clone()
         };
-        let fetched = cell.get_or_init(fetch).await.clone();
-        // Record the outcome before releasing the in-flight slot so a caller
-        // arriving in between hits the success or negative cache, never a
-        // gap that would re-spawn the CLI.
-        let result = match fetched {
-            Some(models) => {
-                self.store_models_cache(models.clone());
-                self.clear_models_negative();
-                json!({ "models": models, "source": "auggie" })
-            }
+        // Recording happens inside the initializer, so exactly one waiter —
+        // the one whose fetch actually runs — records the outcome, and it
+        // does so before the in-flight slot is released. Followers only
+        // consume the shared result: a late-scheduled follower can never
+        // re-record a stale outcome (re-arming the negative window or
+        // re-stamping old rows as fresh) over a newer fetch's caches.
+        let fetched = cell
+            .get_or_init(|| async {
+                let fetched = fetch().await;
+                match &fetched {
+                    Some(models) => {
+                        self.store_models_cache(models.clone());
+                        self.clear_models_negative();
+                    }
+                    None => self.store_models_negative(),
+                }
+                fetched
+            })
+            .await
+            .clone();
+        self.finish_models_inflight(&cell);
+        match fetched {
+            Some(models) => Ok(json!({ "models": models, "source": "auggie" })),
             None => {
-                self.store_models_negative();
                 if force_refresh {
                     if let Some(models) = self.last_good_models() {
-                        self.finish_models_inflight(&cell);
                         return Ok(json!({
                             "models": models,
                             "source": "auggie",
@@ -2103,11 +2133,9 @@ impl Services {
                         }));
                     }
                 }
-                json!({ "models": static_models(), "source": "static" })
+                Ok(json!({ "models": static_models(), "source": "static" }))
             }
-        };
-        self.finish_models_inflight(&cell);
-        Ok(result)
+        }
     }
 
     /// The cached `models.list` rows when still within [`MODELS_CACHE_TTL`].

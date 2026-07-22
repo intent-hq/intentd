@@ -980,6 +980,70 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
     srv.ws.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasses() {
+    // models.list legacy path probe guards (§5.30) over the real WSS
+    // transport: a failed auggie probe is negatively cached for 60s — a
+    // non-forced read within the window serves the static catalog without
+    // re-spawning the CLI — while forceRefresh bypasses the negative entry
+    // and re-probes. The fake auggie appends to a counter file per
+    // invocation and always fails, making CLI spawns observable.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new("/tmp").join(format!("intentd-wss-models-neg-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let count = dir.join("count");
+    let bin = dir.join("auggie");
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    let calls = || {
+        std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+
+    // Cold read: the probe runs (and fails) → static catalog, legacy shape.
+    let frame = r#"{"jsonrpc":"2.0","id":40,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 40);
+    assert_eq!(resp["result"]["source"], "static");
+    assert!(!resp["result"]["models"]
+        .as_array()
+        .expect("models")
+        .is_empty());
+    let after_probe = calls();
+    assert!(after_probe > 0, "cold read must spawn the CLI");
+
+    // Within the negative window: same static fallback, no CLI spawn.
+    let frame = r#"{"jsonrpc":"2.0","id":41,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 41);
+    assert_eq!(resp["result"]["source"], "static");
+    assert_eq!(
+        calls(),
+        after_probe,
+        "negative window must suppress the re-probe"
+    );
+
+    // forceRefresh bypasses the negative entry and re-probes.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":42,"method":"models.list","params":{"forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 42);
+    assert_eq!(resp["result"]["source"], "static");
+    assert!(
+        calls() > after_probe,
+        "forceRefresh must bypass the negative window and re-probe"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    srv.ws.stop().await;
+}
+
 /// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
 /// (§5.31): swallows the piped stdin, then runs `body`.
 #[cfg(unix)]
