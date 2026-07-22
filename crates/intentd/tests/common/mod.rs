@@ -12,6 +12,18 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
+/// Force the hermetic-root guard on for every integration-test binary that
+/// compiles this module. Runs before `main()` — and therefore before any test
+/// threads exist, making `set_var` race-free — so any in-process code path
+/// that falls back to the default `~/intent/workspaces` root panics loudly
+/// (see `assert_hermetic_root_absent` in intent-services). Spawned daemons
+/// inherit the variable, which is the already-supported hermetic mode: the
+/// spawn helpers set `INTENTD_WORKSPACES_DIR` to a tempdir.
+#[ctor::ctor(unsafe)]
+fn force_hermetic_root_guard() {
+    std::env::set_var("INTENTD_ASSERT_HERMETIC_ROOT", "1");
+}
+
 /// Apply the timeout multiplier from the environment for coverage
 /// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
 /// non-finite values are ignored and values below 1.0 are clamped so budgets

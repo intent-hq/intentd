@@ -17,6 +17,8 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+mod common;
+
 struct TempDb {
     path: PathBuf,
 }
@@ -156,7 +158,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(std::env::temp_dir().join(format!("itd-ws-{}", Uuid::new_v4()))),
+            .with_workspaces_root(common::hermetic_workspaces_root()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -217,7 +219,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(std::env::temp_dir().join(format!("itd-ws-{}", Uuid::new_v4()))),
+            .with_workspaces_root(common::hermetic_workspaces_root()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -347,7 +349,7 @@ async fn test_script_list_bootstrap_from_repo() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(std::env::temp_dir().join(format!("itd-ws-{}", Uuid::new_v4()))),
+            .with_workspaces_root(common::hermetic_workspaces_root()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -437,7 +439,7 @@ async fn test_repo_instructions_in_system_prompt() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_workspaces_root(std::env::temp_dir().join(format!("itd-ws-{}", Uuid::new_v4()))),
+            .with_workspaces_root(common::hermetic_workspaces_root()),
     );
 
     // Use /tmp with short ID to fit within SUN_LEN (~104B on macOS)
@@ -489,8 +491,7 @@ async fn concurrent_script_list_no_duplicates() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store.clone())
-            .with_workspaces_root(std::env::temp_dir().join(format!("itd-ws-{}", Uuid::new_v4()))),
+        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root()),
     );
     let socket_path = std::env::temp_dir().join(format!("intentd-{}.sock", Uuid::new_v4()));
 

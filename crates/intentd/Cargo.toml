@@ -68,6 +68,7 @@ base64 = { workspace = true }
 # `e2e_wss_last_activity.rs` parses RFC3339 timestamps with chrono to compare instants
 # (lexicographic comparison can be wrong with differing fractional-second precision).
 chrono = "0.4"
+ctor = "1.0.10"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
