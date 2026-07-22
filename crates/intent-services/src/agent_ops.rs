@@ -3356,7 +3356,7 @@ impl Services {
     /// the agents present in the payload.
     pub(crate) async fn agent_get_subscriptions_op(
         &self,
-        workspace_id: WorkspaceId,
+        _workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> Result<Value> {
         let watches = self.list_watches_for_parent(&agent_id);
@@ -3385,7 +3385,11 @@ impl Services {
                     "id": w.id,
                     "agentId": w.parent_agent_id,
                     "agentName": w.parent_agent_name,
-                    "workspaceId": workspace_id,
+                    // The watch's own anchor (the parent's home workspace,
+                    // where the wake is delivered) — identical to the call
+                    // workspace for same-workspace watches, self-consistent
+                    // for cross-workspace (chief) ones.
+                    "workspaceId": w.parent_workspace_id,
                     "createdAt": w.created_at,
                     "oneShot": w.one_shot,
                     "actorIds": [w.child_agent_id],
