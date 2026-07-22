@@ -3013,7 +3013,8 @@ async fn models_list_cortex_is_feature_code_gated() {
 /// so it is fresh at the real clock ([`models_list_op`] uses `now_ms()`).
 fn seed_auggie_cache(svc: &Services, rows: Vec<serde_json::Value>) {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
-    svc.models_catalog.store("auggie", "", rows, now - 1);
+    svc.models_catalog
+        .store("auggie", "", rows, now.saturating_sub(1));
 }
 
 /// The test clock for the legacy-path tests (unix-ms shaped, arbitrary).

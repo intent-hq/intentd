@@ -565,7 +565,9 @@ async fn probe_rpc_error_survives_dead_child() {
 async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     // A wedged `opencode models` must be reaped when the timeout elapses and
     // the failure must be attributable as a timeout. The fake CLI records its
-    // PID, then sleeps far past the injected timeout.
+    // PID first thing, then sleeps far past the injected timeout — a 500ms
+    // budget leaves slow runners ample time to write the PID file before the
+    // deadline while keeping the test fast.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("pid");
@@ -578,7 +580,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let start = std::time::Instant::now();
-    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_millis(200))
+    let err = super::run_opencode_models_cli(bin, std::time::Duration::from_millis(500))
         .await
         .unwrap_err();
     assert!(
@@ -588,18 +590,15 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     assert_eq!(err, "opencode models timed out");
 
     // kill_on_drop reaps the child when the timed-out output future drops:
-    // signal 0 probes liveness without touching the process.
+    // signal `None` (sig 0) probes liveness without touching the process.
     let pid: i32 = std::fs::read_to_string(&pid_file)
         .expect("fake CLI must have started")
         .trim()
         .parse()
         .expect("pid");
+    let pid = nix::unistd::Pid::from_raw(pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !alive {
-            break;
-        }
+    while nix::sys::signal::kill(pid, None).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,
             "child {pid} must be killed after the timeout"
