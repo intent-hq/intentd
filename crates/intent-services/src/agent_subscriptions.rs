@@ -342,12 +342,11 @@ impl Services {
         };
         // Best-effort DB sync of the refreshed name/anchor (restart
         // durability), skipped when nothing changed (the common
-        // waitFor-called-twice case). Like the registration-time upsert this
-        // is a spawned task, so a register→fast-fire sequence can order the
-        // fired watch's delete before a pending upsert and resurrect the row
-        // as an orphan; rehydration then reconciles it into at most one
-        // duplicate wake after a restart — accepted, mirroring the
-        // `persist_delegation_group` durability note.
+        // waitFor-called-twice case). This is a spawned UPDATE ... WHERE id,
+        // so racing a concurrent fire/delete is benign: against a deleted
+        // row it affects 0 rows (it cannot resurrect an orphan); the only
+        // loss is the refreshed name/anchor not persisting — the in-memory
+        // watch is already refreshed and the row is gone anyway.
         if changed {
             let store = self.store.clone();
             let watch_id = id.clone();
