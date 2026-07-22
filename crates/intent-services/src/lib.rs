@@ -174,12 +174,13 @@ pub struct Services {
     /// `agent:session-stats-changed` only when the rollup actually moved (§6.5).
     session_stats_cache: Arc<Mutex<HashMap<AgentId, SessionStats>>>,
     /// The one `models.list` model cache (PROTOCOL §5.30): entries keyed by
-    /// provider id + version key, 5-minute TTL, persisted in the daemon data
-    /// dir when configured via [`Services::with_models_cache_dir`]; also
-    /// holds the per-provider single-flight and negative-cache state. Both
-    /// the per-provider path (`providerId`) and the legacy no-`providerId`
-    /// auggie path (key `("auggie", "")`) read and write this cache, so the
-    /// two can never diverge. Shared across clones.
+    /// provider id + registry-derived version key, 5-minute TTL, persisted in
+    /// the daemon data dir when configured via
+    /// [`Services::with_models_cache_dir`]; also holds the per-provider
+    /// single-flight and negative-cache state. Both the per-provider path
+    /// (`providerId`) and the legacy no-`providerId` auggie path resolve the
+    /// same registered auggie source — same provider id, same version key —
+    /// so the two can never diverge. Shared across clones.
     models_catalog: Arc<model_catalog::ModelCatalogCache>,
     /// Test-only override for the auggie binary the one-shot CLI RPCs
     /// (`agent.enhancePrompt` §5.31, `agent.completeOnce` §5.32) spawn.
