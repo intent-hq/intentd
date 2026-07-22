@@ -1,6 +1,6 @@
 //! WSS end-to-end for the widened `agent.wakeOrCreate` (C1d-10a).
 //!
-//! Boots a real `intentd serve --listen both`, seeds a workspace + task note,
+//! Boots a real `intentd serve` (WSS listener enabled via config), seeds a workspace + task note,
 //! and drives the widened composite over a pinned TLS WebSocket. The mock
 //! agent is NOT needed — `agent.wakeOrCreate` persists the delivered context
 //! message directly (matching the pre-widening path), so these tests are
@@ -63,10 +63,11 @@ fn temp_data_dir() -> PathBuf {
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -300,7 +301,8 @@ async fn seed_workspace_and_task(data_dir: &Path, title: &str) -> (String, Strin
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services = Services::new(store.clone());
+    let services =
+        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))

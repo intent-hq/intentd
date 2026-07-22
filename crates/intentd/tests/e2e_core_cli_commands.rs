@@ -3,11 +3,11 @@
 
 #![cfg(unix)]
 
-use std::path::PathBuf;
+mod common;
+
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tokio::net::UnixStream;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 struct Daemon {
@@ -42,17 +42,12 @@ fn spawn_daemon(data_dir: &PathBuf) -> Child {
         .expect("spawn intentd serve")
 }
 
-async fn await_socket(socket: &PathBuf) -> bool {
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if UnixStream::connect(socket).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .is_ok()
+/// Wait for the daemon UDS to accept, failing fast (with the daemon log) if
+/// the child dies first. Shares the coverage-aware startup budget with the
+/// other e2e harnesses via `common::await_daemon_listening`.
+async fn await_socket(daemon: &mut Daemon, socket: &Path) {
+    let log_path = daemon.data_dir.join("daemon.log");
+    common::await_daemon_listening(&mut daemon.child, socket, &log_path).await;
 }
 
 #[tokio::test]
@@ -63,11 +58,11 @@ async fn doctor_checks_data_dir_and_migrations() {
     let socket = data_dir.join("intentd.sock");
 
     let child = spawn_daemon(&data_dir);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    assert!(await_socket(&socket).await, "daemon did not start");
+    await_socket(&mut daemon, &socket).await;
 
     // Run `intentd doctor` command
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -246,16 +241,16 @@ async fn token_rotate_flag_generates_new_token() {
 }
 
 /// Spawn a daemon with both UDS and TCP (WSS) listeners and a fixed token, as
-/// `intentd pair` requires a running TCP listener to build the payload.
+/// `intentd pair` requires a running TCP listener to build the payload. The
+/// WSS listener is enabled via `server.wsApi.enabled` in config.toml.
 fn spawn_daemon_both(data_dir: &PathBuf, token: &str) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
+    common::enable_ws_api(data_dir);
     Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("serve")
-        .arg("--listen")
-        .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
@@ -265,7 +260,7 @@ fn spawn_daemon_both(data_dir: &PathBuf, token: &str) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
-        .expect("spawn intentd serve --listen both")
+        .expect("spawn intentd serve (ws api enabled)")
 }
 
 #[tokio::test]
@@ -277,23 +272,32 @@ async fn pair_prints_qr_and_payload_uri_and_writes_png_svg() {
     let token = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
     let child = spawn_daemon_both(&data_dir, token);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    assert!(await_socket(&socket).await, "daemon did not start");
+    await_socket(&mut daemon, &socket).await;
 
+    // `pair` needs the WSS listener, which binds asynchronously after the UDS
+    // socket accepts; retry until it is up (bounded by the startup budget).
     let png_path = data_dir.join("pair.png");
     let svg_path = data_dir.join("pair.svg");
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .arg("--png")
-        .arg(&png_path)
-        .arg("--svg")
-        .arg(&svg_path)
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .output()
-        .expect("run intentd pair");
+    let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
+    let output = loop {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("pair")
+            .arg("--png")
+            .arg(&png_path)
+            .arg("--svg")
+            .arg(&svg_path)
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .output()
+            .expect("run intentd pair");
+        if output.status.success() || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
 
     assert!(
         output.status.success(),
@@ -338,11 +342,11 @@ async fn pair_fails_without_tcp_listener() {
 
     // UDS-only daemon: pairing is impossible without a TCP port.
     let child = spawn_daemon(&data_dir);
-    let _daemon = Daemon {
+    let mut daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
     };
-    assert!(await_socket(&socket).await, "daemon did not start");
+    await_socket(&mut daemon, &socket).await;
 
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("pair")

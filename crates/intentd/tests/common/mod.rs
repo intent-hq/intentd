@@ -8,7 +8,7 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
 
@@ -30,6 +30,82 @@ pub fn test_timeout(base: Duration) -> Duration {
 /// coverage-instrumented startup on oversubscribed CI runners.
 pub fn daemon_startup_timeout() -> Duration {
     test_timeout(Duration::from_secs(60))
+}
+
+/// Return a unique, hermetic workspaces root under the OS temp dir.
+///
+/// In-process integration tests must chain `.with_workspaces_root(...)` onto
+/// every `Services::new(...)` so tests never resolve the real
+/// `~/intent/workspaces`. The directory is created on demand by the services
+/// layer, so this helper only reserves a unique path.
+pub fn hermetic_workspaces_root() -> PathBuf {
+    std::env::temp_dir().join(format!("itd-ws-{}", uuid::Uuid::new_v4()))
+}
+
+/// Wait until a freshly spawned `intentd serve` child accepts connections on
+/// its UDS `socket`, budgeted by [`daemon_startup_timeout`]. Fails fast —
+/// panicking with the daemon log — if the child exits before listening, so
+/// tests don't keep polling a dead daemon for the full window.
+pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: &Path) {
+    let budget = daemon_startup_timeout();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let logs = std::fs::read_to_string(log_path).unwrap_or_default();
+            panic!(
+                "daemon exited ({status}) before listening on {}\n--- daemon log ---\n{logs}",
+                socket.display()
+            );
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let logs = std::fs::read_to_string(log_path).unwrap_or_default();
+            panic!(
+                "daemon never listened on {} within {budget:?}\n--- daemon log ---\n{logs}",
+                socket.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
+/// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
+/// port (the config-driven replacement for the retired `serve --listen both`
+/// flag: UDS always serves; the WSS listener boot-starts iff the effective
+/// `server.wsApi.enabled` is true, binding `server.wsApi.port`). Seeding the
+/// port keeps the suite hermetic — the boot path reads the settings value, so
+/// the fixed 5181 default would collide across parallel daemons. Appends to an
+/// existing seeded config; no-op if the table is already present (restarts on
+/// the same data dir reuse the same port).
+pub fn enable_ws_api(data_dir: &std::path::Path) {
+    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+    let path = data_dir.join("config.toml");
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("read {}: {e}", path.display()),
+    };
+    if text
+        .lines()
+        .any(|l| l.trim_start().starts_with("[server.wsApi]"))
+    {
+        return;
+    }
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind free port")
+        .local_addr()
+        .expect("local addr")
+        .port();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "\n[server.wsApi]\nenabled = true\nport = {port}\n"
+    ));
+    std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
 }
 
 /// RAII guard for a spawned `intentd serve` process.

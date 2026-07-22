@@ -208,6 +208,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         runtime: ProviderRuntime::Node,
         base_args: &["--acp", "--allow-indexing"],
         model_flag: Some("--model"),
+        can_be_disabled: true,
         supports_authenticate: true,
         supports_set_mode: true,
         supports_mcp_config: true,

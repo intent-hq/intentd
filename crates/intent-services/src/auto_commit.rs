@@ -37,7 +37,8 @@ const DIFF_CAP_BYTES: usize = 64 * 1024;
 const AGENTS_MD_CAP_BYTES: usize = 8 * 1024;
 /// Recent commit subjects for style mimicry (~10 commits).
 const RECENT_COMMITS_LIMIT: usize = 10;
-/// Generation timeout (~30 s) — acceptable latency on idle before falling back.
+/// Generation timeout (~30 s) — acceptable latency on idle before falling
+/// back. Tests compress it via [`crate::Services::with_auto_commit_timeout_ms`].
 const GENERATION_TIMEOUT_MS: u64 = 30_000;
 
 /// Opening tag that wraps the LLM-generated commit message.
@@ -396,7 +397,7 @@ impl Services {
                 Some(system_prompt),
                 None,
                 Some(session.workspace_id.clone()),
-                Some(GENERATION_TIMEOUT_MS),
+                Some(self.auto_commit_timeout_ms.unwrap_or(GENERATION_TIMEOUT_MS)),
             )
             .await;
 

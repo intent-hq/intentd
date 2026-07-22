@@ -51,6 +51,7 @@ mod host_ops;
 pub mod lifecycle;
 pub mod listener;
 pub mod pairing;
+mod panic_guard;
 mod protocol;
 pub mod reverse;
 pub mod router;

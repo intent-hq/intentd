@@ -65,7 +65,6 @@ pub const KNOWN_PATHS: &[&str] = &[
     "notifications.soundOnlyWhenUnfocused",
     "notifications.volume",
     "rtk.enabled",
-    "server.listenMode",
     "server.socketPath",
     "server.bindAddress",
     "server.port",
@@ -134,7 +133,7 @@ pub struct WriteStamp {
 }
 
 /// A boot-time pin: the value that overrides the file, plus the flag/env
-/// label used in rejection messages (e.g. `--listen`, `INTENTD_TCP_PORT`).
+/// label used in rejection messages (e.g. `--insecure`, `INTENTD_TCP_PORT`).
 #[derive(Debug, Clone)]
 struct Pin {
     value: Value,
@@ -339,7 +338,7 @@ impl SettingsRegistry {
     }
 
     /// Pin a key to `value` at boot (env/CLI precedence layer). `flag` names
-    /// the startup flag/env var for rejection messages (e.g. `--listen`,
+    /// the startup flag/env var for rejection messages (e.g. `--insecure`,
     /// `INTENTD_TCP_PORT`). The pin overrides the file value; while pinned,
     /// the key rejects [`SettingsRegistry::apply`]. The pin value is
     /// validated against the typed schema. Does not notify subscribers —
@@ -822,7 +821,7 @@ mod tests {
     fn pinned_key_rejects_apply_with_flag_message() {
         let (_dir, path) = temp_config(Some(""));
         let reg = SettingsRegistry::load(&path).expect("load");
-        reg.pin("server.wsApi.enabled", json!(true), "--listen")
+        reg.pin("server.wsApi.enabled", json!(true), "--insecure")
             .expect("pin");
         let err = reg
             .apply(&set("server.wsApi.enabled", json!(false)))
@@ -830,7 +829,7 @@ mod tests {
         match err {
             Error::InvalidParams(msg) => {
                 assert!(msg.contains("overridden by startup flag"), "{msg}");
-                assert!(msg.contains("--listen"), "{msg}");
+                assert!(msg.contains("--insecure"), "{msg}");
             }
             other => panic!("expected InvalidParams, got {other}"),
         }

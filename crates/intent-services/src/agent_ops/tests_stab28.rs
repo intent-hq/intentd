@@ -51,12 +51,14 @@ async fn parent_rewoken_after_send_to_settled_child() {
     // Initial delegation: register oneShot completion watch.
     svc.register_completion_watch(
         &ws,
+        &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
         true,
         None,
-    );
+    )
+    .expect("register watch");
 
     // Child settles for the first time → parent woken, oneShot watch removed.
     let event1 = completion_event(
@@ -81,7 +83,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
 
     // OneShot watch was removed.
     assert!(
-        svc.find_watches_for_child(&ws, &child).is_empty(),
+        svc.find_watches_for_child(&child).is_empty(),
         "OneShot watch should be removed after first completion"
     );
 
@@ -103,7 +105,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
     );
 
     // Verify watch exists before second completion.
-    let watches_before = svc.find_watches_for_child(&ws, &child);
+    let watches_before = svc.find_watches_for_child(&child);
     assert_eq!(
         watches_before.len(),
         1,
@@ -133,7 +135,7 @@ async fn parent_rewoken_after_send_to_settled_child() {
 
     // Second oneShot watch was also removed.
     assert!(
-        svc.find_watches_for_child(&ws, &child).is_empty(),
+        svc.find_watches_for_child(&child).is_empty(),
         "OneShot watch should be removed after second completion"
     );
 }

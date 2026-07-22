@@ -21,15 +21,16 @@ This repo is consumed as a git submodule by [intent-hq/monorepo](https://github.
 
 ## Architecture
 
-A single cargo **workspace** with 12 crates. Dependency direction is enforced per
-`IMPLEMENTATION_SPEC.md` §3.2: `intent-core` is the leaf, `intent-transport` depends only on
-`intent-services` (never on `intent-store`), and the `intentd` binary is the only composition
-root that wires concrete implementations together.
+A single cargo **workspace** with 12 crates. Dependency direction is enforced per the
+"Dependency-direction rules" in the monorepo's `docs/ARCHITECTURE.md`: `intent-core` is
+the leaf, `intent-transport` depends only on `intent-services` (never on `intent-store`),
+and the `intentd` binary is the only composition root that wires concrete
+implementations together.
 
 ```text
                        ┌──────────────────────────────┐
                        │     intentd (bin)            │  CLI: serve / call / status / stop / doctor / …
-                       │   composition root (§3.2)    │  wires store → services → transport
+                       │   composition root           │  wires store → services → transport
                        └───────────────┬──────────────┘
                                        │
         ┌──────────────────────────────┼──────────────────────────────┐
@@ -123,7 +124,7 @@ systemctl --user enable --now intentd
 cargo build --workspace
 
 # 2. Start the daemon (UDS) in one shell
-cargo run -p intentd -- serve --listen uds
+cargo run -p intentd -- serve
 #   intentd listening on UDS path=~/Library/Application Support/intentd/intentd.sock
 
 # 3. In another shell, make a JSON-RPC call
@@ -145,8 +146,8 @@ database (`intentd.db`) and the socket (`intentd.sock`).
 
 The backend port is well past a vertical slice: Milestones 1–10 are implemented, plus the
 recent-repository registry, ACP session resume-on-respawn, and iOS-driven wire-parity fixes.
-For the authoritative, dated progress log see
-`docs/00_initial_porting/BREADCRUMBS.md` in the monorepo.
+The initial porting effort concluded on 2026-07-13; its dated progress log is preserved
+in the monorepo's git history.
 
 **Implemented**
 
@@ -259,11 +260,12 @@ cargo test --workspace
 
 ## Documentation
 
-The design lives in the monorepo under `docs/00_initial_porting/`:
+The design docs live in the monorepo under `docs/`:
 
-- `IMPLEMENTATION_SPEC.md` — architecture, crate layout (§3), persistence, roadmap.
-- `PROTOCOL.md` — the wire contract: transport, JSON-RPC envelope, full method catalog,
-  events, and error codes.
+- `ARCHITECTURE.md` — system overview, crate layout, module responsibilities, and
+  dependency-direction rules.
+- `PROTOCOL.md` — the canonical wire contract (protocol v2.0): transport, JSON-RPC
+  envelope, full method catalog, events, and error codes.
 
 ## Related Repositories
 

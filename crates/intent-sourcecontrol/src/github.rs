@@ -81,6 +81,19 @@ fn rest_next_cursor(page: u64, fetched: usize, per_page: u64) -> Option<String> 
     }
 }
 
+/// Hard safety cap for exhaustive (non-cursored) REST reads: at most 10 pages
+/// of `per_page=100` (1000 items), bounding rate-limit cost if a PR ever
+/// accumulates a pathological number of reviews/check runs.
+const REST_EXHAUSTIVE_MAX_PAGES: u64 = 10;
+
+/// Whether an exhaustive REST read should fetch the next page: the current
+/// page filled the per-page window (same count heuristic as
+/// [`rest_next_cursor`]) and the [`REST_EXHAUSTIVE_MAX_PAGES`] cap has not
+/// been reached.
+fn rest_fetch_next_page(page: u64, fetched: usize, per_page: u64) -> bool {
+    page < REST_EXHAUSTIVE_MAX_PAGES && per_page > 0 && fetched as u64 == per_page
+}
+
 // --- JSON → model mapping (pure; unit-tested with fixtures) ---
 
 fn login_of(user: &Option<dto::User>) -> String {
@@ -814,9 +827,8 @@ impl SourceControl for GitHubSourceControl {
     }
 
     async fn list_reviews(&self, repo: &RepoRef, number: u64) -> Result<Vec<Review>> {
-        let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews?per_page=100"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
-        map_list(v, map_review)
+        let route = Self::repo_path(repo, &format!("/pulls/{number}/reviews"));
+        self.rest_collect_all(&route, |v| v, map_review).await
     }
 
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {
@@ -954,12 +966,17 @@ impl SourceControl for GitHubSourceControl {
 
     async fn check_runs(&self, repo: &RepoRef, git_ref: &str) -> Result<Vec<CheckRun>> {
         let route = Self::repo_path(repo, &format!("/commits/{git_ref}/check-runs"));
-        let v: Value = self.client.get(&route, None::<&()>).await?;
-        let runs = v
-            .get("check_runs")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        map_list(runs, map_check_run)
+        // The check-runs payload nests the item array under `check_runs`.
+        self.rest_collect_all(
+            &route,
+            |v| {
+                v.get("check_runs")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()))
+            },
+            map_check_run,
+        )
+        .await
     }
 
     async fn create_issue(&self, repo: &RepoRef, title: &str, body: Option<&str>) -> Result<Issue> {
@@ -1011,6 +1028,38 @@ impl SourceControl for GitHubSourceControl {
 }
 
 impl GitHubSourceControl {
+    /// Fetch a REST listing to exhaustion: request `per_page=100` pages from
+    /// page 1, extract each page's item array with `extract`, map items with
+    /// `map`, and stop on a short page or at the [`REST_EXHAUSTIVE_MAX_PAGES`]
+    /// safety cap (see [`rest_fetch_next_page`]).
+    async fn rest_collect_all<T>(
+        &self,
+        route: &str,
+        extract: impl Fn(Value) -> Value,
+        map: impl Fn(Value) -> Result<T>,
+    ) -> Result<Vec<T>> {
+        let per_page = REST_MAX_PER_PAGE as u64;
+        let mut page = 1u64;
+        let mut out = Vec::new();
+        loop {
+            let params: Vec<(&str, String)> = vec![
+                ("per_page", per_page.to_string()),
+                ("page", page.to_string()),
+            ];
+            let v: Value = self.client.get(route, Some(&params)).await?;
+            let items: Vec<Value> = serde_json::from_value(extract(v))?;
+            let fetched = items.len();
+            for item in items {
+                out.push(map(item)?);
+            }
+            if !rest_fetch_next_page(page, fetched, per_page) {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
     async fn set_thread_resolution(&self, thread_id: &str, resolve: bool) -> Result<bool> {
         let (mutation, field) = if resolve {
             (
@@ -1299,6 +1348,29 @@ mod tests {
         assert_eq!(rest_next_cursor(1, 100, 100).as_deref(), Some("2"));
         assert_eq!(rest_next_cursor(2, 40, 100), None);
         assert_eq!(rest_next_cursor(1, 0, 100), None);
+    }
+
+    #[test]
+    fn rest_exhaustive_page_loop_termination() {
+        // A full page continues to the next one.
+        assert!(rest_fetch_next_page(1, 100, 100));
+        assert!(rest_fetch_next_page(5, 100, 100));
+        // A short or empty page stops the loop.
+        assert!(!rest_fetch_next_page(1, 40, 100));
+        assert!(!rest_fetch_next_page(1, 0, 100));
+        // The safety cap stops the loop even on a full page: the last page
+        // fetched is `REST_EXHAUSTIVE_MAX_PAGES`.
+        assert!(rest_fetch_next_page(
+            REST_EXHAUSTIVE_MAX_PAGES - 1,
+            100,
+            100
+        ));
+        assert!(!rest_fetch_next_page(REST_EXHAUSTIVE_MAX_PAGES, 100, 100));
+        assert!(!rest_fetch_next_page(
+            REST_EXHAUSTIVE_MAX_PAGES + 1,
+            100,
+            100
+        ));
     }
 
     #[test]

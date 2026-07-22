@@ -1,8 +1,8 @@
 //! WSS end-to-end for the read-side `git.*` extensions added in
 //! PROTOCOL.md §5.6: `git.numstat`, `git.branchDiff`, `git.getRemoteUrl`,
 //! and `git.getConfig` (STAB-10a).
-//! Drives a real pinned-TLS WebSocket against a live `intentd serve --listen
-//! both` and asserts the response envelope shape from PROTOCOL.md §5 plus the
+//! Drives a real pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via
+//! config) and asserts the response envelope shape from PROTOCOL.md §5 plus the
 //! `-32602` error envelope for the validation paths.
 //!
 //! Uses a tiny local repository as the workspace source so the test never
@@ -61,10 +61,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

@@ -488,7 +488,10 @@ async fn concurrent_script_list_no_duplicates() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store.clone()));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(
+        Services::new(store.clone())
+            .with_workspaces_root(std::env::temp_dir().join(format!("itd-ws-{}", Uuid::new_v4()))),
+    );
     let socket_path = std::env::temp_dir().join(format!("intentd-{}.sock", Uuid::new_v4()));
 
     let repo = create_test_repo_with_config(

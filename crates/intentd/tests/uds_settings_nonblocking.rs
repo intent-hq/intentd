@@ -11,6 +11,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -117,7 +119,8 @@ async fn wedged_settings_list_does_not_stall_concurrent_workspace_list() {
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
             .with_event_bus(bus.clone())
-            .with_secret_store(secrets_dyn),
+            .with_secret_store(secrets_dyn)
+            .with_workspaces_root(common::hermetic_workspaces_root()),
     );
     // Short suffix so the full socket path fits under macOS `SUN_LEN`.
     let socket = std::env::temp_dir().join(format!(

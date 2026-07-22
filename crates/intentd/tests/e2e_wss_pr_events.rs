@@ -146,9 +146,12 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 
 /// Stub forge: `get_pr` reports the linked PR (#42, head `feature`) as merged;
 /// when `open_pr_number` is set, `list_prs` offers that open PR on the same
-/// head ref (the relink successor).
+/// head ref (the relink successor). When `caps` is set it overrides the
+/// advertised capabilities (default all-true) for the gating tests.
+#[derive(Default)]
 struct StubForge {
     open_pr_number: Option<u64>,
+    caps: Option<ScCapabilities>,
 }
 
 fn sample_pr() -> PullRequest {
@@ -176,14 +179,14 @@ impl SourceControl for StubForge {
         "stub"
     }
     fn capabilities(&self) -> ScCapabilities {
-        ScCapabilities {
+        self.caps.unwrap_or(ScCapabilities {
             draft_prs: true,
             squash_merge: true,
             rebase_merge: true,
             review_required_changes: true,
             check_runs: true,
             issues: true,
-        }
+        })
     }
     async fn check_auth(&self) -> ScResult<AuthStatus> {
         unimplemented!()
@@ -482,6 +485,7 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
 async fn pr_linked_event_carries_pull_requests_list_over_wss() {
     let fx = boot(StubForge {
         open_pr_number: Some(300),
+        ..Default::default()
     })
     .await;
 
@@ -524,10 +528,7 @@ async fn pr_linked_event_carries_pull_requests_list_over_wss() {
 /// payload carries the status delta plus the seeded `pullRequests` list.
 #[tokio::test]
 async fn pr_updated_event_carries_pull_requests_list_over_wss() {
-    let fx = boot(StubForge {
-        open_pr_number: None,
-    })
-    .await;
+    let fx = boot(StubForge::default()).await;
 
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
     let sub_res = wss_rpc(
@@ -569,6 +570,7 @@ async fn pr_updated_event_carries_pull_requests_list_over_wss() {
 async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
     let fx = boot(StubForge {
         open_pr_number: Some(300),
+        ..Default::default()
     })
     .await;
 
@@ -605,4 +607,105 @@ async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
     assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
     assert_eq!(evt["data"]["prNumber"], 300);
     assert_eq!(evt["data"]["pullRequests"].as_array().unwrap().len(), 2);
+}
+
+/// Like [`wss_rpc`] but returns the full response envelope so callers can
+/// assert `error` payloads (code + message) instead of panicking on them.
+async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(req.to_string())).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v.get("id") == Some(&json!(id)) {
+                        return v;
+                    }
+                }
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Message::Pong(_) => {}
+                _ => panic!("unexpected message"),
+            }
+        }
+    })
+    .await
+    .expect("response timeout")
+}
+
+/// `pr.capabilities` over the wire (PROTOCOL §5.7 extension): returns the
+/// provider id plus the camelCase capability flags, and requires only a
+/// resolvable provider — the seeded workspace is linked, but the flags do not
+/// depend on any PR state.
+#[tokio::test]
+async fn pr_capabilities_returns_provider_flags_over_wss() {
+    let fx = boot(StubForge::default()).await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let result = wss_rpc(
+        &mut rpc,
+        1,
+        "pr.capabilities",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(result["provider"], "stub");
+    let caps = &result["capabilities"];
+    assert_eq!(caps["draftPrs"], true);
+    assert_eq!(caps["squashMerge"], true);
+    assert_eq!(caps["rebaseMerge"], true);
+    assert_eq!(caps["reviewRequiredChanges"], true);
+    assert_eq!(caps["checkRuns"], true);
+    assert_eq!(caps["issues"], true);
+}
+
+/// Runtime capability gating over the wire (§7.2/§7.4): a provider without
+/// `squashMerge` rejects `pr.merge {mergeMethod:"squash"}` with `-32603` and
+/// the stable `unsupported by provider:` message prefix; `pr.capabilities`
+/// reflects the same disabled flags.
+#[tokio::test]
+async fn pr_merge_squash_gated_by_capabilities_over_wss() {
+    let fx = boot(StubForge {
+        caps: Some(ScCapabilities {
+            draft_prs: false,
+            squash_merge: false,
+            rebase_merge: false,
+            review_required_changes: false,
+            check_runs: false,
+            issues: false,
+        }),
+        ..Default::default()
+    })
+    .await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let caps = wss_rpc(
+        &mut rpc,
+        1,
+        "pr.capabilities",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(caps["capabilities"]["squashMerge"], false);
+
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        2,
+        "pr.merge",
+        json!({ "workspaceId": fx.ws_id.as_str(), "mergeMethod": "squash" }),
+    )
+    .await;
+    let err = &resp["error"];
+    assert_eq!(err["code"], -32603, "error envelope: {resp}");
+    assert_eq!(err["message"], "Internal error", "error envelope: {resp}");
+    // The stable detail rides in `error.data` (PROTOCOL §9 envelope).
+    assert!(
+        err["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("unsupported by provider:"),
+        "error envelope: {resp}"
+    );
 }

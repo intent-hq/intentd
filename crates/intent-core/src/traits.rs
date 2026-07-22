@@ -2685,6 +2685,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `pr.capabilities`: the active provider's id + capability flags so
+    /// clients can gate UI on what the host supports. Requires a resolvable
+    /// provider but NOT an active PR (PROTOCOL §5.7 extension).
+    fn pr_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_capabilities not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -4141,7 +4156,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
-    // search.* — BE-owned file/path search (PROTOCOL §5.15, IMPLEMENTATION_SPEC §14).
+    // search.* — BE-owned file/path search (PROTOCOL §5.15).
     // ------------------------------------------------------------------------
 
     /// `search.inFiles`: gitignore-aware ripgrep content search over the
@@ -4530,10 +4545,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     // ------------------------------------------------------------------------
     // client.hello + drafts.* — stable client identity & per-client drafts
-    // (PROTOCOL §5.16/§5.17, IMPLEMENTATION_SPEC §15/§16). These back the
-    // transport-level interceptors (§16); they are not routed through the
-    // JSON-RPC dispatcher, but live on `WorkspaceApi` so the transport reaches
-    // persistence through services without depending on `intent-store` (§3.2).
+    // (PROTOCOL §5.16/§5.17). These back the transport-level interceptors;
+    // they are not routed through the JSON-RPC dispatcher, but live on
+    // `WorkspaceApi` so the transport reaches persistence through services
+    // without depending on `intent-store` (per the dependency-direction rules).
     // ------------------------------------------------------------------------
 
     /// `client.hello` persistence: upsert the logical `client` row, setting
@@ -4570,18 +4585,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `drafts.set`: upsert the calling client's draft. An empty `text` is a
-    /// clear (the row is deleted). Returns `Some(updatedAt)` when a draft was
-    /// stored or `None` when it was cleared, and emits `draft:changed` (carrying
-    /// `hasDraft`, never the text) (PROTOCOL §5.16/§6.5).
+    /// `drafts.set`: upsert the calling client's draft. An empty `text` with no
+    /// `attachments` is a clear (the row is deleted); empty text WITH
+    /// attachments persists the row. `attachments` is an opaque JSON array
+    /// stored verbatim (`None` ⇒ none stored). Returns `Some(updatedAt)` when a
+    /// draft was stored or `None` when it was cleared, and emits
+    /// `draft:changed` (carrying `hasDraft`, never the content) (PROTOCOL
+    /// §5.16/§6.5).
     fn draft_set(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         client_id: ClientId,
         text: String,
+        attachments: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
-        let _ = (workspace_id, agent_id, client_id, text);
+        let _ = (workspace_id, agent_id, client_id, text, attachments);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::draft_set not implemented".to_string(),

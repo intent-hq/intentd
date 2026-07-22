@@ -208,20 +208,50 @@ where
     .await
     .unwrap_or(Err(ProbeError::Timeout));
 
-    let result = result.map_err(|err| attribute_early_exit(err, &mut child, &conn));
+    let result = match result {
+        Ok(models) => Ok(models),
+        Err(err) => Err(attribute_early_exit(err, &mut child, &conn).await),
+    };
     reap_child(&mut child).await;
     result
 }
 
+/// Bounded window to observe a crashed adapter's exit status and let the
+/// stderr reader drain its final lines before attribution. A crashing child's
+/// stdout close (the transport error that reports the crash) races both the
+/// exit-status reap and the stderr drain, so a bare `try_wait` snapshot can
+/// misattribute a genuine crash as a plain transport failure.
+///
+/// Latency cost: on `ProbeError::Timeout` with a hung (still-running) child,
+/// `child.wait()` burns this full window before falling back to `try_wait`,
+/// so a timed-out probe takes ~500ms beyond `overall_timeout()` in
+/// production. Bounded and error-path-only, so accepted.
+const EXIT_OBSERVE_GRACE: Duration = Duration::from_millis(500);
+
 /// Fold an early adapter exit into the probe error: when the child already
 /// exited before the probe could report models, delegate to
 /// [`exit_attribution`] with the observed exit status and recent stderr.
-fn attribute_early_exit(
+async fn attribute_early_exit(
     err: ProbeError,
     child: &mut tokio::process::Child,
     conn: &Connection,
 ) -> ProbeError {
-    let status = child.try_wait().ok().flatten();
+    if matches!(err, ProbeError::Spawn(_) | ProbeError::Rpc(_)) {
+        return err;
+    }
+    let status = match tokio::time::timeout(EXIT_OBSERVE_GRACE, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        _ => child.try_wait().ok().flatten(),
+    };
+    if status.is_some_and(|s| !s.success()) {
+        // The exited child's final stderr may still be in flight to the
+        // reader task; wait briefly for the first line so the attribution
+        // can carry it.
+        let deadline = tokio::time::Instant::now() + EXIT_OBSERVE_GRACE;
+        while conn.recent_stderr().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     exit_attribution(err, status, &conn.recent_stderr())
 }
 
