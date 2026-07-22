@@ -137,6 +137,7 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 /// deterministic fixture script.
 async fn make_services(
     auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
 ) -> (Arc<dyn WorkspaceApi>, EventBus, Store, std::path::PathBuf) {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = Path::new("/tmp").join(format!("intentd-wss-{}", &short[..8]));
@@ -152,6 +153,9 @@ async fn make_services(
         .with_workspaces_root(workspaces_root);
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
+    }
+    if let Some(cache_dir) = models_cache_dir {
+        services = services.with_models_cache_dir(cache_dir);
     }
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     (api, bus, store, dir)
@@ -176,8 +180,18 @@ async fn start(opts: WsOptions) -> Server {
 
 /// [`start`] with an optional auggie-binary override for `agent.enhancePrompt`
 /// tests (§5.31).
-async fn start_with_auggie(mut opts: WsOptions, auggie_bin: Option<std::path::PathBuf>) -> Server {
-    let (api, bus, store, dir) = make_services(auggie_bin).await;
+async fn start_with_auggie(opts: WsOptions, auggie_bin: Option<std::path::PathBuf>) -> Server {
+    start_with_auggie_and_models_cache(opts, auggie_bin, None).await
+}
+
+/// [`start_with_auggie`] with an optional persisted models-cache dir so
+/// `models.list` cache-fallback tests (§5.30) can seed a last-good entry.
+async fn start_with_auggie_and_models_cache(
+    mut opts: WsOptions,
+    auggie_bin: Option<std::path::PathBuf>,
+    models_cache_dir: Option<std::path::PathBuf>,
+) -> Server {
+    let (api, bus, store, dir) = make_services(auggie_bin, models_cache_dir).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
@@ -1044,6 +1058,65 @@ async fn wss_models_list_negative_cache_suppresses_reprobe_force_refresh_bypasse
     srv.ws.stop().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe() {
+    // models.list legacy path staleness contract (§5.30) over the real WSS
+    // transport: a NON-forced read whose cache entry is past the 5-minute TTL
+    // and whose re-probe fails serves the last-good list labeled
+    // `stale: true` + `warning` — exactly `{ models, source, stale, warning }`
+    // with `source: "auggie"`, never a silent static fallback. The last-good
+    // entry is seeded through the persisted cache file (fetchedAtMs: 0 →
+    // expired but present) and the fake auggie always fails.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new("/tmp").join(format!("intentd-wss-models-stale-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("auggie");
+    std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let last_good = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "lg", "name": "LG", "provider": "auggie" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.join("models-cache.json"),
+        serde_json::to_vec(&last_good).unwrap(),
+    )
+    .unwrap();
+    let srv =
+        start_with_auggie_and_models_cache(WsOptions::default(), Some(bin), Some(dir.clone()))
+            .await;
+
+    let frame = r#"{"jsonrpc":"2.0","id":45,"method":"models.list"}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["id"], 45);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["source"], "auggie");
+    assert_eq!(resp["result"]["stale"], true, "{resp}");
+    assert!(resp["result"]["warning"].is_string(), "{resp}");
+    assert_eq!(
+        resp["result"]["models"],
+        serde_json::json!([ { "id": "lg", "name": "LG", "provider": "auggie" } ])
+    );
+    // Legacy shape plus the documented degradation labels — no providerId.
+    let mut keys: Vec<_> = resp["result"]
+        .as_object()
+        .expect("result object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
+    let _ = std::fs::remove_dir_all(&dir);
+    srv.ws.stop().await;
+}
+
 /// Write a deterministic fake `auggie` script for `agent.enhancePrompt` tests
 /// (§5.31): swallows the piped stdin, then runs `body`.
 #[cfg(unix)]
@@ -1414,7 +1487,7 @@ async fn bind_fails_fast_on_occupied_port() {
     // to avoid TOCTOU (no free_port() release-then-rebind window).
     let _hog = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let base = _hog.local_addr().unwrap().port();
-    let (api, bus, _store, dir) = make_services(None).await;
+    let (api, bus, _store, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
@@ -1448,7 +1521,7 @@ async fn insecure_mode_serves_plain_ws_without_token() {
     // header and complete a JSON-RPC round-trip. The listener's `fingerprint()`
     // is `None` and `is_insecure()` reports `true` so `system.status` surfaces
     // the real posture.
-    let (api, bus, _store, _dir) = make_services(None).await;
+    let (api, bus, _store, _dir) = make_services(None, None).await;
     let opts = WsOptions {
         base_port: 0,
         bind_address: Ipv4Addr::LOCALHOST.into(),

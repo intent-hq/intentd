@@ -321,12 +321,7 @@ impl ModelCatalogCache {
     /// `version_key` — a version-pin bump invalidates automatically. An entry
     /// fetched in the future (system clock moved backwards) is not fresh, so
     /// a persisted entry can never outlive the TTL through clock adjustments.
-    pub(crate) fn fresh(
-        &self,
-        provider_id: &str,
-        version_key: &str,
-        now_ms: u64,
-    ) -> Option<Vec<Value>> {
+    fn fresh(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<Vec<Value>> {
         let entries = self.entries.lock().expect("model catalog cache poisoned");
         let entry = entries.get(provider_id)?;
         if entry.version_key != version_key || now_ms < entry.fetched_at_ms {
@@ -349,13 +344,7 @@ impl ModelCatalogCache {
     /// model rows) so concurrent stores for different providers cannot land
     /// their snapshots on disk out of order; temp-file + rename keeps a crash
     /// mid-write from corrupting the previous snapshot.
-    pub(crate) fn store(
-        &self,
-        provider_id: &str,
-        version_key: &str,
-        models: Vec<Value>,
-        now_ms: u64,
-    ) {
+    fn store(&self, provider_id: &str, version_key: &str, models: Vec<Value>, now_ms: u64) {
         let mut entries = self.entries.lock().expect("model catalog cache poisoned");
         entries.insert(
             provider_id.to_string(),
@@ -383,12 +372,7 @@ impl ModelCatalogCache {
     /// [`MODELS_NEGATIVE_TTL`] **and** was recorded under `version_key`. Same
     /// clock-backwards guard as [`Self::fresh`]: an entry stamped ahead of
     /// `now` is not fresh.
-    pub(crate) fn negative_reason(
-        &self,
-        provider_id: &str,
-        version_key: &str,
-        now_ms: u64,
-    ) -> Option<String> {
+    fn negative_reason(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<String> {
         let negative = self.negative.lock().expect("model negative cache poisoned");
         let entry = negative.get(provider_id)?;
         if entry.version_key != version_key || now_ms < entry.failed_at_ms {
@@ -446,6 +430,42 @@ impl ModelCatalogCache {
         if inflight.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, cell)) {
             inflight.remove(&key);
         }
+    }
+
+    /// Test-only cache seeding: production code must go through
+    /// [`resolve_with_cache`] so the TTL / negative-window / single-flight
+    /// invariants hold.
+    #[cfg(test)]
+    pub(crate) fn test_store(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        models: Vec<Value>,
+        now_ms: u64,
+    ) {
+        self.store(provider_id, version_key, models, now_ms);
+    }
+
+    /// Test-only negative-window observation (see [`Self::test_store`]).
+    #[cfg(test)]
+    pub(crate) fn test_negative_reason(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        now_ms: u64,
+    ) -> Option<String> {
+        self.negative_reason(provider_id, version_key, now_ms)
+    }
+
+    /// Test-only fresh-entry observation (see [`Self::test_store`]).
+    #[cfg(test)]
+    pub(crate) fn test_fresh(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        now_ms: u64,
+    ) -> Option<Vec<Value>> {
+        self.fresh(provider_id, version_key, now_ms)
     }
 }
 

@@ -3014,7 +3014,7 @@ async fn models_list_cortex_is_feature_code_gated() {
 fn seed_auggie_cache(svc: &Services, rows: Vec<serde_json::Value>) {
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog
-        .store("auggie", "", rows, now.saturating_sub(1));
+        .test_store("auggie", "", rows, now.saturating_sub(1));
 }
 
 /// The test clock for the legacy-path tests (unix-ms shaped, arbitrary).
@@ -3138,7 +3138,7 @@ async fn models_list_legacy_negative_window_expires_then_refetches() {
     assert_eq!(res["source"], "auggie");
     assert!(svc
         .models_catalog
-        .negative_reason("auggie", "", later)
+        .test_negative_reason("auggie", "", later)
         .is_none());
 }
 
@@ -3185,7 +3185,7 @@ async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
     assert!(res["warning"].is_string());
     assert!(svc
         .models_catalog
-        .negative_reason("auggie", "", legacy_now())
+        .test_negative_reason("auggie", "", legacy_now())
         .is_some());
 }
 
@@ -3197,7 +3197,8 @@ async fn models_list_legacy_negative_window_with_last_good_serves_stale() {
     // static catalog here.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "nw", "name": "NW", "provider": "auggie" })];
-    svc.models_catalog.store("auggie", "", sentinel.clone(), 0);
+    svc.models_catalog
+        .test_store("auggie", "", sentinel.clone(), 0);
     let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
     // Expired cache + failed probe arms the negative window.
     let res = svc
@@ -3225,7 +3226,8 @@ async fn models_list_legacy_expired_cache_failed_probe_serves_last_good_stale() 
     // stale + warning (previously the legacy path fell back to statics).
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "lg2", "name": "LG2", "provider": "auggie" })];
-    svc.models_catalog.store("auggie", "", sentinel.clone(), 0);
+    svc.models_catalog
+        .test_store("auggie", "", sentinel.clone(), 0);
     let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
     let res = svc
         .models_list_auggie_with(false, past_ttl, || Box::pin(async { None }))
