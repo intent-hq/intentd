@@ -392,7 +392,7 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
     let script = format!(
-        "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{dir}:\"*) printf '%s' 'anthropic/claude-3\n' ;;\n  *) exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{dir}:\"*) printf '%s\\n' 'anthropic/claude-3' ;;\n  *) exit 1 ;;\nesac\n",
         dir = dir.path().display(),
     );
     std::fs::write(&bin, script).unwrap();
