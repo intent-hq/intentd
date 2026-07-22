@@ -343,17 +343,20 @@ fn cache() -> &'static AuthStatusCache {
 }
 
 /// Resolve one provider's auth status through the cache: non-forced reads
-/// within TTL serve the cached outcome; otherwise the probe runs
-/// single-flighted (concurrent callers — forced or not — share the in-flight
-/// result). Not-installed providers short-circuit to `None` without probing
-/// or caching, so an install is picked up immediately.
+/// within TTL serve the cached outcome without touching the filesystem;
+/// otherwise the binary is resolved and the probe runs single-flighted
+/// (concurrent callers — forced or not — share the in-flight result).
+/// Not-installed providers short-circuit to `None` without probing or
+/// caching, so an install is picked up immediately; an uninstall within the
+/// TTL serves the stale cached value until expiry (accepted — the next
+/// expired or forced read reports `None`).
 async fn resolve_auth_status(provider_id: &'static str, force: bool) -> Option<bool> {
-    let program = resolve_probe_binary(provider_id)?;
     if !force {
         if let Some(cached) = cache().fresh(provider_id) {
             return cached;
         }
     }
+    let program = resolve_probe_binary(provider_id)?;
     let cell = cache().join_inflight(provider_id);
     let value = *cell
         .get_or_init(|| async {
