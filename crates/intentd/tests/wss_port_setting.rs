@@ -3,6 +3,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 // Port setting tests don't need actual TCP listeners
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -142,7 +144,8 @@ async fn port_setting_crud() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
 
@@ -219,7 +222,8 @@ async fn port_change_restarts_listener() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     // Attach a mock ServerControl that returns a running port
     let requested_port = Arc::new(tokio::sync::Mutex::new(None));
@@ -281,7 +285,8 @@ async fn port_bind_failure_friendly_error() {
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_secret_store(Arc::new(InMemorySecretStore::default()));
+        .with_secret_store(Arc::new(InMemorySecretStore::default()))
+        .with_workspaces_root(common::hermetic_workspaces_root());
 
     // Attach a mock ServerControl that fails with EADDRINUSE
     let requested_port = Arc::new(tokio::sync::Mutex::new(None));

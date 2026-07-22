@@ -32,6 +32,16 @@ pub fn daemon_startup_timeout() -> Duration {
     test_timeout(Duration::from_secs(60))
 }
 
+/// Return a unique, hermetic workspaces root under the OS temp dir.
+///
+/// In-process integration tests must chain `.with_workspaces_root(...)` onto
+/// every `Services::new(...)` so tests never resolve the real
+/// `~/intent/workspaces`. The directory is created on demand by the services
+/// layer, so this helper only reserves a unique path.
+pub fn hermetic_workspaces_root() -> PathBuf {
+    std::env::temp_dir().join(format!("itd-ws-{}", uuid::Uuid::new_v4()))
+}
+
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`
