@@ -582,10 +582,15 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// [`tokio::process::Command::output`] bounded by
 /// [`AUGGIE_MODELS_TIMEOUT`]; a timeout counts as fetch failure (`None`).
+/// `kill_on_drop` reaps the child when the timeout cancels the output
+/// future, so a wedged CLI does not leak past the failed probe.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
     tokio::time::timeout(
         AUGGIE_MODELS_TIMEOUT,
-        tokio::process::Command::new(auggie).args(args).output(),
+        tokio::process::Command::new(auggie)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()?
