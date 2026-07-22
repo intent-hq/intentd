@@ -121,8 +121,8 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or_else(|| {
         Error::Unsupported(
-            "TCP listener is not running — start the daemon with `intentd serve --listen both` \
-             (or enable the WSS listener) before pairing"
+            "TCP listener is not running — enable the WSS listener (server.wsApi.enabled) \
+             before pairing"
                 .to_string(),
         )
     })?;
