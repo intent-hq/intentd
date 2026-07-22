@@ -1825,6 +1825,32 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `app.agents.waitFor` (the `ws.app.agents.waitFor` MCP binding):
+    /// register completion watches for `caller_agent_id` on a set of existing
+    /// target agents — the subscription side of `agent.delegate` without
+    /// creating children. Semantics are identical to workspace agent
+    /// subscriptions: `wait_mode` `"immediate"` (default) registers a oneShot
+    /// watch per target; `"after_all"` enrolls every target in the caller's
+    /// open delegation group (one aggregated wake once the caller idles and
+    /// all targets settle). Targets in other workspaces are permitted only
+    /// for chief-workspace callers (the shared registration scope gate).
+    /// Returns `{ ok, waitMode, results }` where each result is
+    /// `{ agentId, agentName, workspaceId, subscriptionId, groupId }`.
+    fn app_agents_wait(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        agent_ids: Vec<String>,
+        wait_mode: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, caller_agent_id, agent_ids, wait_mode);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_agents_wait not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.cancelSubscriptions`: cancel all of an agent's subscriptions;
     /// `{ success: true }` (PROTOCOL §5.5).
     fn agent_cancel_subscriptions(

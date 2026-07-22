@@ -21,6 +21,11 @@
 //!   (Chief cannot be archived, so `archived = false` is preserved);
 //!   `workspace.delete` → `{ success: true }`; `workspace.dismissAttention`
 //!   → `{ workspace: … }`. Chief remains reachable via `workspace.get`.
+//! - `ws.app.agents.waitFor` (chief-gated cross-workspace waiting): the
+//!   immediate and after_all modes end-to-end through the real MCP bridge
+//!   (mock ACP provider → `workspace_api` tool → service registry → wake
+//!   delivery), plus the non-chief gating error — see the three
+//!   `*_waitfor_*` tests at the bottom of this file.
 
 #![cfg(unix)]
 
@@ -910,4 +915,726 @@ async fn chief_cross_workspace_completion_wake_over_wss() {
 
     // Wind the chief's wake turn down before teardown.
     let _ = wss_rpc_envelope(&mut rpc, 201, "agent.stop", json!({ "agentId": chief_id })).await;
+}
+
+/// Extract every JSON-parsable `tool_result` text payload from an
+/// `agent.getConversation` result's `messages` array. The mock provider's
+/// `emitToolBlocks` persists each MCP tool call as a `tool_use` +
+/// `tool_result` block pair whose `output[0].text` carries the JSON the
+/// agent-side JS returned (same wire shape `e2e_mock_agent_ws_app.rs`
+/// asserts at the service layer).
+fn tool_result_jsons(messages: &Value) -> Vec<Value> {
+    messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter(|b| b["type"] == json!("tool_result"))
+        .filter_map(|b| b["output"].as_array().and_then(|arr| arr.first()))
+        .filter_map(|item| item["text"].as_str())
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect()
+}
+
+/// Poll the agent's transcript over WSS until `pred` returns Some, or panic
+/// with `what` after ~20s. Returns the predicate's payload.
+async fn poll_conversation<S, T>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    agent_id: &str,
+    what: &str,
+    mut pred: impl FnMut(&Value) -> Option<T>,
+) -> T
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for attempt in 0..80i64 {
+        let resp = wss_rpc_envelope(
+            ws,
+            id_base + attempt,
+            "agent.getConversation",
+            json!({ "agentId": agent_id }),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none(),
+            "agent.getConversation errored: {resp}"
+        );
+        if let Some(v) = pred(&resp["result"]["messages"]) {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Poll `agent.getSubscriptions` over WSS until `pred` accepts the result
+/// payload, or panic with `what` after ~20s. Returns the accepted payload.
+async fn poll_subscriptions<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    agent_workspace: &str,
+    agent_id: &str,
+    what: &str,
+    mut pred: impl FnMut(&Value) -> bool,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for attempt in 0..80i64 {
+        let resp = wss_rpc_envelope(
+            ws,
+            id_base + attempt,
+            "agent.getSubscriptions",
+            json!({ "workspaceId": agent_workspace, "agentId": agent_id }),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none(),
+            "agent.getSubscriptions errored: {resp}"
+        );
+        if pred(&resp["result"]) {
+            return resp["result"].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Seed one user workspace + one mock-model target agent over WSS; returns
+/// `(workspace_id, agent_id)`. Target names are test-controlled so the
+/// chief's JS can discover them via `ws.app.agents.list`.
+async fn seed_target<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_title: &str,
+    agent_name: &str,
+) -> (String, String)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let resp = wss_rpc_envelope(
+        ws,
+        id_base,
+        "workspace.create",
+        json!({ "title": ws_title, "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let resp = wss_rpc_envelope(
+        ws,
+        id_base + 1,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": agent_name, "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    (ws_id, agent_id)
+}
+
+/// `ws.app.agents.waitFor` (immediate mode) end-to-end over the real WSS
+/// wire: a chief-workspace agent registers completion watches on targets in
+/// TWO different user workspaces through the real MCP bridge, and the daemon
+/// wakes it once per settling target.
+///
+/// Asserts:
+/// - the persisted tool result carries the documented `{ ok, waitMode,
+///   results }` shape with a `subscriptionId` and `groupId: null` per target,
+/// - `agent.getSubscriptions` reports both oneShot watches anchored under
+///   `__chief__` BEFORE the targets settle,
+/// - registration publishes `agent:subscriptions-changed` in `__chief__`,
+/// - each target's completion delivers a `[WORKSPACE EVENTS]` wake into the
+///   chief transcript and the consumed oneShot watches drain the registry,
+/// - a re-registered wait is removed by `agent.cancelSubscriptions`.
+#[tokio::test]
+async fn chief_waitfor_immediate_cross_workspace_over_wss() {
+    let Some(script) = gate("WSS chief waitFor immediate E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    // The REGISTER_WAITS turn discovers the seeded targets by their
+    // test-controlled names, then registers immediate-mode waits on both.
+    let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+              const targets = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
+              return await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'immediate' });";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "REGISTER_WAITS",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "waitFor immediate e2e" },
+            },
+            "response": "waits registered",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // Two targets in two DIFFERENT user workspaces (DoD: waits across >=2
+    // workspaces) + the chief parent in `__chief__`.
+    let (ws1_id, t1_id) = seed_target(&mut rpc, 2, "Wait WS One", "Target One").await;
+    let (ws2_id, t2_id) = seed_target(&mut rpc, 4, "Wait WS Two", "Target Two").await;
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Waiter",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let chief_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("chief agent id")
+        .to_string();
+
+    // SUBSCRIBER on `__chief__` BEFORE registration: waitFor must publish
+    // `agent:subscriptions-changed` in the caller's home workspace.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let resp = wss_rpc_envelope(
+        &mut sub,
+        7,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:subscriptions-changed"],
+            "workspaceId": CHIEF_WORKSPACE_ID,
+        }),
+    )
+    .await;
+    assert!(
+        resp["result"]["subscriptionId"].is_string(),
+        "subscribed on __chief__: {resp}"
+    );
+
+    // Drive the chief's registration turn through the real provider + MCP
+    // bridge path.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        8,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "content": "please REGISTER_WAITS on the targets",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    // The persisted tool result is the documented waitFor payload.
+    let wait_result = poll_conversation(&mut rpc, 300, &chief_id, "waitFor tool result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v["ok"] == json!(true) && v["results"].is_array())
+    })
+    .await;
+    assert_eq!(wait_result["waitMode"], json!("immediate"));
+    let results = wait_result["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "one result per target: {results:?}");
+    for (tid, wsid, name) in [
+        (&t1_id, &ws1_id, "Target One"),
+        (&t2_id, &ws2_id, "Target Two"),
+    ] {
+        let entry = results
+            .iter()
+            .find(|r| r["agentId"] == json!(tid))
+            .unwrap_or_else(|| panic!("no waitFor result for {tid}: {results:?}"));
+        assert_eq!(entry["workspaceId"], json!(wsid), "target home: {entry}");
+        assert_eq!(entry["agentName"], json!(name), "target name: {entry}");
+        assert!(
+            entry["subscriptionId"].is_string(),
+            "subscriptionId: {entry}"
+        );
+        assert!(entry["groupId"].is_null(), "immediate ⇒ ungrouped: {entry}");
+    }
+
+    // Registration published `agent:subscriptions-changed` in the PARENT's
+    // home workspace (`__chief__`), for the chief caller.
+    let frame = wss_event(&mut sub, 30).await;
+    let ev = &frame["params"]["event"];
+    assert_eq!(ev["type"], json!("agent:subscriptions-changed"));
+    assert_eq!(ev["workspaceId"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(ev["data"]["agentId"], json!(chief_id));
+
+    // BEFORE the targets settle: both oneShot watches visible, anchored in
+    // `__chief__`, ungrouped.
+    let subs_payload = poll_subscriptions(
+        &mut rpc,
+        400,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "2 live waitFor watches",
+        |r| r["subscriptions"].as_array().map(Vec::len) == Some(2),
+    )
+    .await;
+    let subs = subs_payload["subscriptions"].as_array().unwrap();
+    let mut actor_ids: Vec<&str> = Vec::new();
+    for s in subs {
+        assert_eq!(s["agentId"], json!(chief_id), "watch owner: {s}");
+        assert_eq!(s["workspaceId"], json!(CHIEF_WORKSPACE_ID), "anchor: {s}");
+        assert_eq!(s["oneShot"], json!(true), "immediate ⇒ oneShot: {s}");
+        assert!(s["delegationGroup"].is_null(), "ungrouped: {s}");
+        actor_ids.push(s["actorIds"][0].as_str().expect("actor id"));
+    }
+    assert!(
+        actor_ids.contains(&t1_id.as_str()) && actor_ids.contains(&t2_id.as_str()),
+        "watches cover both targets: {actor_ids:?}"
+    );
+
+    // Settle both targets (mock provider full turns) → each `agent:idle`
+    // fires the matching oneShot watch → one wake per target in `__chief__`.
+    for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
+        let resp = wss_rpc_envelope(
+            &mut rpc,
+            20 + i as i64,
+            "agent.sendMessage",
+            json!({ "workspaceId": wsid, "agentId": tid, "content": "please finish" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["success"],
+            json!(true),
+            "target turn: {resp}"
+        );
+    }
+    // The target ids also appear in the registration tool-result JSON, so
+    // match the exact `format_completion_wake` line per target — one
+    // individual wake each is the immediate-mode contract.
+    let wake1 = format!("[WORKSPACE EVENTS] Child agent Target One ({t1_id}) completed.");
+    let wake2 = format!("[WORKSPACE EVENTS] Child agent Target Two ({t2_id}) completed.");
+    poll_conversation(&mut rpc, 500, &chief_id, "both immediate wakes", |m| {
+        let text = serde_json::to_string(m).unwrap_or_default();
+        (text.contains(&wake1) && text.contains(&wake2)).then_some(())
+    })
+    .await;
+
+    // The consumed oneShot watches drained the registry.
+    poll_subscriptions(
+        &mut rpc,
+        600,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "registry drained after wakes",
+        |r| r["subscriptions"] == json!([]),
+    )
+    .await;
+
+    // Re-register waits on the settled targets. They are `RuntimeIdle`
+    // WITHOUT a completion report (plain turns, no `agent.reportToParent`),
+    // so the conservative registration-time reconciliation predicate — the
+    // same one rehydration uses — treats them as re-waitable rather than
+    // settled: the fresh watches stay armed and would fire on the targets'
+    // NEXT turn end. (Terminal Completed/Error targets DO reconcile into an
+    // immediate synthetic wake — covered by the
+    // `app_agents_wait_*_reconciles_already_settled_target*` unit tests.)
+    // → 2 fresh watches → `agent.cancelSubscriptions` removes them all over
+    // the wire.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        30,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "content": "one more round: REGISTER_WAITS again",
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["success"], json!(true), "round 2: {resp}");
+    poll_subscriptions(
+        &mut rpc,
+        700,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "re-registered watches",
+        |r| r["subscriptions"].as_array().map(Vec::len) == Some(2),
+    )
+    .await;
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        31,
+        "agent.cancelSubscriptions",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "cancelSubscriptions errored: {resp}"
+    );
+    assert_eq!(resp["result"]["success"], json!(true), "cancel: {resp}");
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        32,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["subscriptions"],
+        json!([]),
+        "cancelSubscriptions cleared the registry: {resp}"
+    );
+
+    let _ = wss_rpc_envelope(&mut rpc, 33, "agent.stop", json!({ "agentId": chief_id })).await;
+}
+
+/// `ws.app.agents.waitFor` (after_all mode) end-to-end over the real WSS
+/// wire: the chief enrolls targets in TWO different user workspaces in ONE
+/// delegation group; the group seals when the chief's registering turn ends
+/// (parent idle) and fires a SINGLE aggregated wake once both settle.
+///
+/// Asserts:
+/// - each tool-result entry carries the SAME non-null `groupId`,
+/// - `agent.getSubscriptions` shows both grouped watches (`delegationGroup`
+///   with `awaitMode: "all"`) plus the `delegationGroups` record listing both
+///   expected targets, before any target settles,
+/// - exactly ONE aggregated `All 2 delegated child agent(s) settled
+///   (completionStatus: completed)` wake lands in the chief transcript — and
+///   NO per-target `[WORKSPACE EVENTS] Child agent` immediate wakes,
+/// - subscriptions AND delegation groups are drained after settlement.
+#[tokio::test]
+async fn chief_waitfor_after_all_aggregated_wake_over_wss() {
+    let Some(script) = gate("WSS chief waitFor after_all E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "const listing = await ws.app.agents.list({ includeCompleted: true });\n\
+              const targets = listing.threads.filter((t) => String(t.agentName).startsWith('Target ')).map((t) => t.agentId);\n\
+              return await ws.app.agents.waitFor({ agentIds: targets, waitMode: 'after_all' });";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "REGISTER_GROUP",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "waitFor after_all e2e" },
+            },
+            "response": "group waits registered",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let (ws1_id, t1_id) = seed_target(&mut rpc, 2, "Group WS One", "Target One").await;
+    let (ws2_id, t2_id) = seed_target(&mut rpc, 4, "Group WS Two", "Target Two").await;
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Group Waiter",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let chief_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("chief agent id")
+        .to_string();
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        7,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": chief_id,
+            "content": "please REGISTER_GROUP waits on the targets",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    // Tool result: both entries share ONE non-null groupId.
+    let wait_result = poll_conversation(&mut rpc, 300, &chief_id, "waitFor tool result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v["ok"] == json!(true) && v["results"].is_array())
+    })
+    .await;
+    assert_eq!(wait_result["waitMode"], json!("after_all"));
+    let results = wait_result["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "one result per target: {results:?}");
+    let group_id = results[0]["groupId"]
+        .as_str()
+        .expect("after_all ⇒ groupId")
+        .to_string();
+    for (tid, wsid) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)] {
+        let entry = results
+            .iter()
+            .find(|r| r["agentId"] == json!(tid))
+            .unwrap_or_else(|| panic!("no waitFor result for {tid}: {results:?}"));
+        assert_eq!(entry["workspaceId"], json!(wsid), "target home: {entry}");
+        assert_eq!(
+            entry["groupId"],
+            json!(group_id),
+            "both targets share one group: {entry}"
+        );
+        assert!(
+            entry["subscriptionId"].is_string(),
+            "subscriptionId: {entry}"
+        );
+    }
+
+    // BEFORE any target settles: grouped watches + the delegation-group
+    // record are visible, anchored under `__chief__`.
+    let subs_payload = poll_subscriptions(
+        &mut rpc,
+        400,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "2 grouped watches",
+        |r| r["subscriptions"].as_array().map(Vec::len) == Some(2),
+    )
+    .await;
+    for s in subs_payload["subscriptions"].as_array().unwrap() {
+        assert_eq!(s["workspaceId"], json!(CHIEF_WORKSPACE_ID), "anchor: {s}");
+        assert_eq!(s["oneShot"], json!(false), "grouped watch: {s}");
+        assert_eq!(s["delegationGroup"]["groupId"], json!(group_id), "{s}");
+        assert_eq!(s["delegationGroup"]["awaitMode"], json!("all"), "{s}");
+    }
+    let groups = subs_payload["delegationGroups"]
+        .as_array()
+        .expect("delegationGroups array");
+    assert_eq!(groups.len(), 1, "one open group: {groups:?}");
+    assert_eq!(groups[0]["groupId"], json!(group_id));
+    assert_eq!(groups[0]["parentAgentId"], json!(chief_id));
+    assert_eq!(groups[0]["awaitMode"], json!("all"));
+    assert_eq!(groups[0]["delivered"], json!(false));
+    let expected = groups[0]["expectedAgentIds"]
+        .as_array()
+        .expect("expectedAgentIds");
+    assert!(
+        expected.contains(&json!(t1_id)) && expected.contains(&json!(t2_id)),
+        "group expects both targets: {expected:?}"
+    );
+
+    // Settle both targets. The group sealed when the chief's registering
+    // turn went idle; the second settlement fires the ONE aggregated wake.
+    for (i, (tid, wsid)) in [(&t1_id, &ws1_id), (&t2_id, &ws2_id)].iter().enumerate() {
+        let resp = wss_rpc_envelope(
+            &mut rpc,
+            20 + i as i64,
+            "agent.sendMessage",
+            json!({ "workspaceId": wsid, "agentId": tid, "content": "please finish" }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["success"],
+            json!(true),
+            "target turn: {resp}"
+        );
+    }
+    let transcript_text =
+        poll_conversation(&mut rpc, 500, &chief_id, "aggregated after_all wake", |m| {
+            let text = serde_json::to_string(m).unwrap_or_default();
+            text.contains("All 2 delegated child agent(s) settled (completionStatus: completed)")
+                .then_some(text)
+        })
+        .await;
+    assert_eq!(
+        transcript_text
+            .matches("All 2 delegated child agent(s) settled")
+            .count(),
+        1,
+        "exactly ONE aggregated wake"
+    );
+    assert!(
+        !transcript_text.contains("[WORKSPACE EVENTS] Child agent"),
+        "after_all must not deliver per-target immediate wakes"
+    );
+    // The aggregated wake folds in one per-child line per target.
+    assert!(
+        transcript_text.contains(&format!("Target One ({t1_id}) completed."))
+            && transcript_text.contains(&format!("Target Two ({t2_id}) completed.")),
+        "aggregated wake carries both per-child lines"
+    );
+
+    // Group settlement drained both the watches and the group record.
+    poll_subscriptions(
+        &mut rpc,
+        600,
+        CHIEF_WORKSPACE_ID,
+        &chief_id,
+        "registry drained after group settlement",
+        |r| r["subscriptions"] == json!([]) && r["delegationGroups"] == json!([]),
+    )
+    .await;
+
+    let _ = wss_rpc_envelope(&mut rpc, 30, "agent.stop", json!({ "agentId": chief_id })).await;
+}
+
+/// Safety gate over the real WSS wire: a NON-chief agent attempting
+/// `ws.app.agents.waitFor` receives the chief-workspace gating error through
+/// the MCP tool result, and no watch is registered for it.
+#[tokio::test]
+async fn non_chief_waitfor_gated_over_wss() {
+    let Some(script) = gate("WSS non-chief waitFor gating E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "try {\n\
+                const result = await ws.app.agents.waitFor({ agentIds: ['agent-in-another-workspace'] });\n\
+                return { success: true, result };\n\
+              } catch (error) {\n\
+                return { success: false, error: error.message };\n\
+              }";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "TRY_WAITFOR",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "waitFor gating e2e" },
+            },
+            "response": "gating checked",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // The caller is a REGULAR-workspace agent, so the chief-only gate must
+    // reject the call before any target resolution or registration happens.
+    let (ws_id, caller_id) = seed_target(&mut rpc, 2, "Non Chief WS", "Gated Caller").await;
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": caller_id,
+            "content": "TRY_WAITFOR from a regular workspace",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    let gate_result = poll_conversation(&mut rpc, 300, &caller_id, "gating tool result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v.get("success").is_some())
+    })
+    .await;
+    assert_eq!(
+        gate_result["success"],
+        json!(false),
+        "non-chief waitFor must fail: {gate_result}"
+    );
+    let error_msg = gate_result["error"].as_str().expect("error string");
+    assert!(
+        error_msg.contains("ws.app.* is only available in the Chief of Staff workspace"),
+        "clear chief-gating error, got: {error_msg}"
+    );
+
+    // Side-effect free: no watch was registered for the rejected caller.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": ws_id, "agentId": caller_id }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["subscriptions"],
+        json!([]),
+        "no watches for the gated caller: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["delegationGroups"],
+        json!([]),
+        "no groups for the gated caller: {resp}"
+    );
 }

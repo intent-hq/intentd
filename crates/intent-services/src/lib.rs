@@ -12725,6 +12725,19 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn app_agents_wait(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        agent_ids: Vec<String>,
+        wait_mode: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.app_agents_wait_op(workspace_id, caller_agent_id, agent_ids, wait_mode)
+                .await
+        })
+    }
+
     fn agent_list_interrupted(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             let rows = self.store.list_interrupted_agents().await?;

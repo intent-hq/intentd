@@ -1,8 +1,9 @@
 //! `ws.app.agents.*` bindings (chief-gated).
 //!
 //! Exposes cross-workspace agent audit methods (`list`, `readConversation`)
-//! exclusively to Chief-of-Staff workspace agents. Non-chief agents receive a
-//! clear gating error. Shape parity with the TS reference
+//! and the completion-watch registration method (`waitFor`) exclusively to
+//! Chief-of-Staff workspace agents. Non-chief agents receive a clear gating
+//! error. Shape parity with the TS reference
 //! `packages/cloudlands-fe/src/features/mcp/main/mcp/ws-app-agents-api.ts`.
 
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub(crate) const PRELUDE: &str = r#"
         list: (options) => host({ method: 'app.agents.list', args: options || {} }),
         readConversation: (workspaceId, agentId, opts) =>
             host({ method: 'app.agents.readConversation', args: { workspaceId, agentId, ...(opts || {}) } }),
+        waitFor: (options) => host({ method: 'app.agents.waitFor', args: options || {} }),
     };
 "#;
 
@@ -30,6 +32,7 @@ const MAX_READ_LIMIT: i64 = 100;
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -42,6 +45,7 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "readConversation" => read_conversation(api, args).await,
+        "waitFor" => wait_for(api, workspace_id, caller, args).await,
         other => Err(format!("host: unknown method `app.agents.{other}`")),
     }
 }
@@ -233,6 +237,53 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
     }))
 }
 
+/// `ws.app.agents.waitFor({ agentIds, waitMode? })`: register completion
+/// watches for the calling agent on a set of existing target agents. Arg
+/// validation happens here (helpful JS-visible messages); target resolution,
+/// scope gating, and registration live in the service op, whose errors
+/// (unknown agent id, self-wait, deleted targets) surface via `map_err`.
+async fn wait_for(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+) -> Result<Value, String> {
+    let caller_agent_id = caller.cloned().ok_or_else(|| {
+        "No agent context available. This tool must be called by an agent.".to_string()
+    })?;
+    let agent_ids = match args.get("agentIds") {
+        None | Some(Value::Null) => {
+            return Err("agentIds is required (an array of agent ids)".to_string())
+        }
+        Some(Value::Array(items)) => {
+            let mut ids = Vec::with_capacity(items.len());
+            for item in items {
+                match item.as_str() {
+                    Some(s) => ids.push(s.to_string()),
+                    None => return Err("agentIds must be an array of agent id strings".to_string()),
+                }
+            }
+            ids
+        }
+        Some(_) => return Err("agentIds must be an array of agent id strings".to_string()),
+    };
+    if agent_ids.is_empty() {
+        return Err("agentIds must contain at least one agent id".to_string());
+    }
+    let wait_mode = match args.get("waitMode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s == "immediate" || s == "after_all" => Some(s.clone()),
+        Some(other) => {
+            return Err(format!(
+                "invalid waitMode {other} (expected \"immediate\" or \"after_all\")"
+            ))
+        }
+    };
+    api.app_agents_wait(workspace_id.clone(), caller_agent_id, agent_ids, wait_mode)
+        .await
+        .map_err(map_err)
+}
+
 /// Normalize cursor offset: must be non-negative integer.
 fn normalize_offset(value: Option<i64>) -> Result<i64, String> {
     match value {
@@ -296,11 +347,15 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
+    type WaitCall = (WorkspaceId, AgentId, Vec<String>, Option<String>);
+
     #[derive(Default)]
     struct FakeApi {
         workspaces: Mutex<Vec<Workspace>>,
         agents: Mutex<Vec<AgentLite>>,
         conversation_messages: Mutex<Vec<Value>>,
+        wait_calls: Mutex<Vec<WaitCall>>,
+        wait_error: Mutex<Option<String>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -352,6 +407,41 @@ mod tests {
         ) -> BoxFuture<'_, Result<Value>> {
             let messages = self.conversation_messages.lock().unwrap().clone();
             Box::pin(async move { Ok(json!({ "messages": messages })) })
+        }
+
+        fn app_agents_wait(
+            &self,
+            workspace_id: WorkspaceId,
+            caller_agent_id: AgentId,
+            agent_ids: Vec<String>,
+            wait_mode: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let error = self.wait_error.lock().unwrap().clone();
+            self.wait_calls.lock().unwrap().push((
+                workspace_id,
+                caller_agent_id,
+                agent_ids.clone(),
+                wait_mode.clone(),
+            ));
+            Box::pin(async move {
+                if let Some(msg) = error {
+                    return Err(Error::InvalidParams(msg));
+                }
+                let mode = wait_mode.unwrap_or_else(|| "immediate".to_string());
+                let results: Vec<Value> = agent_ids
+                    .iter()
+                    .map(|id| {
+                        json!({
+                            "agentId": id,
+                            "agentName": "Target",
+                            "workspaceId": "ws-1",
+                            "subscriptionId": format!("sub-{id}"),
+                            "groupId": null,
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "ok": true, "waitMode": mode, "results": results }))
+            })
         }
     }
 
@@ -504,7 +594,7 @@ mod tests {
     async fn test_dispatch_rejects_non_chief_workspace() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let non_chief_id = WorkspaceId::from_string("amber-forest");
-        let result = dispatch(&api, &non_chief_id, "list", &json!({})).await;
+        let result = dispatch(&api, &non_chief_id, None, "list", &json!({})).await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -533,7 +623,9 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+        let result = dispatch(&api, &chief_id, None, "list", &json!({}))
+            .await
+            .unwrap();
 
         assert_eq!(result.get("total").unwrap().as_u64().unwrap(), 60);
         assert_eq!(result.get("returned").unwrap().as_u64().unwrap(), 50); // default limit
@@ -562,7 +654,7 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "list", &json!({ "limit": 300 }))
+        let result = dispatch(&api, &chief_id, None, "list", &json!({ "limit": 300 }))
             .await
             .unwrap();
 
@@ -590,7 +682,9 @@ mod tests {
         let api: Arc<dyn WorkspaceApi> = fake;
 
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "list", &json!({})).await.unwrap();
+        let result = dispatch(&api, &chief_id, None, "list", &json!({}))
+            .await
+            .unwrap();
 
         let threads = result.get("threads").unwrap().as_array().unwrap();
         assert_eq!(threads.len(), 1);
@@ -637,6 +731,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1" }),
         )
@@ -682,6 +777,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "lastN": 200 }),
         )
@@ -728,6 +824,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "startTurn": 2, "endTurn": 5 }),
         )
@@ -742,6 +839,7 @@ mod tests {
         let result_err = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "startTurn": 5, "endTurn": 2 }),
         )
@@ -783,6 +881,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1" }),
         )
@@ -833,6 +932,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1", "includeToolCalls": true }),
         )
@@ -878,6 +978,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "readConversation",
             &json!({ "workspaceId": "ws-1", "agentId": "agent-1" }),
         )
@@ -896,5 +997,198 @@ mod tests {
         assert!(result.get("endTurn").is_some());
         assert!(result.get("includeToolCalls").is_some());
         assert!(result.get("messages").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_rejects_non_chief_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let non_chief_id = WorkspaceId::from_string("amber-forest");
+        let caller = AgentId::from_string("agent-caller");
+        let result = dispatch(
+            &api,
+            &non_chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": ["agent-1"] }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "ws.app.* is only available in the Chief of Staff workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_requires_agent_context() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "waitFor",
+            &json!({ "agentIds": ["agent-1"] }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "No agent context available. This tool must be called by an agent."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_validates_agent_ids() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        // Missing agentIds
+        let missing = dispatch(&api, &chief_id, Some(&caller), "waitFor", &json!({})).await;
+        assert_eq!(
+            missing.unwrap_err(),
+            "agentIds is required (an array of agent ids)"
+        );
+
+        // Non-array agentIds
+        let non_array = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": "agent-1" }),
+        )
+        .await;
+        assert_eq!(
+            non_array.unwrap_err(),
+            "agentIds must be an array of agent id strings"
+        );
+
+        // Array with non-string entries
+        let non_string = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": ["agent-1", 42] }),
+        )
+        .await;
+        assert_eq!(
+            non_string.unwrap_err(),
+            "agentIds must be an array of agent id strings"
+        );
+
+        // Empty array
+        let empty = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": [] }),
+        )
+        .await;
+        assert_eq!(
+            empty.unwrap_err(),
+            "agentIds must contain at least one agent id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_validates_wait_mode() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+        let result = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": ["agent-1"], "waitMode": "sometimes" }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "invalid waitMode \"sometimes\" (expected \"immediate\" or \"after_all\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_happy_path_forwards_args_to_service() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let result = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": ["agent-1", "agent-2"], "waitMode": "after_all" }),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.get("ok").unwrap().as_bool().unwrap());
+        assert_eq!(result.get("waitMode").unwrap(), "after_all");
+        let results = result.get("results").unwrap().as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].get("agentId").unwrap(), "agent-1");
+        assert_eq!(results[0].get("subscriptionId").unwrap(), "sub-agent-1");
+
+        let calls = fake.wait_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (ws, caller_id, ids, mode) = &calls[0];
+        assert_eq!(ws, &chief_id);
+        assert_eq!(caller_id, &caller);
+        assert_eq!(ids, &vec!["agent-1".to_string(), "agent-2".to_string()]);
+        assert_eq!(mode.as_deref(), Some("after_all"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_omits_wait_mode_by_default() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let result = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": ["agent-1"] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.get("waitMode").unwrap(), "immediate");
+        let calls = fake.wait_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].3, None);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_surfaces_service_errors() {
+        let fake = Arc::new(FakeApi::default());
+        *fake.wait_error.lock().unwrap() = Some("unknown agent id: agent-ghost".to_string());
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief_id = WorkspaceId::chief();
+        let caller = AgentId::from_string("agent-caller");
+
+        let result = dispatch(
+            &api,
+            &chief_id,
+            Some(&caller),
+            "waitFor",
+            &json!({ "agentIds": ["agent-ghost"] }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("unknown agent id: agent-ghost"));
     }
 }

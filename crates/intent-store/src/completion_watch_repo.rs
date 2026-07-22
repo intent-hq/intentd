@@ -1,0 +1,217 @@
+//! Completion-watch repository: CRUD for persisted parent→child completion
+//! watches (one-shot and grouped).
+//!
+//! Registration persists the row via a best-effort async write-through (NOT
+//! durable-before-observable — see `Services::persist_completion_watch`);
+//! firing a one-shot watch, cancellation, and deadline expiry delete it. On
+//! startup the daemon rehydrates surviving rows into the in-memory registry
+//! (`agent_subscriptions.rs`) so a watch registered before a restart still
+//! wakes the parent when the child completes after the restart.
+
+use intent_core::{AgentId, Error, Result, WorkspaceId};
+use sqlx::Row;
+
+use crate::Store;
+
+/// Persisted completion-watch row (mirrors the in-memory `CompletionWatch`;
+/// the monotonic `cleanup_deadline` instant is stored as wall-clock epoch ms).
+#[derive(Debug, Clone)]
+pub struct PersistedCompletionWatch {
+    pub id: String,
+    pub parent_workspace_id: WorkspaceId,
+    pub child_workspace_id: WorkspaceId,
+    pub parent_agent_id: AgentId,
+    pub parent_agent_name: String,
+    pub child_agent_id: AgentId,
+    pub one_shot: bool,
+    pub group_id: Option<String>,
+    pub report_delivered: bool,
+    pub deadline_at_ms: Option<i64>,
+    pub created_at: String,
+}
+
+impl Store {
+    /// Insert a completion_watch row, or update its mutable columns on id
+    /// conflict (parent anchor/name, one_shot, group_id, report_delivered,
+    /// deadline). The identity columns — child ids/workspace and created_at
+    /// — are fixed at registration and intentionally not overwritten.
+    pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO completion_watch (
+                id, parent_workspace_id, child_workspace_id, parent_agent_id,
+                parent_agent_name, child_agent_id, one_shot, group_id,
+                report_delivered, deadline_at_ms, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                parent_workspace_id = excluded.parent_workspace_id,
+                parent_agent_name = excluded.parent_agent_name,
+                one_shot = excluded.one_shot,
+                group_id = excluded.group_id,
+                report_delivered = excluded.report_delivered,
+                deadline_at_ms = excluded.deadline_at_ms",
+        )
+        .bind(&w.id)
+        .bind(&w.parent_workspace_id.0)
+        .bind(&w.child_workspace_id.0)
+        .bind(&w.parent_agent_id.0)
+        .bind(&w.parent_agent_name)
+        .bind(&w.child_agent_id.0)
+        .bind(w.one_shot as i64)
+        .bind(&w.group_id)
+        .bind(w.report_delivered as i64)
+        .bind(w.deadline_at_ms)
+        .bind(&w.created_at)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("upsert completion_watch failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Load every persisted completion_watch row (the registry is
+    /// daemon-global, so startup rehydration loads all rows in one pass).
+    pub async fn list_completion_watches(&self) -> Result<Vec<PersistedCompletionWatch>> {
+        let rows = sqlx::query(
+            "SELECT id, parent_workspace_id, child_workspace_id, parent_agent_id,
+                    parent_agent_name, child_agent_id, one_shot, group_id,
+                    report_delivered, deadline_at_ms, created_at
+             FROM completion_watch
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list completion watches: {e}")))?;
+
+        rows.iter().map(decode_watch_row).collect()
+    }
+
+    /// Delete a completion_watch row (fired one-shot, cancellation, expiry).
+    pub async fn delete_completion_watch(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM completion_watch WHERE id = ?")
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("delete completion_watch failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete every completion_watch row registered by `parent_agent_id`
+    /// (`agent.cancelSubscriptions`).
+    pub async fn delete_completion_watches_for_parent(
+        &self,
+        parent_agent_id: &AgentId,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM completion_watch WHERE parent_agent_id = ?")
+            .bind(&parent_agent_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("delete completion_watches for parent failed: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Set `report_delivered = 1` (report-time wake already delivered).
+    pub async fn mark_completion_watch_report_delivered(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE completion_watch SET report_delivered = 1 WHERE id = ?")
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "mark completion_watch report_delivered failed: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Update the wall-clock leak-guard deadline (epoch ms).
+    pub async fn set_completion_watch_deadline(&self, id: &str, deadline_at_ms: i64) -> Result<()> {
+        sqlx::query("UPDATE completion_watch SET deadline_at_ms = ? WHERE id = ?")
+            .bind(deadline_at_ms)
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set completion_watch deadline failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Convert a grouped watch into an ungrouped oneShot watch (group
+    /// settlement retaining a failed-not-deleted member, STAB-129).
+    pub async fn ungroup_completion_watch(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE completion_watch SET group_id = NULL, one_shot = 1 WHERE id = ?")
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("ungroup completion_watch failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Refresh a watch's stored parent display name and home-workspace anchor
+    /// (the `find_and_refresh_ungrouped_watch` reuse path).
+    pub async fn update_completion_watch_parent(
+        &self,
+        id: &str,
+        parent_agent_name: &str,
+        parent_workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE completion_watch SET parent_agent_name = ?, parent_workspace_id = ? \
+             WHERE id = ?",
+        )
+        .bind(parent_agent_name)
+        .bind(&parent_workspace_id.0)
+        .bind(id)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("update completion_watch parent failed: {e}")))?;
+        Ok(())
+    }
+}
+
+fn decode_watch_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedCompletionWatch> {
+    Ok(PersistedCompletionWatch {
+        id: row
+            .try_get("id")
+            .map_err(|e| Error::Internal(format!("decode id: {e}")))?,
+        parent_workspace_id: WorkspaceId::from(
+            row.try_get::<String, _>("parent_workspace_id")
+                .map_err(|e| Error::Internal(format!("decode parent_workspace_id: {e}")))?
+                .as_str(),
+        ),
+        child_workspace_id: WorkspaceId::from(
+            row.try_get::<String, _>("child_workspace_id")
+                .map_err(|e| Error::Internal(format!("decode child_workspace_id: {e}")))?
+                .as_str(),
+        ),
+        parent_agent_id: AgentId::from(
+            row.try_get::<String, _>("parent_agent_id")
+                .map_err(|e| Error::Internal(format!("decode parent_agent_id: {e}")))?
+                .as_str(),
+        ),
+        parent_agent_name: row
+            .try_get("parent_agent_name")
+            .map_err(|e| Error::Internal(format!("decode parent_agent_name: {e}")))?,
+        child_agent_id: AgentId::from(
+            row.try_get::<String, _>("child_agent_id")
+                .map_err(|e| Error::Internal(format!("decode child_agent_id: {e}")))?
+                .as_str(),
+        ),
+        one_shot: row
+            .try_get::<i64, _>("one_shot")
+            .map_err(|e| Error::Internal(format!("decode one_shot: {e}")))?
+            != 0,
+        group_id: row
+            .try_get("group_id")
+            .map_err(|e| Error::Internal(format!("decode group_id: {e}")))?,
+        report_delivered: row
+            .try_get::<i64, _>("report_delivered")
+            .map_err(|e| Error::Internal(format!("decode report_delivered: {e}")))?
+            != 0,
+        deadline_at_ms: row
+            .try_get("deadline_at_ms")
+            .map_err(|e| Error::Internal(format!("decode deadline_at_ms: {e}")))?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|e| Error::Internal(format!("decode created_at: {e}")))?,
+    })
+}

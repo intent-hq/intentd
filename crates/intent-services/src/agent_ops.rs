@@ -3314,6 +3314,191 @@ impl Services {
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
 
+    /// `app.agents.waitFor`: register completion watches for the caller on a
+    /// set of existing target agents — the subscription side of
+    /// `agent.delegate` without creating children. Reuses the exact same
+    /// registration/group helpers as the delegate call sites: `immediate`
+    /// (default) registers a oneShot watch per target (deduped against a live
+    /// ungrouped watch, like `agent.watchCompletion`); `after_all` enrolls
+    /// every target in the caller's open delegation group anchored in the
+    /// caller's home workspace (sealed on the caller's idle, one aggregated
+    /// wake, restart-safe through the existing group persistence). Targets
+    /// outside the caller's home workspace pass only for chief-workspace
+    /// callers — enforced by the shared `check_watch_scope` gate, which runs
+    /// for every target BEFORE any side-effectful registration so a rejection
+    /// leaves no partial group or watches behind.
+    ///
+    /// After registration every target is reconciled against current agent
+    /// state (same [`Services::reconcile_watch_child_on_rehydration`] path the
+    /// startup rehydration uses): a target that already settled — Completed /
+    /// Error / genuinely idle with a completion report — delivers its
+    /// synthetic completion immediately instead of leaving a watch armed for
+    /// an event that fired long ago. This also closes the TOCTOU window where
+    /// a target settles between the validation loop above and the watch
+    /// registration (its live event would dispatch before the watch exists).
+    pub(crate) async fn app_agents_wait_op(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: AgentId,
+        agent_ids: Vec<String>,
+        wait_mode: Option<String>,
+    ) -> Result<Value> {
+        let wait_mode = match wait_mode.as_deref() {
+            None | Some("immediate") => "immediate",
+            Some(WAIT_MODE_AFTER_ALL) => WAIT_MODE_AFTER_ALL,
+            Some(other) => {
+                return Err(Error::InvalidParams(format!(
+                    "invalid waitMode `{other}` (expected \"immediate\" or \"after_all\")"
+                )))
+            }
+        };
+        // Dedupe target ids preserving order; drop empty entries.
+        let mut seen: HashSet<String> = HashSet::new();
+        let targets: Vec<AgentId> = agent_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .filter(|id| seen.insert((*id).to_string()))
+            .map(AgentId::from)
+            .collect();
+        if targets.is_empty() {
+            return Err(Error::InvalidParams(
+                "agentIds must contain at least one agent id".to_string(),
+            ));
+        }
+        if targets.iter().any(|t| t == &caller_agent_id) {
+            return Err(Error::InvalidParams(
+                "agentIds must not include the caller agent itself".to_string(),
+            ));
+        }
+        // Resolve the caller's home workspace (where wakes are delivered),
+        // mirroring `agent_watch_completion_op`: fall back to the call's
+        // workspace when the session lookup fails; a deleted caller can never
+        // receive a wake, so registering for it is refused.
+        let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
+        if caller_session
+            .as_ref()
+            .map(|s| s.status == AgentStatus::Deleted)
+            .unwrap_or(false)
+        {
+            return Err(Error::InvalidParams(format!(
+                "caller agent {caller_agent_id} is deleted"
+            )));
+        }
+        let caller_name = caller_session.as_ref().map(|s| s.name.clone());
+        let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
+        let caller_home_ws = resolved_home
+            .clone()
+            .unwrap_or_else(|| workspace_id.clone());
+        // Validate every target and run the scope gate BEFORE any
+        // side-effectful registration (mirrors the delegate path's up-front
+        // gate): a rejection is side-effect free — no group, no watches.
+        let mut resolved: Vec<(AgentId, String, WorkspaceId)> = Vec::with_capacity(targets.len());
+        for target in targets {
+            // Only NotFound maps to a client-facing InvalidParams; internal
+            // store failures propagate unchanged.
+            let session = self
+                .store
+                .get_agent_session(&target)
+                .await
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::InvalidParams(format!("unknown agent id: {}", target.0))
+                    }
+                    other => other,
+                })?;
+            if session.status == AgentStatus::Deleted {
+                return Err(Error::InvalidParams(format!(
+                    "agent {} is deleted",
+                    target.0
+                )));
+            }
+            crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &session.workspace_id)?;
+            resolved.push((target, session.name, session.workspace_id));
+        }
+        let reconcile_targets: Vec<(AgentId, WorkspaceId)> = resolved
+            .iter()
+            .map(|(t, _, ws)| (t.clone(), ws.clone()))
+            .collect();
+        let mut results = Vec::with_capacity(resolved.len());
+        if wait_mode == WAIT_MODE_AFTER_ALL {
+            // Enroll every target in the caller's open after_all group and
+            // register a grouped watch each (group_id = Some, not oneShot),
+            // exactly like the delegate after_all branch (AS-4).
+            let gid = self.get_or_create_delegation_group(&caller_home_ws, &caller_agent_id);
+            for (target, target_name, target_ws) in resolved {
+                self.enroll_child_in_group(&gid, &target);
+                // Durable (awaited) persist: the reconciliation below may fire
+                // and delete this watch immediately for an already-settled
+                // target, and a spawned upsert racing that delete could leave
+                // an orphan row that re-delivers after a restart.
+                let sub_id = self
+                    .register_completion_watch_durable(
+                        &caller_home_ws,
+                        &target_ws,
+                        caller_agent_id.clone(),
+                        caller_name.clone().unwrap_or_default(),
+                        target.clone(),
+                        false,
+                        Some(gid.clone()),
+                    )
+                    .await?;
+                results.push(json!({
+                    "agentId": target.0,
+                    "agentName": target_name,
+                    "workspaceId": target_ws.0,
+                    "subscriptionId": sub_id,
+                    "groupId": gid,
+                }));
+            }
+        } else {
+            // Immediate: one oneShot watch per target, deduped against a live
+            // ungrouped watch (same reuse path as `agent.watchCompletion`).
+            for (target, target_name, target_ws) in resolved {
+                let sub_id = match self.find_and_refresh_ungrouped_watch(
+                    &caller_agent_id,
+                    &target,
+                    true,
+                    caller_name.clone(),
+                    resolved_home.as_ref(),
+                ) {
+                    Some(existing) => existing,
+                    // Durable (awaited) persist — same orphan-row rationale
+                    // as the after_all branch above.
+                    None => {
+                        self.register_completion_watch_durable(
+                            &caller_home_ws,
+                            &target_ws,
+                            caller_agent_id.clone(),
+                            caller_name.clone().unwrap_or_default(),
+                            target.clone(),
+                            true,
+                            None,
+                        )
+                        .await?
+                    }
+                };
+                results.push(json!({
+                    "agentId": target.0,
+                    "agentName": target_name,
+                    "workspaceId": target_ws.0,
+                    "subscriptionId": sub_id,
+                    "groupId": Value::Null,
+                }));
+            }
+        }
+        self.publish_subscriptions_changed(&caller_home_ws, &caller_agent_id)
+            .await;
+        // Reconcile already-settled targets NOW (immediate: fires the fresh
+        // oneShot watch right away; after_all: records the completion in the
+        // still-open group, which fires once it seals on the caller's idle).
+        for (target, target_ws) in reconcile_targets {
+            self.reconcile_watch_child_on_rehydration(&target, &target_ws)
+                .await;
+        }
+        Ok(json!({ "ok": true, "waitMode": wait_mode, "results": results }))
+    }
+
     /// Remove `subscription_id` after `after` elapses (SUB-1 leak guard for
     /// the non-oneShot queued-message watch — mirrors the TS 5-minute
     /// `setTimeout` unsubscribe). A watch already removed by delivery is a

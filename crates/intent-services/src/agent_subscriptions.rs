@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use intent_store::PersistedDelegationGroup;
+use intent_store::{PersistedCompletionWatch, PersistedDelegationGroup};
 
 // Use `tokio::time::Instant` (not `std::time::Instant`) for the cleanup
 // deadline: Tokio timers/instants follow Tokio's time source while
@@ -160,10 +160,75 @@ impl Services {
         one_shot: bool,
         group_id: Option<String>,
     ) -> Result<String> {
+        let watch = self.insert_watch_in_memory(
+            parent_workspace_id,
+            child_workspace_id,
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            one_shot,
+            group_id,
+        )?;
+        // Write-through persist (best-effort) so the watch survives a daemon
+        // restart (rehydrated by `heal_completion_watches_on_startup`).
+        let id = watch.id.clone();
+        self.persist_completion_watch(&watch);
+        Ok(id)
+    }
+
+    /// [`Services::register_completion_watch`] with an AWAITED persist:
+    /// the row is committed before this returns. Required when the caller
+    /// may deliver (and thus delete) the watch immediately after
+    /// registration — e.g. `app.agents.waitFor`'s registration-time
+    /// reconciliation of already-settled targets — where the spawned
+    /// best-effort upsert could otherwise commit AFTER the fired watch's
+    /// spawned delete and resurrect the row as an orphan (duplicate wake on
+    /// the next restart). A failed persist only logs: the in-memory watch
+    /// still fires live, matching the best-effort durability contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_completion_watch_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+        one_shot: bool,
+        group_id: Option<String>,
+    ) -> Result<String> {
+        let watch = self.insert_watch_in_memory(
+            parent_workspace_id,
+            child_workspace_id,
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            one_shot,
+            group_id,
+        )?;
+        let id = watch.id.clone();
+        let persisted = completion_watch_to_persisted(&watch);
+        if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
+            tracing::warn!("completion_watch upsert failed {id}: {e}");
+        }
+        Ok(id)
+    }
+
+    /// Shared body of the two registration variants: build the watch, run
+    /// the scope gate, and push it into the in-memory registry.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_watch_in_memory(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+        one_shot: bool,
+        group_id: Option<String>,
+    ) -> Result<CompletionWatch> {
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
-        let id = Uuid::new_v4().to_string();
         let watch = CompletionWatch {
-            id: id.clone(),
+            id: Uuid::new_v4().to_string(),
             parent_workspace_id: parent_workspace_id.clone(),
             child_workspace_id: child_workspace_id.clone(),
             parent_agent_id,
@@ -179,8 +244,8 @@ impl Services {
             .lock()
             .expect("agent subscription registry poisoned")
             .subscriptions
-            .push(watch);
-        Ok(id)
+            .push(watch.clone());
+        Ok(watch)
     }
 
     /// All watches whose `child_agent_id` matches (the AS-3 delivery lookup),
@@ -242,29 +307,59 @@ impl Services {
         new_parent_name: Option<String>,
         resolved_parent_workspace_id: Option<&WorkspaceId>,
     ) -> Option<String> {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let watch = guard.subscriptions.iter_mut().find(|s| {
-            s.group_id.is_none()
-                && s.one_shot == one_shot
-                && &s.parent_agent_id == parent_agent_id
-                && &s.child_agent_id == child_agent_id
-        })?;
-        if let Some(new_name) = new_parent_name {
-            if watch.parent_agent_name != new_name {
-                watch.parent_agent_name = new_name;
+        let (id, name, home_ws, changed) = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let watch = guard.subscriptions.iter_mut().find(|s| {
+                s.group_id.is_none()
+                    && s.one_shot == one_shot
+                    && &s.parent_agent_id == parent_agent_id
+                    && &s.child_agent_id == child_agent_id
+            })?;
+            let mut changed = false;
+            if let Some(new_name) = new_parent_name {
+                if watch.parent_agent_name != new_name {
+                    watch.parent_agent_name = new_name;
+                    changed = true;
+                }
             }
-        }
-        if let Some(home_ws) = resolved_parent_workspace_id {
-            if &watch.parent_workspace_id != home_ws
-                && check_watch_scope(home_ws, &watch.child_workspace_id).is_ok()
-            {
-                watch.parent_workspace_id = home_ws.clone();
+            if let Some(home_ws) = resolved_parent_workspace_id {
+                if &watch.parent_workspace_id != home_ws
+                    && check_watch_scope(home_ws, &watch.child_workspace_id).is_ok()
+                {
+                    watch.parent_workspace_id = home_ws.clone();
+                    changed = true;
+                }
             }
+            (
+                watch.id.clone(),
+                watch.parent_agent_name.clone(),
+                watch.parent_workspace_id.clone(),
+                changed,
+            )
+        };
+        // Best-effort DB sync of the refreshed name/anchor (restart
+        // durability), skipped when nothing changed (the common
+        // waitFor-called-twice case). This is a spawned UPDATE ... WHERE id,
+        // so racing a concurrent fire/delete is benign: against a deleted
+        // row it affects 0 rows (it cannot resurrect an orphan); the only
+        // loss is the refreshed name/anchor not persisting — the in-memory
+        // watch is already refreshed and the row is gone anyway.
+        if changed {
+            let store = self.store.clone();
+            let watch_id = id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store
+                    .update_completion_watch_parent(&watch_id, &name, &home_ws)
+                    .await
+                {
+                    tracing::warn!("completion_watch parent refresh failed {watch_id}: {e}");
+                }
+            });
         }
-        Some(watch.id.clone())
+        Some(id)
     }
 
     /// SUB-2: monotonically bump a watch's cleanup deadline to at least
@@ -277,21 +372,39 @@ impl Services {
         subscription_id: &str,
         new_deadline: Instant,
     ) -> bool {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let Some(watch) = guard
-            .subscriptions
-            .iter_mut()
-            .find(|s| s.id == subscription_id)
-        else {
-            return false;
+        let bumped = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(watch) = guard
+                .subscriptions
+                .iter_mut()
+                .find(|s| s.id == subscription_id)
+            else {
+                return false;
+            };
+            watch.cleanup_deadline = Some(match watch.cleanup_deadline {
+                Some(existing) => existing.max(new_deadline),
+                None => new_deadline,
+            });
+            watch.cleanup_deadline
         };
-        watch.cleanup_deadline = Some(match watch.cleanup_deadline {
-            Some(existing) => existing.max(new_deadline),
-            None => new_deadline,
-        });
+        // Best-effort DB sync of the leak-guard deadline as wall-clock epoch
+        // ms so a rehydrated watch re-arms with the remaining time.
+        if let Some(deadline) = bumped {
+            let store = self.store.clone();
+            let watch_id = subscription_id.to_string();
+            let deadline_at_ms = instant_to_epoch_ms(deadline);
+            tokio::spawn(async move {
+                if let Err(e) = store
+                    .set_completion_watch_deadline(&watch_id, deadline_at_ms)
+                    .await
+                {
+                    tracing::warn!("completion_watch deadline sync failed {watch_id}: {e}");
+                }
+            });
+        }
         true
     }
 
@@ -302,24 +415,30 @@ impl Services {
     /// task (spawned for the extended deadline) performs the removal.
     pub(crate) fn remove_watch_if_deadline_passed(&self, subscription_id: &str) -> bool {
         let now = Instant::now();
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let Some(idx) = guard
-            .subscriptions
-            .iter()
-            .position(|s| s.id == subscription_id)
-        else {
-            return false;
-        };
-        match guard.subscriptions[idx].cleanup_deadline {
-            Some(deadline) if deadline <= now => {
-                guard.subscriptions.remove(idx);
-                true
+        let removed = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let Some(idx) = guard
+                .subscriptions
+                .iter()
+                .position(|s| s.id == subscription_id)
+            else {
+                return false;
+            };
+            match guard.subscriptions[idx].cleanup_deadline {
+                Some(deadline) if deadline <= now => {
+                    guard.subscriptions.remove(idx);
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        };
+        if removed {
+            self.delete_persisted_watch(subscription_id);
         }
+        removed
     }
 
     /// All watches registered by `parent_agent_id`, regardless of workspace
@@ -340,47 +459,83 @@ impl Services {
 
     /// Remove a single watch by subscription id; returns whether one was found.
     pub(crate) fn remove_watch(&self, subscription_id: &str) -> bool {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let before = guard.subscriptions.len();
-        guard.subscriptions.retain(|s| s.id != subscription_id);
-        guard.subscriptions.len() != before
+        let removed = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let before = guard.subscriptions.len();
+            guard.subscriptions.retain(|s| s.id != subscription_id);
+            guard.subscriptions.len() != before
+        };
+        if removed {
+            self.delete_persisted_watch(subscription_id);
+        }
+        removed
     }
 
     /// Mark a watch as having delivered the report wake (report-time wake).
     /// When marked, `deliver_completion_to_watches` will skip delivery for
     /// `agent:idle` but still deliver for `agent:failed` / `agent:deleted`.
     pub(crate) fn mark_watch_report_delivered(&self, subscription_id: &str) -> bool {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        if let Some(watch) = guard
-            .subscriptions
-            .iter_mut()
-            .find(|s| s.id == subscription_id)
-        {
-            watch.report_delivered = true;
-            true
-        } else {
-            false
+        let marked = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            if let Some(watch) = guard
+                .subscriptions
+                .iter_mut()
+                .find(|s| s.id == subscription_id)
+            {
+                watch.report_delivered = true;
+                true
+            } else {
+                false
+            }
+        };
+        if marked {
+            // Best-effort DB sync so a rehydrated watch keeps suppressing the
+            // duplicate agent:idle wake after a restart.
+            let store = self.store.clone();
+            let watch_id = subscription_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = store
+                    .mark_completion_watch_report_delivered(&watch_id)
+                    .await
+                {
+                    tracing::warn!("completion_watch report_delivered sync failed {watch_id}: {e}");
+                }
+            });
         }
+        marked
     }
 
     /// Remove every watch registered by `parent_agent_id`; returns the count
     /// (`agent.cancelSubscriptions` + parent-deletion cleanup).
     pub(crate) fn remove_all_for_parent(&self, parent_agent_id: &AgentId) -> usize {
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let before = guard.subscriptions.len();
-        guard
-            .subscriptions
-            .retain(|s| &s.parent_agent_id != parent_agent_id);
-        before - guard.subscriptions.len()
+        let removed = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let before = guard.subscriptions.len();
+            guard
+                .subscriptions
+                .retain(|s| &s.parent_agent_id != parent_agent_id);
+            before - guard.subscriptions.len()
+        };
+        if removed > 0 {
+            // Best-effort DB sweep of every persisted watch for this parent.
+            let store = self.store.clone();
+            let parent = parent_agent_id.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.delete_completion_watches_for_parent(&parent).await {
+                    tracing::warn!("completion_watch parent sweep failed {}: {e}", parent.0);
+                }
+            });
+        }
+        removed
     }
 
     /// Return the open (unsealed && undelivered) delegation group for `parent_id`,
@@ -656,32 +811,56 @@ impl Services {
         retain_children: &[AgentId],
     ) -> usize {
         let retain_set: std::collections::HashSet<&AgentId> = retain_children.iter().collect();
-        let mut guard = self
-            .agent_subscriptions
-            .lock()
-            .expect("agent subscription registry poisoned");
-        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
-            .subscriptions
-            .iter()
-            .filter(|s| s.group_id.is_none())
-            .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
-            .collect();
-        let mut retained = 0;
-        guard.subscriptions.retain_mut(|s| {
-            if s.group_id.as_deref() != Some(group_id) {
-                return true;
-            }
-            if retain_set.contains(&s.child_agent_id) {
-                let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
-                if kept.insert(pair) {
-                    s.group_id = None;
-                    s.one_shot = true;
-                    retained += 1;
+        let mut converted_ids: Vec<String> = Vec::new();
+        let mut dropped_ids: Vec<String> = Vec::new();
+        let retained = {
+            let mut guard = self
+                .agent_subscriptions
+                .lock()
+                .expect("agent subscription registry poisoned");
+            let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
+                .subscriptions
+                .iter()
+                .filter(|s| s.group_id.is_none())
+                .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
+                .collect();
+            let mut retained = 0;
+            guard.subscriptions.retain_mut(|s| {
+                if s.group_id.as_deref() != Some(group_id) {
                     return true;
                 }
-            }
-            false
-        });
+                if retain_set.contains(&s.child_agent_id) {
+                    let pair = (s.parent_agent_id.clone(), s.child_agent_id.clone());
+                    if kept.insert(pair) {
+                        s.group_id = None;
+                        s.one_shot = true;
+                        converted_ids.push(s.id.clone());
+                        retained += 1;
+                        return true;
+                    }
+                }
+                dropped_ids.push(s.id.clone());
+                false
+            });
+            retained
+        };
+        // Best-effort DB sync: converted watches become ungrouped oneShot rows,
+        // dropped watches lose their rows (restart durability).
+        if !converted_ids.is_empty() || !dropped_ids.is_empty() {
+            let store = self.store.clone();
+            tokio::spawn(async move {
+                for id in converted_ids {
+                    if let Err(e) = store.ungroup_completion_watch(&id).await {
+                        tracing::warn!("completion_watch ungroup failed {id}: {e}");
+                    }
+                }
+                for id in dropped_ids {
+                    if let Err(e) = store.delete_completion_watch(&id).await {
+                        tracing::warn!("completion_watch delete failed {id}: {e}");
+                    }
+                }
+            });
+        }
         retained
     }
 
@@ -782,6 +961,249 @@ impl Services {
                 tracing::warn!("delegation_group upsert failed {group_id}: {e}");
             }
         });
+    }
+
+    /// Best-effort write-through persist of a completion watch (restart
+    /// durability). Mirrors [`Services::persist_delegation_group`]: spawns an
+    /// async persist task, not durable-before-observable — the crash window
+    /// between in-memory registration and commit is milliseconds and the
+    /// parent can re-register.
+    fn persist_completion_watch(&self, watch: &CompletionWatch) {
+        let store = self.store.clone();
+        let persisted = completion_watch_to_persisted(watch);
+        tokio::spawn(async move {
+            let id = persisted.id.clone();
+            if let Err(e) = store.upsert_completion_watch(&persisted).await {
+                tracing::warn!("completion_watch upsert failed {id}: {e}");
+            }
+        });
+    }
+
+    /// Best-effort async delete of a persisted completion-watch row (fired
+    /// oneShot, cancellation, deadline expiry).
+    fn delete_persisted_watch(&self, subscription_id: &str) {
+        let store = self.store.clone();
+        let id = subscription_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = store.delete_completion_watch(&id).await {
+                tracing::warn!("completion_watch delete failed {id}: {e}");
+            }
+        });
+    }
+
+    /// Rehydrate persisted completion watches at daemon startup: load every
+    /// surviving row, prune rows whose PARENT agent is gone (deleted or
+    /// missing — no wake could ever be delivered) and load the rest into the
+    /// in-memory registry. A gone/deleted CHILD is NOT pruned: that is a
+    /// completion signal for the parent, handled by the reconciliation pass
+    /// below (synthetic `agent:deleted`). Grouped watches whose delegation
+    /// group no longer exists in memory (it fired or was never rehydrated)
+    /// are pruned too — group settlement owns their lifecycle — as are rows
+    /// whose leak-guard deadline already elapsed. Idempotent: watches already
+    /// present in memory (by id) are skipped.
+    ///
+    /// A rehydrated watch with a persisted leak-guard deadline re-arms its
+    /// cleanup timer with the remaining wall-clock time (an already-elapsed
+    /// deadline prunes the row instead). After loading, each watch's child is
+    /// reconciled against current agent state: a child that completed while
+    /// the daemon was down delivers its (synthetic) completion immediately,
+    /// so the parent is not left waiting forever.
+    pub async fn heal_completion_watches_on_startup(&self) -> Result<usize> {
+        let persisted = self.store.list_completion_watches().await?;
+        let mut loaded = 0usize;
+        let mut to_reconcile: Vec<(AgentId, WorkspaceId)> = Vec::new();
+        for p in persisted {
+            // Prune when either endpoint is gone: no wake could fire (child
+            // deleted watches are handled by reconciliation below instead,
+            // since a deleted child IS a completion signal for the parent).
+            let parent_alive = self.agent_is_live(&p.parent_agent_id).await;
+            if !parent_alive {
+                tracing::info!(
+                    watch = %p.id,
+                    parent = %p.parent_agent_id.0,
+                    "pruning persisted completion watch — parent agent gone"
+                );
+                let _ = self.store.delete_completion_watch(&p.id).await;
+                continue;
+            }
+            // Grouped watches belong to their delegation group's settlement;
+            // if the group is gone from memory after group rehydration, the
+            // group already fired (or its row was delivered) — prune.
+            if let Some(gid) = &p.group_id {
+                let group_live = {
+                    let guard = self
+                        .agent_subscriptions
+                        .lock()
+                        .expect("agent subscription registry poisoned");
+                    guard.delegation_groups.iter().any(|g| &g.group_id == gid)
+                };
+                if !group_live {
+                    tracing::info!(
+                        watch = %p.id,
+                        group = %gid,
+                        "pruning persisted completion watch — delegation group gone"
+                    );
+                    let _ = self.store.delete_completion_watch(&p.id).await;
+                    continue;
+                }
+            }
+            // Expired leak-guard deadline: the cleanup timer would have
+            // removed this watch already — prune instead of rehydrating.
+            let remaining = match p.deadline_at_ms {
+                Some(at_ms) => match remaining_from_epoch_ms(at_ms) {
+                    Some(d) => Some(d),
+                    None => {
+                        tracing::info!(
+                            watch = %p.id,
+                            "pruning persisted completion watch — cleanup deadline elapsed"
+                        );
+                        let _ = self.store.delete_completion_watch(&p.id).await;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let (watch_id, parent_ws, parent_agent, child_agent, child_ws) = {
+                let mut guard = self
+                    .agent_subscriptions
+                    .lock()
+                    .expect("agent subscription registry poisoned");
+                if guard.subscriptions.iter().any(|s| s.id == p.id) {
+                    continue;
+                }
+                let watch = persisted_to_completion_watch(&p);
+                let ids = (
+                    watch.id.clone(),
+                    watch.parent_workspace_id.clone(),
+                    watch.parent_agent_id.clone(),
+                    watch.child_agent_id.clone(),
+                    watch.child_workspace_id.clone(),
+                );
+                guard.subscriptions.push(watch);
+                ids
+            };
+            loaded += 1;
+            // Re-arm the leak-guard cleanup with the remaining wall-clock time.
+            if let Some(after) = remaining {
+                self.spawn_watch_cleanup(parent_ws, parent_agent, watch_id, after);
+            }
+            to_reconcile.push((child_agent, child_ws));
+        }
+        // Reconcile: a child that completed (or was deleted) while the daemon
+        // was down must still wake its parent. Dedupe children so one synthetic
+        // event covers every watch on the same child.
+        to_reconcile.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        to_reconcile.dedup_by(|a, b| a.0 == b.0);
+        for (child_id, child_ws) in to_reconcile {
+            self.reconcile_watch_child_on_rehydration(&child_id, &child_ws)
+                .await;
+        }
+        Ok(loaded)
+    }
+
+    /// Whether an agent session row exists and is not `Deleted`. Store errors
+    /// other than NotFound are treated as live (conservative: never prune a
+    /// watch on a transient store error).
+    async fn agent_is_live(&self, agent_id: &AgentId) -> bool {
+        match self.store.get_agent_session(agent_id).await {
+            Ok(session) => !matches!(session.status, intent_core::AgentStatus::Deleted),
+            Err(intent_store::Error::NotFound(_)) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "completion-watch rehydration: agent liveness check failed for {}: {e}",
+                    agent_id.0
+                );
+                true
+            }
+        }
+    }
+
+    /// Reconcile one watch's child against current agent state (mirrors the
+    /// STAB-108 group reconciliation): if the child already completed /
+    /// failed / was deleted, synthesize the matching completion event and
+    /// route it through [`Services::deliver_completion_to_watches`] so the
+    /// parent wakes now instead of waiting for an event that already fired.
+    /// Used both at startup rehydration (child settled while the daemon was
+    /// down) and at `app.agents.waitFor` registration time (target settled
+    /// before — or concurrently with — the registration).
+    pub(crate) async fn reconcile_watch_child_on_rehydration(
+        &self,
+        child_id: &AgentId,
+        fallback_ws: &WorkspaceId,
+    ) {
+        use intent_core::AgentStatus;
+        let (event_type, event_ws, status_value) =
+            match self.store.get_agent_session(child_id).await {
+                Ok(session) => {
+                    let is_deleted = matches!(session.status, AgentStatus::Deleted);
+                    let is_completed = matches!(session.status, AgentStatus::Completed);
+                    let is_failed = matches!(session.status, AgentStatus::Error);
+                    // RuntimeIdle: genuinely complete only with a completion
+                    // report and no interrupted row (same conservative
+                    // predicate as reconcile_group_on_rehydration).
+                    let is_idle_complete = if matches!(session.status, AgentStatus::RuntimeIdle) {
+                        let has_report = session.completion_report.is_some();
+                        match self.store.get_interrupted_agent(child_id).await {
+                            Ok(opt) => has_report && opt.is_none(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "completion-watch reconciliation: interrupted_agent check \
+                                     failed for {}: {e}",
+                                    child_id.0
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    let event_type = if is_deleted {
+                        intent_core::events::AGENT_DELETED
+                    } else if is_failed {
+                        intent_core::events::AGENT_FAILED
+                    } else if is_completed || is_idle_complete {
+                        intent_core::events::AGENT_IDLE
+                    } else {
+                        // Child still working (or interrupted/healing): the
+                        // live event pipeline will deliver its completion.
+                        return;
+                    };
+                    let status = serde_json::to_value(session.status).unwrap_or_default();
+                    (event_type, session.workspace_id, status)
+                }
+                Err(intent_store::Error::NotFound(_)) => (
+                    intent_core::events::AGENT_DELETED,
+                    fallback_ws.clone(),
+                    serde_json::json!("deleted"),
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        "completion-watch reconciliation: session lookup failed for {}: {e}",
+                        child_id.0
+                    );
+                    return;
+                }
+            };
+        let event = Event {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: event_ws,
+            timestamp: now_iso(),
+            event_type: event_type.to_string(),
+            actor: intent_core::EventActor {
+                actor_type: intent_core::ActorType::Agent,
+                id: Some(child_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(child_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: serde_json::json!({
+                "agentId": child_id.0,
+                "status": status_value,
+            }),
+        };
+        self.deliver_completion_to_watches(child_id, &event).await;
     }
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
@@ -1071,6 +1493,73 @@ fn is_group_complete(group: &DelegationGroup) -> bool {
         && group.expected_agent_ids.iter().all(|id| {
             group.completed_agent_ids.contains(id) || group.deleted_agent_ids.contains(id)
         })
+}
+
+/// Convert in-memory `CompletionWatch` to persisted form. The monotonic
+/// `cleanup_deadline` instant is projected onto the wall clock (epoch ms) so
+/// a restarted daemon — with a fresh monotonic clock — can re-arm the timer
+/// with the remaining real time.
+fn completion_watch_to_persisted(watch: &CompletionWatch) -> PersistedCompletionWatch {
+    PersistedCompletionWatch {
+        id: watch.id.clone(),
+        parent_workspace_id: watch.parent_workspace_id.clone(),
+        child_workspace_id: watch.child_workspace_id.clone(),
+        parent_agent_id: watch.parent_agent_id.clone(),
+        parent_agent_name: watch.parent_agent_name.clone(),
+        child_agent_id: watch.child_agent_id.clone(),
+        one_shot: watch.one_shot,
+        group_id: watch.group_id.clone(),
+        report_delivered: watch.report_delivered,
+        deadline_at_ms: watch.cleanup_deadline.map(instant_to_epoch_ms),
+        created_at: watch.created_at.clone(),
+    }
+}
+
+/// Convert a persisted row back to the in-memory form. `cleanup_deadline`
+/// starts `None`: rehydration re-arms it via `spawn_watch_cleanup` (which
+/// bumps the deadline under the registry lock) so the sleeper task and the
+/// in-memory instant stay paired.
+fn persisted_to_completion_watch(p: &PersistedCompletionWatch) -> CompletionWatch {
+    CompletionWatch {
+        id: p.id.clone(),
+        parent_workspace_id: p.parent_workspace_id.clone(),
+        child_workspace_id: p.child_workspace_id.clone(),
+        parent_agent_id: p.parent_agent_id.clone(),
+        parent_agent_name: p.parent_agent_name.clone(),
+        child_agent_id: p.child_agent_id.clone(),
+        one_shot: p.one_shot,
+        group_id: p.group_id.clone(),
+        created_at: p.created_at.clone(),
+        cleanup_deadline: None,
+        report_delivered: p.report_delivered,
+    }
+}
+
+/// Project a (possibly future) monotonic instant onto the wall clock as unix
+/// epoch milliseconds — the persisted representation of a cleanup deadline.
+fn instant_to_epoch_ms(deadline: Instant) -> i64 {
+    let now = Instant::now();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let delta_ms = deadline.saturating_duration_since(now).as_millis() as i64;
+    now_ms + delta_ms
+}
+
+/// Remaining wall-clock time until a persisted epoch-ms deadline; `None`
+/// when it already elapsed.
+fn remaining_from_epoch_ms(deadline_at_ms: i64) -> Option<std::time::Duration> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let remaining = deadline_at_ms - now_ms;
+    if remaining > 0 {
+        Some(std::time::Duration::from_millis(remaining as u64))
+    } else {
+        None
+    }
 }
 
 /// Convert in-memory `DelegationGroup` to persisted form. The persisted

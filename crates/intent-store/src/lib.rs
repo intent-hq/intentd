@@ -16,6 +16,7 @@ mod agent_queue_repo;
 mod agent_repo;
 mod client_repo;
 mod comment_repo;
+mod completion_watch_repo;
 mod delegation_group_repo;
 mod diffs_repo;
 mod draft_repo;
@@ -38,6 +39,7 @@ mod workspace_ui_context_repo;
 
 pub use agent_queue_repo::AgentQueueRow;
 pub use agent_repo::{InterruptedAgent, ReplaceMessage};
+pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};
 pub use event_repo::{EventQuery, NewEvent};

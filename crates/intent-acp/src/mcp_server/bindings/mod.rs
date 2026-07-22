@@ -142,7 +142,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("app.") {
-        return app::try_dispatch(api, workspace_id, rest, args).await;
+        return app::try_dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args).await;
     }
     Ok(None)
 }
