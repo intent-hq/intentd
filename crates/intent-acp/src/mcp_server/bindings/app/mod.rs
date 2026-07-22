@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 pub(crate) mod agents;
@@ -40,9 +40,12 @@ pub(crate) fn prelude() -> String {
 /// Returns `Ok(None)` when the subnamespace is unknown; `Ok(Some(v))` on
 /// success; `Err(msg)` on failure. The chief-workspace gate is delegated to
 /// each submodule's dispatch so they can surface the same clear error.
+/// `caller_agent_id` threads the tool-call's agent context to the
+/// caller-aware `agents` methods (`waitFor`).
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Option<Value>, String> {
@@ -52,7 +55,7 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("agents.") {
-        return agents::dispatch(api, workspace_id, rest, args)
+        return agents::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }
