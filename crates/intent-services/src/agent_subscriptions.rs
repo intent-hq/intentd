@@ -160,10 +160,75 @@ impl Services {
         one_shot: bool,
         group_id: Option<String>,
     ) -> Result<String> {
+        let watch = self.insert_watch_in_memory(
+            parent_workspace_id,
+            child_workspace_id,
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            one_shot,
+            group_id,
+        )?;
+        // Write-through persist (best-effort) so the watch survives a daemon
+        // restart (rehydrated by `heal_completion_watches_on_startup`).
+        let id = watch.id.clone();
+        self.persist_completion_watch(&watch);
+        Ok(id)
+    }
+
+    /// [`Services::register_completion_watch`] with an AWAITED persist:
+    /// the row is committed before this returns. Required when the caller
+    /// may deliver (and thus delete) the watch immediately after
+    /// registration — e.g. `app.agents.waitFor`'s registration-time
+    /// reconciliation of already-settled targets — where the spawned
+    /// best-effort upsert could otherwise commit AFTER the fired watch's
+    /// spawned delete and resurrect the row as an orphan (duplicate wake on
+    /// the next restart). A failed persist only logs: the in-memory watch
+    /// still fires live, matching the best-effort durability contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_completion_watch_durable(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+        one_shot: bool,
+        group_id: Option<String>,
+    ) -> Result<String> {
+        let watch = self.insert_watch_in_memory(
+            parent_workspace_id,
+            child_workspace_id,
+            parent_agent_id,
+            parent_agent_name,
+            child_agent_id,
+            one_shot,
+            group_id,
+        )?;
+        let id = watch.id.clone();
+        let persisted = completion_watch_to_persisted(&watch);
+        if let Err(e) = self.store.upsert_completion_watch(&persisted).await {
+            tracing::warn!("completion_watch upsert failed {id}: {e}");
+        }
+        Ok(id)
+    }
+
+    /// Shared body of the two registration variants: build the watch, run
+    /// the scope gate, and push it into the in-memory registry.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_watch_in_memory(
+        &self,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
+        parent_agent_id: AgentId,
+        parent_agent_name: String,
+        child_agent_id: AgentId,
+        one_shot: bool,
+        group_id: Option<String>,
+    ) -> Result<CompletionWatch> {
         check_watch_scope(parent_workspace_id, child_workspace_id)?;
-        let id = Uuid::new_v4().to_string();
         let watch = CompletionWatch {
-            id: id.clone(),
+            id: Uuid::new_v4().to_string(),
             parent_workspace_id: parent_workspace_id.clone(),
             child_workspace_id: child_workspace_id.clone(),
             parent_agent_id,
@@ -180,10 +245,7 @@ impl Services {
             .expect("agent subscription registry poisoned")
             .subscriptions
             .push(watch.clone());
-        // Write-through persist (best-effort) so the watch survives a daemon
-        // restart (rehydrated by `heal_completion_watches_on_startup`).
-        self.persist_completion_watch(&watch);
-        Ok(id)
+        Ok(watch)
     }
 
     /// All watches whose `child_agent_id` matches (the AS-3 delivery lookup),

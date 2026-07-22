@@ -3428,15 +3428,21 @@ impl Services {
             let gid = self.get_or_create_delegation_group(&caller_home_ws, &caller_agent_id);
             for (target, target_name, target_ws) in resolved {
                 self.enroll_child_in_group(&gid, &target);
-                let sub_id = self.register_completion_watch(
-                    &caller_home_ws,
-                    &target_ws,
-                    caller_agent_id.clone(),
-                    caller_name.clone().unwrap_or_default(),
-                    target.clone(),
-                    false,
-                    Some(gid.clone()),
-                )?;
+                // Durable (awaited) persist: the reconciliation below may fire
+                // and delete this watch immediately for an already-settled
+                // target, and a spawned upsert racing that delete could leave
+                // an orphan row that re-delivers after a restart.
+                let sub_id = self
+                    .register_completion_watch_durable(
+                        &caller_home_ws,
+                        &target_ws,
+                        caller_agent_id.clone(),
+                        caller_name.clone().unwrap_or_default(),
+                        target.clone(),
+                        false,
+                        Some(gid.clone()),
+                    )
+                    .await?;
                 results.push(json!({
                     "agentId": target.0,
                     "agentName": target_name,
@@ -3457,15 +3463,20 @@ impl Services {
                     resolved_home.as_ref(),
                 ) {
                     Some(existing) => existing,
-                    None => self.register_completion_watch(
-                        &caller_home_ws,
-                        &target_ws,
-                        caller_agent_id.clone(),
-                        caller_name.clone().unwrap_or_default(),
-                        target.clone(),
-                        true,
-                        None,
-                    )?,
+                    // Durable (awaited) persist — same orphan-row rationale
+                    // as the after_all branch above.
+                    None => {
+                        self.register_completion_watch_durable(
+                            &caller_home_ws,
+                            &target_ws,
+                            caller_agent_id.clone(),
+                            caller_name.clone().unwrap_or_default(),
+                            target.clone(),
+                            true,
+                            None,
+                        )
+                        .await?
+                    }
                 };
                 results.push(json!({
                     "agentId": target.0,
