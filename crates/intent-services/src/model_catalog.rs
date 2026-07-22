@@ -149,10 +149,11 @@ fn claude_code_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("claude-code")
 }
 
-/// claude-code cache entries are keyed to the adapter pin so a version bump
-/// invalidates them automatically.
+/// claude-code cache entries are keyed to the full pinned npx package spec
+/// (name + version) so both a version bump and a package rename invalidate
+/// them automatically.
 fn claude_code_version() -> String {
-    intent_providers::CLAUDE_AGENT_ACP_VERSION.to_string()
+    intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
 /// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
@@ -429,6 +430,31 @@ impl ModelCatalogCache {
         if inflight.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, cell)) {
             inflight.remove(&key);
         }
+    }
+
+    /// Test-only cache seeding: production code must go through
+    /// [`resolve_with_cache`] so the TTL / negative-window / single-flight
+    /// invariants hold.
+    #[cfg(test)]
+    pub(crate) fn test_store(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        models: Vec<Value>,
+        now_ms: u64,
+    ) {
+        self.store(provider_id, version_key, models, now_ms);
+    }
+
+    /// Test-only negative-window observation (see [`Self::test_store`]).
+    #[cfg(test)]
+    pub(crate) fn test_negative_reason(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        now_ms: u64,
+    ) -> Option<String> {
+        self.negative_reason(provider_id, version_key, now_ms)
     }
 }
 
