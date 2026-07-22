@@ -209,7 +209,7 @@ async fn workspace_create_with_workspaces_dir_provisions_under_temp_root() {
             "method": "workspace.create",
             "params": { "title": "Hermetic Root WS" }
         }),
-        common::daemon_startup_timeout(),
+        common::test_timeout(Duration::from_secs(10)),
     )
     .await
     .expect("workspace.create response");
