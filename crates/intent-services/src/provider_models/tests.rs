@@ -381,13 +381,18 @@ fn parse_opencode_models_empty_output() {
     assert!(parse_opencode_models("no models\n").is_empty());
 }
 
+/// A successful [`std::process::ExitStatus`] for the pure grok outcome seam.
+fn exit_ok() -> std::process::ExitStatus {
+    std::process::ExitStatus::default()
+}
+
 #[test]
 fn grok_outcome_maps_text_rows_to_wire_shape() {
     // Canned `grok models` text output: the shared intent-providers parser
     // extracts the rows; this seam maps them onto §5.30 wire rows.
     let fetch = super::grok_fetch_outcome(
         "You are logged in with grok.com.\ngrok-build  Grok Build  Default model\nopus-4-8  Opus 4.8",
-        true,
+        exit_ok(),
         "",
     );
     let rows = fetch.models.expect("models present");
@@ -409,7 +414,7 @@ fn grok_outcome_maps_text_rows_to_wire_shape() {
 fn grok_outcome_json_payload_wins_over_text_rows() {
     let fetch = super::grok_fetch_outcome(
         r#"{"models":{"availableModels":[{"modelId":"grok-4.5","name":"Grok 4.5","description":"Flagship"}]}}"#,
-        true,
+        exit_ok(),
         "",
     );
     let rows = fetch.models.expect("models present");
@@ -427,7 +432,7 @@ fn grok_outcome_logged_out_degrades_to_auth_required() {
     // 0 in both auth states, so the exit code is never trusted.
     let fetch = super::grok_fetch_outcome(
         "You are not authenticated. Please log in with `grok login`.",
-        true,
+        exit_ok(),
         "",
     );
     assert!(fetch.models.is_none());
@@ -439,18 +444,21 @@ fn grok_outcome_logged_out_degrades_to_auth_required() {
 
 #[test]
 fn grok_outcome_empty_success_degrades_to_no_models() {
-    let fetch = super::grok_fetch_outcome("", true, "");
+    let fetch = super::grok_fetch_outcome("", exit_ok(), "");
     assert!(fetch.models.is_none());
     assert_eq!(fetch.warning.as_deref(), Some("grok: no models reported"));
 }
 
+#[cfg(unix)]
 #[test]
 fn grok_outcome_failed_exit_without_rows_is_attributed() {
-    let fetch = super::grok_fetch_outcome("", false, "grok: command crashed\n");
+    // The warning must carry the actual exit status (parity with the
+    // opencode warning) plus the stderr tail.
+    let fetch = super::grok_fetch_outcome("", exit_status(1), "grok: command crashed\n");
     assert!(fetch.models.is_none());
     let warning = fetch.warning.expect("warning present");
     assert!(
-        warning.starts_with("grok: grok models exited with an error"),
+        warning.starts_with("grok: grok models exited with exit status: 1"),
         "{warning}"
     );
     assert!(warning.contains("command crashed"), "{warning}");
@@ -469,11 +477,12 @@ fn stderr_tail_keeps_last_200_chars() {
     assert_eq!(tail.chars().count(), 200);
 }
 
+#[cfg(unix)]
 #[test]
 fn grok_outcome_rows_win_over_failed_exit() {
     // Parsed rows with a non-zero exit still serve the catalog — stdout is
     // the contract, not the exit code.
-    let fetch = super::grok_fetch_outcome("grok-build  Grok Build", false, "noise");
+    let fetch = super::grok_fetch_outcome("grok-build  Grok Build", exit_status(1), "noise");
     let rows = fetch.models.expect("models present");
     assert_eq!(rows[0]["id"], "grok-build");
 }

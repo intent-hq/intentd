@@ -418,7 +418,7 @@ pub async fn fetch_grok_models() -> ProviderModelsFetch {
     match run_grok_models_cli(bin, GROK_CLI_TIMEOUT).await {
         Ok(output) => grok_fetch_outcome(
             &String::from_utf8_lossy(&output.stdout),
-            output.status.success(),
+            output.status,
             &String::from_utf8_lossy(&output.stderr),
         ),
         Err(reason) => ProviderModelsFetch::unavailable("grok", reason),
@@ -430,8 +430,12 @@ pub async fn fetch_grok_models() -> ProviderModelsFetch {
 /// the CLI exits 0 in both auth states — so stdout is parsed regardless: an
 /// explicit logged-out marker degrades to "authentication required", parsed
 /// rows win otherwise, and only a run that produced neither is attributed to
-/// its exit state.
-fn grok_fetch_outcome(stdout: &str, exit_success: bool, stderr: &str) -> ProviderModelsFetch {
+/// its exit state (status + stderr tail, matching the opencode warning).
+fn grok_fetch_outcome(
+    stdout: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+) -> ProviderModelsFetch {
     let parsed = intent_providers::parse_grok_models_command_output(stdout);
     if parsed.authenticated == Some(false) {
         return ProviderModelsFetch::unavailable("grok", "authentication required");
@@ -439,12 +443,12 @@ fn grok_fetch_outcome(stdout: &str, exit_success: bool, stderr: &str) -> Provide
     let rows = parse::grok_wire_rows(&parsed.models);
     if !rows.is_empty() {
         ProviderModelsFetch::ok(rows)
-    } else if exit_success {
+    } else if status.success() {
         ProviderModelsFetch::unavailable("grok", "no models reported")
     } else {
         ProviderModelsFetch::unavailable(
             "grok",
-            format!("grok models exited with an error: {}", stderr_tail(stderr)),
+            format!("grok models exited with {status}: {}", stderr_tail(stderr)),
         )
     }
 }
