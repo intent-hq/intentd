@@ -340,6 +340,9 @@ async fn reap_child(child: &mut tokio::process::Child) {
 /// backstop, never a probe failure.
 #[cfg(unix)]
 async fn descendant_pids(root: u32) -> Vec<i32> {
+    let Ok(root) = i32::try_from(root) else {
+        return Vec::new();
+    };
     let mut ps = tokio::process::Command::new("ps");
     ps.args(["-axo", "pid=,ppid="])
         .stdin(Stdio::null())
@@ -363,7 +366,7 @@ async fn descendant_pids(root: u32) -> Vec<i32> {
             Some((pid, ppid))
         })
         .collect();
-    descendants_in_table(&table, root as i32)
+    descendants_in_table(&table, root)
 }
 
 /// Breadth-first walk of a `(pid, ppid)` table from `root`, returning up to
