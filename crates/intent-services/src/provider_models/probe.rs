@@ -305,7 +305,11 @@ const PS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 /// server ran as its own group leader, so `killpg` on the probe group never
 /// reached it and it survived orphaned). As a backstop, the child's
 /// descendant pids are snapshotted *before* killing and any survivors are
-/// swept afterwards, regardless of process group.
+/// swept afterwards, regardless of process group. Snapshot-before-kill is
+/// the only viable ordering (post-kill, escaped descendants reparent to init
+/// and are invisible to a ppid walk), so anything the adapter spawns between
+/// the snapshot and the kill is missed — accepted for a best-effort backstop.
+/// The happy path pays one short-lived `ps` per probe teardown for this.
 async fn reap_child(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     let descendants = match child.id() {
@@ -388,7 +392,9 @@ fn descendants_in_table(table: &[(i32, i32)], root: i32) -> Vec<i32> {
 /// SIGTERM → grace → SIGKILL any snapshotted descendants that survived the
 /// group kill (i.e. escaped into a foreign process group). Pids that already
 /// died — or whose pid was recycled into the daemon's own process group — are
-/// skipped, keeping the sweep safe against pid reuse.
+/// skipped, and the SIGKILL pass only revisits pids that were alive at the
+/// SIGTERM pass. This bounds (but, like any pid-based sweep, cannot fully
+/// eliminate) the window in which a recycled pid could be signalled.
 #[cfg(unix)]
 async fn sweep_escaped_descendants(pids: &[i32]) {
     use nix::sys::signal::{kill, Signal};
@@ -413,7 +419,7 @@ async fn sweep_escaped_descendants(pids: &[i32]) {
         let _ = kill(*pid, Signal::SIGTERM);
     }
     tokio::time::sleep(TERM_GRACE).await;
-    for pid in pids.iter().filter_map(|&p| survivor(p)) {
+    for pid in survivors.iter().filter_map(|p| survivor(p.as_raw())) {
         let _ = kill(pid, Signal::SIGKILL);
     }
 }
@@ -568,7 +574,7 @@ mod reap_tests {
         let mut child = command.spawn().expect("spawn bash child");
 
         let mut grandchild_pid = None;
-        for _ in 0..150 {
+        for _ in 0..250 {
             if let Ok(s) = tokio::fs::read_to_string(&pidfile).await {
                 if let Ok(pid) = s.trim().parse::<i32>() {
                     grandchild_pid = Some(pid);
@@ -587,6 +593,16 @@ mod reap_tests {
         assert_ne!(
             grandchild_pgid, child_pgid,
             "grandchild must be in a foreign process group for this regression test"
+        );
+
+        // Distinct failure signal for the snapshot path: if `ps` stalls past
+        // its budget on a loaded runner the snapshot comes back empty and the
+        // sweep silently no-ops — fail here, not at the terminal panic below.
+        let snapshot = descendant_pids(child.id().expect("child pid")).await;
+        assert!(
+            snapshot.contains(&grandchild_pid),
+            "descendant snapshot {snapshot:?} must include grandchild {grandchild_pid} \
+             (empty/partial snapshot ⇒ `ps` walk failed, not the sweep)"
         );
 
         reap_child(&mut child).await;
