@@ -177,6 +177,23 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> WsClient {
     ws
 }
 
+/// RAII guard: sets `INTENTD_TEST_PANIC_METHOD` and removes it on drop, so
+/// cleanup also runs when an assertion above the end of the test panics.
+struct PanicMethodEnv;
+
+impl PanicMethodEnv {
+    fn set(methods: &str) -> Self {
+        std::env::set_var("INTENTD_TEST_PANIC_METHOD", methods);
+        PanicMethodEnv
+    }
+}
+
+impl Drop for PanicMethodEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("INTENTD_TEST_PANIC_METHOD");
+    }
+}
+
 /// Read frames until the next Text frame, skipping Ping/Pong.
 async fn next_text(ws: &mut WsClient) -> Value {
     loop {
@@ -196,11 +213,16 @@ async fn next_text(ws: &mut WsClient) -> Value {
 /// `events.subscribe` fast path, then a healthy request on the SAME
 /// connection still succeeds — the connection and daemon survive throughout.
 #[tokio::test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "INTENTD_TEST_PANIC_METHOD injection is compiled out of release builds"
+)]
 async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // Set BEFORE the server starts; read by the debug-only injection hook at
     // dispatch time inside this same process. `note.list` exercises the
     // spawned `handle_message` path; `events.subscribe` the inline fast path.
-    std::env::set_var("INTENTD_TEST_PANIC_METHOD", "note.list,events.subscribe");
+    // The guard removes the var on drop, including during unwinding.
+    let _env = PanicMethodEnv::set("note.list,events.subscribe");
     let (_srv, port, cfg, _dir) = start_server().await;
     let mut ws = connect_ws(port, cfg).await;
 
@@ -263,6 +285,4 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
         Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
         Ok(other) => panic!("unexpected trailing frame: {other:?}"),
     }
-
-    std::env::remove_var("INTENTD_TEST_PANIC_METHOD");
 }

@@ -32,13 +32,19 @@ pub(crate) fn request_identity(value: &Value) -> (Option<Value>, String) {
 }
 
 /// Serialize the `-32603 Internal error` response echoing the request `id`.
+/// If serialization itself ever fails, fall back to a deterministic valid
+/// envelope (id null) rather than an empty frame, matching the router's
+/// `internal_fallback`.
 pub(crate) fn internal_error_frame(id: Value) -> String {
     serde_json::to_string(&json!({
         "jsonrpc": "2.0",
         "error": { "code": -32603, "message": "Internal error" },
         "id": id
     }))
-    .unwrap_or_default()
+    .unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#
+            .to_string()
+    })
 }
 
 /// Best-effort panic payload text for the log line.
@@ -291,6 +297,9 @@ mod tests {
         }
     }
 
+    // The injection hook is compiled out of release builds (`debug_assertions`
+    // off ⇒ unconditional no-op), so this test only exists where it can pass.
+    #[cfg(debug_assertions)]
     #[test]
     fn inject_panic_matches_env_list() {
         // Serialize with the other global-state tests: hold the lock across
