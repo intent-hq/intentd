@@ -103,9 +103,8 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 // workspace's OWN branch (`pr.head.ref === workspace.branch`), NOT `baseRef`.
 //
 // PARITY NOTE: the TS `performBackgroundEnrichment` additionally accepts a
-// `baseRef` match (`matchesBaseRef`); the porting spec mandated branch-only
-// matching ("the workspace's own branch, NOT baseRef"), so this port follows
-// that rule and ignores `baseRef`.
+// `baseRef` match (`matchesBaseRef`); this port intentionally does branch-only
+// matching (the workspace's own branch, NOT `baseRef`) and ignores `baseRef`.
 // ===========================================================================
 
 /// Outcome of a single workspace PR refresh (§7.6). Drives which `pr:*` event
