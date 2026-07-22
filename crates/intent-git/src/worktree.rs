@@ -1,10 +1,12 @@
 //! Worktree create + lock (§9.5; internal — Cycle C consumes it).
 //!
-//! [`WorktreeLocks`] ports `withGitWorktreeLock`: a per-worktree async mutex
-//! (keyed by worktree path) so concurrent agents/operations on the same worktree
-//! never corrupt the index. [`create_worktree`] wraps `git worktree add`;
-//! [`remove_worktree`] wraps `git worktree remove --force` (+ the manual-rm
-//! fallback and prune from the TS `removeGitWorktree`).
+//! [`WorktreeLocks`] ports `withGitWorktreeLock`: an async mutex per
+//! caller-provided key path — `intent-services` keys it by repository dir for
+//! a per-repository lock — so concurrent agents/operations on the same keyed
+//! path never corrupt the index. [`create_worktree`] wraps `git worktree add`;
+//! [`remove_worktree`] ports the TS `removeGitWorktree` (registration prune +
+//! directory removal), split into [`detach_worktree`] /
+//! [`remove_detached_worktree`] so the recursive delete can run outside locks.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,9 +18,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::map_git_err;
 
-/// A per-worktree async-mutex map. Cheap to clone (shared inner map). Each
-/// distinct worktree path gets its own lock, so operations on different
-/// worktrees never contend.
+/// An async-mutex map keyed by caller-provided path (e.g. the repository
+/// directory for a per-repository lock). Cheap to clone (shared inner map).
+/// Each distinct key path gets its own lock, so operations under different
+/// keys never contend.
 #[derive(Clone, Default)]
 pub struct WorktreeLocks {
     locks: Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>,
@@ -164,11 +167,31 @@ pub fn worktree_branch(worktree_path: &Path) -> Option<String> {
 }
 
 /// Remove the linked worktree at `worktree_path`, porting the TS
-/// `removeGitWorktree` removal sequence: `git worktree remove --force`
-/// (libgit2 prune with the working-tree flag), then the manual
-/// `fs.rm(recursive, force)` fallback when the directory survives, then a
-/// best-effort prune of any remaining stale registrations.
+/// `removeGitWorktree` removal sequence. Composed from the two-phase API —
+/// [`detach_worktree`] (registration prune + rename to a trash path) followed
+/// by [`remove_detached_worktree`] (recursive removal) — so callers that hold
+/// a per-repo lock can run the phases separately and keep the expensive
+/// recursive delete outside the lock.
 pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+    if let Some(trash) = detach_worktree(repo_path, worktree_path)? {
+        remove_detached_worktree(&trash)?;
+    }
+    Ok(())
+}
+
+/// Phase 1 of worktree removal — cheap git-metadata work that is safe to run
+/// under a per-repo lock: prune the worktree registration (metadata only —
+/// libgit2's working-tree delete is deliberately not requested), rename the
+/// working directory to a unique sibling trash path so the potentially
+/// multi-GB recursive removal can happen later via
+/// [`remove_detached_worktree`], outside the lock, then best-effort prune any
+/// remaining stale registrations (including this worktree's own entry when
+/// the path comparison missed — e.g. symlinked temp dirs — since its
+/// directory is now gone). Returns the trash path awaiting removal, or
+/// `None` when the directory was already gone or had to be removed in place
+/// (rename fallback, e.g. permissions or directory busy). Idempotent: a
+/// missing directory or registration is `Ok(None)`.
+pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<PathBuf>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     if let Ok(names) = repo.worktrees() {
         for i in 0..names.len() {
@@ -180,15 +203,11 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
                 continue;
             }
             let mut opts = WorktreePruneOptions::new();
-            opts.valid(true).locked(true).working_tree(true);
+            opts.valid(true).locked(true);
             wt.prune(Some(&mut opts)).map_err(map_git_err)?;
         }
     }
-    // Manual fallback, mirroring `fs.rm(worktreePath, { recursive, force })`.
-    if worktree_path.exists() {
-        std::fs::remove_dir_all(worktree_path)
-            .map_err(|e| Error::Internal(format!("cannot remove worktree dir: {e}")))?;
-    }
+    let trash = rename_worktree_to_trash(worktree_path)?;
     // Best-effort `git worktree prune` of whatever else went stale.
     if let Ok(names) = repo.worktrees() {
         for i in 0..names.len() {
@@ -200,7 +219,85 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(trash)
+}
+
+/// Phase 2 of worktree removal — the expensive recursive delete of a
+/// directory detached by [`detach_worktree`]. Run this outside any per-repo
+/// lock. Idempotent: an already-missing path is `Ok`.
+pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(trash_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Internal(format!(
+            "cannot remove detached worktree dir: {e}"
+        ))),
+    }
+}
+
+/// Rename `worktree_path` to a unique sibling trash path, returning the path
+/// awaiting recursive removal. Race-tolerant: a source that vanished between
+/// the probe and the rename is idempotent success (`None`), a trash-candidate
+/// collision retries with a fresh nonce, and any other rename failure (e.g.
+/// permissions, directory busy) falls back to an in-place recursive removal —
+/// mirroring the original `fs.rm(worktreePath, { recursive, force })` — where
+/// `NotFound` is also treated as already gone.
+fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
+    use std::io::ErrorKind;
+    if !worktree_path.exists() {
+        return Ok(None);
+    }
+    for _ in 0..8 {
+        let candidate = detached_trash_path(worktree_path);
+        match std::fs::rename(worktree_path, &candidate) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            // Trash-candidate collision (`EEXIST` / `ENOTEMPTY`; the latter has
+            // no stable `ErrorKind` on our MSRV, so probe the candidate): retry
+            // with a fresh nonce.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    worktree = %worktree_path.display(),
+                    "rename to trash path failed; falling back to in-place removal"
+                );
+                break;
+            }
+        }
+    }
+    match std::fs::remove_dir_all(worktree_path) {
+        Ok(()) => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Internal(format!("cannot remove worktree dir: {e}"))),
+    }
+}
+
+/// Unique sibling trash path for a detached worktree —
+/// `<wt>.deleting-<nonce>` in the same parent directory, so the rename never
+/// crosses filesystems.
+fn detached_trash_path(worktree_path: &Path) -> PathBuf {
+    let name = worktree_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worktree".to_string());
+    let parent = worktree_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for attempt in 0u32.. {
+        let candidate = parent.join(format!("{name}.deleting-{nonce:x}-{attempt}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("exhausted trash-path candidates")
 }
 
 /// Best-effort delete of the `index.lock` file for the worktree at
@@ -392,6 +489,122 @@ mod tests {
         std::fs::remove_dir_all(&wt_path).unwrap();
         remove_worktree(dir.path(), &wt_path).unwrap();
         assert!(!wt_path.exists());
+    }
+
+    #[test]
+    fn detach_worktree_defers_recursive_removal() {
+        let dir = init_repo("wt-detach");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let wt_path = std::env::temp_dir().join(format!("wt-detach-{}", uuid_ish()));
+        provision_worktree(
+            dir.path(),
+            "detach-ws",
+            &wt_path,
+            "detach-branch",
+            None,
+            "origin",
+        )
+        .unwrap();
+        assert!(wt_path.join("a.txt").exists());
+
+        let trash = detach_worktree(dir.path(), &wt_path)
+            .unwrap()
+            .expect("directory renamed to a trash path");
+        assert!(!wt_path.exists(), "original path vacated by the rename");
+        assert!(
+            trash.join("a.txt").exists(),
+            "contents intact — no recursive removal in the detach phase"
+        );
+        let repo = Repository::open(dir.path()).unwrap();
+        let names = repo.worktrees().unwrap();
+        assert!(
+            (0..names.len())
+                .filter_map(|i| names.get(i).ok().flatten())
+                .all(|n| n != "detach-ws"),
+            "worktree registration pruned"
+        );
+
+        remove_detached_worktree(&trash).unwrap();
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn detach_worktree_is_none_when_directory_already_gone() {
+        let dir = init_repo("wt-detach-gone");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let wt_path = std::env::temp_dir().join(format!("wt-detachgone-{}", uuid_ish()));
+        provision_worktree(
+            dir.path(),
+            "detach-gone-ws",
+            &wt_path,
+            "detach-gone-branch",
+            None,
+            "origin",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        assert!(detach_worktree(dir.path(), &wt_path).unwrap().is_none());
+        let repo = Repository::open(dir.path()).unwrap();
+        let names = repo.worktrees().unwrap();
+        assert!(
+            (0..names.len())
+                .filter_map(|i| names.get(i).ok().flatten())
+                .all(|n| n != "detach-gone-ws"),
+            "worktree registration pruned"
+        );
+    }
+
+    #[test]
+    fn remove_detached_worktree_is_ok_for_missing_path() {
+        remove_detached_worktree(Path::new("/nonexistent/intent-git-trash-probe")).unwrap();
+    }
+
+    // Regression for the delete-cleanup lock starvation: the lock-holding
+    // phase (detach) leaves the heavy recursive removal for after the lock is
+    // released, so a concurrent create on the same repo is never blocked by a
+    // multi-GB `remove_dir_all`.
+    #[tokio::test]
+    async fn per_repo_lock_released_before_detached_removal() {
+        let dir = init_repo("wt-lock-detach");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let wt_path = std::env::temp_dir().join(format!("wt-lockdetach-{}", uuid_ish()));
+        provision_worktree(
+            dir.path(),
+            "lock-detach-ws",
+            &wt_path,
+            "lock-detach-branch",
+            None,
+            "origin",
+        )
+        .unwrap();
+
+        let locks = WorktreeLocks::new();
+        let repo_path = dir.path().to_path_buf();
+        let repo_for_task = repo_path.clone();
+        let wt = wt_path.clone();
+        let trash = locks
+            .with_lock(&repo_path, move || async move {
+                tokio::task::spawn_blocking(move || detach_worktree(&repo_for_task, &wt))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+            .await
+            .expect("trash path awaiting removal");
+        // The lock is free here while the detached directory still exists —
+        // the expensive removal has not run yet. Bound the acquire with a
+        // timeout so a regression fails fast instead of hanging the test.
+        assert!(trash.exists());
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(5),
+            locks.with_lock(&repo_path, || async { true }),
+        )
+        .await
+        .expect("per-repo lock still held after detach phase");
+        assert!(acquired);
+
+        remove_detached_worktree(&trash).unwrap();
+        assert!(!trash.exists());
     }
 
     #[test]
