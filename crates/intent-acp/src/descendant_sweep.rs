@@ -18,8 +18,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-/// Bound on how many descendant pids the pre-kill snapshot tracks *per root*
-/// — keeps the backstop sweep cheap even against a pathological fork storm.
+/// Per-root budget for the pre-kill snapshot. The walk stops after
+/// `DESCENDANT_SWEEP_CAP × roots` pids total (a shared pool scaled by root
+/// count, not enforced per individual root) — keeps the backstop sweep cheap
+/// even against a pathological fork storm.
 const DESCENDANT_SWEEP_CAP: usize = 64;
 /// Timeout on the `ps` snapshot; a hung `ps` must not stall reaping.
 const PS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -74,8 +76,9 @@ pub async fn descendant_pids_many(roots: &[u32]) -> Vec<i32> {
 
 /// Breadth-first walk of a `(pid, ppid)` table from every `root`, returning
 /// descendant pids (children, grandchildren, …) de-duplicated across roots
-/// and capped at [`DESCENDANT_SWEEP_CAP`] per root. Cycle-safe via a visited
-/// set even though real ppid tables are acyclic.
+/// and capped at [`DESCENDANT_SWEEP_CAP`] × root count overall (a shared
+/// pool, so one prolific root may use more than its share). Cycle-safe via a
+/// visited set even though real ppid tables are acyclic.
 fn descendants_in_table(table: &[(i32, i32)], roots: &[i32]) -> Vec<i32> {
     use std::collections::{HashSet, VecDeque};
     let cap = DESCENDANT_SWEEP_CAP.saturating_mul(roots.len().max(1));
