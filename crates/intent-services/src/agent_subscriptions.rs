@@ -224,12 +224,23 @@ impl Services {
     /// is left intact rather than overwritten with an empty placeholder that
     /// would degrade `agent.getSubscriptions` / `describe_subscription`
     /// output.
+    ///
+    /// `resolved_parent_workspace_id` is `Some` only when the caller resolved
+    /// the parent's home workspace from an actual session row (never from a
+    /// call-workspace fallback): a watch originally registered with fallback
+    /// anchors (a transient `get_agent_session` failure) has its
+    /// `parent_workspace_id` corrected on reuse, so subsequent wakes and
+    /// `agent:subscriptions-changed` land in the parent's true home
+    /// workspace. Refreshing only the parent anchor cannot violate the scope
+    /// gate for existing valid records — it either fixes a fallback anchor to
+    /// the true home or is a no-op.
     pub(crate) fn find_and_refresh_ungrouped_watch(
         &self,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
         one_shot: bool,
         new_parent_name: Option<String>,
+        resolved_parent_workspace_id: Option<&WorkspaceId>,
     ) -> Option<String> {
         let mut guard = self
             .agent_subscriptions
@@ -244,6 +255,13 @@ impl Services {
         if let Some(new_name) = new_parent_name {
             if watch.parent_agent_name != new_name {
                 watch.parent_agent_name = new_name;
+            }
+        }
+        if let Some(home_ws) = resolved_parent_workspace_id {
+            if &watch.parent_workspace_id != home_ws
+                && check_watch_scope(home_ws, &watch.child_workspace_id).is_ok()
+            {
+                watch.parent_workspace_id = home_ws.clone();
             }
         }
         Some(watch.id.clone())
@@ -821,8 +839,8 @@ impl Services {
     /// its completion using the persisted completion_report.
     async fn reconcile_group_on_rehydration(&self, group_id: &str) {
         // Get the list of agents to check (expected but not yet recorded as
-        // complete/deleted) plus the group's anchor workspace for the
-        // synthetic events below.
+        // complete/deleted) plus the group's anchor workspace, used as the
+        // fallback for synthetic events whose child session is gone.
         let (anchor_workspace, agents_to_check) = {
             let guard = self
                 .agent_subscriptions
@@ -910,9 +928,12 @@ impl Services {
                         } else {
                             intent_core::events::AGENT_IDLE
                         };
+                        // Child completion events fire in the CHILD's own
+                        // workspace (which differs from the group's anchor
+                        // for chief-anchored groups).
                         let event = Event {
                             id: uuid::Uuid::new_v4().to_string(),
-                            workspace_id: workspace_id.clone(),
+                            workspace_id: session.workspace_id.clone(),
                             timestamp: now_iso(),
                             event_type: event_type.to_string(),
                             actor: intent_core::EventActor {
@@ -940,7 +961,9 @@ impl Services {
                     }
                 }
                 Err(e) => {
-                    // Only NotFound → deleted; other errors → log and skip
+                    // Only NotFound → deleted; other errors → log and skip.
+                    // The session is gone so the child's own workspace is
+                    // unknowable — fall back to the group's anchor workspace.
                     if matches!(e, intent_store::Error::NotFound(_)) {
                         let event = Event {
                             id: uuid::Uuid::new_v4().to_string(),

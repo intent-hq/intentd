@@ -3202,9 +3202,12 @@ impl Services {
         // call's workspace when the parent session lookup failed) and the
         // child's own workspace (falls back likewise) — same-workspace pairs
         // behave exactly as before; a chief parent registers cross-workspace.
-        let parent_home_ws = parent_session
-            .as_ref()
-            .map(|s| s.workspace_id.clone())
+        // `resolved_home` is Some only when read from a real session row: the
+        // reuse path uses it to correct a watch whose anchor was registered
+        // from the fallback.
+        let resolved_home = parent_session.as_ref().map(|s| s.workspace_id.clone());
+        let parent_home_ws = resolved_home
+            .clone()
             .unwrap_or_else(|| workspace_id.clone());
         let child_ws = self
             .store
@@ -3218,6 +3221,7 @@ impl Services {
             &child_agent_id,
             true,
             parent_name.clone(),
+            resolved_home.as_ref(),
         ) {
             Some(existing) => existing,
             None => self.register_completion_watch(
@@ -3274,10 +3278,11 @@ impl Services {
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
         // Anchor the watch in the caller's HOME workspace and the target's
         // workspace (each falls back to the call's workspace when the session
-        // lookup fails), mirroring `agent_watch_completion_op`.
-        let caller_home_ws = caller_session
-            .as_ref()
-            .map(|s| s.workspace_id.clone())
+        // lookup fails), mirroring `agent_watch_completion_op` — including the
+        // `resolved_home` anchor-correction on the reuse path.
+        let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
+        let caller_home_ws = resolved_home
+            .clone()
             .unwrap_or_else(|| workspace_id.clone());
         let target_ws = self
             .store
@@ -3291,6 +3296,7 @@ impl Services {
             &target_agent_id,
             true,
             caller_name.clone(),
+            resolved_home.as_ref(),
         ) {
             Some(existing) => existing,
             None => self.register_completion_watch(
@@ -4052,9 +4058,12 @@ impl Services {
                 let caller_name = caller_session.as_ref().map(|s| s.name.clone());
                 // The watch is anchored in the caller's HOME workspace (falls
                 // back to the call's workspace when the session lookup fails)
-                // so a chief caller's wake lands in `__chief__`.
-                let caller_home_ws = caller_session
-                    .map(|s| s.workspace_id)
+                // so a chief caller's wake lands in `__chief__`. `resolved_home`
+                // is Some only when read from a real session row: the reuse
+                // path uses it to correct a fallback-registered anchor.
+                let resolved_home = caller_session.map(|s| s.workspace_id);
+                let caller_home_ws = resolved_home
+                    .clone()
                     .unwrap_or_else(|| workspace_id.clone());
                 // SUB-2 (Copilot #104 follow-up, thread
                 // PRRT_kwDOS9Wxuc6QKPyt): resolve reuse atomically. If a live
@@ -4071,6 +4080,7 @@ impl Services {
                         &agent_id,
                         one_shot,
                         caller_name.clone(),
+                        resolved_home.as_ref(),
                     ) {
                     (existing_id, true)
                 } else {
@@ -4930,8 +4940,9 @@ impl Services {
                     .as_ref()
                     .map(|s| s.name.clone())
                     .unwrap_or_default();
-                let parent_home_ws = parent_session
-                    .map(|s| s.workspace_id)
+                let resolved_home = parent_session.map(|s| s.workspace_id);
+                let parent_home_ws = resolved_home
+                    .clone()
                     .unwrap_or_else(|| workspace_id.clone());
 
                 // A cross-workspace (chief) parent's group is persisted under
@@ -4968,6 +4979,7 @@ impl Services {
                         agent_id,
                         true,
                         Some(parent_name.clone()),
+                        resolved_home.as_ref(),
                     ) {
                         Some(_) => Ok(()),
                         None => self

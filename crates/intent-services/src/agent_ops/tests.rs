@@ -4622,7 +4622,7 @@ async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
 
     // Reuse with no resolved name: still returns the same subscription id
     // (reuse proceeds), and the stored `parent_agent_name` is untouched.
-    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None);
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
@@ -4635,10 +4635,54 @@ async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
     // before, so the `None` short-circuit is scoped to the lookup-failed
     // case rather than disabling the refresh entirely.
     let reused =
-        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, Some("Renamed".into()));
+        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, Some("Renamed".into()), None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
     let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches[0].parent_agent_name, "Renamed");
+}
+
+/// Reuse corrects a stale parent anchor: a watch registered with a fallback
+/// `parent_workspace_id` (transient parent-session lookup failure) has its
+/// anchor fixed when a later reuse resolves the parent's true home workspace,
+/// so wakes land in the right place. A `None` resolved home (lookup failed
+/// again) leaves the anchor untouched.
+#[tokio::test]
+async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
+    let (_t, svc, ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let caller = create_agent(&svc, &chief_ws, "Chief").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    // Simulate the fallback registration: the chief parent's watch was
+    // anchored under the CHILD's workspace because the session lookup failed.
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Chief".into(),
+            target.clone(),
+            true,
+            None,
+        )
+        .expect("register watch with fallback anchor");
+
+    // Reuse with no resolved home: anchor untouched.
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, None);
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    assert_eq!(
+        svc.list_watches_for_parent(&caller)[0].parent_workspace_id,
+        ws
+    );
+
+    // Reuse with the parent's true home resolved: anchor corrected.
+    let reused =
+        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, Some(&chief_ws));
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    assert_eq!(
+        svc.list_watches_for_parent(&caller)[0].parent_workspace_id,
+        chief_ws,
+        "resolved home workspace must correct a fallback-registered anchor"
+    );
 }
 
 /// End-to-end through the MCP front door: delegating with a caller registers
