@@ -113,9 +113,19 @@ fn validate_attachments(attachments: Option<Value>) -> Result<Option<Value>, (i3
     if items.is_empty() {
         return Ok(None);
     }
-    let size = serde_json::to_string(&value)
-        .map_err(|e| (-32603, e.to_string()))?
-        .len();
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, &value).map_err(|e| (-32603, e.to_string()))?;
+    let size = counter.0;
     if size > MAX_ATTACHMENTS_BYTES {
         return Err((
             -32602,
