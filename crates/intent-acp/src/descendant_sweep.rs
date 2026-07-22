@@ -105,7 +105,10 @@ fn descendants_in_table(table: &[(i32, i32)], roots: &[i32]) -> Vec<i32> {
 /// skipped, and the SIGKILL pass only revisits pids that were alive at the
 /// SIGTERM pass. This bounds (but, like any pid-based sweep, cannot fully
 /// eliminate) the window in which a recycled pid could be signalled. Returns
-/// immediately (no grace wait) when nothing survived — the common case.
+/// immediately (no grace wait) when nothing survived — the common case —
+/// though a group-killed descendant that init has not reaped yet still
+/// passes the liveness check (`getpgid` succeeds on zombies), in which case
+/// the sweep harmlessly signals it and pays one grace window.
 pub async fn sweep_escaped_descendants(pids: &[i32]) {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::{getpgid, Pid};

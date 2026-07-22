@@ -208,13 +208,19 @@ impl SpawnedAgent {
         // The group SIGKILL above may already have terminated the direct child,
         // making `start_kill` report a spurious "already exited" error
         // (InvalidInput) — tolerate it, then `wait()` so the child is actually
-        // reaped instead of lingering as a zombie.
-        match self.child.start_kill() {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-            Err(e) => return Err(e),
-        }
-        let result = self.child.wait().await.map(|_| ());
+        // reaped instead of lingering as a zombie. Errors are captured rather
+        // than returned early so the sweep below still runs — the group
+        // SIGKILL was already sent, so escaped descendants must be swept on
+        // every path.
+        let result = match self.child.start_kill() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            Err(e) => Err(e),
+        };
+        let result = match result {
+            Ok(()) => self.child.wait().await.map(|_| ()),
+            Err(e) => Err(e),
+        };
         #[cfg(unix)]
         crate::descendant_sweep::sweep_escaped_descendants(&descendants).await;
         result

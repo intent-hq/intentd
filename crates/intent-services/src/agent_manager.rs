@@ -3298,7 +3298,10 @@ async fn kill_child_tree(mut child: Child) {
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
 /// still-live group is SIGKILLed — so total teardown is ~one grace period
 /// regardless of how many agents were running (unlike per-child
-/// [`kill_child_tree`], which serialises one grace window per tree).
+/// [`kill_child_tree`], which serialises one grace window per tree). The
+/// pre-kill descendant snapshot (bounded at 2s for a hung `ps`) and the
+/// post-kill escape sweep (one extra grace window when something escaped)
+/// add hard-bounded overhead on top of that shared window.
 #[cfg(unix)]
 async fn kill_child_trees(children: Vec<Child>) {
     use intent_acp::{descendant_pids_many, sweep_escaped_descendants};
