@@ -740,10 +740,6 @@ fn rescue_target_position(
 ) -> Result<(usize, usize)> {
     let not_found =
         || Error::InvalidParams("Could not find the search context in the document.".to_string());
-    let occurrences = find_all_occurrences(proj_text, needle_tgt);
-    if occurrences.is_empty() {
-        return Err(not_found());
-    }
     // Same guard as the exact and projection paths: an ambiguous target
     // within the provided context would make the before/after split (and
     // therefore the scoring) anchor off the wrong instance.
@@ -761,9 +757,15 @@ fn rescue_target_position(
         ));
     };
     let (before, after) = (&needle_ctx[..rel], &needle_ctx[rel + needle_tgt.len()..]);
+    // Stream over non-overlapping occurrences (no Vec of every position: a
+    // short/common target in a large document would otherwise allocate and
+    // score unboundedly).
     let mut best: Option<(usize, usize)> = None;
     let mut tied = false;
-    for &pos in &occurrences {
+    let mut from = 0;
+    while let Some(off) = proj_text[from..].find(needle_tgt) {
+        let pos = from + off;
+        from = pos + needle_tgt.len();
         let score = suffix_overlap(before, &proj_text[..pos])
             + prefix_overlap(after, &proj_text[pos + needle_tgt.len()..]);
         match best {
@@ -775,7 +777,9 @@ fn rescue_target_position(
             }
         }
     }
-    let (score, pos) = best.expect("occurrences is non-empty");
+    let Some((score, pos)) = best else {
+        return Err(not_found());
+    };
     if score < MIN_RESCUE_CONTEXT_OVERLAP {
         return Err(not_found());
     }
@@ -1752,7 +1756,9 @@ mod tests {
 
     #[test]
     fn anchor_target_rescue_missing_target_still_not_found() {
-        let err = find_and_anchor_text("some document text", "stale context here", "missing")
+        // Target is inside the (stale) context but absent from the document:
+        // nothing to rescue, so the context-not-found error stands.
+        let err = find_and_anchor_text("some document text", "stale missing here", "missing")
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidParams(ref m) if m.contains("Could not find the search context")),
