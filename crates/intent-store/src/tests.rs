@@ -90,7 +90,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47
+            47, 48
         ]
     );
     assert_eq!(
@@ -98,7 +98,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47
+            47, 48
         ]
     );
 }
@@ -2233,7 +2233,7 @@ async fn draft_round_trip_upsert_get_delete() {
         .unwrap()
         .is_none());
     store
-        .upsert_draft(&ws, &agent, &client, "hello")
+        .upsert_draft(&ws, &agent, &client, "hello", None)
         .await
         .expect("set");
     let got = store
@@ -2242,20 +2242,42 @@ async fn draft_round_trip_upsert_get_delete() {
         .unwrap()
         .expect("present");
     assert_eq!(got.text, "hello");
+    assert_eq!(
+        got.attachments, None,
+        "a text-only draft has no attachments"
+    );
 
-    // Upsert overwrites text in place.
+    // Upsert overwrites text and attachments in place.
+    let attachments = json!([{ "type": "image", "imageData": "aGk=" }]);
     store
-        .upsert_draft(&ws, &agent, &client, "world")
+        .upsert_draft(&ws, &agent, &client, "world", Some(&attachments))
         .await
         .expect("set2");
+    let got = store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(got.text, "world");
+    assert_eq!(
+        got.attachments,
+        Some(attachments),
+        "attachments round-trip verbatim"
+    );
+
+    // An upsert without attachments drops the stored ones.
+    store
+        .upsert_draft(&ws, &agent, &client, "world", None)
+        .await
+        .expect("set3");
     assert_eq!(
         store
             .get_draft(&ws, &agent, &client)
             .await
             .unwrap()
             .unwrap()
-            .text,
-        "world"
+            .attachments,
+        None
     );
 
     assert!(
@@ -2288,8 +2310,14 @@ async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
     store.upsert_client(&a, None, None).await.unwrap();
     store.upsert_client(&b, None, None).await.unwrap();
 
-    store.upsert_draft(&ws, &agent, &a, "from-a").await.unwrap();
-    store.upsert_draft(&ws, &agent, &b, "from-b").await.unwrap();
+    store
+        .upsert_draft(&ws, &agent, &a, "from-a", None)
+        .await
+        .unwrap();
+    store
+        .upsert_draft(&ws, &agent, &b, "from-b", None)
+        .await
+        .unwrap();
     assert_eq!(
         store
             .get_draft(&ws, &agent, &a)

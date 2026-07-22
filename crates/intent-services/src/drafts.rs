@@ -40,17 +40,21 @@ impl Services {
             .await
     }
 
-    /// `drafts.set`: upsert (or, for empty `text`, clear) the calling client's
-    /// draft and emit `draft:changed`. Returns `Some(updatedAt)` on store, or
-    /// `None` when cleared (PROTOCOL §5.16/§6.5).
+    /// `drafts.set`: upsert (or, for empty `text` with no attachments, clear)
+    /// the calling client's draft and emit `draft:changed`. `attachments` is an
+    /// opaque JSON array stored verbatim; an empty array is normalized to none.
+    /// Returns `Some(updatedAt)` on store, or `None` when cleared (PROTOCOL
+    /// §5.16/§6.5).
     pub(crate) async fn drafts_set(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         client_id: ClientId,
         text: String,
+        attachments: Option<serde_json::Value>,
     ) -> Result<Option<String>> {
-        let updated = if text.is_empty() {
+        let attachments = attachments.filter(|a| a.as_array().is_some_and(|arr| !arr.is_empty()));
+        let updated = if text.is_empty() && attachments.is_none() {
             self.store
                 .delete_draft(&workspace_id, &agent_id, &client_id)
                 .await?;
@@ -58,7 +62,13 @@ impl Services {
         } else {
             Some(
                 self.store
-                    .upsert_draft(&workspace_id, &agent_id, &client_id, &text)
+                    .upsert_draft(
+                        &workspace_id,
+                        &agent_id,
+                        &client_id,
+                        &text,
+                        attachments.as_ref(),
+                    )
                     .await?,
             )
         };
