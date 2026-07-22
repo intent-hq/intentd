@@ -2,10 +2,12 @@
 //! `{ id, name, provider, description? }`.
 //!
 //! Ports the FE payload normalization: the model list may live under
-//! `models.availableModels`, `availableModels`, `models.available`, or a bare
-//! `models` array, and the payload may be wrapped under `update` /
-//! `sessionUpdate` (session-update notifications). Codex additionally expands
-//! effort-variant base models into `{model}/{effort}` rows.
+//! `models.availableModels`, `availableModels`, `models.available`, a bare
+//! `models` array, or a `configOptions` select option with `id == "model"`
+//! (claude-agent-acp ≥ 0.60 / codex-acp ≥ 0.16 report the catalog this way),
+//! and the payload may be wrapped under `update` / `sessionUpdate`
+//! (session-update notifications). Codex additionally expands effort-variant
+//! base models into `{model}/{effort}` rows.
 
 use serde_json::{json, Map, Value};
 
@@ -27,24 +29,61 @@ const CODEX_EFFORT_VARIANT_MODELS: [&str; 3] =
 ///
 /// Accepts the bare update or one wrapped under `update` / `sessionUpdate`,
 /// with the list under `models.availableModels`, `availableModels`,
-/// `models.available`, or a bare `models` array.
+/// `models.available`, a bare `models` array, or the `configOptions` select
+/// option whose `id` is `"model"`.
 fn extract_available_models(payload: &Value) -> Option<&Vec<Value>> {
     let update = payload
         .get("update")
         .or_else(|| payload.get("sessionUpdate"))
         .unwrap_or(payload);
     let models = update.get("models");
+    // Emptiness is filtered per branch so an empty array in one shape (e.g. a
+    // transitional adapter emitting `availableModels: []` alongside a
+    // populated configOptions catalog) still lets a later shape win.
+    let non_empty = |a: &&Vec<Value>| !a.is_empty();
     models
         .and_then(|m| m.get("availableModels"))
         .and_then(Value::as_array)
-        .or_else(|| update.get("availableModels").and_then(Value::as_array))
+        .filter(non_empty)
+        .or_else(|| {
+            update
+                .get("availableModels")
+                .and_then(Value::as_array)
+                .filter(non_empty)
+        })
         .or_else(|| {
             models
                 .and_then(|m| m.get("available"))
                 .and_then(Value::as_array)
+                .filter(non_empty)
         })
-        .or_else(|| models.and_then(Value::as_array))
-        .filter(|a| !a.is_empty())
+        .or_else(|| models.and_then(Value::as_array).filter(non_empty))
+        .or_else(|| extract_config_options_models(update))
+}
+
+/// Extract the model rows from a `configOptions` payload: the select option
+/// with `id == "model"` (falling back to `category == "model"`) carries the
+/// catalog as `options: [{ value, name, description? }]`. Sibling select
+/// options (`mode`, `effort`, `fast`, …) are ignored. Values are preserved
+/// verbatim as model ids (including effort-suffixed ids like `opus[1m]`),
+/// matching the retired FE probe's behavior.
+///
+/// Each candidate must carry a non-empty `options` array: an `id == "model"`
+/// entry without usable options falls through to a `category == "model"`
+/// sibling instead of aborting the extraction.
+fn extract_config_options_models(update: &Value) -> Option<&Vec<Value>> {
+    let options = update.get("configOptions").and_then(Value::as_array)?;
+    let by_key = |key: &str| {
+        options
+            .iter()
+            .filter(|o| o.get(key).and_then(Value::as_str) == Some("model"))
+            .find_map(|o| {
+                o.get("options")
+                    .and_then(Value::as_array)
+                    .filter(|a| !a.is_empty())
+            })
+    };
+    by_key("id").or_else(|| by_key("category"))
 }
 
 /// Pull `(id, name, description)` out of one raw model entry, tolerating the

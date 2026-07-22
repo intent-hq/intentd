@@ -18,12 +18,31 @@ use serde_json::{json, Value};
 use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 
-/// Hard cap on the whole probe (mirrors the FE's 15s outer timeout).
+/// Hard cap on the whole probe for resolved binaries (mirrors the FE's 15s
+/// outer timeout). Deliberately smaller than the sum of the per-stage budgets
+/// (4s + 10s + 2s grace), matching the FE: the outer cap is the real bound
+/// and preempts slow-but-not-stuck stages.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(15);
-/// Per-request timeout for `initialize` (FE: 4s).
+/// Per-request timeout for `initialize` for resolved binaries (FE: 4s).
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(4);
-/// Per-request timeout for `session/new` (FE: 8–10s).
+/// `initialize` budget for npx-run adapters: a cold `npx -y <pkg>@<version>`
+/// downloads and installs the package before the adapter can answer, which
+/// routinely takes tens of seconds. A pinned-version bump must not guarantee
+/// a static-fallback cycle just because the cache is cold.
+const NPX_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Overall cap for npx-run adapters, kept bounded but sized to cover the full
+/// per-stage sum (45s initialize + 20s session/new + 2s grace) so a cold
+/// install that eats the initialize budget cannot starve `session/new` of its
+/// own window. This is also the worst-case latency of a `forceRefresh`
+/// `models.list` against a hung npx adapter — an accepted trade-off for
+/// surviving cold installs.
+const NPX_OVERALL_TIMEOUT: Duration = Duration::from_secs(70);
+/// Per-request timeout for `session/new` for resolved binaries (FE: 8–10s).
 const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(10);
+/// `session/new` budget for npx-run adapters: claude-agent-acp boots the
+/// underlying CLI while creating the session, which alone takes ~10s even
+/// with a warm npx cache — a flat 10s budget times out right at the wire.
+const NPX_SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(20);
 /// Grace window to catch a late model notification after an empty
 /// `session/new` result.
 const NOTIFICATION_GRACE: Duration = Duration::from_secs(2);
@@ -33,6 +52,8 @@ pub(super) struct AcpProbeCommand {
     program: PathBuf,
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
+    /// npx-run probes get the longer cold-install timeout budget.
+    via_npx: bool,
 }
 
 impl AcpProbeCommand {
@@ -42,6 +63,7 @@ impl AcpProbeCommand {
             program: npx,
             args: vec!["-y".to_string(), package.to_string()],
             envs: Vec::new(),
+            via_npx: true,
         }
     }
 
@@ -51,6 +73,7 @@ impl AcpProbeCommand {
             program: bin,
             args,
             envs: Vec::new(),
+            via_npx: false,
         }
     }
 
@@ -63,6 +86,30 @@ impl AcpProbeCommand {
     #[cfg(test)]
     pub(super) fn env_vars(&self) -> &[(String, OsString)] {
         &self.envs
+    }
+
+    fn initialize_timeout(&self) -> Duration {
+        if self.via_npx {
+            NPX_INITIALIZE_TIMEOUT
+        } else {
+            INITIALIZE_TIMEOUT
+        }
+    }
+
+    fn session_new_timeout(&self) -> Duration {
+        if self.via_npx {
+            NPX_SESSION_NEW_TIMEOUT
+        } else {
+            SESSION_NEW_TIMEOUT
+        }
+    }
+
+    fn overall_timeout(&self) -> Duration {
+        if self.via_npx {
+            NPX_OVERALL_TIMEOUT
+        } else {
+            OVERALL_TIMEOUT
+        }
     }
 }
 
@@ -79,6 +126,10 @@ pub(super) enum ProbeError {
     Timeout,
     /// The handshake succeeded but no models were reported.
     Empty,
+    /// The adapter process exited unsuccessfully before reporting models
+    /// (e.g. a corrupt npx cache producing an ENOENT from node); carries the
+    /// exit status plus a bounded tail of recent stderr when available.
+    Exited(String),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -89,6 +140,9 @@ impl std::fmt::Display for ProbeError {
             ProbeError::Rpc(e) => write!(f, "adapter returned an error: {e}"),
             ProbeError::Timeout => write!(f, "model probe timed out"),
             ProbeError::Empty => write!(f, "no models reported"),
+            ProbeError::Exited(detail) => {
+                write!(f, "adapter exited before reporting models: {detail}")
+            }
         }
     }
 }
@@ -139,12 +193,92 @@ where
     };
     let conn = Connection::new(stdin, stdout, stderr, hooks);
 
-    let result = tokio::time::timeout(OVERALL_TIMEOUT, drive_probe(&conn, note_rx, extract))
-        .await
-        .unwrap_or(Err(ProbeError::Timeout));
+    let result = tokio::time::timeout(
+        cmd.overall_timeout(),
+        drive_probe(
+            &conn,
+            note_rx,
+            extract,
+            cmd.initialize_timeout(),
+            cmd.session_new_timeout(),
+        ),
+    )
+    .await
+    .unwrap_or(Err(ProbeError::Timeout));
 
+    let result = result.map_err(|err| attribute_early_exit(err, &mut child, &conn));
     reap_child(&mut child).await;
     result
+}
+
+/// Fold an early adapter exit into the probe error: when the child already
+/// exited before the probe could report models, delegate to
+/// [`exit_attribution`] with the observed exit status and recent stderr.
+fn attribute_early_exit(
+    err: ProbeError,
+    child: &mut tokio::process::Child,
+    conn: &Connection,
+) -> ProbeError {
+    let status = child.try_wait().ok().flatten();
+    exit_attribution(err, status, &conn.recent_stderr())
+}
+
+/// How many trailing stderr lines to include in an exit attribution. npm's
+/// final line is typically just "A complete log of this run can be found
+/// in: …" with the actual cause a few lines earlier, so a single line is
+/// not enough.
+const STDERR_TAIL_LINES: usize = 3;
+/// Character bound on the joined stderr tail (kept from the end).
+const STDERR_TAIL_MAX_CHARS: usize = 300;
+
+/// Decide whether a probe error should be re-attributed to a dead adapter
+/// (e.g. a corrupt `~/.npm/_npx` entry making node fail with ENOENT):
+/// unsuccessful exits carry their exit status plus a bounded tail of recent
+/// stderr instead of a generic transport/timeout/empty reason. Spawn and RPC
+/// errors pass through untouched (auth detection keys off `Rpc`), as do
+/// clean exits — an adapter that finishes the handshake, reports zero
+/// models, and exits 0 is genuinely "no models reported".
+pub(super) fn exit_attribution(
+    err: ProbeError,
+    status: Option<std::process::ExitStatus>,
+    stderr: &[String],
+) -> ProbeError {
+    if matches!(err, ProbeError::Spawn(_) | ProbeError::Rpc(_)) {
+        return err;
+    }
+    let Some(status) = status else {
+        return err;
+    };
+    if status.success() {
+        return err;
+    }
+    let tail = match stderr_tail(stderr) {
+        Some(t) => format!("; stderr: {t}"),
+        None => String::new(),
+    };
+    ProbeError::Exited(format!("{status}{tail}"))
+}
+
+/// Join the last [`STDERR_TAIL_LINES`] non-empty stderr lines, bounded to
+/// [`STDERR_TAIL_MAX_CHARS`] characters kept from the end.
+fn stderr_tail(stderr: &[String]) -> Option<String> {
+    let non_empty: Vec<&str> = stderr
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = non_empty.len().saturating_sub(STDERR_TAIL_LINES);
+    let joined = non_empty[start..].join(" | ");
+    if joined.is_empty() {
+        return None;
+    }
+    let count = joined.chars().count();
+    Some(
+        joined
+            .chars()
+            .skip(count.saturating_sub(STDERR_TAIL_MAX_CHARS))
+            .collect(),
+    )
 }
 
 /// Grace window between SIGTERM and SIGKILL when reaping the probe child
@@ -178,6 +312,8 @@ async fn drive_probe<F>(
     conn: &Connection,
     mut notifications: mpsc::UnboundedReceiver<intent_acp::IncomingNotification>,
     extract: F,
+    initialize_timeout: Duration,
+    session_new_timeout: Duration,
 ) -> Result<Vec<Value>, ProbeError>
 where
     F: Fn(&Value) -> Vec<Value>,
@@ -187,7 +323,7 @@ where
         "clientInfo": { "name": "Intent", "version": env!("CARGO_PKG_VERSION") },
         "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false } },
     });
-    conn.request_timeout("initialize", init_params, INITIALIZE_TIMEOUT)
+    conn.request_timeout("initialize", init_params, initialize_timeout)
         .await
         .map_err(map_acp_error)?;
 
@@ -200,7 +336,7 @@ where
     // Race the session/new response against model notifications: some
     // adapters publish the catalog via a session update before (or instead
     // of) including it in the session/new result.
-    let session_new = conn.request_timeout("session/new", session_params, SESSION_NEW_TIMEOUT);
+    let session_new = conn.request_timeout("session/new", session_params, session_new_timeout);
     tokio::pin!(session_new);
     let mut notifications_open = true;
     let session_result = loop {
@@ -255,6 +391,15 @@ fn is_model_update_method(method: &str) -> bool {
 
 fn map_acp_error(err: intent_acp::AcpError) -> ProbeError {
     match err {
+        // The transport synthesizes a code-0 "agent stdout closed" JSON-RPC
+        // error when the child's stdout closes with requests still pending.
+        // That is a transport failure, not an adapter response — keeping it
+        // out of `Rpc` lets exit attribution rewrite it (a crashed adapter
+        // is the main way stdout closes mid-probe) and keeps auth detection
+        // keyed to genuine adapter errors.
+        intent_acp::AcpError::Rpc(e) if e.code == 0 && e.message == "agent stdout closed" => {
+            ProbeError::Transport(e.message)
+        }
         intent_acp::AcpError::Rpc(e) => ProbeError::Rpc(e),
         other => ProbeError::Transport(other.to_string()),
     }
