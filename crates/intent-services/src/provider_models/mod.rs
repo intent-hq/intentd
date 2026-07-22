@@ -261,10 +261,14 @@ pub async fn fetch_opencode_models() -> ProviderModelsFetch {
 /// Run `opencode models` with a hard timeout, returning stdout on exit 0.
 /// On timeout the `output()` future is dropped, and `kill_on_drop` reaps the
 /// child so a wedged CLI does not leak past the failed probe. The timeout is
-/// injectable for tests; production passes [`OPENCODE_CLI_TIMEOUT`].
+/// injectable for tests; production passes [`OPENCODE_CLI_TIMEOUT`]. The
+/// child runs with the enhanced PATH (binary's parent dir prepended,
+/// matching the ACP probe spawns) so anything the opencode CLI shells out to
+/// resolves in a packaged-app (minimal PATH) environment.
 async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("models")
+        .env("PATH", intent_providers::enhanced_path(Some(&bin)))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
