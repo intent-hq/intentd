@@ -1,7 +1,7 @@
 //! WSS end-to-end host-services (AUDIT-P2-1 / -P2-4): drives the additive
 //! `host.*` detection methods — `host.findBinary`, `host.toolAvailability`,
 //! `host.env`, `host.findApp`, and `host.listInstalledEditors` — over a real
-//! pinned-TLS WebSocket against a live `intentd serve --listen both`. These
+//! pinned-TLS WebSocket against a live `intentd serve` (WSS listener enabled via config). These
 //! methods resolve binaries / PATH / environment / GUI apps on the daemon host
 //! so a remote client sees what actually lives where workspaces run; this
 //! suite proves the §5.14 wire contract end-to-end (HTTPS upgrade → JSON-RPC
@@ -63,10 +63,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -261,7 +262,7 @@ where
     }
 }
 
-/// Boot a daemon over `--listen both` and return the live handle + a pinned WSS
+/// Boot a daemon with the WSS listener enabled and return the live handle + a pinned WSS
 /// client config plus the bound TCP port (discovered via UDS `system.status`).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = temp_data_dir();

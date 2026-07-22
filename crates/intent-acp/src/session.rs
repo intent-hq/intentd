@@ -227,6 +227,26 @@ pub async fn set_session_model(
     Ok(())
 }
 
+/// `session/set_config_option` to change a session config option after
+/// establishment. Used for providers that expose the model as a
+/// `configOptions[id="model"]` select in the `session/new` result
+/// ([`ProviderConfig::supports_config_option_model`](intent_providers::ProviderConfig),
+/// claude-code today). The request shape is `{ sessionId, configId, value }` —
+/// verified live against claude-agent-acp@0.60.0 (2026-07-22), whose response
+/// echoes the updated `configOptions` list; the pinned `agent-client-protocol`
+/// schema has no typed request for it yet.
+pub async fn set_session_config_option(
+    conn: &Connection,
+    session_id: &str,
+    config_id: &str,
+    value: &str,
+) -> AcpResult<()> {
+    let params =
+        serde_json::json!({ "sessionId": session_id, "configId": config_id, "value": value });
+    conn.request("session/set_config_option", params).await?;
+    Ok(())
+}
+
 /// `session/cancel` to interrupt the current turn (fire-and-forget notification;
 /// the agent then resolves the in-flight `session/prompt` with
 /// `StopReason::Cancelled`). Hard-cancel/reap process-tree kill is

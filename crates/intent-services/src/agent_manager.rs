@@ -1019,18 +1019,12 @@ impl AgentManager {
         }
 
         // Reconstruct the spawn options with the generated config path injected.
-        let mut spawn_opts = SpawnOptions::new(opts.provider);
-        spawn_opts.model = opts.model;
-        spawn_opts.cwd = opts.cwd;
-        spawn_opts.rules_file = opts.rules_file.or(rules_file_path.as_deref());
-        spawn_opts.quiet = opts.quiet;
-        spawn_opts.provider_binary = opts.provider_binary;
-        spawn_opts.extra_env = opts.extra_env.clone();
-        spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
-        if let Some(ref p) = mcp_config_path {
-            spawn_opts.mcp_config_file = Some(p.as_str());
-        }
-        spawn_opts.env_mcp_config = env_mcp_config.as_deref();
+        let spawn_opts = rebuild_spawn_opts(
+            opts,
+            rules_file_path.as_deref(),
+            mcp_config_path.as_deref(),
+            env_mcp_config.as_deref(),
+        );
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
@@ -1386,8 +1380,9 @@ impl AgentManager {
             .collect();
 
         // The persisted model (bare part of a compound id) feeds the
-        // post-session `session/set_model` for providers with no CLI model
-        // flag (grok) — see `maybe_apply_session_model`.
+        // post-session model application for providers with no CLI model
+        // flag — `session/set_model` (grok) or `session/set_config_option`
+        // (claude-code) — see `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
         // The persisted id (if any) decides the no-resume branch: a brand-new
@@ -1521,51 +1516,78 @@ impl AgentManager {
         Ok(opened.session_id)
     }
 
-    /// Best-effort post-session `session/set_model` for providers whose ACP
-    /// subcommand has no CLI model flag (`supports_set_model`; grok today —
-    /// parity with the reference acp-provider, which applies the selected
-    /// model via `session/set_model` after session creation for such
-    /// providers). Compound ids are honored only when their provider prefix
-    /// matches the running provider (a stale id from a pre-spawn provider
-    /// switch must not be sent to grok); bare ids are treated as
-    /// provider-local. The `default` sentinel and empty ids are no-ops.
-    /// Failures are logged at WARN and never fail session startup.
+    /// Best-effort post-session model application, gated per provider
+    /// capability (parity with the reference acp-provider): `session/set_model`
+    /// for providers whose ACP subcommand has no CLI model flag
+    /// (`supports_set_model`; grok today), and
+    /// `session/set_config_option { configId: "model" }` for providers that
+    /// expose the model as a session config option
+    /// (`supports_config_option_model`; claude-code today). Compound ids are
+    /// honored only when their provider prefix matches the running provider (a
+    /// stale id from a pre-spawn provider switch must not be sent); bare ids
+    /// are treated as provider-local. The `default` sentinel and empty ids are
+    /// no-ops. Failures are logged at WARN and never fail session startup.
     async fn maybe_apply_session_model(
         conn: &Connection,
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
     ) {
-        let Some(model_id) = Self::set_model_target(provider, stored_model) else {
-            return;
-        };
-        match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
-            Ok(()) => {
-                tracing::debug!(
-                    provider = provider.id,
-                    session_id = acp_session_id,
-                    model = %model_id,
-                    "session/set_model accepted"
-                );
+        if let Some(model_id) = Self::set_model_target(provider, stored_model) {
+            match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        "session/set_model accepted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        error = %e,
+                        "session/set_model failed; provider keeps its default model"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    provider = provider.id,
-                    session_id = acp_session_id,
-                    model = %model_id,
-                    error = %e,
-                    "session/set_model failed; provider keeps its default model"
-                );
+        }
+        if let Some(model_id) = Self::config_option_model_target(provider, stored_model) {
+            match intent_acp::session::set_session_config_option(
+                conn,
+                acp_session_id,
+                "model",
+                model_id,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::debug!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        "session/set_config_option accepted"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = provider.id,
+                        session_id = acp_session_id,
+                        model = %model_id,
+                        error = %e,
+                        "session/set_config_option failed; provider keeps its default model"
+                    );
+                }
             }
         }
     }
 
-    /// Resolve the model id `maybe_apply_session_model` should send, or `None`
-    /// when no `session/set_model` should be issued: providers without
-    /// `supports_set_model`, absent/empty models, the `default` sentinel, and
-    /// compound ids whose provider prefix does not match the running provider
-    /// (a stale id from a pre-spawn provider switch must not be sent to grok).
-    /// Bare ids are treated as provider-local.
+    /// Resolve the model id `maybe_apply_session_model` should send via
+    /// `session/set_model`, or `None` when the call should not be issued:
+    /// providers without `supports_set_model`, or ids rejected by
+    /// [`Self::provider_local_model_target`].
     fn set_model_target<'m>(
         provider: &ProviderConfig,
         stored_model: Option<&'m str>,
@@ -1573,6 +1595,33 @@ impl AgentManager {
         if !provider.supports_set_model {
             return None;
         }
+        Self::provider_local_model_target(provider, stored_model)
+    }
+
+    /// Resolve the model id `maybe_apply_session_model` should send via
+    /// `session/set_config_option { configId: "model" }`, or `None` when the
+    /// call should not be issued: providers without
+    /// `supports_config_option_model`, or ids rejected by
+    /// [`Self::provider_local_model_target`].
+    fn config_option_model_target<'m>(
+        provider: &ProviderConfig,
+        stored_model: Option<&'m str>,
+    ) -> Option<&'m str> {
+        if !provider.supports_config_option_model {
+            return None;
+        }
+        Self::provider_local_model_target(provider, stored_model)
+    }
+
+    /// Shared gating for the post-session model-application paths: `None` for
+    /// absent/empty models, the `default` sentinel, and compound ids whose
+    /// provider prefix does not match the running provider (a stale id from a
+    /// pre-spawn provider switch must not be sent). Bare ids are treated as
+    /// provider-local; compound ids are stripped to their bare part.
+    fn provider_local_model_target<'m>(
+        provider: &ProviderConfig,
+        stored_model: Option<&'m str>,
+    ) -> Option<&'m str> {
         let model = stored_model?;
         let model_id = match model.split_once(':') {
             Some((prefix, bare)) if prefix == provider.id => bare,
@@ -3734,6 +3783,12 @@ fn resolve_spawn(
         // so the E2E suite can exercise the claude-code/codex/droid wire path
         // (STAB-156) against the real daemon.
         let session_mcp = std::env::var("MOCK_AGENT_SESSION_MCP").is_ok_and(|v| v == "1");
+        // `MOCK_AGENT_CONFIG_OPTION_MODEL=1` marks the mock as a
+        // config-option-model provider (claude-code-like), so the E2E suite
+        // can exercise the post-session `session/set_config_option` model
+        // application against the real daemon.
+        let config_option_model =
+            std::env::var("MOCK_AGENT_CONFIG_OPTION_MODEL").is_ok_and(|v| v == "1");
         let provider = ProviderConfig {
             command: "node",
             base_args,
@@ -3745,6 +3800,7 @@ fn resolve_spawn(
                 Some("--mcp-config")
             },
             supports_session_mcp_servers: session_mcp,
+            supports_config_option_model: config_option_model,
             ..*base
         };
         return Ok(ResolvedSpawn {
@@ -3854,6 +3910,33 @@ fn resolve_npx_only(
         "spawning npx-only provider via pinned npx package"
     );
     Ok((npx, pkg))
+}
+
+/// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
+/// generated rules/MCP config paths while preserving every other field of the
+/// incoming opts. Notably the npx fallback pair must survive: dropping it
+/// makes `build_command` fall back to the bare provider command and fail with
+/// ENOENT when no local provider binary exists (codex fallback / claude-code
+/// npx-only spawns).
+fn rebuild_spawn_opts<'a>(
+    opts: &SpawnOptions<'a>,
+    rules_file_path: Option<&'a str>,
+    mcp_config_path: Option<&'a str>,
+    env_mcp_config: Option<&'a str>,
+) -> SpawnOptions<'a> {
+    let mut spawn_opts = SpawnOptions::new(opts.provider);
+    spawn_opts.model = opts.model;
+    spawn_opts.cwd = opts.cwd;
+    spawn_opts.rules_file = opts.rules_file.or(rules_file_path);
+    spawn_opts.quiet = opts.quiet;
+    spawn_opts.provider_binary = opts.provider_binary;
+    spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
+    spawn_opts.npx_fallback_package = opts.npx_fallback_package;
+    spawn_opts.extra_env = opts.extra_env.clone();
+    spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
+    spawn_opts.mcp_config_file = mcp_config_path;
+    spawn_opts.env_mcp_config = env_mcp_config;
+    spawn_opts
 }
 
 /// Read the provider path from the `providers.paths` map setting, if set.
@@ -5002,6 +5085,51 @@ mod role_reminder_tests {
         );
     }
 
+    #[test]
+    fn config_option_model_target_gates_provider_sentinel_and_compound_prefix() {
+        let claude = intent_providers::find_provider("claude-code").unwrap();
+        let grok = intent_providers::find_provider("grok").unwrap();
+
+        // Providers without supports_config_option_model never produce a
+        // target (grok uses session/set_model instead) — and vice versa,
+        // claude-code never produces a session/set_model target.
+        assert_eq!(
+            AgentManager::config_option_model_target(grok, Some("sonnet")),
+            None
+        );
+        assert_eq!(AgentManager::set_model_target(claude, Some("sonnet")), None);
+        // Absent / empty / sentinel models are no-ops.
+        assert_eq!(AgentManager::config_option_model_target(claude, None), None);
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("default")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("claude-code:default")),
+            None
+        );
+        // Bare ids are provider-local.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("sonnet")),
+            Some("sonnet")
+        );
+        // Matching compound prefix strips to the bare id.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("claude-code:opus")),
+            Some("opus")
+        );
+        // A compound id for a DIFFERENT provider (stale pre-spawn provider
+        // switch) must not be sent to claude-code.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("grok:grok-4.5")),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn first_turn_prepend_skipped_when_no_system_prompt() {
         // Armed but the session has no persisted system_prompt (or blank) —
@@ -5046,6 +5174,76 @@ mod role_reminder_tests {
             text.starts_with("<system>\nSP\n</system>\n\nContext:\nctx\n\n---\n\n[Role Reminder:"),
             "unexpected ordering: {text:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rebuild_spawn_opts_tests {
+    //! Regression tests for the `create_agent` [`SpawnOptions`] reconstruction:
+    //! it must preserve the npx fallback pair, otherwise providers without a
+    //! local binary (codex fallback / claude-code npx-only) spawn the bare
+    //! provider command and fail with ENOENT.
+
+    use super::*;
+
+    #[test]
+    fn rebuild_preserves_npx_fallback_and_targets_npx() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
+        assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
+        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+
+        // Through build_command/build_args: the rebuilt opts must spawn npx
+        // with `-y <package>`, not the bare `codex-acp` command.
+        let cmd = intent_acp::spawn::build_command(&rebuilt);
+        assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
+        let args = intent_acp::spawn::build_args(&rebuilt);
+        assert_eq!(args[0], "-y");
+        assert_eq!(
+            args[1],
+            provider
+                .fallback_npx_package
+                .expect("codex has npx fallback")
+        );
+    }
+
+    #[test]
+    fn rebuild_injects_generated_paths_and_keeps_caller_fields() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let binary = PathBuf::from("/custom/codex-acp");
+        let cwd = PathBuf::from("/work/dir");
+        let mut opts = SpawnOptions::new(provider);
+        opts.model = Some("gpt-5");
+        opts.cwd = Some(&cwd);
+        opts.quiet = true;
+        opts.provider_binary = Some(&binary);
+        opts.extra_env = BTreeMap::from([("K".to_string(), "V".to_string())]);
+        opts.tools_to_remove = vec!["shell"];
+
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
+        assert_eq!(rebuilt.model, Some("gpt-5"));
+        assert_eq!(rebuilt.cwd, Some(cwd.as_path()));
+        assert!(rebuilt.quiet);
+        assert_eq!(rebuilt.provider_binary, Some(binary.as_path()));
+        assert_eq!(rebuilt.extra_env, opts.extra_env);
+        assert_eq!(rebuilt.tools_to_remove, vec!["shell"]);
+        assert_eq!(rebuilt.rules_file, Some("/tmp/rules.md"));
+        assert_eq!(rebuilt.mcp_config_file, Some("/tmp/mcp.json"));
+        assert_eq!(rebuilt.env_mcp_config, None);
+    }
+
+    #[test]
+    fn rebuild_prefers_caller_rules_file_over_generated() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.rules_file = Some("/caller/rules.md");
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/generated.md"), None, None);
+        assert_eq!(rebuilt.rules_file, Some("/caller/rules.md"));
     }
 }
 

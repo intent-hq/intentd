@@ -474,6 +474,41 @@ async function dispatch(msg) {
     case 'session/set_mode':
       // Accept any mode change request (no-op for the mock).
       return result(msg.id, {});
+    case 'session/set_config_option': {
+      // Post-session model application for config-option-model providers
+      // (claude-code-like). Record the exact wire params — one JSON line per
+      // call ({ sessionId, configId, value }) — when MOCK_AGENT_CONFIG_LOG
+      // points at a file, so e2e tests can assert the daemon issued the call
+      // with the stored model exactly once per fresh session. The real
+      // adapter's response echoes the updated configOptions list; the daemon
+      // only checks for success, so a minimal echo suffices.
+      const configLog = process.env.MOCK_AGENT_CONFIG_LOG;
+      if (configLog) {
+        try {
+          fs.appendFileSync(configLog, JSON.stringify(msg.params || {}) + '\n');
+        } catch (err) {
+          log(`config log write failed: ${err.message}`);
+        }
+      }
+      // Deterministic failure mode: reject the call (invalid params, e.g. an
+      // unknown model id) so tests can assert the daemon logs a warning and
+      // the turn still completes on the provider's default model.
+      if (behavior.rejectSetConfigOption) {
+        return send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32602, message: 'unknown config value' },
+        });
+      }
+      return result(msg.id, {
+        configOptions: [
+          {
+            id: msg.params && msg.params.configId,
+            currentValue: msg.params && msg.params.value,
+          },
+        ],
+      });
+    }
     case 'session/prompt':
       return handlePrompt(msg.id, msg.params);
     case 'session/cancel':
