@@ -118,8 +118,10 @@ async fn uds_oversized_line_rejected_and_connection_closed() {
     let stream = UnixStream::connect(&socket).await.expect("connect");
     let (read_half, mut write_half) = stream.into_split();
     let payload = vec![b'a'; MAX_INBOUND_MESSAGE_BYTES + 1024];
-    write_half.write_all(&payload).await.expect("write payload");
-    // The daemon stops reading once the limit is hit; late writes may fail.
+    // The daemon stops reading (and closes) once the limit is hit, so any of
+    // these writes may fail mid-payload with EPIPE/ECONNRESET — that's fine,
+    // the assertion is on the error frame the daemon sent first.
+    let _ = write_half.write_all(&payload).await;
     let _ = write_half.write_all(b"\n").await;
     let _ = write_half.flush().await;
     let mut reader = BufReader::new(read_half);
