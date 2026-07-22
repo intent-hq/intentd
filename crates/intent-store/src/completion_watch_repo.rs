@@ -31,7 +31,10 @@ pub struct PersistedCompletionWatch {
 }
 
 impl Store {
-    /// Insert or replace a completion_watch row (upsert).
+    /// Insert a completion_watch row, or update its mutable columns on id
+    /// conflict (parent anchor/name, one_shot, group_id, report_delivered,
+    /// deadline). The identity columns — child ids/workspace and created_at
+    /// — are fixed at registration and intentionally not overwritten.
     pub async fn upsert_completion_watch(&self, w: &PersistedCompletionWatch) -> Result<()> {
         sqlx::query(
             "INSERT INTO completion_watch (

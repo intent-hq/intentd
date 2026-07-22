@@ -3395,11 +3395,18 @@ impl Services {
         // gate): a rejection is side-effect free — no group, no watches.
         let mut resolved: Vec<(AgentId, String, WorkspaceId)> = Vec::with_capacity(targets.len());
         for target in targets {
+            // Only NotFound maps to a client-facing InvalidParams; internal
+            // store failures propagate unchanged.
             let session = self
                 .store
                 .get_agent_session(&target)
                 .await
-                .map_err(|_| Error::InvalidParams(format!("unknown agent id: {}", target.0)))?;
+                .map_err(|e| match e {
+                    Error::NotFound(_) => {
+                        Error::InvalidParams(format!("unknown agent id: {}", target.0))
+                    }
+                    other => other,
+                })?;
             if session.status == AgentStatus::Deleted {
                 return Err(Error::InvalidParams(format!(
                     "agent {} is deleted",
