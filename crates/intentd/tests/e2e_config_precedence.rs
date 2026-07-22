@@ -158,24 +158,24 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     assert!(ok_update.get("error").is_none(), "{ok_update}");
 }
 
-/// `serve` no longer pins `server.listenMode` (the `--listen` flag is
-/// retired): a file-set value reads back with origin `file`, and the live
-/// `system.status` `listenMode` is derived from the actual listener state
-/// (UDS-only boot ⇒ `uds`) regardless of the file value.
+/// `server.listenMode` is retired as a settings key: a config.toml still
+/// carrying it must NOT refuse startup — the daemon boots, DISCARDS the value
+/// (no catalog entry remains, so `settings.get` rejects the path), strips the
+/// key from the file, and the live `system.status` `listenMode` stays derived
+/// from the actual listener state (UDS-only boot ⇒ `uds`) regardless of the
+/// legacy file value.
 #[tokio::test]
-async fn listen_mode_is_unpinned_and_status_reports_derived_mode() {
+async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
     let data_dir = temp_data_dir();
-    std::fs::write(
-        data_dir.join("config.toml"),
-        "[server]\nlistenMode = \"both\"\n",
-    )
-    .expect("seed config.toml");
+    let config_path = data_dir.join("config.toml");
+    std::fs::write(&config_path, "[server]\nlistenMode = \"both\"\n").expect("seed config.toml");
 
     let child = spawn_serve(&data_dir, &[]);
     let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
+    // The retired key has no catalog entry: settings.get rejects the path.
     let get = uds_rpc(
         &socket,
         1,
@@ -183,15 +183,28 @@ async fn listen_mode_is_unpinned_and_status_reports_derived_mode() {
         json!({ "path": "server.listenMode" }),
     )
     .await;
-    assert_eq!(
-        get["result"]["value"],
-        json!("both"),
-        "file value effective (no CLI pin): {get}"
+    assert_eq!(get["error"]["code"], json!(-32602), "{get}");
+
+    // …and so does settings.update — the key is gone from the wire surface.
+    let update = uds_rpc(
+        &socket,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.listenMode", "value": "uds" }] }),
+    )
+    .await;
+    assert_eq!(update["error"]["code"], json!(-32602), "{update}");
+
+    // The legacy key was stripped from the file on boot.
+    let rewritten = std::fs::read_to_string(&config_path).expect("config.toml readable");
+    assert!(
+        !rewritten.contains("listenMode"),
+        "legacy key stripped: {rewritten}"
     );
-    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
 
     // system.status listenMode is derived from live listener state, not the
-    // setting: no WSS listener is up (server.wsApi.enabled=false), so `uds`.
+    // legacy value: no WSS listener is up (server.wsApi.enabled=false), so
+    // `uds`.
     let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
     assert_eq!(status["result"]["listenMode"], json!("uds"), "{status}");
 }

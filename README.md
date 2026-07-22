@@ -124,7 +124,7 @@ systemctl --user enable --now intentd
 cargo build --workspace
 
 # 2. Start the daemon (UDS) in one shell
-cargo run -p intentd -- serve --listen uds
+cargo run -p intentd -- serve
 #   intentd listening on UDS path=~/Library/Application Support/intentd/intentd.sock
 
 # 3. In another shell, make a JSON-RPC call
