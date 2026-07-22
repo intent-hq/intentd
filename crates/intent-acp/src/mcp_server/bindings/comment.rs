@@ -62,6 +62,7 @@ async fn add(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Res
     }
     let kind = opt_str(args, "type");
     let author = opt_str(args, "author");
+    let author_type = opt_str(args, "authorType");
     let r = api
         .comment_add(
             ws.clone(),
@@ -71,6 +72,7 @@ async fn add(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, args: &Value) -> Res
             comment,
             kind,
             author,
+            author_type,
             opt_str(args, "idempotencyKey")
                 .filter(|k| !k.trim().is_empty())
                 .or_else(|| Some(uuid::Uuid::new_v4().to_string())),

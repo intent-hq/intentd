@@ -1903,6 +1903,9 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
     ///
+    /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);
+    /// it defaults to `agent` for backward compatibility with agent/MCP callers.
+    ///
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
     /// §5): when present and previously recorded, the original result is returned
     /// without re-executing; soft-launch when absent (warn + execute).
@@ -1916,6 +1919,7 @@ pub trait WorkspaceApi: Send + Sync {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        author_type: Option<String>,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let _ = (
@@ -1926,6 +1930,7 @@ pub trait WorkspaceApi: Send + Sync {
             comment,
             kind,
             author,
+            author_type,
             idempotency_key,
         );
         Box::pin(async {

@@ -4,7 +4,9 @@
 //! `edit`, 1-based inclusive `editLines`, the `setContent` cleaner, checkbox
 //! task parsing, and asset-id parsing. User-facing failures surface as
 //! [`Error::Internal`] so the router maps them to `-32603` with the original
-//! message in `data`, matching the TS handler.
+//! message in `data`, matching the TS handler — except comment anchoring
+//! failures, which are [`Error::InvalidParams`] (`-32602`) so clients see the
+//! actionable message directly.
 
 use intent_core::{Error, NoteTaskRow, Result};
 
@@ -538,41 +540,208 @@ fn line_of(content: &str, idx: usize) -> usize {
 }
 
 /// `findAndAnchorText` — locate `comment_target` inside a unique `search_context`
-/// occurrence. Returns `(from_byte, to_byte, line)`; errors carry the same
-/// user-facing messages the TS handler throws (surfaced as `-32603` `data`).
+/// occurrence. Returns `(from_byte, to_byte, line)`; failures are
+/// [`Error::InvalidParams`] so the router surfaces the descriptive message as
+/// `-32602` instead of an opaque `-32603 "Internal error"`.
+///
+/// When the exact substring search finds no occurrence, a plaintext-tolerant
+/// fallback retries against a markdown-stripped projection of the note (see
+/// [`plaintext_projection`]): editor clients derive anchors from the rendered
+/// document's *plain text*, which drops markdown syntax and joins blocks with
+/// no separator.
 pub fn find_and_anchor_text(
     content: &str,
     search_context: &str,
     comment_target: &str,
 ) -> Result<(usize, usize, usize)> {
     let ctx = find_all_occurrences(content, search_context);
-    if ctx.is_empty() {
-        return Err(Error::Internal(
-            "Could not find the search context in the document.".to_string(),
-        ));
-    }
     if ctx.len() > 1 {
-        return Err(Error::Internal(
+        return Err(Error::InvalidParams(
             "The search context appears multiple times in the document.".to_string(),
         ));
+    }
+    if ctx.is_empty() {
+        let (from, to) = plaintext_fallback_anchor(content, search_context, comment_target)?;
+        return Ok((from, to, line_of(content, from)));
     }
     let ctx_from = ctx[0];
     let rel = match search_context.find(comment_target) {
         Some(r) => r,
         None => {
-            return Err(Error::Internal(
+            return Err(Error::InvalidParams(
                 "The comment target was not found within the search context.".to_string(),
             ))
         }
     };
     if count_occurrences(search_context, comment_target) > 1 {
-        return Err(Error::Internal(
+        return Err(Error::InvalidParams(
             "The comment target appears multiple times within the search context.".to_string(),
         ));
     }
     let from = ctx_from + rel;
     let to = from + comment_target.len();
     Ok((from, to, line_of(content, from)))
+}
+
+/// A plaintext rendering of a note's markdown plus a per-byte map back to the
+/// source: `map[i]` is the starting byte offset in the markdown of the
+/// character that produced byte `i` of `text` (multi-byte characters repeat
+/// the same start; the end boundary is recomputed from the source on demand).
+struct PlaintextProjection {
+    text: String,
+    map: Vec<usize>,
+}
+
+/// Characters dropped from BOTH the markdown projection and the search
+/// needles: whitespace (block joins and newline/space differences become
+/// flexible) plus inline emphasis/code delimiters and link brackets. Dropping
+/// them symmetrically keeps literal `*`/`_`/brackets in prose matching.
+fn is_normalized_away(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '*' | '_' | '`' | '~' | '[' | ']')
+}
+
+/// Normalize a client-supplied needle (searchContext / commentTarget) for the
+/// plaintext fallback search.
+fn normalize_needle(s: &str) -> String {
+    s.chars().filter(|c| !is_normalized_away(*c)).collect()
+}
+
+/// Byte length of a leading list marker (`- `, `* `, `+ `, `1. `, `1) `) on a
+/// line, if present.
+fn list_marker_len(line: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    match b.first()? {
+        b'-' | b'*' | b'+' => (b.get(1) == Some(&b' ')).then_some(2),
+        b'0'..=b'9' => {
+            let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
+            (matches!(b.get(digits), Some(b'.') | Some(b')')) && b.get(digits + 1) == Some(&b' '))
+                .then_some(digits + 2)
+        }
+        _ => None,
+    }
+}
+
+/// Build the plaintext projection: strip HTML comments (including
+/// `<!--anchor:…-->` markers from existing comments), leading heading /
+/// list / blockquote markers, and every [`is_normalized_away`] character,
+/// keeping link text while dropping the `(url)` part.
+fn plaintext_projection(md: &str) -> PlaintextProjection {
+    let mut text = String::with_capacity(md.len());
+    let mut map = Vec::with_capacity(md.len());
+    let mut i = 0;
+    let mut at_line_start = true;
+    while i < md.len() {
+        let rest = &md[i..];
+        if rest.starts_with("<!--") {
+            if let Some(close) = rest.find("-->") {
+                i += close + 3;
+                continue;
+            }
+        }
+        if at_line_start {
+            at_line_start = false;
+            let line_end = rest.find('\n').map_or(md.len(), |p| i + p);
+            let line = &md[i..line_end];
+            let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+            let body = &line[indent..];
+            let hashes = body.bytes().take_while(|b| *b == b'#').count();
+            let skip = if (1..=6).contains(&hashes)
+                && matches!(body.as_bytes().get(hashes), Some(b' ') | Some(b'\t'))
+            {
+                hashes + 1
+            } else if body.starts_with("> ") {
+                2
+            } else {
+                list_marker_len(body).unwrap_or(0)
+            };
+            i += indent + skip;
+            continue;
+        }
+        let ch = rest.chars().next().expect("in-bounds char");
+        let clen = ch.len_utf8();
+        if ch == '\n' {
+            at_line_start = true;
+            i += clen;
+            continue;
+        }
+        if is_normalized_away(ch) {
+            // Link target: drop the `(url)` immediately following a `]`.
+            if ch == ']' {
+                let after = &md[i + 1..];
+                if after.starts_with('(') {
+                    if let Some(close) = after.find(')') {
+                        i += 1 + close + 1;
+                        continue;
+                    }
+                }
+            }
+            i += clen;
+            continue;
+        }
+        text.push(ch);
+        for _ in 0..clen {
+            map.push(i);
+        }
+        i += clen;
+    }
+    PlaintextProjection { text, map }
+}
+
+/// Fallback anchor search over the plaintext projection. Applies the same
+/// uniqueness rules as the exact path and maps the unique match back to
+/// markdown byte offsets.
+fn plaintext_fallback_anchor(
+    content: &str,
+    search_context: &str,
+    comment_target: &str,
+) -> Result<(usize, usize)> {
+    let not_found =
+        || Error::InvalidParams("Could not find the search context in the document.".to_string());
+    let needle_ctx = normalize_needle(search_context);
+    if needle_ctx.is_empty() {
+        return Err(not_found());
+    }
+    let proj = plaintext_projection(content);
+    let ctx = find_all_occurrences(&proj.text, &needle_ctx);
+    if ctx.is_empty() {
+        return Err(not_found());
+    }
+    if ctx.len() > 1 {
+        return Err(Error::InvalidParams(
+            "The search context appears multiple times in the document.".to_string(),
+        ));
+    }
+    let needle_tgt = normalize_needle(comment_target);
+    if needle_tgt.is_empty() || !needle_ctx.contains(&needle_tgt) {
+        return Err(Error::InvalidParams(
+            "The comment target was not found within the search context.".to_string(),
+        ));
+    }
+    if count_occurrences(&needle_ctx, &needle_tgt) > 1 {
+        return Err(Error::InvalidParams(
+            "The comment target appears multiple times within the search context.".to_string(),
+        ));
+    }
+    let rel = needle_ctx.find(&needle_tgt).expect("checked above");
+    let pos = ctx[0] + rel;
+    let from = proj.map[pos];
+    let last_start = proj.map[pos + needle_tgt.len() - 1];
+    let last_len = content[last_start..]
+        .chars()
+        .next()
+        .expect("mapped offset is a char boundary")
+        .len_utf8();
+    let to = last_start + last_len;
+    // A projected match can span an existing `<!--anchor:…-->` marker (the
+    // projection strips them); embedding new markers around such a span would
+    // interleave with the existing pair and replay raw marker text into the
+    // note. Reject instead of producing a corrupt anchor.
+    if content[from..to].contains("<!--anchor:") {
+        return Err(Error::InvalidParams(
+            "The comment target overlaps an existing comment anchor.".to_string(),
+        ));
+    }
+    Ok((from, to))
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,6 +1501,102 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("appears multiple times within the search context"));
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_strips_formatting() {
+        // The FE derives the anchor from the tiptap document's *plain text*:
+        // heading markers, bold delimiters, and link syntax are absent from
+        // the needle even though the markdown source carries them.
+        let content = "## Project Title\n\nThis has **bold text** and a [link label](https://example.com) inline.";
+        let (from, to, line) = find_and_anchor_text(
+            content,
+            "This has bold text and a link label inline.",
+            "bold text",
+        )
+        .unwrap();
+        assert_eq!(&content[from..to], "bold text");
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_crosses_block_boundary() {
+        // tiptap `textBetween` joins blocks with no separator, so the plain
+        // text has no `\n\n` where the markdown does.
+        let content = "First paragraph ends here.\n\nSecond paragraph starts now.";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "ends here.Second paragraph", "here.Second").unwrap();
+        assert_eq!(&content[from..to], "here.\n\nSecond");
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_heading_and_list_markers() {
+        let content = "# Title\n\n- first item\n- second item\n";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "Titlefirst itemsecond item", "second item").unwrap();
+        assert_eq!(&content[from..to], "second item");
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_ignores_anchor_markers() {
+        // Existing comments embed `<!--anchor:…-->` markers into the note
+        // markdown; the editor's plain text never contains them.
+        let content = "alpha <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma delta";
+        let (from, to, _line) = find_and_anchor_text(content, "beta gamma delta", "gamma").unwrap();
+        assert_eq!(&content[from..to], "gamma");
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_rejects_span_over_existing_marker() {
+        // A target whose mapped source range would swallow an existing anchor
+        // marker must be rejected: embedding new markers there would
+        // interleave the pairs and replay raw marker text into the note.
+        let content = "alpha <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma delta";
+        let err = find_and_anchor_text(content, "beta gamma delta", "beta gamma").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("overlaps an existing comment anchor")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_multibyte_target_boundaries() {
+        // Multi-byte characters at the end of the target: the mapped `to`
+        // must land on the char's end boundary, not mid-codepoint.
+        let content = "# Título\n\nUne **phrase où ça** finit là";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "TítuloUne phrase où ça finit là", "où ça").unwrap();
+        assert_eq!(&content[from..to], "où ça");
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_preserves_ambiguity_rules() {
+        let content = "**dup** text\n\n**dup** text";
+        let err = find_and_anchor_text(content, "dup text", "dup").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times in the document")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_failures_are_invalid_params() {
+        assert!(matches!(
+            find_and_anchor_text("abc", "zzz", "z").unwrap_err(),
+            Error::InvalidParams(_)
+        ));
+        assert!(matches!(
+            find_and_anchor_text("repeat repeat", "repeat", "repeat").unwrap_err(),
+            Error::InvalidParams(_)
+        ));
+        assert!(matches!(
+            find_and_anchor_text("quick brown", "quick brown", "zzz").unwrap_err(),
+            Error::InvalidParams(_)
+        ));
+        assert!(matches!(
+            find_and_anchor_text("x ab ab y tail", "ab ab y tail", "ab").unwrap_err(),
+            Error::InvalidParams(_)
+        ));
     }
 
     #[test]

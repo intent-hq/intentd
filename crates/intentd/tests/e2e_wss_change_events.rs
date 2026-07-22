@@ -209,6 +209,22 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let v = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
+}
+
+/// Like [`wss_rpc`] but returns the full response envelope so tests can
+/// assert `error.code` / `error.message` for expected-failure paths.
+async fn wss_rpc_envelope<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string()))
         .await
@@ -221,8 +237,7 @@ where
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["id"] == json!(id) {
-                    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                    return v["result"].clone();
+                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -1260,4 +1275,238 @@ async fn note_list_adopts_stray_spec_note_over_wss() {
         drain_extra(&mut sub, "note:created", 400).await.is_none(),
         "adoption must not republish note:created on re-list"
     );
+}
+
+/// End-to-end: `comment.add` whose `searchContext`/`commentTarget` come from
+/// the editor's *plain text* (markdown syntax stripped, blocks joined with no
+/// separator — the FE's `doc.textBetween` shape) anchors successfully against
+/// the formatted markdown source via the plaintext-tolerant fallback.
+#[tokio::test]
+async fn comment_add_plaintext_context_anchors_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "PlainAnchors", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Note",
+            "content": "## Heading\n\nSome **bold words** in a [link](https://example.com) here.",
+        }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            // Plain text of the doc: heading joined to the paragraph with no
+            // separator, bold/link markdown stripped.
+            "searchContext": "HeadingSome bold words in a link here.",
+            "commentTarget": "bold words",
+            "comment": "needs review",
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], json!(true));
+    assert_eq!(add["anchored"], json!(true));
+    assert_eq!(add["location"]["anchoredText"], json!("bold words"));
+    let comment_id = add["commentId"].as_str().expect("comment id").to_string();
+
+    // The anchor markers landed around the markdown-source text.
+    let read = wss_rpc(
+        &mut rpc,
+        2,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = read["note"]["content"].as_str().expect("content");
+    assert!(
+        content.contains(&format!(
+            "<!--anchor:{comment_id}:start-->bold words<!--anchor:{comment_id}:end-->"
+        )),
+        "anchor markers missing: {content}"
+    );
+}
+
+/// End-to-end: a `comment.add` whose context cannot be found returns the
+/// actionable `-32602` error with the descriptive message (not an opaque
+/// `-32603 "Internal error"`).
+#[tokio::test]
+async fn comment_add_context_not_found_returns_invalid_params_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "AnchorErrors", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "some note content" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let v = wss_rpc_envelope(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "totally absent context",
+            "commentTarget": "absent",
+            "comment": "c",
+        }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "envelope: {v}");
+    assert_eq!(
+        v["error"]["message"],
+        json!("invalid params: Could not find the search context in the document."),
+        "envelope: {v}"
+    );
+}
+
+/// End-to-end: `comment.add` with `authorType: "user"` persists the author
+/// type and round-trips it through `comment.list`; omitting the param keeps
+/// the backward-compatible `agent` default.
+#[tokio::test]
+async fn comment_add_author_type_round_trips_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "AuthorType", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "alpha target-a and target-b omega" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let user_add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "alpha target-a and",
+            "commentTarget": "target-a",
+            "comment": "from the user",
+            "authorType": "user",
+        }),
+    )
+    .await;
+    let user_comment_id = user_add["commentId"].as_str().expect("id").to_string();
+
+    let agent_add = wss_rpc(
+        &mut rpc,
+        2,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "and target-b omega",
+            "commentTarget": "target-b",
+            "comment": "from an agent",
+        }),
+    )
+    .await;
+    let agent_comment_id = agent_add["commentId"].as_str().expect("id").to_string();
+
+    let list = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "includeComments": true }),
+    )
+    .await;
+    let comments: Vec<Value> = list["threads"]
+        .as_array()
+        .expect("threads")
+        .iter()
+        .flat_map(|t| t["comments"].as_array().cloned().unwrap_or_default())
+        .collect();
+    let by_id = |id: &str| {
+        comments
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap_or_else(|| panic!("comment {id} missing: {list}"))
+    };
+    let user_comment = by_id(&user_comment_id);
+    assert_eq!(user_comment["authorType"], json!("user"), "{user_comment}");
+    assert_eq!(user_comment["author"], json!("User"), "{user_comment}");
+    let agent_comment = by_id(&agent_comment_id);
+    assert_eq!(
+        agent_comment["authorType"],
+        json!("agent"),
+        "{agent_comment}"
+    );
+
+    // Invalid authorType is rejected with -32602.
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "alpha target-a and",
+            "commentTarget": "target-a",
+            "comment": "c",
+            "authorType": "robot",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
 }

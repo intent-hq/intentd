@@ -267,6 +267,7 @@ async fn comment_add_anchors_to_text() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add comment");
@@ -310,6 +311,7 @@ async fn comment_list_returns_threads() {
             "Content for commenting".to_string(),
             "Content".to_string(),
             "Test comment".to_string(),
+            None,
             None,
             None,
             None,
@@ -359,6 +361,7 @@ async fn comment_respond_adds_reply_to_thread() {
             "Reply test content".to_string(),
             "test content".to_string(),
             "Original comment".to_string(),
+            None,
             None,
             None,
             None,
