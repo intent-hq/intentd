@@ -587,7 +587,8 @@ mod reap_tests {
 
         // Prove the grandchild actually escaped the probe's process group —
         // otherwise killpg would reach it and the test would be vacuous.
-        let child_pgid = Pid::from_raw(child.id().expect("child pid") as i32);
+        let child_pgid = getpgid(Some(Pid::from_raw(child.id().expect("child pid") as i32)))
+            .expect("child pgid");
         let grandchild_pgid =
             getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
         assert_ne!(
