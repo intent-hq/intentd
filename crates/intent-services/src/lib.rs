@@ -14897,10 +14897,11 @@ impl WorkspaceApi for Services {
         agent_id: AgentId,
         client_id: ClientId,
         text: String,
+        attachments: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         let svc = self.clone();
         Box::pin(async move {
-            svc.drafts_set(workspace_id, agent_id, client_id, text)
+            svc.drafts_set(workspace_id, agent_id, client_id, text, attachments)
                 .await
         })
     }

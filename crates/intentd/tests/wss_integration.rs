@@ -337,7 +337,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
         vec![
             r#"{"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"cli-wss","name":"WSS"}}"#.to_string(),
             format!(
-                r#"{{"jsonrpc":"2.0","id":3,"method":"drafts.set","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss","text":"wss draft"}}}}"#
+                r#"{{"jsonrpc":"2.0","id":3,"method":"drafts.set","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss","text":"wss draft","attachments":[{{"type":"image","imageData":"aGk=","imageMimeType":"image/png"}}]}}}}"#
             ),
             format!(
                 r#"{{"jsonrpc":"2.0","id":4,"method":"drafts.get","params":{{"workspaceId":"{ws_id}","agentId":"agent-wss"}}}}"#
@@ -357,6 +357,11 @@ async fn wss_client_hello_and_drafts_round_trip() {
     assert_eq!(sess[1]["result"]["ok"], true);
     assert!(sess[1]["result"]["updatedAt"].is_string());
     assert_eq!(sess[2]["result"]["text"], "wss draft");
+    assert_eq!(
+        sess[2]["result"]["attachments"],
+        serde_json::json!([{ "type": "image", "imageData": "aGk=", "imageMimeType": "image/png" }]),
+        "attachments round-trip verbatim (§5.16)"
+    );
 
     // Reconnect with the same clientId restores the persisted draft.
     let sess = wss_session(
@@ -373,6 +378,10 @@ async fn wss_client_hello_and_drafts_round_trip() {
     assert_eq!(
         sess[1]["result"]["text"], "wss draft",
         "reconnect restores the draft"
+    );
+    assert_eq!(
+        sess[1]["result"]["attachments"][0]["imageData"], "aGk=",
+        "reconnect restores the attachments"
     );
     srv.ws.stop().await;
 }

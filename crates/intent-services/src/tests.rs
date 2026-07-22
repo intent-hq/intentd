@@ -4725,6 +4725,7 @@ mod drafts_events {
                 agent.clone(),
                 client.clone(),
                 secret.to_string(),
+                None,
             )
             .await
             .expect("set draft");
@@ -4766,6 +4767,113 @@ mod drafts_events {
             .expect("draft:changed fired on clear");
         assert_eq!(ev.data["hasDraft"], json!(false));
         assert!(ev.data.get("text").is_none());
+    }
+
+    /// Attachments round-trip through the real SQLite store (additive
+    /// `attachments` column, §5.16): stored verbatim, empty-text-with-
+    /// attachments persists, empty-text-no-attachments clears, and the
+    /// `draft:changed` payload never carries attachment content.
+    #[tokio::test]
+    async fn draft_attachments_round_trip_through_store() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let client = ClientId::from_string("cli-attach");
+        store
+            .upsert_client(&client, None, None)
+            .await
+            .expect("client");
+        let agent = AgentId::from_string("agent-1");
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let attachments =
+            json!([{ "type": "image", "imageData": "aGVsbG8=", "imageMimeType": "image/png" }]);
+        // Empty text WITH attachments persists the row.
+        let updated = services
+            .drafts_set(
+                ws.clone(),
+                agent.clone(),
+                client.clone(),
+                String::new(),
+                Some(attachments.clone()),
+            )
+            .await
+            .expect("set draft");
+        assert!(updated.is_some(), "empty text with attachments persists");
+
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = batch
+            .iter()
+            .find(|e| e.event_type == DRAFT_CHANGED)
+            .expect("draft:changed fired");
+        assert_eq!(ev.data["hasDraft"], json!(true));
+        assert!(
+            ev.data.get("attachments").is_none(),
+            "draft:changed must NOT carry attachments"
+        );
+        assert!(
+            !serde_json::to_string(&ev.data).unwrap().contains("aGVsbG8"),
+            "attachment content never appears in the event payload"
+        );
+
+        let draft = services
+            .drafts_get(ws.clone(), agent.clone(), client.clone())
+            .await
+            .expect("get draft")
+            .expect("draft stored");
+        assert_eq!(draft.text, "");
+        assert_eq!(
+            draft.attachments,
+            Some(attachments),
+            "attachments round-trip verbatim through SQLite"
+        );
+
+        // A text-only overwrite drops the attachments.
+        services
+            .drafts_set(
+                ws.clone(),
+                agent.clone(),
+                client.clone(),
+                "text only".to_string(),
+                None,
+            )
+            .await
+            .expect("overwrite draft");
+        let draft = services
+            .drafts_get(ws.clone(), agent.clone(), client.clone())
+            .await
+            .expect("get draft")
+            .expect("draft stored");
+        assert_eq!(draft.text, "text only");
+        assert_eq!(draft.attachments, None);
+
+        // Empty text and no attachments is still a clear.
+        let updated = services
+            .drafts_set(
+                ws.clone(),
+                agent.clone(),
+                client.clone(),
+                String::new(),
+                None,
+            )
+            .await
+            .expect("clear draft");
+        assert!(updated.is_none(), "empty text with no attachments clears");
+        assert!(services
+            .drafts_get(ws.clone(), agent.clone(), client.clone())
+            .await
+            .expect("get draft")
+            .is_none());
     }
 }
 
