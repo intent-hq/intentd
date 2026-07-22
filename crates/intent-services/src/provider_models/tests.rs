@@ -7,7 +7,7 @@ use super::finish;
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
-use super::probe::ProbeError;
+use super::probe::{exit_attribution, ProbeError};
 
 #[test]
 fn parse_acp_models_from_session_new_result() {
@@ -193,6 +193,52 @@ fn parse_config_options_without_model_entry_yields_no_rows() {
         "configOptions": [ { "id": "model", "options": [] } ]
     });
     assert!(parse_acp_models(&empty_options, "claude-code").is_empty());
+}
+
+#[test]
+fn parse_config_options_id_match_wins_over_category() {
+    // When one option matches by id and a different one by category, the id
+    // match takes precedence.
+    let payload = json!({
+        "configOptions": [
+            { "category": "model", "options": [ { "value": "by-category", "name": "C" } ] },
+            { "id": "model", "options": [ { "value": "by-id", "name": "I" } ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "by-id");
+}
+
+#[test]
+fn parse_config_options_id_without_options_falls_back_to_category_sibling() {
+    // An id == "model" entry without a usable options array must not abort
+    // the extraction; a category == "model" sibling with options still wins.
+    let payload = json!({
+        "configOptions": [
+            { "id": "model" },
+            { "id": "primary", "category": "model",
+              "options": [ { "value": "m1", "name": "M1" } ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "m1");
+}
+
+#[test]
+fn parse_empty_available_models_still_reads_config_options() {
+    // A transitional adapter emitting an empty availableModels alongside a
+    // populated configOptions catalog must not short-circuit to zero models.
+    let payload = json!({
+        "models": { "availableModels": [] },
+        "configOptions": [
+            { "id": "model", "options": [ { "value": "sonnet", "name": "Sonnet" } ] }
+        ]
+    });
+    let rows = parse_acp_models(&payload, "claude-code");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "sonnet");
 }
 
 #[test]
@@ -423,6 +469,95 @@ fn early_adapter_exit_is_surfaced_in_warning() {
     let warning = fetch.warning.expect("warning present");
     assert!(warning.starts_with("codex: adapter exited before reporting models"));
     assert!(warning.contains("enoent"));
+}
+
+#[cfg(unix)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_attribution_rewrites_generic_errors_on_unsuccessful_exit() {
+    let err = exit_attribution(
+        ProbeError::Timeout,
+        Some(exit_status(1)),
+        &[
+            "npm error enoent ENOENT: no such file or directory".to_string(),
+            "npm error A complete log of this run can be found in: /tmp/log".to_string(),
+        ],
+    );
+    let ProbeError::Exited(detail) = err else {
+        panic!("expected Exited, got {err}");
+    };
+    // The tail must include the actual cause, not just npm's final log-path line.
+    assert!(detail.contains("ENOENT"), "detail: {detail}");
+    assert!(detail.contains("complete log"), "detail: {detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn exit_attribution_passes_through_spawn_rpc_clean_exit_and_live_child() {
+    // Rpc must survive a dead child: auth detection keys off it.
+    let rpc = ProbeError::Rpc(intent_acp::JsonRpcError {
+        code: -32000,
+        message: "auth required".to_string(),
+        data: None,
+    });
+    assert!(matches!(
+        exit_attribution(rpc, Some(exit_status(1)), &[]),
+        ProbeError::Rpc(_)
+    ));
+    assert!(matches!(
+        exit_attribution(
+            ProbeError::Spawn("nope".to_string()),
+            Some(exit_status(1)),
+            &[]
+        ),
+        ProbeError::Spawn(_)
+    ));
+    // A clean exit after an empty handshake is genuinely "no models reported".
+    assert!(matches!(
+        exit_attribution(ProbeError::Empty, Some(exit_status(0)), &[]),
+        ProbeError::Empty
+    ));
+    // A still-running (slow) child must not be reported as exited.
+    assert!(matches!(
+        exit_attribution(ProbeError::Timeout, None, &[]),
+        ProbeError::Timeout
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_reports_exit_status_and_stderr_for_crashing_adapter() {
+    use super::probe::{run_acp_probe, AcpProbeCommand};
+    let cmd = AcpProbeCommand::binary(
+        "/bin/sh".into(),
+        vec!["-c".to_string(), "echo boom >&2; exit 7".to_string()],
+    );
+    let err = run_acp_probe(cmd, |_| Vec::new()).await.unwrap_err();
+    let ProbeError::Exited(detail) = err else {
+        panic!("expected Exited, got {err}");
+    };
+    assert!(detail.contains("boom"), "detail: {detail}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_rpc_error_survives_dead_child() {
+    use super::probe::{run_acp_probe, AcpProbeCommand};
+    // Respond to the initialize request (id 1) with a JSON-RPC error, then
+    // exit non-zero: the Rpc error must pass through exit attribution so
+    // auth detection still sees it.
+    let script = r#"read line; printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Authentication required"}}\n'; exit 1"#;
+    let cmd = AcpProbeCommand::binary("/bin/sh".into(), vec!["-c".to_string(), script.to_string()]);
+    let err = run_acp_probe(cmd, |_| Vec::new()).await.unwrap_err();
+    let ProbeError::Rpc(rpc) = err else {
+        panic!("expected Rpc, got {err}");
+    };
+    assert_eq!(rpc.message, "Authentication required");
 }
 
 #[test]

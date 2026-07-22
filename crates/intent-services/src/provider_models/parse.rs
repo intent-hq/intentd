@@ -37,18 +37,28 @@ fn extract_available_models(payload: &Value) -> Option<&Vec<Value>> {
         .or_else(|| payload.get("sessionUpdate"))
         .unwrap_or(payload);
     let models = update.get("models");
+    // Emptiness is filtered per branch so an empty array in one shape (e.g. a
+    // transitional adapter emitting `availableModels: []` alongside a
+    // populated configOptions catalog) still lets a later shape win.
+    let non_empty = |a: &&Vec<Value>| !a.is_empty();
     models
         .and_then(|m| m.get("availableModels"))
         .and_then(Value::as_array)
-        .or_else(|| update.get("availableModels").and_then(Value::as_array))
+        .filter(non_empty)
+        .or_else(|| {
+            update
+                .get("availableModels")
+                .and_then(Value::as_array)
+                .filter(non_empty)
+        })
         .or_else(|| {
             models
                 .and_then(|m| m.get("available"))
                 .and_then(Value::as_array)
+                .filter(non_empty)
         })
-        .or_else(|| models.and_then(Value::as_array))
+        .or_else(|| models.and_then(Value::as_array).filter(non_empty))
         .or_else(|| extract_config_options_models(update))
-        .filter(|a| !a.is_empty())
 }
 
 /// Extract the model rows from a `configOptions` payload: the select option
@@ -57,15 +67,23 @@ fn extract_available_models(payload: &Value) -> Option<&Vec<Value>> {
 /// options (`mode`, `effort`, `fast`, …) are ignored. Values are preserved
 /// verbatim as model ids (including effort-suffixed ids like `opus[1m]`),
 /// matching the retired FE probe's behavior.
+///
+/// Each candidate must carry a non-empty `options` array: an `id == "model"`
+/// entry without usable options falls through to a `category == "model"`
+/// sibling instead of aborting the extraction.
 fn extract_config_options_models(update: &Value) -> Option<&Vec<Value>> {
     let options = update.get("configOptions").and_then(Value::as_array)?;
     let by_key = |key: &str| {
         options
             .iter()
-            .find(|o| o.get(key).and_then(Value::as_str) == Some("model"))
+            .filter(|o| o.get(key).and_then(Value::as_str) == Some("model"))
+            .find_map(|o| {
+                o.get("options")
+                    .and_then(Value::as_array)
+                    .filter(|a| !a.is_empty())
+            })
     };
-    let model_option = by_key("id").or_else(|| by_key("category"))?;
-    model_option.get("options").and_then(Value::as_array)
+    by_key("id").or_else(|| by_key("category"))
 }
 
 /// Pull `(id, name, description)` out of one raw model entry, tolerating the

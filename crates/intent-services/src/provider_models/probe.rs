@@ -19,7 +19,9 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 
 /// Hard cap on the whole probe for resolved binaries (mirrors the FE's 15s
-/// outer timeout).
+/// outer timeout). Deliberately smaller than the sum of the per-stage budgets
+/// (4s + 10s + 2s grace), matching the FE: the outer cap is the real bound
+/// and preempts slow-but-not-stuck stages.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Per-request timeout for `initialize` for resolved binaries (FE: 4s).
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -28,8 +30,13 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(4);
 /// routinely takes tens of seconds. A pinned-version bump must not guarantee
 /// a static-fallback cycle just because the cache is cold.
 const NPX_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
-/// Overall cap for npx-run adapters (cold install + handshake), kept bounded.
-const NPX_OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overall cap for npx-run adapters, kept bounded but sized to cover the full
+/// per-stage sum (45s initialize + 20s session/new + 2s grace) so a cold
+/// install that eats the initialize budget cannot starve `session/new` of its
+/// own window. This is also the worst-case latency of a `forceRefresh`
+/// `models.list` against a hung npx adapter — an accepted trade-off for
+/// surviving cold installs.
+const NPX_OVERALL_TIMEOUT: Duration = Duration::from_secs(70);
 /// Per-request timeout for `session/new` for resolved binaries (FE: 8–10s).
 const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// `session/new` budget for npx-run adapters: claude-agent-acp boots the
@@ -119,9 +126,9 @@ pub(super) enum ProbeError {
     Timeout,
     /// The handshake succeeded but no models were reported.
     Empty,
-    /// The adapter process exited before completing the handshake (e.g. a
-    /// corrupt npx cache producing an ENOENT from node); carries the exit
-    /// status plus the last stderr line when available.
+    /// The adapter process exited unsuccessfully before reporting models
+    /// (e.g. a corrupt npx cache producing an ENOENT from node); carries the
+    /// exit status plus a bounded tail of recent stderr when available.
     Exited(String),
 }
 
@@ -205,34 +212,73 @@ where
 }
 
 /// Fold an early adapter exit into the probe error: when the child already
-/// died before the handshake finished (e.g. a corrupt `~/.npm/_npx` entry
-/// making node fail with ENOENT), report its exit status and last stderr
-/// line instead of a generic transport/timeout/empty reason. Spawn and RPC
-/// errors pass through untouched (auth detection keys off `Rpc`).
+/// exited before the probe could report models, delegate to
+/// [`exit_attribution`] with the observed exit status and recent stderr.
 fn attribute_early_exit(
     err: ProbeError,
     child: &mut tokio::process::Child,
     conn: &Connection,
 ) -> ProbeError {
+    let status = child.try_wait().ok().flatten();
+    exit_attribution(err, status, &conn.recent_stderr())
+}
+
+/// How many trailing stderr lines to include in an exit attribution. npm's
+/// final line is typically just "A complete log of this run can be found
+/// in: …" with the actual cause a few lines earlier, so a single line is
+/// not enough.
+const STDERR_TAIL_LINES: usize = 3;
+/// Character bound on the joined stderr tail (kept from the end).
+const STDERR_TAIL_MAX_CHARS: usize = 300;
+
+/// Decide whether a probe error should be re-attributed to a dead adapter
+/// (e.g. a corrupt `~/.npm/_npx` entry making node fail with ENOENT):
+/// unsuccessful exits carry their exit status plus a bounded tail of recent
+/// stderr instead of a generic transport/timeout/empty reason. Spawn and RPC
+/// errors pass through untouched (auth detection keys off `Rpc`), as do
+/// clean exits — an adapter that finishes the handshake, reports zero
+/// models, and exits 0 is genuinely "no models reported".
+pub(super) fn exit_attribution(
+    err: ProbeError,
+    status: Option<std::process::ExitStatus>,
+    stderr: &[String],
+) -> ProbeError {
     if matches!(err, ProbeError::Spawn(_) | ProbeError::Rpc(_)) {
         return err;
     }
-    let Ok(Some(status)) = child.try_wait() else {
+    let Some(status) = status else {
         return err;
     };
-    let stderr = conn.recent_stderr();
-    let tail = match stderr.last() {
-        Some(line) => {
-            let trimmed = line.trim();
-            let bounded: String = trimmed
-                .chars()
-                .skip(trimmed.chars().count().saturating_sub(200))
-                .collect();
-            format!("; stderr: {bounded}")
-        }
+    if status.success() {
+        return err;
+    }
+    let tail = match stderr_tail(stderr) {
+        Some(t) => format!("; stderr: {t}"),
         None => String::new(),
     };
     ProbeError::Exited(format!("{status}{tail}"))
+}
+
+/// Join the last [`STDERR_TAIL_LINES`] non-empty stderr lines, bounded to
+/// [`STDERR_TAIL_MAX_CHARS`] characters kept from the end.
+fn stderr_tail(stderr: &[String]) -> Option<String> {
+    let start = stderr.len().saturating_sub(STDERR_TAIL_LINES);
+    let joined = stderr[start..]
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        return None;
+    }
+    let count = joined.chars().count();
+    Some(
+        joined
+            .chars()
+            .skip(count.saturating_sub(STDERR_TAIL_MAX_CHARS))
+            .collect(),
+    )
 }
 
 /// Grace window between SIGTERM and SIGKILL when reaping the probe child
@@ -345,6 +391,15 @@ fn is_model_update_method(method: &str) -> bool {
 
 fn map_acp_error(err: intent_acp::AcpError) -> ProbeError {
     match err {
+        // The transport synthesizes a code-0 "agent stdout closed" JSON-RPC
+        // error when the child's stdout closes with requests still pending.
+        // That is a transport failure, not an adapter response — keeping it
+        // out of `Rpc` lets exit attribution rewrite it (a crashed adapter
+        // is the main way stdout closes mid-probe) and keeps auth detection
+        // keyed to genuine adapter errors.
+        intent_acp::AcpError::Rpc(e) if e.code == 0 && e.message == "agent stdout closed" => {
+            ProbeError::Transport(e.message)
+        }
         intent_acp::AcpError::Rpc(e) => ProbeError::Rpc(e),
         other => ProbeError::Transport(other.to_string()),
     }
