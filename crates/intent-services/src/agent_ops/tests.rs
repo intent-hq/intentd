@@ -601,6 +601,326 @@ async fn group_fire_attaches_event_notification_metadata() {
     }
 }
 
+// ── `app.agents.waitFor` (app_agents_wait_op) ───────────────────────────────
+
+/// Immediate mode from a chief caller: one oneShot watch per target across
+/// TWO different workspaces; each target's completion delivers its own wake
+/// to the caller and consumes the watch.
+#[tokio::test]
+async fn app_agents_wait_immediate_wakes_from_two_workspaces() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let chief_ws = WorkspaceId::chief();
+    let caller = create_agent(&svc, &chief_ws, "Chief").await;
+    let t1 = create_agent(&svc, &ws_a, "TargetA").await;
+    let t2 = create_agent(&svc, &ws_b, "TargetB").await;
+
+    let out = svc
+        .app_agents_wait_op(
+            chief_ws.clone(),
+            caller.clone(),
+            vec![t1.0.clone(), t2.0.clone()],
+            None,
+        )
+        .await
+        .expect("waitFor immediate");
+    assert_eq!(out["ok"], json!(true));
+    assert_eq!(out["waitMode"], json!("immediate"));
+    let results = out["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["agentId"], json!(t1.0));
+    assert_eq!(results[0]["workspaceId"], json!(ws_a.0));
+    assert!(results[0]["subscriptionId"].is_string());
+    assert!(results[0]["groupId"].is_null());
+    assert_eq!(results[1]["agentId"], json!(t2.0));
+    assert_eq!(results[1]["workspaceId"], json!(ws_b.0));
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 2);
+
+    // Each target's completion (in its OWN workspace) wakes the caller.
+    svc.handle_completion_event(&completion_event(
+        &ws_a,
+        AGENT_IDLE,
+        &t1,
+        json!({ "agentId": t1.0, "lastResponseSummary": "a done" }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws_b,
+        AGENT_IDLE,
+        &t2,
+        json!({ "agentId": t2.0, "lastResponseSummary": "b done" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 2, "one wake per completed target");
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// Calling waitFor twice for the same target in immediate mode reuses the
+/// live oneShot watch (same subscription id) instead of stacking duplicates.
+#[tokio::test]
+async fn app_agents_wait_immediate_dedupes_live_watch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    let first = svc
+        .app_agents_wait_op(
+            ws.clone(),
+            caller.clone(),
+            vec![target.0.clone()],
+            Some("immediate".into()),
+        )
+        .await
+        .expect("first waitFor");
+    let second = svc
+        .app_agents_wait_op(ws.clone(), caller.clone(), vec![target.0.clone()], None)
+        .await
+        .expect("second waitFor");
+    assert_eq!(
+        first["results"][0]["subscriptionId"], second["results"][0]["subscriptionId"],
+        "live ungrouped watch is reused, not duplicated"
+    );
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
+}
+
+/// after_all from a chief caller with targets in TWO different workspaces:
+/// both targets share one chief-anchored group; sealing on the caller's idle
+/// and completing both targets fires ONE aggregated wake.
+#[tokio::test]
+async fn app_agents_wait_after_all_across_two_workspaces_single_aggregated_wake() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let chief_ws = WorkspaceId::chief();
+    let caller = create_agent(&svc, &chief_ws, "Chief").await;
+    let t1 = create_agent(&svc, &ws_a, "TargetA").await;
+    let t2 = create_agent(&svc, &ws_b, "TargetB").await;
+
+    let out = svc
+        .app_agents_wait_op(
+            chief_ws.clone(),
+            caller.clone(),
+            vec![t1.0.clone(), t2.0.clone()],
+            Some("after_all".into()),
+        )
+        .await
+        .expect("waitFor after_all");
+    assert_eq!(out["waitMode"], json!("after_all"));
+    let results = out["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+    let gid = results[0]["groupId"]
+        .as_str()
+        .expect("group id")
+        .to_string();
+    assert_eq!(results[1]["groupId"], json!(gid));
+
+    // First target settles: group not complete, no wake yet.
+    svc.handle_completion_event(&completion_event(
+        &ws_a,
+        AGENT_IDLE,
+        &t1,
+        json!({ "agentId": t1.0, "lastResponseSummary": "one" }),
+    ))
+    .await;
+    // The chief caller idles: the group seals.
+    svc.handle_completion_event(&completion_event(
+        &chief_ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    // Second target settles: group complete → single aggregated wake.
+    svc.handle_completion_event(&completion_event(
+        &ws_b,
+        AGENT_IDLE,
+        &t2,
+        json!({ "agentId": t2.0, "lastResponseSummary": "two" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
+    assert!(svc.delegation_group_for_parent(&caller).is_none());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// Restart-rehydration: an after_all group registered via waitFor persists
+/// under the chief anchor; after a simulated restart (fresh Store + Services),
+/// `rehydrate_delegation_groups` reconciles the remaining completed target and
+/// fires the single aggregated wake to the caller.
+#[tokio::test]
+async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
+    let tmp = TempDb::new();
+    let chief_ws = WorkspaceId::chief();
+    let ws = WorkspaceId::new();
+    let (caller, t1, t2) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let caller = create_agent(&svc, &chief_ws, "Chief").await;
+        let t1 = create_agent(&svc, &ws, "Target1").await;
+        let t2 = create_agent(&svc, &ws, "Target2").await;
+
+        svc.app_agents_wait_op(
+            chief_ws.clone(),
+            caller.clone(),
+            vec![t1.0.clone(), t2.0.clone()],
+            Some("after_all".into()),
+        )
+        .await
+        .expect("waitFor after_all");
+
+        // Wait for the group row to persist under the chief anchor (the
+        // upsert is spawned; completion recording below awaits persistence).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&chief_ws)
+                .await
+                .expect("list persisted groups");
+            if !rows.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group row persisted under the chief anchor workspace"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // First target settles BEFORE the restart — durably recorded.
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            &t1,
+            json!({ "agentId": t1.0, "lastResponseSummary": "one" }),
+        ))
+        .await;
+        (caller, t1, t2)
+    }; // old Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // The second target finished while the daemon was down: its session is
+    // Completed with a report and no interrupted row (the STAB-108 predicate).
+    let mut s2 = store.get_agent_session(&t2).await.expect("t2 session");
+    s2.status = intent_core::AgentStatus::Completed;
+    s2.completion_report = Some("two".into());
+    store.update_agent_session(&ws, &s2).await.expect("mark t2");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .rehydrate_delegation_groups(&chief_ws)
+        .await
+        .expect("rehydrate");
+    assert_eq!(loaded, 1, "one chief-anchored group rehydrated");
+
+    // Reconciliation recorded t2 and fired the sealed group: ONE aggregated
+    // wake to the caller covering both targets.
+    let session = restarted
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "one aggregated wake post-restart"
+    );
+    let text = session.messages[0].content.to_string();
+    assert!(text.contains(&t1.0), "wake covers pre-restart target");
+    assert!(text.contains(&t2.0), "wake covers reconciled target");
+    assert!(restarted.delegation_group_for_parent(&caller).is_none());
+}
+
+/// Scope gate: a non-chief caller may not wait on a target outside its own
+/// workspace — rejected for BOTH modes and side-effect free (no watches, no
+/// group), even when a same-workspace target precedes the offending one.
+#[tokio::test]
+async fn app_agents_wait_rejects_non_chief_cross_workspace_caller() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let caller = create_agent(&svc, &ws_a, "Caller").await;
+    let local = create_agent(&svc, &ws_a, "Local").await;
+    let remote = create_agent(&svc, &ws_b, "Remote").await;
+
+    for mode in [None, Some("after_all".to_string())] {
+        let denied = svc
+            .app_agents_wait_op(
+                ws_a.clone(),
+                caller.clone(),
+                vec![local.0.clone(), remote.0.clone()],
+                mode,
+            )
+            .await;
+        assert!(denied.is_err(), "non-chief cross-workspace wait rejected");
+        assert!(
+            svc.list_watches_for_parent(&caller).is_empty(),
+            "rejection leaves no watches (not even for the valid local target)"
+        );
+        assert!(
+            svc.delegation_group_for_parent(&caller).is_none(),
+            "rejection leaves no partially-initialized group"
+        );
+    }
+
+    // Same-workspace-only waits still succeed for the non-chief caller.
+    svc.app_agents_wait_op(ws_a.clone(), caller.clone(), vec![local.0.clone()], None)
+        .await
+        .expect("same-workspace wait is allowed");
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
+}
+
+/// Input validation: empty target list, self-wait, unknown target id, and an
+/// invalid waitMode are all InvalidParams and side-effect free.
+#[tokio::test]
+async fn app_agents_wait_validation_failures() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let target = create_agent(&svc, &ws, "Target").await;
+
+    let cases: Vec<(Vec<String>, Option<String>)> = vec![
+        (vec![], None),
+        (vec!["  ".into()], None),
+        (vec![caller.0.clone()], None),
+        (vec!["agent-nonexistent".into()], None),
+        (vec![target.0.clone()], Some("bogus_mode".into())),
+    ];
+    for (ids, mode) in cases {
+        let err = svc
+            .app_agents_wait_op(ws.clone(), caller.clone(), ids.clone(), mode.clone())
+            .await;
+        assert!(
+            matches!(err, Err(Error::InvalidParams(_))),
+            "expected InvalidParams for ids={ids:?} mode={mode:?}"
+        );
+    }
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+    assert!(svc.delegation_group_for_parent(&caller).is_none());
+}
+
 async fn create_agent(svc: &Services, ws: &WorkspaceId, name: &str) -> AgentId {
     let created = svc
         .agent_create_op(
