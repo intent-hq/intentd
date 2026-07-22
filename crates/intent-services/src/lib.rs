@@ -10036,6 +10036,7 @@ impl WorkspaceApi for Services {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        author_type: Option<String>,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let store = self.store.clone();
@@ -10044,10 +10045,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
+            let warn_note_id = note_id.clone();
             // Emission lives inside the idempotency scope so a replayed add
             // (same idempotencyKey) returns the cached result without a second
             // `comment:added` (design note TB-0 §5).
-            with_idempotency(
+            let result = with_idempotency(
                 &store,
                 &ws_scope,
                 idempotency_key,
@@ -10055,20 +10057,31 @@ impl WorkspaceApi for Services {
                 move || async move {
                     let store = op_store;
                     if comment.trim().is_empty() {
-                        return Err(Error::Internal(
+                        return Err(Error::InvalidParams(
                             "Comment text is required and must be non-empty".to_string(),
                         ));
                     }
                     if search_context.trim().is_empty() {
-                        return Err(Error::Internal(
+                        return Err(Error::InvalidParams(
                             "searchContext is required and must be non-empty".to_string(),
                         ));
                     }
                     if comment_target.trim().is_empty() {
-                        return Err(Error::Internal(
+                        return Err(Error::InvalidParams(
                             "commentTarget is required and must be non-empty".to_string(),
                         ));
                     }
+                    // Default `agent` keeps backward compatibility with
+                    // agent/MCP callers that predate the param.
+                    let author_type = match author_type.as_deref() {
+                        None | Some("agent") => AuthorType::Agent,
+                        Some("user") => AuthorType::User,
+                        Some(other) => {
+                            return Err(Error::InvalidParams(format!(
+                                "Invalid 'authorType': {other}. Must be 'user' or 'agent'."
+                            )))
+                        }
+                    };
                     let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
                     let (from, to, line) = note_ops::find_and_anchor_text(
                         &note.content,
@@ -10106,8 +10119,14 @@ impl WorkspaceApi for Services {
                         note_id: Some(note_id.clone()),
                         kind: parse_comment_type(kind.as_deref()),
                         content: comment,
-                        author: author.unwrap_or_else(|| "Agent".to_string()),
-                        author_type: AuthorType::Agent,
+                        author: author.unwrap_or_else(|| {
+                            match author_type {
+                                AuthorType::User => "User",
+                                AuthorType::Agent => "Agent",
+                            }
+                            .to_string()
+                        }),
+                        author_type,
                         status: CommentStatus::Open,
                         parent_id: None,
                         anchor: CommentAnchor {
@@ -10152,7 +10171,15 @@ impl WorkspaceApi for Services {
                     })
                 },
             )
-            .await
+            .await;
+            if let Err(e) = &result {
+                tracing::warn!(
+                    note_id = %warn_note_id.as_str(),
+                    error = %e,
+                    "comment.add failed"
+                );
+            }
+            result
         })
     }
 

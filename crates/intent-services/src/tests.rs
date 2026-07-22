@@ -1696,6 +1696,7 @@ async fn comment_add_unique_match_anchors_and_persists() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("comment.add");
@@ -1730,6 +1731,7 @@ async fn comment_add_persists_anchor_context() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,
@@ -1789,6 +1791,7 @@ async fn edit_above_anchor_preserves_healthy_state() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add");
@@ -1826,6 +1829,7 @@ async fn edit_that_destroys_start_marker_recovers_via_context() {
             "prefix target here suffix".into(),
             "target".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -1876,6 +1880,7 @@ async fn edit_that_destroys_both_markers_marks_orphaned() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add");
@@ -1910,11 +1915,90 @@ async fn comment_add_ambiguous_context_errors() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::Internal(ref m) if m.contains("appears multiple times in the document"))
+        matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times in the document"))
+    );
+}
+
+#[tokio::test]
+async fn comment_add_plaintext_context_over_formatted_markdown() {
+    // Regression: the FE builds searchContext/commentTarget from the tiptap
+    // document's *plain text* — markdown syntax is stripped and blocks are
+    // joined with no separator. The exact substring search over the markdown
+    // source fails for such anchors; the plaintext fallback must succeed.
+    let (_tmp, svc, ws, id) =
+        setup("## Heading\n\nSome **bold words** in a [link](https://example.com) here.").await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "HeadingSome bold words in a link here.".into(),
+            "bold words".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add via plaintext fallback");
+    assert!(r.anchored);
+    assert_eq!(r.location.anchored_text, "bold words");
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert!(note.content.contains(&format!(
+        "<!--anchor:{}:start-->bold words<!--anchor:{}:end-->",
+        r.comment_id, r.comment_id
+    )));
+}
+
+#[tokio::test]
+async fn comment_add_context_not_found_is_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("some note content").await;
+    let err = svc
+        .comment_add(
+            ws,
+            id,
+            "totally absent context".into(),
+            "absent".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Could not find the search context")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn comment_add_empty_target_is_invalid_params() {
+    // Caret-only selections send an empty commentTarget.
+    let (_tmp, svc, ws, id) = setup("some note content").await;
+    let err = svc
+        .comment_add(
+            ws,
+            id,
+            "some note content".into(),
+            "".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("commentTarget")),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -1928,6 +2012,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "alpha unique-target omega".into(),
             "unique-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -1998,6 +2083,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
             "alpha resolve-target omega".into(),
             "resolve-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2104,6 +2190,7 @@ async fn comment_ops_reject_cross_workspace_bare_id_writes() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,
@@ -2951,6 +3038,7 @@ mod change_event_parity {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("comment");
@@ -2983,6 +3071,7 @@ mod change_event_parity {
                 "nice".to_string(),
                 None,
                 None,
+                None,
                 key.clone(),
             )
             .await
@@ -3000,6 +3089,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "nice".to_string(),
+                None,
                 None,
                 None,
                 key,
@@ -3034,6 +3124,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "root".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -3084,6 +3175,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "nice".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -12907,6 +12999,7 @@ mod line_attribution_hooks {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,

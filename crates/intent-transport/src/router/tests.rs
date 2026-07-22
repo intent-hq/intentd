@@ -493,6 +493,7 @@ impl WorkspaceApi for FakeApi {
         _comment: String,
         _kind: Option<String>,
         _author: Option<String>,
+        _author_type: Option<String>,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         Box::pin(async move {
