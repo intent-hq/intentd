@@ -2254,6 +2254,221 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .contains("urgent"));
 }
 
+/// Regression: the keep-alive interrupt (`agent.stop` mid-turn) must persist
+/// the streamed-so-far assistant content instead of dropping it. The live-turn
+/// slot is snapshotted BEFORE the worker abort (the abort drops
+/// `LiveTurnGuard`, clearing the slot) and flushed via
+/// `flush_partial_turn_on_interruption` — same convention as the graceful
+/// shutdown flush: the turn's minted message id, `metadata.interrupted = true`
+/// + `stopReason = "interrupted"`.
+#[tokio::test]
+async fn interrupt_flushes_partial_live_turn_as_interrupted_assistant_row() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-flush"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // An `acpSessionId` keeps the interrupt on the keep-alive path.
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-flush")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    // Simulate a mid-stream turn: the live-turn slot holds coalesced blocks.
+    let blocks = vec![json!({ "type": "text", "id": "msg-int-flush:0", "text": "partial…" })];
+    mgr.services
+        .set_live_turn(&id, "msg-int-flush", blocks.clone());
+
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the partial turn persisted: {messages:?}"
+    );
+    let msg = &messages[0];
+    assert_eq!(msg.id, "msg-int-flush");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, Value::Array(blocks));
+    let metadata = msg.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    assert_eq!(metadata["stopReason"], "interrupted");
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "live-turn slot cleared after the flush"
+    );
+}
+
+/// Regression companion: the hard `stop()` path (interrupt fallback / kill)
+/// flushes the partial live turn the same way as the keep-alive interrupt, so
+/// a mid-stream `agent.stop` that lands on the kill path (no `acpSessionId`)
+/// still keeps the streamed-so-far content.
+#[tokio::test]
+async fn stop_flushes_partial_live_turn_as_interrupted_assistant_row() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-stop-flush"));
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let blocks = vec![json!({ "type": "text", "id": "msg-stop-flush:0", "text": "partial…" })];
+    mgr.services
+        .set_live_turn(&id, "msg-stop-flush", blocks.clone());
+
+    assert!(mgr.stop(&id).await, "stop finds the live agent");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the partial turn persisted: {messages:?}"
+    );
+    let msg = &messages[0];
+    assert_eq!(msg.id, "msg-stop-flush");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, Value::Array(blocks));
+    let metadata = msg.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    assert_eq!(metadata["stopReason"], "interrupted");
+}
+
+/// `agent.forceMessage` preempts via `stop()`, so the preempted turn's
+/// streamed-so-far output now persists as an interrupted assistant row BEFORE
+/// the forced message's user row — a deliberate transcript-shape change from
+/// the detach-path flush (previously the partial output was dropped).
+#[tokio::test]
+async fn force_message_persists_preempted_partial_turn_before_forced_row() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-force-flush"));
+    seed_agent(&mgr, &ws, &id).await;
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    let blocks = vec![json!({ "type": "text", "id": "msg-force-flush:0", "text": "partial…" })];
+    mgr.services
+        .set_live_turn(&id, "msg-force-flush", blocks.clone());
+
+    let result = mgr
+        .force_message(
+            id.clone(),
+            ws.clone(),
+            "forced-mid".to_string(),
+            "urgent override".to_string(),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("force message");
+    assert_eq!(result["success"], json!(true));
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let flushed = messages
+        .iter()
+        .find(|m| m.id == "msg-force-flush")
+        .expect("preempted partial persisted as interrupted assistant row");
+    assert_eq!(flushed.role, "assistant");
+    assert_eq!(flushed.content, Value::Array(blocks));
+    let metadata = flushed.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    let forced_pos = messages
+        .iter()
+        .position(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("urgent")
+        })
+        .expect("forced user row persisted");
+    let flushed_pos = messages
+        .iter()
+        .position(|m| m.id == "msg-force-flush")
+        .unwrap();
+    assert!(
+        flushed_pos < forced_pos,
+        "interrupted partial precedes the forced message: {messages:?}"
+    );
+}
+
+/// STAB-114/126 guard: a zero-output interrupt (live-turn slot open but no
+/// assistant blocks streamed yet) must NOT persist an assistant row — the
+/// flush is a no-op for empty blocks — so the requeue's "non-user messages
+/// after last user message" check still sees only the user row and re-queues
+/// the preempted message.
+#[tokio::test]
+async fn interrupt_send_message_zero_output_persists_nothing_and_requeues() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-zero"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-zero")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    // The in-flight turn's user message is already persisted, and its live-turn
+    // slot is open with ZERO streamed assistant blocks.
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "first" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.set_live_turn(&id, "msg-int-zero", Vec::new());
+
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("interrupt send");
+    assert_eq!(result["success"], json!(true));
+
+    // No assistant row was flushed: only the original user row plus the
+    // interrupt message's own user row exist.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages.iter().all(|m| m.role == "user"),
+        "zero-output interrupt persists no assistant row: {messages:?}"
+    );
+    // The preempted message was re-queued (STAB-114 semantics preserved).
+    let queue = mgr.services.queue_snapshot(&id);
+    assert!(
+        queue
+            .iter()
+            .any(|m| m["content"].as_str().unwrap_or_default().contains("first")),
+        "zero-output interrupt re-queues the preempted message: {queue:?}"
+    );
+}
+
 /// Regression: interrupt-WITH-message preemption must NOT emit the STAB-28
 /// synthetic `agent:idle`. The child is not settling — it is about to run the
 /// interrupt turn — so an idle emit here would fire completion watches and
