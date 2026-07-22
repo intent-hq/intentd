@@ -957,6 +957,10 @@ where
             json!({ "agentId": agent_id }),
         )
         .await;
+        assert!(
+            resp.get("error").is_none(),
+            "agent.getConversation errored: {resp}"
+        );
         if let Some(v) = pred(&resp["result"]["messages"]) {
             return v;
         }
