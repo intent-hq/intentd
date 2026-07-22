@@ -4141,7 +4141,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
-    // search.* — BE-owned file/path search (PROTOCOL §5.15, IMPLEMENTATION_SPEC §14).
+    // search.* — BE-owned file/path search (PROTOCOL §5.15).
     // ------------------------------------------------------------------------
 
     /// `search.inFiles`: gitignore-aware ripgrep content search over the
@@ -4530,10 +4530,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     // ------------------------------------------------------------------------
     // client.hello + drafts.* — stable client identity & per-client drafts
-    // (PROTOCOL §5.16/§5.17, IMPLEMENTATION_SPEC §15/§16). These back the
-    // transport-level interceptors (§16); they are not routed through the
-    // JSON-RPC dispatcher, but live on `WorkspaceApi` so the transport reaches
-    // persistence through services without depending on `intent-store` (§3.2).
+    // (PROTOCOL §5.16/§5.17). These back the transport-level interceptors;
+    // they are not routed through the JSON-RPC dispatcher, but live on
+    // `WorkspaceApi` so the transport reaches persistence through services
+    // without depending on `intent-store` (per the dependency-direction rules).
     // ------------------------------------------------------------------------
 
     /// `client.hello` persistence: upsert the logical `client` row, setting

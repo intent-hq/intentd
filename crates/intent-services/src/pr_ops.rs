@@ -103,9 +103,9 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 // workspace's OWN branch (`pr.head.ref === workspace.branch`), NOT `baseRef`.
 //
 // PARITY NOTE: the TS `performBackgroundEnrichment` additionally accepts a
-// `baseRef` match (`matchesBaseRef`); IMPLEMENTATION_SPEC §626 mandates
-// branch-only matching ("the workspace's own branch, NOT baseRef"), so this
-// port follows the SPEC and ignores `baseRef`.
+// `baseRef` match (`matchesBaseRef`); the porting spec mandated branch-only
+// matching ("the workspace's own branch, NOT baseRef"), so this port follows
+// that rule and ignores `baseRef`.
 // ===========================================================================
 
 /// Outcome of a single workspace PR refresh (§7.6). Drives which `pr:*` event
@@ -461,7 +461,7 @@ pub(crate) fn fallback_threads(mut comments: Vec<ReviewComment>) -> Vec<ReviewTh
 }
 
 // ===========================================================================
-// `pr.*` write/action glue (PROTOCOL §5.7, IMPLEMENTATION_SPEC §7.5).
+// `pr.*` write/action glue (PROTOCOL §5.7).
 // ===========================================================================
 
 /// `pr.waitForChanges` safety padding (TS `SAFETY_PADDING_SECONDS`).
