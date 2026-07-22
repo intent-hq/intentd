@@ -279,14 +279,17 @@ mod tests {
             .with_workspaces_root(workspaces_root.clone());
 
         // Register a completion watch: parent watches child (oneShot)
-        services.register_completion_watch(
-            &ws.id,
-            parent_id.clone(),
-            "Parent".to_string(),
-            child_id.clone(),
-            true, // oneShot
-            None, // no group
-        );
+        services
+            .register_completion_watch(
+                &ws.id,
+                &ws.id,
+                parent_id.clone(),
+                "Parent".to_string(),
+                child_id.clone(),
+                true, // oneShot
+                None, // no group
+            )
+            .expect("register watch");
 
         // Subscribe to sandbox:merged events
         let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
@@ -438,14 +441,17 @@ mod tests {
             .with_workspaces_root(workspaces_root.clone());
 
         // Register a completion watch: parent watches child
-        services.register_completion_watch(
-            &ws.id,
-            parent_id.clone(),
-            "Parent".to_string(),
-            child_id.clone(),
-            true, // oneShot
-            None,
-        );
+        services
+            .register_completion_watch(
+                &ws.id,
+                &ws.id,
+                parent_id.clone(),
+                "Parent".to_string(),
+                child_id.clone(),
+                true, // oneShot
+                None,
+            )
+            .expect("register watch");
 
         // Count parent messages before
         let parent_messages_before = store.get_agent_messages(&parent_id, None).await.unwrap();
@@ -609,14 +615,17 @@ mod tests {
             .with_workspaces_root(workspaces_root.clone());
 
         // Register a completion watch: parent watches child
-        services.register_completion_watch(
-            &ws.id,
-            parent_id.clone(),
-            "Parent".to_string(),
-            child_id.clone(),
-            true, // oneShot
-            None,
-        );
+        services
+            .register_completion_watch(
+                &ws.id,
+                &ws.id,
+                parent_id.clone(),
+                "Parent".to_string(),
+                child_id.clone(),
+                true, // oneShot
+                None,
+            )
+            .expect("register watch");
 
         // Trigger completion
         let event = completion_event(&ws.id, &child_id);

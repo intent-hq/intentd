@@ -194,12 +194,15 @@ pub struct Services {
     /// idle auto-commit path uses its ~30s default; tests compress it so the
     /// timeout-fallback path completes in milliseconds.
     auto_commit_timeout_ms: Option<u64>,
-    /// Daemon-owned parent→child completion-watch registry (AS-2), keyed by
-    /// workspace. A oneShot watch is registered when an agent delegates with
-    /// `waitMode` `immediate` over the MCP front door; the delivery worker (AS-3)
-    /// and the `after_all` group fan-in (AS-4) consume it later. Shared across
-    /// clones like the other in-memory registries.
-    agent_subscriptions: Arc<Mutex<HashMap<WorkspaceId, agent_subscriptions::WorkspaceWatches>>>,
+    /// Daemon-global parent→child completion-watch registry (AS-2). One table
+    /// for all workspaces: each watch/group carries its own workspace anchors
+    /// (parent home + child workspace), so the same code path serves
+    /// same-workspace delegation and cross-workspace (chief) waits. A oneShot
+    /// watch is registered when an agent delegates with `waitMode` `immediate`
+    /// over the MCP front door; the delivery worker (AS-3) and the `after_all`
+    /// group fan-in (AS-4) consume it later. Shared across clones like the
+    /// other in-memory registries.
+    agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -402,7 +405,9 @@ impl Services {
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
             auto_commit_timeout_ms: None,
-            agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            agent_subscriptions: Arc::new(Mutex::new(
+                agent_subscriptions::SubscriptionRegistry::default(),
+            )),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
@@ -1982,17 +1987,13 @@ impl Services {
             }
         }
 
-        self.deliver_completion_to_watches(&event.workspace_id, &child, event)
-            .await;
+        self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
         // — covers the case where every child finished before the parent idled.
         if event.event_type == AGENT_IDLE {
-            if let Some(gid) = self
-                .seal_group_for_parent(&event.workspace_id, &child)
-                .await
-            {
-                self.try_fire_group(&event.workspace_id, &gid).await;
+            if let Some(gid) = self.seal_group_for_parent(&child).await {
+                self.try_fire_group(&gid).await;
             }
         }
     }
@@ -2003,13 +2004,13 @@ impl Services {
     /// the remaining watches still fire. Wave B: remove oneShot watches BEFORE
     /// delivery to prevent duplicate wakes if the same event is reprocessed or
     /// the delivery loop is reentrant.
-    pub(crate) async fn deliver_completion_to_watches(
-        &self,
-        workspace_id: &WorkspaceId,
-        child_id: &AgentId,
-        event: &Event,
-    ) {
-        for watch in self.find_watches_for_child(workspace_id, child_id) {
+    ///
+    /// Every wake is delivered in the watch's `parent_workspace_id` — the
+    /// parent's home workspace — which equals the child's workspace for
+    /// same-workspace delegation and `__chief__` for chief parents.
+    pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
+        for watch in self.find_watches_for_child(child_id) {
+            let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
                 // Route the child's completion into the parent's after_all
                 // delegation group instead of waking immediately. The group's own
@@ -2027,14 +2028,7 @@ impl Services {
                     .and_then(|s| s.completion_report);
                 let summary = format_group_child_line(child_id, event, report.as_deref());
                 let newly_recorded = self
-                    .record_group_child_completion(
-                        workspace_id,
-                        &gid,
-                        child_id,
-                        deleted,
-                        summary,
-                        event.clone(),
-                    )
+                    .record_group_child_completion(&gid, child_id, deleted, summary, event.clone())
                     .await;
                 // STAB-160: a grouped child's failure must wake the parent
                 // immediately — a failed child is parked in Error and never
@@ -2050,7 +2044,7 @@ impl Services {
                     let metadata = build_event_notification_metadata(&[event]);
                     if let Err(e) = self
                         .deliver_parent_wake(
-                            workspace_id,
+                            &parent_ws,
                             watch.parent_agent_id.clone(),
                             wake,
                             Some(metadata),
@@ -2065,7 +2059,7 @@ impl Services {
                         );
                     }
                 }
-                self.try_fire_group(workspace_id, &gid).await;
+                self.try_fire_group(&gid).await;
                 continue;
             }
             // Report-time wake suppression: if the watch has already delivered the
@@ -2080,8 +2074,8 @@ impl Services {
                 );
                 // Remove the oneShot watch now that the completion cycle is done.
                 if watch.one_shot {
-                    self.remove_watch(workspace_id, &watch.id);
-                    self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                    self.remove_watch(&watch.id);
+                    self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                         .await;
                 }
                 continue;
@@ -2093,7 +2087,7 @@ impl Services {
             // duplicate delivery (which we observed in production: STAB-5). Group
             // watches are still removed AFTER group settlement as before.
             if watch.one_shot {
-                let removed = self.remove_watch(workspace_id, &watch.id);
+                let removed = self.remove_watch(&watch.id);
                 if !removed {
                     // Watch was concurrently removed (e.g. by another event or
                     // cancelSubscriptions); skip delivery to avoid a duplicate.
@@ -2109,7 +2103,7 @@ impl Services {
             let metadata = build_event_notification_metadata(&[event]);
             if let Err(e) = self
                 .deliver_parent_wake(
-                    workspace_id,
+                    &parent_ws,
                     watch.parent_agent_id.clone(),
                     wake,
                     Some(metadata),
@@ -2124,7 +2118,7 @@ impl Services {
                 continue;
             }
             if watch.one_shot {
-                self.publish_subscriptions_changed(workspace_id, &watch.parent_agent_id)
+                self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
                     .await;
             }
         }
@@ -2134,11 +2128,13 @@ impl Services {
     /// complete, undelivered). `take_group_if_ready` flips `delivered` and removes
     /// the group atomically, so this fires at most once even under concurrent
     /// completions; on a send error we log and accept the dropped wake (mirroring
-    /// the immediate path's best-effort delivery).
-    pub(crate) async fn try_fire_group(&self, workspace_id: &WorkspaceId, group_id: &str) {
-        let Some(group) = self.take_group_if_ready(workspace_id, group_id).await else {
+    /// the immediate path's best-effort delivery). The wake is delivered in the
+    /// group's anchor workspace (`group.workspace_id`, the parent's home).
+    pub(crate) async fn try_fire_group(&self, group_id: &str) {
+        let Some(group) = self.take_group_if_ready(group_id).await else {
             return;
         };
+        let workspace_id = &group.workspace_id;
         // STAB-129: settle the group's watches BEFORE the wake delivery await.
         // A member recorded via `agent:failed` (e.g. the `session/prompt` idle
         // timeout firing mid-turn) may still be working and settle for real
@@ -2148,7 +2144,7 @@ impl Services {
         // into an ungrouped oneShot watch (and drops the rest), so there is no
         // window in which the child has neither a live group nor a watch.
         let failed_children = failed_group_children(&group);
-        let retained = self.settle_group_watches(workspace_id, group_id, &failed_children);
+        let retained = self.settle_group_watches(group_id, &failed_children);
         if retained > 0 {
             tracing::info!(
                 parent = %group.parent_agent_id.0,
@@ -7727,14 +7723,22 @@ impl WorkspaceApi for Services {
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&session.id);
             }
-            // Drop the workspace's completion-watch + delegation-group entry
-            // wholesale: every parent/child in the map is workspace-scoped, so
-            // the entry cannot outlive the workspace it keys off. Poison
-            // recovery mirrors the per-session sweep above.
-            agent_subscriptions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
+            // Sweep the deleted workspace out of the daemon-global
+            // subscription registry: drop watches whose PARENT lives here
+            // (their wake destination is gone) and groups anchored here.
+            // Watches whose parent lives elsewhere (a chief watching a child
+            // in this workspace) are kept — the `agent:deleted` events
+            // published just below still wake the cross-workspace parent.
+            // Poison recovery mirrors the per-session sweep above.
+            {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                registry
+                    .subscriptions
+                    .retain(|s| s.parent_workspace_id != id);
+                registry.delegation_groups.retain(|g| g.workspace_id != id);
+            }
             // Emit `agent:deleted` per swept session before the worktree /
             // store cleanup so subscribers see the terminal event for each
             // agent ahead of `workspace:deleted`. Best-effort: emits when the

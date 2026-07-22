@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -212,6 +212,50 @@ async fn connect_ws(
         .await
         .expect("ws handshake");
     ws
+}
+
+/// Gate on the deterministic mock ACP agent fixture; skip cleanly when the
+/// script is unavailable (mirrors the other WSS e2e suites).
+fn gate(test: &str) -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("Skip {test}: mock ACP not found at {script}");
+        return None;
+    }
+    Some(script)
+}
+
+/// Wait for the next `events.event` notification frame (pings are answered,
+/// other frames skipped). `secs` bounds the TOTAL wait as a single deadline,
+/// so intervening frames (e.g. heartbeat pings) cannot reset the window.
+async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let next = timeout_at(deadline, ws.next())
+            .await
+            .expect("wss event timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
 }
 
 /// Send one JSON-RPC frame and return the full envelope whose id matches;
@@ -622,4 +666,248 @@ async fn ws_app_surface_events_and_gating_over_wss() {
 
     drop(ws);
     drop(event_sub);
+}
+
+/// Daemon-level subscription registry over the real WSS wire: a chief
+/// (`__chief__`) parent watching a child in a regular workspace receives its
+/// completion wake — and the `agent:subscriptions-changed` events — in the
+/// PARENT's home workspace, not the child's.
+///
+/// Drives `agent.wakeOrCreate` with `callerAgentId` (the SUB-1 sender
+/// auto-watch registration path), completes the child's turn via the mock ACP
+/// provider, and asserts:
+/// - the wake response carries a `subscriptionId` (cross-workspace watch
+///   registered, not rejected),
+/// - `agent.getSubscriptions` reports the watch anchored under `__chief__`,
+/// - an `events.subscribe` on `__chief__` observes `agent:subscriptions-changed`
+///   for the chief parent,
+/// - the `[WORKSPACE EVENTS]` completion wake lands in the chief parent's
+///   transcript.
+///
+/// Gated on the mock ACP fixture; skips cleanly otherwise.
+#[tokio::test]
+async fn chief_cross_workspace_completion_wake_over_wss() {
+    let Some(script) = gate("WSS chief cross-workspace wake E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let behavior = json!({ "response": "done" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // A regular (non-chief) workspace holding the child agent + task note.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        2,
+        "workspace.create",
+        json!({ "title": "Chief Child WS", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = resp["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // The chief parent lives in `__chief__`.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let chief_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("chief agent id")
+        .to_string();
+
+    // The child agent, assigned to a task note in the regular workspace.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Child", "model": "mock:default" }),
+    )
+    .await;
+    let child_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("child agent id")
+        .to_string();
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Chief-watched task" }),
+    )
+    .await;
+    let note_id = resp["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    wss_rpc_envelope(
+        &mut rpc,
+        7,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": child_id }),
+    )
+    .await;
+
+    // SUBSCRIBER on the CHIEF workspace — the parent's home is where both
+    // the registration-time and the delivery-time
+    // `agent:subscriptions-changed` must be published.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let resp = wss_rpc_envelope(
+        &mut sub,
+        8,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["agent:subscriptions-changed"],
+            "workspaceId": CHIEF_WORKSPACE_ID,
+        }),
+    )
+    .await;
+    assert!(
+        resp["result"]["subscriptionId"].is_string(),
+        "subscribed on __chief__: {resp}"
+    );
+
+    // The chief wakes the child, carrying its own id as `callerAgentId`: the
+    // sender auto-watch registers CROSS-WORKSPACE (parent home `__chief__`,
+    // child in `ws_id`) through the daemon-global registry.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        9,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": note_id,
+            "contextMessage": "chief kickoff",
+            "callerAgentId": chief_id,
+        }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "cross-workspace wakeOrCreate must not be rejected for a chief caller: {resp}"
+    );
+    let wake = &resp["result"];
+    assert_eq!(wake["ok"], json!(true), "wake ok: {wake}");
+    assert_eq!(
+        wake["agentId"],
+        json!(child_id),
+        "woke the assignee: {wake}"
+    );
+    assert!(
+        wake["subscriptionId"].is_string(),
+        "chief sender auto-subscribed across workspaces: {wake}"
+    );
+
+    // Registration published `agent:subscriptions-changed` in the PARENT's
+    // home workspace (`__chief__`), for the chief parent.
+    let frame = wss_event(&mut sub, 30).await;
+    let ev = &frame["params"]["event"];
+    assert_eq!(ev["type"], json!("agent:subscriptions-changed"));
+    assert_eq!(
+        ev["workspaceId"],
+        json!(CHIEF_WORKSPACE_ID),
+        "subscriptions-changed lands in the chief home workspace: {ev}"
+    );
+    assert_eq!(
+        ev["data"]["agentId"],
+        json!(chief_id),
+        "for the chief: {ev}"
+    );
+
+    // `agent.getSubscriptions` reports the watch anchored under `__chief__`
+    // (the parent's home — where the wake is delivered).
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        10,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
+    )
+    .await;
+    let subs = resp["result"]["subscriptions"]
+        .as_array()
+        .expect("subscriptions array");
+    assert_eq!(subs.len(), 1, "one chief watch: {subs:?}");
+    assert_eq!(subs[0]["workspaceId"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(subs[0]["actorIds"], json!([child_id]));
+
+    // The child completes its woken turn (mock provider) → agent:idle in the
+    // CHILD's workspace → the delivery worker wakes the chief parent in
+    // `__chief__`. Poll the chief transcript for the wake.
+    let mut delivered = false;
+    for attempt in 0..80i64 {
+        let resp = wss_rpc_envelope(
+            &mut rpc,
+            100 + attempt,
+            "agent.getConversation",
+            json!({ "agentId": chief_id }),
+        )
+        .await;
+        let text = serde_json::to_string(&resp["result"]["messages"]).unwrap_or_default();
+        if text.contains("[WORKSPACE EVENTS] Child agent") && text.contains(&child_id) {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        delivered,
+        "chief parent received the cross-workspace completion wake in __chief__"
+    );
+
+    // The consumed oneShot watch republished `agent:subscriptions-changed` in
+    // `__chief__` and the registry is empty for the chief again.
+    let frame = wss_event(&mut sub, 30).await;
+    let ev = &frame["params"]["event"];
+    assert_eq!(ev["workspaceId"], json!(CHIEF_WORKSPACE_ID));
+    assert_eq!(ev["data"]["agentId"], json!(chief_id));
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        200,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID, "agentId": chief_id }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["subscriptions"],
+        json!([]),
+        "oneShot watch consumed after delivery"
+    );
+
+    // Wind the chief's wake turn down before teardown.
+    let _ = wss_rpc_envelope(&mut rpc, 201, "agent.stop", json!({ "agentId": chief_id })).await;
 }

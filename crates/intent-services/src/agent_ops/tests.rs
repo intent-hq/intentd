@@ -190,14 +190,17 @@ async fn completion_delivery_wakes_oneshot_parent_and_removes_watch() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
 
-    let sub_id = svc.register_completion_watch(
-        &ws,
-        parent.clone(),
-        "Parent".into(),
-        child.clone(),
-        true,
-        None,
-    );
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
 
     let event = completion_event(
         &ws,
@@ -216,8 +219,8 @@ async fn completion_delivery_wakes_oneshot_parent_and_removes_watch() {
     assert_eq!(parent_session.messages.len(), 1);
 
     // The oneShot watch was removed after delivery.
-    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
-    assert!(!svc.remove_watch(&ws, &sub_id));
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(!svc.remove_watch(&sub_id));
 }
 
 #[tokio::test]
@@ -228,12 +231,14 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
 
     svc.register_completion_watch(
         &ws,
+        &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
         true,
         Some("group-1".into()),
-    );
+    )
+    .expect("register watch");
 
     let event = completion_event(
         &ws,
@@ -250,7 +255,7 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
         .await
         .expect("parent session");
     assert!(parent_session.messages.is_empty());
-    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
 /// The immediate-path wake persists FE-shaped `event_notification` metadata on
@@ -265,12 +270,14 @@ async fn completion_delivery_attaches_event_notification_metadata() {
 
     svc.register_completion_watch(
         &ws,
+        &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
         true,
         None,
-    );
+    )
+    .expect("register watch");
 
     let event = completion_event(
         &ws,
@@ -308,6 +315,232 @@ async fn completion_delivery_attaches_event_notification_metadata() {
     assert_eq!(events[0]["data"]["completionReport"], json!("done"));
     assert_eq!(events[0]["actor"]["type"], json!("agent"));
     assert_eq!(events[0]["actor"]["id"], json!(child.0));
+}
+
+/// Daemon-global registry: a chief-workspace parent's oneShot watch on a child
+/// in a regular workspace fires through the exact same delivery path, and the
+/// wake (plus `agent:subscriptions-changed`) lands in the PARENT's home
+/// workspace (`__chief__`), not the child's.
+#[tokio::test]
+async fn cross_workspace_chief_watch_delivers_wake_in_parent_home_workspace() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let sub_id = svc
+        .register_completion_watch(
+            &chief_ws,
+            &ws,
+            parent.clone(),
+            "Chief".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("chief cross-workspace watch is allowed");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+
+    let event = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "done" }),
+    );
+    svc.handle_completion_event(&event).await;
+
+    // The chief parent received exactly one wake and the watch is consumed.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1);
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(!svc.remove_watch(&sub_id));
+
+    // `agent:subscriptions-changed` is published in the PARENT's home
+    // workspace (`__chief__`), not the child's.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].workspace_id, chief_ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(parent.0.as_str()));
+}
+
+/// The registration safety gate: a non-chief parent may not watch a child
+/// outside its own workspace; the same pair is fine when the parent is
+/// chief-scoped, and same-workspace registration is unaffected.
+#[tokio::test]
+async fn register_watch_scope_gate_rejects_non_chief_cross_workspace_parent() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+    let child = create_agent(&svc, &ws_b, "Child").await;
+
+    let denied = svc.register_completion_watch(
+        &ws_a,
+        &ws_b,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    );
+    assert!(
+        denied.is_err(),
+        "non-chief cross-workspace watch must be rejected"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+
+    // Same-workspace registration still succeeds for the same parent.
+    svc.register_completion_watch(
+        &ws_a,
+        &ws_a,
+        parent.clone(),
+        "Parent".into(),
+        AgentId::from("agent-local-child"),
+        true,
+        None,
+    )
+    .expect("same-workspace watch is allowed");
+    assert_eq!(svc.list_watches_for_parent(&parent).len(), 1);
+}
+
+/// A scope-gate rejection in the after_all delegate path is side-effect free:
+/// the gate runs before the child is created and before the delegation group
+/// is created/enrolled, so a denied non-chief cross-workspace delegate leaves
+/// no group, no watch, and no orphaned Pending child behind.
+#[tokio::test]
+async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..Default::default()
+    };
+    let denied = svc
+        .agent_delegate_op(ws_b.clone(), input, Some(parent.clone()))
+        .await;
+    assert!(
+        denied.is_err(),
+        "non-chief cross-workspace after_all delegate must be rejected"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "rejection must not leave a partially-initialized group"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws_b)
+        .await
+        .expect("list ws-b sessions");
+    assert!(
+        sessions.is_empty(),
+        "rejection must not leave an orphaned child agent"
+    );
+}
+
+/// Chief-anchored after_all group: children in a regular workspace, group
+/// anchored (and persisted) under `__chief__`. Sealing on the chief parent's
+/// idle and completing both children fires ONE aggregated wake to the chief
+/// parent, and the persisted row carries the chief anchor workspace.
+#[tokio::test]
+async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
+    let (_t, svc, ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let c1 = create_agent(&svc, &ws, "Child1").await;
+    let c2 = create_agent(&svc, &ws, "Child2").await;
+
+    let gid = svc.get_or_create_delegation_group(&chief_ws, &parent);
+    for child in [&c1, &c2] {
+        svc.enroll_child_in_group(&gid, child);
+        svc.register_completion_watch(
+            &chief_ws,
+            &ws,
+            parent.clone(),
+            "Chief".into(),
+            (*child).clone(),
+            false,
+            Some(gid.clone()),
+        )
+        .expect("chief grouped watch");
+    }
+
+    // The group persists under its anchor workspace (`__chief__`), so a
+    // restart rehydrates it from the chief workspace, not the children's.
+    let seal_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = svc
+            .store()
+            .list_undelivered_groups(&chief_ws)
+            .await
+            .expect("list persisted groups");
+        if rows.iter().any(|r| r.group_id == gid) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < seal_deadline,
+            "group row persisted under the chief anchor workspace"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // First child settles: group not complete, no wake yet.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c1,
+        json!({ "agentId": c1.0, "lastResponseSummary": "one" }),
+    ))
+    .await;
+    // The chief parent idles (its delegating turn ends): the group seals.
+    svc.handle_completion_event(&completion_event(
+        &chief_ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    // Second child settles: group complete → single aggregated wake.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c2,
+        json!({ "agentId": c2.0, "lastResponseSummary": "two" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("chief parent session");
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "exactly one aggregated wake to the chief parent"
+    );
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
 /// The aggregated after_all wake carries `event_notification` metadata whose
@@ -493,12 +726,14 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     // The parent also parents a pending completion watch: isWaitingForOtherAgents.
     svc.register_completion_watch(
         &ws,
+        &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
         true,
         None,
-    );
+    )
+    .expect("register watch");
 
     let lite = svc.agent_get_op(parent.clone(), None).await.expect("get");
     let v = serde_json::to_value(&lite).unwrap();
@@ -542,12 +777,14 @@ async fn agent_lite_activity_flags_reflect_busy_waiting_state() {
     // waiting-on list (distinct child ids, registration order).
     svc.register_completion_watch(
         &ws,
+        &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
         true,
         None,
-    );
+    )
+    .expect("register watch");
     let v =
         serde_json::to_value(svc.agent_get_op(parent.clone(), None).await.expect("get")).unwrap();
     assert_eq!(v["waitingForAgentIds"], json!([child.0]));
@@ -1776,7 +2013,7 @@ async fn watch_completion_dedupe() {
     );
 
     // Only one watch should exist
-    let watches = svc.list_watches_for_parent(&ws, &parent);
+    let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 1, "only one watch should exist after dedupe");
 
     // Deliver an idle event - parent should receive exactly ONE wake
@@ -1842,7 +2079,7 @@ async fn report_to_parent_delivers_immediate_wake_then_idle_suppressed() {
     // No second wake fires — idle suppression working.
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 1);
     // The oneShot watch is consumed after the idle suppression.
-    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+    assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
 /// Regression for PR #237: after a child calls reportToParent (which marks the
@@ -1958,7 +2195,7 @@ async fn wake_or_create_reuses_existing_watch_no_duplicate() {
         .expect("wake 2");
     // The second wake reuses the first watch's subscription id.
     assert_eq!(r1["subscriptionId"], r2["subscriptionId"]);
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1, "no duplicate watches: {watches:?}");
 
     // A single terminal agent:idle produces exactly one parent wake.
@@ -1996,7 +2233,7 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
         .await
         .expect("wake 1");
     let sub_id = r1["subscriptionId"].as_str().expect("sub id").to_string();
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].parent_agent_name, "OldName");
 
@@ -2012,7 +2249,7 @@ async fn wake_or_create_reuse_refreshes_parent_agent_name() {
         .await
         .expect("wake 2");
     assert_eq!(r2["subscriptionId"].as_str(), Some(sub_id.as_str()));
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1, "still no duplicate watches: {watches:?}");
     assert_eq!(
         watches[0].parent_agent_name, "NewName",
@@ -2049,16 +2286,16 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
         .await
         .expect("wake 1");
     let sub1 = r1["subscriptionId"].as_str().expect("sub id").to_string();
-    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 
     // Simulate the concurrent removal window (deliver_completion_to_watches
     // dropping the oneShot watch, or an expired queued-watch cleanup task
     // removing it) by dropping the seeded watch directly.
     assert!(
-        svc.remove_watch(&ws, &sub1),
+        svc.remove_watch(&sub1),
         "seeded watch must be removed for the race scenario"
     );
-    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
 
     // Second wake finds no live watch to reuse and MUST create a new one —
     // the caller must never be handed back the dead subscription id.
@@ -2068,7 +2305,7 @@ async fn wake_or_create_reuse_after_removal_registers_fresh_watch() {
         .expect("wake 2");
     let sub2 = r2["subscriptionId"].as_str().expect("sub id").to_string();
     assert_ne!(sub1, sub2, "must not reuse the dead subscription id");
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1, "one fresh live watch: {watches:?}");
     assert_eq!(watches[0].id, sub2, "returned id points to the live watch");
 }
@@ -3773,40 +4010,46 @@ async fn completion_watch_registry_register_find_list_remove() {
     let child_a = AgentId::from("agent-00000000-0000-0000-0000-0000000child");
     let child_b = AgentId::from("agent-00000000-0000-0000-0000-000000childb");
 
-    let sub_a = svc.register_completion_watch(
-        &ws,
-        parent.clone(),
-        "Parent".into(),
-        child_a.clone(),
-        true,
-        None,
-    );
-    let sub_b = svc.register_completion_watch(
-        &ws,
-        parent.clone(),
-        "Parent".into(),
-        child_b.clone(),
-        true,
-        None,
-    );
+    let sub_a = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child_a.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
+    let sub_b = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child_b.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
     assert_ne!(sub_a, sub_b);
 
-    let for_child_a = svc.find_watches_for_child(&ws, &child_a);
+    let for_child_a = svc.find_watches_for_child(&child_a);
     assert_eq!(for_child_a.len(), 1);
     assert_eq!(for_child_a[0].id, sub_a);
     assert!(for_child_a[0].one_shot);
     assert_eq!(for_child_a[0].parent_agent_id, parent);
     assert_eq!(for_child_a[0].child_agent_id, child_a);
 
-    assert_eq!(svc.list_watches_for_parent(&ws, &parent).len(), 2);
+    assert_eq!(svc.list_watches_for_parent(&parent).len(), 2);
 
-    assert!(svc.remove_watch(&ws, &sub_a));
-    assert!(!svc.remove_watch(&ws, &sub_a));
-    assert!(svc.find_watches_for_child(&ws, &child_a).is_empty());
-    assert_eq!(svc.list_watches_for_parent(&ws, &parent).len(), 1);
+    assert!(svc.remove_watch(&sub_a));
+    assert!(!svc.remove_watch(&sub_a));
+    assert!(svc.find_watches_for_child(&child_a).is_empty());
+    assert_eq!(svc.list_watches_for_parent(&parent).len(), 1);
 
-    assert_eq!(svc.remove_all_for_parent(&ws, &parent), 1);
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert_eq!(svc.remove_all_for_parent(&parent), 1);
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
 /// MCP front door (caller set), default wait mode: exactly one oneShot watch is
@@ -3826,11 +4069,11 @@ async fn delegate_immediate_registers_one_oneshot_watch_for_mcp_caller() {
         .expect("delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert!(watches[0].one_shot);
     assert_eq!(watches[0].child_agent_id, child);
-    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
 /// RPC front door (caller `None`): no watch is registered.
@@ -3842,7 +4085,7 @@ async fn delegate_rpc_path_registers_no_watch() {
         .await
         .expect("rpc delegate");
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
-    assert!(svc.find_watches_for_child(&ws, &child).is_empty());
+    assert!(svc.find_watches_for_child(&child).is_empty());
 }
 
 /// `wait_mode == "after_all"` (AS-4): the child is enrolled in the parent's
@@ -3863,11 +4106,11 @@ async fn delegate_after_all_enrolls_group_and_registers_group_watch() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
 
     let group = svc
-        .delegation_group_for_parent(&ws, &caller)
+        .delegation_group_for_parent(&caller)
         .expect("group exists");
     assert_eq!(group.expected_agent_ids, vec![child.clone()]);
 
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert!(!watches[0].one_shot);
     assert_eq!(
@@ -3901,7 +4144,7 @@ async fn delegate_skips_watch_when_parent_deleted() {
     )
     .await
     .expect("delegate");
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
 /// `agent_watch_completion_op` (AS-5, the MCP `create_agent` auto-subscribe):
@@ -3920,13 +4163,13 @@ async fn watch_completion_registers_oneshot_watch() {
     assert_eq!(resp["ok"], serde_json::json!(true));
     let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
 
-    let watches = svc.list_watches_for_parent(&ws, &parent);
+    let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
     assert!(watches[0].one_shot);
     assert!(watches[0].group_id.is_none());
     assert_eq!(watches[0].child_agent_id, child);
-    assert_eq!(svc.find_watches_for_child(&ws, &child).len(), 1);
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
 }
 
 /// The deleted-parent guard applies to the `create_agent` auto-subscribe too:
@@ -3953,7 +4196,7 @@ async fn watch_completion_skips_when_parent_deleted() {
         .expect("watch completion");
     assert_eq!(resp["ok"], serde_json::json!(false));
     assert!(resp["subscriptionId"].is_null());
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
 // SUB-1 — sender auto-subscribe on the send/wake coordination paths.
@@ -3975,7 +4218,7 @@ async fn sender_watch_registers_oneshot_for_foreground_caller() {
     assert_eq!(resp["ok"], serde_json::json!(true));
     let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
 
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
     assert!(watches[0].one_shot);
@@ -4013,7 +4256,7 @@ async fn sender_watch_skips_delegated_background_caller() {
         .expect("sender watch");
     assert_eq!(resp["ok"], serde_json::json!(false));
     assert!(resp["subscriptionId"].is_null());
-    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
 }
 
 /// `agent.wakeOrCreate` woke-existing with a caller: the caller gets a oneShot
@@ -4045,7 +4288,7 @@ async fn wake_or_create_woke_existing_subscribes_caller() {
         "notification text parity: {message}"
     );
 
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
     assert!(watches[0].one_shot);
@@ -4075,7 +4318,7 @@ async fn wake_or_create_without_caller_registers_no_watch() {
     assert_eq!(resp["action"], "woke_existing");
     assert!(resp.get("subscriptionId").is_none());
     assert!(resp.get("message").is_none());
-    assert!(svc.find_watches_for_child(&ws, &target).is_empty());
+    assert!(svc.find_watches_for_child(&target).is_empty());
 }
 
 /// Queued-to-active wake: the context message queues behind the assignee's
@@ -4114,7 +4357,7 @@ async fn wake_or_create_queued_registers_non_oneshot_watch() {
         "notification text parity: {message}"
     );
 
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].id, sub_id);
     assert!(!watches[0].one_shot, "queued watch must survive agent:idle");
@@ -4130,15 +4373,18 @@ async fn spawn_watch_cleanup_removes_watch_after_timeout() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
-    let sub_id = svc.register_completion_watch(
-        &ws,
-        caller.clone(),
-        "Coordinator".into(),
-        target.clone(),
-        false,
-        None,
-    );
-    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Coordinator".into(),
+            target.clone(),
+            false,
+            None,
+        )
+        .expect("register watch");
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 
     svc.spawn_watch_cleanup(
         ws.clone(),
@@ -4148,7 +4394,7 @@ async fn spawn_watch_cleanup_removes_watch_after_timeout() {
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        if svc.list_watches_for_parent(&ws, &caller).is_empty() {
+        if svc.list_watches_for_parent(&caller).is_empty() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4177,14 +4423,17 @@ async fn wake_or_create_queued_does_not_reuse_or_receive_oneshot_watch() {
 
     // Seed a oneShot watch for this caller/target pair (as an earlier
     // non-queued wake would have registered).
-    let oneshot_sub_id = svc.register_completion_watch(
-        &ws,
-        caller.clone(),
-        "Coordinator".into(),
-        target.clone(),
-        true,
-        None,
-    );
+    let oneshot_sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Coordinator".into(),
+            target.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
 
     // Occupy the assignee's in-flight slot so the wakeOrCreate takes the
     // queued branch deterministically.
@@ -4215,7 +4464,7 @@ async fn wake_or_create_queued_does_not_reuse_or_receive_oneshot_watch() {
 
     // Both watches now coexist: the oneShot watch is unchanged and a
     // fresh non-oneShot watch was registered for the queued delivery.
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(
         watches.len(),
         2,
@@ -4251,15 +4500,18 @@ async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
-    let sub_id = svc.register_completion_watch(
-        &ws,
-        caller.clone(),
-        "Coordinator".into(),
-        target.clone(),
-        false,
-        None,
-    );
-    assert_eq!(svc.list_watches_for_parent(&ws, &caller).len(), 1);
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Coordinator".into(),
+            target.clone(),
+            false,
+            None,
+        )
+        .expect("register watch");
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 
     // Arm a short cleanup, then immediately extend it with a much later
     // deadline before the first timer can fire.
@@ -4280,7 +4532,7 @@ async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
     // the watch it would be gone here — that is the bug this test guards
     // against.
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(
         watches.len(),
         1,
@@ -4290,7 +4542,7 @@ async fn spawn_watch_cleanup_extension_defers_removal_to_the_later_deadline() {
     // Wait past the extended deadline; the later task must fire and remove.
     let removal_deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < removal_deadline {
-        if svc.list_watches_for_parent(&ws, &caller).is_empty() {
+        if svc.list_watches_for_parent(&caller).is_empty() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4308,19 +4560,22 @@ async fn spawn_watch_cleanup_skips_when_deadline_bump_misses() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Target").await;
-    let sub_id = svc.register_completion_watch(
-        &ws,
-        caller.clone(),
-        "Coordinator".into(),
-        target.clone(),
-        false,
-        None,
-    );
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Coordinator".into(),
+            target.clone(),
+            false,
+            None,
+        )
+        .expect("register watch");
 
     // Stand in for a concurrent removal: drop the watch before the cleanup
     // task would be armed.
-    assert!(svc.remove_watch(&ws, &sub_id), "seed removal");
-    assert!(svc.list_watches_for_parent(&ws, &caller).is_empty());
+    assert!(svc.remove_watch(&sub_id), "seed removal");
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
 
     // The arm must observe the missing watch, skip the tokio::spawn, and
     // report `false`. Waiting past the requested delay must not resurrect
@@ -4337,7 +4592,7 @@ async fn spawn_watch_cleanup_skips_when_deadline_bump_misses() {
     );
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
-        svc.list_watches_for_parent(&ws, &caller).is_empty(),
+        svc.list_watches_for_parent(&caller).is_empty(),
         "registry stays empty; the skipped cleanup task cannot side-effect it",
     );
 }
@@ -4353,20 +4608,23 @@ async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
     let (_t, svc, ws) = setup().await;
     let caller = create_agent(&svc, &ws, "Coordinator").await;
     let target = create_agent(&svc, &ws, "Assignee").await;
-    let sub_id = svc.register_completion_watch(
-        &ws,
-        caller.clone(),
-        "Coordinator".into(),
-        target.clone(),
-        true,
-        None,
-    );
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Coordinator".into(),
+            target.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
 
     // Reuse with no resolved name: still returns the same subscription id
     // (reuse proceeds), and the stored `parent_agent_name` is untouched.
-    let reused = svc.find_and_refresh_ungrouped_watch(&ws, &caller, &target, true, None);
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(
         watches[0].parent_agent_name, "Coordinator",
@@ -4377,10 +4635,54 @@ async fn find_and_refresh_ungrouped_watch_preserves_name_when_lookup_fails() {
     // before, so the `None` short-circuit is scoped to the lookup-failed
     // case rather than disabling the refresh entirely.
     let reused =
-        svc.find_and_refresh_ungrouped_watch(&ws, &caller, &target, true, Some("Renamed".into()));
+        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, Some("Renamed".into()), None);
     assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches[0].parent_agent_name, "Renamed");
+}
+
+/// Reuse corrects a stale parent anchor: a watch registered with a fallback
+/// `parent_workspace_id` (transient parent-session lookup failure) has its
+/// anchor fixed when a later reuse resolves the parent's true home workspace,
+/// so wakes land in the right place. A `None` resolved home (lookup failed
+/// again) leaves the anchor untouched.
+#[tokio::test]
+async fn find_and_refresh_ungrouped_watch_corrects_fallback_parent_anchor() {
+    let (_t, svc, ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let caller = create_agent(&svc, &chief_ws, "Chief").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    // Simulate the fallback registration: the chief parent's watch was
+    // anchored under the CHILD's workspace because the session lookup failed.
+    let sub_id = svc
+        .register_completion_watch(
+            &ws,
+            &ws,
+            caller.clone(),
+            "Chief".into(),
+            target.clone(),
+            true,
+            None,
+        )
+        .expect("register watch with fallback anchor");
+
+    // Reuse with no resolved home: anchor untouched.
+    let reused = svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, None);
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    assert_eq!(
+        svc.list_watches_for_parent(&caller)[0].parent_workspace_id,
+        ws
+    );
+
+    // Reuse with the parent's true home resolved: anchor corrected.
+    let reused =
+        svc.find_and_refresh_ungrouped_watch(&caller, &target, true, None, Some(&chief_ws));
+    assert_eq!(reused.as_deref(), Some(sub_id.as_str()));
+    assert_eq!(
+        svc.list_watches_for_parent(&caller)[0].parent_workspace_id,
+        chief_ws,
+        "resolved home workspace must correct a fallback-registered anchor"
+    );
 }
 
 /// End-to-end through the MCP front door: delegating with a caller registers
@@ -4416,7 +4718,7 @@ async fn mcp_delegate_immediate_registers_oneshot_watch() {
     let parsed: serde_json::Value = serde_json::from_str(text).expect("tool json");
     let child = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
 
-    let watches = svc.list_watches_for_parent(&ws, &caller);
+    let watches = svc.list_watches_for_parent(&caller);
     assert_eq!(watches.len(), 1);
     assert_eq!(watches[0].child_agent_id, child);
     assert!(watches[0].one_shot);
@@ -5069,13 +5371,13 @@ async fn two_after_all_delegates_share_one_group() {
     let c2 = delegate_after_all(&svc, &ws, &parent).await;
 
     let group = svc
-        .delegation_group_for_parent(&ws, &parent)
+        .delegation_group_for_parent(&parent)
         .expect("group exists");
     assert_eq!(group.expected_agent_ids.len(), 2);
     assert!(group.expected_agent_ids.contains(&c1));
     assert!(group.expected_agent_ids.contains(&c2));
 
-    let watches = svc.list_watches_for_parent(&ws, &parent);
+    let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(watches.len(), 2);
     assert!(watches.iter().all(|w| !w.one_shot));
     assert!(watches
@@ -5118,8 +5420,8 @@ async fn group_fires_once_after_parent_then_remaining_child() {
     ))
     .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
-    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
 /// Both children idle before the parent: no fire until the parent idles, then a
@@ -5150,8 +5452,8 @@ async fn group_fires_on_parent_idle_when_children_already_done() {
     ))
     .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
-    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 }
 
 /// A deleted child counts toward completion as `partial`: after the parent
@@ -5456,13 +5758,13 @@ async fn wait_for_message_count(svc: &Services, parent: &AgentId, expected: usiz
 /// deterministic rather than timing-dependent.
 async fn wait_for_group_children(
     svc: &Services,
-    workspace_id: &WorkspaceId,
+    _workspace_id: &WorkspaceId,
     parent: &AgentId,
     n: usize,
 ) {
     timeout(Duration::from_secs(2), async {
         loop {
-            if let Some(g) = svc.delegation_group_for_parent(workspace_id, parent) {
+            if let Some(g) = svc.delegation_group_for_parent(parent) {
                 if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
                     return;
                 }
@@ -5526,7 +5828,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
     .await;
     wait_for_message_count(&svc, &parent, 1).await;
 
-    assert!(svc.find_watches_for_child(&ws, &child1).is_empty());
+    assert!(svc.find_watches_for_child(&child1).is_empty());
     let subs = svc
         .agent_get_subscriptions(ws.clone(), parent.clone())
         .await
@@ -5577,8 +5879,8 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         "a deleted child should yield a partial aggregated wake"
     );
 
-    assert!(svc.delegation_group_for_parent(&ws, &parent).is_none());
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert!(svc.delegation_group_for_parent(&parent).is_none());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
     let subs = svc
         .agent_get_subscriptions(ws.clone(), parent.clone())
         .await
@@ -5612,7 +5914,7 @@ async fn as6_end_to_end_auto_subscription_over_bus() {
         .await
         .expect("subs");
     assert!(subs["subscriptions"].as_array().expect("array").is_empty());
-    assert!(svc.list_watches_for_parent(&ws, &parent).is_empty());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
 
     worker.abort();
 }
@@ -5627,12 +5929,14 @@ async fn diagnostics_snapshot_shape_and_subscriptions() {
     let child = create_agent(&svc, &ws, "Child").await;
     svc.register_completion_watch(
         &ws,
+        &ws,
         parent.clone(),
         "Parent".into(),
         child.clone(),
         true,
         None,
-    );
+    )
+    .expect("register watch");
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
@@ -5701,12 +6005,14 @@ async fn diagnostics_flags_orphaned_subscription() {
     let ghost = AgentId::from("agent-ghost");
     svc.register_completion_watch(
         &ws,
+        &ws,
         ghost.clone(),
         "Ghost".into(),
         child.clone(),
         true,
         None,
-    );
+    )
+    .expect("register watch");
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, None, None)
@@ -6874,11 +7180,11 @@ async fn sub1_sendtotask_after_all_no_duplicate_wake() {
 
     // Verify child_in_undelivered_group returns true (the core of the fix)
     assert!(
-        svc.child_in_undelivered_group(&ws, &parent, &child_a),
+        svc.child_in_undelivered_group(&parent, &child_a),
         "child A should be in undelivered group"
     );
     assert!(
-        svc.child_in_undelivered_group(&ws, &parent, &child_b),
+        svc.child_in_undelivered_group(&parent, &child_b),
         "child B should be in undelivered group"
     );
 
@@ -7154,7 +7460,8 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     // Seed a completion watch (Alpha → Beta), a live-turn slot for Alpha,
     // and a queued message for Gamma — the three in-memory registries the
     // delete path must sweep.
-    svc.register_completion_watch(&ws, a.clone(), "Alpha".into(), b.clone(), true, None);
+    svc.register_completion_watch(&ws, &ws, a.clone(), "Alpha".into(), b.clone(), true, None)
+        .expect("register watch");
     svc.set_live_turn(
         &a,
         "msg-live",
@@ -7163,7 +7470,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     svc.enqueue_message(&c, "queued follow-up".to_string(), None, None, None);
     assert!(svc.live_turn(&a).is_some(), "live-turn slot seeded");
     assert!(svc.has_ready_to_send(&c), "queue seeded");
-    assert_eq!(svc.find_watches_for_child(&ws, &b).len(), 1);
+    assert_eq!(svc.find_watches_for_child(&b).len(), 1);
 
     let mut sub = bus.subscribe(SubscriptionFilter {
         event_types: vec![
@@ -7181,7 +7488,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     // completion-watch entries left for the workspace.
     assert!(svc.live_turn(&a).is_none(), "live-turn cleared on delete");
     assert!(!svc.has_ready_to_send(&c), "queue cleared on delete");
-    assert!(svc.find_watches_for_child(&ws, &b).is_empty());
+    assert!(svc.find_watches_for_child(&b).is_empty());
     assert!(svc.all_watches(&ws).is_empty());
 
     // Store rows are gone — the cascade ran after the live-state sweep.
@@ -7587,7 +7894,7 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     // poll until the registry reaches its settled state.
     let watches = timeout(Duration::from_secs(2), async {
         loop {
-            let watches = svc.list_watches_for_parent(&ws, &parent);
+            let watches = svc.list_watches_for_parent(&parent);
             let settled = watches.iter().all(|w| w.group_id.is_none())
                 && watches.iter().any(|w| w.child_agent_id == child_b);
             if settled {
@@ -7635,7 +7942,7 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     );
 
     // The oneShot watch is consumed by the delivery.
-    let watches_after = svc.list_watches_for_parent(&ws, &parent);
+    let watches_after = svc.list_watches_for_parent(&parent);
     assert!(
         !watches_after.iter().any(|w| w.child_agent_id == child_b),
         "oneShot watch removed after the late completion delivered"
@@ -7684,14 +7991,14 @@ async fn grouped_child_failure_wakes_parent_immediately() {
     // The group is still live (it still owns settlement) and both grouped
     // watches remain in place.
     let group = svc
-        .delegation_group_for_parent(&ws, &parent)
+        .delegation_group_for_parent(&parent)
         .expect("group must remain live after the immediate failure wake");
     assert_eq!(
         group.completed_agent_ids.len() + group.deleted_agent_ids.len(),
         1,
         "only the failed child is recorded so far"
     );
-    let watches = svc.list_watches_for_parent(&ws, &parent);
+    let watches = svc.list_watches_for_parent(&parent);
     assert_eq!(
         watches.len(),
         2,
@@ -7754,6 +8061,7 @@ fn settled_group(
 ) -> crate::agent_subscriptions::DelegationGroup {
     crate::agent_subscriptions::DelegationGroup {
         group_id: "group-test".into(),
+        workspace_id: ws.clone(),
         parent_agent_id: AgentId::from("agent-parent"),
         await_mode: "all".into(),
         expected_agent_ids: children.iter().map(|(id, _)| (*id).clone()).collect(),
