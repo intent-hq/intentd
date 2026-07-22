@@ -41,10 +41,14 @@ pub async fn descendant_pids(root: u32) -> Vec<i32> {
 /// snapshot rather than an error — the sweep is a backstop, never a kill
 /// failure.
 pub async fn descendant_pids_many(roots: &[u32]) -> Vec<i32> {
-    let roots: Vec<i32> = roots
+    let mut roots: Vec<i32> = roots
         .iter()
         .filter_map(|&r| i32::try_from(r).ok())
         .collect();
+    // Dedupe so repeated roots neither inflate the snapshot cap (which scales
+    // with root count) nor add redundant BFS work.
+    roots.sort_unstable();
+    roots.dedup();
     if roots.is_empty() {
         return Vec::new();
     }
