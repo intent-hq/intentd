@@ -127,8 +127,10 @@ pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// The probe child runs with an isolated `CODEX_HOME` (fresh per-probe temp
 /// dir, removed after the probe) so the user's `~/.codex/config.toml` — and
 /// any `mcp_servers` it registers — is never loaded by the throwaway
-/// codex-acp process. Only `auth.json` is seeded into the isolated home so a
-/// logged-in codex stays logged in.
+/// codex-acp process. `auth.json` is seeded into the isolated home so a
+/// logged-in codex stays logged in, plus a minimal `config.toml` carrying
+/// only the user's configured `model` / `model_reasoning_effort` so that
+/// model appears in the reported catalog.
 pub async fn fetch_codex_models() -> ProviderModelsFetch {
     let cmd = if let Some(bin) = find_provider_binary("codex", "codex-acp", None) {
         AcpProbeCommand::binary(bin, Vec::new())
@@ -176,10 +178,23 @@ fn user_codex_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex"))
 }
 
+/// Top-level scalar keys copied from the user's `config.toml` into the
+/// isolated probe home. `model` (and its effort) is what surfaces
+/// user-configured models (e.g. a newer model than the adapter presets) in
+/// codex-acp's reported catalog. Everything else — notably `mcp_servers` —
+/// is deliberately never copied. Known limitation: a model configured only
+/// via a codex profile (`profile = "x"` + `[profiles.x].model`) or backed by
+/// a custom `[model_providers.*]` entry is not seeded — only top-level
+/// scalars are read.
+const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort"];
+
 /// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires
-/// the directory to exist). Only `auth.json` is copied from `user_codex_dir`;
-/// `config.toml` is deliberately NOT copied so user-configured `mcp_servers`
-/// never start under the probe.
+/// the directory to exist). `auth.json` is copied from `user_codex_dir` so a
+/// logged-in codex stays logged in, and a minimal `config.toml` holding only
+/// the [`CODEX_CONFIG_SEED_KEYS`] scalars is seeded so the user's configured
+/// model shows up in the probe's catalog. The user's full `config.toml` is
+/// deliberately NOT copied so user-configured `mcp_servers` never start under
+/// the probe.
 fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::Builder::new()
         .prefix("intentd-codex-home-")
@@ -193,8 +208,48 @@ fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfil
                 );
             }
         }
+        if let Some(seed) = minimal_codex_config_seed(&user_dir.join("config.toml")) {
+            if let Err(e) = std::fs::write(dir.path().join("config.toml"), seed) {
+                tracing::warn!(
+                    "failed to seed minimal config.toml into isolated CODEX_HOME (probe will use adapter presets): {e}"
+                );
+            }
+        }
     }
     Ok(dir)
+}
+
+/// Build the minimal `config.toml` text to seed into the isolated probe home:
+/// only the [`CODEX_CONFIG_SEED_KEYS`] top-level string values from the
+/// user's config at `path`. Returns `None` — seed nothing, the probe still
+/// works with adapter presets — when the file is absent, unreadable, or
+/// malformed, or when none of the allowlisted keys hold a string.
+fn minimal_codex_config_seed(path: &Path) -> Option<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("could not read user codex config.toml; seeding nothing: {e}");
+            return None;
+        }
+    };
+    let doc: toml_edit::DocumentMut = match text.parse() {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!("user codex config.toml is malformed; seeding nothing: {e}");
+            return None;
+        }
+    };
+    let mut seed = toml_edit::DocumentMut::new();
+    for key in CODEX_CONFIG_SEED_KEYS {
+        if let Some(value) = doc.get(key).and_then(|item| item.as_str()) {
+            seed[key] = toml_edit::value(value);
+        }
+    }
+    if seed.as_table().is_empty() {
+        return None;
+    }
+    Some(seed.to_string())
 }
 
 /// pi: ACP probe via the pinned npx adapter. Models may arrive under

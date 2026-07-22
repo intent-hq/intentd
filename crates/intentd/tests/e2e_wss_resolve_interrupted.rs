@@ -1,6 +1,6 @@
 //! WSS end-to-end for `agent.resolveInterrupted` (INT-41, agent-resumption phase 2).
 //!
-//! Boots a real `intentd serve --listen both`, creates interrupted agent rows,
+//! Boots a real `intentd serve` (WSS listener enabled via config), creates interrupted agent rows,
 //! then calls `agent.resolveInterrupted` to resume/abandon them. Verifies that
 //! resumed agents receive continuation messages and abandoned agents get system
 //! interruption messages.
@@ -268,10 +268,11 @@ async fn resolve_interrupted_resume_and_abandon() {
     let socket = data_dir.join("intentd.sock");
 
     // Phase 1: Boot daemon, create workspace, seed two interrupted agent rows.
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -562,10 +563,11 @@ async fn resolve_interrupted_invalid_params_validation() {
     let socket = data_dir.join("intentd.sock");
 
     // Boot daemon
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")

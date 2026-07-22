@@ -1,23 +1,17 @@
-//! WSS e2e for the FirstTurnPrepend system-prompt fallback (§18.1).
+//! WSS e2e for post-session model application via `session/set_config_option`.
 //!
-//! The `mock` provider is registered with
-//! `InjectionMechanism::FirstTurnPrepend` (like cortex): it has no native
-//! system-prompt mechanism, so the daemon must deliver the assembled prompt by
-//! prepending it as a `<system>` block to the FIRST prompt of each fresh ACP
-//! session. This suite drives a specialist agent over the real WSS transport
-//! and asserts — via the mock fixture's `MOCK_AGENT_PROMPT_LOG` seam — the
-//! exact prompt text the provider received on each turn:
+//! Providers whose adapter exposes the model as a `configOptions[id="model"]`
+//! select (`supports_config_option_model`; claude-code's pinned adapter) get
+//! the stored model applied right after session establishment via
+//! `session/set_config_option { sessionId, configId: "model", value }` —
+//! verified live against claude-agent-acp@0.60.0. This suite drives the real
+//! daemon over WSS with the mock provider flipped into that mode
+//! (`MOCK_AGENT_CONFIG_OPTION_MODEL=1`) and asserts — via the fixture's
+//! `MOCK_AGENT_CONFIG_LOG` seam — the exact wire params the provider received:
 //!
-//! * Turn 1 starts with the `<system>`-wrapped assembled prompt (including the
-//!   `<specialist_role>` section) BEFORE the role reminder and user content.
-//! * Turn 2 (same session) does NOT repeat the block.
-//!
-//! SessionMeta note: the `_meta` mechanism (claude-code / codex) is keyed off
-//! the provider ID in `build_session_meta`, and the mock provider cannot be
-//! spawned under either of those IDs (spawn resolution and binary lookup are
-//! provider-ID-keyed). The `_meta` payload shapes are covered by the unit
-//! suites in `intent-services/src/agent_session/tests_meta.rs` and
-//! `intent-acp/src/tests.rs` instead.
+//! * The call fires once on the fresh session with the bare model id (the
+//!   compound `mock:` prefix stripped), BEFORE the first prompt resolves.
+//! * A second turn on the same live session does NOT re-issue it.
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
@@ -46,10 +40,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
-/// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
-/// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
     data_dir: PathBuf,
@@ -65,7 +57,7 @@ impl Drop for Daemon {
 
 fn temp_data_dir() -> PathBuf {
     let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-spf-{}", &id[..8]));
+    let dir = PathBuf::from("/tmp").join(format!("itd-cfgopt-{}", &id[..8]));
     std::fs::create_dir_all(&dir).expect("mkdir data dir");
     dir
 }
@@ -105,7 +97,6 @@ async fn await_uds(socket: &Path) -> bool {
     .is_ok()
 }
 
-/// One UDS JSON-RPC round-trip (used only to discover bound port + fingerprint).
 async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     let stream = UnixStream::connect(socket).await.expect("connect uds");
     let (read_half, mut write_half) = stream.into_split();
@@ -125,7 +116,6 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
-/// Pin the server's SHA-256 fingerprint (colon-UPPER hex over the DER cert).
 #[derive(Debug)]
 struct PinnedVerifier {
     fingerprint: String,
@@ -213,7 +203,6 @@ async fn tls_connect(
         .expect("tls connect")
 }
 
-/// Open an authenticated WSS connection (token in the query string).
 async fn connect_ws(
     port: u16,
     cfg: Arc<ClientConfig>,
@@ -226,8 +215,6 @@ async fn connect_ws(
     ws
 }
 
-/// Send one JSON-RPC frame and return the result whose id matches; any
-/// out-of-band notifications (`events.event`) are ignored.
 async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -282,25 +269,6 @@ where
     }
 }
 
-/// Mock-agent gate (parity with the WSS lifecycle suite).
-fn gate(test: &str) -> Option<String> {
-    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
-        format!(
-            "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
-        )
-    });
-    if intent_providers::resolve_on_path("node").is_none() {
-        eprintln!("skipping {test}: node not on PATH");
-        return None;
-    }
-    if !std::path::Path::new(&script).exists() {
-        eprintln!("skipping {test}: mock script missing at {script}");
-        return None;
-    }
-    Some(script)
-}
-
 /// Drain subscriber events until an `agent:stream:end` for `agent_id` arrives.
 async fn await_stream_end<S>(sub: &mut WebSocketStream<S>, agent_id: &str)
 where
@@ -316,114 +284,56 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
-/// Parse the mock fixture's prompt log: one `{ turn, text }` JSON per line.
-fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
-    let raw = std::fs::read_to_string(path).expect("read prompt log");
+/// Mock-agent gate (parity with the WSS lifecycle suite).
+fn gate() -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping WSS set_config_option E2E: node not on PATH");
+        return None;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping WSS set_config_option E2E: mock script missing at {script}");
+        return None;
+    }
+    Some(script)
+}
+
+/// Parse the fixture's config-option log: one JSON object per line, the exact
+/// `session/set_config_option` params the provider received.
+fn read_config_log(path: &Path) -> Vec<Value> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
     raw.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let v: Value = serde_json::from_str(l).expect("prompt log line json");
-            (
-                v["turn"].as_u64().expect("turn"),
-                v["text"].as_str().expect("text").to_string(),
-            )
-        })
+        .map(|l| serde_json::from_str(l).expect("config log line json"))
         .collect()
 }
 
-/// Pre-seed the daemon's SQLite store with a workspace (the daemon opens the
-/// same data dir on launch).
-async fn seed_workspace_only(data_dir: &Path) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
-    use intent_store::Store;
-    let db_path = data_dir.join("intentd.db");
-    let store = Store::open(&db_path).await.expect("open store");
-    let ws = WorkspaceId::new();
-    let ts = now_iso();
-    store
-        .insert_workspace(&Workspace {
-            id: ws.clone(),
-            title: "SPF-E2E".to_string(),
-            branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
-            created_at: ts.clone(),
-            updated_at: ts,
-            last_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-        })
-        .await
-        .expect("insert ws");
-    ws.0
-}
-
-/// FirstTurnPrepend over the real WSS transport: a specialist agent on the
-/// `mock` provider (registered `InjectionMechanism::FirstTurnPrepend`) must
-/// receive the assembled system prompt — `<system>`-wrapped, including the
-/// `<specialist_role>` section — prepended to the FIRST prompt of its fresh
-/// ACP session, ordered before the per-turn role reminder and the user
-/// content; the SECOND turn on the same session must NOT repeat it.
+/// The stored model reaches a config-option-model provider as
+/// `session/set_config_option { configId: "model", value: <bare id> }` once
+/// per fresh session — issued post-establishment, not repeated on a second
+/// turn over the same live child.
 #[tokio::test]
-async fn first_turn_prepend_delivers_system_prompt_over_wss() {
-    let Some(script) = gate("WSS FirstTurnPrepend E2E") else {
+async fn stored_model_applied_via_set_config_option_over_wss() {
+    let Some(script) = gate() else {
         return;
     };
 
     let data_dir = temp_data_dir();
-    let ws_id = seed_workspace_only(&data_dir).await;
-    // Hermetic specialist tier: a bundled dir with one specialist whose id is
-    // unique to this test (so a developer's user/project-tier `implementor.md`
-    // can never shadow it) and whose behaviorPrompt is a unique marker, so the
-    // assembled prompt provably contains the file-resolved <specialist_role>
-    // section.
-    let specialists_dir = data_dir.join("specialists");
-    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists");
-    std::fs::write(
-        specialists_dir.join("spf-e2e-tester.md"),
-        "---\nname: \"SpfTester\"\ndescription: \"d\"\nroleReminder: \"Stay in scope.\"\n---\n\nSPF_E2E_BEHAVIOR_MARKER: implement exactly what the task says.",
-    )
-    .expect("write specialist");
-    let prompt_log = data_dir.join("prompt-log.jsonl");
-    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
     let behavior = json!({ "response": "ok" }).to_string();
     let env: [(&str, &str); 6] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
-        (
-            "INTENTD_BUNDLED_SPECIALISTS_DIR",
-            specialists_dir.to_str().unwrap(),
-        ),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -442,9 +352,20 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
 
     // SUBSCRIBER conn — events.subscribe BEFORE the turns so we miss nothing.
     let mut sub = connect_ws(port, cfg.clone()).await;
-    let sub_resp = wss_rpc(
+    let ws_result = wss_rpc(
         &mut sub,
         1,
+        "workspace.create",
+        json!({ "title": "CfgOpt E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let sub_resp = wss_rpc(
+        &mut sub,
+        2,
         "events.subscribe",
         json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
     )
@@ -454,7 +375,7 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
         "subscribed: {sub_resp}"
     );
 
-    // RPC conn — create a specialist agent on the mock provider and run two turns.
+    // RPC conn — create an agent with a compound stored model and run two turns.
     let mut rpc = connect_ws(port, cfg.clone()).await;
     let created = wss_rpc(
         &mut rpc,
@@ -462,9 +383,8 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
         "agent.create",
         json!({
             "workspaceId": ws_id,
-            "name": "SPF",
-            "model": "mock:default",
-            "specialistId": "spf-e2e-tester",
+            "name": "CfgOpt",
+            "model": "mock:sonnet",
         }),
     )
     .await;
@@ -477,71 +397,142 @@ async fn first_turn_prepend_delivers_system_prompt_over_wss() {
         &mut rpc,
         11,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first user turn" }),
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
     await_stream_end(&mut sub, &agent_id).await;
 
+    // The daemon issued exactly one session/set_config_option on the fresh
+    // session, with the bare model id (compound `mock:` prefix stripped) and
+    // the exact live-verified wire shape { sessionId, configId, value }.
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "one set_config_option after turn 1: {log:?}");
+    assert_eq!(log[0]["configId"], "model", "configId: {:?}", log[0]);
+    assert_eq!(log[0]["value"], "sonnet", "bare model id: {:?}", log[0]);
+    assert!(
+        log[0]["sessionId"].is_string(),
+        "sessionId present: {:?}",
+        log[0]
+    );
+
+    // Turn 2 reuses the live session — no re-application.
     let sent2 = wss_rpc(
         &mut rpc,
         12,
         "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second user turn" }),
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "second turn" }),
     )
     .await;
     assert_eq!(sent2["success"], true, "second sendMessage ok: {sent2}");
     await_stream_end(&mut sub, &agent_id).await;
 
-    // The mock child logged the exact prompt text it received per turn.
-    let log = read_prompt_log(&prompt_log);
-    assert!(
-        log.len() >= 2,
-        "expected 2 logged prompts, got {}: {log:?}",
-        log.len()
+    let log = read_config_log(&config_log);
+    assert_eq!(
+        log.len(),
+        1,
+        "no re-issue on a reused live session: {log:?}"
     );
-    let (first_turn, first_text) = &log[0];
-    assert_eq!(*first_turn, 1, "first logged prompt is the child's turn 1");
-    assert!(
-        first_text.starts_with("<system>\n"),
-        "turn 1 must START with the <system>-wrapped assembled prompt: {first_text:?}"
-    );
-    assert!(
-        first_text.contains("<specialist_role>") && first_text.contains("SPF_E2E_BEHAVIOR_MARKER"),
-        "assembled prompt must include the file-resolved <specialist_role> section: {first_text:?}"
-    );
-    let sys_end = first_text
-        .find("\n</system>")
-        .expect("closing </system> tag on turn 1");
-    let after_system = &first_text[sys_end..];
-    assert!(
-        after_system.contains("[Role Reminder:"),
-        "role reminder must follow the <system> block: {first_text:?}"
-    );
-    assert!(
-        first_text
-            .find("[Role Reminder:")
-            .expect("role reminder present")
-            > sys_end,
-        "the <system> block must be OUTERMOST (before the role reminder)"
-    );
-    assert!(
-        first_text.ends_with("first user turn"),
-        "user content last on turn 1: {first_text:?}"
-    );
+}
 
-    let (second_turn, second_text) = &log[1];
-    assert_eq!(*second_turn, 2, "same child served turn 2 (no respawn)");
+/// A rejected `session/set_config_option` (e.g. an unknown model id) is
+/// best-effort: the daemon logs a warning, the provider keeps its default
+/// model, and the turn still completes.
+#[tokio::test]
+async fn set_config_option_failure_does_not_fail_the_turn() {
+    let Some(script) = gate() else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let config_log = data_dir.join("config-log.jsonl");
+    let config_log_str = config_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "ok", "rejectSetConfigOption": true }).to_string();
+    let env: [(&str, &str); 6] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_CONFIG_OPTION_MODEL", "1"),
+        ("MOCK_AGENT_CONFIG_LOG", &config_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let ws_result = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({ "title": "CfgOpt Reject E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = ws_result["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "CfgOptReject", "model": "mock:bogus-model" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "turn despite rejection" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    // The turn must still complete (stream:end) even though the provider
+    // rejected the config-option call.
+    await_stream_end(&mut sub, &agent_id).await;
+
+    // The daemon did attempt the call (with the bare stored id) …
+    let log = read_config_log(&config_log);
+    assert_eq!(log.len(), 1, "set_config_option was attempted: {log:?}");
+    assert_eq!(log[0]["configId"], "model", "configId: {:?}", log[0]);
+    assert_eq!(log[0]["value"], "bogus-model", "value: {:?}", log[0]);
+
+    // … and the agent is still healthy: transcript has the mock's response.
+    let messages = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let rendered = messages.to_string();
     assert!(
-        !second_text.contains("<system>\n") && !second_text.contains("<specialist_role>"),
-        "turn 2 on the SAME session must NOT repeat the system prompt: {second_text:?}"
-    );
-    assert!(
-        second_text.contains("[Role Reminder:"),
-        "per-turn role reminder still fires on turn 2: {second_text:?}"
-    );
-    assert!(
-        second_text.ends_with("second user turn"),
-        "user content last on turn 2: {second_text:?}"
+        rendered.contains("\"ok\""),
+        "assistant response landed despite the rejected set_config_option: {rendered}"
     );
 }
