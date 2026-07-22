@@ -26,15 +26,19 @@
 //! threads reconstruct via `threadId`/`parentId`, `markId`/`from`/`to` derive
 //! the anchor, and legacy fields intentd does not model land in `extra_json`.
 //! The rest of the `.meta/` sidecar (versions/CRDT/trash) is skipped entirely.
+//! Agent transcripts land last: `.workspace/agents/{agentId}.json` files (the
+//! legacy FE `AgentSession` shape) become `agent_session` rows plus ordered
+//! `agent_message` rows — always as terminal `Completed` historical sessions
+//! that the startup interrupted-agent heal sweep never touches.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use intent_core::{
-    now_iso, AgentId, AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus,
-    CommentType, ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata,
-    Workspace,
+    now_iso, AgentId, AgentSession, AgentStatus, AuthorType, Comment, CommentAnchor,
+    CommentAnchorType, CommentStatus, CommentType, ContentType, Error, Note, NoteId, NoteMetadata,
+    NoteVisibility, TaskMetadata, Workspace,
 };
 use intent_store::Store;
 use serde::Deserialize;
@@ -107,6 +111,31 @@ impl CommentCounts {
     }
 }
 
+/// Per-workspace agent-transcript-import counters (part of
+/// [`WorkspaceReport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentCounts {
+    /// Agent-session rows inserted.
+    pub sessions_imported: usize,
+    /// Sessions already present (idempotent skip, matched by id or by the
+    /// preserved legacy id).
+    pub sessions_skipped: usize,
+    /// Files that could not be read/parsed or sessions that failed to insert
+    /// (logged, never fatal).
+    pub sessions_failed: usize,
+    /// Message rows inserted across all imported sessions.
+    pub messages_imported: usize,
+    /// Malformed message entries or failed message inserts (logged, never
+    /// fatal; the rest of the transcript still lands).
+    pub messages_failed: usize,
+}
+
+impl AgentCounts {
+    fn total(&self) -> usize {
+        self.sessions_imported + self.sessions_skipped + self.sessions_failed
+    }
+}
+
 /// Per-workspace line of the final report.
 #[derive(Debug, Clone)]
 pub struct WorkspaceReport {
@@ -115,6 +144,7 @@ pub struct WorkspaceReport {
     pub outcome: Outcome,
     pub notes: NoteCounts,
     pub comments: CommentCounts,
+    pub agents: AgentCounts,
 }
 
 /// Full report of one run: one entry per candidate workspace directory.
@@ -147,6 +177,22 @@ impl Report {
         self.entries.iter().map(|e| e.comments.imported).sum()
     }
 
+    /// Total agent-session rows inserted across all workspaces.
+    pub fn agent_sessions_imported(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| e.agents.sessions_imported)
+            .sum()
+    }
+
+    /// Total agent-message rows inserted across all workspaces.
+    pub fn agent_messages_imported(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| e.agents.messages_imported)
+            .sum()
+    }
+
     fn count(&self, pred: impl Fn(&Outcome) -> bool) -> usize {
         self.entries.iter().filter(|e| pred(&e.outcome)).count()
     }
@@ -158,6 +204,7 @@ impl Report {
             outcome: Outcome::Skipped(reason.into()),
             notes: NoteCounts::default(),
             comments: CommentCounts::default(),
+            agents: AgentCounts::default(),
         });
     }
 }
@@ -200,9 +247,21 @@ impl fmt::Display for Report {
             } else {
                 String::new()
             };
+            let agents = if entry.agents.total() > 0 {
+                format!(
+                    ", agents: {} imported, {} skipped, {} failed, messages: {} imported, {} failed",
+                    entry.agents.sessions_imported,
+                    entry.agents.sessions_skipped,
+                    entry.agents.sessions_failed,
+                    entry.agents.messages_imported,
+                    entry.agents.messages_failed
+                )
+            } else {
+                String::new()
+            };
             writeln!(
                 f,
-                "  {}  {}{notes}{comments} ({})",
+                "  {}  {}{notes}{comments}{agents} ({})",
                 entry.id,
                 outcome,
                 entry.dir.display()
@@ -210,12 +269,14 @@ impl fmt::Display for Report {
         }
         write!(
             f,
-            "summary: {} imported, {} updated, {} skipped, {} notes imported, {} comments imported",
+            "summary: {} imported, {} updated, {} skipped, {} notes imported, {} comments imported, {} agent sessions imported, {} agent messages imported",
             self.imported(),
             self.updated(),
             self.skipped(),
             self.notes_imported(),
-            self.comments_imported()
+            self.comments_imported(),
+            self.agent_sessions_imported(),
+            self.agent_messages_imported()
         )
     }
 }
@@ -364,6 +425,7 @@ async fn import_one(
         outcome,
         notes: NoteCounts::default(),
         comments: CommentCounts::default(),
+        agents: AgentCounts::default(),
     };
     if landed && !opts.dry_run {
         import_workspace_extras(store, &ws, dir, &mut entry).await;
@@ -373,9 +435,8 @@ async fn import_one(
 
 /// Extension seam for the per-workspace importers: called once per
 /// imported/updated workspace with its legacy directory (`<root>/<id>`,
-/// containing `.workspace/…`). Currently imports notes, then comments (after
-/// notes, so comments can attach to just-imported note rows); follow-ups
-/// (agent transcripts) plug in here.
+/// containing `.workspace/…`). Imports notes, then comments (after notes, so
+/// comments can attach to just-imported note rows), then agent transcripts.
 async fn import_workspace_extras(
     store: &Store,
     workspace: &Workspace,
@@ -384,6 +445,7 @@ async fn import_workspace_extras(
 ) {
     entry.notes = import_workspace_notes(store, workspace, legacy_dir).await;
     entry.comments = import_workspace_comments(store, workspace, legacy_dir).await;
+    entry.agents = import_workspace_agents(store, workspace, legacy_dir).await;
 }
 
 /// Import legacy `.workspace/notes/*.md` files as note rows. Best-effort and
@@ -767,6 +829,421 @@ fn comment_from_legacy_json(
     Ok((comment, obj))
 }
 
+/// Content-block `type`s intentd understands (the FE `ContentBlock` union in
+/// `content-block.ts`). Blocks with any other/missing `type` degrade to text
+/// blocks on import so the transcript stays readable.
+const KNOWN_BLOCK_TYPES: &[&str] = &[
+    "text",
+    "code",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "image",
+    "audio",
+    "file",
+];
+
+/// Validate an `agent-{uuid}` id (mirrors the TS `agentIdPattern` and the
+/// service-layer check). Legacy files carrying any other id shape get a fresh
+/// server-minted id, with the original preserved in the session metadata.
+fn is_valid_agent_id(s: &str) -> bool {
+    let rest = match s.strip_prefix("agent-") {
+        Some(r) => r,
+        None => return false,
+    };
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == groups.len()
+        && parts
+            .iter()
+            .zip(groups.iter())
+            .all(|(part, &len)| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Import legacy `.workspace/agents/{agentId}.json` files (the FE
+/// `AgentSession` shape) as `agent_session` + ordered `agent_message` rows.
+/// Best-effort and idempotent: sessions already present (by id, or by the
+/// legacy id preserved under `metadata.legacyImport.originalId` when a new id
+/// was minted) are skipped whole; malformed files and failed inserts are
+/// logged and counted without ever failing the workspace import. Imported
+/// sessions are always terminal (`Completed`, not active) so the startup
+/// interrupted-agent heal sweep never resumes them.
+async fn import_workspace_agents(
+    store: &Store,
+    workspace: &Workspace,
+    legacy_dir: &Path,
+) -> AgentCounts {
+    let mut counts = AgentCounts::default();
+    let agents_dir = legacy_dir.join(".workspace").join("agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return counts; // no agents dir — nothing to import
+    };
+    // Sidecar artifacts (`*.json.checksum`, `*.json.corrupted.{ts}`, backups,
+    // `.health-check`) fail the extension/dotfile filter and are ignored.
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|ext| ext == "json")
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return counts;
+    }
+    // Existing sessions for the workspace: ids plus preserved legacy ids, so
+    // re-runs skip sessions that landed under a minted id.
+    let mut existing: HashSet<String> = HashSet::new();
+    match store.list_agent_session_summaries(&workspace.id).await {
+        Ok(sessions) => {
+            for s in sessions {
+                if let Some(orig) = s
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("legacyImport"))
+                    .and_then(|l| l.get("originalId"))
+                    .and_then(Value::as_str)
+                {
+                    existing.insert(orig.to_string());
+                }
+                existing.insert(s.id.0);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(workspace_id = %workspace.id, error = %e, "legacy agents: listing existing sessions failed; skipping agent import");
+            counts.sessions_failed += files.len();
+            return counts;
+        }
+    }
+    for path in files {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy agent file unreadable; skipping");
+                counts.sessions_failed += 1;
+                continue;
+            }
+        };
+        let obj = match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(o)) => o,
+            Ok(_) => {
+                tracing::warn!(path = %path.display(), "legacy agent file is not a JSON object; skipping");
+                counts.sessions_failed += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy agent file is not valid JSON; skipping");
+                counts.sessions_failed += 1;
+                continue;
+            }
+        };
+        let (session, messages) = match session_from_legacy_json(workspace, &stem, obj) {
+            Ok(pair) => pair,
+            Err(reason) => {
+                tracing::warn!(path = %path.display(), reason, "legacy agent session malformed; skipping");
+                counts.sessions_failed += 1;
+                continue;
+            }
+        };
+        let original_id = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("legacyImport"))
+            .and_then(|l| l.get("originalId"))
+            .and_then(Value::as_str)
+            .unwrap_or(session.id.as_str())
+            .to_string();
+        if existing.contains(&original_id) || existing.contains(session.id.as_str()) {
+            counts.sessions_skipped += 1;
+            continue;
+        }
+        // Guard against the id living in another workspace (ids are global).
+        match store.get_agent_session_status(&session.id).await {
+            Err(Error::NotFound(_)) => {}
+            Ok(_) => {
+                counts.sessions_skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), agent_id = %session.id, error = %e, "legacy agent session lookup failed");
+                counts.sessions_failed += 1;
+                continue;
+            }
+        }
+        if session.id.as_str() != original_id {
+            tracing::info!(path = %path.display(), original_id, minted_id = %session.id, "legacy agent id invalid; minted a new id (original preserved in metadata)");
+        }
+        if let Err(e) = store.insert_agent_session(&session).await {
+            tracing::warn!(path = %path.display(), agent_id = %session.id, error = %e, "legacy agent session insert failed");
+            counts.sessions_failed += 1;
+            continue;
+        }
+        existing.insert(original_id);
+        existing.insert(session.id.0.clone());
+        counts.sessions_imported += 1;
+        for raw in messages {
+            let (role, content, metadata, created_at) = match message_from_legacy_json(raw) {
+                Ok(parts) => parts,
+                Err(reason) => {
+                    tracing::warn!(path = %path.display(), agent_id = %session.id, reason, "legacy agent message malformed; skipping");
+                    counts.messages_failed += 1;
+                    continue;
+                }
+            };
+            match store
+                .append_agent_message_with_metadata(
+                    &session.id,
+                    &role,
+                    &content,
+                    metadata.as_ref(),
+                    &created_at,
+                )
+                .await
+            {
+                Ok(_) => counts.messages_imported += 1,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), agent_id = %session.id, error = %e, "legacy agent message insert failed");
+                    counts.messages_failed += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Map one legacy `AgentSession` JSON object (FE `agent-session.ts`) to an
+/// [`AgentSession`] plus its raw legacy `messages` array. The session is
+/// always imported as a terminal historical record: status `Completed`, not
+/// active, no ACP session handle — the startup heal sweep (which only touches
+/// `Active`/`Processing`/`Waiting`) never sees it. Legacy fields intentd has
+/// no column for (`lastActivity`, `startedAt`/`endedAt`, fork lineage,
+/// `agentMetadata`, `digest`, …) are preserved under
+/// `metadata.legacyImport`, next to the verbatim legacy `metadata` object.
+fn session_from_legacy_json(
+    workspace: &Workspace,
+    stem: &str,
+    mut obj: Map<String, Value>,
+) -> Result<(AgentSession, Vec<Value>), String> {
+    fn take_string(obj: &mut Map<String, Value>, key: &str) -> Option<String> {
+        match obj.remove(key) {
+            Some(Value::String(s)) if !s.is_empty() => Some(s),
+            Some(other) if !other.is_null() => {
+                obj.insert(key.to_string(), other); // wrong type → legacyImport
+                None
+            }
+            _ => None,
+        }
+    }
+    fn take_bool(obj: &mut Map<String, Value>, key: &str) -> bool {
+        match obj.remove(key) {
+            Some(Value::Bool(b)) => b,
+            Some(other) if !other.is_null() => {
+                obj.insert(key.to_string(), other);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    let original_id = take_string(&mut obj, "id").unwrap_or_else(|| stem.to_string());
+    if original_id.is_empty() {
+        return Err("missing `id` and empty filename".to_string());
+    }
+    let id = if is_valid_agent_id(&original_id) {
+        AgentId::from(original_id.clone())
+    } else {
+        AgentId::from(format!("agent-{}", AgentId::new()))
+    };
+    let name = take_string(&mut obj, "name").unwrap_or_else(|| stem.to_string());
+    let name_explicitly_set = take_bool(&mut obj, "nameExplicitlySet");
+    let model = take_string(&mut obj, "model");
+    // 'acp' is the protocol name, not a provider id — treat it as unset
+    // (mirrors the FE `getAgentProvider`).
+    let provider = take_string(&mut obj, "provider").filter(|p| p != "acp");
+    let system_prompt = take_string(&mut obj, "systemPrompt");
+    let backend_session_id = take_string(&mut obj, "backendSessionId").map(AgentId::from);
+    let parent_agent_id = take_string(&mut obj, "parentSessionId").map(AgentId::from);
+    let is_background = take_bool(&mut obj, "isBackground");
+    let now = now_iso();
+    let created_at = take_string(&mut obj, "createdAt").unwrap_or_else(|| now.clone());
+    let updated_at = take_string(&mut obj, "updatedAt").unwrap_or_else(|| created_at.clone());
+    let messages = match obj.remove("messages") {
+        Some(Value::Array(list)) => list,
+        None | Some(Value::Null) => Vec::new(),
+        Some(_) => return Err("`messages` is not an array".to_string()),
+    };
+    let original_status = obj.remove("status");
+    // The verbatim legacy `metadata` object rides along at the top level of
+    // the persisted metadata; behavior fields intentd models as columns are
+    // lifted out of it.
+    let mut metadata = match obj.remove("metadata") {
+        Some(Value::Object(m)) => m,
+        Some(other) if !other.is_null() => {
+            let mut m = Map::new();
+            m.insert("legacyMetadata".to_string(), other);
+            m
+        }
+        _ => Map::new(),
+    };
+    fn lift_string(m: &mut Map<String, Value>, key: &str) -> Option<String> {
+        match m.get(key) {
+            Some(Value::String(_)) => match m.remove(key) {
+                Some(Value::String(s)) if !s.is_empty() => Some(s),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let specialist = lift_string(&mut metadata, "specialist");
+    let task_note_id = lift_string(&mut metadata, "taskNoteId").map(NoteId::from);
+    let completion_report = lift_string(&mut metadata, "completionReport");
+    let completion_report_timestamp = lift_string(&mut metadata, "completionReportTimestamp");
+    let initial_message = lift_string(&mut metadata, "initialMessage");
+    let delegation_depth = match metadata.get("delegationDepth") {
+        Some(Value::Number(n)) if n.is_i64() => {
+            let v = n.as_i64();
+            metadata.remove("delegationDepth");
+            v
+        }
+        _ => None,
+    };
+    // Everything left in the legacy object (lastActivity, startedAt/endedAt,
+    // fork lineage, agentMetadata, digest, runtime/UI state, …) is preserved
+    // verbatim under `legacyImport`, alongside the import provenance fields.
+    let mut legacy_import = obj;
+    legacy_import.insert("originalId".to_string(), json!(original_id));
+    if let Some(status) = original_status {
+        legacy_import.insert("originalStatus".to_string(), status);
+    }
+    legacy_import.insert("importedAt".to_string(), json!(now.clone()));
+    metadata.insert("legacyImport".to_string(), Value::Object(legacy_import));
+
+    let session = AgentSession {
+        id,
+        workspace_id: workspace.id.clone(),
+        parent_agent_id,
+        backend_session_id,
+        acp_session_id: None,
+        name,
+        name_explicitly_set,
+        model,
+        provider,
+        system_prompt,
+        specialist,
+        status: AgentStatus::Completed,
+        is_active: false,
+        messages: Vec::new(),
+        stats: None,
+        task_note_id,
+        skip_auto_commit: false,
+        completion_report,
+        completion_report_timestamp,
+        delegation_depth,
+        initial_message,
+        context_references: None,
+        image_blocks: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        is_background,
+        metadata: Some(Value::Object(metadata)),
+        stop_reason: None,
+        created_at,
+        updated_at,
+    };
+    Ok((session, messages))
+}
+
+/// Map one legacy `AgentMessage` JSON entry (FE `agent-message.ts`) to the
+/// `(role, contentBlocks, metadata, createdAt)` tuple intentd persists.
+/// Legacy role `error` becomes `system` (recorded as `legacyRole`); content
+/// blocks with an unknown shape degrade to text blocks; legacy-only fields
+/// (`toolCalls`/`toolResults`/`turnNumber`/`error`/…) are folded into the row
+/// metadata so nothing is dropped. Entries that are not objects or carry no
+/// usable role are malformed and skipped by the caller.
+#[allow(clippy::type_complexity)]
+fn message_from_legacy_json(raw: Value) -> Result<(String, Value, Option<Value>, String), String> {
+    let Value::Object(mut obj) = raw else {
+        return Err("message entry is not an object".to_string());
+    };
+    let legacy_role = match obj.remove("role") {
+        Some(Value::String(s)) if !s.is_empty() => s,
+        _ => return Err("missing `role`".to_string()),
+    };
+    let role = match legacy_role.as_str() {
+        "user" | "assistant" | "system" | "tool" => legacy_role.clone(),
+        "error" => "system".to_string(),
+        other => return Err(format!("unknown role `{other}`")),
+    };
+    let content = match obj.remove("contentBlocks") {
+        Some(Value::Array(blocks)) => Value::Array(
+            blocks
+                .into_iter()
+                .map(|b| {
+                    let known = b
+                        .as_object()
+                        .and_then(|o| o.get("type"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| KNOWN_BLOCK_TYPES.contains(&t));
+                    if known {
+                        b
+                    } else {
+                        // Unknown block shape → best-effort text block.
+                        let text = match &b {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        json!({"type": "text", "text": text})
+                    }
+                })
+                .collect(),
+        ),
+        // No blocks: an error-only message still lands as readable text.
+        _ => match obj.get("error").and_then(Value::as_str) {
+            Some(err) => json!([{"type": "text", "text": err}]),
+            None => json!([]),
+        },
+    };
+    let created_at = match obj.remove("timestamp") {
+        Some(Value::String(s)) if !s.is_empty() => s,
+        _ => now_iso(),
+    };
+    // Fold the legacy metadata object plus every remaining legacy-only field
+    // (id, toolCalls, toolResults, turnNumber, error, errorCode, streaming
+    // flags, …) into the persisted row metadata.
+    let mut metadata = match obj.remove("metadata") {
+        Some(Value::Object(m)) => m,
+        Some(other) if !other.is_null() => {
+            let mut m = Map::new();
+            m.insert("legacyMetadata".to_string(), other);
+            m
+        }
+        _ => Map::new(),
+    };
+    if legacy_role != role {
+        metadata.insert("legacyRole".to_string(), json!(legacy_role));
+    }
+    if let Some(id) = obj.remove("id") {
+        metadata.insert("legacyMessageId".to_string(), id);
+    }
+    if !obj.is_empty() {
+        metadata.insert("legacyFields".to_string(), Value::Object(obj));
+    }
+    let metadata = if metadata.is_empty() {
+        None
+    } else {
+        Some(Value::Object(metadata))
+    };
+    Ok((role, content, metadata, created_at))
+}
+
 /// Build a [`Workspace`] from a legacy `workspace.json` object: drop the
 /// legacy-only FE fields, default the intentd-only required fields, and apply
 /// the worktree fallback (a `worktreePath` that no longer exists on disk is
@@ -840,6 +1317,8 @@ pub async fn maybe_import_on_first_boot(store: &Store, db_existed: bool, roots: 
                 skipped = report.skipped(),
                 notes = report.notes_imported(),
                 comments = report.comments_imported(),
+                agent_sessions = report.agent_sessions_imported(),
+                agent_messages = report.agent_messages_imported(),
                 "first-boot legacy workspace import complete"
             );
             for entry in &report.entries {
@@ -1501,6 +1980,302 @@ mod tests {
                 .len(),
             1
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write `<ws-dir>/.workspace/agents/<name>` with raw contents.
+    fn write_legacy_agent(ws_dir: &Path, name: &str, contents: &str) {
+        let agents_dir = ws_dir.join(".workspace").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join(name), contents).unwrap();
+    }
+
+    const LEGACY_AGENT_ID: &str = "agent-b0a8044a-5eac-4b52-8456-15d3b784decb";
+
+    /// A realistic legacy `AgentSession` file: runtime/UI state, fork lineage,
+    /// metadata behavior fields, and a transcript mixing known blocks, an
+    /// unknown block shape, an error-only message, and one malformed entry.
+    fn legacy_agent_fixture() -> Value {
+        let messages = json!([
+            {
+                "id": "msg-1",
+                "role": "user",
+                "contentBlocks": [{"type": "text", "text": "Port the store crate"}],
+                "timestamp": "2025-06-01T00:00:02Z",
+                "turnNumber": 1
+            },
+            {
+                "id": "msg-2",
+                "role": "assistant",
+                "contentBlocks": [
+                    {"type": "thinking", "text": "Let me look."},
+                    {"type": "tool_use", "id": "tu-1", "name": "view", "input": {"path": "src"}},
+                    {"type": "tool_result", "tool_use_id": "tu-1", "output": "ok"},
+                    {"type": "mystery", "payload": {"x": 1}},
+                    {"type": "text", "text": "Done."}
+                ],
+                "timestamp": "2025-06-01T00:00:03Z",
+                "toolCalls": [{"id": "tu-1", "name": "view", "arguments": {}}],
+                "metadata": {"model": "sonnet4.5", "stopReason": "end_turn"}
+            },
+            {
+                "id": "msg-3",
+                "role": "error",
+                "error": "stream disconnected",
+                "timestamp": "2025-06-01T00:00:04Z"
+            },
+            "not an object — malformed",
+            { "id": "msg-5", "contentBlocks": [] }
+        ]);
+        json!({
+            "id": LEGACY_AGENT_ID,
+            "backendSessionId": "auggie-session-1",
+            "workspaceId": "ws-agents",
+            "name": "Port the store",
+            "nameExplicitlySet": true,
+            "model": "sonnet4.5",
+            "provider": "acp",
+            "systemPrompt": "You are a porting agent.",
+            "status": "Processing",
+            "activationState": "active",
+            "isStreaming": true,
+            "queuedMessages": [],
+            "createdAt": "2025-06-01T00:00:00Z",
+            "updatedAt": "2025-06-02T00:00:00Z",
+            "lastActivity": "2025-06-02T00:00:00Z",
+            "startedAt": "2025-06-01T00:00:01Z",
+            "endedAt": "2025-06-02T00:00:00Z",
+            "isInitialAgent": true,
+            "isBackground": true,
+            "digest": "Ported the store crate",
+            "parentSessionId": "agent-99999999-9999-4999-8999-999999999999",
+            "forkedAt": "2025-06-01T12:00:00Z",
+            "forkPoint": 2,
+            "childSessionIds": ["agent-11111111-1111-4111-8111-111111111111"],
+            "metadata": {
+                "specialist": "implementor",
+                "taskNoteId": "task-1",
+                "completionReport": "Done.",
+                "completionReportTimestamp": "2025-06-02T00:00:00Z",
+                "delegationDepth": 1,
+                "initialMessage": "Port the store crate",
+                "createdByAgentId": "agent-99999999-9999-4999-8999-999999999999"
+            },
+            "messages": messages
+        })
+    }
+
+    #[tokio::test]
+    async fn imports_agent_transcripts_as_completed_sessions() {
+        let root = temp_root("agents");
+        let ws_dir = write_legacy_workspace(&root, "ws-agents", json!({}));
+        write_legacy_agent(
+            &ws_dir,
+            &format!("{LEGACY_AGENT_ID}.json"),
+            &legacy_agent_fixture().to_string(),
+        );
+        // Sidecar/stray files the legacy persistence wrote are ignored.
+        write_legacy_agent(&ws_dir, &format!("{LEGACY_AGENT_ID}.json.checksum"), "abc");
+        write_legacy_agent(&ws_dir, ".health-check", "test");
+        write_legacy_agent(&ws_dir, "notes.txt", "not an agent");
+        // Whole-file garbage: counted failed, never fatal.
+        write_legacy_agent(&ws_dir, "agent-broken.json", "{ nope");
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        let counts = report.entries[0].agents;
+        assert_eq!(counts.sessions_imported, 1, "{report}");
+        assert_eq!(counts.sessions_failed, 1, "{report}");
+        // 3 good messages; the non-object entry and the role-less entry skip.
+        assert_eq!(counts.messages_imported, 3, "{report}");
+        assert_eq!(counts.messages_failed, 2, "{report}");
+        assert_eq!(report.agent_sessions_imported(), 1, "{report}");
+        assert_eq!(report.agent_messages_imported(), 3, "{report}");
+        assert!(
+            report.to_string().contains(
+                "agents: 1 imported, 0 skipped, 1 failed, messages: 3 imported, 2 failed"
+            ),
+            "{report}"
+        );
+
+        let session = store
+            .get_agent_session(&AgentId::from(LEGACY_AGENT_ID))
+            .await
+            .unwrap();
+        // Terminal historical record: never resumable.
+        assert_eq!(session.status, AgentStatus::Completed);
+        assert!(!session.is_active);
+        assert_eq!(session.acp_session_id, None);
+        assert_eq!(session.workspace_id, WorkspaceId::from("ws-agents"));
+        assert_eq!(session.name, "Port the store");
+        assert!(session.name_explicitly_set);
+        assert_eq!(session.model, Some("sonnet4.5".to_string()));
+        // 'acp' is the protocol name, not a provider — dropped.
+        assert_eq!(session.provider, None);
+        assert_eq!(
+            session.system_prompt,
+            Some("You are a porting agent.".to_string())
+        );
+        assert_eq!(
+            session.backend_session_id,
+            Some(AgentId::from("auggie-session-1"))
+        );
+        assert_eq!(
+            session.parent_agent_id,
+            Some(AgentId::from("agent-99999999-9999-4999-8999-999999999999"))
+        );
+        assert!(session.is_background);
+        assert_eq!(session.created_at, "2025-06-01T00:00:00Z");
+        assert_eq!(session.updated_at, "2025-06-02T00:00:00Z");
+        // Metadata behavior fields lifted to columns.
+        assert_eq!(session.specialist, Some("implementor".to_string()));
+        assert_eq!(session.task_note_id, Some(NoteId::from("task-1")));
+        assert_eq!(session.completion_report, Some("Done.".to_string()));
+        assert_eq!(session.delegation_depth, Some(1));
+        assert_eq!(
+            session.initial_message,
+            Some("Port the store crate".to_string())
+        );
+        // Unmapped legacy fields survive under metadata.legacyImport.
+        let meta = session.metadata.as_ref().unwrap();
+        assert_eq!(
+            meta["createdByAgentId"],
+            json!("agent-99999999-9999-4999-8999-999999999999")
+        );
+        let legacy = &meta["legacyImport"];
+        assert_eq!(legacy["originalId"], json!(LEGACY_AGENT_ID));
+        assert_eq!(legacy["originalStatus"], json!("Processing"));
+        assert_eq!(legacy["lastActivity"], json!("2025-06-02T00:00:00Z"));
+        assert_eq!(legacy["startedAt"], json!("2025-06-01T00:00:01Z"));
+        assert_eq!(legacy["endedAt"], json!("2025-06-02T00:00:00Z"));
+        assert_eq!(legacy["isInitialAgent"], json!(true));
+        assert_eq!(legacy["forkPoint"], json!(2));
+        assert_eq!(
+            legacy["childSessionIds"],
+            json!(["agent-11111111-1111-4111-8111-111111111111"])
+        );
+        assert_eq!(legacy["digest"], json!("Ported the store crate"));
+
+        // Transcript: ordered, monotonic seq, roles mapped, blocks preserved.
+        let msgs = &session.messages;
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].seq, 0);
+        assert_eq!(msgs[1].seq, 1);
+        assert_eq!(msgs[2].seq, 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(
+            msgs[0].content,
+            json!([{"type": "text", "text": "Port the store crate"}])
+        );
+        assert_eq!(msgs[0].created_at, "2025-06-01T00:00:02Z");
+        assert_eq!(msgs[1].role, "assistant");
+        let blocks = msgs[1].content.as_array().unwrap();
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[0]["type"], json!("thinking"));
+        assert_eq!(blocks[1]["type"], json!("tool_use"));
+        assert_eq!(blocks[2]["type"], json!("tool_result"));
+        // Unknown block shape degraded to a text block.
+        assert_eq!(blocks[3]["type"], json!("text"));
+        assert!(blocks[3]["text"].as_str().unwrap().contains("mystery"));
+        assert_eq!(blocks[4], json!({"type": "text", "text": "Done."}));
+        // Legacy-only message fields folded into row metadata.
+        let m1 = msgs[1].metadata.as_ref().unwrap();
+        assert_eq!(m1["model"], json!("sonnet4.5"));
+        assert_eq!(m1["legacyMessageId"], json!("msg-2"));
+        assert!(m1["legacyFields"]["toolCalls"].is_array());
+        // `error` role → system, error text preserved as a text block.
+        assert_eq!(msgs[2].role, "system");
+        assert_eq!(
+            msgs[2].content,
+            json!([{"type": "text", "text": "stream disconnected"}])
+        );
+        let m2 = msgs[2].metadata.as_ref().unwrap();
+        assert_eq!(m2["legacyRole"], json!("error"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_import_is_idempotent_and_mints_ids_for_invalid() {
+        let root = temp_root("agents-idem");
+        let ws_dir = write_legacy_workspace(&root, "ws-agent-idem", json!({}));
+        write_legacy_agent(
+            &ws_dir,
+            "not-a-uuid.json",
+            &json!({
+                "id": "not-a-uuid",
+                "name": "Oddball",
+                "messages": [
+                    {"role": "user", "contentBlocks": [{"type": "text", "text": "hi"}],
+                     "timestamp": "2025-06-01T00:00:00Z"}
+                ]
+            })
+            .to_string(),
+        );
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        assert_eq!(report.entries[0].agents.sessions_imported, 1, "{report}");
+
+        let ws_id = WorkspaceId::from("ws-agent-idem");
+        let sessions = store.list_agent_sessions(&ws_id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        // Invalid legacy id → fresh `agent-{uuid}`, original preserved.
+        assert!(is_valid_agent_id(session.id.as_str()), "{}", session.id);
+        assert_eq!(
+            session.metadata.as_ref().unwrap()["legacyImport"]["originalId"],
+            json!("not-a-uuid")
+        );
+        assert_eq!(session.messages.len(), 1);
+
+        // Force re-run: matched by preserved originalId, skipped whole —
+        // no duplicate session, no duplicate messages.
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                dry_run: false,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.entries[0].agents.sessions_imported, 0, "{report}");
+        assert_eq!(report.entries[0].agents.sessions_skipped, 1, "{report}");
+        assert_eq!(report.entries[0].agents.messages_imported, 0, "{report}");
+        let sessions = store.list_agent_sessions(&ws_id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages.len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn imported_agent_sessions_are_never_swept_as_interrupted() {
+        let root = temp_root("agents-heal");
+        let ws_dir = write_legacy_workspace(&root, "ws-agent-heal", json!({}));
+        // Legacy file frozen mid-flight ("Processing"): imports as Completed.
+        write_legacy_agent(
+            &ws_dir,
+            &format!("{LEGACY_AGENT_ID}.json"),
+            &legacy_agent_fixture().to_string(),
+        );
+        let store = open_store().await;
+        run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        // The startup heal sweep must not touch the imported session.
+        let services = intent_services::Services::new(store.clone());
+        let healed = services.heal_stale_agent_sessions().await.unwrap();
+        assert_eq!(healed, 0);
+        assert!(store.list_interrupted_agents().await.unwrap().is_empty());
+        let session = store
+            .get_agent_session(&AgentId::from(LEGACY_AGENT_ID))
+            .await
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::Completed);
+        assert!(!session.is_active);
 
         std::fs::remove_dir_all(&root).ok();
     }
