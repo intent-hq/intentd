@@ -221,6 +221,11 @@ where
 /// stdout close (the transport error that reports the crash) races both the
 /// exit-status reap and the stderr drain, so a bare `try_wait` snapshot can
 /// misattribute a genuine crash as a plain transport failure.
+///
+/// Latency cost: on `ProbeError::Timeout` with a hung (still-running) child,
+/// `child.wait()` burns this full window before falling back to `try_wait`,
+/// so a timed-out probe takes ~500ms beyond `overall_timeout()` in
+/// production. Bounded and error-path-only, so accepted.
 const EXIT_OBSERVE_GRACE: Duration = Duration::from_millis(500);
 
 /// Fold an early adapter exit into the probe error: when the child already

@@ -830,6 +830,14 @@ impl TerminalHost for PtyTermHost {
             // The child's exit races the reader thread draining its final
             // output into scrollback; give the drain a bounded window so a
             // subsequent `terminal/output` sees the full text.
+            //
+            // Heuristic caveats, acceptable for the sole current consumer
+            // (the single-burst `echo` test below): two identical non-empty
+            // snapshots 20ms apart can break early if the final output lands
+            // in chunks more than 20ms apart, and a genuinely output-free
+            // command waits out the full 5s deadline. Revisit (e.g. an
+            // explicit reader-drained signal from the PTY host) before
+            // reusing this host for other commands.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut last = pty.scrollback(id).unwrap_or_default();
             loop {

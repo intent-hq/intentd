@@ -328,7 +328,7 @@ async fn await_stream_ends<S>(ws: &mut WebSocketStream<S>, agent_id: &str, count
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     let mut seen = 0usize;
     while seen < count {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -600,7 +600,10 @@ async fn last_activity_debounce_coalesces_burst() {
 
     // Drain the warm-up turn's own lastActivity emission(s): read until the
     // workspace:* subscription has been quiet for well over one debounce
-    // window, so nothing from the warm-up leaks into the burst count.
+    // window, so nothing from the warm-up leaks into the burst count. An
+    // outer deadline hard-bounds the drain even if some event source kept
+    // emitting less than one quiet window apart.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -608,7 +611,12 @@ async fn last_activity_debounce_coalesces_burst() {
     )
     .await
     .is_some()
-    {}
+    {
+        assert!(
+            tokio::time::Instant::now() < drain_deadline,
+            "warm-up drain never went quiet within 30s"
+        );
+    }
 
     // Drive a rapid burst: 3 messages within the 500ms debounce window
     for i in 0..3 {
@@ -627,6 +635,8 @@ async fn last_activity_debounce_coalesces_burst() {
 
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).
+    // Same outer deadline pattern as the warm-up drain above.
+    let collect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut last_activity_events = Vec::new();
     while let Some(evt) = try_next_event(
         &mut sub,
@@ -635,6 +645,10 @@ async fn last_activity_debounce_coalesces_burst() {
     )
     .await
     {
+        assert!(
+            tokio::time::Instant::now() < collect_deadline,
+            "workspace:updated collection never went quiet within 30s"
+        );
         if evt["data"]["changes"]["lastActivity"].is_string() {
             last_activity_events.push(evt);
         }

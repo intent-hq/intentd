@@ -282,6 +282,19 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    wss_event_opt_until(ws, deadline).await
+}
+
+/// Variant of `wss_event_opt` bounded by an absolute deadline, for loops that
+/// share one hard deadline across many reads (no per-call truncation to whole
+/// seconds, no stale `remaining` snapshots).
+async fn wss_event_opt_until<S>(
+    ws: &mut WebSocketStream<S>,
+    deadline: tokio::time::Instant,
+) -> Option<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
             Some(d) if !d.is_zero() => d,
@@ -2645,10 +2658,9 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let mut parent_wake_ends = 0u32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_idle) {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let frame = match wss_event_opt(&mut sub, remaining.as_secs().max(1)).await {
-            Some(frame) if !remaining.is_zero() => frame,
-            _ => panic!(
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
                 "timed out waiting for wake milestones: parent_idle_count={parent_idle_count} \
                  parent_wake_ends={parent_wake_ends} child_idle={child_idle} child_id={child_id:?}"
             ),
