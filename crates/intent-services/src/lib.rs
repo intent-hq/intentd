@@ -3771,33 +3771,45 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Blocking `workspace.delete` cleanup (ports the TS `removeGitWorktree`
-/// body): capture the checked-out branch, remove the linked worktree (with
-/// the manual-rm fallback and prune inside [`intent_git::worktree::remove_worktree`]),
-/// drop the now-empty `<root>/<workspaceId>` parent directory, and delete the
-/// workspace branch only when it passes every guard — it must be the branch
-/// currently checked out there, it must be the branch the daemon
-/// auto-generated at create time (never a caller-supplied branch), and never
-/// `main`/`master` or a detached HEAD. Best-effort throughout.
-fn cleanup_workspace_worktree(
+/// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
+/// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
+/// does git-metadata work only: capture the checked-out branch, detach the
+/// linked worktree (prune the registration and rename the checkout to a
+/// trash path via [`intent_git::worktree::detach_worktree`] — never the
+/// recursive delete), drop the `.workspace` metadata dir and the now-empty
+/// `<root>/<workspaceId>` parent directory, and delete the workspace branch
+/// only when it passes every guard — it must be the branch currently checked
+/// out there, it must be the branch the daemon auto-generated at create time
+/// (never a caller-supplied branch), and never `main`/`master` or a detached
+/// HEAD. Best-effort throughout. Returns the detached trash path still
+/// awaiting recursive removal, which the caller must pass to
+/// [`cleanup_detached_worktree`] after releasing the lock.
+fn cleanup_workspace_worktree_locked(
     repo: &Path,
     worktree: &Path,
     branch: &str,
     branch_auto_generated: bool,
-) {
+) -> Option<PathBuf> {
     let checked_out = intent_git::worktree::worktree_branch(worktree);
-    if let Err(e) = intent_git::worktree::remove_worktree(repo, worktree) {
-        tracing::warn!(
-            error = %e,
-            worktree = %worktree.display(),
-            "failed to remove git worktree"
-        );
-    }
+    let trash = match intent_git::worktree::detach_worktree(repo, worktree) {
+        Ok(trash) => trash,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                worktree = %worktree.display(),
+                "failed to remove git worktree"
+            );
+            None
+        }
+    };
     // The provisioned layout is `<root>/<workspaceId>/<repo-slug>` alongside
     // the daemon-written `<root>/<workspaceId>/.workspace/` metadata dir.
     // Remove the metadata dir first so the subsequent parent `remove_dir`
     // (which only deletes empty directories) can succeed. A caller-supplied
-    // path shared with other content is still never destroyed.
+    // path shared with other content is still never destroyed. The trash
+    // rename target is a sibling in the same parent, so the `remove_dir`
+    // fails while it exists — [`cleanup_detached_worktree`] retries it after
+    // the recursive removal.
     if let Some(parent) = worktree.parent() {
         let _ = std::fs::remove_dir_all(parent.join(".workspace"));
         let _ = std::fs::remove_dir(parent);
@@ -3815,6 +3827,25 @@ fn cleanup_workspace_worktree(
             branch = %checked_out,
             "skipping branch deletion - not the auto-generated workspace branch"
         );
+    }
+    trash
+}
+
+/// Unlocked phase of the `workspace.delete` cleanup: recursively remove the
+/// checkout that [`cleanup_workspace_worktree_locked`] renamed to a trash
+/// path, then retry the empty-only parent `remove_dir` that the trash sibling
+/// blocked. Runs after the per-repo lock is released so a multi-GB
+/// `remove_dir_all` never starves concurrent `workspace.create` provisioning.
+fn cleanup_detached_worktree(worktree: &Path, trash: &Path) {
+    if let Err(e) = intent_git::worktree::remove_detached_worktree(trash) {
+        tracing::warn!(
+            error = %e,
+            path = %trash.display(),
+            "failed to remove detached worktree dir"
+        );
+    }
+    if let Some(parent) = worktree.parent() {
+        let _ = std::fs::remove_dir(parent);
     }
 }
 
@@ -7746,8 +7777,9 @@ impl WorkspaceApi for Services {
             //
             // Same-slug-recreate race guard: the `create` path already takes
             // the per-repo worktree lock before provisioning, so a recreate
-            // cannot run its `add_worktree` while this cleanup's
-            // `remove_worktree` is still in progress for the same repo.
+            // cannot run its `add_worktree` while this cleanup's locked phase
+            // (registration prune + rename to a trash path) is still in
+            // progress for the same repo.
             // Residual risk: if a recreate runs *before* the background task
             // fires (row is deleted, event is sent, response is ACKed, but the
             // spawn hasn't yet grabbed the worktree lock), the recreate could
@@ -7794,25 +7826,50 @@ impl WorkspaceApi for Services {
                                 let branch = ws_cleanup.branch.clone();
                                 let repo = repo_dir.clone();
                                 let branch_flag = branch_auto_generated_bg;
-                                worktree_locks_bg
+                                let wt_locked = wt.clone();
+                                // Under the per-repo lock: git-metadata work
+                                // only (registration prune, rename of the
+                                // checkout to a trash path, branch-delete
+                                // guard). The multi-GB recursive removal runs
+                                // below, after the lock is released, so
+                                // concurrent `workspace.create` provisioning
+                                // on the same repo is never starved by bulk
+                                // deletes.
+                                let trash = worktree_locks_bg
                                     .with_lock(&repo_dir, move || async move {
                                         let task = tokio::task::spawn_blocking(move || {
-                                            cleanup_workspace_worktree(
+                                            cleanup_workspace_worktree_locked(
                                                 &repo,
-                                                &wt,
+                                                &wt_locked,
                                                 &branch,
                                                 branch_flag,
-                                            );
+                                            )
                                         })
                                         .await;
-                                        if let Err(e) = task {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "background worktree cleanup task failed"
-                                            );
+                                        match task {
+                                            Ok(trash) => trash,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "background worktree cleanup task failed"
+                                                );
+                                                None
+                                            }
                                         }
                                     })
                                     .await;
+                                if let Some(trash) = trash {
+                                    let removal = tokio::task::spawn_blocking(move || {
+                                        cleanup_detached_worktree(&wt, &trash)
+                                    })
+                                    .await;
+                                    if let Err(e) = removal {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "background detached-worktree removal task failed"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
