@@ -1,6 +1,8 @@
 //! Unit tests for the generic per-provider model cache (PROTOCOL §5.30):
 //! TTL, version-key invalidation, forceRefresh bypass, failure fallback,
-//! and persistence.
+//! single-flighting, negative caching, and persistence.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
 
@@ -36,7 +38,27 @@ fn panicking_fetch() -> impl FnOnce() -> BoxFuture<'static, ModelFetchResult> {
     || panic!("fetch must not be called on a fresh cache hit")
 }
 
+/// A fetch that counts its runs: only the single-flight leader's closure
+/// actually executes, so the counter proves how many probes ran.
+fn counting_fetch(
+    calls: &Arc<AtomicUsize>,
+    tag: &'static str,
+) -> impl FnOnce() -> BoxFuture<'static, ModelFetchResult> {
+    let calls = calls.clone();
+    move || {
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ModelFetchResult {
+                models: Some(rows(tag)),
+                warning: None,
+            }
+        })
+    }
+}
+
 const TTL_MS: u64 = super::MODELS_CACHE_TTL.as_millis() as u64;
+const NEG_TTL_MS: u64 = super::MODELS_NEGATIVE_TTL.as_millis() as u64;
 
 #[tokio::test]
 async fn fresh_cache_hit_within_ttl_skips_fetch() {
@@ -214,4 +236,154 @@ async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
     assert!(r.stale);
     let warning = r.warning.expect("stale data must be labeled");
     assert!(warning.contains("droid binary not found"), "{warning}");
+}
+
+#[tokio::test]
+async fn concurrent_cold_reads_single_flight_one_probe() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let cache = cache.clone();
+            let fetch = counting_fetch(&calls, "shared");
+            tokio::spawn(
+                async move { resolve_with_cache(&cache, "p", "v1", false, 1_000, fetch).await },
+            )
+        })
+        .collect();
+    for h in handles {
+        let r = h.await.expect("join");
+        assert_eq!(r.models, Some(rows("shared")));
+        assert!(!r.stale);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one probe runs");
+}
+
+#[tokio::test]
+async fn concurrent_forced_reads_single_flight_one_probe() {
+    // forceRefresh bypasses the caches but still coalesces into one probe.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("cached"), 1_000);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let cache = cache.clone();
+            let fetch = counting_fetch(&calls, "forced");
+            tokio::spawn(
+                async move { resolve_with_cache(&cache, "p", "v1", true, 1_001, fetch).await },
+            )
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.await.expect("join").models, Some(rows("forced")));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one probe runs");
+}
+
+#[tokio::test]
+async fn inflight_slot_is_released_after_probe() {
+    // A later (post-completion) read must run its own probe, not the stale
+    // shared cell — i.e. finish_inflight released the slot.
+    let cache = ModelCatalogCache::new(None);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        1_000,
+        counting_fetch(&calls, "one"),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("one")));
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        true,
+        1_001,
+        counting_fetch(&calls, "two"),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("two")));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn negative_window_suppresses_reprobe_without_last_good() {
+    let cache = ModelCatalogCache::new(None);
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
+    assert!(r.models.is_none());
+    // Within the negative window the fetch must not run again.
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        1_000 + NEG_TTL_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert!(r.models.is_none());
+    assert!(!r.stale);
+    assert_eq!(r.warning.as_deref(), Some("probe failed"));
+}
+
+#[tokio::test]
+async fn negative_window_serves_last_good_as_stale() {
+    let cache = ModelCatalogCache::new(None);
+    cache.store("p", "v1", rows("last-good"), 1_000);
+    let now = 1_000 + TTL_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, failing_fetch()).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    // Within the negative window: same stale fallback, no re-probe.
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        now + NEG_TTL_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    let warning = r.warning.expect("stale data must be labeled");
+    assert!(warning.contains("probe failed"), "{warning}");
+}
+
+#[tokio::test]
+async fn negative_entry_expires_and_reprobe_succeeds() {
+    let cache = ModelCatalogCache::new(None);
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
+    assert!(r.models.is_none());
+    // Past the negative TTL the probe runs again; success clears the entry.
+    let now = 1_000 + NEG_TTL_MS;
+    let r = resolve_with_cache(&cache, "p", "v1", false, now, ok_fetch("recovered")).await;
+    assert_eq!(r.models, Some(rows("recovered")));
+    assert!(!r.stale);
+    assert!(cache.negative_reason("p", "v1", now).is_none());
+}
+
+#[tokio::test]
+async fn force_refresh_bypasses_negative_window() {
+    let cache = ModelCatalogCache::new(None);
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
+    assert!(r.models.is_none());
+    // Within the window a forced read still probes — and its success clears
+    // the negative entry for subsequent non-forced reads.
+    let r = resolve_with_cache(&cache, "p", "v1", true, 1_001, ok_fetch("forced")).await;
+    assert_eq!(r.models, Some(rows("forced")));
+    assert_eq!(cache.fresh("p", "v1", 1_002), Some(rows("forced")));
+}
+
+#[tokio::test]
+async fn negative_entry_is_version_key_scoped() {
+    let cache = ModelCatalogCache::new(None);
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
+    assert!(r.models.is_none());
+    // A version-key bump must not be blocked by the old key's failure.
+    let r = resolve_with_cache(&cache, "p", "v2", false, 1_001, ok_fetch("bumped")).await;
+    assert_eq!(r.models, Some(rows("bumped")));
 }

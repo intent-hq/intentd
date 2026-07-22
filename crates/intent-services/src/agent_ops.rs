@@ -479,8 +479,20 @@ pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
 pub(crate) const MODELS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// The shared `models.list` success-cache slot on [`Services`]: the fetch
-/// instant plus the finalized rows (PROTOCOL §5.30).
-pub(crate) type ModelsCache = Arc<Mutex<Option<(std::time::Instant, Vec<Value>)>>>;
+/// instant plus the finalized rows (PROTOCOL §5.30). Uses `tokio::time`
+/// instants so paused-clock tests can age the window.
+pub(crate) type ModelsCache = Arc<Mutex<Option<(tokio::time::Instant, Vec<Value>)>>>;
+
+/// The legacy `models.list` negative-cache slot on [`Services`]: the instant
+/// of the last failed auggie CLI fetch. Within
+/// [`crate::model_catalog::MODELS_NEGATIVE_TTL`] non-forced reads do not
+/// re-spawn the CLI (PROTOCOL §5.30).
+pub(crate) type ModelsNegative = Arc<Mutex<Option<tokio::time::Instant>>>;
+
+/// The legacy `models.list` single-flight slot on [`Services`]: concurrent
+/// auggie CLI fetches share one in-flight probe (the first caller initializes
+/// the cell, everyone else awaits and clones its result).
+pub(crate) type ModelsInflight = Arc<Mutex<Option<Arc<tokio::sync::OnceCell<Option<Vec<Value>>>>>>>;
 
 /// Parse `auggie model list --json` output into rich wire `ModelInfo` rows
 /// (PROTOCOL §5.30), porting the TS `parseModelListJson`: expects
@@ -2036,26 +2048,66 @@ impl Services {
     /// "auggie"` reads; the two can diverge within a TTL window (a follow-up
     /// may route this path through the generic cache).
     async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
+        self.models_list_auggie_with(force_refresh, || Box::pin(fetch_auggie_models_rich()))
+            .await
+    }
+
+    /// [`Self::models_list_auggie_op`] with an injectable fetch, carrying the
+    /// same probe guards as the generic [`crate::model_catalog`] cache:
+    /// concurrent fetches are single-flighted (one CLI spawn, shared result)
+    /// and a failed fetch is negatively cached for
+    /// [`crate::model_catalog::MODELS_NEGATIVE_TTL`] — within that window
+    /// non-forced reads serve the static catalog (byte-for-byte what the
+    /// failed probe itself returned) without re-spawning the CLI.
+    /// `force_refresh` bypasses the negative entry but still single-flights.
+    async fn models_list_auggie_with<F>(&self, force_refresh: bool, fetch: F) -> Result<Value>
+    where
+        F: FnOnce() -> intent_core::BoxFuture<'static, Option<Vec<Value>>>,
+    {
         if !force_refresh {
             if let Some(models) = self.cached_models() {
                 return Ok(json!({ "models": models, "source": "auggie" }));
             }
-        }
-        if let Some(models) = fetch_auggie_models_rich().await {
-            self.store_models_cache(models.clone());
-            return Ok(json!({ "models": models, "source": "auggie" }));
-        }
-        if force_refresh {
-            if let Some(models) = self.last_good_models() {
-                return Ok(json!({
-                    "models": models,
-                    "source": "auggie",
-                    "stale": true,
-                    "warning": "auggie CLI unavailable or returned no models; serving last-good cached list",
-                }));
+            if self.models_negative_fresh() {
+                return Ok(json!({ "models": static_models(), "source": "static" }));
             }
         }
-        Ok(json!({ "models": static_models(), "source": "static" }))
+        let cell = {
+            let mut slot = self
+                .models_inflight
+                .lock()
+                .expect("models inflight poisoned");
+            slot.get_or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let fetched = cell.get_or_init(fetch).await.clone();
+        // Record the outcome before releasing the in-flight slot so a caller
+        // arriving in between hits the success or negative cache, never a
+        // gap that would re-spawn the CLI.
+        let result = match fetched {
+            Some(models) => {
+                self.store_models_cache(models.clone());
+                self.clear_models_negative();
+                json!({ "models": models, "source": "auggie" })
+            }
+            None => {
+                self.store_models_negative();
+                if force_refresh {
+                    if let Some(models) = self.last_good_models() {
+                        self.finish_models_inflight(&cell);
+                        return Ok(json!({
+                            "models": models,
+                            "source": "auggie",
+                            "stale": true,
+                            "warning": "auggie CLI unavailable or returned no models; serving last-good cached list",
+                        }));
+                    }
+                }
+                json!({ "models": static_models(), "source": "static" })
+            }
+        };
+        self.finish_models_inflight(&cell);
+        Ok(result)
     }
 
     /// The cached `models.list` rows when still within [`MODELS_CACHE_TTL`].
@@ -2080,7 +2132,46 @@ impl Services {
     /// Record a successful `models.list` CLI fetch for [`MODELS_CACHE_TTL`].
     fn store_models_cache(&self, rows: Vec<Value>) {
         *self.models_cache.lock().expect("models cache poisoned") =
-            Some((std::time::Instant::now(), rows));
+            Some((tokio::time::Instant::now(), rows));
+    }
+
+    /// Whether the last legacy fetch failure is still within
+    /// [`crate::model_catalog::MODELS_NEGATIVE_TTL`].
+    fn models_negative_fresh(&self) -> bool {
+        self.models_negative
+            .lock()
+            .expect("models negative poisoned")
+            .is_some_and(|at| at.elapsed() < crate::model_catalog::MODELS_NEGATIVE_TTL)
+    }
+
+    /// Record a failed legacy fetch so non-forced reads within the negative
+    /// window do not re-spawn the CLI.
+    fn store_models_negative(&self) {
+        *self
+            .models_negative
+            .lock()
+            .expect("models negative poisoned") = Some(tokio::time::Instant::now());
+    }
+
+    /// Drop the legacy negative entry (any successful fetch clears it).
+    fn clear_models_negative(&self) {
+        *self
+            .models_negative
+            .lock()
+            .expect("models negative poisoned") = None;
+    }
+
+    /// Release the legacy in-flight slot once its outcome has been recorded.
+    /// Only removes `cell` itself (`ptr_eq`), so a late finisher cannot evict
+    /// a newer probe's slot.
+    fn finish_models_inflight(&self, cell: &Arc<tokio::sync::OnceCell<Option<Vec<Value>>>>) {
+        let mut slot = self
+            .models_inflight
+            .lock()
+            .expect("models inflight poisoned");
+        if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, cell)) {
+            *slot = None;
+        }
     }
 
     /// `agent.queueMessage` (PROTOCOL §5.5). Enqueues the message, publishes
