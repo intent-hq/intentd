@@ -24,6 +24,7 @@ use crate::drafts;
 use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
+use crate::panic_guard;
 use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
 use crate::subscriptions::{self, Channel, SubFastPath};
@@ -123,9 +124,16 @@ pub(crate) async fn process_frame(
         if reverse.route_response(&value) {
             return true;
         }
+        // Every handler path below (inline or spawned) runs under a panic
+        // guard: a panicking handler yields `-32603` with the echoed request
+        // `id` (no frame for notifications) and the connection stays open.
+        let (rpc_id, method) = panic_guard::request_identity(&value);
         if let Some(control) = control {
             if let Some(req) = control::classify(&value) {
-                return match control::handle(req, control.as_ref(), is_local) {
+                let frame = panic_guard::guard_frame_sync(&method, rpc_id.clone(), || {
+                    control::handle(req, control.as_ref(), is_local)
+                });
+                return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };
@@ -136,7 +144,13 @@ pub(crate) async fn process_frame(
                 // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
                 // not the locality flag. Task-local context set by transport (§5.2).
                 let is_local = !crate::context::is_tcp_connection();
-                return match crate::server::handle(req, server_info, is_local).await {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::server::handle(req, server_info, is_local),
+                )
+                .await;
+                return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };
@@ -145,7 +159,13 @@ pub(crate) async fn process_frame(
                 // pairing.getInfo shares the server.* provider and local-only gating:
                 // the payload embeds the bearer token, so it never crosses TCP.
                 let is_local = !crate::context::is_tcp_connection();
-                return match crate::pairing::handle(req, server_info, is_local).await {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::pairing::handle(req, server_info, is_local),
+                )
+                .await;
+                return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };
@@ -163,10 +183,15 @@ pub(crate) async fn process_frame(
             let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) =
-                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
+                    if let Some(frame) = panic_guard::guard_frame(
+                        &method,
+                        rpc_id,
+                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                    )
+                    .await
                     {
                         let _ = out.send(frame).await;
                     }
@@ -183,9 +208,13 @@ pub(crate) async fn process_frame(
             let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) = browser::handle(req, &reverse).await {
+                    if let Some(frame) =
+                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
+                            .await
+                    {
                         let _ = out.send(frame).await;
                     }
                 })
@@ -194,28 +223,58 @@ pub(crate) async fn process_frame(
             return true;
         }
         if let Some(req) = forward::classify(&value) {
-            return match forward::handle(req, forwards, is_local).await {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                forward::handle(req, forwards, is_local),
+            )
+            .await;
+            return match frame {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
         if let Some(req) = client::classify(&value) {
-            return match client::handle(req, api.as_ref(), client_id, is_local).await {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                client::handle(req, api.as_ref(), client_id, is_local),
+            )
+            .await;
+            return match frame {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
         if let Some(req) = drafts::classify(&value) {
-            return match drafts::handle(req, api.as_ref(), client_id).await {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                drafts::handle(req, api.as_ref(), client_id),
+            )
+            .await;
+            return match frame {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
         if let Some(sub) = subscriptions::classify(&value) {
-            return handle_sub_fast_path(sub, api, bus, out_tx, subs).await;
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_sub_fast_path(sub, api, bus, out_tx, subs),
+            )
+            .await;
         }
         if let Some(fast_path) = events::classify(&value) {
-            return handle_fast_path(fast_path, bus, out_tx, subs).await;
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_fast_path(fast_path, bus, out_tx, subs),
+            )
+            .await;
         }
     }
     // Slow path: the ported-methods dispatcher can touch any service, so spawn
@@ -228,7 +287,12 @@ pub(crate) async fn process_frame(
     let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
         crate::context::with_connection_context(is_tcp, async {
-            if let Some(response) = handle_message(api.as_ref(), &raw).await {
+            let (rpc_id, method) = serde_json::from_str::<Value>(&raw)
+                .map(|v| panic_guard::request_identity(&v))
+                .unwrap_or((None, String::new()));
+            if let Some(response) =
+                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
+            {
                 let _ = out_tx.send(response).await;
             }
         })
