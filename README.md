@@ -195,8 +195,9 @@ version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
   stable) with the version to promote; it validates that the release exists and updates
   the stable channel manifest to point at it.
 
-To cut a release: bump `version` in `crates/intentd/Cargo.toml` to match, commit, then
-push the tag.
+To cut a release: bump `version` in `crates/intentd/Cargo.toml` via a normal PR (branch
+protection requires it); once that PR merges, push the tag pointing at the merged `main`
+commit.
 
 ### Channel manifests
 
