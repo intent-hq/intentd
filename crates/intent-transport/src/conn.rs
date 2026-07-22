@@ -121,12 +121,20 @@ pub(crate) async fn process_frame(
     if let Some(value) = &parsed {
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
-        // never treat it as a client request. Deliberately outside the panic
-        // guards below: it routes a *response* frame (no request handler runs
-        // and there is no request id to echo an error to), and it only touches
-        // the reverse pending map.
-        if reverse.route_response(value) {
-            return true;
+        // never treat it as a client request. It routes a *response* frame (no
+        // request handler runs and there is no request id to echo an error
+        // to), so a panic here (e.g. a poisoned pending map) yields no error
+        // frame — but it must still not tear down the read loop, so it gets
+        // its own unwind guard: treat the frame as consumed and keep serving.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reverse.route_response(value)
+        })) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => {
+                tracing::error!("reverse-response routing panicked; connection kept alive");
+                return true;
+            }
         }
         // Every handler path below (inline or spawned) runs under a panic
         // guard: a panicking handler yields `-32603` with the echoed request
