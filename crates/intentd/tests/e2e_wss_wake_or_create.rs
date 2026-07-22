@@ -1,6 +1,6 @@
 //! WSS end-to-end for the widened `agent.wakeOrCreate` (C1d-10a).
 //!
-//! Boots a real `intentd serve --listen both`, seeds a workspace + task note,
+//! Boots a real `intentd serve` (WSS enabled via config.toml), seeds a workspace + task note,
 //! and drives the widened composite over a pinned TLS WebSocket. The mock
 //! agent is NOT needed — `agent.wakeOrCreate` persists the delivered context
 //! message directly (matching the pre-widening path), so these tests are
@@ -63,10 +63,11 @@ fn temp_data_dir() -> PathBuf {
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    if listen == "both" {
+        common::enable_wss_boot(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));

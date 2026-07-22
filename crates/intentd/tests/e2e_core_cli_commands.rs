@@ -3,6 +3,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -252,10 +254,9 @@ fn spawn_daemon_both(data_dir: &PathBuf, token: &str) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
+    common::enable_wss_boot(data_dir);
     Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("serve")
-        .arg("--listen")
-        .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
@@ -265,7 +266,7 @@ fn spawn_daemon_both(data_dir: &PathBuf, token: &str) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
-        .expect("spawn intentd serve --listen both")
+        .expect("spawn intentd serve (wsApi enabled)")
 }
 
 #[tokio::test]

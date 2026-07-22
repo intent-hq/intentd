@@ -70,16 +70,18 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-/// Spawn `intentd serve --listen <listen>` with the given data dir + env. The
+/// Spawn `intentd serve` with the given data dir + env; `listen == "both"`
+/// seeds `server.wsApi.enabled = true` into config.toml (WSS at boot). The
 /// caller holds the returned [`Daemon`] for the test's lifetime.
 fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen == "both" {
+        common::enable_wss_boot(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

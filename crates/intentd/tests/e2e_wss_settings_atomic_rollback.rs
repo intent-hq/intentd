@@ -57,10 +57,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen == "both" {
+        common::enable_wss_boot(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -237,7 +238,7 @@ where
 async fn mixed_batch_rollback_over_wss() {
     let data_dir = temp_data_dir();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
-    // Start daemon with both UDS and TCP (--listen both)
+    // Start daemon with WSS enabled at boot (seeded via config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -247,7 +248,8 @@ async fn mixed_batch_rollback_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     // Baseline: git.autoCommit=true, server.port=5181 (default)
-    // Note: server.wsApi.enabled setting is false by default, but the listener is running because of --listen both
+    // Note: server.wsApi.enabled is true (origin=file) via the seeded config,
+    // which is what boot-started the WSS listener.
     let r = uds_rpc(
         &socket,
         1,
@@ -260,7 +262,7 @@ async fn mixed_batch_rollback_over_wss() {
     // server.port is stored as a JSON number (float); compare numerically
     assert_eq!(r["result"]["value"], json!(5181.0));
 
-    // Get server fingerprint and port from system.status (WSS listener started at boot with --listen both)
+    // Get server fingerprint and port from system.status (WSS listener started at boot via seeded config)
     let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
     let port = status["result"]["port"]
         .as_u64()
@@ -336,7 +338,7 @@ async fn mixed_batch_rollback_over_wss() {
     .await;
     assert_eq!(
         r["result"]["value"],
-        json!(false),
-        "server.wsApi.enabled should be rolled back to false (default)"
+        json!(true),
+        "server.wsApi.enabled should be rolled back to true (seeded file value)"
     );
 }

@@ -1,5 +1,5 @@
 //! WSS end-to-end `workspace.create` worktree provisioning: drives the real
-//! pinned-TLS WebSocket against a live `intentd serve --listen both` and
+//! pinned-TLS WebSocket against a live `intentd serve` (WSS enabled via config.toml) and
 //! asserts that creating a workspace off a local git repository provisions a
 //! linked worktree (PROTOCOL.md §5.1) — the returned `workspace.worktreePath`
 //! exists on disk, is a git worktree checked out on the workspace branch, and
@@ -62,10 +62,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen == "both" {
+        common::enable_wss_boot(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

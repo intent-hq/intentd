@@ -1,6 +1,6 @@
 //! WSS end-to-end for LLM-generated auto-commit messages (LNI-1 §9.1).
 //!
-//! Boots a real `intentd serve --listen both` with a fake auggie binary that
+//! Boots a real `intentd serve` (WSS enabled via config.toml) with a fake auggie binary that
 //! emits a deterministic `<<<COMMIT_MESSAGE>>>` reply. Drives an agent turn
 //! that writes a file over WSS, waits for `agent:idle`, then asserts via
 //! `git.commits` that the resulting auto-commit message is the generated one
@@ -107,10 +107,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
+    if listen == "both" {
+        common::enable_wss_boot(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)

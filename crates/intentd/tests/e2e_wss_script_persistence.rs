@@ -1,5 +1,5 @@
 //! WSS end-to-end `script.*` persistence: drives the real pinned-TLS WebSocket
-//! against a live `intentd serve --listen both`, creates a script, restarts the
+//! against a live `intentd serve` (WSS enabled via config.toml), creates a script, restarts the
 //! daemon on the same data dir, and asserts the definition survives (hydrated
 //! with a fresh idle runtime state) — then that `script.remove` unpersists it
 //! across another restart. Regression for the registry living only in memory.
@@ -46,10 +46,9 @@ fn spawn_serve(data_dir: &Path) -> Child {
         .expect("open daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    common::enable_wss_boot(data_dir);
     Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("serve")
-        .arg("--listen")
-        .arg("both")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")

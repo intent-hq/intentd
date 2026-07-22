@@ -1,6 +1,6 @@
 //! WSS end-to-end for `agent.listInterrupted` (INT-41, agent-resumption phase 1).
 //!
-//! Boots a real `intentd serve --listen both`, creates agent sessions in stale
+//! Boots a real `intentd serve` (WSS enabled via config.toml), creates agent sessions in stale
 //! in-flight statuses (Active/Processing/Waiting), restarts the daemon, and
 //! verifies that `agent.listInterrupted` returns the interrupted agents.
 //!
@@ -251,14 +251,12 @@ where
 #[tokio::test]
 async fn interrupted_agents_persisted_across_restart() {
     let data_dir = temp_data_dir();
-    let listen = "both";
+    common::enable_wss_boot(&data_dir);
     let socket = data_dir.join("intentd.sock");
 
     // Phase 1: Boot daemon, create a workspace, create an agent session with Active status.
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -342,8 +340,6 @@ async fn interrupted_agents_persisted_across_restart() {
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd2.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -392,8 +388,6 @@ async fn interrupted_agents_persisted_across_restart() {
     drop(guard2);
     let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd3.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -450,7 +444,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     };
 
     let data_dir = temp_data_dir();
-    let listen = "both";
+    common::enable_wss_boot(&data_dir);
     let socket = data_dir.join("intentd.sock");
     let ws_id = "ws-graceful-test";
 
@@ -476,8 +470,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     .to_string();
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -589,8 +581,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     // Phase 2: Restart daemon — should list the interrupted agent.
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd2.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")

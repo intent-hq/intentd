@@ -30,15 +30,15 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-/// Spawn `intentd serve --listen uds` with the hermetic env seams plus `env`.
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+/// Spawn `intentd serve` (UDS always on) with the hermetic env seams plus
+/// `env` and any extra CLI `args`.
+fn spawn_serve_args(data_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg("uds")
+        .args(args)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -98,7 +98,7 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     )
     .expect("seed config.toml");
 
-    let child = spawn_serve(&data_dir, &[("INTENTD_IDLE_REAP_MINUTES", "3")]);
+    let child = spawn_serve_args(&data_dir, &[], &[("INTENTD_IDLE_REAP_MINUTES", "3")]);
     let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -160,19 +160,21 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     assert!(ok_update.get("error").is_none(), "{ok_update}");
 }
 
-/// `--listen` pins `server.listenMode`: the wire reports the CLI value with
-/// origin `flag` even when the file claims otherwise, and mutation rejects
-/// naming `--listen`.
+/// `--insecure` pins `server.auth.enabled`: the wire reports the CLI value
+/// with origin `flag` even when the file claims otherwise, and mutation
+/// rejects naming `--insecure`.
 #[tokio::test]
-async fn listen_flag_pins_listen_mode() {
+async fn insecure_flag_pins_auth_enabled() {
     let data_dir = temp_data_dir();
     std::fs::write(
         data_dir.join("config.toml"),
-        "[server]\nlistenMode = \"both\"\n",
+        "[server.auth]\nenabled = true\n",
     )
     .expect("seed config.toml");
 
-    let child = spawn_serve(&data_dir, &[]);
+    // INTENTD_TCP_PORT=0 keeps the always-on insecure plain-ws listener on an
+    // ephemeral port so parallel tests don't contend for the fixed default.
+    let child = spawn_serve_args(&data_dir, &["--insecure"], &[("INTENTD_TCP_PORT", "0")]);
     let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -181,12 +183,12 @@ async fn listen_flag_pins_listen_mode() {
         &socket,
         1,
         "settings.get",
-        json!({ "path": "server.listenMode" }),
+        json!({ "path": "server.auth.enabled" }),
     )
     .await;
     assert_eq!(
         get["result"]["value"],
-        json!("uds"),
+        json!(false),
         "CLI beats file: {get}"
     );
     assert_eq!(get["result"]["origin"], json!("flag"), "{get}");
@@ -195,7 +197,7 @@ async fn listen_flag_pins_listen_mode() {
         &socket,
         2,
         "settings.update",
-        json!({ "changes": [{ "path": "server.listenMode", "value": "tcp" }] }),
+        json!({ "changes": [{ "path": "server.auth.enabled", "value": true }] }),
     )
     .await;
     assert_eq!(update["error"]["code"], json!(-32602), "{update}");
@@ -203,8 +205,8 @@ async fn listen_flag_pins_listen_mode() {
         update["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("--listen"),
-        "rejection names --listen: {update}"
+            .contains("--insecure"),
+        "rejection names --insecure: {update}"
     );
 }
 
@@ -226,7 +228,7 @@ async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
     .expect("seed config.toml");
 
     // First boot: tolerated + imported + stripped.
-    let child = spawn_serve(&data_dir, &[]);
+    let child = spawn_serve_args(&data_dir, &[], &[]);
     let socket = data_dir.join("intentd.sock");
     {
         let _daemon = DaemonGuard::new(child, data_dir.clone(), false);
@@ -272,7 +274,7 @@ async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
 
     // Second boot: clean file, imported value still served from SQLite.
     let stripped_text = std::fs::read_to_string(&config_path).expect("read config");
-    let child = spawn_serve(&data_dir, &[]);
+    let child = spawn_serve_args(&data_dir, &[], &[]);
     let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
     assert!(await_uds(&socket).await, "second boot did not start");
     let get = uds_rpc(
@@ -312,7 +314,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.join("config.toml"), body).expect("seed config.toml");
         let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args(["serve", "--listen", "uds"])
+            .arg("serve")
             .env("INTENTD_DATA_DIR", &data_dir)
             .output()
             .expect("run intentd serve");
@@ -340,7 +342,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
     let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["serve", "--listen", "uds"])
+        .arg("serve")
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_TCP_PORT", "80")
         .output()

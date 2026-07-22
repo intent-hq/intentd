@@ -8,9 +8,46 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::Duration;
+
+/// Enable the WSS listener at boot by seeding `[server.wsApi]` with
+/// `enabled = true` and an OS-assigned free port into `config.toml` under
+/// `data_dir`. Replaces the retired `intentd serve --listen both` flag: the
+/// UDS listener is always on and the HTTPS+WSS listener boot-starts iff the
+/// effective `server.wsApi.enabled` is true, binding `server.wsApi.port`.
+/// Seeding a hermetic free port keeps parallel tests off the fixed default
+/// (5181). Idempotent and append-only, so a test-seeded config.toml (and the
+/// section itself — including the port — across daemon restarts on the same
+/// data dir) is preserved.
+pub fn enable_wss_boot(data_dir: &Path) {
+    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+    let path = data_dir.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if text.contains("[server.wsApi]") {
+        return;
+    }
+    if !text.is_empty() {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push('\n');
+    }
+    let port = free_port();
+    text.push_str(&format!("[server.wsApi]\nenabled = true\nport = {port}\n"));
+    std::fs::write(&path, text).expect("write config.toml");
+}
+
+/// Grab an OS-assigned free TCP port (bind :0, read, release). The tiny
+/// reuse window is acceptable for hermetic tests.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind :0")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
 
 /// Apply the timeout multiplier from the environment for coverage
 /// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
