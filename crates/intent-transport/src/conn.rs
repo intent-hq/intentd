@@ -24,6 +24,7 @@ use crate::drafts;
 use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
+use crate::panic_guard;
 use crate::reverse::ReverseChannel;
 use crate::router::handle_message;
 use crate::subscriptions::{self, Channel, SubFastPath};
@@ -116,42 +117,73 @@ pub(crate) async fn process_frame(
     client_id: &mut Option<ClientId>,
     is_local: bool,
 ) -> bool {
-    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+    let parsed = serde_json::from_str::<Value>(raw).ok();
+    if let Some(value) = &parsed {
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
-        // never treat it as a client request.
-        if reverse.route_response(&value) {
-            return true;
+        // never treat it as a client request. It routes a *response* frame (no
+        // request handler runs and there is no request id to echo an error
+        // to), so a panic here (e.g. a poisoned pending map) yields no error
+        // frame — but it must still not tear down the read loop, so it gets
+        // its own unwind guard: treat the frame as consumed and keep serving.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reverse.route_response(value)
+        })) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => {
+                tracing::error!("reverse-response routing panicked; connection kept alive");
+                return true;
+            }
         }
+        // Every handler path below (inline or spawned) runs under a panic
+        // guard: a panicking handler yields `-32603` with the echoed request
+        // `id` (no frame for notifications) and the connection stays open.
+        let (rpc_id, method) = panic_guard::request_identity(value);
         if let Some(control) = control {
-            if let Some(req) = control::classify(&value) {
-                return match control::handle(req, control.as_ref(), is_local) {
+            if let Some(req) = control::classify(value) {
+                let frame = panic_guard::guard_frame_sync(&method, rpc_id.clone(), || {
+                    control::handle(req, control.as_ref(), is_local)
+                });
+                return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };
             }
         }
         if let Some(server_info) = server_pairing_info {
-            if let Some(req) = crate::server::classify(&value) {
+            if let Some(req) = crate::server::classify(value) {
                 // server.* RPCs are local-only; gate on real connection origin (UDS vs TCP)
                 // not the locality flag. Task-local context set by transport (§5.2).
                 let is_local = !crate::context::is_tcp_connection();
-                return match crate::server::handle(req, server_info, is_local).await {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::server::handle(req, server_info, is_local),
+                )
+                .await;
+                return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };
             }
-            if let Some(req) = crate::pairing::classify(&value) {
+            if let Some(req) = crate::pairing::classify(value) {
                 // pairing.getInfo shares the server.* provider and local-only gating:
                 // the payload embeds the bearer token, so it never crosses TCP.
                 let is_local = !crate::context::is_tcp_connection();
-                return match crate::pairing::handle(req, server_info, is_local).await {
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    crate::pairing::handle(req, server_info, is_local),
+                )
+                .await;
+                return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
                 };
             }
         }
-        if let Some(req) = host::classify(&value) {
+        if let Some(req) = host::classify(value) {
             // Slow path: spawn so `host.exec` and friends can't block the read
             // loop (UDS HOL fix). `openInEditor` in particular awaits an
             // FE-served reverse RPC on this same connection (§5.14) — running
@@ -163,10 +195,15 @@ pub(crate) async fn process_frame(
             let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) =
-                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse).await
+                    if let Some(frame) = panic_guard::guard_frame(
+                        &method,
+                        rpc_id,
+                        host::handle(req, api.as_ref(), Some(&bus), is_local, &reverse),
+                    )
+                    .await
                     {
                         let _ = out.send(frame).await;
                     }
@@ -175,7 +212,7 @@ pub(crate) async fn process_frame(
             });
             return true;
         }
-        if let Some(req) = browser::classify(&value) {
+        if let Some(req) = browser::classify(value) {
             // Slow path: `browser.exec` awaits an FE-served reverse RPC on this
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
@@ -183,9 +220,13 @@ pub(crate) async fn process_frame(
             let out = out_tx.clone();
             let reverse = reverse.clone();
             let is_tcp = crate::context::is_tcp_connection();
+            let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
-                    if let Some(frame) = browser::handle(req, &reverse).await {
+                    if let Some(frame) =
+                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse))
+                            .await
+                    {
                         let _ = out.send(frame).await;
                     }
                 })
@@ -193,42 +234,89 @@ pub(crate) async fn process_frame(
             });
             return true;
         }
-        if let Some(req) = forward::classify(&value) {
-            return match forward::handle(req, forwards, is_local).await {
+        if let Some(req) = forward::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                forward::handle(req, forwards, is_local),
+            )
+            .await;
+            return match frame {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
-        if let Some(req) = client::classify(&value) {
-            return match client::handle(req, api.as_ref(), client_id, is_local).await {
+        if let Some(req) = client::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                client::handle(req, api.as_ref(), client_id, is_local),
+            )
+            .await;
+            return match frame {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
-        if let Some(req) = drafts::classify(&value) {
-            return match drafts::handle(req, api.as_ref(), client_id).await {
+        if let Some(req) = drafts::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                drafts::handle(req, api.as_ref(), client_id),
+            )
+            .await;
+            return match frame {
                 Some(frame) => out_tx.send(frame).await.is_ok(),
                 None => true,
             };
         }
-        if let Some(sub) = subscriptions::classify(&value) {
-            return handle_sub_fast_path(sub, api, bus, out_tx, subs).await;
+        // `AssertUnwindSafe` over `&mut ConnSubs` is sound here: if a
+        // subscribe handler panics after `tokio::spawn(forward_*)` but before
+        // `subs.insert(...)`, the forwarder is spawned but unregistered, so
+        // unsubscribe/`replaceGroup` can't reach it. The leak is bounded — the
+        // forwarder exits when its `out_tx.send` fails after the connection
+        // closes — and the registry itself is never left mid-mutation.
+        if let Some(sub) = subscriptions::classify(value) {
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_sub_fast_path(sub, api, bus, out_tx, subs),
+            )
+            .await;
         }
-        if let Some(fast_path) = events::classify(&value) {
-            return handle_fast_path(fast_path, bus, out_tx, subs).await;
+        if let Some(fast_path) = events::classify(value) {
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_fast_path(fast_path, bus, out_tx, subs),
+            )
+            .await;
         }
     }
     // Slow path: the ported-methods dispatcher can touch any service, so spawn
     // it too. Owns the raw frame so the read loop can advance to the next line.
     // Thread connection context (UDS vs TCP) through so ServerControl can guard
     // self-terminating stop calls.
+    // Identity comes from the already-parsed frame — no re-parse of `raw`.
+    // An unparseable frame gets `id: null` (per JSON-RPC, error responses to
+    // unknown/invalid frames use a null id), so a panic in `handle_message`
+    // (which owns the -32700 reply) still yields a response instead of
+    // silently hanging the client.
+    let (rpc_id, method) = parsed
+        .as_ref()
+        .map(panic_guard::request_identity)
+        .unwrap_or_else(|| (Some(Value::Null), String::new()));
     let api = api.clone();
     let out_tx = out_tx.clone();
     let raw = raw.to_string();
     let is_tcp = crate::context::is_tcp_connection();
     tokio::spawn(async move {
         crate::context::with_connection_context(is_tcp, async {
-            if let Some(response) = handle_message(api.as_ref(), &raw).await {
+            if let Some(response) =
+                panic_guard::guard_frame(&method, rpc_id, handle_message(api.as_ref(), &raw)).await
+            {
                 let _ = out_tx.send(response).await;
             }
         })
