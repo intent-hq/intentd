@@ -262,13 +262,13 @@ pub(super) fn exit_attribution(
 /// Join the last [`STDERR_TAIL_LINES`] non-empty stderr lines, bounded to
 /// [`STDERR_TAIL_MAX_CHARS`] characters kept from the end.
 fn stderr_tail(stderr: &[String]) -> Option<String> {
-    let start = stderr.len().saturating_sub(STDERR_TAIL_LINES);
-    let joined = stderr[start..]
+    let non_empty: Vec<&str> = stderr
         .iter()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" | ");
+        .collect();
+    let start = non_empty.len().saturating_sub(STDERR_TAIL_LINES);
+    let joined = non_empty[start..].join(" | ");
     if joined.is_empty() {
         return None;
     }
