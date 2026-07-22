@@ -12,7 +12,7 @@
 //! - Debounce: rapid burst coalesces into one emission with the latest value.
 //!
 //! Uses the mock ACP agent fixture for deterministic behavior. The test
-//! overrides `LAST_ACTIVITY_DEBOUNCE_TEST_MS` to 200ms for fast execution.
+//! overrides `LAST_ACTIVITY_DEBOUNCE_TEST_MS` to 500ms for fast execution.
 
 #![cfg(unix)]
 
@@ -320,13 +320,37 @@ where
     }
 }
 
+/// Wait until `count` terminal `agent:stream:end` events for `agent_id` have
+/// arrived on an `agent:*` subscription. One overall deadline bounds the whole
+/// wait so a missing event fails fast instead of polling a fixed iteration
+/// budget.
+async fn await_stream_ends<S>(ws: &mut WebSocketStream<S>, agent_id: &str, count: usize)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut seen = 0usize;
+    while seen < count {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let evt = try_next_event(ws, &["agent:stream:end"], remaining)
+            .await
+            .unwrap_or_else(|| {
+                panic!("timed out waiting for {count} agent:stream:end events (saw {seen})")
+            });
+        if evt["data"]["agentId"] == agent_id {
+            seen += 1;
+        }
+    }
+}
+
 async fn boot(mock_script: &str, behavior: &str) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = scratch_dir("data");
-    // Override debounce to 200ms for fast test execution
+    // Override debounce to 500ms for fast test execution (large enough that
+    // CI scheduler stalls between activity touches don't split the window).
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
-        ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "200"),
+        ("LAST_ACTIVITY_DEBOUNCE_TEST_MS", "500"),
         ("MOCK_AGENT_SCRIPT_PATH", mock_script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
     ];
@@ -428,7 +452,7 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
     .await;
 
     // Wait for workspace:updated with lastActivity.
-    // The debounce window is 200ms, so we wait a bit longer to account for
+    // The debounce window is 500ms, so we wait a bit longer to account for
     // agent turn execution + debounce + event delivery.
     let updated_evt = next_event(&mut sub, &["workspace:updated"], 10).await;
     assert_eq!(updated_evt["workspaceId"], ws_id);
@@ -539,6 +563,17 @@ async fn last_activity_debounce_coalesces_burst() {
     )
     .await;
 
+    // Second subscription on `agent:*`: turn completion is observed via
+    // `agent:stream:end`, which a `workspace:*` subscription never receives.
+    let mut agent_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut agent_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
     // Create agent
@@ -551,7 +586,31 @@ async fn last_activity_debounce_coalesces_burst() {
     .await;
     let agent_id = created["agent"]["id"].as_str().expect("agent id");
 
-    // Drive a rapid burst: 3 messages within the 200ms window
+    // Warm-up turn: absorb the one-off agent process spawn latency so a slow
+    // spawn on a loaded host can't open a quiet gap that splits the measured
+    // burst below into multiple debounce windows.
+    wss_rpc(
+        &mut rpc,
+        4,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "warm-up" }),
+    )
+    .await;
+    await_stream_ends(&mut agent_sub, agent_id, 1).await;
+
+    // Drain the warm-up turn's own lastActivity emission(s): read until the
+    // workspace:* subscription has been quiet for well over one debounce
+    // window, so nothing from the warm-up leaks into the burst count.
+    while try_next_event(
+        &mut sub,
+        &["workspace:updated"],
+        Duration::from_millis(1500),
+    )
+    .await
+    .is_some()
+    {}
+
+    // Drive a rapid burst: 3 messages within the 500ms debounce window
     for i in 0..3 {
         wss_rpc(
             &mut rpc,
@@ -563,31 +622,30 @@ async fn last_activity_debounce_coalesces_burst() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Wait for agent:stream:end
-    for _ in 0..60 {
-        if let Some(evt) =
-            try_next_event(&mut sub, &["agent:stream:end"], Duration::from_secs(2)).await
-        {
-            if evt["data"]["agentId"] == agent_id {
-                break;
-            }
-        }
-    }
+    // Wait (bounded) until all three burst turns completed.
+    await_stream_ends(&mut agent_sub, agent_id, 3).await;
 
-    // Collect workspace:updated events for 1 second (covers debounce + some buffer)
+    // Collect workspace:updated events until the subscription has been quiet
+    // for well over one debounce window (covers the trailing debounce fire).
     let mut last_activity_events = Vec::new();
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < Duration::from_secs(1) {
-        if let Some(evt) =
-            try_next_event(&mut sub, &["workspace:updated"], Duration::from_millis(300)).await
-        {
-            if evt["data"]["changes"]["lastActivity"].is_string() {
-                last_activity_events.push(evt);
-            }
+    while let Some(evt) = try_next_event(
+        &mut sub,
+        &["workspace:updated"],
+        Duration::from_millis(1500),
+    )
+    .await
+    {
+        if evt["data"]["changes"]["lastActivity"].is_string() {
+            last_activity_events.push(evt);
         }
     }
 
-    // Assert at most one event (debounce coalesced the burst)
+    // Assert exactly one event (debounce coalesced the burst into a single
+    // non-vacuous emission).
+    assert!(
+        !last_activity_events.is_empty(),
+        "expected the burst to emit a workspace:updated {{ lastActivity }}"
+    );
     assert!(
         last_activity_events.len() <= 1,
         "expected at most 1 workspace:updated, got {}",
