@@ -7845,65 +7845,72 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // The agent is observably mid-stream once the chunk event lands.
-    let mut saw_chunk = false;
-    for _ in 0..40 {
-        let frame = wss_event(&mut sub, 30).await;
-        if frame["params"]["event"]["type"] == "agent:stream:chunk" {
-            saw_chunk = true;
-            break;
+    // The agent is observably mid-stream once the chunk event lands. The whole
+    // wait is bounded by a single deadline (per-frame reads inside `wss_event`
+    // would otherwise reset on heartbeat Pings and hang on a missing chunk).
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            if frame["params"]["event"]["type"] == "agent:stream:chunk" {
+                return;
+            }
         }
-    }
-    assert!(saw_chunk, "mock streamed its pre-park chunk");
+    })
+    .await
+    .expect("mock streamed its pre-park chunk");
 
     // The chat channel saw the streamed block too — capture its id so the
     // terminal assertions below key off the exact block that streamed live.
-    let mut streamed_block_id = None;
-    for _ in 0..40 {
-        let frame = wss_push(&mut chat, 15).await;
-        assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-        let delta = &frame["params"]["delta"];
-        if let Some(entity) = delta["added"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(delta["updated"].as_array().into_iter().flatten())
-            .find(|e| {
-                e["block"]["text"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("streaming-before-cancel"))
-            })
-        {
-            streamed_block_id = entity["block"]["id"].as_str().map(String::from);
-            break;
+    // Single total deadline, same rationale as above.
+    let streamed_block_id = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = &frame["params"]["delta"];
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("streaming-before-cancel"))
+                })
+            {
+                return entity["block"]["id"].as_str().map(String::from);
+            }
         }
-    }
-    let streamed_block_id = streamed_block_id.expect("streamed text block reached chat channel");
+    })
+    .await
+    .expect("streamed text block reached chat channel in time")
+    .expect("streamed text block carries an id");
 
     // User interrupt mid-stream.
     let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
 
     // Terminal reconcile: the streamed block survives (added or updated with
-    // `streamingComplete: true`) and NOTHING is removed.
-    let mut terminal = None;
-    for _ in 0..40 {
-        let frame = wss_push(&mut chat, 15).await;
-        assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-        let delta = frame["params"]["delta"].clone();
-        let is_terminal = ["added", "updated"].iter().any(|key| {
-            delta[*key]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
-        });
-        if is_terminal {
-            terminal = Some(delta);
-            break;
+    // `streamingComplete: true`) and NOTHING is removed. Single total deadline.
+    let terminal = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = frame["params"]["delta"].clone();
+            let is_terminal = ["added", "updated"].iter().any(|key| {
+                delta[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+            });
+            if is_terminal {
+                return delta;
+            }
         }
-    }
-    let terminal = terminal.expect("terminal (streamingComplete) delta arrived");
+    })
+    .await
+    .expect("terminal (streamingComplete) delta arrived");
     assert_eq!(
         terminal["removedIds"],
         json!([]),
