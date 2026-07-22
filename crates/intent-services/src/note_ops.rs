@@ -584,11 +584,12 @@ pub fn find_and_anchor_text(
 }
 
 /// A plaintext rendering of a note's markdown plus a per-byte map back to the
-/// source: `map[i]` is the `(start, end)` byte range of the markdown character
-/// that produced byte `i` of `text`.
+/// source: `map[i]` is the starting byte offset in the markdown of the
+/// character that produced byte `i` of `text` (multi-byte characters repeat
+/// the same start; the end boundary is recomputed from the source on demand).
 struct PlaintextProjection {
     text: String,
-    map: Vec<(usize, usize)>,
+    map: Vec<usize>,
 }
 
 /// Characters dropped from BOTH the markdown projection and the search
@@ -625,8 +626,8 @@ fn list_marker_len(line: &str) -> Option<usize> {
 /// list / blockquote markers, and every [`is_normalized_away`] character,
 /// keeping link text while dropping the `(url)` part.
 fn plaintext_projection(md: &str) -> PlaintextProjection {
-    let mut text = String::new();
-    let mut map = Vec::new();
+    let mut text = String::with_capacity(md.len());
+    let mut map = Vec::with_capacity(md.len());
     let mut i = 0;
     let mut at_line_start = true;
     while i < md.len() {
@@ -679,7 +680,7 @@ fn plaintext_projection(md: &str) -> PlaintextProjection {
         }
         text.push(ch);
         for _ in 0..clen {
-            map.push((i, i + clen));
+            map.push(i);
         }
         i += clen;
     }
@@ -723,8 +724,23 @@ fn plaintext_fallback_anchor(
     }
     let rel = needle_ctx.find(&needle_tgt).expect("checked above");
     let pos = ctx[0] + rel;
-    let from = proj.map[pos].0;
-    let to = proj.map[pos + needle_tgt.len() - 1].1;
+    let from = proj.map[pos];
+    let last_start = proj.map[pos + needle_tgt.len() - 1];
+    let last_len = content[last_start..]
+        .chars()
+        .next()
+        .expect("mapped offset is a char boundary")
+        .len_utf8();
+    let to = last_start + last_len;
+    // A projected match can span an existing `<!--anchor:…-->` marker (the
+    // projection strips them); embedding new markers around such a span would
+    // interleave with the existing pair and replay raw marker text into the
+    // note. Reject instead of producing a corrupt anchor.
+    if content[from..to].contains("<!--anchor:") {
+        return Err(Error::InvalidParams(
+            "The comment target overlaps an existing comment anchor.".to_string(),
+        ));
+    }
     Ok((from, to))
 }
 
@@ -1528,6 +1544,29 @@ mod tests {
         let content = "alpha <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma delta";
         let (from, to, _line) = find_and_anchor_text(content, "beta gamma delta", "gamma").unwrap();
         assert_eq!(&content[from..to], "gamma");
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_rejects_span_over_existing_marker() {
+        // A target whose mapped source range would swallow an existing anchor
+        // marker must be rejected: embedding new markers there would
+        // interleave the pairs and replay raw marker text into the note.
+        let content = "alpha <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma delta";
+        let err = find_and_anchor_text(content, "beta gamma delta", "beta gamma").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("overlaps an existing comment anchor")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_multibyte_target_boundaries() {
+        // Multi-byte characters at the end of the target: the mapped `to`
+        // must land on the char's end boundary, not mid-codepoint.
+        let content = "# Título\n\nUne **phrase où ça** finit là";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "TítuloUne phrase où ça finit là", "où ça").unwrap();
+        assert_eq!(&content[from..to], "où ça");
     }
 
     #[test]
