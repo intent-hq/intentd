@@ -189,8 +189,8 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
 /// the path comparison missed — e.g. symlinked temp dirs — since its
 /// directory is now gone). Returns the trash path awaiting removal, or
 /// `None` when the directory was already gone or had to be removed in place
-/// (rename fallback, e.g. cross-device). Idempotent: a missing directory or
-/// registration is `Ok(None)`.
+/// (rename fallback, e.g. permissions or directory busy). Idempotent: a
+/// missing directory or registration is `Ok(None)`.
 pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<PathBuf>> {
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     if let Ok(names) = repo.worktrees() {
@@ -239,9 +239,9 @@ pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
 /// awaiting recursive removal. Race-tolerant: a source that vanished between
 /// the probe and the rename is idempotent success (`None`), a trash-candidate
 /// collision retries with a fresh nonce, and any other rename failure (e.g.
-/// cross-device) falls back to an in-place recursive removal — mirroring the
-/// original `fs.rm(worktreePath, { recursive, force })` — where `NotFound` is
-/// also treated as already gone.
+/// permissions, directory busy) falls back to an in-place recursive removal —
+/// mirroring the original `fs.rm(worktreePath, { recursive, force })` — where
+/// `NotFound` is also treated as already gone.
 fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
     use std::io::ErrorKind;
     if !worktree_path.exists() {

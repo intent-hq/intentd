@@ -3775,8 +3775,9 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
 /// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
 /// does git-metadata work only: capture the checked-out branch, detach the
 /// linked worktree (prune the registration and rename the checkout to a
-/// trash path via [`intent_git::worktree::detach_worktree`] — never the
-/// recursive delete), drop the `.workspace` metadata dir and the now-empty
+/// trash path via [`intent_git::worktree::detach_worktree`] — the recursive
+/// delete happens under the lock only in the rare rename-failure fallback),
+/// drop the `.workspace` metadata dir and the now-empty
 /// `<root>/<workspaceId>` parent directory, and delete the workspace branch
 /// only when it passes every guard — it must be the branch currently checked
 /// out there, it must be the branch the daemon auto-generated at create time
@@ -7829,11 +7830,13 @@ impl WorkspaceApi for Services {
                                 // Under the per-repo lock: git-metadata work
                                 // only (registration prune, rename of the
                                 // checkout to a trash path, branch-delete
-                                // guard). The multi-GB recursive removal runs
-                                // below, after the lock is released, so
-                                // concurrent `workspace.create` provisioning
-                                // on the same repo is never starved by bulk
-                                // deletes.
+                                // guard). On the rename-success path the
+                                // multi-GB recursive removal runs below,
+                                // after the lock is released, so concurrent
+                                // `workspace.create` provisioning on the same
+                                // repo is not starved by bulk deletes; only
+                                // the rare rename-failure fallback removes
+                                // in place under the lock.
                                 let trash = worktree_locks_bg
                                     .with_lock(&repo_dir, move || async move {
                                         let task = tokio::task::spawn_blocking(move || {
