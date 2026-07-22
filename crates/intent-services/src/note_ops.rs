@@ -752,10 +752,15 @@ fn rescue_target_position(
             "The comment target appears multiple times within the search context.".to_string(),
         ));
     }
-    let (before, after) = match needle_ctx.find(needle_tgt) {
-        Some(rel) => (&needle_ctx[..rel], &needle_ctx[rel + needle_tgt.len()..]),
-        None => ("", ""),
+    let Some(rel) = needle_ctx.find(needle_tgt) else {
+        // Consistent with the exact/projection paths: a target that is not
+        // inside the provided context is a target problem, not a missing
+        // context.
+        return Err(Error::InvalidParams(
+            "The comment target was not found within the search context.".to_string(),
+        ));
     };
+    let (before, after) = (&needle_ctx[..rel], &needle_ctx[rel + needle_tgt.len()..]);
     let mut best: Option<(usize, usize)> = None;
     let mut tied = false;
     for &pos in &occurrences {
@@ -1751,6 +1756,18 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidParams(ref m) if m.contains("Could not find the search context")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_rescue_target_outside_context_reports_target_error() {
+        // Context missing AND target not contained in it: the error names the
+        // target relationship, consistent with the in-context path.
+        let err =
+            find_and_anchor_text("alpha token beta", "vanished context here", "token").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("comment target was not found")),
             "unexpected error: {err:?}"
         );
     }
