@@ -2,7 +2,7 @@
 //!
 //! Proves that failed listener starts do not persist `server.wsApi.enabled=true`
 //! (settings rollback guard from PR #135). This test does NOT prove the runtime WSS
-//! toggle works under `--listen uds`; that requires a real composition-root daemon
+//! toggle works on a UDS-only boot; that requires a real composition-root daemon
 //! and is covered by e2e_wss_runtime_control.rs (see the placeholder test below).
 
 use std::path::PathBuf;
@@ -186,13 +186,13 @@ async fn settings_rollback_on_failed_listener_start() {
 /// Runtime WSS listener toggle from UDS: prove that a UDS-started daemon can
 /// successfully enable the WSS listener at runtime via settings.update
 /// server.wsApi.enabled=true (Phase 4 fix). This is the sidecar-managed run
-/// contract: FE spawns 'serve --listen uds', user toggles WS on via UI.
+/// contract: FE spawns a UDS-only 'serve', user toggles WS on via UI.
 ///
 /// Note: This test is a placeholder for e2e coverage that needs a real
 /// composition-root daemon. The FailingServerControl mock in this file doesn't
 /// exercise the fixed path. Full regression coverage for the UDS-started runtime
 /// toggle should be added to e2e_wss_runtime_control.rs or a similar e2e suite
-/// that spawns an actual intentd process with --listen uds.
+/// that spawns an actual intentd process without WSS enabled.
 #[tokio::test]
 #[ignore = "placeholder for e2e coverage in e2e_wss_runtime_control.rs"]
 async fn uds_started_daemon_can_enable_ws_listener_at_runtime() {
@@ -200,5 +200,5 @@ async fn uds_started_daemon_can_enable_ws_listener_at_runtime() {
     // The fix is verified by:
     // 1. Manual testing (sidecar-managed dev builds)
     // 2. Local gates (all passing)
-    // 3. Existing e2e_wss_runtime_control.rs tests (which start with --listen both)
+    // 3. Existing e2e_wss_runtime_control.rs tests (which boot with WSS enabled)
 }

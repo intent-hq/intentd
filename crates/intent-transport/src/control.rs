@@ -18,13 +18,17 @@ use crate::protocol::PROTOCOL_VERSION;
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
-    /// The `--listen` mode the daemon was started with (`uds`/`tcp`/`both`).
+    /// Derived listen mode: `both` while the TCP listener (secure WSS, or
+    /// plain-ws under `--insecure`) is up, else `uds` (the UDS listener
+    /// always serves).
     pub listen_mode: String,
-    /// Whether the UDS listener is active.
+    /// Whether the UDS listener is active (always true in practice).
     pub uds: bool,
-    /// Whether the TCP/WSS listener is active.
+    /// Whether the TCP/WSS listener is currently active (runtime state, not a
+    /// boot-time flag).
     pub tcp: bool,
-    /// The bound WSS port, when the TCP listener is running.
+    /// The bound TCP listener port (secure WSS, or plain-ws under
+    /// `--insecure`), when the listener is running.
     pub port: Option<u16>,
     /// Currently-connected WebSocket clients (UDS connections are not tracked).
     pub clients: usize,
