@@ -11,6 +11,7 @@ use intent_core::{
     Result, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
@@ -54,6 +55,21 @@ impl Store {
     /// The wire-facing [`Comment`] itself carries no `workspace_id`, so the
     /// caller supplies it explicitly.
     pub async fn insert_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
+        self.insert_comment_with_extras(workspace_id, c, &Map::new())
+            .await
+    }
+
+    /// [`Store::insert_comment`], additionally merging `legacy_extra` — legacy
+    /// fields intentd does not model (used by the legacy workspace importer so
+    /// unknown source fields are preserved instead of dropped) — into the
+    /// `extra_json` blob. On key collision the comment's own fields win.
+    /// Unknown keys in `extra_json` are ignored when the row is read back.
+    pub async fn insert_comment_with_extras(
+        &self,
+        workspace_id: &WorkspaceId,
+        c: &Comment,
+        legacy_extra: &Map<String, Value>,
+    ) -> Result<()> {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
         let extra = ExtraFields {
@@ -64,11 +80,19 @@ impl Store {
             agent_id: c.agent_id.clone(),
             is_orphaned: c.is_orphaned,
         };
-        let extra_json = if extra.is_empty() {
+        let mut merged = match serde_json::to_value(&extra) {
+            Ok(Value::Object(m)) => m,
+            Ok(_) => return Err(Error::Internal("encode extra failed: not an object".into())),
+            Err(e) => return Err(Error::Internal(format!("encode extra failed: {e}"))),
+        };
+        for (k, v) in legacy_extra {
+            merged.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        let extra_json = if merged.is_empty() {
             None
         } else {
             Some(
-                serde_json::to_string(&extra)
+                serde_json::to_string(&Value::Object(merged))
                     .map_err(|e| Error::Internal(format!("encode extra failed: {e}")))?,
             )
         };

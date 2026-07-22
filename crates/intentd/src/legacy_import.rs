@@ -15,20 +15,25 @@
 //! - `intentd import-legacy [--root <dir>] [--dry-run] [--force]`
 //!   (`cmd_import_legacy` in `main.rs`).
 //!
-//! Later per-workspace importers (comments, agent transcripts) plug into
+//! Later per-workspace importers (agent transcripts) plug into
 //! [`import_workspace_extras`], which receives each imported workspace's
 //! legacy directory. Notes import is implemented there: legacy
 //! `.workspace/notes/{id}.md` files (YAML frontmatter + markdown body) become
 //! `note` rows — `spec.md` lands as the well-known `spec` note, frontmatter
 //! `task:` maps to task metadata (`task_json`), and `parent` to `parent_id`.
-//! The `.meta/` sidecar (versions/CRDT/trash) is skipped entirely.
+//! Comments import follows: `.workspace/notes/.meta/{noteId}.comments.json`
+//! files (the legacy FE `NoteCommentsData` shape) become `comment` rows —
+//! threads reconstruct via `threadId`/`parentId`, `markId`/`from`/`to` derive
+//! the anchor, and legacy fields intentd does not model land in `extra_json`.
+//! The rest of the `.meta/` sidecar (versions/CRDT/trash) is skipped entirely.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use intent_core::{
-    now_iso, ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata,
+    now_iso, AgentId, AuthorType, Comment, CommentAnchor, CommentAnchorType, CommentStatus,
+    CommentType, ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata,
     Workspace,
 };
 use intent_store::Store;
@@ -82,6 +87,26 @@ impl NoteCounts {
     }
 }
 
+/// Per-workspace comment-import counters (part of [`WorkspaceReport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommentCounts {
+    /// Comment rows inserted.
+    pub imported: usize,
+    /// Comment ids already present (idempotent skip).
+    pub skipped: usize,
+    /// Malformed entries/files or failed inserts (logged, never fatal).
+    pub failed: usize,
+    /// Comments files whose note does not exist for the workspace; skipped
+    /// whole with a log.
+    pub orphaned: usize,
+}
+
+impl CommentCounts {
+    fn total(&self) -> usize {
+        self.imported + self.skipped + self.failed + self.orphaned
+    }
+}
+
 /// Per-workspace line of the final report.
 #[derive(Debug, Clone)]
 pub struct WorkspaceReport {
@@ -89,6 +114,7 @@ pub struct WorkspaceReport {
     pub dir: PathBuf,
     pub outcome: Outcome,
     pub notes: NoteCounts,
+    pub comments: CommentCounts,
 }
 
 /// Full report of one run: one entry per candidate workspace directory.
@@ -116,6 +142,11 @@ impl Report {
         self.entries.iter().map(|e| e.notes.imported).sum()
     }
 
+    /// Total comment rows inserted across all workspaces.
+    pub fn comments_imported(&self) -> usize {
+        self.entries.iter().map(|e| e.comments.imported).sum()
+    }
+
     fn count(&self, pred: impl Fn(&Outcome) -> bool) -> usize {
         self.entries.iter().filter(|e| pred(&e.outcome)).count()
     }
@@ -126,6 +157,7 @@ impl Report {
             dir: dir.to_path_buf(),
             outcome: Outcome::Skipped(reason.into()),
             notes: NoteCounts::default(),
+            comments: CommentCounts::default(),
         });
     }
 }
@@ -157,9 +189,20 @@ impl fmt::Display for Report {
             } else {
                 String::new()
             };
+            let comments = if entry.comments.total() > 0 {
+                format!(
+                    ", comments: {} imported, {} skipped, {} failed, {} orphaned",
+                    entry.comments.imported,
+                    entry.comments.skipped,
+                    entry.comments.failed,
+                    entry.comments.orphaned
+                )
+            } else {
+                String::new()
+            };
             writeln!(
                 f,
-                "  {}  {}{notes} ({})",
+                "  {}  {}{notes}{comments} ({})",
                 entry.id,
                 outcome,
                 entry.dir.display()
@@ -167,11 +210,12 @@ impl fmt::Display for Report {
         }
         write!(
             f,
-            "summary: {} imported, {} updated, {} skipped, {} notes imported",
+            "summary: {} imported, {} updated, {} skipped, {} notes imported, {} comments imported",
             self.imported(),
             self.updated(),
             self.skipped(),
-            self.notes_imported()
+            self.notes_imported(),
+            self.comments_imported()
         )
     }
 }
@@ -319,6 +363,7 @@ async fn import_one(
         dir: dir.to_path_buf(),
         outcome,
         notes: NoteCounts::default(),
+        comments: CommentCounts::default(),
     };
     if landed && !opts.dry_run {
         import_workspace_extras(store, &ws, dir, &mut entry).await;
@@ -328,8 +373,9 @@ async fn import_one(
 
 /// Extension seam for the per-workspace importers: called once per
 /// imported/updated workspace with its legacy directory (`<root>/<id>`,
-/// containing `.workspace/…`). Currently imports notes; follow-ups (comments,
-/// agent transcripts) plug in here.
+/// containing `.workspace/…`). Currently imports notes, then comments (after
+/// notes, so comments can attach to just-imported note rows); follow-ups
+/// (agent transcripts) plug in here.
 async fn import_workspace_extras(
     store: &Store,
     workspace: &Workspace,
@@ -337,6 +383,7 @@ async fn import_workspace_extras(
     entry: &mut WorkspaceReport,
 ) {
     entry.notes = import_workspace_notes(store, workspace, legacy_dir).await;
+    entry.comments = import_workspace_comments(store, workspace, legacy_dir).await;
 }
 
 /// Import legacy `.workspace/notes/*.md` files as note rows. Best-effort and
@@ -490,6 +537,236 @@ fn note_from_legacy_file(workspace: &Workspace, stem: &str, text: &str, path: &P
     }
 }
 
+/// Suffix of the legacy per-note comments sidecar
+/// (`.workspace/notes/.meta/{noteId}.comments.json`).
+const LEGACY_COMMENTS_SUFFIX: &str = ".comments.json";
+
+/// Import legacy `.workspace/notes/.meta/{noteId}.comments.json` files (the FE
+/// `NoteCommentsData` shape) as comment rows. Best-effort and idempotent:
+/// comment ids already present are skipped, malformed files/entries and failed
+/// inserts are logged and counted as `failed`, and files whose note does not
+/// exist for the workspace are counted `orphaned` and skipped whole — nothing
+/// ever fails the workspace import.
+async fn import_workspace_comments(
+    store: &Store,
+    workspace: &Workspace,
+    legacy_dir: &Path,
+) -> CommentCounts {
+    let mut counts = CommentCounts::default();
+    let meta_dir = legacy_dir.join(".workspace").join("notes").join(".meta");
+    let Ok(entries) = std::fs::read_dir(&meta_dir) else {
+        return counts; // no .meta dir — nothing to import
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().ends_with(LEGACY_COMMENTS_SUFFIX))
+        })
+        .collect();
+    files.sort();
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let note_id = NoteId::from(name.trim_end_matches(LEGACY_COMMENTS_SUFFIX));
+        match store.get_note(&workspace.id, &note_id).await {
+            Ok(_) => {}
+            Err(Error::NotFound(_)) => {
+                tracing::warn!(path = %path.display(), note_id = %note_id, "legacy comments file references missing note; skipping");
+                counts.orphaned += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), note_id = %note_id, error = %e, "legacy comments note lookup failed");
+                counts.failed += 1;
+                continue;
+            }
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy comments file unreadable; skipping");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        let parsed: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy comments file is not valid JSON; skipping");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        let Some(list) = parsed.get("comments").and_then(Value::as_array) else {
+            tracing::warn!(path = %path.display(), "legacy comments file has no `comments` array; skipping");
+            counts.failed += 1;
+            continue;
+        };
+        for raw in list {
+            let Some(obj) = raw.as_object() else {
+                tracing::warn!(path = %path.display(), "legacy comment entry is not an object; skipping");
+                counts.failed += 1;
+                continue;
+            };
+            let (comment, extra) = match comment_from_legacy_json(&note_id, obj.clone()) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    tracing::warn!(path = %path.display(), reason, "legacy comment entry malformed; skipping");
+                    counts.failed += 1;
+                    continue;
+                }
+            };
+            match store.get_comment(&comment.id).await {
+                Ok(_) => counts.skipped += 1,
+                Err(Error::NotFound(_)) => {
+                    match store
+                        .insert_comment_with_extras(&workspace.id, &comment, &extra)
+                        .await
+                    {
+                        Ok(()) => counts.imported += 1,
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), comment_id = %comment.id, error = %e, "legacy comment insert failed");
+                            counts.failed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), comment_id = %comment.id, error = %e, "legacy comment lookup failed");
+                    counts.failed += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Map one legacy `NoteComment` JSON object (FE `comment.types.ts`) to a
+/// [`Comment`] plus the leftover legacy fields destined for `extra_json`.
+/// Known fields are consumed (removed) as they are mapped; whatever remains —
+/// `lineStart`/`lineEnd`, `from`/`to`, `tags`, `reactions`, unknown keys — is
+/// preserved verbatim so no source data is dropped. Thread structure keeps
+/// `threadId` (defaulting to the FE's `thread-{id}` convention) and
+/// `parentId`; `markId` becomes a point anchor and `section` the anchor text.
+fn comment_from_legacy_json(
+    note_id: &NoteId,
+    mut obj: Map<String, Value>,
+) -> Result<(Comment, Map<String, Value>), String> {
+    fn take_string(obj: &mut Map<String, Value>, key: &str) -> Option<String> {
+        match obj.get(key) {
+            Some(Value::String(_)) => match obj.remove(key) {
+                Some(Value::String(s)) if !s.is_empty() => Some(s),
+                _ => None,
+            },
+            Some(Value::Null) => {
+                obj.remove(key);
+                None
+            }
+            // Wrong-typed values stay behind so they land in `extra_json`.
+            _ => None,
+        }
+    }
+    fn take_enum<T: serde::de::DeserializeOwned + Default>(
+        obj: &mut Map<String, Value>,
+        key: &str,
+    ) -> Result<T, String> {
+        match obj.remove(key) {
+            None | Some(Value::Null) => Ok(T::default()),
+            Some(v) => serde_json::from_value(v).map_err(|e| format!("bad `{key}`: {e}")),
+        }
+    }
+
+    let id = take_string(&mut obj, "id").ok_or("missing `id`")?;
+    // FE convention: comments without an explicit thread root their own.
+    let thread_id = take_string(&mut obj, "threadId").unwrap_or_else(|| format!("thread-{id}"));
+    let kind: CommentType = take_enum(&mut obj, "type")?;
+    let status: CommentStatus = take_enum(&mut obj, "status")?;
+    let author_type: AuthorType = take_enum(&mut obj, "authorType")?;
+    let content = take_string(&mut obj, "content").unwrap_or_default();
+    let author = take_string(&mut obj, "author").unwrap_or_default();
+    let parent_id = take_string(&mut obj, "parentId");
+    let created_at = take_string(&mut obj, "createdAt").unwrap_or_else(now_iso);
+    let updated_at = take_string(&mut obj, "updatedAt").unwrap_or_else(|| created_at.clone());
+    let anchor_text = take_string(&mut obj, "section");
+    let agent_id = take_string(&mut obj, "agentId").map(AgentId::from);
+    let is_orphaned = match obj.remove("isOrphaned") {
+        Some(Value::Bool(b)) => Some(b),
+        _ => None,
+    };
+    // The sidecar duplicates the note id per entry; the file location is
+    // authoritative, so drop it rather than persisting a stale copy.
+    obj.remove("noteId");
+
+    // `markId` is the legacy anchor-mark id → point anchor. Without one the
+    // exact offsets (`from`/`to`) stay in `extra_json` and the anchor is a
+    // default (unanchored) range.
+    let anchor = match take_string(&mut obj, "markId") {
+        Some(mark_id) => CommentAnchor {
+            kind: CommentAnchorType::Point,
+            point_id: Some(mark_id),
+            ..Default::default()
+        },
+        None => CommentAnchor::default(),
+    };
+
+    let (suggestion_original, suggestion_proposed) = match obj.remove("suggestionDiff") {
+        Some(Value::Object(mut diff)) => {
+            let original = match diff.remove("original") {
+                Some(Value::String(s)) => Some(s),
+                Some(other) => {
+                    diff.insert("original".to_string(), other);
+                    None
+                }
+                None => None,
+            };
+            let proposed = match diff.remove("proposed") {
+                Some(Value::String(s)) => Some(s),
+                Some(other) => {
+                    diff.insert("proposed".to_string(), other);
+                    None
+                }
+                None => None,
+            };
+            if !diff.is_empty() {
+                // Keep the unmapped diff fields (lineStart/lineEnd, …).
+                obj.insert("suggestionDiff".to_string(), Value::Object(diff));
+            }
+            (original, proposed)
+        }
+        Some(other) => {
+            obj.insert("suggestionDiff".to_string(), other);
+            (None, None)
+        }
+        None => (None, None),
+    };
+
+    let comment = Comment {
+        id,
+        thread_id,
+        note_id: Some(note_id.clone()),
+        kind,
+        content,
+        author,
+        author_type,
+        status,
+        parent_id,
+        anchor,
+        anchor_text,
+        anchor_before: None,
+        anchor_after: None,
+        suggestion_original,
+        suggestion_proposed,
+        agent_id,
+        is_orphaned,
+        created_at,
+        updated_at,
+    };
+    Ok((comment, obj))
+}
+
 /// Build a [`Workspace`] from a legacy `workspace.json` object: drop the
 /// legacy-only FE fields, default the intentd-only required fields, and apply
 /// the worktree fallback (a `worktreePath` that no longer exists on disk is
@@ -562,6 +839,7 @@ pub async fn maybe_import_on_first_boot(store: &Store, db_existed: bool, roots: 
                 imported = report.imported(),
                 skipped = report.skipped(),
                 notes = report.notes_imported(),
+                comments = report.comments_imported(),
                 "first-boot legacy workspace import complete"
             );
             for entry in &report.entries {
@@ -1015,6 +1293,214 @@ mod tests {
         let spec = store.get_note(&ws_id, &NoteId::from("spec")).await.unwrap();
         assert_eq!(spec.content, "Original spec\n");
         assert_eq!(store.list_notes(&ws_id).await.unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Write `<ws-dir>/.workspace/notes/.meta/<name>` with raw contents.
+    fn write_legacy_meta(ws_dir: &Path, name: &str, contents: &str) {
+        let meta_dir = ws_dir.join(".workspace").join("notes").join(".meta");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(meta_dir.join(name), contents).unwrap();
+    }
+
+    /// Fetch the raw `extra_json` column for one comment row.
+    async fn comment_extra_json(store: &Store, id: &str) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT extra_json FROM comment WHERE id = ?")
+            .bind(id)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("read extra_json")
+    }
+
+    #[tokio::test]
+    async fn imports_comments_with_threads_anchors_and_extras() {
+        let root = temp_root("comments");
+        let ws_dir = write_legacy_workspace(&root, "ws-comments", json!({}));
+        write_legacy_note(&ws_dir, "spec.md", "---\nid: spec\n---\n\nSpec body\n");
+        // Realistic legacy sidecar: a root comment with anchor/extras, a reply
+        // in the same thread, a suggestion, and one malformed entry (no id).
+        let data = json!({
+            "version": "1.0",
+            "lastUpdated": "2025-06-02T00:00:00Z",
+            "comments": [
+                {
+                    "id": "c-root",
+                    "noteId": "spec",
+                    "author": "clement",
+                    "authorType": "user",
+                    "type": "question",
+                    "content": "Why this approach?",
+                    "status": "open",
+                    "createdAt": "2025-06-01T00:00:00Z",
+                    "updatedAt": "2025-06-01T00:00:00Z",
+                    "threadId": "thread-1",
+                    "section": "## Design",
+                    "markId": "mark-abc",
+                    "from": 120,
+                    "to": 148,
+                    "lineStart": 10,
+                    "lineEnd": 12,
+                    "tags": ["design"],
+                    "reactions": {"👍": "clement"}
+                },
+                {
+                    "id": "c-reply",
+                    "noteId": "spec",
+                    "author": "agent-1",
+                    "authorType": "agent",
+                    "type": "comment",
+                    "content": "Because of X.",
+                    "status": "open",
+                    "createdAt": "2025-06-01T01:00:00Z",
+                    "updatedAt": "2025-06-01T01:00:00Z",
+                    "threadId": "thread-1",
+                    "parentId": "c-root",
+                    "agentId": "agent-1",
+                    "isOrphaned": false
+                },
+                {
+                    "id": "c-sugg",
+                    "noteId": "spec",
+                    "author": "agent-1",
+                    "authorType": "agent",
+                    "type": "suggestion",
+                    "content": "Rename it",
+                    "status": "pending",
+                    "createdAt": "2025-06-01T02:00:00Z",
+                    "updatedAt": "2025-06-01T02:00:00Z",
+                    "suggestionDiff": {
+                        "original": "foo",
+                        "proposed": "bar",
+                        "lineStart": 3
+                    }
+                },
+                { "noteId": "spec", "content": "no id — malformed" }
+            ]
+        });
+        write_legacy_meta(&ws_dir, "spec.comments.json", &data.to_string());
+        // Orphaned sidecar: no matching note file → skipped whole.
+        write_legacy_meta(
+            &ws_dir,
+            "ghost.comments.json",
+            &json!({"version": "1.0", "comments": [{"id": "c-ghost"}]}).to_string(),
+        );
+        // Non-comments .meta files are ignored.
+        write_legacy_meta(&ws_dir, "spec.versions.jsonl", "{}");
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        let counts = report.entries[0].comments;
+        assert_eq!(counts.imported, 3, "{report}");
+        assert_eq!(counts.failed, 1, "{report}");
+        assert_eq!(counts.orphaned, 1, "{report}");
+        assert_eq!(report.comments_imported(), 3, "{report}");
+        assert!(
+            report
+                .to_string()
+                .contains("comments: 3 imported, 0 skipped, 1 failed, 1 orphaned"),
+            "{report}"
+        );
+
+        let root_c = store.get_comment("c-root").await.unwrap();
+        assert_eq!(root_c.thread_id, "thread-1");
+        assert_eq!(root_c.note_id, Some(NoteId::from("spec")));
+        assert_eq!(root_c.kind, CommentType::Question);
+        assert_eq!(root_c.status, CommentStatus::Open);
+        assert_eq!(root_c.author, "clement");
+        assert_eq!(root_c.author_type, AuthorType::User);
+        assert_eq!(root_c.anchor.kind, CommentAnchorType::Point);
+        assert_eq!(root_c.anchor.point_id, Some("mark-abc".to_string()));
+        assert_eq!(root_c.anchor_text, Some("## Design".to_string()));
+        assert_eq!(root_c.created_at, "2025-06-01T00:00:00Z");
+        // Unmapped legacy fields survive in extra_json.
+        let extra: Value =
+            serde_json::from_str(&comment_extra_json(&store, "c-root").await.unwrap()).unwrap();
+        assert_eq!(extra["from"], json!(120));
+        assert_eq!(extra["to"], json!(148));
+        assert_eq!(extra["lineStart"], json!(10));
+        assert_eq!(extra["lineEnd"], json!(12));
+        assert_eq!(extra["tags"], json!(["design"]));
+        assert_eq!(extra["reactions"], json!({"👍": "clement"}));
+
+        // Thread structure survives: reply shares the thread and parent.
+        let reply = store.get_comment("c-reply").await.unwrap();
+        assert_eq!(reply.parent_id, Some("c-root".to_string()));
+        assert_eq!(reply.author_type, AuthorType::Agent);
+        assert_eq!(reply.agent_id, Some(AgentId::from("agent-1")));
+        assert_eq!(reply.is_orphaned, Some(false));
+        let thread = store.get_thread("thread-1").await.unwrap();
+        assert_eq!(thread.comments.len(), 2);
+
+        // Suggestion diff maps to suggestion_original/proposed; no threadId in
+        // the source → FE default thread-{id}; leftover diff fields kept.
+        let sugg = store.get_comment("c-sugg").await.unwrap();
+        assert_eq!(sugg.kind, CommentType::Suggestion);
+        assert_eq!(sugg.status, CommentStatus::Pending);
+        assert_eq!(sugg.thread_id, "thread-c-sugg");
+        assert_eq!(sugg.suggestion_original, Some("foo".to_string()));
+        assert_eq!(sugg.suggestion_proposed, Some("bar".to_string()));
+        let sugg_extra: Value =
+            serde_json::from_str(&comment_extra_json(&store, "c-sugg").await.unwrap()).unwrap();
+        assert_eq!(sugg_extra["suggestionDiff"], json!({"lineStart": 3}));
+
+        assert!(store.get_comment("c-ghost").await.is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn comments_import_is_idempotent_and_survives_malformed_files() {
+        let root = temp_root("comments-idem");
+        let ws_dir = write_legacy_workspace(&root, "ws-c-idem", json!({}));
+        write_legacy_note(&ws_dir, "spec.md", "---\nid: spec\n---\n\nSpec\n");
+        write_legacy_note(&ws_dir, "other.md", "---\nid: other\n---\n\nOther\n");
+        write_legacy_meta(
+            &ws_dir,
+            "spec.comments.json",
+            &json!({"version": "1.0", "comments": [{
+                "id": "c-1",
+                "author": "clement",
+                "authorType": "user",
+                "type": "comment",
+                "content": "First",
+                "status": "open",
+                "createdAt": "2025-06-01T00:00:00Z",
+                "updatedAt": "2025-06-01T00:00:00Z"
+            }]})
+            .to_string(),
+        );
+        // Whole-file garbage: counted failed, never fatal.
+        write_legacy_meta(&ws_dir, "other.comments.json", "{ nope");
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        assert_eq!(report.entries[0].comments.imported, 1, "{report}");
+        assert_eq!(report.entries[0].comments.failed, 1, "{report}");
+
+        // Force re-run: existing comment id skipped, content untouched.
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                dry_run: false,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.entries[0].comments.imported, 0, "{report}");
+        assert_eq!(report.entries[0].comments.skipped, 1, "{report}");
+        let c1 = store.get_comment("c-1").await.unwrap();
+        assert_eq!(c1.content, "First");
+        assert_eq!(
+            store
+                .list_comments(&NoteId::from("spec"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
