@@ -1349,6 +1349,81 @@ async fn comment_add_plaintext_context_anchors_over_wss() {
     );
 }
 
+/// End-to-end: `comment.add` from a *stale* editor doc — the note gained a
+/// paragraph on the server after the editor loaded it, so the ±50-char
+/// `searchContext` includes text that no longer neighbors the selection. The
+/// target-rescue path still anchors the (unique) `commentTarget`.
+#[tokio::test]
+async fn comment_add_stale_context_target_rescue_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "StaleAnchors", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Note",
+            // Server copy already has the "Status" paragraph inserted between
+            // Goal and Diagnosis; the client context below predates it.
+            "content": "## Goal\nOld goal paragraph tail.\n\n**Status:** new paragraph the editor never saw.\n\n## Diagnosis\n\n**Symptom:** things broke badly.",
+        }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            // Stale plain-text context: Goal tail joined directly to the
+            // Diagnosis heading (the Status paragraph is missing).
+            "searchContext": "Old goal paragraph tail.DiagnosisSymptom: things broke badly.",
+            "commentTarget": "DiagnosisSymptom: things broke",
+            "comment": "cross-block comment",
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], json!(true), "response: {add}");
+    assert_eq!(add["anchored"], json!(true));
+    let comment_id = add["commentId"].as_str().expect("comment id").to_string();
+
+    let read = wss_rpc(
+        &mut rpc,
+        2,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = read["note"]["content"].as_str().expect("content");
+    assert!(
+        content.contains(&format!("<!--anchor:{comment_id}:start-->Diagnosis")),
+        "start marker missing before the heading text: {content}"
+    );
+    assert!(
+        content.contains(&format!("things broke<!--anchor:{comment_id}:end-->")),
+        "end marker missing after the target text: {content}"
+    );
+}
+
 /// End-to-end: a `comment.add` whose context cannot be found returns the
 /// actionable `-32602` error with the descriptive message (not an opaque
 /// `-32603 "Internal error"`).

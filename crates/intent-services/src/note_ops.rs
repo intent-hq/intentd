@@ -687,9 +687,114 @@ fn plaintext_projection(md: &str) -> PlaintextProjection {
     PlaintextProjection { text, map }
 }
 
+/// Minimum number of surviving context bytes (before-suffix + after-prefix
+/// overlap around the target) required for the stale-context target rescue.
+/// Guards against anchoring on an accidental short substring when the whole
+/// context is gone.
+const MIN_RESCUE_CONTEXT_OVERLAP: usize = 4;
+
+/// Byte length of the longest suffix of `needle` that is also a suffix of
+/// `hay`, clamped back to a char boundary of `needle` so a shared lead byte
+/// of two different multi-byte characters never counts as surviving context.
+fn suffix_overlap(needle: &str, hay: &str) -> usize {
+    let mut n = needle
+        .as_bytes()
+        .iter()
+        .rev()
+        .zip(hay.as_bytes().iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !needle.is_char_boundary(needle.len() - n) {
+        n -= 1;
+    }
+    n
+}
+
+/// Byte length of the longest prefix of `needle` that is also a prefix of
+/// `hay`, clamped back to a char boundary of `needle` (see [`suffix_overlap`]).
+fn prefix_overlap(needle: &str, hay: &str) -> usize {
+    let mut n = needle
+        .as_bytes()
+        .iter()
+        .zip(hay.as_bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !needle.is_char_boundary(n) {
+        n -= 1;
+    }
+    n
+}
+
+/// Stale-context rescue: the search context no longer occurs in the document
+/// (typically the editor doc lagged the server copy, so the ±50-char context
+/// captured around the selection includes text from blocks that have since
+/// changed). Locate the (normalized) comment target alone in the projection
+/// and corroborate with whatever before/after context still matches adjacent
+/// to it; requires at least [`MIN_RESCUE_CONTEXT_OVERLAP`] surviving bytes and
+/// a strictly-best occurrence, so ambiguity is still an error and short
+/// accidental matches are rejected. Returns `(projection_pos, needle_len)`.
+fn rescue_target_position(
+    proj_text: &str,
+    needle_ctx: &str,
+    needle_tgt: &str,
+) -> Result<(usize, usize)> {
+    let not_found =
+        || Error::InvalidParams("Could not find the search context in the document.".to_string());
+    // Same guard as the exact and projection paths: an ambiguous target
+    // within the provided context would make the before/after split (and
+    // therefore the scoring) anchor off the wrong instance.
+    if count_occurrences(needle_ctx, needle_tgt) > 1 {
+        return Err(Error::InvalidParams(
+            "The comment target appears multiple times within the search context.".to_string(),
+        ));
+    }
+    let Some(rel) = needle_ctx.find(needle_tgt) else {
+        // Consistent with the exact/projection paths: a target that is not
+        // inside the provided context is a target problem, not a missing
+        // context.
+        return Err(Error::InvalidParams(
+            "The comment target was not found within the search context.".to_string(),
+        ));
+    };
+    let (before, after) = (&needle_ctx[..rel], &needle_ctx[rel + needle_tgt.len()..]);
+    // Stream over non-overlapping occurrences (no Vec of every position: a
+    // short/common target in a large document would otherwise allocate and
+    // score unboundedly).
+    let mut best: Option<(usize, usize)> = None;
+    let mut tied = false;
+    let mut from = 0;
+    while let Some(off) = proj_text[from..].find(needle_tgt) {
+        let pos = from + off;
+        from = pos + needle_tgt.len();
+        let score = suffix_overlap(before, &proj_text[..pos])
+            + prefix_overlap(after, &proj_text[pos + needle_tgt.len()..]);
+        match best {
+            Some((best_score, _)) if score < best_score => {}
+            Some((best_score, _)) if score == best_score => tied = true,
+            _ => {
+                best = Some((score, pos));
+                tied = false;
+            }
+        }
+    }
+    let Some((score, pos)) = best else {
+        return Err(not_found());
+    };
+    if score < MIN_RESCUE_CONTEXT_OVERLAP {
+        return Err(not_found());
+    }
+    if tied {
+        return Err(Error::InvalidParams(
+            "The comment target appears multiple times in the document.".to_string(),
+        ));
+    }
+    Ok((pos, needle_tgt.len()))
+}
+
 /// Fallback anchor search over the plaintext projection. Applies the same
 /// uniqueness rules as the exact path and maps the unique match back to
-/// markdown byte offsets.
+/// markdown byte offsets. When even the projected context is gone (stale
+/// editor doc), falls back to [`rescue_target_position`].
 fn plaintext_fallback_anchor(
     content: &str,
     search_context: &str,
@@ -703,29 +808,37 @@ fn plaintext_fallback_anchor(
     }
     let proj = plaintext_projection(content);
     let ctx = find_all_occurrences(&proj.text, &needle_ctx);
-    if ctx.is_empty() {
-        return Err(not_found());
-    }
     if ctx.len() > 1 {
         return Err(Error::InvalidParams(
             "The search context appears multiple times in the document.".to_string(),
         ));
     }
     let needle_tgt = normalize_needle(comment_target);
-    if needle_tgt.is_empty() || !needle_ctx.contains(&needle_tgt) {
-        return Err(Error::InvalidParams(
-            "The comment target was not found within the search context.".to_string(),
-        ));
-    }
-    if count_occurrences(&needle_ctx, &needle_tgt) > 1 {
-        return Err(Error::InvalidParams(
-            "The comment target appears multiple times within the search context.".to_string(),
-        ));
-    }
-    let rel = needle_ctx.find(&needle_tgt).expect("checked above");
-    let pos = ctx[0] + rel;
+    let (pos, tgt_len) = if let Some(&ctx_from) = ctx.first() {
+        if needle_tgt.is_empty() || !needle_ctx.contains(&needle_tgt) {
+            return Err(Error::InvalidParams(
+                "The comment target was not found within the search context.".to_string(),
+            ));
+        }
+        if count_occurrences(&needle_ctx, &needle_tgt) > 1 {
+            return Err(Error::InvalidParams(
+                "The comment target appears multiple times within the search context.".to_string(),
+            ));
+        }
+        let rel = needle_ctx.find(&needle_tgt).expect("checked above");
+        (ctx_from + rel, needle_tgt.len())
+    } else {
+        if needle_tgt.is_empty() {
+            // Consistent with the in-context path: an empty target is a
+            // target problem, not a context-not-found.
+            return Err(Error::InvalidParams(
+                "The comment target was not found within the search context.".to_string(),
+            ));
+        }
+        rescue_target_position(&proj.text, &needle_ctx, &needle_tgt)?
+    };
     let from = proj.map[pos];
-    let last_start = proj.map[pos + needle_tgt.len() - 1];
+    let last_start = proj.map[pos + tgt_len - 1];
     let last_len = content[last_start..]
         .chars()
         .next()
@@ -1577,6 +1690,158 @@ mod tests {
             matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times in the document")),
             "unexpected error: {err:?}"
         );
+    }
+
+    // Real-world dogfood repro (2026-07-22): the note gained a new paragraph
+    // between `## Goal` and `## Diagnosis` on the server, but the editor doc
+    // was still on the previous revision. The user selected across the
+    // heading/paragraph boundary; the ±50-char context was built from the
+    // *stale* plain text, so the full search context no longer exists in the
+    // current markdown even though the selected text itself does.
+    const STALE_CTX_MD: &str = "# Fix \"Failed to add comment\"\n\n## Goal\nAdding a comment succeeds instead of failing with an opaque \"Internal error\" toast.\n\n**Status: COMPLETE (2026-07-22).** All three tasks verified and merged — dogfood after restarting the app on the new build.\n\n## Diagnosis (confirmed in code)\n\n**Symptom:** Toast \"Failed to add comment / Internal error\" when adding a comment in the note editor. Nothing in the daemon log or FE console log.\n\n**Root cause — plaintext vs markdown mismatch.** The FE builds the anchor params from plain text.";
+
+    const STALE_CTX_SELECTED: &str = "Diagnosis (confirmed in code)Symptom: Toast \"Failed to add comment / Internal error\" when adding a comment in the note editor. Nothing in the daemon log or FE console log.";
+    // Tail of the *stale* revision's plain text (the Goal paragraph directly
+    // preceded the Diagnosis heading before the Status paragraph landed).
+    const STALE_CTX_BEFORE: &str = "of failing with an opaque \"Internal error\" toast.";
+    const STALE_CTX_AFTER: &str = "Root cause — plaintext vs markdown mismatch. The F";
+
+    #[test]
+    fn anchor_target_rescue_stale_context_zero_join() {
+        // tiptap `doc.textBetween` with no block separator: blocks join with
+        // nothing. The stale before-context is not adjacent to the selection
+        // in the current markdown, so the full-context search fails; the
+        // target itself is unique and must still anchor.
+        let ctx = format!("{STALE_CTX_BEFORE}{STALE_CTX_SELECTED}{STALE_CTX_AFTER}");
+        let (from, to, line) =
+            find_and_anchor_text(STALE_CTX_MD, &ctx, STALE_CTX_SELECTED).unwrap();
+        assert!(STALE_CTX_MD[from..].starts_with("Diagnosis (confirmed in code)"));
+        assert!(STALE_CTX_MD[..to].ends_with("FE console log."));
+        assert_eq!(line, 8);
+    }
+
+    #[test]
+    fn anchor_target_rescue_stale_context_space_join() {
+        // Same case with single-space block joins (textBetween with a ' '
+        // block separator).
+        let selected = STALE_CTX_SELECTED.replace(")Symptom", ") Symptom");
+        let ctx = format!("{STALE_CTX_BEFORE} {selected} {STALE_CTX_AFTER}");
+        let (from, to, _line) = find_and_anchor_text(STALE_CTX_MD, &ctx, &selected).unwrap();
+        assert!(STALE_CTX_MD[from..].starts_with("Diagnosis (confirmed in code)"));
+        assert!(STALE_CTX_MD[..to].ends_with("FE console log."));
+    }
+
+    #[test]
+    fn anchor_target_rescue_disambiguates_by_partial_context() {
+        // Target appears twice; the stale context is gone but its after side
+        // still matches only the second occurrence.
+        let content = "alpha token beta\n\nnew paragraph\n\ngamma token delta";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "vanished context token delta", "token").unwrap();
+        assert_eq!(from, content.rfind("token").unwrap());
+        assert_eq!(&content[from..to], "token");
+    }
+
+    #[test]
+    fn anchor_target_rescue_ambiguous_target_errors() {
+        // Target appears twice and the surviving context matches neither
+        // occurrence better — must stay an error, not guess.
+        let content = "alpha token beta\n\ngamma token beta";
+        let err = find_and_anchor_text(content, "vanished token beta", "token").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_target_rescue_missing_target_still_not_found() {
+        // Target is inside the (stale) context but absent from the document:
+        // nothing to rescue, so the context-not-found error stands.
+        let err = find_and_anchor_text("some document text", "stale missing here", "missing")
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("Could not find the search context")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_rescue_target_outside_context_reports_target_error() {
+        // Context missing AND target not contained in it: the error names the
+        // target relationship, consistent with the in-context path.
+        let err =
+            find_and_anchor_text("alpha token beta", "vanished context here", "token").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("comment target was not found")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_rescue_empty_target_reports_target_error() {
+        // Context missing AND target empty: the error names the target
+        // relationship, consistent with the in-context path.
+        let err = find_and_anchor_text("some document text", "stale context here", "").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("comment target was not found")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_target_rescue_requires_min_context_overlap() {
+        // Target exists exactly once, but only 3 bytes of the stale context
+        // survive around it (< MIN_RESCUE_CONTEXT_OVERLAP) — must stay
+        // not-found rather than anchor on a near-bare target match.
+        let content = "xyz token pqr";
+        let err = find_and_anchor_text(content, "abc token dqr", "token").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("Could not find the search context")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_target_rescue_ambiguous_target_in_context_errors() {
+        // The target appears twice within the provided (stale) context: the
+        // rescue must reject like the exact/projection paths instead of
+        // splitting the context at the first occurrence.
+        let content = "alpha token beta\n\nsomething else entirely";
+        let err = find_and_anchor_text(content, "token stale token beta", "token").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times within the search context")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_target_rescue_rejects_span_over_existing_marker() {
+        // Rescue output goes through the same marker-overlap rejection.
+        let content = "gone before <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma tail";
+        let err = find_and_anchor_text(content, "vanished before beta gamma tail", "beta gamma")
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("overlaps an existing comment anchor")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_target_rescue_multibyte_target_boundaries() {
+        let content = "# Título\n\nUne **phrase où ça** finit là aujourd'hui.";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "vanished stale phrase où ça finit", "où ça").unwrap();
+        assert_eq!(&content[from..to], "où ça");
+    }
+
+    #[test]
+    fn overlap_helpers_clamp_to_char_boundaries() {
+        // 'é' (C3 A9) vs 'è' (C3 A8): the shared lead byte must not count.
+        assert_eq!(prefix_overlap("éx", "èx"), 0);
+        assert_eq!(suffix_overlap("xé", "xè"), 0);
+        assert_eq!(prefix_overlap("éx", "éy"), 'é'.len_utf8());
+        assert_eq!(suffix_overlap("xé", "yé"), 'é'.len_utf8());
     }
 
     #[test]
