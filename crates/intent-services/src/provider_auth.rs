@@ -96,45 +96,72 @@ impl CliAuthProbe {
 /// Best-effort CLI authentication probe for an installed provider: run its
 /// `auth_check_args` with a short timeout. Most providers signal auth via the
 /// exit code (0 ⇒ authenticated); grok's `models` probe exits 0 in both auth
-/// states, so its stdout is parsed for the explicit auth markers instead.
-/// Shared by `intentd doctor` and `host.providerAuthStatus`.
+/// states, so its stdout is parsed for the explicit auth markers instead; and
+/// opencode's `models` probe requires at least one `provider/model` stdout
+/// line beyond exit 0 (credentials may come from `opencode auth login`, env
+/// vars, or a project `.env`). Shared by `intentd doctor` and
+/// `host.providerAuthStatus` so the two cannot drift.
 pub async fn check_provider_auth_cli(
     provider_id: &str,
     program: &OsStr,
     auth_check_args: &[&str],
 ) -> CliAuthProbe {
-    if provider_id == "grok" {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(auth_check_args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        return match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parsed = intent_providers::parse_grok_models_command_output(&stdout);
-                grok_probe_outcome(
-                    parsed.authenticated,
-                    parsed.models.is_empty(),
-                    output.status.success(),
-                )
+    match provider_id {
+        "grok" => {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(auth_check_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let parsed = intent_providers::parse_grok_models_command_output(&stdout);
+                    grok_probe_outcome(
+                        parsed.authenticated,
+                        parsed.models.is_empty(),
+                        output.status.success(),
+                    )
+                }
+                Ok(Err(_)) => CliAuthProbe::Failed,
+                Err(_) => CliAuthProbe::TimedOut,
             }
-            Ok(Err(_)) => CliAuthProbe::Failed,
-            Err(_) => CliAuthProbe::TimedOut,
-        };
-    }
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(auth_check_args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.status()).await {
-        Ok(Ok(status)) if status.success() => CliAuthProbe::Authenticated,
-        Ok(Ok(_)) => CliAuthProbe::NotAuthenticated,
-        Ok(Err(_)) => CliAuthProbe::Failed,
-        Err(_) => CliAuthProbe::TimedOut,
+        }
+        "opencode" => {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(auth_check_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            match tokio::time::timeout(OPENCODE_READY_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) if !output.status.success() => CliAuthProbe::NotAuthenticated,
+                Ok(Ok(output)) => {
+                    if opencode_models_ready(&String::from_utf8_lossy(&output.stdout)) {
+                        CliAuthProbe::Authenticated
+                    } else {
+                        CliAuthProbe::NotAuthenticated
+                    }
+                }
+                Ok(Err(_)) => CliAuthProbe::Failed,
+                Err(_) => CliAuthProbe::TimedOut,
+            }
+        }
+        _ => {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(auth_check_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.status()).await {
+                Ok(Ok(status)) if status.success() => CliAuthProbe::Authenticated,
+                Ok(Ok(_)) => CliAuthProbe::NotAuthenticated,
+                Ok(Err(_)) => CliAuthProbe::Failed,
+                Err(_) => CliAuthProbe::TimedOut,
+            }
+        }
     }
 }
 
@@ -213,38 +240,15 @@ fn opencode_models_ready(stdout: &str) -> bool {
     })
 }
 
-/// opencode probe: `opencode models` is the readiness gate — credentials may
-/// come from `opencode auth login`, env vars, or a project `.env`, so there
-/// is no single "am I logged in" signal. Non-zero exit ⇒ `false`; exit 0 is
-/// ready iff at least one `provider/model` line; timeout/spawn ⇒ unknown.
-async fn check_opencode_auth(program: &OsStr) -> Option<bool> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.arg("models")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(OPENCODE_READY_TIMEOUT, cmd.output()).await {
-        Ok(Ok(output)) => {
-            if !output.status.success() {
-                return Some(false);
-            }
-            Some(opencode_models_ready(&String::from_utf8_lossy(
-                &output.stdout,
-            )))
-        }
-        _ => None,
-    }
-}
-
 /// Run one provider's auth probe. The caller has already gated on the
 /// provider being installed (`program` is its resolved binary; pi passes the
 /// resolved `pi` CLI purely as the install gate — its probe runs the pinned
-/// npx adapter).
+/// npx adapter). CLI-probed providers (claude-code, codex, opencode, grok)
+/// share [`check_provider_auth_cli`] with `intentd doctor`.
 async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) -> Option<bool> {
     match provider_id {
         "auggie" => check_auggie_auth(&program).await,
-        "claude-code" | "codex" | "grok" => {
+        "claude-code" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
                 .unwrap_or_default();
@@ -255,7 +259,6 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
                 .await
                 .auth_status()
         }
-        "opencode" => check_opencode_auth(&program).await,
         "droid" => crate::provider_models::probe_droid_auth(program.into()).await,
         "pi" => crate::provider_models::probe_pi_auth().await,
         _ => None,
@@ -472,9 +475,10 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_result_carries_exactly_one_entry() {
-        // grok resolution is a pure filesystem check, so this runs the real
-        // resolve path; on hosts without grok the probe is skipped entirely
-        // and authenticated is null — either way the shape holds.
+        // Runs the real resolve path: on hosts without grok the probe is
+        // skipped (authenticated: null); with grok installed, `grok models`
+        // actually runs, bounded by the probe timeout. The assertions are
+        // shape-only so the test passes in both environments.
         let result = provider_auth_status(Some("grok"), false)
             .await
             .expect("grok is a known provider");

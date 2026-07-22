@@ -482,9 +482,9 @@ async fn handle_provider_auth_status_rejects_non_bool_force() {
 
 #[tokio::test]
 async fn handle_provider_auth_status_scoped_to_grok_returns_one_entry() {
-    // grok's install gate is a pure filesystem check; on hosts without grok
-    // the probe never spawns and `authenticated` is null — the shape holds
-    // either way, keeping the test hermetic.
+    // On hosts without grok the probe never spawns (`authenticated: null`);
+    // with grok installed, `grok models` actually runs, bounded by the probe
+    // timeout. The assertions are shape-only so both environments pass.
     let req = classify(&json!({
         "jsonrpc": "2.0",
         "id": 26,
