@@ -3081,7 +3081,13 @@ impl Services {
                     .unwrap_or_else(|| workspace_id.clone());
                 let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
-                let registered = if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                // Run the scope gate BEFORE any side-effectful registration so
+                // a rejection (non-chief parent delegating outside its
+                // workspace) never leaves behind a partially-initialized
+                // delegation group; it surfaces as a clear error to the
+                // caller. `register_completion_watch` re-checks the same gate.
+                crate::agent_subscriptions::check_watch_scope(&parent_home_ws, &workspace_id)?;
+                if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
                     // Enroll the child in the parent's after_all delegation group
                     // and register a group watch (group_id = Some, not oneShot) so
                     // the delivery worker routes its completion into the group
@@ -3096,7 +3102,7 @@ impl Services {
                         child,
                         false,
                         Some(gid),
-                    )
+                    )?;
                 } else {
                     self.register_completion_watch(
                         &parent_home_ws,
@@ -3106,11 +3112,8 @@ impl Services {
                         child,
                         true,
                         None,
-                    )
-                };
-                // A scope-gate rejection (non-chief parent delegating outside
-                // its workspace) surfaces as a clear error to the caller.
-                registered?;
+                    )?;
+                }
                 self.publish_subscriptions_changed(&parent_home_ws, &parent)
                     .await;
             }

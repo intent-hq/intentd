@@ -123,9 +123,11 @@ pub(crate) struct SubscriptionRegistry {
 
 /// The shared registration safety gate: a non-chief parent may only watch
 /// children inside its own workspace; a chief-workspace parent may watch any
-/// agent. Enforced here (the single path every registration goes through),
-/// not per-caller.
-fn check_watch_scope(
+/// agent. Enforced in [`Services::register_completion_watch`] (the single
+/// path every registration goes through), not per-caller; also exposed to
+/// callers that must validate the pair BEFORE creating side-effectful state
+/// (e.g. the `after_all` delegation group in `agent_delegate_op`).
+pub(crate) fn check_watch_scope(
     parent_workspace_id: &WorkspaceId,
     child_workspace_id: &WorkspaceId,
 ) -> Result<()> {

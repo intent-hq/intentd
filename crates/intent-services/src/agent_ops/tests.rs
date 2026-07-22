@@ -417,6 +417,37 @@ async fn register_watch_scope_gate_rejects_non_chief_cross_workspace_parent() {
     assert_eq!(svc.list_watches_for_parent(&parent).len(), 1);
 }
 
+/// A scope-gate rejection in the after_all delegate path is side-effect free:
+/// the gate runs before the delegation group is created/enrolled, so a denied
+/// non-chief cross-workspace delegate leaves no group (or watch) behind.
+#[tokio::test]
+async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let parent = create_agent(&svc, &ws_a, "Parent").await;
+
+    let input = AgentDelegateInput {
+        wait_mode: Some("after_all".into()),
+        ..Default::default()
+    };
+    let denied = svc
+        .agent_delegate_op(ws_b.clone(), input, Some(parent.clone()))
+        .await;
+    assert!(
+        denied.is_err(),
+        "non-chief cross-workspace after_all delegate must be rejected"
+    );
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "rejection must not leave a partially-initialized group"
+    );
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+}
+
 /// Chief-anchored after_all group: children in a regular workspace, group
 /// anchored (and persisted) under `__chief__`. Sealing on the chief parent's
 /// idle and completing both children fires ONE aggregated wake to the chief

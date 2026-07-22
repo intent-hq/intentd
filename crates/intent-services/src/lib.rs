@@ -7681,9 +7681,9 @@ impl WorkspaceApi for Services {
             // subscription registry: drop watches whose PARENT lives here
             // (their wake destination is gone) and groups anchored here.
             // Watches whose parent lives elsewhere (a chief watching a child
-            // in this workspace) are kept — the published `agent:deleted`
-            // events above still wake the cross-workspace parent. Poison
-            // recovery mirrors the per-session sweep above.
+            // in this workspace) are kept — the `agent:deleted` events
+            // published just below still wake the cross-workspace parent.
+            // Poison recovery mirrors the per-session sweep above.
             {
                 let mut registry = agent_subscriptions
                     .lock()
