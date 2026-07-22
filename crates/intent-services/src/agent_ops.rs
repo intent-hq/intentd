@@ -1050,7 +1050,7 @@ impl Services {
         }
         let is_responding = self.agent_is_busy(session.id.clone());
         let is_waiting_on_tool = is_responding && self.live_turn_has_unresolved_tool(&session.id);
-        let watches = self.list_watches_for_parent(&session.workspace_id, &session.id);
+        let watches = self.list_watches_for_parent(&session.id);
         // Distinct child ids in registration order — a parent can register
         // multiple watches against the same child (e.g. successive `immediate`
         // delegates), but the FE only wants each waiting-on agent once.
@@ -1206,7 +1206,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
     ) {
-        let watches = self.list_watches_for_parent(workspace_id, parent_agent_id);
+        let watches = self.list_watches_for_parent(parent_agent_id);
         let mut waiting: Vec<AgentId> = Vec::with_capacity(watches.len());
         for w in &watches {
             if !waiting.contains(&w.child_agent_id) {
@@ -2619,8 +2619,18 @@ impl Services {
         // aggregated wake will fold this report in when all children settle. Otherwise,
         // deliver the wake NOW unconditionally to the parent, then mark any oneShot
         // watches to suppress their agent:idle delivery (report-time wake requirement).
-        let grouped = self.child_in_undelivered_group(&workspace_id, &parent, &caller);
+        let grouped = self.child_in_undelivered_group(&parent, &caller);
         if !grouped {
+            // Deliver the wake in the parent's HOME workspace: for a
+            // cross-workspace (chief) parent this differs from the child's;
+            // fall back to the child's workspace when the parent session
+            // cannot be resolved (matches the pre-lift behavior).
+            let parent_home_ws = self
+                .store
+                .get_agent_session(&parent)
+                .await
+                .map(|s| s.workspace_id)
+                .unwrap_or_else(|_| workspace_id.clone());
             // Deliver exactly ONE wake to the parent, regardless of watch count.
             // Format the wake message with the persisted report.
             let wake_text = format!(
@@ -2650,7 +2660,7 @@ impl Services {
             });
             // Deliver the wake to the parent unconditionally (even if no watch exists).
             if let Err(e) = self
-                .deliver_parent_wake(&workspace_id, parent.clone(), wake_text, Some(metadata))
+                .deliver_parent_wake(&parent_home_ws, parent.clone(), wake_text, Some(metadata))
                 .await
             {
                 tracing::warn!(
@@ -2666,12 +2676,12 @@ impl Services {
             // for them (suppressing the duplicate wake). Do NOT mark watches for other
             // watchers (e.g. SUB-1 sender-watches) — those keep their normal idle-time
             // completion wake and should not receive the report wake.
-            let watches = self.find_watches_for_child(&workspace_id, &caller);
+            let watches = self.find_watches_for_child(&caller);
             for watch in watches
                 .iter()
                 .filter(|w| w.one_shot && w.group_id.is_none() && w.parent_agent_id == parent)
             {
-                self.mark_watch_report_delivered(&workspace_id, &watch.id);
+                self.mark_watch_report_delivered(&watch.id);
             }
         }
 
@@ -3060,34 +3070,48 @@ impl Services {
                 .map(|s| s.status == AgentStatus::Deleted)
                 .unwrap_or(false);
             if !parent_deleted {
+                // The watch/group is anchored in the parent's HOME workspace
+                // (where wakes are delivered): for same-workspace delegation
+                // this equals `workspace_id`; for a chief parent it is
+                // `__chief__`. Fall back to the child's workspace when the
+                // parent session could not be loaded.
+                let parent_home_ws = parent_session
+                    .as_ref()
+                    .map(|s| s.workspace_id.clone())
+                    .unwrap_or_else(|| workspace_id.clone());
                 let parent_name = parent_session.map(|s| s.name).unwrap_or_default();
                 let child = AgentId::from(agent_id.as_str());
-                if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
+                let registered = if wait_mode.as_deref() == Some(WAIT_MODE_AFTER_ALL) {
                     // Enroll the child in the parent's after_all delegation group
                     // and register a group watch (group_id = Some, not oneShot) so
                     // the delivery worker routes its completion into the group
                     // fan-in instead of waking the parent immediately (AS-4).
-                    let gid = self.get_or_create_delegation_group(&workspace_id, &parent);
-                    self.enroll_child_in_group(&workspace_id, &gid, &child);
+                    let gid = self.get_or_create_delegation_group(&parent_home_ws, &parent);
+                    self.enroll_child_in_group(&gid, &child);
                     self.register_completion_watch(
+                        &parent_home_ws,
                         &workspace_id,
                         parent.clone(),
                         parent_name,
                         child,
                         false,
                         Some(gid),
-                    );
+                    )
                 } else {
                     self.register_completion_watch(
+                        &parent_home_ws,
                         &workspace_id,
                         parent.clone(),
                         parent_name,
                         child,
                         true,
                         None,
-                    );
-                }
-                self.publish_subscriptions_changed(&workspace_id, &parent)
+                    )
+                };
+                // A scope-gate rejection (non-chief parent delegating outside
+                // its workspace) surfaces as a clear error to the caller.
+                registered?;
+                self.publish_subscriptions_changed(&parent_home_ws, &parent)
                     .await;
             }
         }
@@ -3156,26 +3180,39 @@ impl Services {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         let parent_name = parent_session.as_ref().map(|s| s.name.clone());
+        // Anchor the watch in the parent's HOME workspace (falls back to the
+        // call's workspace when the parent session lookup failed) and the
+        // child's own workspace (falls back likewise) — same-workspace pairs
+        // behave exactly as before; a chief parent registers cross-workspace.
+        let parent_home_ws = parent_session
+            .as_ref()
+            .map(|s| s.workspace_id.clone())
+            .unwrap_or_else(|| workspace_id.clone());
+        let child_ws = self
+            .store
+            .get_agent_session(&child_agent_id)
+            .await
+            .map(|s| s.workspace_id)
+            .unwrap_or_else(|_| workspace_id.clone());
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
-        let id = self
-            .find_and_refresh_ungrouped_watch(
-                &workspace_id,
-                &parent_agent_id,
-                &child_agent_id,
+        let id = match self.find_and_refresh_ungrouped_watch(
+            &parent_agent_id,
+            &child_agent_id,
+            true,
+            parent_name.clone(),
+        ) {
+            Some(existing) => existing,
+            None => self.register_completion_watch(
+                &parent_home_ws,
+                &child_ws,
+                parent_agent_id.clone(),
+                parent_name.unwrap_or_default(),
+                child_agent_id,
                 true,
-                parent_name.clone(),
-            )
-            .unwrap_or_else(|| {
-                self.register_completion_watch(
-                    &workspace_id,
-                    parent_agent_id.clone(),
-                    parent_name.unwrap_or_default(),
-                    child_agent_id,
-                    true,
-                    None,
-                )
-            });
-        self.publish_subscriptions_changed(&workspace_id, &parent_agent_id)
+                None,
+            )?,
+        };
+        self.publish_subscriptions_changed(&parent_home_ws, &parent_agent_id)
             .await;
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
@@ -3208,7 +3245,7 @@ impl Services {
         // child_in_undelivered_group suppression used for reportToParent wakes).
         // Prevents duplicate wakes when a coordinator sends coordination messages
         // (sendToTask) to children that are already covered by a grouped watch.
-        if self.child_in_undelivered_group(&workspace_id, &caller_agent_id, &target_agent_id) {
+        if self.child_in_undelivered_group(&caller_agent_id, &target_agent_id) {
             tracing::debug!(
                 caller = %caller_agent_id.0,
                 target = %target_agent_id.0,
@@ -3217,26 +3254,38 @@ impl Services {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
+        // Anchor the watch in the caller's HOME workspace and the target's
+        // workspace (each falls back to the call's workspace when the session
+        // lookup fails), mirroring `agent_watch_completion_op`.
+        let caller_home_ws = caller_session
+            .as_ref()
+            .map(|s| s.workspace_id.clone())
+            .unwrap_or_else(|| workspace_id.clone());
+        let target_ws = self
+            .store
+            .get_agent_session(&target_agent_id)
+            .await
+            .map(|s| s.workspace_id)
+            .unwrap_or_else(|_| workspace_id.clone());
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
-        let id = self
-            .find_and_refresh_ungrouped_watch(
-                &workspace_id,
-                &caller_agent_id,
-                &target_agent_id,
+        let id = match self.find_and_refresh_ungrouped_watch(
+            &caller_agent_id,
+            &target_agent_id,
+            true,
+            caller_name.clone(),
+        ) {
+            Some(existing) => existing,
+            None => self.register_completion_watch(
+                &caller_home_ws,
+                &target_ws,
+                caller_agent_id.clone(),
+                caller_name.unwrap_or_default(),
+                target_agent_id,
                 true,
-                caller_name.clone(),
-            )
-            .unwrap_or_else(|| {
-                self.register_completion_watch(
-                    &workspace_id,
-                    caller_agent_id.clone(),
-                    caller_name.unwrap_or_default(),
-                    target_agent_id,
-                    true,
-                    None,
-                )
-            });
-        self.publish_subscriptions_changed(&workspace_id, &caller_agent_id)
+                None,
+            )?,
+        };
+        self.publish_subscriptions_changed(&caller_home_ws, &caller_agent_id)
             .await;
         Ok(json!({ "ok": true, "subscriptionId": id }))
     }
@@ -3266,13 +3315,13 @@ impl Services {
         // and spawning a task that just sleeps and no-ops wastes a
         // tokio worker slot per repeated wake.
         let deadline = tokio::time::Instant::now() + after;
-        if !self.bump_watch_cleanup_deadline(&workspace_id, &subscription_id, deadline) {
+        if !self.bump_watch_cleanup_deadline(&subscription_id, deadline) {
             return false;
         }
         let services = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
-            if services.remove_watch_if_deadline_passed(&workspace_id, &subscription_id) {
+            if services.remove_watch_if_deadline_passed(&subscription_id) {
                 services
                     .publish_subscriptions_changed(&workspace_id, &parent_agent_id)
                     .await;
@@ -3292,8 +3341,8 @@ impl Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> Result<Value> {
-        let watches = self.list_watches_for_parent(&workspace_id, &agent_id);
-        let groups = self.list_groups_for_parent(&workspace_id, &agent_id);
+        let watches = self.list_watches_for_parent(&agent_id);
+        let groups = self.list_groups_for_parent(&agent_id);
 
         let event_types = [AGENT_IDLE, AGENT_FAILED, AGENT_DELETED];
 
@@ -3370,11 +3419,11 @@ impl Services {
     /// returns `{ "success": true }` (TS shape).
     pub(crate) async fn agent_cancel_subscriptions_op(
         &self,
-        workspace_id: WorkspaceId,
+        _workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> Result<Value> {
-        self.remove_all_for_parent(&workspace_id, &agent_id);
-        self.remove_groups_for_parent(&workspace_id, &agent_id);
+        self.remove_all_for_parent(&agent_id);
+        self.remove_groups_for_parent(&agent_id);
         Ok(json!({ "success": true }))
     }
 
@@ -3977,12 +4026,14 @@ impl Services {
                 // still proceed; only the fresh-register branch has to
                 // materialize a name, and there `""` matches the pre-fix
                 // behaviour for a brand-new watch.
-                let caller_name = self
-                    .store
-                    .get_agent_session(&caller)
-                    .await
-                    .ok()
-                    .map(|s| s.name);
+                let caller_session = self.store.get_agent_session(&caller).await.ok();
+                let caller_name = caller_session.as_ref().map(|s| s.name.clone());
+                // The watch is anchored in the caller's HOME workspace (falls
+                // back to the call's workspace when the session lookup fails)
+                // so a chief caller's wake lands in `__chief__`.
+                let caller_home_ws = caller_session
+                    .map(|s| s.workspace_id)
+                    .unwrap_or_else(|| workspace_id.clone());
                 // SUB-2 (Copilot #104 follow-up, thread
                 // PRRT_kwDOS9Wxuc6QKPyt): resolve reuse atomically. If a live
                 // ungrouped watch is found, its `parent_agent_name` is
@@ -3994,7 +4045,6 @@ impl Services {
                 // caller subscribed to a dead id.
                 let (subscription_id, reused) = if let Some(existing_id) = self
                     .find_and_refresh_ungrouped_watch(
-                        &workspace_id,
                         &caller,
                         &agent_id,
                         one_shot,
@@ -4003,22 +4053,23 @@ impl Services {
                     (existing_id, true)
                 } else {
                     let new_id = self.register_completion_watch(
+                        &caller_home_ws,
                         &workspace_id,
                         caller.clone(),
                         caller_name.unwrap_or_default(),
                         agent_id.clone(),
                         one_shot,
                         None,
-                    );
+                    )?;
                     (new_id, false)
                 };
                 if !reused {
-                    self.publish_subscriptions_changed(&workspace_id, &caller)
+                    self.publish_subscriptions_changed(&caller_home_ws, &caller)
                         .await;
                 }
                 if queued {
                     self.spawn_watch_cleanup(
-                        workspace_id.clone(),
+                        caller_home_ws.clone(),
                         caller,
                         subscription_id.clone(),
                         QUEUED_WATCH_CLEANUP,
@@ -4848,44 +4899,58 @@ impl Services {
                 .map(AgentId::from);
 
             if let Some(parent) = created_by.or_else(|| Some(parent_id.clone())) {
-                // Fetch parent session for name
-                let parent_name = self
-                    .store
-                    .get_agent_session(&parent)
-                    .await
-                    .ok()
-                    .map(|s| s.name)
+                // Fetch parent session for name + home workspace. The watch
+                // (and any group) is anchored in the parent's HOME workspace;
+                // fall back to the child's workspace when the parent session
+                // cannot be loaded (matches the pre-lift behavior).
+                let parent_session = self.store.get_agent_session(&parent).await.ok();
+                let parent_name = parent_session
+                    .as_ref()
+                    .map(|s| s.name.clone())
                     .unwrap_or_default();
+                let parent_home_ws = parent_session
+                    .map(|s| s.workspace_id)
+                    .unwrap_or_else(|| workspace_id.clone());
+
+                // A cross-workspace (chief) parent's group is persisted under
+                // the parent's home workspace, which the child-workspace
+                // rehydration above did not load — rehydrate it too so the
+                // grouped child re-enrolls (idempotent, best-effort).
+                if parent_home_ws != workspace_id {
+                    let _ = self.rehydrate_delegation_groups(&parent_home_ws).await;
+                }
 
                 // Check if this agent is in a rehydrated delegation group
-                let groups = self.list_groups_for_parent(&workspace_id, &parent);
+                let groups = self.list_groups_for_parent(&parent);
                 let group_id = groups
                     .iter()
                     .find(|g| g.expected_agent_ids.contains(agent_id))
                     .map(|g| g.group_id.clone());
 
-                if let Some(gid) = group_id {
+                let registered = if let Some(gid) = group_id {
                     // Register grouped completion watch for after_all fan-in
-                    let _sub_id = self.register_completion_watch(
+                    self.register_completion_watch(
+                        &parent_home_ws,
                         &workspace_id,
                         parent,
                         parent_name,
                         agent_id.clone(),
                         false,
                         Some(gid),
-                    );
+                    )
+                    .map(|_| ())
                 } else {
                     // Register ungrouped completion watch (dedupe via find_and_refresh)
-                    let _sub_id = self
-                        .find_and_refresh_ungrouped_watch(
-                            &workspace_id,
-                            &parent,
-                            agent_id,
-                            true,
-                            Some(parent_name.clone()),
-                        )
-                        .unwrap_or_else(|| {
-                            self.register_completion_watch(
+                    match self.find_and_refresh_ungrouped_watch(
+                        &parent,
+                        agent_id,
+                        true,
+                        Some(parent_name.clone()),
+                    ) {
+                        Some(_) => Ok(()),
+                        None => self
+                            .register_completion_watch(
+                                &parent_home_ws,
                                 &workspace_id,
                                 parent,
                                 parent_name,
@@ -4893,7 +4958,17 @@ impl Services {
                                 true,
                                 None,
                             )
-                        });
+                            .map(|_| ()),
+                    }
+                };
+                if let Err(e) = registered {
+                    // Scope-gate rejection is non-fatal on resume: the agent
+                    // still continues; only the parent wake path is lost.
+                    tracing::warn!(
+                        agent = %agent_id.0,
+                        error = %e,
+                        "resume: completion-watch re-registration rejected"
+                    );
                 }
             }
         }
@@ -4998,8 +5073,18 @@ impl Services {
         let session = self.store.get_agent_session(agent_id).await.ok();
         if let Some(session) = &session {
             if let Some(parent_id) = &session.parent_agent_id {
+                // A cross-workspace (chief) parent's group is persisted under
+                // the parent's home workspace — rehydrate it too so this
+                // abandoned child is recorded there (idempotent, best-effort).
+                if let Ok(parent_session) = self.store.get_agent_session(parent_id).await {
+                    if parent_session.workspace_id != workspace_id {
+                        let _ = self
+                            .rehydrate_delegation_groups(&parent_session.workspace_id)
+                            .await;
+                    }
+                }
                 // Check if this agent is in a delegation group
-                let groups = self.list_groups_for_parent(&workspace_id, parent_id);
+                let groups = self.list_groups_for_parent(parent_id);
                 for group in groups {
                     if group.expected_agent_ids.contains(agent_id) {
                         // Record this child as deleted in the group (AS-4 abandoned child path).
@@ -5022,7 +5107,6 @@ impl Services {
                             data: json!({ "agentId": agent_id.0 }),
                         };
                         self.record_group_child_completion(
-                            &workspace_id,
                             &group.group_id,
                             agent_id,
                             true,

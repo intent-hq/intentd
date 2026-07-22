@@ -1,10 +1,22 @@
 //! Daemon-owned parent→child completion-watch registry (AS-2).
 //!
-//! In-memory state, keyed by workspace, recording which parent agents are
-//! watching which child agents for completion. A oneShot watch is registered
-//! when an agent delegates with `waitMode` `immediate` (default) over the MCP
-//! front door; the delivery worker that fires on child completion lands in AS-3
-//! and the `after_all` delegation-group fan-in lands in AS-4.
+//! One daemon-global in-memory registry (not keyed by workspace) recording
+//! which parent agents are watching which child agents for completion. Every
+//! record carries the workspaces it spans: a watch knows the parent's HOME
+//! workspace (where the wake is delivered) and the child's workspace (where
+//! the completion event fires); a delegation group is anchored in the PARENT's
+//! home workspace. For same-workspace delegation the two coincide and behavior
+//! is identical to the old per-workspace map; a chief-workspace parent can
+//! watch children in any workspace through the exact same code path.
+//!
+//! Safety gate: non-chief parents may only watch children in their own
+//! workspace — enforced in [`Services::register_completion_watch`], the single
+//! shared registration path, not per-caller.
+//!
+//! A oneShot watch is registered when an agent delegates with `waitMode`
+//! `immediate` (default) over the MCP front door; the delivery worker that
+//! fires on child completion lands in AS-3 and the `after_all`
+//! delegation-group fan-in lands in AS-4.
 //!
 //! Mirrors the TS `subscribeCallerToAgentCompletion` / `agentSubscribe` shape
 //! (oneShot, `actorIds: [child]`, AGENT completion event set
@@ -34,6 +46,14 @@ use crate::Services;
 #[derive(Debug, Clone)]
 pub(crate) struct CompletionWatch {
     pub id: String,
+    /// The parent's HOME workspace — where every wake for this watch is
+    /// delivered (and where `agent:subscriptions-changed` is published). For
+    /// same-workspace delegation this equals `child_workspace_id`; for a
+    /// chief-workspace parent it is `__chief__`.
+    pub parent_workspace_id: WorkspaceId,
+    /// The child's workspace — where its completion events
+    /// (`agent:idle`/`agent:failed`/`agent:deleted`) fire.
+    pub child_workspace_id: WorkspaceId,
     pub parent_agent_id: AgentId,
     pub parent_agent_name: String,
     pub child_agent_id: AgentId,
@@ -63,6 +83,13 @@ pub(crate) struct CompletionWatch {
 #[derive(Debug, Clone)]
 pub(crate) struct DelegationGroup {
     pub group_id: String,
+    /// The PARENT's home workspace — the group's anchor: where the aggregated
+    /// wake is delivered, where `agent:subscriptions-changed` is published,
+    /// and the `workspace_id` column the group persists/rehydrates under. For
+    /// same-workspace delegation this is the delegating workspace (identical
+    /// to the old per-workspace registry); for a chief parent it is
+    /// `__chief__`.
+    pub workspace_id: WorkspaceId,
     pub parent_agent_id: AgentId,
     // Retained for parity with the TS group shape; not read by the fan-in.
     #[allow(dead_code)]
@@ -85,27 +112,58 @@ pub(crate) struct DelegationGroup {
     pub raw_events: Vec<Arc<Event>>,
 }
 
-/// Per-workspace registry state held behind the `Services` mutex.
+/// Daemon-global registry state held behind the `Services` mutex. Watches and
+/// groups from every workspace share this one table; each record carries its
+/// own workspace anchors (see [`CompletionWatch`] / [`DelegationGroup`]).
 #[derive(Debug, Default)]
-pub(crate) struct WorkspaceWatches {
+pub(crate) struct SubscriptionRegistry {
     pub subscriptions: Vec<CompletionWatch>,
     pub delegation_groups: Vec<DelegationGroup>,
 }
 
+/// The shared registration safety gate: a non-chief parent may only watch
+/// children inside its own workspace; a chief-workspace parent may watch any
+/// agent. Enforced here (the single path every registration goes through),
+/// not per-caller.
+fn check_watch_scope(
+    parent_workspace_id: &WorkspaceId,
+    child_workspace_id: &WorkspaceId,
+) -> Result<()> {
+    if parent_workspace_id != child_workspace_id && !parent_workspace_id.is_chief() {
+        return Err(Error::InvalidParams(format!(
+            "cross-workspace completion watch denied: parent in workspace {} may only \
+             watch agents in its own workspace (child is in workspace {}); only \
+             chief-workspace parents may watch agents in any workspace",
+            parent_workspace_id.0, child_workspace_id.0
+        )));
+    }
+    Ok(())
+}
+
 impl Services {
     /// Register a parent→child completion watch and return its subscription id.
+    ///
+    /// `parent_workspace_id` is the parent's home workspace (where wakes are
+    /// delivered); `child_workspace_id` is where the child's completion events
+    /// fire. Errs when the scope gate rejects the pair (non-chief parent
+    /// watching a child outside its own workspace).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_completion_watch(
         &self,
-        workspace_id: &WorkspaceId,
+        parent_workspace_id: &WorkspaceId,
+        child_workspace_id: &WorkspaceId,
         parent_agent_id: AgentId,
         parent_agent_name: String,
         child_agent_id: AgentId,
         one_shot: bool,
         group_id: Option<String>,
-    ) -> String {
+    ) -> Result<String> {
+        check_watch_scope(parent_workspace_id, child_workspace_id)?;
         let id = Uuid::new_v4().to_string();
         let watch = CompletionWatch {
             id: id.clone(),
+            parent_workspace_id: parent_workspace_id.clone(),
+            child_workspace_id: child_workspace_id.clone(),
             parent_agent_id,
             parent_agent_name,
             child_agent_id,
@@ -118,33 +176,23 @@ impl Services {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .entry(workspace_id.clone())
-            .or_default()
             .subscriptions
             .push(watch);
-        id
+        Ok(id)
     }
 
-    /// All watches whose `child_agent_id` matches (the AS-3 delivery lookup).
-    // TODO(AS-3): consumed by the completion-delivery worker.
-    #[allow(dead_code)]
-    pub(crate) fn find_watches_for_child(
-        &self,
-        workspace_id: &WorkspaceId,
-        child_agent_id: &AgentId,
-    ) -> Vec<CompletionWatch> {
+    /// All watches whose `child_agent_id` matches (the AS-3 delivery lookup),
+    /// regardless of workspace — the same lookup serves same-workspace and
+    /// cross-workspace (chief) watches.
+    pub(crate) fn find_watches_for_child(&self, child_agent_id: &AgentId) -> Vec<CompletionWatch> {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .map(|w| {
-                w.subscriptions
-                    .iter()
-                    .filter(|s| &s.child_agent_id == child_agent_id)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+            .subscriptions
+            .iter()
+            .filter(|s| &s.child_agent_id == child_agent_id)
+            .cloned()
+            .collect()
     }
 
     /// SUB-2 (Copilot #104 follow-up, thread PRRT_kwDOS9Wxuc6QKPyt):
@@ -176,7 +224,6 @@ impl Services {
     /// output.
     pub(crate) fn find_and_refresh_ungrouped_watch(
         &self,
-        workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
         child_agent_id: &AgentId,
         one_shot: bool,
@@ -186,8 +233,7 @@ impl Services {
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let w = guard.get_mut(workspace_id)?;
-        let watch = w.subscriptions.iter_mut().find(|s| {
+        let watch = guard.subscriptions.iter_mut().find(|s| {
             s.group_id.is_none()
                 && s.one_shot == one_shot
                 && &s.parent_agent_id == parent_agent_id
@@ -208,7 +254,6 @@ impl Services {
     /// call has extended the deadline past its wake-up time.
     pub(crate) fn bump_watch_cleanup_deadline(
         &self,
-        workspace_id: &WorkspaceId,
         subscription_id: &str,
         new_deadline: Instant,
     ) -> bool {
@@ -216,10 +261,11 @@ impl Services {
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return false;
-        };
-        let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) else {
+        let Some(watch) = guard
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.id == subscription_id)
+        else {
             return false;
         };
         watch.cleanup_deadline = Some(match watch.cleanup_deadline {
@@ -234,85 +280,68 @@ impl Services {
     /// by the cleanup task spawned in [`Services::spawn_watch_cleanup`]; a
     /// task that wakes before the current deadline is a no-op and the later
     /// task (spawned for the extended deadline) performs the removal.
-    pub(crate) fn remove_watch_if_deadline_passed(
-        &self,
-        workspace_id: &WorkspaceId,
-        subscription_id: &str,
-    ) -> bool {
+    pub(crate) fn remove_watch_if_deadline_passed(&self, subscription_id: &str) -> bool {
         let now = Instant::now();
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
+        let Some(idx) = guard
+            .subscriptions
+            .iter()
+            .position(|s| s.id == subscription_id)
+        else {
             return false;
         };
-        let Some(idx) = w.subscriptions.iter().position(|s| s.id == subscription_id) else {
-            return false;
-        };
-        match w.subscriptions[idx].cleanup_deadline {
+        match guard.subscriptions[idx].cleanup_deadline {
             Some(deadline) if deadline <= now => {
-                w.subscriptions.remove(idx);
+                guard.subscriptions.remove(idx);
                 true
             }
             _ => false,
         }
     }
 
-    /// All watches registered by `parent_agent_id`.
-    // TODO(AS-3/AS-4): consumed by `agent.getSubscriptions` + delivery/cleanup.
-    #[allow(dead_code)]
+    /// All watches registered by `parent_agent_id`, regardless of workspace
+    /// (consumed by `agent.getSubscriptions` + delivery/cleanup).
     pub(crate) fn list_watches_for_parent(
         &self,
-        workspace_id: &WorkspaceId,
         parent_agent_id: &AgentId,
     ) -> Vec<CompletionWatch> {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .map(|w| {
-                w.subscriptions
-                    .iter()
-                    .filter(|s| &s.parent_agent_id == parent_agent_id)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+            .subscriptions
+            .iter()
+            .filter(|s| &s.parent_agent_id == parent_agent_id)
+            .cloned()
+            .collect()
     }
 
     /// Remove a single watch by subscription id; returns whether one was found.
-    // TODO(AS-3): oneShot cleanup after a completion is delivered.
-    #[allow(dead_code)]
-    pub(crate) fn remove_watch(&self, workspace_id: &WorkspaceId, subscription_id: &str) -> bool {
+    pub(crate) fn remove_watch(&self, subscription_id: &str) -> bool {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return false;
-        };
-        let before = w.subscriptions.len();
-        w.subscriptions.retain(|s| s.id != subscription_id);
-        w.subscriptions.len() != before
+        let before = guard.subscriptions.len();
+        guard.subscriptions.retain(|s| s.id != subscription_id);
+        guard.subscriptions.len() != before
     }
 
     /// Mark a watch as having delivered the report wake (report-time wake).
     /// When marked, `deliver_completion_to_watches` will skip delivery for
     /// `agent:idle` but still deliver for `agent:failed` / `agent:deleted`.
-    pub(crate) fn mark_watch_report_delivered(
-        &self,
-        workspace_id: &WorkspaceId,
-        subscription_id: &str,
-    ) -> bool {
+    pub(crate) fn mark_watch_report_delivered(&self, subscription_id: &str) -> bool {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return false;
-        };
-        if let Some(watch) = w.subscriptions.iter_mut().find(|s| s.id == subscription_id) {
+        if let Some(watch) = guard
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.id == subscription_id)
+        {
             watch.report_delivered = true;
             true
         } else {
@@ -320,42 +349,36 @@ impl Services {
         }
     }
 
-    /// Remove every watch registered by `parent_agent_id`; returns the count.
-    // TODO(AS-3): `agent.cancelSubscriptions` + parent-deletion cleanup.
-    #[allow(dead_code)]
-    pub(crate) fn remove_all_for_parent(
-        &self,
-        workspace_id: &WorkspaceId,
-        parent_agent_id: &AgentId,
-    ) -> usize {
+    /// Remove every watch registered by `parent_agent_id`; returns the count
+    /// (`agent.cancelSubscriptions` + parent-deletion cleanup).
+    pub(crate) fn remove_all_for_parent(&self, parent_agent_id: &AgentId) -> usize {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return 0;
-        };
-        let before = w.subscriptions.len();
-        w.subscriptions
+        let before = guard.subscriptions.len();
+        guard
+            .subscriptions
             .retain(|s| &s.parent_agent_id != parent_agent_id);
-        before - w.subscriptions.len()
+        before - guard.subscriptions.len()
     }
 
     /// Return the open (unsealed && undelivered) delegation group for `parent_id`,
     /// creating a fresh one if none exists. All `after_all` children delegated by
     /// the same parent turn share this group; a sealed/delivered group is never
-    /// reused, so a later turn opens a new one.
+    /// reused, so a later turn opens a new one. `parent_workspace_id` is the
+    /// PARENT's home workspace — the group's anchor for wake delivery and
+    /// persistence.
     pub(crate) fn get_or_create_delegation_group(
         &self,
-        workspace_id: &WorkspaceId,
+        parent_workspace_id: &WorkspaceId,
         parent_id: &AgentId,
     ) -> String {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let entry = guard.entry(workspace_id.clone()).or_default();
-        if let Some(g) = entry
+        if let Some(g) = guard
             .delegation_groups
             .iter()
             .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)
@@ -365,6 +388,7 @@ impl Services {
         let group_id = Uuid::new_v4().to_string();
         let group = DelegationGroup {
             group_id: group_id.clone(),
+            workspace_id: parent_workspace_id.clone(),
             parent_agent_id: parent_id.clone(),
             await_mode: "after_all".to_string(),
             expected_agent_ids: Vec::new(),
@@ -376,28 +400,20 @@ impl Services {
             event_summaries: Vec::new(),
             raw_events: Vec::new(),
         };
-        entry.delegation_groups.push(group.clone());
+        guard.delegation_groups.push(group.clone());
         drop(guard);
         // Write-through persist (best-effort).
-        self.persist_delegation_group(workspace_id, &group);
+        self.persist_delegation_group(&group);
         group_id
     }
 
     /// Add `child_id` to a group's expected set (idempotent).
-    pub(crate) fn enroll_child_in_group(
-        &self,
-        workspace_id: &WorkspaceId,
-        group_id: &str,
-        child_id: &AgentId,
-    ) {
+    pub(crate) fn enroll_child_in_group(&self, group_id: &str, child_id: &AgentId) {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return;
-        };
-        let group_clone = if let Some(g) = w
+        let group_clone = if let Some(g) = guard
             .delegation_groups
             .iter_mut()
             .find(|g| g.group_id == group_id)
@@ -412,7 +428,7 @@ impl Services {
         drop(guard);
         // Write-through persist (best-effort).
         if let Some(g) = group_clone {
-            self.persist_delegation_group(workspace_id, &g);
+            self.persist_delegation_group(&g);
         }
     }
 
@@ -422,18 +438,13 @@ impl Services {
     /// DURABILITY: Awaits the persist before returning so the sealed flag is durable
     /// before the caller proceeds (fixes race where daemon kill between seal and
     /// spawned persist loses the sealed state across restart).
-    pub(crate) async fn seal_group_for_parent(
-        &self,
-        workspace_id: &WorkspaceId,
-        parent_id: &AgentId,
-    ) -> Option<String> {
+    pub(crate) async fn seal_group_for_parent(&self, parent_id: &AgentId) -> Option<String> {
         let (group_id, group_clone) = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let w = guard.get_mut(workspace_id)?;
-            let g = w
+            let g = guard
                 .delegation_groups
                 .iter_mut()
                 .find(|g| &g.parent_agent_id == parent_id && !g.sealed && !g.delivered)?;
@@ -444,7 +455,7 @@ impl Services {
         }; // guard is dropped here automatically
            // Durable write-through persist: await the write so the sealed flag is
            // persisted before the caller continues.
-        let persisted = match delegation_group_to_persisted(workspace_id, &group_clone) {
+        let persisted = match delegation_group_to_persisted(&group_clone) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("skip delegation_group persist {}: {e}", group_id);
@@ -462,25 +473,21 @@ impl Services {
     /// the immediate-mode `reportToParent` suppression has moved to SUB-2
     /// (the child's `agent:idle` drives the single wake, so grouped children
     /// no longer need the pre-persist branch this predicate used to gate).
-    #[allow(dead_code)]
     pub(crate) fn child_in_undelivered_group(
         &self,
-        workspace_id: &WorkspaceId,
         parent_id: &AgentId,
         child_id: &AgentId,
     ) -> bool {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .map(|w| {
-                w.delegation_groups.iter().any(|g| {
-                    &g.parent_agent_id == parent_id
-                        && !g.delivered
-                        && g.expected_agent_ids.contains(child_id)
-                })
+            .delegation_groups
+            .iter()
+            .any(|g| {
+                &g.parent_agent_id == parent_id
+                    && !g.delivered
+                    && g.expected_agent_ids.contains(child_id)
             })
-            .unwrap_or(false)
     }
 
     /// Record one child's completion in its group (idempotent): adds it to the
@@ -500,7 +507,6 @@ impl Services {
     /// the STAB-108 rehydration reconciliation).
     pub(crate) async fn record_group_child_completion(
         &self,
-        workspace_id: &WorkspaceId,
         group_id: &str,
         child_id: &AgentId,
         deleted: bool,
@@ -512,10 +518,7 @@ impl Services {
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let Some(w) = guard.get_mut(workspace_id) else {
-                return false;
-            };
-            if let Some(g) = w
+            if let Some(g) = guard
                 .delegation_groups
                 .iter_mut()
                 .find(|g| g.group_id == group_id)
@@ -543,7 +546,7 @@ impl Services {
            // Durable write-through persist: await the write so the completion is
            // persisted before the caller continues / before the event is observable.
         if let Some(g) = group_clone {
-            let persisted = match delegation_group_to_persisted(workspace_id, &g) {
+            let persisted = match delegation_group_to_persisted(&g) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("skip delegation_group persist {group_id}: {e}");
@@ -572,33 +575,28 @@ impl Services {
     ///   (correct: wake already delivered, or about to be).
     ///
     /// The synchronous delete before publish prevents double-wake.
-    pub(crate) async fn take_group_if_ready(
-        &self,
-        workspace_id: &WorkspaceId,
-        group_id: &str,
-    ) -> Option<DelegationGroup> {
-        // Inside the lock: check readiness and remove from in-memory map.
+    pub(crate) async fn take_group_if_ready(&self, group_id: &str) -> Option<DelegationGroup> {
+        // Inside the lock: check readiness and remove from in-memory table.
         let group = {
             let mut guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let w = guard.get_mut(workspace_id)?;
-            let idx = w
+            let idx = guard
                 .delegation_groups
                 .iter()
                 .position(|g| g.group_id == group_id)?;
-            if !(w.delegation_groups[idx].sealed
-                && !w.delegation_groups[idx].delivered
-                && is_group_complete(&w.delegation_groups[idx]))
+            if !(guard.delegation_groups[idx].sealed
+                && !guard.delegation_groups[idx].delivered
+                && is_group_complete(&guard.delegation_groups[idx]))
             {
                 return None;
             }
-            w.delegation_groups.remove(idx)
+            guard.delegation_groups.remove(idx)
         }; // Drop guard before await
            // DURABLE-BEFORE-OBSERVABLE: delete the row synchronously before returning.
            // If the delete FAILS, do NOT deliver the wake — put the group back into the
-           // in-memory map (delivered=false) and return None. The next child-completion
+           // in-memory table (delivered=false) and return None. The next child-completion
            // or restart retry will attempt the delete again. This makes delete-commit
            // strictly precede observability in ALL paths.
         if let Err(e) = self.store.delete_delegation_group(group_id).await {
@@ -606,17 +604,15 @@ impl Services {
                 "Failed to delete delegation_group row {} (workspace {}): {}. \
                  Wake NOT delivered; group restored to memory for retry.",
                 group_id,
-                workspace_id.0,
+                group.workspace_id.0,
                 e
             );
-            // Restore the group to the in-memory map for retry
-            let mut guard = self
-                .agent_subscriptions
+            // Restore the group to the in-memory table for retry
+            self.agent_subscriptions
                 .lock()
-                .expect("agent subscription registry poisoned");
-            if let Some(w) = guard.get_mut(workspace_id) {
-                w.delegation_groups.push(group);
-            }
+                .expect("agent subscription registry poisoned")
+                .delegation_groups
+                .push(group);
             return None;
         }
         // Delete committed → safe to deliver the wake
@@ -636,7 +632,6 @@ impl Services {
     /// watches retained.
     pub(crate) fn settle_group_watches(
         &self,
-        workspace_id: &WorkspaceId,
         group_id: &str,
         retain_children: &[AgentId],
     ) -> usize {
@@ -645,17 +640,14 @@ impl Services {
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return 0;
-        };
-        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = w
+        let mut kept: std::collections::HashSet<(AgentId, AgentId)> = guard
             .subscriptions
             .iter()
             .filter(|s| s.group_id.is_none())
             .map(|s| (s.parent_agent_id.clone(), s.child_agent_id.clone()))
             .collect();
         let mut retained = 0;
-        w.subscriptions.retain_mut(|s| {
+        guard.subscriptions.retain_mut(|s| {
             if s.group_id.as_deref() != Some(group_id) {
                 return true;
             }
@@ -674,86 +666,77 @@ impl Services {
     }
 
     /// All delegation groups parented by `parent_id` (read snapshot for
-    /// `agent.getSubscriptions`). Mirrors `delegation_group_for_parent` but
-    /// returns every group rather than the first match.
-    pub(crate) fn list_groups_for_parent(
-        &self,
-        workspace_id: &WorkspaceId,
-        parent_id: &AgentId,
-    ) -> Vec<DelegationGroup> {
+    /// `agent.getSubscriptions`), regardless of workspace. Mirrors
+    /// `delegation_group_for_parent` but returns every group rather than the
+    /// first match.
+    pub(crate) fn list_groups_for_parent(&self, parent_id: &AgentId) -> Vec<DelegationGroup> {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .map(|w| {
-                w.delegation_groups
-                    .iter()
-                    .filter(|g| &g.parent_agent_id == parent_id)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+            .delegation_groups
+            .iter()
+            .filter(|g| &g.parent_agent_id == parent_id)
+            .cloned()
+            .collect()
     }
 
-    /// Every completion watch registered in the workspace (the `agent.diagnostics`
-    /// workspace-wide subscription view).
+    /// Every completion watch that touches the workspace — as the parent's
+    /// home OR the child's workspace (the `agent.diagnostics` workspace-wide
+    /// subscription view; for same-workspace watches this matches the old
+    /// per-workspace snapshot exactly).
     pub(crate) fn all_watches(&self, workspace_id: &WorkspaceId) -> Vec<CompletionWatch> {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .map(|w| w.subscriptions.clone())
-            .unwrap_or_default()
+            .subscriptions
+            .iter()
+            .filter(|s| {
+                &s.parent_workspace_id == workspace_id || &s.child_workspace_id == workspace_id
+            })
+            .cloned()
+            .collect()
     }
 
-    /// Every delegation group in the workspace (the `agent.diagnostics`
+    /// Every delegation group anchored in the workspace (the `agent.diagnostics`
     /// workspace-wide delegation-group view).
     pub(crate) fn all_groups(&self, workspace_id: &WorkspaceId) -> Vec<DelegationGroup> {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .map(|w| w.delegation_groups.clone())
-            .unwrap_or_default()
+            .delegation_groups
+            .iter()
+            .filter(|g| &g.workspace_id == workspace_id)
+            .cloned()
+            .collect()
     }
 
     /// Drop every delegation group parented by `parent_id`; returns the count
     /// removed (the group side of `agent.cancelSubscriptions`).
-    pub(crate) fn remove_groups_for_parent(
-        &self,
-        workspace_id: &WorkspaceId,
-        parent_id: &AgentId,
-    ) -> usize {
+    pub(crate) fn remove_groups_for_parent(&self, parent_id: &AgentId) -> usize {
         let mut guard = self
             .agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned");
-        let Some(w) = guard.get_mut(workspace_id) else {
-            return 0;
-        };
-        let before = w.delegation_groups.len();
-        w.delegation_groups
+        let before = guard.delegation_groups.len();
+        guard
+            .delegation_groups
             .retain(|g| &g.parent_agent_id != parent_id);
-        before - w.delegation_groups.len()
+        before - guard.delegation_groups.len()
     }
 
     /// Test-only snapshot of a parent's delegation group, if one exists.
     #[cfg(test)]
     pub(crate) fn delegation_group_for_parent(
         &self,
-        workspace_id: &WorkspaceId,
         parent_id: &AgentId,
     ) -> Option<DelegationGroup> {
         self.agent_subscriptions
             .lock()
             .expect("agent subscription registry poisoned")
-            .get(workspace_id)
-            .and_then(|w| {
-                w.delegation_groups
-                    .iter()
-                    .find(|g| &g.parent_agent_id == parent_id)
-                    .cloned()
-            })
+            .delegation_groups
+            .iter()
+            .find(|g| &g.parent_agent_id == parent_id)
+            .cloned()
     }
 
     /// Best-effort write-through persist of a delegation group (AS-2 persistence).
@@ -764,11 +747,10 @@ impl Services {
     /// the parent agent can re-delegate if needed. Consistency requirement applies
     /// to **agent completions** (must persist before `agent:idle` event), not group
     /// creation.
-    fn persist_delegation_group(&self, workspace_id: &WorkspaceId, group: &DelegationGroup) {
+    fn persist_delegation_group(&self, group: &DelegationGroup) {
         let store = self.store.clone();
-        let workspace_id = workspace_id.clone();
         let group_id = group.group_id.clone();
-        let persisted = match delegation_group_to_persisted(&workspace_id, group) {
+        let persisted = match delegation_group_to_persisted(group) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("skip delegation_group persist {group_id}: {e}");
@@ -784,6 +766,9 @@ impl Services {
 
     /// Rehydrate undelivered delegation groups on resume (AS-2 rehydration).
     /// Idempotent: skips groups already present in memory (by group_id).
+    /// `workspace_id` selects which persisted groups to load (the group's
+    /// anchor — the parent's home workspace); the loaded groups land in the
+    /// daemon-global registry.
     ///
     /// STAB-108 FIX: Reconciles each rehydrated group against current agent state.
     /// If an expected child is already idle/completed (or deleted/missing), records
@@ -798,12 +783,11 @@ impl Services {
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let entry = guard.entry(workspace_id.clone()).or_default();
             let mut loaded = 0;
             let mut groups_to_reconcile = Vec::new();
             for p in persisted {
                 // Skip if this group is already in memory (idempotent rehydration).
-                if entry
+                if guard
                     .delegation_groups
                     .iter()
                     .any(|g| g.group_id == p.group_id)
@@ -814,7 +798,7 @@ impl Services {
                 let mut group = persisted_to_delegation_group(&p)?;
                 group.sealed = true;
                 groups_to_reconcile.push(group.group_id.clone());
-                entry.delegation_groups.push(group);
+                guard.delegation_groups.push(group);
                 loaded += 1;
             }
             (loaded, groups_to_reconcile)
@@ -822,10 +806,9 @@ impl Services {
 
         // STAB-108 reconciliation: check each rehydrated group for already-completed children
         for group_id in groups_to_reconcile {
-            self.reconcile_group_on_rehydration(workspace_id, &group_id)
-                .await;
+            self.reconcile_group_on_rehydration(&group_id).await;
             // Fire the group if it's now ready (all children completed/deleted)
-            self.try_fire_group(workspace_id, &group_id).await;
+            self.try_fire_group(&group_id).await;
         }
         Ok(loaded)
     }
@@ -834,27 +817,34 @@ impl Services {
     /// For each expected child not already in completed_agent_ids or deleted_agent_ids,
     /// check if the agent session is idle/completed (or deleted/missing). If so, record
     /// its completion using the persisted completion_report.
-    async fn reconcile_group_on_rehydration(&self, workspace_id: &WorkspaceId, group_id: &str) {
-        // Get the list of agents to check (expected but not yet recorded as complete/deleted)
-        let agents_to_check = {
+    async fn reconcile_group_on_rehydration(&self, group_id: &str) {
+        // Get the list of agents to check (expected but not yet recorded as
+        // complete/deleted) plus the group's anchor workspace for the
+        // synthetic events below.
+        let (anchor_workspace, agents_to_check) = {
             let guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            let Some(w) = guard.get(workspace_id) else {
-                return;
-            };
-            let Some(g) = w.delegation_groups.iter().find(|g| g.group_id == group_id) else {
-                return;
-            };
-            g.expected_agent_ids
+            let Some(g) = guard
+                .delegation_groups
                 .iter()
-                .filter(|id| {
-                    !g.completed_agent_ids.contains(id) && !g.deleted_agent_ids.contains(id)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+                .find(|g| g.group_id == group_id)
+            else {
+                return;
+            };
+            (
+                g.workspace_id.clone(),
+                g.expected_agent_ids
+                    .iter()
+                    .filter(|id| {
+                        !g.completed_agent_ids.contains(id) && !g.deleted_agent_ids.contains(id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
         };
+        let workspace_id = &anchor_workspace;
 
         // For each unrecorded child, check its status and record if complete/deleted
         for child_id in agents_to_check {
@@ -942,12 +932,7 @@ impl Services {
 
                         // Record the completion
                         self.record_group_child_completion(
-                            workspace_id,
-                            group_id,
-                            &child_id,
-                            is_deleted,
-                            summary,
-                            event,
+                            group_id, &child_id, is_deleted, summary, event,
                         )
                         .await;
                     }
@@ -977,12 +962,8 @@ impl Services {
                         let summary = crate::format_group_child_line(&child_id, &event, None);
 
                         self.record_group_child_completion(
-                            workspace_id,
-                            group_id,
-                            &child_id,
-                            true, // deleted
-                            summary,
-                            event,
+                            group_id, &child_id, true, // deleted
+                            summary, event,
                         )
                         .await;
                     } else {
@@ -1007,18 +988,18 @@ impl Services {
         agent_id: &AgentId,
         event_data: &serde_json::Value,
     ) {
-        // Find which group (if any) this agent belongs to
+        // Find which group (if any) this agent belongs to — global lookup,
+        // so a chief-anchored group finds its workspace-scoped child too.
         let group_id = {
             let guard = self
                 .agent_subscriptions
                 .lock()
                 .expect("agent subscription registry poisoned");
-            guard.get(workspace_id).and_then(|w| {
-                w.delegation_groups
-                    .iter()
-                    .find(|g| g.expected_agent_ids.contains(agent_id))
-                    .map(|g| g.group_id.clone())
-            })
+            guard
+                .delegation_groups
+                .iter()
+                .find(|g| g.expected_agent_ids.contains(agent_id))
+                .map(|g| g.group_id.clone())
         };
 
         if let Some(group_id) = group_id {
@@ -1050,12 +1031,8 @@ impl Services {
             let summary = crate::format_group_child_line(agent_id, &event, report.as_deref());
 
             self.record_group_child_completion(
-                workspace_id,
-                &group_id,
-                agent_id,
-                false, // not deleted
-                summary,
-                event,
+                &group_id, agent_id, false, // not deleted
+                summary, event,
             )
             .await;
         }
@@ -1071,11 +1048,10 @@ fn is_group_complete(group: &DelegationGroup) -> bool {
         })
 }
 
-/// Convert in-memory `DelegationGroup` to persisted form.
-fn delegation_group_to_persisted(
-    workspace_id: &WorkspaceId,
-    group: &DelegationGroup,
-) -> Result<PersistedDelegationGroup> {
+/// Convert in-memory `DelegationGroup` to persisted form. The persisted
+/// `workspace_id` column carries the group's anchor (the parent's home
+/// workspace).
+fn delegation_group_to_persisted(group: &DelegationGroup) -> Result<PersistedDelegationGroup> {
     let raw_events_json: Vec<String> = group
         .raw_events
         .iter()
@@ -1087,7 +1063,7 @@ fn delegation_group_to_persisted(
 
     Ok(PersistedDelegationGroup {
         group_id: group.group_id.clone(),
-        workspace_id: workspace_id.clone(),
+        workspace_id: group.workspace_id.clone(),
         parent_agent_id: group.parent_agent_id.clone(),
         await_mode: group.await_mode.clone(),
         expected_agent_ids: group.expected_agent_ids.clone(),
@@ -1116,6 +1092,7 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
 
     Ok(DelegationGroup {
         group_id: p.group_id.clone(),
+        workspace_id: p.workspace_id.clone(),
         parent_agent_id: p.parent_agent_id.clone(),
         await_mode: p.await_mode.clone(),
         expected_agent_ids: p.expected_agent_ids.clone(),
