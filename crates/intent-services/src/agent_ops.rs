@@ -2041,14 +2041,15 @@ impl Services {
     }
 
     /// The legacy no-`providerId` `models.list` path, routed through the same
-    /// generic per-provider cache as `providerId: "auggie"` (key `("auggie",
-    /// "")`) so the two can never diverge — one cache, one single-flight, one
-    /// negative window. Only the wire shape differs: the response omits the
-    /// `providerId` field, `source` is `"auggie"` or `"static"`, and the
-    /// static tier catalog (never an empty list) is the fallback when the
-    /// probe fails with no last-good list. A failed probe with a last-good
-    /// cached list serves it labeled `stale: true` + `warning` — never
-    /// silently — whether or not the read was forced.
+    /// generic per-provider cache as `providerId: "auggie"` — same provider
+    /// id and same registry-derived version key — so the two can never
+    /// diverge: one cache, one single-flight, one negative window. Only the
+    /// wire shape differs: the response omits the `providerId` field,
+    /// `source` is `"auggie"` or `"static"`, and the static tier catalog
+    /// (never an empty list) is the fallback when the probe fails with no
+    /// last-good list. A failed probe with a last-good cached list serves it
+    /// labeled `stale: true` + `warning` — never silently — whether or not
+    /// the read was forced.
     async fn models_list_auggie_op(&self, force_refresh: bool) -> Result<Value> {
         let auggie_bin = self.auggie_bin.clone();
         self.models_list_auggie_with(
@@ -2073,10 +2074,16 @@ impl Services {
     where
         F: FnOnce() -> intent_core::BoxFuture<'static, Option<Vec<Value>>> + Send + 'static,
     {
+        // Derive the version key from the registry (like the per-provider
+        // path) so an auggie pin added later cannot silently split the
+        // legacy and providerId caches again.
+        let version_key = crate::model_catalog::source_for("auggie")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default();
         let resolved = crate::model_catalog::resolve_with_cache(
             &self.models_catalog,
             "auggie",
-            "",
+            &version_key,
             force_refresh,
             now_ms,
             || {

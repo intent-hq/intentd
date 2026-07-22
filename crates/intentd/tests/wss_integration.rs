@@ -1069,8 +1069,16 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
     // entry is seeded through the persisted cache file (fetchedAtMs: 0 →
     // expired but present) and the fake auggie always fails.
     use std::os::unix::fs::PermissionsExt;
+    // Drop-guard so the fixture dir is removed even when an assertion panics.
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let dir = Path::new("/tmp").join(format!("intentd-wss-models-stale-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = DirGuard(dir.clone());
     let bin = dir.join("auggie");
     std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1113,7 +1121,6 @@ async fn wss_models_list_legacy_expired_last_good_served_stale_on_failed_probe()
         .collect();
     keys.sort();
     assert_eq!(keys, ["models", "source", "stale", "warning"], "{resp}");
-    let _ = std::fs::remove_dir_all(&dir);
     srv.ws.stop().await;
 }
 
