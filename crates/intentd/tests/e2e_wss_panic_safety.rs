@@ -217,10 +217,13 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     assert_eq!(resp["error"]["code"], -32603);
     assert_eq!(resp["error"]["message"], "Internal error");
 
-    // 2) Panicking NOTIFICATION (no id) → no response frame. Proven by the
-    //    next request's response arriving as the very next text frame.
+    // 2) Panicking NOTIFICATION (no id) on the INLINE `events.subscribe` fast
+    //    path → no response frame. The inline path is strictly ordered on the
+    //    read loop, so a (buggy) frame from it would have to arrive before the
+    //    response to the next request — its absence below is the proof.
     ws.send(Message::Text(
-        r#"{"jsonrpc":"2.0","method":"note.list","params":{"workspaceId":"w1"}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","method":"events.subscribe","params":{"eventTypes":["*"]}}"#
+            .to_string(),
     ))
     .await
     .expect("send");
@@ -233,8 +236,12 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     .await
     .expect("send");
     let resp = next_text(&mut ws).await;
-    assert_eq!(resp["id"], 42, "notification must not produce a frame");
+    assert_eq!(
+        resp["id"], 42,
+        "notification in step 2 must not produce a frame"
+    );
     assert_eq!(resp["error"]["code"], -32603);
+    assert_eq!(resp["error"]["message"], "Internal error");
 
     // 4) The SAME connection keeps serving: a healthy request round-trips.
     ws.send(Message::Text(
@@ -248,6 +255,14 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
         resp.get("result").is_some(),
         "healthy request after panics must succeed, got {resp}"
     );
+
+    // Brief drain: no stray frame (e.g. from the step-2 notification) may
+    // trail the final response.
+    match timeout(Duration::from_millis(300), ws.next()).await {
+        Err(_) => {}
+        Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+        Ok(other) => panic!("unexpected trailing frame: {other:?}"),
+    }
 
     std::env::remove_var("INTENTD_TEST_PANIC_METHOD");
 }

@@ -120,7 +120,10 @@ pub(crate) async fn process_frame(
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
-        // never treat it as a client request.
+        // never treat it as a client request. Deliberately outside the panic
+        // guards below: it routes a *response* frame (no request handler runs
+        // and there is no request id to echo an error to), and it only touches
+        // the reverse pending map.
         if reverse.route_response(&value) {
             return true;
         }
@@ -258,6 +261,12 @@ pub(crate) async fn process_frame(
                 None => true,
             };
         }
+        // `AssertUnwindSafe` over `&mut ConnSubs` is sound here: if a
+        // subscribe handler panics after `tokio::spawn(forward_*)` but before
+        // `subs.insert(...)`, the forwarder is spawned but unregistered, so
+        // unsubscribe/`replaceGroup` can't reach it. The leak is bounded — the
+        // forwarder exits when its `out_tx.send` fails after the connection
+        // closes — and the registry itself is never left mid-mutation.
         if let Some(sub) = subscriptions::classify(&value) {
             return panic_guard::guard_send(
                 &method,

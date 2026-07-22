@@ -14,10 +14,15 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-/// Extract the request `id` (as sent, `None` when absent → notification) and
-/// the `method` name (empty string when absent) from a parsed frame.
+/// Extract the request `id` (`None` when absent → notification) and the
+/// `method` name (empty string when absent) from a parsed frame. Invalid id
+/// types (object/array/bool) are coerced to `null` per JSON-RPC 2.0, which
+/// only allows string/number/null ids in responses.
 pub(crate) fn request_identity(value: &Value) -> (Option<Value>, String) {
-    let rpc_id = value.get("id").cloned();
+    let rpc_id = value.get("id").cloned().map(|id| match id {
+        Value::String(_) | Value::Number(_) | Value::Null => id,
+        _ => Value::Null,
+    });
     let method = value
         .get("method")
         .and_then(|m| m.as_str())
@@ -141,7 +146,7 @@ where
             );
             match rpc_id {
                 Some(id) => out_tx.send(internal_error_frame(id)).await.is_ok(),
-                None => true,
+                None => !out_tx.is_closed(),
             }
         }
     }
@@ -150,10 +155,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-global state (the panic hook and
+    /// the `INTENTD_TEST_PANIC_METHOD` env var) so parallel test threads
+    /// cannot interleave hook swaps or env mutations.
+    static GLOBAL_STATE: Mutex<()> = Mutex::new(());
 
     /// Silence the default panic hook's stderr backtrace inside a scope; the
     /// guards rely on `catch_unwind`, not the hook, so behavior is unchanged.
+    /// Holds [`GLOBAL_STATE`] for the duration so hook swaps never interleave.
     fn with_quiet_panics<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let out = f();
@@ -235,6 +248,18 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn guard_send_panic_on_notification_reports_closed_channel() {
+        let (tx, rx) = mpsc::channel::<String>(4);
+        drop(rx);
+        let open = with_quiet_panics(|| {
+            futures::executor::block_on(guard_send("x.y", None, &tx, async {
+                panic!("boom");
+            }))
+        });
+        assert!(!open, "closed outbound channel must be reported");
+    }
+
     #[test]
     fn request_identity_extracts_id_and_method() {
         let v: Value =
@@ -253,13 +278,32 @@ mod tests {
     }
 
     #[test]
+    fn request_identity_coerces_invalid_id_types_to_null() {
+        // JSON-RPC 2.0 response ids must be string/number/null; an invalid
+        // request id (object/array/bool) still gets a response, with id null.
+        for raw in [
+            r#"{"jsonrpc":"2.0","id":{"k":1},"method":"a.b"}"#,
+            r#"{"jsonrpc":"2.0","id":[1],"method":"a.b"}"#,
+            r#"{"jsonrpc":"2.0","id":true,"method":"a.b"}"#,
+        ] {
+            let v: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(request_identity(&v), (Some(Value::Null), "a.b".to_string()));
+        }
+    }
+
+    #[test]
     fn inject_panic_matches_env_list() {
-        // Uses a process-wide env var; unique name-space per test binary run.
+        // Serialize with the other global-state tests: hold the lock across
+        // both the env mutation and the hook swap (open-coded here because
+        // `with_quiet_panics` takes the same lock).
+        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
         std::env::set_var("INTENTD_TEST_PANIC_METHOD", "p.one , p.two");
-        let hit =
-            with_quiet_panics(|| std::panic::catch_unwind(|| maybe_inject_panic("p.two")).is_err());
+        let hit = std::panic::catch_unwind(|| maybe_inject_panic("p.two")).is_err();
         let miss = std::panic::catch_unwind(|| maybe_inject_panic("p.three")).is_ok();
         std::env::remove_var("INTENTD_TEST_PANIC_METHOD");
+        std::panic::set_hook(prev);
         assert!(hit, "listed method must panic");
         assert!(miss, "unlisted method must not panic");
     }
