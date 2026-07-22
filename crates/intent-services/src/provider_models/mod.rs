@@ -399,13 +399,13 @@ async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<Stri
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// The last ~200 chars of a trimmed stderr, for warning attribution.
+/// The last ~200 chars of a trimmed stderr, for warning attribution. Walks
+/// backwards from the end so the cost is bounded by the tail length, not the
+/// full stderr size.
 fn stderr_tail(stderr: &str) -> String {
     let trimmed = stderr.trim();
-    trimmed
-        .chars()
-        .skip(trimmed.chars().count().saturating_sub(200))
-        .collect()
+    let start = trimmed.char_indices().rev().nth(199).map_or(0, |(i, _)| i);
+    trimmed[start..].to_string()
 }
 
 /// grok: native CLI — run `grok models` and parse stdout via

@@ -457,6 +457,19 @@ fn grok_outcome_failed_exit_without_rows_is_attributed() {
 }
 
 #[test]
+fn stderr_tail_keeps_last_200_chars() {
+    assert_eq!(super::stderr_tail("  boom \n"), "boom");
+    let long = format!("{}{}", "x".repeat(500), "y".repeat(200));
+    let tail = super::stderr_tail(&long);
+    assert_eq!(tail.chars().count(), 200);
+    assert_eq!(tail, "y".repeat(200));
+    // Multi-byte chars: the boundary walk must never split a char.
+    let unicode = "é".repeat(300);
+    let tail = super::stderr_tail(&unicode);
+    assert_eq!(tail.chars().count(), 200);
+}
+
+#[test]
 fn grok_outcome_rows_win_over_failed_exit() {
     // Parsed rows with a non-zero exit still serve the catalog — stdout is
     // the contract, not the exit code.
