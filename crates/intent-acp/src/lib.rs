@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use intent_core::WorkspaceApi;
 
+#[cfg(unix)]
+pub mod descendant_sweep;
 pub mod error;
 pub mod fs;
 pub mod handler;
@@ -34,6 +36,8 @@ pub mod terminal;
 pub mod tool_restrictions;
 pub mod transport;
 
+#[cfg(unix)]
+pub use descendant_sweep::{descendant_pids, descendant_pids_many, sweep_escaped_descendants};
 pub use error::{AcpError, AcpResult, JsonRpcError};
 pub use fs::{FileAction, FileChange, FileService};
 pub use handler::{ClientRequestHandler, EventSink, SinkEvent};

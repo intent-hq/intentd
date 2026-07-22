@@ -474,16 +474,20 @@ async fn run_wait_loop(
 
 /// Reap the whole process group: SIGTERM → grace → SIGKILL, mirroring
 /// `host_exec::run`'s reap so helper subprocesses do not survive a
-/// cancel/timeout.
+/// cancel/timeout. Descendants that escaped into their OWN process groups
+/// survive the group kill, so they are snapshotted before signalling and
+/// swept afterwards (`intent_acp::descendant_sweep`).
 async fn reap_child_group(child: &mut tokio::process::Child, pid: Option<u32>) {
     #[cfg(unix)]
     {
         if let Some(pid) = pid {
+            let descendants = intent_acp::descendant_pids(pid).await;
             kill_group(pid, nix::sys::signal::Signal::SIGTERM);
             tokio::time::sleep(TERM_GRACE).await;
             if !matches!(child.try_wait(), Ok(Some(_))) {
                 kill_group(pid, nix::sys::signal::Signal::SIGKILL);
             }
+            intent_acp::sweep_escaped_descendants(&descendants).await;
             return;
         }
     }

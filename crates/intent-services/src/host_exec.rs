@@ -363,11 +363,15 @@ pub async fn run(
         match tokio::time::timeout(Duration::from_millis(ms), wait_fut).await {
             Ok((out, err, status)) => (out, err, status, false),
             Err(_) => {
-                // Reap the whole process group: SIGTERM → grace → SIGKILL. On
-                // non-unix `kill_on_drop` will still reap the direct child when
-                // `child` is dropped by the returned future's scope.
+                // Reap the whole process group: SIGTERM → grace → SIGKILL,
+                // plus a snapshot-before-kill descendant sweep for anything
+                // that escaped into its own process group
+                // (`intent_acp::descendant_sweep`). On non-unix `kill_on_drop`
+                // will still reap the direct child when `child` is dropped by
+                // the returned future's scope.
                 #[cfg(unix)]
                 if let Some(pid) = pid {
+                    let descendants = intent_acp::descendant_pids(pid).await;
                     kill_group(pid, nix::sys::signal::Signal::SIGTERM);
                     tokio::time::sleep(TERM_GRACE).await;
                     if matches!(child.try_wait(), Ok(Some(_))) {
@@ -375,6 +379,7 @@ pub async fn run(
                     } else {
                         kill_group(pid, nix::sys::signal::Signal::SIGKILL);
                     }
+                    intent_acp::sweep_escaped_descendants(&descendants).await;
                 }
                 #[cfg(not(unix))]
                 let _ = pid;

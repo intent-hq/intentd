@@ -190,8 +190,15 @@ impl SpawnedAgent {
     /// child is its own group leader (`process_group(0)` in [`build_command`]),
     /// so `killpg` terminates grandchildren a bare `kill()` would orphan (the
     /// direct child is reaped via `wait()` below; grandchildren are reaped by
-    /// init).
+    /// init). Descendants that escaped into their OWN process groups survive
+    /// the `killpg`, so they are snapshotted before the kill and swept
+    /// afterwards ([`crate::descendant_sweep`]).
     pub async fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        let descendants = match self.child.id() {
+            Some(pid) => crate::descendant_sweep::descendant_pids(pid).await,
+            None => Vec::new(),
+        };
         #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             use nix::sys::signal::{killpg, Signal};
@@ -207,7 +214,10 @@ impl SpawnedAgent {
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
             Err(e) => return Err(e),
         }
-        self.child.wait().await.map(|_| ())
+        let result = self.child.wait().await.map(|_| ());
+        #[cfg(unix)]
+        crate::descendant_sweep::sweep_escaped_descendants(&descendants).await;
+        result
     }
 
     /// Decompose into the child and connection (e.g. to store separately).
@@ -341,6 +351,88 @@ mod kill_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("grandchild pid {grandchild_pid} still alive after group kill");
+    }
+
+    /// Regression for the killpg-escape vector: an MCP-server-style grandchild
+    /// that moves into its OWN process group survives the group SIGKILL in
+    /// `kill()` (observed live: codex-acp's auggie ran with pgid == its own
+    /// pid); the descendant sweep must still reap it. The grandchild escapes
+    /// the group via `set -m` job control (background jobs become their own
+    /// group leaders).
+    #[tokio::test]
+    async fn kill_sweeps_grandchild_in_foreign_process_group() {
+        use nix::unistd::{getpgid, Pid};
+
+        let pidfile =
+            std::env::temp_dir().join(format!("intent-acp-sweep-{}.pid", uuid::Uuid::new_v4()));
+        let base = *intent_providers::find_provider("auggie").unwrap();
+        let provider = intent_providers::ProviderConfig {
+            command: "bash",
+            base_args: &[
+                "-c",
+                r#"set -m; sleep 300 & echo $! > "$INTENT_TEST_PIDFILE"; wait"#,
+            ],
+            model_flag: None,
+            rules_flag: None,
+            mcp_config_flag: None,
+            quiet_flag: None,
+            supports_mcp_config: false,
+            supports_rules_file: false,
+            ..base
+        };
+        let mut opts = SpawnOptions::new(&provider);
+        opts.extra_env.insert(
+            "INTENT_TEST_PIDFILE".to_string(),
+            pidfile.display().to_string(),
+        );
+        let mut agent =
+            spawn_provider(&opts, ConnectionHooks::default()).expect("spawn bash child");
+
+        let mut grandchild_pid = None;
+        for _ in 0..250 {
+            if let Ok(s) = tokio::fs::read_to_string(&pidfile).await {
+                if let Ok(pid) = s.trim().parse::<i32>() {
+                    grandchild_pid = Some(pid);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let grandchild_pid = grandchild_pid.expect("grandchild pid written");
+
+        // Prove the grandchild actually escaped the child's process group —
+        // otherwise killpg would reach it and the test would be vacuous.
+        let child_pid = agent.child_mut().id().expect("child pid");
+        let child_pgid = getpgid(Some(Pid::from_raw(child_pid as i32))).expect("child pgid");
+        let grandchild_pgid =
+            getpgid(Some(Pid::from_raw(grandchild_pid))).expect("grandchild pgid");
+        assert_ne!(
+            grandchild_pgid, child_pgid,
+            "grandchild must be in a foreign process group for this regression test"
+        );
+
+        // Distinct failure signal for the snapshot path: if `ps` stalls past
+        // its budget on a loaded runner the snapshot comes back empty and the
+        // sweep silently no-ops — fail here, not at the terminal panic below.
+        let snapshot = crate::descendant_sweep::descendant_pids(child_pid).await;
+        assert!(
+            snapshot.contains(&grandchild_pid),
+            "descendant snapshot {snapshot:?} must include grandchild {grandchild_pid} \
+             (empty/partial snapshot ⇒ `ps` walk failed, not the sweep)"
+        );
+
+        agent.kill().await.expect("kill agent");
+        tokio::fs::remove_file(&pidfile).await.ok();
+
+        // `kill(pid, 0)` returns ESRCH once the pid is gone (the grandchild
+        // is not our direct child, so init reaps it after the sweep's kill).
+        for _ in 0..100 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(grandchild_pid), None).is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild pid {grandchild_pid} still alive after kill() sweep");
     }
 }
 
