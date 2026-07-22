@@ -6,6 +6,7 @@ members = ["crates/*"]
 edition = "2021"
 rust-version = "1.79"
 repository = "https://github.com/intent-hq/intentd"
+homepage = "https://github.com/intent-hq/intentd"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
