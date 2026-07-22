@@ -1117,8 +1117,12 @@ impl SystemControl for DaemonControl {
 
         let (cpu_percent, memory_bytes) = self.proc_usage.load();
         // Derived transport surface: UDS always serves; `tcp`/`listenMode`
-        // reflect the live WSS listener state (runtime toggles included), so
+        // reflect the live TCP listener state (runtime toggles included), so
         // `listenMode` is `both` while the listener is up and `uds` otherwise.
+        // Under try_lock contention above `port` reads `None`, so a status
+        // call racing a listener start/stop may transiently report `uds` —
+        // matching the port/fingerprint/clients fallback, and self-correcting
+        // on the next call.
         let tcp = port.is_some();
         SystemStatus {
             listen_mode: if tcp { "both" } else { "uds" }.to_string(),

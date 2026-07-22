@@ -18,8 +18,9 @@ use crate::protocol::PROTOCOL_VERSION;
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
-    /// Derived listen mode: `both` while the WSS listener is up, else `uds`
-    /// (the UDS listener always serves).
+    /// Derived listen mode: `both` while the TCP listener (secure WSS, or
+    /// plain-ws under `--insecure`) is up, else `uds` (the UDS listener
+    /// always serves).
     pub listen_mode: String,
     /// Whether the UDS listener is active (always true in practice).
     pub uds: bool,
