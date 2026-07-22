@@ -27,6 +27,7 @@ use sqlx::Row;
 
 mod client;
 mod import;
+mod legacy_import;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -99,6 +100,22 @@ enum Command {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Import legacy per-directory Intent workspaces
+    /// (`<root>/<id>/.workspace/workspace.json`) into the SQLite store. Scans
+    /// `~/intent/workspaces`, `~/intent`, and `~/.workspaces` by default;
+    /// idempotent (ids already in the DB are skipped) and read-only toward the
+    /// source. The same module backs the automatic first-boot import in `serve`.
+    ImportLegacy {
+        /// Scan only this directory instead of the default legacy roots.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Print the per-workspace plan without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Update rows whose workspace id already exists instead of skipping.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print WSS pairing credentials (bearer token + TLS fingerprint); --rotate
     /// regenerates the token.
     Token {
@@ -149,6 +166,11 @@ async fn main() -> ExitCode {
         Command::Doctor => cmd_doctor().await,
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
+        Command::ImportLegacy {
+            root,
+            dry_run,
+            force,
+        } => to_exit(cmd_import_legacy(root.as_deref(), dry_run, force).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
         Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
         #[cfg(feature = "js-engine")]
@@ -294,6 +316,43 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let summary = import::run(&store, from).await?;
     println!("{summary}");
+    Ok(())
+}
+
+/// Import legacy per-directory Intent workspaces into the configured SQLite
+/// store. `--root` narrows the scan to one explicit directory (which must
+/// exist); otherwise the default legacy roots are scanned. A non-dry-run
+/// completion writes the first-boot marker so `serve` never re-imports.
+/// Per-workspace problems are soft (reported, exit 0); only an unusable
+/// explicit `--root` or a store-open failure exits non-zero.
+async fn cmd_import_legacy(root: Option<&Path>, dry_run: bool, force: bool) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let roots = match root {
+        Some(dir) => {
+            if !dir.is_dir() {
+                anyhow::bail!("--root is not a directory: {}", dir.display());
+            }
+            vec![dir.to_path_buf()]
+        }
+        None => legacy_import::default_roots(),
+    };
+    let store = Store::open(&config.db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let report = legacy_import::run(
+        &store,
+        &legacy_import::Options {
+            roots,
+            dry_run,
+            force,
+        },
+    )
+    .await?;
+    println!("{report}");
+    if !dry_run {
+        legacy_import::write_completion_marker(&store).await?;
+    }
     Ok(())
 }
 
@@ -458,9 +517,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
     let _pidfile = acquire_single_instance(&config).await?;
+    // Snapshot DB-file existence before `Store::open` creates it: the one-time
+    // legacy workspace import below fires only on a truly fresh database.
+    let db_existed = config.db_path.exists();
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // First-boot legacy workspace import: on a fresh DB with no completion
+    // marker, scan the legacy roots and import `.workspace/workspace.json`
+    // workspaces. Runs after migrations (inside `Store::open`) and before any
+    // transport serves RPCs; never fails startup.
+    legacy_import::maybe_import_on_first_boot(&store, db_existed, legacy_import::default_roots())
+        .await;
     // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
     // WAL growth when continuous readers hold long-lived transactions. Aborted
     // during shutdown before Store::close().
