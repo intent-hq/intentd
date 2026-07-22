@@ -456,17 +456,6 @@ impl ModelCatalogCache {
     ) -> Option<String> {
         self.negative_reason(provider_id, version_key, now_ms)
     }
-
-    /// Test-only fresh-entry observation (see [`Self::test_store`]).
-    #[cfg(test)]
-    pub(crate) fn test_fresh(
-        &self,
-        provider_id: &str,
-        version_key: &str,
-        now_ms: u64,
-    ) -> Option<Vec<Value>> {
-        self.fresh(provider_id, version_key, now_ms)
-    }
 }
 
 /// Read the persisted snapshot, discarding unreadable or version-mismatched
