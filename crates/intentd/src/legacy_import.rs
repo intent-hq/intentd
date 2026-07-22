@@ -15,16 +15,24 @@
 //! - `intentd import-legacy [--root <dir>] [--dry-run] [--force]`
 //!   (`cmd_import_legacy` in `main.rs`).
 //!
-//! Later per-workspace importers (notes, comments, agent transcripts) plug
-//! into [`import_workspace_extras`], which receives each imported workspace's
-//! legacy directory.
+//! Later per-workspace importers (comments, agent transcripts) plug into
+//! [`import_workspace_extras`], which receives each imported workspace's
+//! legacy directory. Notes import is implemented there: legacy
+//! `.workspace/notes/{id}.md` files (YAML frontmatter + markdown body) become
+//! `note` rows — `spec.md` lands as the well-known `spec` note, frontmatter
+//! `task:` maps to task metadata (`task_json`), and `parent` to `parent_id`.
+//! The `.meta/` sidecar (versions/CRDT/trash) is skipped entirely.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use intent_core::{now_iso, Error, Workspace};
+use intent_core::{
+    now_iso, ContentType, Error, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata,
+    Workspace,
+};
 use intent_store::Store;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 /// Settings-table marker written after a successful non-dry-run import so the
@@ -57,12 +65,30 @@ pub enum Outcome {
     Skipped(String),
 }
 
+/// Per-workspace note-import counters (part of [`WorkspaceReport`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoteCounts {
+    /// Note rows inserted.
+    pub imported: usize,
+    /// Note ids already present for the workspace (idempotent skip).
+    pub skipped: usize,
+    /// Files that could not be read or inserted (logged, never fatal).
+    pub failed: usize,
+}
+
+impl NoteCounts {
+    fn total(&self) -> usize {
+        self.imported + self.skipped + self.failed
+    }
+}
+
 /// Per-workspace line of the final report.
 #[derive(Debug, Clone)]
 pub struct WorkspaceReport {
     pub id: String,
     pub dir: PathBuf,
     pub outcome: Outcome,
+    pub notes: NoteCounts,
 }
 
 /// Full report of one run: one entry per candidate workspace directory.
@@ -85,6 +111,11 @@ impl Report {
         self.count(|o| matches!(o, Outcome::Skipped(_)))
     }
 
+    /// Total note rows inserted across all workspaces.
+    pub fn notes_imported(&self) -> usize {
+        self.entries.iter().map(|e| e.notes.imported).sum()
+    }
+
     fn count(&self, pred: impl Fn(&Outcome) -> bool) -> usize {
         self.entries.iter().filter(|e| pred(&e.outcome)).count()
     }
@@ -94,6 +125,7 @@ impl Report {
             id: id.into(),
             dir: dir.to_path_buf(),
             outcome: Outcome::Skipped(reason.into()),
+            notes: NoteCounts::default(),
         });
     }
 }
@@ -117,14 +149,29 @@ impl fmt::Display for Report {
                 Outcome::Updated => "updated (force)".to_string(),
                 Outcome::Skipped(reason) => format!("skipped: {reason}"),
             };
-            writeln!(f, "  {}  {} ({})", entry.id, outcome, entry.dir.display())?;
+            let notes = if entry.notes.total() > 0 {
+                format!(
+                    ", notes: {} imported, {} skipped, {} failed",
+                    entry.notes.imported, entry.notes.skipped, entry.notes.failed
+                )
+            } else {
+                String::new()
+            };
+            writeln!(
+                f,
+                "  {}  {}{notes} ({})",
+                entry.id,
+                outcome,
+                entry.dir.display()
+            )?;
         }
         write!(
             f,
-            "summary: {} imported, {} updated, {} skipped",
+            "summary: {} imported, {} updated, {} skipped, {} notes imported",
             self.imported(),
             self.updated(),
-            self.skipped()
+            self.skipped(),
+            self.notes_imported()
         )
     }
 }
@@ -267,25 +314,180 @@ async fn import_one(
         Err(e) => Outcome::Skipped(format!("lookup failed: {e}")),
     };
     let landed = matches!(outcome, Outcome::Imported | Outcome::Updated);
-    report.entries.push(WorkspaceReport {
+    let mut entry = WorkspaceReport {
         id,
         dir: dir.to_path_buf(),
         outcome,
-    });
+        notes: NoteCounts::default(),
+    };
     if landed && !opts.dry_run {
-        import_workspace_extras(store, &ws, dir, report).await;
+        import_workspace_extras(store, &ws, dir, &mut entry).await;
     }
+    report.entries.push(entry);
 }
 
-/// Extension seam for the follow-up importers (notes, comments, agent
-/// transcripts): called once per imported/updated workspace with its legacy
-/// directory (`<root>/<id>`, containing `.workspace/…`). Currently a no-op.
+/// Extension seam for the per-workspace importers: called once per
+/// imported/updated workspace with its legacy directory (`<root>/<id>`,
+/// containing `.workspace/…`). Currently imports notes; follow-ups (comments,
+/// agent transcripts) plug in here.
 async fn import_workspace_extras(
-    _store: &Store,
-    _workspace: &Workspace,
-    _legacy_dir: &Path,
-    _report: &mut Report,
+    store: &Store,
+    workspace: &Workspace,
+    legacy_dir: &Path,
+    entry: &mut WorkspaceReport,
 ) {
+    entry.notes = import_workspace_notes(store, workspace, legacy_dir).await;
+}
+
+/// Import legacy `.workspace/notes/*.md` files as note rows. Best-effort and
+/// idempotent: note ids already present for the workspace are skipped, every
+/// per-file problem is logged and counted as `failed` without ever failing the
+/// workspace. The `.meta/` sidecar (versions/CRDT/trash) and dotfiles are
+/// skipped entirely.
+async fn import_workspace_notes(
+    store: &Store,
+    workspace: &Workspace,
+    legacy_dir: &Path,
+) -> NoteCounts {
+    let mut counts = NoteCounts::default();
+    let notes_dir = legacy_dir.join(".workspace").join("notes");
+    let Ok(entries) = std::fs::read_dir(&notes_dir) else {
+        return counts; // no notes dir — nothing to import
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension().is_some_and(|ext| ext == "md")
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    files.sort();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy note unreadable; skipping");
+                counts.failed += 1;
+                continue;
+            }
+        };
+        let note = note_from_legacy_file(workspace, &stem, &text, &path);
+        match store.get_note(&workspace.id, &note.id).await {
+            Ok(_) => counts.skipped += 1,
+            Err(Error::NotFound(_)) => match store.insert_note(&note).await {
+                Ok(()) => counts.imported += 1,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note insert failed");
+                    counts.failed += 1;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(path = %path.display(), note_id = %note.id, error = %e, "legacy note lookup failed");
+                counts.failed += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Legacy note YAML frontmatter (the shape the Intent FE wrote to
+/// `.workspace/notes/{id}.md`). Unknown keys are ignored; `task` is kept as a
+/// raw YAML value so a malformed task block degrades to a plain note instead
+/// of failing the whole file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NoteFrontmatter {
+    id: Option<String>,
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    archived: bool,
+    visibility: Option<NoteVisibility>,
+    #[serde(alias = "parentId")]
+    parent: Option<String>,
+    created: Option<String>,
+    task: Option<serde_yaml::Value>,
+}
+
+/// Split `---\n<yaml>\n---\n<body>` frontmatter. Returns `(yaml, body)` or
+/// `None` when the text does not start with a frontmatter block.
+fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
+    let rest = text
+        .strip_prefix("---\r\n")
+        .or_else(|| text.strip_prefix("---\n"))?;
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            let yaml = &rest[..offset];
+            let body = &rest[offset + line.len()..];
+            let body = body
+                .strip_prefix("\r\n")
+                .or_else(|| body.strip_prefix('\n'))
+                .unwrap_or(body);
+            return Some((yaml, body));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Build a [`Note`] from one legacy note file. Best-effort: malformed or
+/// missing frontmatter degrades to importing the body (or the whole file) with
+/// a filename-derived title and defaults; a malformed `task:` block degrades
+/// to a plain note. `spec.md` (or frontmatter id `spec`) becomes the
+/// workspace's default spec note.
+fn note_from_legacy_file(workspace: &Workspace, stem: &str, text: &str, path: &Path) -> Note {
+    let (fm, body) = match split_frontmatter(text) {
+        Some((yaml, body)) => match serde_yaml::from_str::<NoteFrontmatter>(yaml) {
+            Ok(fm) => (fm, body),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy note frontmatter malformed; importing body with filename-derived title");
+                (NoteFrontmatter::default(), body)
+            }
+        },
+        None => (NoteFrontmatter::default(), text),
+    };
+    let id = fm
+        .id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| stem.to_string());
+    let task = fm.task.and_then(|v| {
+        match serde_yaml::from_value::<TaskMetadata>(v) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "legacy note task frontmatter malformed; importing as plain note");
+                None
+            }
+        }
+    });
+    let created_at = fm.created.unwrap_or_else(now_iso);
+    Note {
+        id: NoteId::from(id.clone()),
+        workspace_id: workspace.id.clone(),
+        title: fm.title.unwrap_or_else(|| stem.to_string()),
+        content: body.to_string(),
+        content_type: ContentType::Markdown,
+        tags: fm.tags,
+        is_pinned: fm.pinned,
+        is_archived: fm.archived,
+        is_default: id == "spec",
+        parent_id: fm.parent.filter(|s| !s.is_empty()).map(NoteId::from),
+        visibility: fm.visibility.unwrap_or_default(),
+        metadata: NoteMetadata { task },
+        created_at: created_at.clone(),
+        rev: 0,
+        updated_at: created_at,
+    }
 }
 
 /// Build a [`Workspace`] from a legacy `workspace.json` object: drop the
@@ -359,6 +561,7 @@ pub async fn maybe_import_on_first_boot(store: &Store, db_existed: bool, roots: 
             tracing::info!(
                 imported = report.imported(),
                 skipped = report.skipped(),
+                notes = report.notes_imported(),
                 "first-boot legacy workspace import complete"
             );
             for entry in &report.entries {
@@ -433,6 +636,13 @@ mod tests {
             dry_run: false,
             force: false,
         }
+    }
+
+    /// Write `<ws-dir>/.workspace/notes/<name>` with raw contents.
+    fn write_legacy_note(ws_dir: &Path, name: &str, contents: &str) {
+        let notes_dir = ws_dir.join(".workspace").join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join(name), contents).unwrap();
     }
 
     #[tokio::test]
@@ -650,6 +860,161 @@ mod tests {
 
         run(&store, &opts(vec![root.clone()])).await.unwrap();
         assert_eq!(std::fs::read(&manifest).unwrap(), before);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn imports_notes_with_frontmatter_spec_and_task() {
+        let root = temp_root("notes");
+        let ws_dir = write_legacy_workspace(&root, "ws-notes", json!({}));
+        write_legacy_note(
+            &ws_dir,
+            "spec.md",
+            "---\nid: spec\ntitle: Spec\ntags: [spec]\npinned: true\ncreated: \"2026-07-15T23:58:11.557Z\"\n---\n\n# The spec body\n",
+        );
+        write_legacy_note(
+            &ws_dir,
+            "task-1.md",
+            "---\nid: task-1\ntitle: Do the thing\ntags: [task]\narchived: true\nvisibility: private\nparent: spec\ncreated: \"2026-07-16T00:00:00.000Z\"\ntask:\n  status: in_progress\n  assignedAgentIds: [agent-1]\n  acceptanceCriteria:\n    - it works\n  peerOrder: 100\n---\n\nTask body\n",
+        );
+        // No frontmatter at all: whole file is the body, filename-derived title.
+        write_legacy_note(&ws_dir, "plain.md", "Just a body\n");
+        // The .meta sidecar (versions/CRDT/trash) must be skipped entirely.
+        let meta = ws_dir.join(".workspace").join("notes").join(".meta");
+        std::fs::create_dir_all(meta.join("versions")).unwrap();
+        std::fs::write(meta.join("versions").join("spec.jsonl"), "{}").unwrap();
+        // Non-markdown files are ignored.
+        write_legacy_note(&ws_dir, "scratch.txt", "not a note");
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        assert_eq!(report.imported(), 1, "{report}");
+        assert_eq!(report.notes_imported(), 3, "{report}");
+        assert_eq!(report.entries[0].notes.imported, 3, "{report}");
+        assert_eq!(report.entries[0].notes.failed, 0, "{report}");
+        assert!(report.to_string().contains("notes: 3 imported"), "{report}");
+
+        let ws_id = WorkspaceId::from("ws-notes");
+        assert_eq!(store.list_notes(&ws_id).await.unwrap().len(), 3);
+
+        let spec = store.get_note(&ws_id, &NoteId::from("spec")).await.unwrap();
+        assert_eq!(spec.title, "Spec");
+        assert!(spec.is_default);
+        assert!(spec.is_pinned);
+        assert_eq!(spec.tags, vec!["spec".to_string()]);
+        assert_eq!(spec.created_at, "2026-07-15T23:58:11.557Z");
+        assert_eq!(spec.content, "# The spec body\n");
+        assert_eq!(spec.visibility, NoteVisibility::Workspace);
+        assert!(spec.metadata.task.is_none());
+
+        let task = store
+            .get_note(&ws_id, &NoteId::from("task-1"))
+            .await
+            .unwrap();
+        assert_eq!(task.title, "Do the thing");
+        assert!(task.is_archived);
+        assert!(!task.is_default);
+        assert_eq!(task.visibility, NoteVisibility::Private);
+        assert_eq!(task.parent_id, Some(NoteId::from("spec")));
+        assert_eq!(task.content, "Task body\n");
+        let meta = task.metadata.task.expect("task metadata");
+        assert_eq!(meta.status, intent_core::TaskStatus::InProgress);
+        assert_eq!(meta.assigned_agent_ids, vec!["agent-1".into()]);
+        assert_eq!(meta.acceptance_criteria, vec!["it works".to_string()]);
+        assert_eq!(meta.peer_order, Some(100));
+
+        let plain = store
+            .get_note(&ws_id, &NoteId::from("plain"))
+            .await
+            .unwrap();
+        assert_eq!(plain.title, "plain");
+        assert_eq!(plain.content, "Just a body\n");
+        assert!(!plain.is_pinned);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_note_frontmatter_imports_body_best_effort() {
+        let root = temp_root("notes-malformed");
+        let ws_dir = write_legacy_workspace(&root, "ws-bad-notes", json!({}));
+        // Unparseable YAML between valid delimiters: body still lands, with a
+        // filename-derived title.
+        write_legacy_note(
+            &ws_dir,
+            "broken.md",
+            "---\ntitle: [unclosed\n  nope ::\n---\n\nSurviving body\n",
+        );
+        // Malformed task block inside otherwise-valid frontmatter: imports as
+        // a plain note, keeping the rest of the metadata.
+        write_legacy_note(
+            &ws_dir,
+            "bad-task.md",
+            "---\nid: bad-task\ntitle: Bad task\ntask: \"not a mapping\"\n---\n\nBody here\n",
+        );
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        assert_eq!(report.entries[0].notes.imported, 2, "{report}");
+        assert_eq!(report.entries[0].notes.failed, 0, "{report}");
+
+        let ws_id = WorkspaceId::from("ws-bad-notes");
+        let broken = store
+            .get_note(&ws_id, &NoteId::from("broken"))
+            .await
+            .unwrap();
+        assert_eq!(broken.title, "broken");
+        assert_eq!(broken.content, "Surviving body\n");
+
+        let bad_task = store
+            .get_note(&ws_id, &NoteId::from("bad-task"))
+            .await
+            .unwrap();
+        assert_eq!(bad_task.title, "Bad task");
+        assert_eq!(bad_task.content, "Body here\n");
+        assert!(bad_task.metadata.task.is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn notes_import_is_idempotent_per_note_id() {
+        let root = temp_root("notes-idem");
+        let ws_dir = write_legacy_workspace(&root, "ws-note-idem", json!({}));
+        write_legacy_note(
+            &ws_dir,
+            "spec.md",
+            "---\nid: spec\ntitle: Spec\n---\n\nOriginal spec\n",
+        );
+        let store = open_store().await;
+        run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        // Re-run with --force (workspace row updates, extras re-run): the
+        // existing note id is skipped, its content untouched.
+        write_legacy_note(
+            &ws_dir,
+            "spec.md",
+            "---\nid: spec\ntitle: Spec\n---\n\nRewritten spec\n",
+        );
+        write_legacy_note(&ws_dir, "extra.md", "---\nid: extra\n---\n\nNew note\n");
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                dry_run: false,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.entries[0].notes.imported, 1, "{report}");
+        assert_eq!(report.entries[0].notes.skipped, 1, "{report}");
+
+        let ws_id = WorkspaceId::from("ws-note-idem");
+        let spec = store.get_note(&ws_id, &NoteId::from("spec")).await.unwrap();
+        assert_eq!(spec.content, "Original spec\n");
+        assert_eq!(store.list_notes(&ws_id).await.unwrap().len(), 2);
 
         std::fs::remove_dir_all(&root).ok();
     }
