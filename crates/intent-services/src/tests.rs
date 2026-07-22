@@ -4923,6 +4923,14 @@ mod pr {
         /// When set, `list_repos` emits a two-page sequence driven by the opaque
         /// cursor, exercising the §5.5 multi-page round-trip end to end.
         paginate: bool,
+        /// When >0, `get_review_threads` emits this many single-thread pages
+        /// driven by a numeric cursor (unresolved thread `RT{n}` on page `n`),
+        /// exercising the exhaustive `pr.listReviewComments` fetch.
+        thread_pages: u64,
+        /// When >0, `list_review_comments` emits this many single-comment pages
+        /// driven by a numeric cursor (comment id `n` on page `n`, no reply
+        /// parent), exercising the multi-page REST fallback.
+        review_comment_pages: u64,
         head_seq: AtomicU64,
         /// Notified on the first `get_pr` call — the point at which
         /// `pr.waitForChanges` has finished its one SQLite read and is past it.
@@ -5194,8 +5202,30 @@ mod pr {
             &self,
             _: &RepoRef,
             _: u64,
-            _: PageParams,
+            page: PageParams,
         ) -> ScResult<Page<ReviewComment>> {
+            if self.review_comment_pages > 0 {
+                let n = page
+                    .cursor
+                    .as_deref()
+                    .and_then(|c| c.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let next_cursor = (n < self.review_comment_pages).then(|| (n + 1).to_string());
+                return Ok(Page {
+                    items: vec![ReviewComment {
+                        id: n,
+                        body: format!("nit {n}"),
+                        path: "a.rs".into(),
+                        line: Some(1),
+                        author: "rev".into(),
+                        created_at: "2026".into(),
+                        updated_at: "2026".into(),
+                        in_reply_to_id: None,
+                        url: "url".into(),
+                    }],
+                    next_cursor,
+                });
+            }
             Ok(Page {
                 items: vec![ReviewComment {
                     id: 5,
@@ -5234,10 +5264,33 @@ mod pr {
             &self,
             _: &RepoRef,
             _: u64,
-            _: PageParams,
+            page: PageParams,
         ) -> ScResult<Page<ReviewThread>> {
             if self.fail_threads {
                 return Err(ScError::Api("graphql down".into()));
+            }
+            if self.thread_pages > 0 {
+                let n = page
+                    .cursor
+                    .as_deref()
+                    .and_then(|c| c.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let next_cursor = (n < self.thread_pages).then(|| (n + 1).to_string());
+                return Ok(Page {
+                    items: vec![ReviewThread {
+                        id: format!("RT{n}"),
+                        is_resolved: false,
+                        comments: vec![ReviewThreadComment {
+                            id: format!("c{n}"),
+                            body: "x".into(),
+                            author: "rev".into(),
+                            path: "a.rs".into(),
+                            line: Some(1),
+                            created_at: "2026".into(),
+                        }],
+                    }],
+                    next_cursor,
+                });
             }
             Ok(Page {
                 items: vec![
@@ -5675,6 +5728,77 @@ mod pr {
         assert_eq!(v["threadCount"], 1);
         assert_eq!(v["threads"][0]["id"], "rest-thread-5");
         assert!(v["note"].is_string());
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_merges_thread_pages() {
+        // Threads spanning multiple GraphQL pages are merged into one reply
+        // with truthful pagination metadata.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                thread_pages: 3,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], false);
+        assert_eq!(v["threadCount"], 3);
+        assert_eq!(v["threads"][0]["id"], "RT1");
+        assert_eq!(v["threads"][2]["id"], "RT3");
+        assert_eq!(v["pagination"]["totalCount"], 3);
+        assert_eq!(v["pagination"]["pagesFetched"], 3);
+        assert_eq!(v["pagination"]["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_page_cap_reports_has_more() {
+        // More pages than the cap: the loop stops at REVIEW_FETCH_MAX_PAGES
+        // (10) and reports `hasMore: true`.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                thread_pages: 12,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], false);
+        assert_eq!(v["threadCount"], 10);
+        assert_eq!(v["pagination"]["totalCount"], 10);
+        assert_eq!(v["pagination"]["pagesFetched"], 10);
+        assert_eq!(v["pagination"]["hasMore"], true);
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_fallback_merges_pages() {
+        // REST fallback also drains all pages and reports honest metadata.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_threads: true,
+                review_comment_pages: 2,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], true);
+        assert_eq!(v["threadCount"], 2);
+        assert_eq!(v["pagination"]["totalFetched"], 2);
+        assert_eq!(v["pagination"]["pagesFetched"], 2);
+        assert_eq!(v["pagination"]["hasMore"], false);
     }
 
     #[tokio::test]

@@ -13088,16 +13088,8 @@ impl WorkspaceApi for Services {
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match sc
-                .get_review_threads(
-                    &repo_ref,
-                    number,
-                    intent_sourcecontrol::PageParams::first(100),
-                )
-                .await
-            {
-                Ok(page) => {
-                    let mut threads = page.items;
+            match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, number, p)).await {
+                Ok((mut threads, pages_fetched, has_more)) => {
                     let total = threads.len() as i64;
                     if status == "resolved" {
                         threads.retain(|t| t.is_resolved);
@@ -13112,21 +13104,16 @@ impl WorkspaceApi for Services {
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": false,
-                        "pagination": { "totalCount": total, "pagesFetched": 1, "hasMore": false },
+                        "pagination": { "totalCount": total, "pagesFetched": pages_fetched, "hasMore": has_more },
                         "filter": { "path": path, "status": status },
                         "note": serde_json::Value::Null,
                     }))
                 }
                 Err(_) => {
-                    let comments = sc
-                        .list_review_comments(
-                            &repo_ref,
-                            number,
-                            intent_sourcecontrol::PageParams::first(100),
-                        )
-                        .await
-                        .map_err(pr_ops::map_sc_err)?
-                        .items;
+                    let (comments, pages_fetched, has_more) =
+                        pr_ops::fetch_all_pages(|p| sc.list_review_comments(&repo_ref, number, p))
+                            .await
+                            .map_err(pr_ops::map_sc_err)?;
                     let total_fetched = comments.len() as i64;
                     let mut threads = pr_ops::fallback_threads(comments);
                     if let Some(p) = &path {
@@ -13146,7 +13133,7 @@ impl WorkspaceApi for Services {
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": true,
-                        "pagination": { "totalFetched": total_fetched, "pagesFetched": 1, "hasMore": false },
+                        "pagination": { "totalFetched": total_fetched, "pagesFetched": pages_fetched, "hasMore": has_more },
                         "filter": { "path": path, "status": status },
                         "note": note,
                     }))
