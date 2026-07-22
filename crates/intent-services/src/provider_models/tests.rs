@@ -591,6 +591,8 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 
     // kill_on_drop reaps the child when the timed-out output future drops:
     // signal `None` (sig 0) probes liveness without touching the process.
+    // (A recycled PID within the 5s window would false-positive the probe;
+    // accepted as vanishingly unlikely.)
     let pid: i32 = std::fs::read_to_string(&pid_file)
         .expect("fake CLI must have started")
         .trim()

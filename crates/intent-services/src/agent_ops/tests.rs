@@ -3190,6 +3190,35 @@ async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
 }
 
 #[tokio::test]
+async fn models_list_legacy_negative_window_with_last_good_serves_stale() {
+    // Unification consequence (documented): a non-forced read WITHIN the
+    // negative window that has an expired last-good entry serves it labeled
+    // stale + warning without re-probing — the old legacy path served the
+    // static catalog here.
+    let (_t, svc, _ws) = setup().await;
+    let sentinel = vec![json!({ "id": "nw", "name": "NW", "provider": "auggie" })];
+    svc.models_catalog.store("auggie", "", sentinel.clone(), 0);
+    let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
+    // Expired cache + failed probe arms the negative window.
+    let res = svc
+        .models_list_auggie_with(false, past_ttl, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch");
+    assert_eq!(res["stale"], true);
+    // Within the window: same stale last-good, no re-probe.
+    let res = svc
+        .models_list_auggie_with(false, past_ttl + 1, || {
+            panic!("must not re-fetch in negative window")
+        })
+        .await
+        .expect("negative-window read");
+    assert_eq!(res["models"], json!(sentinel));
+    assert_eq!(res["source"], "auggie");
+    assert_eq!(res["stale"], true);
+    assert!(res["warning"].is_string());
+}
+
+#[tokio::test]
 async fn models_list_legacy_expired_cache_failed_probe_serves_last_good_stale() {
     // Staleness fix from unifying on the generic cache: a NON-forced read
     // past the TTL whose probe fails serves the last-good list labeled
