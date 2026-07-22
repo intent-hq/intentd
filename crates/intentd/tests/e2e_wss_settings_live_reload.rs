@@ -71,10 +71,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -302,7 +303,7 @@ fn atomic_write(path: &Path, content: &str) {
     std::fs::rename(&tmp, path).expect("rename tmp over config.toml");
 }
 
-/// Boot `--listen both`, discover the WSS port + fingerprint via
+/// Boot with the WSS listener enabled, discover the WSS port + fingerprint via
 /// `system.status` over UDS, and return (daemon, rpc conn, subscriber conn)
 /// with the subscriber already subscribed to `settings:changed`.
 async fn boot_with_wss(data_dir: &Path) -> (Daemon, Wss, Wss) {
@@ -450,6 +451,15 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
 
     let (mut daemon, mut rpc, mut sub) = boot_with_wss(&data_dir).await;
 
+    // Capture the harness-seeded [server.wsApi] table (enabled + ephemeral
+    // port): every valid rewrite below must carry it unchanged so the WSS
+    // listener (and these connections) stays up across reloads.
+    let ws_api_block = {
+        let text = std::fs::read_to_string(&config_path).expect("read config.toml");
+        let idx = text.find("[server.wsApi]").expect("wsApi table seeded");
+        text[idx..].to_string()
+    };
+
     let get = wss_rpc(
         &mut rpc,
         10,
@@ -462,7 +472,10 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
 
     // Valid external edit (atomic tmp+rename) → live-reload: the watcher
     // emits settings:changed naming the changed key with the new value.
-    atomic_write(&config_path, "[workspace]\nbranchPrefix = \"after/\"\n");
+    atomic_write(
+        &config_path,
+        &format!("[workspace]\nbranchPrefix = \"after/\"\n\n{ws_api_block}"),
+    );
     let ev = next_settings_event(&mut sub, 15).await;
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()
@@ -509,7 +522,10 @@ async fn external_edit_live_reloads_and_invalid_edit_keeps_last_good() {
     );
 
     // Recovery: a subsequent valid edit applies and emits settings:changed.
-    atomic_write(&config_path, "[workspace]\nbranchPrefix = \"recovered/\"\n");
+    atomic_write(
+        &config_path,
+        &format!("[workspace]\nbranchPrefix = \"recovered/\"\n\n{ws_api_block}"),
+    );
     let ev = next_settings_event(&mut sub, 15).await;
     let changes = ev["params"]["event"]["data"]["changes"]
         .as_array()

@@ -30,15 +30,13 @@ fn temp_data_dir() -> PathBuf {
     dir
 }
 
-/// Spawn `intentd serve --listen uds` with the hermetic env seams plus `env`.
+/// Spawn `intentd serve` (UDS always serves) with the hermetic env seams plus `env`.
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg("uds")
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -160,11 +158,12 @@ async fn env_pins_beat_file_and_reject_wire_mutation() {
     assert!(ok_update.get("error").is_none(), "{ok_update}");
 }
 
-/// `--listen` pins `server.listenMode`: the wire reports the CLI value with
-/// origin `flag` even when the file claims otherwise, and mutation rejects
-/// naming `--listen`.
+/// `serve` no longer pins `server.listenMode` (the `--listen` flag is
+/// retired): a file-set value reads back with origin `file`, and the live
+/// `system.status` `listenMode` is derived from the actual listener state
+/// (UDS-only boot ⇒ `uds`) regardless of the file value.
 #[tokio::test]
-async fn listen_flag_pins_listen_mode() {
+async fn listen_mode_is_unpinned_and_status_reports_derived_mode() {
     let data_dir = temp_data_dir();
     std::fs::write(
         data_dir.join("config.toml"),
@@ -186,26 +185,15 @@ async fn listen_flag_pins_listen_mode() {
     .await;
     assert_eq!(
         get["result"]["value"],
-        json!("uds"),
-        "CLI beats file: {get}"
+        json!("both"),
+        "file value effective (no CLI pin): {get}"
     );
-    assert_eq!(get["result"]["origin"], json!("flag"), "{get}");
+    assert_eq!(get["result"]["origin"], json!("file"), "{get}");
 
-    let update = uds_rpc(
-        &socket,
-        2,
-        "settings.update",
-        json!({ "changes": [{ "path": "server.listenMode", "value": "tcp" }] }),
-    )
-    .await;
-    assert_eq!(update["error"]["code"], json!(-32602), "{update}");
-    assert!(
-        update["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("--listen"),
-        "rejection names --listen: {update}"
-    );
+    // system.status listenMode is derived from live listener state, not the
+    // setting: no WSS listener is up (server.wsApi.enabled=false), so `uds`.
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    assert_eq!(status["result"]["listenMode"], json!("uds"), "{status}");
 }
 
 /// One-time legacy import: a config.toml carrying the retired
@@ -312,7 +300,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
         let data_dir = temp_data_dir();
         std::fs::write(data_dir.join("config.toml"), body).expect("seed config.toml");
         let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args(["serve", "--listen", "uds"])
+            .args(["serve"])
             .env("INTENTD_DATA_DIR", &data_dir)
             .output()
             .expect("run intentd serve");
@@ -340,7 +328,7 @@ fn invalid_config_refuses_startup_with_key_in_error() {
 fn out_of_range_env_pin_refuses_startup() {
     let data_dir = temp_data_dir();
     let out = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["serve", "--listen", "uds"])
+        .args(["serve"])
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_TCP_PORT", "80")
         .output()
