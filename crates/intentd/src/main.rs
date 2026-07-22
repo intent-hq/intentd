@@ -2424,57 +2424,26 @@ async fn report_provider_availability() {
 }
 
 /// Best-effort authentication probe for an installed provider: run its
-/// `auth_check_args` with a short timeout and report auth status. Most
-/// providers signal auth via the exit code (0 ⇒ authenticated); grok's
-/// `models` probe exits 0 in both auth states, so its stdout is parsed for
-/// the explicit auth markers instead. Returns a trailing status fragment for
-/// the doctor line, or empty when no probe applies.
+/// `auth_check_args` via the shared CLI probe
+/// (`intent_services::provider_auth::check_provider_auth_cli` — the same
+/// implementation backing `host.providerAuthStatus`, so doctor and the RPC
+/// cannot drift). Returns a trailing status fragment for the doctor line, or
+/// empty when no probe applies.
 async fn check_provider_auth(
     provider_id: &str,
     program: &std::ffi::OsStr,
     auth_check_args: Option<&[&str]>,
 ) -> String {
+    use intent_services::provider_auth::{check_provider_auth_cli, CliAuthProbe};
     let Some(args) = auth_check_args else {
         return String::new();
     };
-    if provider_id == "grok" {
-        let run = tokio::process::Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output();
-        return match tokio::time::timeout(std::time::Duration::from_secs(8), run).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parsed = intent_providers::parse_grok_models_command_output(&stdout);
-                match (parsed.authenticated, parsed.models.is_empty()) {
-                    (Some(true), _) => " (authenticated)".to_string(),
-                    (Some(false), _) => " (not authenticated)".to_string(),
-                    // No explicit marker but a parsed model list ⇒ the CLI is
-                    // serving models, treat as authenticated.
-                    (None, false) => " (authenticated)".to_string(),
-                    // No markers, no models: distinguish a probe that ran but
-                    // said nothing from one that failed outright (broken
-                    // install exits non-zero with empty/garbage stdout).
-                    (None, true) if output.status.success() => " (auth status unknown)".to_string(),
-                    (None, true) => " (auth check failed)".to_string(),
-                }
-            }
-            Ok(Err(_)) => " (auth check failed)".to_string(),
-            Err(_) => " (auth check timed out)".to_string(),
-        };
-    }
-    let run = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match tokio::time::timeout(std::time::Duration::from_secs(8), run).await {
-        Ok(Ok(status)) if status.success() => " (authenticated)".to_string(),
-        Ok(Ok(_)) => " (not authenticated)".to_string(),
-        Ok(Err(_)) => " (auth check failed)".to_string(),
-        Err(_) => " (auth check timed out)".to_string(),
+    match check_provider_auth_cli(provider_id, program, args).await {
+        CliAuthProbe::Authenticated => " (authenticated)".to_string(),
+        CliAuthProbe::NotAuthenticated => " (not authenticated)".to_string(),
+        CliAuthProbe::StatusUnknown => " (auth status unknown)".to_string(),
+        CliAuthProbe::Failed => " (auth check failed)".to_string(),
+        CliAuthProbe::TimedOut => " (auth check timed out)".to_string(),
     }
 }
 

@@ -197,6 +197,10 @@ fn classify_matches_host_status_and_host_services() {
             .is_some()
     );
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 8, "method": "host.env" })).is_some());
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 9, "method": "host.providerAuthStatus" }))
+            .is_some()
+    );
     // `host.openExternal` (FE-served reverse RPC) / wrong version / bad id fall through.
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "host.openExternal" })).is_none()
@@ -423,6 +427,63 @@ async fn handle_env_returns_path_and_var_names() {
     assert!(parsed["result"]["pathEntries"].is_array());
     assert!(parsed["result"]["enhancedPath"].is_string());
     assert!(parsed["result"]["varNames"].is_array());
+}
+
+#[tokio::test]
+async fn handle_provider_auth_status_unknown_provider_is_invalid_params() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 24,
+        "method": "host.providerAuthStatus",
+        "params": { "providerId": "not-a-provider" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("unknown provider produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 24);
+    assert_eq!(parsed["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn handle_provider_auth_status_rejects_non_string_provider_id() {
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 25,
+        "method": "host.providerAuthStatus",
+        "params": { "providerId": 42 }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("non-string providerId produces an error frame");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 25);
+    assert_eq!(parsed["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn handle_provider_auth_status_scoped_to_grok_returns_one_entry() {
+    // grok's install gate is a pure filesystem check; on hosts without grok
+    // the probe never spawns and `authenticated` is null — the shape holds
+    // either way, keeping the test hermetic.
+    let req = classify(&json!({
+        "jsonrpc": "2.0",
+        "id": 26,
+        "method": "host.providerAuthStatus",
+        "params": { "providerId": "grok" }
+    }))
+    .unwrap();
+    let frame = handle(req, &NoopApi, None, true, &idle_reverse())
+        .await
+        .expect("providerAuthStatus always replies");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 26);
+    let providers = parsed["result"]["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0]["id"], "grok");
+    assert!(providers[0]["authenticated"].is_boolean() || providers[0]["authenticated"].is_null());
 }
 
 #[tokio::test]

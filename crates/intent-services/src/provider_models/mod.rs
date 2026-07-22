@@ -238,6 +238,53 @@ pub async fn fetch_droid_models() -> ProviderModelsFetch {
     }
 }
 
+/// droid auth probe (`host.providerAuthStatus`): the same ACP probe as
+/// [`fetch_droid_models`], mapped to auth semantics (parity with the FE
+/// `checkDroidReady`) — a non-empty model list ⇒ authenticated, an explicit
+/// auth-required error ⇒ not authenticated, anything else (timeout, spawn
+/// failure, empty catalog) ⇒ unknown. The caller gates on the `droid` binary
+/// being installed.
+pub async fn probe_droid_auth() -> Option<bool> {
+    let bin = find_provider_binary("droid", "droid", None)?;
+    let args = vec![
+        "exec".to_string(),
+        "--output-format".to_string(),
+        "acp".to_string(),
+    ];
+    let outcome = run_acp_probe(AcpProbeCommand::binary(bin, args), |v| {
+        parse::parse_acp_models(v, "droid")
+    })
+    .await;
+    match outcome {
+        Ok(models) if !models.is_empty() => Some(true),
+        Ok(_) => None,
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
+/// pi auth probe (`host.providerAuthStatus`): the same pinned-adapter ACP
+/// probe as [`fetch_pi_models`], mapped to auth semantics — a non-empty
+/// model list ⇒ authenticated; an empty list or an explicit auth-required
+/// error ⇒ not authenticated (pi's adapter serves only credentialed models);
+/// spawn failure / timeout / transport error ⇒ unknown. The caller gates on
+/// the `pi` CLI being installed.
+pub async fn probe_pi_auth() -> Option<bool> {
+    let npx = find_npx()?;
+    let cmd = AcpProbeCommand::npx(npx, PI_ACP_NPX_PACKAGE);
+    let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "pi")).await;
+    match outcome {
+        Ok(models) if !models.is_empty() => Some(true),
+        Ok(_) | Err(ProbeError::Empty) => Some(false),
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
 /// opencode: native CLI — run `opencode models` and parse one
 /// `provider/model` per line (parity with the FE `opencode.ipc.ts`, which
 /// routes the same command through `host.exec`).

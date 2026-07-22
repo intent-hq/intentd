@@ -217,12 +217,28 @@ async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    wss_rpc_with_timeout(ws, id, method, params, Duration::from_secs(15)).await
+}
+
+/// [`wss_rpc`] with a caller-chosen deadline, for methods whose legitimate
+/// worst case exceeds the default 15s (e.g. `host.providerAuthStatus` on a
+/// host with providers installed — each probe carries its own budget).
+async fn wss_rpc_with_timeout<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    method: &str,
+    params: Value,
+    deadline: Duration,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(frame.to_string()))
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(deadline, ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
@@ -441,6 +457,89 @@ async fn host_app_detection_services_over_wss() {
             );
         }
     }
+}
+
+/// host.providerAuthStatus over the real WSS wire: full sweep, scoped call,
+/// and the unknown-provider invalid-params error (PROTOCOL §9).
+#[tokio::test]
+async fn host_provider_auth_status_over_wss() {
+    let (_daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Full sweep: every probe-able provider appears exactly once, in order,
+    // with `authenticated: true | false | null`. On a host without providers
+    // every entry short-circuits to null without probing; with providers
+    // installed the parallel probes are bounded by their own budgets, so give
+    // the sweep a generous overall deadline.
+    let result = wss_rpc_with_timeout(
+        &mut ws,
+        300,
+        "host.providerAuthStatus",
+        json!({}),
+        Duration::from_secs(120),
+    )
+    .await;
+    let providers = result["providers"].as_array().expect("providers array");
+    let expected_ids = [
+        "auggie",
+        "claude-code",
+        "codex",
+        "opencode",
+        "droid",
+        "grok",
+        "pi",
+    ];
+    assert_eq!(
+        providers.len(),
+        expected_ids.len(),
+        "one entry per probe-able provider: {result}"
+    );
+    for (entry, expected_id) in providers.iter().zip(expected_ids) {
+        assert_eq!(
+            entry["id"], expected_id,
+            "response order is fixed: {result}"
+        );
+        assert!(
+            entry["authenticated"].is_boolean() || entry["authenticated"].is_null(),
+            "authenticated is true|false|null: {entry}"
+        );
+    }
+
+    // Scoped call: `providerId` narrows the sweep to one provider. This also
+    // exercises the cache — the sweep above already probed (or skipped) grok,
+    // so this read is served without a fresh probe.
+    let scoped = wss_rpc(
+        &mut ws,
+        301,
+        "host.providerAuthStatus",
+        json!({ "providerId": "grok" }),
+    )
+    .await;
+    let scoped_providers = scoped["providers"].as_array().expect("providers array");
+    assert_eq!(
+        scoped_providers.len(),
+        1,
+        "scoped to one provider: {scoped}"
+    );
+    assert_eq!(scoped_providers[0]["id"], "grok");
+    assert!(
+        scoped_providers[0]["authenticated"].is_boolean()
+            || scoped_providers[0]["authenticated"].is_null()
+    );
+
+    // Unknown providerId ⇒ -32602 invalid params (PROTOCOL §9).
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": 302,
+        "method": "host.providerAuthStatus",
+        "params": { "providerId": "not-a-provider" }
+    });
+    ws.send(Message::Text(frame.to_string())).await.unwrap();
+    let err = wss_expect_error(&mut ws, 302).await;
+    assert_eq!(
+        err["error"]["code"], -32602,
+        "unknown providerId ⇒ -32602: {err}"
+    );
 }
 
 /// Seed one workspace with a filesystem root so `host.exec` can enforce the
