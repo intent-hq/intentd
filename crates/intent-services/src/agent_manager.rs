@@ -1019,18 +1019,12 @@ impl AgentManager {
         }
 
         // Reconstruct the spawn options with the generated config path injected.
-        let mut spawn_opts = SpawnOptions::new(opts.provider);
-        spawn_opts.model = opts.model;
-        spawn_opts.cwd = opts.cwd;
-        spawn_opts.rules_file = opts.rules_file.or(rules_file_path.as_deref());
-        spawn_opts.quiet = opts.quiet;
-        spawn_opts.provider_binary = opts.provider_binary;
-        spawn_opts.extra_env = opts.extra_env.clone();
-        spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
-        if let Some(ref p) = mcp_config_path {
-            spawn_opts.mcp_config_file = Some(p.as_str());
-        }
-        spawn_opts.env_mcp_config = env_mcp_config.as_deref();
+        let spawn_opts = rebuild_spawn_opts(
+            opts,
+            rules_file_path.as_deref(),
+            mcp_config_path.as_deref(),
+            env_mcp_config.as_deref(),
+        );
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
@@ -3918,6 +3912,33 @@ fn resolve_npx_only(
     Ok((npx, pkg))
 }
 
+/// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
+/// generated rules/MCP config paths while preserving every other field of the
+/// incoming opts. Notably the npx fallback pair must survive: dropping it
+/// makes `build_command` fall back to the bare provider command and fail with
+/// ENOENT when no local provider binary exists (codex fallback / claude-code
+/// npx-only spawns).
+fn rebuild_spawn_opts<'a>(
+    opts: &SpawnOptions<'a>,
+    rules_file_path: Option<&'a str>,
+    mcp_config_path: Option<&'a str>,
+    env_mcp_config: Option<&'a str>,
+) -> SpawnOptions<'a> {
+    let mut spawn_opts = SpawnOptions::new(opts.provider);
+    spawn_opts.model = opts.model;
+    spawn_opts.cwd = opts.cwd;
+    spawn_opts.rules_file = opts.rules_file.or(rules_file_path);
+    spawn_opts.quiet = opts.quiet;
+    spawn_opts.provider_binary = opts.provider_binary;
+    spawn_opts.npx_fallback_binary = opts.npx_fallback_binary;
+    spawn_opts.npx_fallback_package = opts.npx_fallback_package;
+    spawn_opts.extra_env = opts.extra_env.clone();
+    spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
+    spawn_opts.mcp_config_file = mcp_config_path;
+    spawn_opts.env_mcp_config = env_mcp_config;
+    spawn_opts
+}
+
 /// Read the provider path from the `providers.paths` map setting, if set.
 fn read_provider_path_setting(
     settings: &intent_core::settings_file::SettingsFile,
@@ -5153,6 +5174,76 @@ mod role_reminder_tests {
             text.starts_with("<system>\nSP\n</system>\n\nContext:\nctx\n\n---\n\n[Role Reminder:"),
             "unexpected ordering: {text:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rebuild_spawn_opts_tests {
+    //! Regression tests for the `create_agent` [`SpawnOptions`] reconstruction:
+    //! it must preserve the npx fallback pair, otherwise providers without a
+    //! local binary (codex fallback / claude-code npx-only) spawn the bare
+    //! provider command and fail with ENOENT.
+
+    use super::*;
+
+    #[test]
+    fn rebuild_preserves_npx_fallback_and_targets_npx() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
+        assert_eq!(rebuilt.npx_fallback_binary, Some(npx_path.as_path()));
+        assert_eq!(rebuilt.npx_fallback_package, provider.fallback_npx_package);
+
+        // Through build_command/build_args: the rebuilt opts must spawn npx
+        // with `-y <package>`, not the bare `codex-acp` command.
+        let cmd = intent_acp::spawn::build_command(&rebuilt);
+        assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
+        let args = intent_acp::spawn::build_args(&rebuilt);
+        assert_eq!(args[0], "-y");
+        assert_eq!(
+            args[1],
+            provider
+                .fallback_npx_package
+                .expect("codex has npx fallback")
+        );
+    }
+
+    #[test]
+    fn rebuild_injects_generated_paths_and_keeps_caller_fields() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let binary = PathBuf::from("/custom/codex-acp");
+        let cwd = PathBuf::from("/work/dir");
+        let mut opts = SpawnOptions::new(provider);
+        opts.model = Some("gpt-5");
+        opts.cwd = Some(&cwd);
+        opts.quiet = true;
+        opts.provider_binary = Some(&binary);
+        opts.extra_env = BTreeMap::from([("K".to_string(), "V".to_string())]);
+        opts.tools_to_remove = vec!["shell"];
+
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/rules.md"), Some("/tmp/mcp.json"), None);
+        assert_eq!(rebuilt.model, Some("gpt-5"));
+        assert_eq!(rebuilt.cwd, Some(cwd.as_path()));
+        assert!(rebuilt.quiet);
+        assert_eq!(rebuilt.provider_binary, Some(binary.as_path()));
+        assert_eq!(rebuilt.extra_env, opts.extra_env);
+        assert_eq!(rebuilt.tools_to_remove, vec!["shell"]);
+        assert_eq!(rebuilt.rules_file, Some("/tmp/rules.md"));
+        assert_eq!(rebuilt.mcp_config_file, Some("/tmp/mcp.json"));
+        assert_eq!(rebuilt.env_mcp_config, None);
+    }
+
+    #[test]
+    fn rebuild_prefers_caller_rules_file_over_generated() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        opts.rules_file = Some("/caller/rules.md");
+        let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/generated.md"), None, None);
+        assert_eq!(rebuilt.rules_file, Some("/caller/rules.md"));
     }
 }
 
