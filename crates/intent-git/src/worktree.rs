@@ -205,21 +205,7 @@ pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<
             wt.prune(Some(&mut opts)).map_err(map_git_err)?;
         }
     }
-    let trash = if worktree_path.exists() {
-        let candidate = detached_trash_path(worktree_path);
-        match std::fs::rename(worktree_path, &candidate) {
-            Ok(()) => Some(candidate),
-            // Rename fallback: remove in place, mirroring the original
-            // `fs.rm(worktreePath, { recursive, force })` manual fallback.
-            Err(_) => {
-                std::fs::remove_dir_all(worktree_path)
-                    .map_err(|e| Error::Internal(format!("cannot remove worktree dir: {e}")))?;
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let trash = rename_worktree_to_trash(worktree_path)?;
     // Best-effort `git worktree prune` of whatever else went stale.
     if let Ok(names) = repo.worktrees() {
         for i in 0..names.len() {
@@ -244,6 +230,39 @@ pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
         Err(e) => Err(Error::Internal(format!(
             "cannot remove detached worktree dir: {e}"
         ))),
+    }
+}
+
+/// Rename `worktree_path` to a unique sibling trash path, returning the path
+/// awaiting recursive removal. Race-tolerant: a source that vanished between
+/// the probe and the rename is idempotent success (`None`), a trash-candidate
+/// collision retries with a fresh nonce, and any other rename failure (e.g.
+/// cross-device) falls back to an in-place recursive removal — mirroring the
+/// original `fs.rm(worktreePath, { recursive, force })` — where `NotFound` is
+/// also treated as already gone.
+fn rename_worktree_to_trash(worktree_path: &Path) -> Result<Option<PathBuf>> {
+    use std::io::ErrorKind;
+    if !worktree_path.exists() {
+        return Ok(None);
+    }
+    for _ in 0..8 {
+        let candidate = detached_trash_path(worktree_path);
+        match std::fs::rename(worktree_path, &candidate) {
+            Ok(()) => return Ok(Some(candidate)),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            // Trash-candidate collision (`EEXIST` / `ENOTEMPTY`; the latter has
+            // no stable `ErrorKind` on our MSRV, so probe the candidate): retry
+            // with a fresh nonce.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists || candidate.exists() => {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    match std::fs::remove_dir_all(worktree_path) {
+        Ok(()) => Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Internal(format!("cannot remove worktree dir: {e}"))),
     }
 }
 

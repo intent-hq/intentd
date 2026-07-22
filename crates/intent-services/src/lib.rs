@@ -3797,7 +3797,7 @@ fn cleanup_workspace_worktree_locked(
             tracing::warn!(
                 error = %e,
                 worktree = %worktree.display(),
-                "failed to remove git worktree"
+                "failed to detach git worktree"
             );
             None
         }
