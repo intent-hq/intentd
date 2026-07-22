@@ -1772,21 +1772,31 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("intentd-settings-hang-{}.db", uuid::Uuid::new_v4()));
         let store = Store::open(&tmp).await.expect("open store");
+        // Compressed load budget (`with_timings`) so the timeout path runs in
+        // milliseconds instead of the production 3s default.
+        let load_timeout = Duration::from_millis(100);
         // Hang for well over the per-op budget so a naive implementation would
-        // stall for `N_sensitive * hang_for` seconds and blow past the test's
-        // outer timeout.
+        // stall for `N_sensitive * hang_for` and blow past the test's outer
+        // timeout — but short enough that the blocking-pool shutdown at
+        // end-of-test doesn't hold up the whole test binary.
         let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_secs(30),
+            hang_for: Duration::from_millis(750),
         });
-        let secrets = AsyncSecretStore::new(secrets);
+        let secrets = AsyncSecretStore::with_timings(
+            secrets,
+            load_timeout,
+            DEFAULT_WRITE_TIMEOUT,
+            DEFAULT_CACHE_TTL,
+            DEFAULT_WARN_INTERVAL,
+        );
         let svc = SettingsService::new(&store, &secrets, None);
 
         let started = std::time::Instant::now();
         // Outer cap: single-flight + TTL cache in AsyncSecretStore bounds the
-        // total latency to ONE keychain budget — well under the 30-second
-        // per-call stall the store models. A small slack absorbs task-spawn
+        // total latency to ONE keychain budget — well under the per-call
+        // stall the store models. A generous slack absorbs task-spawn
         // overhead on cold runners.
-        let cap = DEFAULT_LOAD_TIMEOUT + Duration::from_secs(2);
+        let cap = load_timeout + Duration::from_secs(2);
         let list = timeout(cap, svc.list())
             .await
             .expect("settings.list must not hang when the keychain stalls")
@@ -1832,16 +1842,27 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let store = Store::open(&tmp).await.expect("open store");
+        // Compressed write budget (`with_timings`) so the timeout path runs
+        // in milliseconds instead of the production 10s default; the stall
+        // stays well over the budget but short enough that the blocking-pool
+        // shutdown at end-of-test doesn't hold up the whole test binary.
+        let write_timeout = Duration::from_millis(150);
         let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_secs(30),
+            hang_for: Duration::from_millis(750),
         });
-        let secrets = AsyncSecretStore::new(secrets);
+        let secrets = AsyncSecretStore::with_timings(
+            secrets,
+            DEFAULT_LOAD_TIMEOUT,
+            write_timeout,
+            DEFAULT_CACHE_TTL,
+            DEFAULT_WARN_INTERVAL,
+        );
         let svc = SettingsService::new(&store, &secrets, None);
 
         let started = std::time::Instant::now();
-        // AsyncSecretStore's write budget is DEFAULT_WRITE_TIMEOUT; use it plus
-        // a small slack so the assertion measures the bounded write path.
-        let cap = DEFAULT_WRITE_TIMEOUT + Duration::from_secs(2);
+        // AsyncSecretStore's write budget is `write_timeout`; use it plus a
+        // small slack so the assertion measures the bounded write path.
+        let cap = write_timeout + Duration::from_secs(2);
         let err = timeout(
             cap,
             svc.update(&json!([{ "path": "linear.token", "value": "irrelevant" }])),

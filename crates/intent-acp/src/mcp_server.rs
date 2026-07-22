@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
@@ -39,6 +40,10 @@ pub struct WorkspaceMcpServer {
     /// the base tool description (which omits most `ws.app.*`) and the chief
     /// variant (which advertises the full `ws.app.*` surface).
     is_chief: bool,
+    /// Wall-clock budget for one `workspace_api` invocation. Production keeps
+    /// the 30s default; tests compress it so timeout-path coverage completes
+    /// in milliseconds.
+    workspace_api_timeout: Duration,
 }
 
 impl WorkspaceMcpServer {
@@ -53,6 +58,7 @@ impl WorkspaceMcpServer {
             version: env!("CARGO_PKG_VERSION").to_string(),
             caller_agent_id: None,
             is_chief,
+            workspace_api_timeout: dispatch::WORKSPACE_API_TIMEOUT,
         }
     }
 
@@ -87,6 +93,14 @@ impl WorkspaceMcpServer {
     /// point). Caller-aware tools attribute their actions to this id.
     pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
         self.caller_agent_id = caller;
+        self
+    }
+
+    /// Override the wall-clock budget for one `workspace_api` invocation
+    /// (testing) — compresses the 30s production default so timeout-path
+    /// tests finish in milliseconds.
+    pub fn with_workspace_api_timeout(mut self, timeout: Duration) -> Self {
+        self.workspace_api_timeout = timeout;
         self
     }
 
