@@ -454,34 +454,30 @@ where
 
 /// Resolve the auggie binary for daemon-side CLI fetches: the explicit
 /// override (the [`crate::Services::with_auggie_bin`] test seam) wins, else
-/// canonical discovery ([`intent_context::discovery::find_auggie`] — the
-/// Intent-managed binary, then the enhanced-PATH scan) so a packaged app
-/// with a minimal process PATH still finds the CLI. Returns `None` when
-/// discovery fails, so callers keep their static/transcript fallbacks.
+/// canonical discovery ([`intent_context::discovery::find_auggie`] —
+/// auggie's own managed install (`~/.augment/bin`) first, then the
+/// enhanced-PATH scan) so a packaged app with a minimal process PATH still
+/// finds the CLI. Returns `None` when discovery fails, so callers keep
+/// their static/transcript fallbacks.
 fn resolve_auggie_bin(auggie_bin: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
     resolve_auggie_bin_with(auggie_bin, intent_context::discovery::find_auggie)
 }
 
 /// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
 /// stdout (then stderr), and map to wire models. Returns `Ok(None)` when the
-/// CLI is unavailable or yields nothing, so the caller can fall back to
-/// [`static_models`]. The binary comes from [`resolve_auggie_bin`] and runs
-/// with the exec PATH (`intent_context::discovery::exec_path`) so its
-/// co-located `node` resolves in a packaged-app environment.
+/// CLI is unavailable, hangs past [`AUGGIE_MODELS_TIMEOUT`], or yields
+/// nothing, so the caller can fall back to [`static_models`]. The binary
+/// comes from [`resolve_auggie_bin`] and runs via [`auggie_output`] (bounded,
+/// exec PATH) so its co-located `node` resolves in a packaged-app
+/// environment.
 pub(crate) async fn fetch_auggie_models(
     auggie_bin: Option<std::path::PathBuf>,
 ) -> Result<Option<Vec<Value>>> {
     let Some(auggie) = resolve_auggie_bin(auggie_bin) else {
         return Ok(None);
     };
-    let output = match tokio::process::Command::new(&auggie)
-        .args(["model", "list"])
-        .env("PATH", intent_context::discovery::exec_path(&auggie))
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => return Ok(None),
+    let Some(output) = auggie_output(&auggie, &["model", "list"]).await else {
+        return Ok(None);
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut parsed = parse_model_list_output(&stdout);
@@ -604,11 +600,11 @@ pub(crate) fn finalize_model_rows(rows: Vec<Value>) -> Vec<Value> {
     kept
 }
 
-/// Upper bound on one auggie CLI model-list invocation. The fetch is
-/// single-flighted, so a wedged CLI (e.g. blocked on a TTY prompt) would
-/// otherwise stall every `models.list` caller — including `forceRefresh` —
-/// daemon-wide instead of just its own. Matches the bounded ACP
-/// (15s overall) and opencode (10s) probe sources.
+/// Upper bound on one auggie CLI invocation (model list / session stats).
+/// The models fetch is single-flighted, so a wedged CLI (e.g. blocked on a
+/// TTY prompt) would otherwise stall every `models.list` caller — including
+/// `forceRefresh` — daemon-wide instead of just its own. Matches the bounded
+/// ACP (15s overall) and opencode (10s) probe sources.
 const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// [`tokio::process::Command::output`] bounded by
@@ -700,22 +696,22 @@ pub(crate) fn parse_session_stats_output(stdout: &str) -> Option<SessionStats> {
 
 /// Best-effort `agent.getSessionStats` CLI refresh: run
 /// `auggie session stats <sessionId> --json` and parse stdout (then stderr).
-/// Returns `None` when the CLI is unavailable or emits nothing parseable, so the
-/// caller can fall back to transcript-derived counts with `creditsUsed = null`.
+/// Returns `None` when the CLI is unavailable, hangs past
+/// [`AUGGIE_MODELS_TIMEOUT`], or emits nothing parseable, so the caller can
+/// fall back to transcript-derived counts with `creditsUsed = null`.
 /// The binary comes from [`resolve_auggie_bin`] (`auggie_bin` is the
-/// [`crate::Services::with_auggie_bin`] test seam) and runs with the exec
-/// PATH so its co-located `node` resolves.
+/// [`crate::Services::with_auggie_bin`] test seam) and runs via
+/// [`auggie_output`] (bounded, exec PATH) so its co-located `node` resolves.
 pub(crate) async fn fetch_session_stats(
     auggie_bin: Option<std::path::PathBuf>,
     session_id: &AgentId,
 ) -> Option<SessionStats> {
     let auggie = resolve_auggie_bin(auggie_bin)?;
-    let output = tokio::process::Command::new(&auggie)
-        .args(["session", "stats", session_id.0.as_str(), "--json"])
-        .env("PATH", intent_context::discovery::exec_path(&auggie))
-        .output()
-        .await
-        .ok()?;
+    let output = auggie_output(
+        &auggie,
+        &["session", "stats", session_id.0.as_str(), "--json"],
+    )
+    .await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_session_stats_output(&stdout).or_else(|| {
         let stderr = String::from_utf8_lossy(&output.stderr);
