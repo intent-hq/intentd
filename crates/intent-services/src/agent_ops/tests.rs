@@ -2961,29 +2961,27 @@ fn resolve_auggie_bin_uses_discovery_when_seam_unset() {
 /// child's `$PATH` — the exec-path contract (`discovery::exec_path` prepends
 /// the binary's dir so its co-located `node` resolves). The temp dir is not
 /// on the process PATH, so the fetch only succeeds when the spawn sets the
-/// child's PATH explicitly.
+/// child's PATH explicitly. Returns the [`tempfile::TempDir`] guard alongside
+/// the binary path so the directory is cleaned up on drop.
 #[cfg(unix)]
-fn fake_path_gated_auggie(tag: &str, stdout: &str) -> PathBuf {
+fn fake_path_gated_auggie(stdout: &str) -> (tempfile::TempDir, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("intentd-agentops-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("auggie");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("auggie");
     let script = format!(
         "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{dir}:\"*) printf '%s' '{stdout}' ;;\n  *) exit 1 ;;\nesac\n",
-        dir = dir.display(),
+        dir = dir.path().display(),
     );
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin
+    (dir, bin)
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn fetch_auggie_models_rich_child_path_includes_binary_dir() {
-    let bin = fake_path_gated_auggie(
-        "rich",
-        r#"{"models":[{"shortName":"m1","displayName":"M1"}]}"#,
-    );
+    let (_dir, bin) =
+        fake_path_gated_auggie(r#"{"models":[{"shortName":"m1","displayName":"M1"}]}"#);
     let rows = fetch_auggie_models_rich(Some(bin))
         .await
         .expect("dynamic rows when the child PATH carries the binary dir");
@@ -2995,7 +2993,7 @@ async fn fetch_auggie_models_rich_child_path_includes_binary_dir() {
 #[cfg(unix)]
 #[tokio::test]
 async fn fetch_auggie_models_child_path_includes_binary_dir() {
-    let bin = fake_path_gated_auggie("legacy", "- Sonnet 4.5 [sonnet4.5]");
+    let (_dir, bin) = fake_path_gated_auggie("- Sonnet 4.5 [sonnet4.5]");
     let models = fetch_auggie_models(Some(bin))
         .await
         .expect("no error")
@@ -3007,10 +3005,8 @@ async fn fetch_auggie_models_child_path_includes_binary_dir() {
 #[cfg(unix)]
 #[tokio::test]
 async fn fetch_session_stats_child_path_includes_binary_dir() {
-    let bin = fake_path_gated_auggie(
-        "stats",
-        r#"{"creditsUsed":1.5,"messageCount":2,"toolCount":3}"#,
-    );
+    let (_dir, bin) =
+        fake_path_gated_auggie(r#"{"creditsUsed":1.5,"messageCount":2,"toolCount":3}"#);
     let stats = fetch_session_stats(Some(bin), &AgentId::from("agent-x"))
         .await
         .expect("stats when the child PATH carries the binary dir");

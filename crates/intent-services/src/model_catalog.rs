@@ -69,9 +69,9 @@ fn no_version() -> String {
     String::new()
 }
 
-/// auggie source: the rich CLI fetch already backing `models.list` (PATH
-/// lookup — registry sources are plain fns with no `Services` handle for the
-/// `auggie_bin` test seam).
+/// auggie source: the rich CLI fetch already backing `models.list`
+/// (discovery via `resolve_auggie_bin` — registry sources are plain fns with
+/// no `Services` handle, so the `auggie_bin` test seam is unavailable here).
 fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
         match crate::agent_ops::fetch_auggie_models_rich(None).await {
