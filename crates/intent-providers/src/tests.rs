@@ -48,7 +48,7 @@ fn registry_field_parity() {
     assert_eq!(auggie.remove_tool_flag, Some("--remove-tool"));
     assert!(auggie.supports_authenticate && auggie.supports_set_mode);
     assert!(auggie.supports_mcp_config && auggie.supports_rules_file);
-    assert!(!auggie.can_be_disabled);
+    assert!(auggie.can_be_disabled);
     assert_eq!(auggie.login_command_hint, Some("auggie login"));
 
     let cc = find_provider("claude-code").unwrap();
@@ -770,6 +770,7 @@ fn disableable_and_always_enabled_partition_registry() {
     assert_eq!(
         disableable,
         vec![
+            "auggie",
             "claude-code",
             "codex",
             "cortex",
@@ -781,8 +782,9 @@ fn disableable_and_always_enabled_partition_registry() {
     );
     assert!(disableable_providers().iter().all(|p| p.can_be_disabled));
 
+    // Every provider — auggie included — is now disableable.
     let always: Vec<&str> = always_enabled_providers().iter().map(|p| p.id).collect();
-    assert_eq!(always, vec!["auggie"]);
+    assert!(always.is_empty());
     assert!(always_enabled_providers()
         .iter()
         .all(|p| !p.can_be_disabled));
