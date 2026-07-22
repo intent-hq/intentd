@@ -827,6 +827,19 @@ impl TerminalHost for PtyTermHost {
                 .wait(id)
                 .await
                 .map_err(|e| AcpError::Terminal(e.to_string()))?;
+            // The child's exit races the reader thread draining its final
+            // output into scrollback; give the drain a bounded window so a
+            // subsequent `terminal/output` sees the full text.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut last = pty.scrollback(id).unwrap_or_default();
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let cur = pty.scrollback(id).unwrap_or_default();
+                if (!cur.is_empty() && cur == last) || tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                last = cur;
+            }
             Ok(TerminalExitInfo {
                 exit_code: Some(exit.exit_code),
                 signal: None,

@@ -747,10 +747,12 @@ mod tests {
         let mut spec = SpawnSpec::new("scope-x", "sh");
         spec.args = vec!["-c".into(), "sleep 300 & echo $!; sleep 300".into()];
         let id = host.spawn(spec).unwrap();
-        let mut rx = host.attach(id).unwrap().live;
 
-        // Poll for the grandchild PID with retry to handle scheduling/output delays
-        // on loaded runners. Honor INTENTD_TEST_TIMEOUT_MULTIPLIER for coverage runs.
+        // Poll the scrollback snapshot for the grandchild PID rather than
+        // tailing a live receiver: the reader thread can capture the `echo $!`
+        // line before `attach()` subscribes, in which case the PID only ever
+        // exists in scrollback and a live tail would wait out the whole
+        // deadline. Honor INTENTD_TEST_TIMEOUT_MULTIPLIER for coverage runs.
         let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
@@ -759,18 +761,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10).mul_f64(multiplier);
 
         let grandchild: u32 = loop {
-            if Instant::now() >= deadline {
-                panic!("grandchild pid never printed within deadline");
-            }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .expect("deadline not yet reached");
-            let out = collect_until(&mut rx, b"\n", remaining).await;
-            let line = String::from_utf8_lossy(&out);
-            if let Some(pid) = line.split_whitespace().find_map(|t| t.parse().ok()) {
+            let out = host.scrollback(id).unwrap();
+            let text = String::from_utf8_lossy(&out);
+            if let Some(pid) = text.split_whitespace().find_map(|t| t.parse().ok()) {
                 break pid;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if Instant::now() >= deadline {
+                panic!("grandchild pid never printed within deadline; scrollback: {text:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
         assert!(pid_alive(grandchild), "grandchild alive before teardown");
