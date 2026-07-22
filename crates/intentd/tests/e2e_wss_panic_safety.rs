@@ -280,10 +280,11 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
 
     // Brief drain: no stray frame (e.g. from the step-2 notification) may
     // trail the final response. Loop for the full window, skipping Ping/Pong,
-    // so a heartbeat can't mask a trailing Text frame.
+    // so a heartbeat can't mask a trailing Text frame. `timeout_at` keeps the
+    // fixed deadline without computing a (potentially negative) remainder.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     loop {
-        match timeout(deadline - tokio::time::Instant::now(), ws.next()).await {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => break,
             Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
             Ok(other) => panic!("unexpected trailing frame: {other:?}"),
