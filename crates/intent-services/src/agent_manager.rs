@@ -1386,8 +1386,9 @@ impl AgentManager {
             .collect();
 
         // The persisted model (bare part of a compound id) feeds the
-        // post-session `session/set_model` for providers with no CLI model
-        // flag (grok) — see `maybe_apply_session_model`.
+        // post-session model application for providers with no CLI model
+        // flag — `session/set_model` (grok) or `session/set_config_option`
+        // (claude-code) — see `maybe_apply_session_model`.
         let stored_model = session_record.model.clone();
 
         // The persisted id (if any) decides the no-resume branch: a brand-new

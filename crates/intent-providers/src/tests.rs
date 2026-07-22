@@ -135,9 +135,15 @@ fn config_option_model_partition() {
             opted_in.contains(&id),
             "{id}: supports_config_option_model must match the pinned opt-in set {opted_in:?}"
         );
+        // The two post-session model paths are mutually exclusive for EVERY
+        // provider: `maybe_apply_session_model` would issue both calls for a
+        // provider carrying both flags.
+        assert!(
+            !(p.supports_set_model && p.supports_config_option_model),
+            "{id}: supports_set_model and supports_config_option_model are mutually exclusive"
+        );
     }
-    // The two post-session model paths are mutually exclusive: claude-code
-    // must not also issue session/set_model.
+    // claude-code additionally has no CLI model flag and no set_model path.
     let cc = find_provider("claude-code").unwrap();
     assert!(cc.model_flag.is_none() && !cc.supports_set_model);
 }
