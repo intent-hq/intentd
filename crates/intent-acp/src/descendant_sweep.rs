@@ -25,8 +25,9 @@ use std::time::Duration;
 const DESCENDANT_SWEEP_CAP: usize = 64;
 /// Timeout on the `ps` snapshot; a hung `ps` must not stall reaping.
 const PS_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Grace window between the sweep's SIGTERM and SIGKILL passes (mirrors the
-/// `TERM_GRACE` used by the group-kill paths themselves).
+/// Grace window between the sweep's SIGTERM and SIGKILL passes —
+/// intentionally short and fixed, independent of whatever grace the calling
+/// group-kill path used, since escapees already ignored the group signal.
 const SWEEP_TERM_GRACE: Duration = Duration::from_millis(500);
 
 /// Snapshot one child's descendant pids. See [`descendant_pids_many`].
