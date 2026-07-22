@@ -37,6 +37,13 @@ impl McpBridge {
     pub fn connect_addr(&self) -> String {
         format!("127.0.0.1:{}", self.addr.port())
     }
+
+    /// Test-only: handle to the accept-loop task so tests can await abort
+    /// completion deterministically instead of probing the (reusable) port.
+    #[cfg(test)]
+    pub(crate) fn accept_loop_handle(&self) -> tokio::task::AbortHandle {
+        self.task.abort_handle()
+    }
 }
 
 impl Drop for McpBridge {

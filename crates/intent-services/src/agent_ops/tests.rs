@@ -3059,9 +3059,9 @@ async fn models_list_returns_non_empty_catalog_with_source() {
 #[tokio::test]
 async fn models_list_legacy_force_refresh_bypasses_cache_and_labels_stale_fallback() {
     let (_t, svc, _ws) = setup().await;
-    // Seed the legacy in-memory cache with a fresh sentinel entry.
+    // Seed the unified cache under the legacy key with a fresh sentinel entry.
     let sentinel = vec![json!({ "id": "sentinel", "name": "Sentinel", "provider": "auggie" })];
-    svc.store_models_cache(sentinel.clone());
+    seed_auggie_cache(&svc, sentinel.clone());
     // Non-forced: the sentinel is served straight from the cache.
     let cached = svc.models_list_op(None, false).await.expect("cached");
     assert_eq!(cached["models"], json!(sentinel));
@@ -3109,6 +3109,19 @@ async fn models_list_cortex_is_feature_code_gated() {
     assert!(res["warning"].as_str().unwrap().contains("Cortex"));
 }
 
+/// Seed the unified model cache under the legacy auggie key `("auggie", "")`
+/// so it is fresh at the real clock ([`models_list_op`] uses `now_ms()`).
+fn seed_auggie_cache(svc: &Services, rows: Vec<serde_json::Value>) {
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog
+        .test_store("auggie", "", rows, now.saturating_sub(1));
+}
+
+/// The test clock for the legacy-path tests (unix-ms shaped, arbitrary).
+fn legacy_now() -> u64 {
+    1_000_000
+}
+
 /// A legacy-path fetch that counts its runs: only the single-flight leader's
 /// closure executes, so the counter proves how many CLI probes would spawn.
 fn counting_legacy_fetch(
@@ -3134,7 +3147,10 @@ async fn models_list_legacy_concurrent_cold_reads_single_flight_one_fetch() {
         .map(|_| {
             let svc = svc.clone();
             let fetch = counting_legacy_fetch(&calls, Some(sentinel.clone()));
-            tokio::spawn(async move { svc.models_list_auggie_with(false, fetch).await })
+            tokio::spawn(async move {
+                svc.models_list_auggie_with(false, legacy_now(), fetch)
+                    .await
+            })
         })
         .collect();
     for h in handles {
@@ -3153,16 +3169,19 @@ async fn models_list_legacy_concurrent_cold_reads_single_flight_one_fetch() {
 async fn models_list_legacy_concurrent_forced_reads_single_flight_one_fetch() {
     // forceRefresh bypasses the caches but still coalesces into one fetch.
     let (_t, svc, _ws) = setup().await;
-    svc.store_models_cache(vec![
-        json!({ "id": "old", "name": "Old", "provider": "auggie" }),
-    ]);
+    seed_auggie_cache(
+        &svc,
+        vec![json!({ "id": "old", "name": "Old", "provider": "auggie" })],
+    );
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fresh = vec![json!({ "id": "fresh", "name": "Fresh", "provider": "auggie" })];
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let svc = svc.clone();
             let fetch = counting_legacy_fetch(&calls, Some(fresh.clone()));
-            tokio::spawn(async move { svc.models_list_auggie_with(true, fetch).await })
+            tokio::spawn(
+                async move { svc.models_list_auggie_with(true, legacy_now(), fetch).await },
+            )
         })
         .collect();
     for h in handles {
@@ -3182,13 +3201,15 @@ async fn models_list_legacy_negative_window_suppresses_refetch() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // A failed fetch serves the static catalog and records the failure.
     let res = svc
-        .models_list_auggie_with(false, counting_legacy_fetch(&calls, None))
+        .models_list_auggie_with(false, legacy_now(), counting_legacy_fetch(&calls, None))
         .await
         .expect("first");
     assert_eq!(res["source"], "static");
     // Within the negative window the fetch must not run again.
     let res = svc
-        .models_list_auggie_with(false, || panic!("must not re-fetch in negative window"))
+        .models_list_auggie_with(false, legacy_now() + 1, || {
+            panic!("must not re-fetch in negative window")
+        })
         .await
         .expect("second");
     assert_eq!(res["source"], "static");
@@ -3198,33 +3219,34 @@ async fn models_list_legacy_negative_window_suppresses_refetch() {
 #[tokio::test]
 async fn models_list_legacy_negative_window_expires_then_refetches() {
     let (_t, svc, _ws) = setup().await;
-    // Pause after setup: Store::open needs real IO timeouts, but the negative
-    // TTL is aged with the paused tokio clock.
-    tokio::time::pause();
     let res = svc
-        .models_list_auggie_with(false, || Box::pin(async { None }))
+        .models_list_auggie_with(false, legacy_now(), || Box::pin(async { None }))
         .await
         .expect("failed fetch");
     assert_eq!(res["source"], "static");
     // Past the negative TTL the fetch runs again; success clears the entry.
-    tokio::time::advance(crate::model_catalog::MODELS_NEGATIVE_TTL + Duration::from_millis(1))
-        .await;
+    let later = legacy_now() + crate::model_catalog::MODELS_NEGATIVE_TTL.as_millis() as u64 + 1;
     let recovered = vec![json!({ "id": "rec", "name": "Rec", "provider": "auggie" })];
     let expected = recovered.clone();
     let res = svc
-        .models_list_auggie_with(false, move || Box::pin(async move { Some(recovered) }))
+        .models_list_auggie_with(false, later, move || {
+            Box::pin(async move { Some(recovered) })
+        })
         .await
         .expect("recovered fetch");
     assert_eq!(res["models"], json!(expected));
     assert_eq!(res["source"], "auggie");
-    assert!(!svc.models_negative_fresh());
+    assert!(svc
+        .models_catalog
+        .test_negative_reason("auggie", "", later)
+        .is_none());
 }
 
 #[tokio::test]
 async fn models_list_legacy_force_refresh_bypasses_negative_window() {
     let (_t, svc, _ws) = setup().await;
     let res = svc
-        .models_list_auggie_with(false, || Box::pin(async { None }))
+        .models_list_auggie_with(false, legacy_now(), || Box::pin(async { None }))
         .await
         .expect("failed fetch");
     assert_eq!(res["source"], "static");
@@ -3233,12 +3255,14 @@ async fn models_list_legacy_force_refresh_bypasses_negative_window() {
     let forced_rows = vec![json!({ "id": "f", "name": "F", "provider": "auggie" })];
     let expected = forced_rows.clone();
     let res = svc
-        .models_list_auggie_with(true, move || Box::pin(async move { Some(forced_rows) }))
+        .models_list_auggie_with(true, legacy_now() + 1, move || {
+            Box::pin(async move { Some(forced_rows) })
+        })
         .await
         .expect("forced fetch");
     assert_eq!(res["models"], json!(expected));
     let res = svc
-        .models_list_auggie_with(false, || panic!("cache hit expected"))
+        .models_list_auggie_with(false, legacy_now() + 2, || panic!("cache hit expected"))
         .await
         .expect("cached");
     assert_eq!(res["models"], json!(expected));
@@ -3251,15 +3275,93 @@ async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
     // last-good served as stale + warning, and the failure is negative-cached.
     let (_t, svc, _ws) = setup().await;
     let sentinel = vec![json!({ "id": "lg", "name": "LG", "provider": "auggie" })];
-    svc.store_models_cache(sentinel.clone());
+    seed_auggie_cache(&svc, sentinel.clone());
     let res = svc
-        .models_list_auggie_with(true, || Box::pin(async { None }))
+        .models_list_auggie_with(true, legacy_now(), || Box::pin(async { None }))
         .await
         .expect("forced failure");
     assert_eq!(res["models"], json!(sentinel));
     assert_eq!(res["stale"], true);
     assert!(res["warning"].is_string());
-    assert!(svc.models_negative_fresh());
+    assert!(svc
+        .models_catalog
+        .test_negative_reason("auggie", "", legacy_now())
+        .is_some());
+}
+
+#[tokio::test]
+async fn models_list_legacy_negative_window_with_last_good_serves_stale() {
+    // Unification consequence (documented): a non-forced read WITHIN the
+    // negative window that has an expired last-good entry serves it labeled
+    // stale + warning without re-probing — the old legacy path served the
+    // static catalog here.
+    let (_t, svc, _ws) = setup().await;
+    let sentinel = vec![json!({ "id": "nw", "name": "NW", "provider": "auggie" })];
+    svc.models_catalog
+        .test_store("auggie", "", sentinel.clone(), 0);
+    let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
+    // Expired cache + failed probe arms the negative window.
+    let res = svc
+        .models_list_auggie_with(false, past_ttl, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch");
+    assert_eq!(res["stale"], true);
+    // Within the window: same stale last-good, no re-probe.
+    let res = svc
+        .models_list_auggie_with(false, past_ttl + 1, || {
+            panic!("must not re-fetch in negative window")
+        })
+        .await
+        .expect("negative-window read");
+    assert_eq!(res["models"], json!(sentinel));
+    assert_eq!(res["source"], "auggie");
+    assert_eq!(res["stale"], true);
+    assert!(res["warning"].is_string());
+}
+
+#[tokio::test]
+async fn models_list_legacy_expired_cache_failed_probe_serves_last_good_stale() {
+    // Staleness fix from unifying on the generic cache: a NON-forced read
+    // past the TTL whose probe fails serves the last-good list labeled
+    // stale + warning (previously the legacy path fell back to statics).
+    let (_t, svc, _ws) = setup().await;
+    let sentinel = vec![json!({ "id": "lg2", "name": "LG2", "provider": "auggie" })];
+    svc.models_catalog
+        .test_store("auggie", "", sentinel.clone(), 0);
+    let past_ttl = crate::agent_ops::MODELS_CACHE_TTL.as_millis() as u64 + 1;
+    let res = svc
+        .models_list_auggie_with(false, past_ttl, || Box::pin(async { None }))
+        .await
+        .expect("expired failure");
+    assert_eq!(res["models"], json!(sentinel));
+    assert_eq!(res["source"], "auggie");
+    assert_eq!(res["stale"], true);
+    assert!(res["warning"].is_string());
+}
+
+#[tokio::test]
+async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
+    // The dual-cache divergence is gone: rows fetched via the legacy path are
+    // served to `providerId: "auggie"` reads within the TTL, and vice versa.
+    let (_t, svc, _ws) = setup().await;
+    let rows = vec![json!({ "id": "shared", "name": "Shared", "provider": "auggie" })];
+    let fetched = rows.clone();
+    // Real clock: the entry the legacy fetch stores must be fresh for the
+    // per-provider read below, which uses `now_ms()`.
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let res = svc
+        .models_list_auggie_with(false, now, move || Box::pin(async move { Some(fetched) }))
+        .await
+        .expect("legacy fetch");
+    assert_eq!(res["models"], json!(rows));
+    // The per-provider path reads the same entry — a fresh hit, no probe.
+    let res = svc
+        .models_list_op(Some("auggie".to_string()), false)
+        .await
+        .expect("providerId read");
+    assert_eq!(res["providerId"], "auggie");
+    assert_eq!(res["models"], json!(rows));
+    assert_eq!(res["source"], "auggie");
 }
 
 #[tokio::test]

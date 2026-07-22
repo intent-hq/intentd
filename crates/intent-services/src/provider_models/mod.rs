@@ -245,7 +245,7 @@ pub async fn fetch_opencode_models() -> ProviderModelsFetch {
     let Some(bin) = find_provider_binary("opencode", "opencode", None) else {
         return ProviderModelsFetch::unavailable("opencode", "opencode binary not found");
     };
-    match run_opencode_models_cli(bin).await {
+    match run_opencode_models_cli(bin, OPENCODE_CLI_TIMEOUT).await {
         Ok(stdout) => {
             let models = parse::parse_opencode_models(&stdout);
             if models.is_empty() {
@@ -259,10 +259,13 @@ pub async fn fetch_opencode_models() -> ProviderModelsFetch {
 }
 
 /// Run `opencode models` with a hard timeout, returning stdout on exit 0.
-/// The child runs with the enhanced PATH (binary's parent dir prepended,
+/// On timeout the `output()` future is dropped, and `kill_on_drop` reaps the
+/// child so a wedged CLI does not leak past the failed probe. The timeout is
+/// injectable for tests; production passes [`OPENCODE_CLI_TIMEOUT`]. The
+/// child runs with the enhanced PATH (binary's parent dir prepended,
 /// matching the ACP probe spawns) so anything the opencode CLI shells out to
 /// resolves in a packaged-app (minimal PATH) environment.
-async fn run_opencode_models_cli(bin: PathBuf) -> Result<String, String> {
+async fn run_opencode_models_cli(bin: PathBuf, timeout: Duration) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.arg("models")
         .env("PATH", intent_providers::enhanced_path(Some(&bin)))
@@ -271,7 +274,7 @@ async fn run_opencode_models_cli(bin: PathBuf) -> Result<String, String> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let fut = cmd.output();
-    let output = match tokio::time::timeout(OPENCODE_CLI_TIMEOUT, fut).await {
+    let output = match tokio::time::timeout(timeout, fut).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) => return Err(format!("failed to run opencode models: {e}")),
         Err(_) => return Err("opencode models timed out".to_string()),
