@@ -46,10 +46,11 @@ enum Command {
     /// Start the daemon and serve JSON-RPC. The UDS listener always serves;
     /// the HTTPS+WSS listener (0.0.0.0:5181) boot-starts iff the effective
     /// `server.wsApi.enabled` setting is true (config.toml or runtime toggle).
-    /// The TCP listener binds exactly that port and exits non-zero on any
-    /// bind error (no port walking). `--insecure` (or `INTENTD_INSECURE=1`)
-    /// always starts the TCP listener, serving plain `ws://` with no TLS and
-    /// no bearer-token auth — dev only.
+    /// The TCP listener binds exactly that port — no port walking. A WSS
+    /// bind failure at boot is non-fatal (UDS keeps serving; toggle the
+    /// setting to retry). `--insecure` (or `INTENTD_INSECURE=1`) always
+    /// starts the TCP listener, serving plain `ws://` with no TLS and no
+    /// bearer-token auth — dev only; its bind errors are fatal.
     Serve {
         /// Force connection locality (§5.14): `local` or `remote`. Overrides the
         /// transport default (UDS ⇒ local, TCP/WSS ⇒ remote) for `host.status`.
@@ -2200,7 +2201,7 @@ fn check_ports_free() -> bool {
 fn check_cert_validity(config: &Config) -> bool {
     match intent_transport::inspect_cert(&config.data_dir) {
         CertStatus::Missing => {
-            println!("[ok] TLS cert: none yet (generated on first `serve`)");
+            println!("[ok] TLS cert: none yet (generated on first secure `serve`)");
             true
         }
         CertStatus::Valid { fingerprint } => {
