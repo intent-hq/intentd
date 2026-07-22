@@ -1068,6 +1068,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_parse_tolerates_listen_mode_values_the_old_enum_rejected() {
+        // Legacy paths are captured BEFORE the strict parse, so even a value
+        // the retired ListenMode enum would have rejected (`"quic"` was a
+        // hard boot error) now boots — the daemon discards it at import time
+        // (no catalog entry) and strips the key from the file.
+        let (file, legacy) =
+            SettingsFile::parse_str_with_legacy("[server]\nlistenMode = \"quic\"\n")
+                .expect("tolerant parse");
+        assert_eq!(file.server, ServerSettings::default());
+        assert_eq!(
+            legacy.get("server.listenMode"),
+            Some(&serde_json::json!("quic"))
+        );
+        assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
     fn legacy_parse_captures_and_tolerates_ai_table() {
         let text = "[ai]\napiUrl = \"https://api.example\"\nmodel = \"m1\"\ntemperature = 0.5\n\n[git]\nautoCommit = false\n";
         let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");

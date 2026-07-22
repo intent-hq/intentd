@@ -185,6 +185,16 @@ async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
     .await;
     assert_eq!(get["error"]["code"], json!(-32602), "{get}");
 
+    // …and so does settings.update — the key is gone from the wire surface.
+    let update = uds_rpc(
+        &socket,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "server.listenMode", "value": "uds" }] }),
+    )
+    .await;
+    assert_eq!(update["error"]["code"], json!(-32602), "{update}");
+
     // The legacy key was stripped from the file on boot.
     let rewritten = std::fs::read_to_string(&config_path).expect("config.toml readable");
     assert!(
