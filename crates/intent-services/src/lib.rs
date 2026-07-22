@@ -178,10 +178,18 @@ pub struct Services {
     /// successful auggie CLI fetch is cached; the static fallback is recomputed
     /// per call. Shared across clones so every handle sees the same window.
     models_cache: agent_ops::ModelsCache,
+    /// Negative cache for the legacy `models.list` auggie path: the instant of
+    /// the last failed CLI fetch, suppressing re-probes for
+    /// [`model_catalog::MODELS_NEGATIVE_TTL`]. Shared across clones.
+    models_negative: agent_ops::ModelsNegative,
+    /// Single-flight slot for the legacy `models.list` auggie fetch so
+    /// concurrent cold-cache calls share one CLI spawn. Shared across clones.
+    models_inflight: agent_ops::ModelsInflight,
     /// Generic per-provider model cache backing `models.list { providerId }`
     /// (PROTOCOL §5.30): entries keyed by provider id + version key, 5-minute
     /// TTL, persisted in the daemon data dir when configured via
-    /// [`Services::with_models_cache_dir`]. Shared across clones.
+    /// [`Services::with_models_cache_dir`]; also holds the per-provider
+    /// single-flight and negative-cache state. Shared across clones.
     models_catalog: Arc<model_catalog::ModelCatalogCache>,
     /// Test-only override for the auggie binary the one-shot CLI RPCs
     /// (`agent.enhancePrompt` §5.31, `agent.completeOnce` §5.32) spawn.
@@ -395,6 +403,8 @@ impl Services {
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             session_stats_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache: Arc::new(Mutex::new(None)),
+            models_negative: Arc::new(Mutex::new(None)),
+            models_inflight: Arc::new(Mutex::new(None)),
             models_catalog: Arc::new(model_catalog::ModelCatalogCache::new(None)),
             auggie_bin: None,
             agent_subscriptions: Arc::new(Mutex::new(HashMap::new())),

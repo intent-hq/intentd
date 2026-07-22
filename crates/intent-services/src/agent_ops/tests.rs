@@ -3009,6 +3009,159 @@ async fn models_list_cortex_is_feature_code_gated() {
     assert!(res["warning"].as_str().unwrap().contains("Cortex"));
 }
 
+/// A legacy-path fetch that counts its runs: only the single-flight leader's
+/// closure executes, so the counter proves how many CLI probes would spawn.
+fn counting_legacy_fetch(
+    calls: &Arc<std::sync::atomic::AtomicUsize>,
+    result: Option<Vec<serde_json::Value>>,
+) -> impl FnOnce() -> intent_core::BoxFuture<'static, Option<Vec<serde_json::Value>>> {
+    let calls = calls.clone();
+    move || {
+        Box::pin(async move {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn models_list_legacy_concurrent_cold_reads_single_flight_one_fetch() {
+    let (_t, svc, _ws) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sentinel = vec![json!({ "id": "sf", "name": "SF", "provider": "auggie" })];
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let svc = svc.clone();
+            let fetch = counting_legacy_fetch(&calls, Some(sentinel.clone()));
+            tokio::spawn(async move { svc.models_list_auggie_with(false, fetch).await })
+        })
+        .collect();
+    for h in handles {
+        let res = h.await.expect("join").expect("models.list");
+        assert_eq!(res["models"], json!(sentinel));
+        assert_eq!(res["source"], "auggie");
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one CLI fetch runs"
+    );
+}
+
+#[tokio::test]
+async fn models_list_legacy_concurrent_forced_reads_single_flight_one_fetch() {
+    // forceRefresh bypasses the caches but still coalesces into one fetch.
+    let (_t, svc, _ws) = setup().await;
+    svc.store_models_cache(vec![
+        json!({ "id": "old", "name": "Old", "provider": "auggie" }),
+    ]);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fresh = vec![json!({ "id": "fresh", "name": "Fresh", "provider": "auggie" })];
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let svc = svc.clone();
+            let fetch = counting_legacy_fetch(&calls, Some(fresh.clone()));
+            tokio::spawn(async move { svc.models_list_auggie_with(true, fetch).await })
+        })
+        .collect();
+    for h in handles {
+        let res = h.await.expect("join").expect("models.list");
+        assert_eq!(res["models"], json!(fresh));
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one CLI fetch runs"
+    );
+}
+
+#[tokio::test]
+async fn models_list_legacy_negative_window_suppresses_refetch() {
+    let (_t, svc, _ws) = setup().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // A failed fetch serves the static catalog and records the failure.
+    let res = svc
+        .models_list_auggie_with(false, counting_legacy_fetch(&calls, None))
+        .await
+        .expect("first");
+    assert_eq!(res["source"], "static");
+    // Within the negative window the fetch must not run again.
+    let res = svc
+        .models_list_auggie_with(false, || panic!("must not re-fetch in negative window"))
+        .await
+        .expect("second");
+    assert_eq!(res["source"], "static");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn models_list_legacy_negative_window_expires_then_refetches() {
+    let (_t, svc, _ws) = setup().await;
+    // Pause after setup: Store::open needs real IO timeouts, but the negative
+    // TTL is aged with the paused tokio clock.
+    tokio::time::pause();
+    let res = svc
+        .models_list_auggie_with(false, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch");
+    assert_eq!(res["source"], "static");
+    // Past the negative TTL the fetch runs again; success clears the entry.
+    tokio::time::advance(crate::model_catalog::MODELS_NEGATIVE_TTL + Duration::from_millis(1))
+        .await;
+    let recovered = vec![json!({ "id": "rec", "name": "Rec", "provider": "auggie" })];
+    let expected = recovered.clone();
+    let res = svc
+        .models_list_auggie_with(false, move || Box::pin(async move { Some(recovered) }))
+        .await
+        .expect("recovered fetch");
+    assert_eq!(res["models"], json!(expected));
+    assert_eq!(res["source"], "auggie");
+    assert!(!svc.models_negative_fresh());
+}
+
+#[tokio::test]
+async fn models_list_legacy_force_refresh_bypasses_negative_window() {
+    let (_t, svc, _ws) = setup().await;
+    let res = svc
+        .models_list_auggie_with(false, || Box::pin(async { None }))
+        .await
+        .expect("failed fetch");
+    assert_eq!(res["source"], "static");
+    // Within the window a forced read still fetches — success clears the
+    // negative entry so subsequent non-forced reads serve the fresh cache.
+    let forced_rows = vec![json!({ "id": "f", "name": "F", "provider": "auggie" })];
+    let expected = forced_rows.clone();
+    let res = svc
+        .models_list_auggie_with(true, move || Box::pin(async move { Some(forced_rows) }))
+        .await
+        .expect("forced fetch");
+    assert_eq!(res["models"], json!(expected));
+    let res = svc
+        .models_list_auggie_with(false, || panic!("cache hit expected"))
+        .await
+        .expect("cached");
+    assert_eq!(res["models"], json!(expected));
+    assert_eq!(res["source"], "auggie");
+}
+
+#[tokio::test]
+async fn models_list_legacy_forced_failure_still_serves_last_good_stale() {
+    // The pre-existing forced-failure contract holds with the new guards:
+    // last-good served as stale + warning, and the failure is negative-cached.
+    let (_t, svc, _ws) = setup().await;
+    let sentinel = vec![json!({ "id": "lg", "name": "LG", "provider": "auggie" })];
+    svc.store_models_cache(sentinel.clone());
+    let res = svc
+        .models_list_auggie_with(true, || Box::pin(async { None }))
+        .await
+        .expect("forced failure");
+    assert_eq!(res["models"], json!(sentinel));
+    assert_eq!(res["stale"], true);
+    assert!(res["warning"].is_string());
+    assert!(svc.models_negative_fresh());
+}
+
 #[tokio::test]
 async fn subscribe_then_unsubscribe_roundtrips() {
     let (_t, svc, ws) = setup().await;

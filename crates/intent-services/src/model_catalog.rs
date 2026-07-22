@@ -9,6 +9,14 @@
 //! stale-while-revalidate) and fall back to the last-good list — labeled
 //! with a `warning` — only when the probe fails.
 //!
+//! Probes are bounded two ways so a broken adapter cannot be re-spawned on
+//! every `models.list` call: concurrent fetches for one (provider, version
+//! key) are **single-flighted** (one probe runs, everyone shares its result),
+//! and a failed probe is **negatively cached** for [`MODELS_NEGATIVE_TTL`] —
+//! within that window non-forced reads serve the last-good list (labeled
+//! `stale` + `warning`) or report nothing to serve, without re-probing.
+//! `force_refresh` bypasses the negative entry but still single-flights.
+//!
 //! The registry lists every provider with a daemon-side model source: auggie
 //! (rich CLI fetch), cortex (feature-code-gated static catalog), the
 //! ACP-probe sources (claude-code/codex/pi/droid), and opencode (native CLI)
@@ -16,20 +24,27 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use intent_core::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
 use crate::agent_ops::MODELS_CACHE_TTL;
 
 /// File name of the persisted cache inside the daemon data dir.
 pub(crate) const MODELS_CACHE_FILE: &str = "models-cache.json";
 
+/// How long a failed probe suppresses re-fetching (negative cache TTL): the
+/// probe spawns an adapter/CLI, so a persistent failure must not be retried
+/// on every `models.list` call (PROTOCOL §5.30).
+pub(crate) const MODELS_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Outcome of one provider model probe: `models: None` means the probe failed
 /// (CLI unavailable / nothing parseable) and the caller may fall back;
 /// `warning` carries a human-readable reason either way.
+#[derive(Clone)]
 pub(crate) struct ModelFetchResult {
     /// The fetched wire `ModelInfo` rows, or `None` on probe failure.
     pub models: Option<Vec<Value>>,
@@ -54,10 +69,12 @@ fn no_version() -> String {
     String::new()
 }
 
-/// auggie source: the rich CLI fetch already backing `models.list`.
+/// auggie source: the rich CLI fetch already backing `models.list` (PATH
+/// lookup — registry sources are plain fns with no `Services` handle for the
+/// `auggie_bin` test seam).
 fn auggie_fetch() -> BoxFuture<'static, ModelFetchResult> {
     Box::pin(async {
-        match crate::agent_ops::fetch_auggie_models_rich().await {
+        match crate::agent_ops::fetch_auggie_models_rich(None).await {
             Some(models) => ModelFetchResult {
                 models: Some(models),
                 warning: None,
@@ -246,12 +263,33 @@ struct PersistedCache {
 /// Schema version of [`PersistedCache`]; unknown versions are discarded.
 const PERSIST_VERSION: u32 = 1;
 
+/// One in-memory negative entry: a probe failure under `version_key` at
+/// `failed_at_ms`, with the human-readable `reason` served to callers within
+/// the [`MODELS_NEGATIVE_TTL`] window. Never persisted — a daemon restart
+/// retries immediately.
+struct NegativeEntry {
+    version_key: String,
+    failed_at_ms: u64,
+    reason: String,
+}
+
+/// A shared in-flight probe slot: the first caller initializes the cell (runs
+/// the fetch), concurrent callers await and clone the same result.
+type InflightCell = Arc<OnceCell<ModelFetchResult>>;
+
 /// The generic per-provider model cache: in-memory entries, optionally
 /// mirrored to a JSON file in the daemon data dir so a restart keeps the
 /// last-good lists. Shared across [`crate::Services`] clones via `Arc`.
 pub(crate) struct ModelCatalogCache {
     entries: Mutex<HashMap<String, CacheEntry>>,
     persist_path: Option<PathBuf>,
+    /// Per-provider negative entries (probe failures); in-memory only.
+    /// Keyed by provider id — mirroring `entries` — because at most one
+    /// version key is live per provider at a time (keys come from
+    /// process-wide adapter pins); a key bump simply replaces the entry.
+    negative: Mutex<HashMap<String, NegativeEntry>>,
+    /// In-flight probes keyed by (provider id, version key).
+    inflight: Mutex<HashMap<(String, String), InflightCell>>,
 }
 
 impl ModelCatalogCache {
@@ -265,6 +303,8 @@ impl ModelCatalogCache {
         Self {
             entries: Mutex::new(entries),
             persist_path,
+            negative: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -326,6 +366,70 @@ impl ModelCatalogCache {
             }
         }
     }
+
+    /// The negative entry's failure reason when it is still within
+    /// [`MODELS_NEGATIVE_TTL`] **and** was recorded under `version_key`. Same
+    /// clock-backwards guard as [`Self::fresh`]: an entry stamped ahead of
+    /// `now` is not fresh.
+    fn negative_reason(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<String> {
+        let negative = self.negative.lock().expect("model negative cache poisoned");
+        let entry = negative.get(provider_id)?;
+        if entry.version_key != version_key || now_ms < entry.failed_at_ms {
+            return None;
+        }
+        let age = now_ms - entry.failed_at_ms;
+        (age < MODELS_NEGATIVE_TTL.as_millis() as u64).then(|| entry.reason.clone())
+    }
+
+    /// Record a probe failure so non-forced reads within
+    /// [`MODELS_NEGATIVE_TTL`] do not re-spawn the adapter.
+    fn store_negative(&self, provider_id: &str, version_key: &str, reason: String, now_ms: u64) {
+        self.negative
+            .lock()
+            .expect("model negative cache poisoned")
+            .insert(
+                provider_id.to_string(),
+                NegativeEntry {
+                    version_key: version_key.to_string(),
+                    failed_at_ms: now_ms,
+                    reason,
+                },
+            );
+    }
+
+    /// Drop the provider's negative entry (any successful probe clears it).
+    fn clear_negative(&self, provider_id: &str) {
+        self.negative
+            .lock()
+            .expect("model negative cache poisoned")
+            .remove(provider_id);
+    }
+
+    /// Join (or create) the in-flight probe slot for `(provider_id,
+    /// version_key)`. All concurrent callers get the same cell, so
+    /// `get_or_init` runs exactly one fetch and everyone shares its result.
+    /// Two coalescing consequences, both accepted: a `force_refresh` caller
+    /// may join a probe that started *before* its request, and a caller
+    /// landing in the record→[`Self::finish_inflight`] window joins an
+    /// already-resolved cell and returns its result without a new probe.
+    fn join_inflight(&self, provider_id: &str, version_key: &str) -> InflightCell {
+        let mut inflight = self.inflight.lock().expect("model inflight map poisoned");
+        inflight
+            .entry((provider_id.to_string(), version_key.to_string()))
+            .or_default()
+            .clone()
+    }
+
+    /// Release the in-flight slot once its outcome has been recorded in the
+    /// success/negative caches. Only removes `cell` itself (`ptr_eq`), so a
+    /// late finisher cannot evict a newer probe's slot.
+    fn finish_inflight(&self, provider_id: &str, version_key: &str, cell: &InflightCell) {
+        let mut inflight = self.inflight.lock().expect("model inflight map poisoned");
+        let key = (provider_id.to_string(), version_key.to_string());
+        if inflight.get(&key).is_some_and(|cur| Arc::ptr_eq(cur, cell)) {
+            inflight.remove(&key);
+        }
+    }
 }
 
 /// Read the persisted snapshot, discarding unreadable or version-mismatched
@@ -349,10 +453,14 @@ pub(crate) struct ResolvedModels {
 }
 
 /// The single cache policy every provider goes through (PROTOCOL §5.30):
-/// non-forced reads within TTL serve the cache; expired or forced reads await
-/// the fresh probe (`force_refresh` skips the cache read entirely); a
+/// non-forced reads within TTL serve the cache; a fresh negative entry
+/// (recent probe failure) short-circuits to the failure fallback without
+/// re-probing; expired or forced reads await the fresh probe (`force_refresh`
+/// skips both cache reads). Concurrent probes for one (provider, version key)
+/// are single-flighted — one fetch runs, everyone shares its result. A
 /// successful non-empty probe is stored (empty successes are served but not
-/// cached, so they never masquerade as a last-good list); a failed probe
+/// cached, so they never masquerade as a last-good list) and any success
+/// clears the negative entry; a failed probe records a negative entry and
 /// falls back to the last-good list labeled `stale` + `warning`, or reports
 /// nothing to serve.
 pub(crate) async fn resolve_with_cache<F>(
@@ -374,35 +482,73 @@ where
                 warning: None,
             };
         }
-    }
-    let fetched = fetch().await;
-    match fetched.models {
-        Some(models) => {
-            if !models.is_empty() {
-                cache.store(provider_id, version_key, models.clone(), now_ms);
-            }
-            ResolvedModels {
-                models: Some(models),
-                stale: false,
-                warning: fetched.warning,
-            }
+        if let Some(reason) = cache.negative_reason(provider_id, version_key, now_ms) {
+            return failure_fallback(cache, provider_id, version_key, reason);
         }
-        None => match cache.last_good(provider_id, version_key) {
-            Some(models) => {
-                let reason = fetched
-                    .warning
-                    .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
-                ResolvedModels {
-                    models: Some(models),
-                    stale: true,
-                    warning: Some(format!("{reason}; serving last known model list")),
+    }
+    let cell = cache.join_inflight(provider_id, version_key);
+    // Recording happens inside the initializer, so exactly one waiter — the
+    // one whose fetch actually runs — records the outcome, and it does so
+    // before the in-flight slot is released. Followers only consume the
+    // shared result: a late-scheduled follower can never re-record a stale
+    // outcome over a newer probe's caches.
+    let fetched = cell
+        .get_or_init(|| async {
+            let fetched = fetch().await;
+            match &fetched.models {
+                Some(models) => {
+                    cache.clear_negative(provider_id);
+                    if !models.is_empty() {
+                        cache.store(provider_id, version_key, models.clone(), now_ms);
+                    }
+                }
+                None => {
+                    let reason = fetched
+                        .warning
+                        .clone()
+                        .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+                    cache.store_negative(provider_id, version_key, reason, now_ms);
                 }
             }
-            None => ResolvedModels {
-                models: None,
-                stale: false,
-                warning: fetched.warning,
-            },
+            fetched
+        })
+        .await
+        .clone();
+    cache.finish_inflight(provider_id, version_key, &cell);
+    match fetched.models {
+        Some(models) => ResolvedModels {
+            models: Some(models),
+            stale: false,
+            warning: fetched.warning,
+        },
+        None => {
+            let reason = fetched
+                .warning
+                .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed"));
+            failure_fallback(cache, provider_id, version_key, reason)
+        }
+    }
+}
+
+/// What a failed (or negatively cached) probe serves: the last-good list
+/// labeled `stale` + `warning`, or nothing (the caller falls back to its
+/// static catalog).
+fn failure_fallback(
+    cache: &ModelCatalogCache,
+    provider_id: &str,
+    version_key: &str,
+    reason: String,
+) -> ResolvedModels {
+    match cache.last_good(provider_id, version_key) {
+        Some(models) => ResolvedModels {
+            models: Some(models),
+            stale: true,
+            warning: Some(format!("{reason}; serving last known model list")),
+        },
+        None => ResolvedModels {
+            models: None,
+            stale: false,
+            warning: Some(reason),
         },
     }
 }
