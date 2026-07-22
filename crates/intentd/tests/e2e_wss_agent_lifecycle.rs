@@ -2511,10 +2511,14 @@ async fn after_all_group_delivers_single_aggregated_wake_over_wss() {
 /// - the parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake
 ///   message (proving the report-time wake delivered, and idle was suppressed);
 /// - that wake carries the `Report: <report>` framing and does NOT fall
-///   through to the `Summary:` branch (report-preferred formatting);
-/// - the wake turn runs on the parent BEFORE the child's `agent:idle` —
-///   parent `agent:stream:*` fires between the child's first stream chunk
-///   and the child's terminal `agent:idle` (proving immediate wake).
+///   through to the `Summary:` branch (report-preferred formatting).
+///
+/// NOTE on ordering: the report-time wake fires DURING the child's turn (the
+/// `reportToParent` tool call), so the parent's wake turn runs concurrently
+/// with the child finishing its own turn — the parent's wake `stream:end` /
+/// second `agent:idle` and the child's terminal `agent:idle` can arrive on
+/// the wire in EITHER order. The event loop below must therefore track each
+/// milestone independently and never gate one on the other.
 #[tokio::test]
 async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss() {
     let Some(script) = gate("WSS reportToParent SUB-2 E2E") else {
@@ -2619,17 +2623,36 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // Track the observable event ordering:
-    // - parent goes idle after the delegating turn;
-    // - child streams (chunk/end) → child agent:idle (report already persisted);
-    // - THEN the parent's wake turn runs (chunk/end) → parent idles again.
+    // Track the observable milestones ORDER-INSENSITIVELY:
+    // - parent goes idle after the delegating turn (first parent agent:idle);
+    // - the child streams and its reportToParent triggers the parent's wake
+    //   turn (parent stream:end after that first idle) → parent idles again;
+    // - the child emits its terminal agent:idle.
+    //
+    // ROOT CAUSE of the historical 180s-hang flake: the wake is report-time
+    // driven — it fires DURING the child's turn — so the parent's wake
+    // `stream:end` / second `agent:idle` race the child's terminal
+    // `agent:idle` on the wire. The old loop only counted the parent's wake
+    // events once `child_idle` was already true; when the wake events won the
+    // race, the break condition could never be satisfied and the loop blocked
+    // forever in `wss_event` (heartbeat pings reset its per-frame timeout)
+    // until the 180s terminate guard. Each milestone below is tracked
+    // independently, and the whole wait sits under one hard deadline so a
+    // regression fails fast with a diagnostic instead of hanging.
     let mut child_id: Option<String> = None;
-    let mut parent_idle_after_delegate = false;
+    let mut parent_idle_count = 0u32;
     let mut child_idle = false;
     let mut parent_wake_ends = 0u32;
-    let mut parent_idle_after_wake = false;
-    for _ in 0..400 {
-        let frame = wss_event(&mut sub, 60).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_idle) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match wss_event_opt(&mut sub, remaining.as_secs().max(1)).await {
+            Some(frame) if !remaining.is_zero() => frame,
+            _ => panic!(
+                "timed out waiting for wake milestones: parent_idle_count={parent_idle_count} \
+                 parent_wake_ends={parent_wake_ends} child_idle={child_idle} child_id={child_id:?}"
+            ),
+        };
         let ev = &frame["params"]["event"];
         let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
         let ev_type = ev["type"].as_str().unwrap_or_default();
@@ -2642,29 +2665,20 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         {
             child_id = Some(ev_agent.to_string());
         }
-        if ev_agent == parent_id && ev_type == "agent:idle" && !parent_idle_after_delegate {
-            parent_idle_after_delegate = true;
-            continue;
+        if ev_agent == parent_id && ev_type == "agent:idle" {
+            parent_idle_count += 1;
         }
         if let Some(cid) = child_id.as_deref() {
             if ev_agent == cid && ev_type == "agent:idle" {
                 child_idle = true;
             }
         }
-        if ev_agent == parent_id && ev_type == "agent:stream:end" && child_idle {
+        // Any parent stream:end after the first parent idle belongs to the
+        // wake turn (the delegating turn's stream:end precedes that idle).
+        if ev_agent == parent_id && ev_type == "agent:stream:end" && parent_idle_count >= 1 {
             parent_wake_ends += 1;
         }
-        if ev_agent == parent_id && ev_type == "agent:idle" && child_idle {
-            parent_idle_after_wake = true;
-        }
-        if parent_idle_after_wake && parent_wake_ends >= 1 {
-            break;
-        }
     }
-    assert!(
-        parent_idle_after_delegate,
-        "parent went idle after the delegating turn"
-    );
     assert!(child_id.is_some(), "child agent id observed on the wire");
     assert!(child_idle, "child emitted agent:idle after reportToParent");
     assert_eq!(
@@ -2672,8 +2686,8 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         "exactly one wake-turn stream:end on the parent (single wake driven by reportToParent, idle suppressed)"
     );
     assert!(
-        parent_idle_after_wake,
-        "parent idled again after the wake turn"
+        parent_idle_count >= 2,
+        "parent idled after the delegating turn and again after the wake turn"
     );
 
     // The parent transcript carries EXACTLY ONE `[WORKSPACE EVENTS]` wake
