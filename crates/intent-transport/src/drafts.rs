@@ -14,10 +14,17 @@ use serde_json::{json, Value};
 
 use crate::events::{error_frame, success_frame};
 
+/// Cap on the serialized `attachments` payload of a `drafts.set` (rejected
+/// with `-32602` above this) to keep SQLite rows bounded (PROTOCOL §5.16).
+pub(crate) const MAX_ATTACHMENTS_BYTES: usize = 25 * 1024 * 1024;
+
 /// The three `drafts.*` methods, once classified.
 pub(crate) enum DraftMethod {
     Get,
-    Set { text: Option<String> },
+    Set {
+        text: Option<String>,
+        attachments: Option<Value>,
+    },
     Clear,
 }
 
@@ -55,6 +62,10 @@ pub(crate) fn classify(value: &Value) -> Option<DraftRequest> {
         "drafts.get" => DraftMethod::Get,
         "drafts.set" => DraftMethod::Set {
             text: opt_str("text"),
+            attachments: params
+                .and_then(|p| p.get("attachments"))
+                .filter(|v| !v.is_null())
+                .cloned(),
         },
         "drafts.clear" => DraftMethod::Clear,
         _ => return None,
@@ -86,9 +97,48 @@ async fn resolve_for_write(
     Ok(minted)
 }
 
+/// Validate the optional `attachments` param of a `drafts.set`: it must be a
+/// JSON array, an empty array is normalized to `None` (nothing stored), and a
+/// serialized payload above [`MAX_ATTACHMENTS_BYTES`] is rejected (`-32602`).
+fn validate_attachments(attachments: Option<Value>) -> Result<Option<Value>, (i32, String)> {
+    let Some(value) = attachments else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        return Err((
+            -32602,
+            "Invalid parameter: attachments must be an array".to_string(),
+        ));
+    };
+    if items.is_empty() {
+        return Ok(None);
+    }
+    struct CountingWriter(usize);
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = CountingWriter(0);
+    serde_json::to_writer(&mut counter, &value).map_err(|e| (-32603, e.to_string()))?;
+    let size = counter.0;
+    if size > MAX_ATTACHMENTS_BYTES {
+        return Err((
+            -32602,
+            format!("Invalid parameter: attachments exceeds {MAX_ATTACHMENTS_BYTES} bytes"),
+        ));
+    }
+    Ok(Some(value))
+}
+
 /// Handle a classified `drafts.*` request against the connection's `client_id`
-/// binding. Missing `workspaceId`/`agentId` (or `text` on `set`) is `-32602`;
-/// persistence failures are `-32603` (PROTOCOL §5.16, §9).
+/// binding. Missing `workspaceId`/`agentId` (or `text` on `set`) and invalid
+/// or oversized `attachments` are `-32602`; persistence failures are `-32603`
+/// (PROTOCOL §5.16, §9).
 pub(crate) async fn handle(
     req: DraftRequest,
     api: &dyn WorkspaceApi,
@@ -115,19 +165,28 @@ pub(crate) async fn handle(
             // without minting a client row for a pure read.
             None => Ok(Value::Null),
             Some(cid) => match api.draft_get(ws, agent, cid).await {
-                Ok(Some(draft)) => Ok(json!({ "text": draft.text, "updatedAt": draft.updated_at })),
+                Ok(Some(draft)) => {
+                    let mut result = json!({ "text": draft.text, "updatedAt": draft.updated_at });
+                    if let Some(attachments) = draft.attachments {
+                        result["attachments"] = attachments;
+                    }
+                    Ok(result)
+                }
                 Ok(None) => Ok(Value::Null),
                 Err(e) => Err((-32603, e.to_string())),
             },
         },
-        DraftMethod::Set { text } => match text {
+        DraftMethod::Set { text, attachments } => match text {
             None => Err((-32602, "Missing required parameter: text".to_string())),
-            Some(text) => match resolve_for_write(api, client_id).await {
+            Some(text) => match validate_attachments(attachments) {
                 Err(e) => Err(e),
-                Ok(cid) => match api.draft_set(ws, agent, cid, text).await {
-                    Ok(Some(updated_at)) => Ok(json!({ "ok": true, "updatedAt": updated_at })),
-                    Ok(None) => Ok(json!({ "ok": true })),
-                    Err(e) => Err((-32603, e.to_string())),
+                Ok(attachments) => match resolve_for_write(api, client_id).await {
+                    Err(e) => Err(e),
+                    Ok(cid) => match api.draft_set(ws, agent, cid, text, attachments).await {
+                        Ok(Some(updated_at)) => Ok(json!({ "ok": true, "updatedAt": updated_at })),
+                        Ok(None) => Ok(json!({ "ok": true })),
+                        Err(e) => Err((-32603, e.to_string())),
+                    },
                 },
             },
         },

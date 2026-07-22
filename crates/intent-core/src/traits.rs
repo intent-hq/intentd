@@ -4570,18 +4570,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `drafts.set`: upsert the calling client's draft. An empty `text` is a
-    /// clear (the row is deleted). Returns `Some(updatedAt)` when a draft was
-    /// stored or `None` when it was cleared, and emits `draft:changed` (carrying
-    /// `hasDraft`, never the text) (PROTOCOL §5.16/§6.5).
+    /// `drafts.set`: upsert the calling client's draft. An empty `text` with no
+    /// `attachments` is a clear (the row is deleted); empty text WITH
+    /// attachments persists the row. `attachments` is an opaque JSON array
+    /// stored verbatim (`None` ⇒ none stored). Returns `Some(updatedAt)` when a
+    /// draft was stored or `None` when it was cleared, and emits
+    /// `draft:changed` (carrying `hasDraft`, never the content) (PROTOCOL
+    /// §5.16/§6.5).
     fn draft_set(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         client_id: ClientId,
         text: String,
+        attachments: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
-        let _ = (workspace_id, agent_id, client_id, text);
+        let _ = (workspace_id, agent_id, client_id, text, attachments);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::draft_set not implemented".to_string(),
