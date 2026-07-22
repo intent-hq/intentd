@@ -2685,6 +2685,21 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `pr.capabilities`: the active provider's id + capability flags so
+    /// clients can gate UI on what the host supports. Requires a resolvable
+    /// provider but NOT an active PR (PROTOCOL §5.7 extension).
+    fn pr_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = workspace_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_capabilities not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
     /// active PR; otherwise `-32603` (PROTOCOL §5.7).
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {

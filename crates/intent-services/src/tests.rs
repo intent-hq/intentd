@@ -4923,6 +4923,18 @@ mod pr {
         /// When set, `list_repos` emits a two-page sequence driven by the opaque
         /// cursor, exercising the §5.5 multi-page round-trip end to end.
         paginate: bool,
+        /// When >0, `get_review_threads` emits this many single-thread pages
+        /// driven by a numeric cursor (unresolved thread `RT{n}` on page `n`),
+        /// exercising the exhaustive `pr.listReviewComments` fetch.
+        thread_pages: u64,
+        /// When >0, `list_review_comments` emits this many single-comment pages
+        /// driven by a numeric cursor (comment id `n` on page `n`, no reply
+        /// parent), exercising the multi-page REST fallback.
+        review_comment_pages: u64,
+        /// When set, overrides the advertised [`ScCapabilities`] (default is
+        /// all-true), exercising the `pr.capabilities` surface + runtime
+        /// gating of `pr.merge` / `pr.createReview` / `pr.listCheckRuns`.
+        capabilities: Option<ScCapabilities>,
         head_seq: AtomicU64,
         /// Notified on the first `get_pr` call — the point at which
         /// `pr.waitForChanges` has finished its one SQLite read and is past it.
@@ -4956,14 +4968,14 @@ mod pr {
             "stub"
         }
         fn capabilities(&self) -> ScCapabilities {
-            ScCapabilities {
+            self.capabilities.unwrap_or(ScCapabilities {
                 draft_prs: true,
                 squash_merge: true,
                 rebase_merge: true,
                 review_required_changes: true,
                 check_runs: true,
                 issues: true,
-            }
+            })
         }
         async fn check_auth(&self) -> ScResult<AuthStatus> {
             Ok(AuthStatus {
@@ -5194,8 +5206,30 @@ mod pr {
             &self,
             _: &RepoRef,
             _: u64,
-            _: PageParams,
+            page: PageParams,
         ) -> ScResult<Page<ReviewComment>> {
+            if self.review_comment_pages > 0 {
+                let n = page
+                    .cursor
+                    .as_deref()
+                    .and_then(|c| c.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let next_cursor = (n < self.review_comment_pages).then(|| (n + 1).to_string());
+                return Ok(Page {
+                    items: vec![ReviewComment {
+                        id: n,
+                        body: format!("nit {n}"),
+                        path: "a.rs".into(),
+                        line: Some(1),
+                        author: "rev".into(),
+                        created_at: "2026".into(),
+                        updated_at: "2026".into(),
+                        in_reply_to_id: None,
+                        url: "url".into(),
+                    }],
+                    next_cursor,
+                });
+            }
             Ok(Page {
                 items: vec![ReviewComment {
                     id: 5,
@@ -5234,10 +5268,33 @@ mod pr {
             &self,
             _: &RepoRef,
             _: u64,
-            _: PageParams,
+            page: PageParams,
         ) -> ScResult<Page<ReviewThread>> {
             if self.fail_threads {
                 return Err(ScError::Api("graphql down".into()));
+            }
+            if self.thread_pages > 0 {
+                let n = page
+                    .cursor
+                    .as_deref()
+                    .and_then(|c| c.parse::<u64>().ok())
+                    .unwrap_or(1);
+                let next_cursor = (n < self.thread_pages).then(|| (n + 1).to_string());
+                return Ok(Page {
+                    items: vec![ReviewThread {
+                        id: format!("RT{n}"),
+                        is_resolved: false,
+                        comments: vec![ReviewThreadComment {
+                            id: format!("c{n}"),
+                            body: "x".into(),
+                            author: "rev".into(),
+                            path: "a.rs".into(),
+                            line: Some(1),
+                            created_at: "2026".into(),
+                        }],
+                    }],
+                    next_cursor,
+                });
             }
             Ok(Page {
                 items: vec![
@@ -5678,6 +5735,77 @@ mod pr {
     }
 
     #[tokio::test]
+    async fn list_review_comments_merges_thread_pages() {
+        // Threads spanning multiple GraphQL pages are merged into one reply
+        // with truthful pagination metadata.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                thread_pages: 3,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], false);
+        assert_eq!(v["threadCount"], 3);
+        assert_eq!(v["threads"][0]["id"], "RT1");
+        assert_eq!(v["threads"][2]["id"], "RT3");
+        assert_eq!(v["pagination"]["totalCount"], 3);
+        assert_eq!(v["pagination"]["pagesFetched"], 3);
+        assert_eq!(v["pagination"]["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_page_cap_reports_has_more() {
+        // More pages than the cap: the loop stops at REVIEW_FETCH_MAX_PAGES
+        // (10) and reports `hasMore: true`.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                thread_pages: 12,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], false);
+        assert_eq!(v["threadCount"], 10);
+        assert_eq!(v["pagination"]["totalCount"], 10);
+        assert_eq!(v["pagination"]["pagesFetched"], 10);
+        assert_eq!(v["pagination"]["hasMore"], true);
+    }
+
+    #[tokio::test]
+    async fn list_review_comments_fallback_merges_pages() {
+        // REST fallback also drains all pages and reports honest metadata.
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                fail_threads: true,
+                review_comment_pages: 2,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_list_review_comments(ws, None, None)
+            .await
+            .expect("review comments");
+        assert_eq!(v["usingFallback"], true);
+        assert_eq!(v["threadCount"], 2);
+        assert_eq!(v["pagination"]["totalFetched"], 2);
+        assert_eq!(v["pagination"]["pagesFetched"], 2);
+        assert_eq!(v["pagination"]["hasMore"], false);
+    }
+
+    #[tokio::test]
     async fn list_comments_returns_count() {
         let (_t, svc, ws) = setup(false, true).await;
         let v = svc.pr_list_comments(ws, Some(5)).await.expect("comments");
@@ -5781,6 +5909,163 @@ mod pr {
         let v = svc.pr_update_branch(ws).await.expect("update branch");
         assert_eq!(v["method"], "merge");
         assert_eq!(v["alreadyUpToDate"], false);
+    }
+
+    // ---- pr.capabilities + runtime gating (§5.7 extension, §7.2/§7.4) ------
+
+    /// All capability flags disabled except plain merge (which is never gated).
+    fn no_caps() -> ScCapabilities {
+        ScCapabilities {
+            draft_prs: false,
+            squash_merge: false,
+            rebase_merge: false,
+            review_required_changes: false,
+            check_runs: false,
+            issues: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn capabilities_returns_provider_and_camel_case_flags() {
+        // `with_pr: false` — pr.capabilities must NOT require an active PR.
+        let (_t, svc, ws) = setup(false, false).await;
+        let v = svc.pr_capabilities(ws).await.expect("capabilities");
+        assert_eq!(v["provider"], "stub");
+        let caps = &v["capabilities"];
+        assert_eq!(caps["draftPrs"], true);
+        assert_eq!(caps["squashMerge"], true);
+        assert_eq!(caps["rebaseMerge"], true);
+        assert_eq!(caps["reviewRequiredChanges"], true);
+        assert_eq!(caps["checkRuns"], true);
+        assert_eq!(caps["issues"], true);
+    }
+
+    #[tokio::test]
+    async fn capabilities_reflects_provider_flags() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let v = svc.pr_capabilities(ws).await.expect("capabilities");
+        assert_eq!(v["capabilities"]["squashMerge"], false);
+        assert_eq!(v["capabilities"]["checkRuns"], false);
+    }
+
+    #[tokio::test]
+    async fn capabilities_unknown_workspace_is_not_found() {
+        let (_t, svc, _ws) = setup(false, false).await;
+        let err = svc
+            .pr_capabilities(WorkspaceId::from_string("nope"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn merge_gated_when_squash_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc
+            .pr_merge(ws, Some("squash".into()), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_gated_when_rebase_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc
+            .pr_merge(ws, Some("rebase".into()), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
+    }
+
+    #[tokio::test]
+    async fn plain_merge_not_gated_by_capabilities() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_merge(ws, None, None, None, None)
+            .await
+            .expect("merge");
+        assert_eq!(v["merged"], true);
+        assert_eq!(v["mergeMethod"], "merge");
+    }
+
+    #[tokio::test]
+    async fn create_review_gated_when_request_changes_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc
+            .pr_create_review(ws, "request-changes".into(), Some("needs work".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
+    }
+
+    #[tokio::test]
+    async fn create_review_approve_not_gated() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let v = svc
+            .pr_create_review(ws, "approve".into(), None)
+            .await
+            .expect("review");
+        assert_eq!(v["review"]["verdict"], "approve");
+    }
+
+    #[tokio::test]
+    async fn list_check_runs_gated_when_unsupported() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                capabilities: Some(no_caps()),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let err = svc.pr_list_check_runs(ws, None).await.unwrap_err();
+        assert!(matches!(&err, Error::Internal(m) if m.starts_with("unsupported by provider:")));
     }
 
     #[tokio::test]

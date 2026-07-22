@@ -12995,6 +12995,26 @@ impl WorkspaceApi for Services {
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
     // ========================================================================
 
+    fn pr_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            // Requires a resolvable provider but NOT an active PR — the FE
+            // gates UI on the flags before any PR exists (§5.7 extension).
+            // Workspace existence is still validated so a bogus id fails like
+            // every other workspace-scoped method.
+            store.get_workspace(&workspace_id).await?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            Ok(serde_json::json!({
+                "provider": sc.provider_id(),
+                "capabilities": sc.capabilities(),
+            }))
+        })
+    }
+
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
@@ -13088,16 +13108,8 @@ impl WorkspaceApi for Services {
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
-            match sc
-                .get_review_threads(
-                    &repo_ref,
-                    number,
-                    intent_sourcecontrol::PageParams::first(100),
-                )
-                .await
-            {
-                Ok(page) => {
-                    let mut threads = page.items;
+            match pr_ops::fetch_all_pages(|p| sc.get_review_threads(&repo_ref, number, p)).await {
+                Ok((mut threads, pages_fetched, has_more)) => {
                     let total = threads.len() as i64;
                     if status == "resolved" {
                         threads.retain(|t| t.is_resolved);
@@ -13112,21 +13124,16 @@ impl WorkspaceApi for Services {
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": false,
-                        "pagination": { "totalCount": total, "pagesFetched": 1, "hasMore": false },
+                        "pagination": { "totalCount": total, "pagesFetched": pages_fetched, "hasMore": has_more },
                         "filter": { "path": path, "status": status },
                         "note": serde_json::Value::Null,
                     }))
                 }
                 Err(_) => {
-                    let comments = sc
-                        .list_review_comments(
-                            &repo_ref,
-                            number,
-                            intent_sourcecontrol::PageParams::first(100),
-                        )
-                        .await
-                        .map_err(pr_ops::map_sc_err)?
-                        .items;
+                    let (comments, pages_fetched, has_more) =
+                        pr_ops::fetch_all_pages(|p| sc.list_review_comments(&repo_ref, number, p))
+                            .await
+                            .map_err(pr_ops::map_sc_err)?;
                     let total_fetched = comments.len() as i64;
                     let mut threads = pr_ops::fallback_threads(comments);
                     if let Some(p) = &path {
@@ -13146,7 +13153,7 @@ impl WorkspaceApi for Services {
                         "threads": json_threads,
                         "threadCount": threads.len(),
                         "usingFallback": true,
-                        "pagination": { "totalFetched": total_fetched, "pagesFetched": 1, "hasMore": false },
+                        "pagination": { "totalFetched": total_fetched, "pagesFetched": pages_fetched, "hasMore": has_more },
                         "filter": { "path": path, "status": status },
                         "note": note,
                     }))
@@ -13198,6 +13205,7 @@ impl WorkspaceApi for Services {
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
+            pr_ops::require_capability(sc.capabilities().check_runs, "check runs")?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let git_ref = match git_ref {
                 Some(r) => r,
@@ -13259,6 +13267,16 @@ impl WorkspaceApi for Services {
                     let (owner, repo) = pr_ops::repo_of(&ws)?;
                     let number = pr_ops::active_pr_number(&ws)?;
                     let sc = pr_ops::resolve_source_control(injected).await?;
+                    let caps = sc.capabilities();
+                    match method {
+                        intent_sourcecontrol::MergeMethod::Squash => {
+                            pr_ops::require_capability(caps.squash_merge, "squash merge")?
+                        }
+                        intent_sourcecontrol::MergeMethod::Rebase => {
+                            pr_ops::require_capability(caps.rebase_merge, "rebase merge")?
+                        }
+                        intent_sourcecontrol::MergeMethod::Merge => {}
+                    }
                     let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
                     let pr = sc
                         .get_pr(&repo_ref, number)
@@ -13460,6 +13478,12 @@ impl WorkspaceApi for Services {
             let (owner, repo) = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
+            if verdict == intent_sourcecontrol::ReviewVerdict::RequestChanges {
+                pr_ops::require_capability(
+                    sc.capabilities().review_required_changes,
+                    "request-changes review",
+                )?;
+            }
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let review = sc
                 .submit_review(&repo_ref, number, verdict, body)
