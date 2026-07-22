@@ -185,7 +185,11 @@ fn isolated_codex_home(user_codex_dir: Option<&Path>) -> std::io::Result<tempfil
     if let Some(user_dir) = user_codex_dir {
         let auth = user_dir.join("auth.json");
         if auth.is_file() {
-            let _ = std::fs::copy(&auth, dir.path().join("auth.json"));
+            if let Err(e) = std::fs::copy(&auth, dir.path().join("auth.json")) {
+                tracing::warn!(
+                    "failed to seed auth.json into isolated CODEX_HOME (probe will run logged-out): {e}"
+                );
+            }
         }
     }
     Ok(dir)
