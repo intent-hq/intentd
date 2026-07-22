@@ -1,6 +1,6 @@
 //! WSS end-to-end for `agent.listInterrupted` (INT-41, agent-resumption phase 1).
 //!
-//! Boots a real `intentd serve --listen both`, creates agent sessions in stale
+//! Boots a real `intentd serve` (WSS listener enabled via config), creates agent sessions in stale
 //! in-flight statuses (Active/Processing/Waiting), restarts the daemon, and
 //! verifies that `agent.listInterrupted` returns the interrupted agents.
 //!
@@ -255,10 +255,11 @@ async fn interrupted_agents_persisted_across_restart() {
     let socket = data_dir.join("intentd.sock");
 
     // Phase 1: Boot daemon, create a workspace, create an agent session with Active status.
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -340,10 +341,11 @@ async fn interrupted_agents_persisted_across_restart() {
     drop(guard1);
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd2.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -390,10 +392,11 @@ async fn interrupted_agents_persisted_across_restart() {
     guard2.child_mut().kill().expect("kill daemon 2");
     guard2.child_mut().wait().expect("wait daemon 2");
     drop(guard2);
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd3 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd3.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -474,10 +477,11 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         "blockUntilCancel": true
     })
     .to_string();
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd1 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd1.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")
@@ -587,10 +591,11 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     std::mem::drop(daemon);
 
     // Phase 2: Restart daemon — should list the interrupted agent.
+    if listen != "uds" {
+        common::enable_ws_api(&data_dir);
+    }
     let mut cmd2 = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd2.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_TCP_PORT", "0")

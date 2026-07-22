@@ -1,7 +1,7 @@
 //! WSS end-to-end agent lifecycle (WSS-1): the UDS analogue in
 //! `uds_agent_runtime.rs` ported to the WebSocket transport.
 //!
-//! Boots a real `intentd serve --listen both` against the mock ACP provider and
+//! Boots a real `intentd serve` (WSS listener enabled via config) against the mock ACP provider and
 //! drives the full agent lifecycle over a pinned TLS WebSocket — one persistent
 //! SUBSCRIBER connection (events.event notifications) and one RPC connection
 //! (request/response). Mirrors the lifecycle assertions of the UDS suite and
@@ -63,10 +63,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)
@@ -2889,7 +2890,7 @@ where
     }
 }
 
-/// Boot a hermetic `intentd serve --listen both` (no mock-agent env), seed a
+/// Boot a hermetic `intentd serve` with WSS enabled (no mock-agent env), seed a
 /// workspace + note, and return `(daemon, ws_id, note_id, port, fingerprint)`.
 /// Used by the no-node read-arm sweep below.
 async fn boot_daemon_with_seeded_note() -> (Daemon, String, String, u16, String) {
