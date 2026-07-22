@@ -512,22 +512,20 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
 #[tokio::test]
 async fn grok_cli_timeout_flows_into_attributed_warning() {
     // A wedged `grok models` must be cut short and the timeout reason must
-    // surface through the fetch attribution (`grok: ...`).
+    // surface through the fetch attribution (`grok: ...`). No wall-clock
+    // bound (parity with the opencode analog): a first-exec Gatekeeper scan
+    // on macOS can delay the spawn itself by seconds, and the attributed
+    // warning already proves the timeout path fired.
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
     std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let start = std::time::Instant::now();
     let fetch = super::ProviderModelsFetch::unavailable(
         "grok",
         super::run_grok_models_cli(bin, std::time::Duration::from_millis(100))
             .await
             .unwrap_err(),
-    );
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(5),
-        "timeout must cut the wedged CLI short"
     );
     assert!(fetch.models.is_none());
     assert_eq!(
