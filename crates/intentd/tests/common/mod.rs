@@ -44,8 +44,15 @@ pub fn daemon_startup_timeout() -> Duration {
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
-    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-    if text.contains("[server.wsApi]") {
+    let mut text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => panic!("read {}: {e}", path.display()),
+    };
+    if text
+        .lines()
+        .any(|l| l.trim_start().starts_with("[server.wsApi]"))
+    {
         return;
     }
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
