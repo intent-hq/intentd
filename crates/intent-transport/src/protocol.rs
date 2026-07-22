@@ -8,3 +8,11 @@
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
 pub const PROTOCOL_VERSION: &str = "2.1";
+
+/// Maximum size in bytes of a single inbound JSON-RPC message accepted by
+/// either transport (one newline-delimited UDS frame, one WebSocket text
+/// message). Sized to comfortably cover the largest legitimate payload: the
+/// 25 MB drafts-attachments cap base64-encodes to ~33.4 MiB on the wire, plus
+/// JSON envelope overhead → 40 MiB. Anything larger is rejected without
+/// buffering the full payload (monorepo#472).
+pub const MAX_INBOUND_MESSAGE_BYTES: usize = 40 * 1024 * 1024;

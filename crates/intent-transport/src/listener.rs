@@ -176,15 +176,37 @@ async fn handle_connection(
     let _reverse_guard = reverse_registry.register(reverse.clone());
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
-    let mut line = String::new();
+    let mut line = Vec::new();
     let io_result = loop {
         line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break Ok(()), // EOF
-            Ok(_) => {}
+        match read_line_bounded(&mut reader, &mut line, crate::MAX_INBOUND_MESSAGE_BYTES).await {
+            Ok(BoundedLine::Eof) => break Ok(()),
+            Ok(BoundedLine::Line) => {}
+            Ok(BoundedLine::TooLong) => {
+                // Over-limit frame (monorepo#472): answer with a `-32600`
+                // error (`id: null` — the request was never parsed) and end
+                // the connection WITHOUT draining the rest of the oversized
+                // line into memory.
+                let frame = crate::events::error_frame(
+                    serde_json::Value::Null,
+                    -32600,
+                    &format!(
+                        "message exceeds maximum size of {} bytes",
+                        crate::MAX_INBOUND_MESSAGE_BYTES
+                    ),
+                );
+                let _ = out_tx.send(frame).await;
+                break Ok(());
+            }
             Err(e) => break Err(e),
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let Ok(text) = std::str::from_utf8(&line) else {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame is not valid UTF-8",
+            ));
+        };
+        let trimmed = text.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             continue;
         }
@@ -214,12 +236,74 @@ async fn handle_connection(
         }
     };
 
-    // Cleanup: abort all subscriptions + forwards, then let the writer finish.
+    // Cleanup: abort all subscriptions + forwards, then close the outbound
+    // queue and let the writer finish. The reverse channel and its registry
+    // guard hold `out_tx` clones, so both must drop before the writer can
+    // observe the channel closing — otherwise the writer (and the socket's
+    // write half) would outlive the connection and the peer would never see
+    // EOF after a server-initiated close (e.g. an oversized frame).
     drop(subs);
     drop(forwards);
+    drop(_reverse_guard);
+    drop(reverse);
     drop(out_tx);
     let _ = writer.await;
     io_result
+}
+
+/// Outcome of one bounded line read (see [`read_line_bounded`]).
+#[cfg(unix)]
+enum BoundedLine {
+    /// A complete line (newline consumed, not included in the buffer) — or the
+    /// final unterminated line before EOF.
+    Line,
+    /// Clean EOF with no buffered bytes.
+    Eof,
+    /// The line exceeded the limit; the tail was NOT read into memory.
+    TooLong,
+}
+
+/// Read one newline-delimited line into `buf`, never buffering more than
+/// `limit` bytes (monorepo#472). Unlike `read_line`, an over-limit line yields
+/// [`BoundedLine::TooLong`] with at most `limit` bytes consumed, so a hostile
+/// or buggy client cannot make the daemon buffer an unbounded frame.
+#[cfg(unix)]
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<BoundedLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line
+            });
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                if buf.len() + pos > limit {
+                    return Ok(BoundedLine::TooLong);
+                }
+                buf.extend_from_slice(&available[..pos]);
+                reader.consume(pos + 1);
+                return Ok(BoundedLine::Line);
+            }
+            None => {
+                let len = available.len();
+                if buf.len() + len > limit {
+                    return Ok(BoundedLine::TooLong);
+                }
+                buf.extend_from_slice(available);
+                reader.consume(len);
+            }
+        }
+    }
 }
 
 /// Non-Unix fallback: UDS is unavailable, so report a clear runtime error
@@ -262,4 +346,75 @@ where
         std::io::ErrorKind::Unsupported,
         "UDS transport is not supported on this platform",
     ))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{read_line_bounded, BoundedLine};
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn bounded_reader_reads_lines_within_limit() {
+        let data: &[u8] = b"first\nsecond\n";
+        let mut reader = BufReader::new(data);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf, 64).await.unwrap(),
+            BoundedLine::Line
+        ));
+        assert_eq!(buf, b"first");
+        buf.clear();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf, 64).await.unwrap(),
+            BoundedLine::Line
+        ));
+        assert_eq!(buf, b"second");
+        buf.clear();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf, 64).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_returns_final_unterminated_line() {
+        let data: &[u8] = b"tail-no-newline";
+        let mut reader = BufReader::new(data);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf, 64).await.unwrap(),
+            BoundedLine::Line
+        ));
+        assert_eq!(buf, b"tail-no-newline");
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_allows_line_exactly_at_limit() {
+        let data = [vec![b'a'; 8], b"\n".to_vec()].concat();
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf, 8).await.unwrap(),
+            BoundedLine::Line
+        ));
+        assert_eq!(buf.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_over_limit_line_without_buffering_it() {
+        // A 1 MiB line against an 8-byte limit: TooLong, with at most `limit`
+        // bytes buffered — the reader must not slurp the rest.
+        let data = [vec![b'a'; 1024 * 1024], b"\n".to_vec()].concat();
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert!(matches!(
+            read_line_bounded(&mut reader, &mut buf, 8).await.unwrap(),
+            BoundedLine::TooLong
+        ));
+        assert!(
+            buf.len() <= 8,
+            "buffered {} bytes past the limit",
+            buf.len()
+        );
+    }
 }
