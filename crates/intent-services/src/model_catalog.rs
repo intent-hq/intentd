@@ -149,10 +149,11 @@ fn claude_code_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("claude-code")
 }
 
-/// claude-code cache entries are keyed to the adapter pin so a version bump
-/// invalidates them automatically.
+/// claude-code cache entries are keyed to the full pinned npx package spec
+/// (name + version) so both a version bump and a package rename invalidate
+/// them automatically.
 fn claude_code_version() -> String {
-    intent_providers::CLAUDE_AGENT_ACP_VERSION.to_string()
+    intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE.to_string()
 }
 
 /// codex source: ACP probe via a resolved `codex-acp` binary, else the pinned
@@ -320,7 +321,12 @@ impl ModelCatalogCache {
     /// `version_key` — a version-pin bump invalidates automatically. An entry
     /// fetched in the future (system clock moved backwards) is not fresh, so
     /// a persisted entry can never outlive the TTL through clock adjustments.
-    fn fresh(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<Vec<Value>> {
+    pub(crate) fn fresh(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        now_ms: u64,
+    ) -> Option<Vec<Value>> {
         let entries = self.entries.lock().expect("model catalog cache poisoned");
         let entry = entries.get(provider_id)?;
         if entry.version_key != version_key || now_ms < entry.fetched_at_ms {
@@ -343,7 +349,13 @@ impl ModelCatalogCache {
     /// model rows) so concurrent stores for different providers cannot land
     /// their snapshots on disk out of order; temp-file + rename keeps a crash
     /// mid-write from corrupting the previous snapshot.
-    fn store(&self, provider_id: &str, version_key: &str, models: Vec<Value>, now_ms: u64) {
+    pub(crate) fn store(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        models: Vec<Value>,
+        now_ms: u64,
+    ) {
         let mut entries = self.entries.lock().expect("model catalog cache poisoned");
         entries.insert(
             provider_id.to_string(),
@@ -371,7 +383,12 @@ impl ModelCatalogCache {
     /// [`MODELS_NEGATIVE_TTL`] **and** was recorded under `version_key`. Same
     /// clock-backwards guard as [`Self::fresh`]: an entry stamped ahead of
     /// `now` is not fresh.
-    fn negative_reason(&self, provider_id: &str, version_key: &str, now_ms: u64) -> Option<String> {
+    pub(crate) fn negative_reason(
+        &self,
+        provider_id: &str,
+        version_key: &str,
+        now_ms: u64,
+    ) -> Option<String> {
         let negative = self.negative.lock().expect("model negative cache poisoned");
         let entry = negative.get(provider_id)?;
         if entry.version_key != version_key || now_ms < entry.failed_at_ms {

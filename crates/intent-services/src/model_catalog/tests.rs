@@ -200,9 +200,11 @@ fn registry_version_keys_follow_adapter_pins() {
     let key = |provider: &str| (source_for(provider).unwrap().version_key)();
     assert_eq!(key("auggie"), "");
     assert_eq!(key("cortex"), "");
+    // Keyed on the full npx package spec (name + version), not just the
+    // version constant, so a package rename also invalidates cache entries.
     assert_eq!(
         key("claude-code"),
-        intent_providers::CLAUDE_AGENT_ACP_VERSION
+        intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
     );
     assert_eq!(key("pi"), crate::provider_models::PI_ACP_NPX_PACKAGE);
     assert_eq!(key("droid"), "");
