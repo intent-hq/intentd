@@ -439,13 +439,44 @@ pub(crate) fn static_provider_response(provider_id: &str, warning: String) -> Va
     })
 }
 
+/// Resolve the auggie binary for daemon-side CLI fetches with an injectable
+/// discovery step (unit-test seam for the resolution order): the explicit
+/// override wins, else `discover` is consulted.
+fn resolve_auggie_bin_with<F>(
+    auggie_bin: Option<std::path::PathBuf>,
+    discover: F,
+) -> Option<std::path::PathBuf>
+where
+    F: FnOnce() -> Option<std::path::PathBuf>,
+{
+    auggie_bin.or_else(discover)
+}
+
+/// Resolve the auggie binary for daemon-side CLI fetches: the explicit
+/// override (the [`crate::Services::with_auggie_bin`] test seam) wins, else
+/// canonical discovery ([`intent_context::discovery::find_auggie`] — the
+/// Intent-managed binary, then the enhanced-PATH scan) so a packaged app
+/// with a minimal process PATH still finds the CLI. Returns `None` when
+/// discovery fails, so callers keep their static/transcript fallbacks.
+fn resolve_auggie_bin(auggie_bin: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    resolve_auggie_bin_with(auggie_bin, intent_context::discovery::find_auggie)
+}
+
 /// Best-effort `agent.getModels` dynamic fetch: run `auggie model list`, parse
 /// stdout (then stderr), and map to wire models. Returns `Ok(None)` when the
 /// CLI is unavailable or yields nothing, so the caller can fall back to
-/// [`static_models`].
-pub(crate) async fn fetch_auggie_models() -> Result<Option<Vec<Value>>> {
-    let output = match tokio::process::Command::new("auggie")
+/// [`static_models`]. The binary comes from [`resolve_auggie_bin`] and runs
+/// with the exec PATH (`intent_context::discovery::exec_path`) so its
+/// co-located `node` resolves in a packaged-app environment.
+pub(crate) async fn fetch_auggie_models(
+    auggie_bin: Option<std::path::PathBuf>,
+) -> Result<Option<Vec<Value>>> {
+    let Some(auggie) = resolve_auggie_bin(auggie_bin) else {
+        return Ok(None);
+    };
+    let output = match tokio::process::Command::new(&auggie)
         .args(["model", "list"])
+        .env("PATH", intent_context::discovery::exec_path(&auggie))
         .output()
         .await
     {
@@ -583,12 +614,16 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// [`tokio::process::Command::output`] bounded by
 /// [`AUGGIE_MODELS_TIMEOUT`]; a timeout counts as fetch failure (`None`).
 /// `kill_on_drop` reaps the child when the timeout cancels the output
-/// future, so a wedged CLI does not leak past the failed probe.
+/// future, so a wedged CLI does not leak past the failed probe. The child
+/// runs with the exec PATH (`intent_context::discovery::exec_path`) so the
+/// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
+/// environment.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
     tokio::time::timeout(
         AUGGIE_MODELS_TIMEOUT,
         tokio::process::Command::new(auggie)
             .args(args)
+            .env("PATH", intent_context::discovery::exec_path(auggie))
             .kill_on_drop(true)
             .output(),
     )
@@ -603,12 +638,13 @@ async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::p
 /// then filter legacy models and sort ([`finalize_model_rows`]). Returns
 /// `None` when the CLI is unavailable, hangs past
 /// [`AUGGIE_MODELS_TIMEOUT`], or yields nothing parseable, so the caller can
-/// fall back to [`static_models`]. `auggie_bin` overrides the PATH lookup
-/// (the [`crate::Services::with_auggie_bin`] test seam).
+/// fall back to [`static_models`]. `auggie_bin` overrides discovery
+/// (the [`crate::Services::with_auggie_bin`] test seam); otherwise the
+/// binary comes from [`resolve_auggie_bin`].
 pub(crate) async fn fetch_auggie_models_rich(
     auggie_bin: Option<std::path::PathBuf>,
 ) -> Option<Vec<Value>> {
-    let auggie = auggie_bin.unwrap_or_else(|| std::path::PathBuf::from("auggie"));
+    let auggie = resolve_auggie_bin(auggie_bin)?;
     let mut rows: Option<Vec<Value>> = None;
     if let Some(output) = auggie_output(&auggie, &["model", "list", "--json"]).await {
         rows = parse_model_list_json(&String::from_utf8_lossy(&output.stdout))
@@ -666,9 +702,17 @@ pub(crate) fn parse_session_stats_output(stdout: &str) -> Option<SessionStats> {
 /// `auggie session stats <sessionId> --json` and parse stdout (then stderr).
 /// Returns `None` when the CLI is unavailable or emits nothing parseable, so the
 /// caller can fall back to transcript-derived counts with `creditsUsed = null`.
-pub(crate) async fn fetch_session_stats(session_id: &AgentId) -> Option<SessionStats> {
-    let output = tokio::process::Command::new("auggie")
+/// The binary comes from [`resolve_auggie_bin`] (`auggie_bin` is the
+/// [`crate::Services::with_auggie_bin`] test seam) and runs with the exec
+/// PATH so its co-located `node` resolves.
+pub(crate) async fn fetch_session_stats(
+    auggie_bin: Option<std::path::PathBuf>,
+    session_id: &AgentId,
+) -> Option<SessionStats> {
+    let auggie = resolve_auggie_bin(auggie_bin)?;
+    let output = tokio::process::Command::new(&auggie)
         .args(["session", "stats", session_id.0.as_str(), "--json"])
+        .env("PATH", intent_context::discovery::exec_path(&auggie))
         .output()
         .await
         .ok()?;
@@ -1993,7 +2037,7 @@ impl Services {
 
     /// `agent.getModels`: auggie CLI with the static-tier fallback (PROTOCOL §5.5).
     pub(crate) async fn agent_get_models_op(&self) -> Result<Value> {
-        let models = match fetch_auggie_models().await? {
+        let models = match fetch_auggie_models(self.auggie_bin.clone()).await? {
             Some(m) => m,
             None => static_models(),
         };
@@ -2531,7 +2575,7 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {session_id}")));
             }
         }
-        let stats = match fetch_session_stats(&session_id).await {
+        let stats = match fetch_session_stats(self.auggie_bin.clone(), &session_id).await {
             Some(cli) => cli,
             None => {
                 let (message_count, tool_count) = transcript_counts(&session.messages);

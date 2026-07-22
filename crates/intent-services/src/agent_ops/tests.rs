@@ -25,8 +25,9 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
-    finalize_model_rows, parse_model_list_json, parse_model_list_output,
-    parse_session_stats_output, static_models,
+    fetch_auggie_models, fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows,
+    parse_model_list_json, parse_model_list_output, parse_session_stats_output,
+    resolve_auggie_bin_with, static_models,
 };
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
@@ -2932,6 +2933,109 @@ fn finalize_model_rows_filters_legacy_and_sorts() {
     assert!(out
         .iter()
         .all(|r| r.as_object().unwrap().get("isLegacyModel").is_none()));
+}
+
+#[test]
+fn resolve_auggie_bin_seam_wins_over_discovery() {
+    let seam = PathBuf::from("/tmp/intentd-test/seam-auggie");
+    let got = resolve_auggie_bin_with(Some(seam.clone()), || {
+        panic!("discovery must not run when the seam is set")
+    });
+    assert_eq!(got, Some(seam));
+}
+
+#[test]
+fn resolve_auggie_bin_uses_discovery_when_seam_unset() {
+    // With no explicit binary, the discovery-resolved path (e.g. found in an
+    // enhanced dir off the process PATH) is used; when discovery also fails,
+    // resolution yields None so callers keep their static fallbacks.
+    let discovered = PathBuf::from("/enhanced/dir/auggie");
+    assert_eq!(
+        resolve_auggie_bin_with(None, || Some(discovered.clone())),
+        Some(discovered)
+    );
+    assert_eq!(resolve_auggie_bin_with(None, || None), None);
+}
+
+/// A fake auggie whose success is gated on its own parent dir being on the
+/// child's `$PATH` — the exec-path contract (`discovery::exec_path` prepends
+/// the binary's dir so its co-located `node` resolves). The temp dir is not
+/// on the process PATH, so the fetch only succeeds when the spawn sets the
+/// child's PATH explicitly.
+#[cfg(unix)]
+fn fake_path_gated_auggie(tag: &str, stdout: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("intentd-agentops-{tag}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("auggie");
+    let script = format!(
+        "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{dir}:\"*) printf '%s' '{stdout}' ;;\n  *) exit 1 ;;\nesac\n",
+        dir = dir.display(),
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_auggie_models_rich_child_path_includes_binary_dir() {
+    let bin = fake_path_gated_auggie(
+        "rich",
+        r#"{"models":[{"shortName":"m1","displayName":"M1"}]}"#,
+    );
+    let rows = fetch_auggie_models_rich(Some(bin))
+        .await
+        .expect("dynamic rows when the child PATH carries the binary dir");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "m1");
+    assert_eq!(rows[0]["provider"], "auggie");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_auggie_models_child_path_includes_binary_dir() {
+    let bin = fake_path_gated_auggie("legacy", "- Sonnet 4.5 [sonnet4.5]");
+    let models = fetch_auggie_models(Some(bin))
+        .await
+        .expect("no error")
+        .expect("dynamic rows when the child PATH carries the binary dir");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["id"], "sonnet4.5");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_session_stats_child_path_includes_binary_dir() {
+    let bin = fake_path_gated_auggie(
+        "stats",
+        r#"{"creditsUsed":1.5,"messageCount":2,"toolCount":3}"#,
+    );
+    let stats = fetch_session_stats(Some(bin), &AgentId::from("agent-x"))
+        .await
+        .expect("stats when the child PATH carries the binary dir");
+    assert_eq!(stats.credits_used, Some(1.5));
+    assert_eq!(stats.message_count, 2);
+    assert_eq!(stats.tool_count, 3);
+}
+
+#[tokio::test]
+async fn auggie_fetches_return_none_for_unresolvable_binary() {
+    let missing = std::env::temp_dir()
+        .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
+        .join("auggie");
+    assert!(fetch_auggie_models_rich(Some(missing.clone()))
+        .await
+        .is_none());
+    assert!(fetch_auggie_models(Some(missing.clone()))
+        .await
+        .expect("no error")
+        .is_none());
+    assert!(
+        fetch_session_stats(Some(missing), &AgentId::from("agent-x"))
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]

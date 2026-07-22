@@ -381,6 +381,28 @@ fn parse_opencode_models_empty_output() {
     assert!(parse_opencode_models("no models\n").is_empty());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn opencode_models_cli_child_path_includes_binary_dir() {
+    // A fake opencode whose success is gated on its own parent dir being on
+    // the child's $PATH — the enhanced-path contract shared with the ACP
+    // probe spawns. The temp dir is not on the process PATH, so the run only
+    // succeeds when the spawn sets the child's PATH explicitly.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("opencode");
+    let script = format!(
+        "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{dir}:\"*) printf '%s' 'anthropic/claude-3\n' ;;\n  *) exit 1 ;;\nesac\n",
+        dir = dir.path().display(),
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = super::run_opencode_models_cli(bin)
+        .await
+        .expect("exit 0 when the child PATH carries the binary dir");
+    assert!(stdout.contains("anthropic/claude-3"));
+}
+
 #[test]
 fn isolated_codex_home_seeds_auth_but_never_config() {
     let user = tempfile::tempdir().unwrap();
