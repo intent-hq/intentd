@@ -22,7 +22,7 @@ hosting = "github"
 # Whether to install an updater program
 install-updater = false
 # Post-announce: publish/update the stable.json / beta.json channel manifests
-post-announce-jobs = ["./publish-channel-manifest"]
+post-announce-jobs = ["./publish-channel-manifest", "./build-deb"]
 
 # aarch64 linux would default to the `ubuntu-22.04-arm` runner, which is only
 # available on public repos. Build it on x86_64 instead (dist cross-compiles

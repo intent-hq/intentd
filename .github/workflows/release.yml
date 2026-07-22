@@ -350,3 +350,12 @@ jobs:
     with:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
+
+  custom-build-deb:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/build-deb.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
