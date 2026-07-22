@@ -404,7 +404,7 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 }
 
 #[test]
-fn isolated_codex_home_seeds_auth_but_never_config() {
+fn isolated_codex_home_seeds_auth_but_never_mcp_servers() {
     let user = tempfile::tempdir().unwrap();
     std::fs::write(
         user.path().join("config.toml"),
@@ -417,11 +417,100 @@ fn isolated_codex_home_seeds_auth_but_never_config() {
     assert!(home.path().is_dir());
     assert_ne!(home.path(), user.path());
     assert!(home.path().join("auth.json").is_file());
+    // No allowlisted scalar keys ⇒ no config.toml at all; mcp_servers never
+    // reaches the probe home.
     assert!(!home.path().join("config.toml").exists());
 
     let probe_home = home.path().to_path_buf();
     drop(home);
     assert!(!probe_home.exists());
+}
+
+#[test]
+fn isolated_codex_home_seeds_only_allowlisted_config_scalars() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(
+        user.path().join("config.toml"),
+        concat!(
+            "model = \"gpt-5.6-sol\"\n",
+            "model_reasoning_effort = \"high\"\n",
+            "sandbox_mode = \"danger-full-access\"\n",
+            "[mcp_servers.codebase-retrieval]\n",
+            "command = \"auggie\"\n",
+        ),
+    )
+    .unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    let seeded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let doc: toml_edit::DocumentMut = seeded.parse().unwrap();
+    assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
+    assert_eq!(doc["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(doc.as_table().len(), 2);
+    assert!(doc.get("mcp_servers").is_none());
+    assert!(doc.get("sandbox_mode").is_none());
+}
+
+#[test]
+fn isolated_codex_home_seeds_model_without_effort() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("config.toml"), "model = \"gpt-5.6-sol\"\n").unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    let seeded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let doc: toml_edit::DocumentMut = seeded.parse().unwrap();
+    assert_eq!(doc["model"].as_str(), Some("gpt-5.6-sol"));
+    assert_eq!(doc.as_table().len(), 1);
+}
+
+#[test]
+fn isolated_codex_home_seeds_effort_without_model() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(
+        user.path().join("config.toml"),
+        "model_reasoning_effort = \"high\"\n",
+    )
+    .unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    let seeded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let doc: toml_edit::DocumentMut = seeded.parse().unwrap();
+    assert_eq!(doc["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(doc.as_table().len(), 1);
+}
+
+#[test]
+fn isolated_codex_home_skips_non_string_allowlisted_keys() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(
+        user.path().join("config.toml"),
+        "[model]\nnested = \"not-a-scalar\"\n",
+    )
+    .unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    assert!(!home.path().join("config.toml").exists());
+}
+
+#[test]
+fn isolated_codex_home_tolerates_malformed_config() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("config.toml"), "model = [unclosed\n").unwrap();
+    std::fs::write(user.path().join("auth.json"), "{\"tokens\":{}}").unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    assert!(home.path().join("auth.json").is_file());
+    assert!(!home.path().join("config.toml").exists());
+}
+
+#[test]
+fn isolated_codex_home_tolerates_absent_config() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("auth.json"), "{\"tokens\":{}}").unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    assert!(home.path().join("auth.json").is_file());
+    assert!(!home.path().join("config.toml").exists());
 }
 
 #[test]
