@@ -66,6 +66,42 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 | `intent-pty` | Unified `portable-pty` host for interactive terminals **and** scripts. |
 | `intent-search` | Gitignore-aware content + filename search over ripgrep/`ignore`/`globset`. |
 
+## Install
+
+> **Note:** the installers below download artifacts from public GitHub Release URLs, so
+> they require this repository (and `intent-hq/homebrew-tap`) to be **public**. Both are
+> currently **private**, so these commands will fail with 404/authentication errors until
+> the repos are opened up. In the meantime, build from source (see
+> [Quickstart](#quickstart)) or download release assets via the GitHub API with a token.
+
+### Homebrew (macOS / Linux)
+
+```sh
+brew tap intent-hq/tap
+brew install intentd
+# or in one step:
+brew install intent-hq/tap/intentd
+```
+
+The formula lives in [intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap)
+and covers both macOS targets (Apple Silicon `aarch64-apple-darwin` and Intel
+`x86_64-apple-darwin`) as well as Linux. Every `vX.Y.Z` release updates the formula
+automatically, so **the tap tracks the latest release — i.e. the beta channel**;
+promoting a release to stable (see [Releases & channels](#releases--channels)) does not
+touch the tap.
+
+### Shell installer (macOS / Linux)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/intent-hq/intentd/releases/latest/download/intentd-installer.sh | sh
+```
+
+### PowerShell installer (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/intent-hq/intentd/releases/latest/download/intentd-installer.ps1 | iex"
+```
+
 ## Quickstart
 
 ```bash
@@ -144,6 +180,11 @@ Releases are tag-driven and built by [dist (cargo-dist)](https://axodotdev.githu
 publishes a GitHub Release with per-platform archives, `.sha256` checksums, and shell /
 PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
+It also pushes an updated Homebrew formula to
+[intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap) (the
+`publish-homebrew-formula` job, authenticated via the `HOMEBREW_TAP_TOKEN` secret). The
+tap always reflects the **latest release (beta channel)**; the stable promotion workflow
+below only updates the stable channel manifest and never touches the tap.
 
 Channels follow a **promotion model** — channel routing does not depend on prerelease
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
