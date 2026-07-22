@@ -377,20 +377,28 @@ pub async fn provider_auth_status(provider_id: Option<&str>, force: bool) -> Res
         },
         None => AUTH_PROBE_PROVIDERS.to_vec(),
     };
-    let handles: Vec<_> = selected
-        .iter()
-        .map(|id| {
-            let id: &'static str = id;
-            tokio::spawn(async move { resolve_auth_status(id, force).await })
-        })
-        .collect();
-    let mut providers = Vec::with_capacity(handles.len());
-    for (id, handle) in selected.iter().zip(handles) {
-        // A panicked probe task degrades to unknown rather than failing the
-        // whole status call.
-        let authenticated = handle.await.unwrap_or(None);
-        providers.push(json!({ "id": id, "authenticated": authenticated }));
+    // JoinSet (not bare `tokio::spawn`) so dropping this future — client
+    // disconnect / request cancellation — aborts in-flight probe tasks
+    // instead of leaving CLIs/ACP probes running in the background.
+    let mut set = tokio::task::JoinSet::new();
+    for (index, id) in selected.iter().enumerate() {
+        let id: &'static str = id;
+        set.spawn(async move { (index, resolve_auth_status(id, force).await) });
     }
+    // A panicked probe task degrades to unknown rather than failing the
+    // whole status call; response order stays fixed regardless of
+    // completion order.
+    let mut statuses: Vec<Option<bool>> = vec![None; selected.len()];
+    while let Some(joined) = set.join_next().await {
+        if let Ok((index, authenticated)) = joined {
+            statuses[index] = authenticated;
+        }
+    }
+    let providers: Vec<Value> = selected
+        .iter()
+        .zip(statuses)
+        .map(|(id, authenticated)| json!({ "id": id, "authenticated": authenticated }))
+        .collect();
     Ok(json!({ "providers": providers }))
 }
 
