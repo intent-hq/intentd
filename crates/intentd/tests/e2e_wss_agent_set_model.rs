@@ -1,6 +1,6 @@
 //! WSS e2e test for STAB-115: `agent.setModel` triggering provider respawn.
 //!
-//! Boots a real `intentd serve --listen both` against the mock ACP provider and
+//! Boots a real `intentd serve` (WSS listener enabled via config) against the mock ACP provider and
 //! verifies that calling `agent.setModel` while a provider child is live causes
 //! the next turn to respawn the child with the new model.
 //!
@@ -58,10 +58,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     let secrets_file = data_dir.join("secrets.json");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_SECRETS_FILE", &secrets_file)

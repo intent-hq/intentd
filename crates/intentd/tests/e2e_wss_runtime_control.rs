@@ -78,10 +78,11 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         .expect("open daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    if listen != "uds" {
+        common::enable_ws_api(data_dir);
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
     cmd.arg("serve")
-        .arg("--listen")
-        .arg(listen)
         .env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
@@ -258,7 +259,7 @@ where
 async fn runtime_ws_listener_toggle_over_wss() {
     let data_dir = temp_data_dir();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
-    // Start daemon with both UDS and TCP (--listen both)
+    // Start daemon with both UDS and TCP (server.wsApi.enabled seeded in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
@@ -393,9 +394,9 @@ async fn runtime_ws_listener_toggle_over_wss() {
     );
 }
 
-/// Regression test: boot with --listen uds + persisted server.wsApi.enabled=true
+/// Regression test: boot UDS-only + persisted server.wsApi.enabled=true
 /// should auto-start the WSS listener. This tests the sidecar/packaged posture
-/// where the daemon is spawned with --listen uds but the user has previously
+/// where the daemon is spawned UDS-only but the user has previously
 /// enabled the WSS listener via the UI toggle. Before the fix, the persisted
 /// setting was ignored at boot and the listener stayed down until manual toggle.
 #[tokio::test]
@@ -404,7 +405,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     let port_s = free_port().to_string();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", &port_s)];
 
-    // STEP 1: Boot with --listen uds, persist server.wsApi.enabled=true
+    // STEP 1: Boot UDS-only, persist server.wsApi.enabled=true
     let child = spawn_serve(&data_dir, "uds", &env);
     let mut _daemon = Daemon {
         child,
@@ -533,7 +534,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     // Drop the first daemon without cleanup; process already exited
     drop(_daemon);
 
-    // STEP 3: Boot again with --listen uds (same data dir, persisted setting is true)
+    // STEP 3: Boot again UDS-only (same data dir, persisted setting is true)
     let child2 = spawn_serve(&data_dir, "uds", &env);
     let _daemon2 = Daemon {
         child: child2,
@@ -715,12 +716,12 @@ async fn wss_system_status_includes_capacity_version_uptime() {
 
 #[tokio::test]
 async fn runtime_toggled_wss_serves_system_status() {
-    // Daemon starts with --listen uds, then toggles WSS on at runtime via
+    // Daemon starts UDS-only, then toggles WSS on at runtime via
     // settings.update. Verify system.status works over the runtime-started
     // WSS listener (tests OnceLock control population, §5.7).
     let data_dir = temp_data_dir();
     let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
-    // Start daemon with ONLY UDS (--listen uds)
+    // Start daemon with ONLY UDS (no wsApi config seed)
     let _daemon = Daemon {
         child: spawn_serve(&data_dir, "uds", &env),
         data_dir: data_dir.clone(),
