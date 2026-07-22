@@ -3299,9 +3299,12 @@ const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
 /// orphaning grandchildren. SIGTERM first for a clean exit, then SIGKILL after a
-/// grace period to sweep anything that ignored it.
+/// grace period to sweep anything that ignored it. Descendants that escaped
+/// into their OWN process groups survive the `killpg`, so they are snapshotted
+/// before the kill and swept afterwards (`intent_acp::descendant_sweep`).
 #[cfg(unix)]
 async fn kill_child_tree(mut child: Child) {
+    use intent_acp::{descendant_pids, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
@@ -3309,12 +3312,14 @@ async fn kill_child_tree(mut child: Child) {
         let _ = child.start_kill();
         return;
     };
+    let descendants = descendant_pids(pid).await;
     let pgid = Pid::from_raw(pid as i32);
     let _ = killpg(pgid, Signal::SIGTERM);
     // Wait briefly for the group to drain, then SIGKILL the whole group so any
     // grandchild that ignored SIGTERM is still removed.
     let _ = tokio::time::timeout(PROCESS_GROUP_TERM_GRACE, child.wait()).await;
     let _ = killpg(pgid, Signal::SIGKILL);
+    sweep_escaped_descendants(&descendants).await;
 }
 
 /// Non-unix fallback: no process groups, so fall back to killing the direct
@@ -3329,11 +3334,22 @@ async fn kill_child_tree(mut child: Child) {
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
 /// still-live group is SIGKILLed — so total teardown is ~one grace period
 /// regardless of how many agents were running (unlike per-child
-/// [`kill_child_tree`], which serialises one grace window per tree).
+/// [`kill_child_tree`], which serialises one grace window per tree). The
+/// pre-kill descendant snapshot (bounded at 2s for a hung `ps`) and the
+/// post-kill escape sweep (one extra grace window when something escaped)
+/// add hard-bounded overhead on top of that shared window.
 #[cfg(unix)]
 async fn kill_child_trees(children: Vec<Child>) {
+    use intent_acp::{descendant_pids_many, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
+
+    // Phase 0: snapshot every tree's descendants BEFORE signalling (one shared
+    // `ps` for the whole batch) so descendants that escaped into their own
+    // process groups can be swept after the group kills — post-kill they
+    // reparent to init and become invisible (`intent_acp::descendant_sweep`).
+    let roots: Vec<u32> = children.iter().filter_map(|c| c.id()).collect();
+    let descendants = descendant_pids_many(&roots).await;
 
     // Phase 1: SIGTERM every group up-front so all trees start exiting at once.
     let mut pgids = Vec::new();
@@ -3378,6 +3394,10 @@ async fn kill_child_trees(children: Vec<Child>) {
     for mut w in pending {
         let _ = tokio::time::timeout_at(reap_deadline, &mut w).await;
     }
+    // Phase 5: sweep snapshotted descendants that survived the group kills
+    // (foreign process groups). No-cost when nothing escaped; otherwise one
+    // extra bounded SIGTERM→grace→SIGKILL pass over the survivors.
+    sweep_escaped_descendants(&descendants).await;
 }
 
 /// Non-unix fallback: no process groups, so kill each direct child; the kills
