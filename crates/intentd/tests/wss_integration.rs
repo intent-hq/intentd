@@ -1000,6 +1000,29 @@ async fn wss_models_list_with_provider_id_and_force_refresh() {
         "static" => assert!(resp["result"]["warning"].is_string(), "{resp}"),
         other => panic!("unexpected source '{other}': {resp}"),
     }
+
+    // grok (native `grok models` CLI probe): same host-dependent contract —
+    // dynamic rows under `source: "grok"`, or the static fallback + warning
+    // when the CLI is missing/unauthenticated. Never an error.
+    let frame = r#"{"jsonrpc":"2.0","id":12,"method":"models.list","params":{"providerId":"grok","forceRefresh":true}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 12);
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["providerId"], "grok");
+    let models = resp["result"]["models"].as_array().expect("models");
+    match resp["result"]["source"].as_str().expect("source") {
+        "grok" => {
+            assert!(!models.is_empty(), "{resp}");
+            for m in models {
+                assert!(m["id"].is_string(), "{m}");
+                assert!(m["name"].is_string(), "{m}");
+                assert_eq!(m["provider"], "grok", "{m}");
+            }
+        }
+        "static" => assert!(resp["result"]["warning"].is_string(), "{resp}"),
+        other => panic!("unexpected source '{other}': {resp}"),
+    }
     srv.ws.stop().await;
 }
 

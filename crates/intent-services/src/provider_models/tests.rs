@@ -381,6 +381,112 @@ fn parse_opencode_models_empty_output() {
     assert!(parse_opencode_models("no models\n").is_empty());
 }
 
+/// A successful [`std::process::ExitStatus`] for the pure grok outcome seam.
+fn exit_ok() -> std::process::ExitStatus {
+    std::process::ExitStatus::default()
+}
+
+#[test]
+fn grok_outcome_maps_text_rows_to_wire_shape() {
+    // Canned `grok models` text output: the shared intent-providers parser
+    // extracts the rows; this seam maps them onto §5.30 wire rows.
+    let fetch = super::grok_fetch_outcome(
+        "You are logged in with grok.com.\ngrok-build  Grok Build  Default model\nopus-4-8  Opus 4.8",
+        exit_ok(),
+        "",
+    );
+    let rows = fetch.models.expect("models present");
+    assert!(fetch.warning.is_none());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        json!({ "id": "grok-build", "name": "Grok Build", "provider": "grok",
+                "description": "Default model" })
+    );
+    // description omitted (not null) when the CLI doesn't report one
+    assert_eq!(
+        rows[1],
+        json!({ "id": "opus-4-8", "name": "Opus 4.8", "provider": "grok" })
+    );
+}
+
+#[test]
+fn grok_outcome_json_payload_wins_over_text_rows() {
+    let fetch = super::grok_fetch_outcome(
+        r#"{"models":{"availableModels":[{"modelId":"grok-4.5","name":"Grok 4.5","description":"Flagship"}]}}"#,
+        exit_ok(),
+        "",
+    );
+    let rows = fetch.models.expect("models present");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0],
+        json!({ "id": "grok-4.5", "name": "Grok 4.5", "provider": "grok",
+                "description": "Flagship" })
+    );
+}
+
+#[test]
+fn grok_outcome_logged_out_degrades_to_auth_required() {
+    // An explicit logged-out marker wins even on exit 0 — the grok CLI exits
+    // 0 in both auth states, so the exit code is never trusted.
+    let fetch = super::grok_fetch_outcome(
+        "You are not authenticated. Please log in with `grok login`.",
+        exit_ok(),
+        "",
+    );
+    assert!(fetch.models.is_none());
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("grok: authentication required")
+    );
+}
+
+#[test]
+fn grok_outcome_empty_success_degrades_to_no_models() {
+    let fetch = super::grok_fetch_outcome("", exit_ok(), "");
+    assert!(fetch.models.is_none());
+    assert_eq!(fetch.warning.as_deref(), Some("grok: no models reported"));
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_outcome_failed_exit_without_rows_is_attributed() {
+    // The warning must carry the actual exit status (parity with the
+    // opencode warning) plus the stderr tail.
+    let fetch = super::grok_fetch_outcome("", exit_status(1), "grok: command crashed\n");
+    assert!(fetch.models.is_none());
+    let warning = fetch.warning.expect("warning present");
+    assert!(
+        warning.starts_with("grok: grok models exited with exit status: 1"),
+        "{warning}"
+    );
+    assert!(warning.contains("command crashed"), "{warning}");
+}
+
+#[test]
+fn stderr_tail_keeps_last_200_chars() {
+    assert_eq!(super::stderr_tail("  boom \n"), "boom");
+    let long = format!("{}{}", "x".repeat(500), "y".repeat(200));
+    let tail = super::stderr_tail(&long);
+    assert_eq!(tail.chars().count(), 200);
+    assert_eq!(tail, "y".repeat(200));
+    // Multi-byte chars: the boundary walk must never split a char.
+    let unicode = "é".repeat(300);
+    let tail = super::stderr_tail(&unicode);
+    assert_eq!(tail.chars().count(), 200);
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_outcome_rows_win_over_failed_exit() {
+    // Parsed rows with a non-zero exit still serve the catalog — stdout is
+    // the contract, not the exit code.
+    let fetch = super::grok_fetch_outcome("grok-build  Grok Build", exit_status(1), "noise");
+    let rows = fetch.models.expect("models present");
+    assert_eq!(rows[0]["id"], "grok-build");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn opencode_models_cli_child_path_includes_binary_dir() {
@@ -401,6 +507,53 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
         .await
         .expect("exit 0 when the child PATH carries the binary dir");
     assert!(stdout.contains("anthropic/claude-3"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grok_models_cli_child_path_includes_binary_dir() {
+    // Same enhanced-path contract as the opencode CLI spawn: the fake grok
+    // only succeeds when its own parent dir is on the child's $PATH.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("grok");
+    let script = format!(
+        "#!/bin/sh\ncase \":$PATH:\" in\n  *\":{dir}:\"*) printf '%s\\n' 'grok-build  Grok Build' ;;\n  *) exit 1 ;;\nesac\n",
+        dir = dir.path().display(),
+    );
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = super::run_grok_models_cli(bin, super::GROK_CLI_TIMEOUT)
+        .await
+        .expect("spawn succeeds");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("grok-build"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grok_cli_timeout_flows_into_attributed_warning() {
+    // A wedged `grok models` must be cut short and the timeout reason must
+    // surface through the fetch attribution (`grok: ...`). No wall-clock
+    // bound (parity with the opencode analog): a first-exec Gatekeeper scan
+    // on macOS can delay the spawn itself by seconds, and the attributed
+    // warning already proves the timeout path fired.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("grok");
+    std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let fetch = super::ProviderModelsFetch::unavailable(
+        "grok",
+        super::run_grok_models_cli(bin, std::time::Duration::from_millis(100))
+            .await
+            .unwrap_err(),
+    );
+    assert!(fetch.models.is_none());
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("grok: grok models timed out")
+    );
 }
 
 #[test]
