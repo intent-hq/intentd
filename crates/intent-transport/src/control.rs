@@ -27,7 +27,8 @@ pub struct SystemStatus {
     /// Whether the TCP/WSS listener is currently active (runtime state, not a
     /// boot-time flag).
     pub tcp: bool,
-    /// The bound WSS port, when the TCP listener is running.
+    /// The bound TCP listener port (secure WSS, or plain-ws under
+    /// `--insecure`), when the listener is running.
     pub port: Option<u16>,
     /// Currently-connected WebSocket clients (UDS connections are not tracked).
     pub clients: usize,

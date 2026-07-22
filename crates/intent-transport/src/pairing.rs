@@ -121,8 +121,9 @@ async fn get_info_json(provider: &dyn ServerPairingInfo) -> Result<Value> {
     let snapshot = provider.pairing_snapshot().await;
     let port = snapshot.port.ok_or_else(|| {
         Error::Unsupported(
-            "TCP listener is not running — enable the WSS listener (server.wsApi.enabled) \
-             before pairing"
+            "TCP listener is not running — ensure the WSS listener is enabled \
+             (server.wsApi.enabled) and started successfully (check daemon logs for bind \
+             errors, e.g. port already in use) before pairing"
                 .to_string(),
         )
     })?;
