@@ -182,7 +182,10 @@ fn user_codex_dir() -> Option<PathBuf> {
 /// isolated probe home. `model` (and its effort) is what surfaces
 /// user-configured models (e.g. a newer model than the adapter presets) in
 /// codex-acp's reported catalog. Everything else — notably `mcp_servers` —
-/// is deliberately never copied.
+/// is deliberately never copied. Known limitation: a model configured only
+/// via a codex profile (`profile = "x"` + `[profiles.x].model`) or backed by
+/// a custom `[model_providers.*]` entry is not seeded — only top-level
+/// scalars are read.
 const CODEX_CONFIG_SEED_KEYS: &[&str] = &["model", "model_reasoning_effort"];
 
 /// Create a fresh temp dir to serve as a probe's `CODEX_HOME` (codex requires

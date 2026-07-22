@@ -464,6 +464,22 @@ fn isolated_codex_home_seeds_model_without_effort() {
 }
 
 #[test]
+fn isolated_codex_home_seeds_effort_without_model() {
+    let user = tempfile::tempdir().unwrap();
+    std::fs::write(
+        user.path().join("config.toml"),
+        "model_reasoning_effort = \"high\"\n",
+    )
+    .unwrap();
+
+    let home = super::isolated_codex_home(Some(user.path())).unwrap();
+    let seeded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let doc: toml_edit::DocumentMut = seeded.parse().unwrap();
+    assert_eq!(doc["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(doc.as_table().len(), 1);
+}
+
+#[test]
 fn isolated_codex_home_skips_non_string_allowlisted_keys() {
     let user = tempfile::tempdir().unwrap();
     std::fs::write(
