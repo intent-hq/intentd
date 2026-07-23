@@ -94,6 +94,155 @@ pub fn build_proposal_resource_block(block_id: &str, item: &Value) -> Value {
     block
 }
 
+/// Size cap for the collapsed-output fallback parse: a stringified
+/// `{ok, proposal}` payload larger than this is never a real proposal echo
+/// (proposals are preview+payload sized), so skip the parse entirely.
+const COLLAPSED_PROPOSAL_MAX_BYTES: usize = 256 * 1024;
+
+/// Valid proposal kinds. Parity with the `ws.app.*` bindings
+/// (`intent-acp/src/mcp_server/bindings/app/proposal.rs::PROPOSAL_KINDS`) and
+/// the FE contract (`proposal.ts::PROPOSAL_KINDS`).
+const PROPOSAL_KINDS: &[&str] = &[
+    "workspace-create",
+    "settings-change",
+    "specialist-edit",
+    "bulk-op",
+];
+
+/// Find or reconstruct the proposal resource item for a completed tool's
+/// output (§7.1). Tries [`find_proposal_resource`] first (the provider echoed
+/// the MCP content-item array intact); when the output is not an array,
+/// falls back to recovering the daemon's own `{ok: true, proposal}` text-item
+/// payload from a provider-collapsed output — auggie flattens the dual
+/// text+resource MCP content items into `{ "output": "<stringified {ok,
+/// proposal}>" }`, dropping the resource item entirely
+/// (intent-hq/monorepo#511 regression class). The fallback is guarded: the
+/// candidate string is size-capped, must parse as JSON carrying `ok: true`
+/// plus a structurally valid proposal, and the resource item is rebuilt
+/// exactly as the `ws.app.*` bindings build it, so downstream rendering is
+/// identical to the array path.
+pub fn lift_proposal_resource(output: &Value) -> Option<Value> {
+    if let Some(item) = find_proposal_resource(output) {
+        return Some(item.clone());
+    }
+    rebuild_collapsed_proposal_resource(output)
+}
+
+/// Extract the candidate stringified payload from a provider-collapsed tool
+/// output: `{ "output": "<string>" }` (auggie's shape) or a bare string.
+fn collapsed_output_text(output: &Value) -> Option<&str> {
+    match output {
+        Value::String(s) => Some(s),
+        Value::Object(m) => m.get("output")?.as_str(),
+        _ => None,
+    }
+}
+
+/// Parse a collapsed output back into the `{ok: true, proposal}` payload the
+/// daemon's own `ws.app.*` bindings emitted as their MCP text item, and
+/// rebuild the proposal resource item from it. `None` unless every guard
+/// passes: string present, within the size cap, valid JSON object with
+/// `ok: true`, and a proposal that passes the same structural validation the
+/// bindings applied before emitting it.
+fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
+    let text = collapsed_output_text(output)?;
+    if text.len() > COLLAPSED_PROPOSAL_MAX_BYTES || !text.trim_start().starts_with('{') {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(text).ok()?;
+    let obj = parsed.as_object()?;
+    if obj.get("ok") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    let proposal = obj.get("proposal")?;
+    if !is_valid_proposal(proposal) {
+        return None;
+    }
+    Some(build_proposal_resource_item(proposal))
+}
+
+/// Structural proposal validation. Parity with the `ws.app.*` bindings
+/// (`proposal.rs::is_valid_proposal`): known `kind`, non-empty
+/// `preview.title`, object `payload`.
+fn is_valid_proposal(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    let kind_valid = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(|k| PROPOSAL_KINDS.contains(&k))
+        .unwrap_or(false);
+    let preview_valid = obj
+        .get("preview")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("title"))
+        .and_then(Value::as_str)
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let payload_valid = obj.get("payload").and_then(Value::as_object).is_some();
+    kind_valid && preview_valid && payload_valid
+}
+
+/// Rebuild the MCP proposal resource item exactly as the `ws.app.*` bindings
+/// construct it (`proposal.rs::show`): uri from kind + applyToolCallId (or
+/// preview.title), name from preview.title, compact proposal JSON as `text`.
+fn build_proposal_resource_item(proposal: &Value) -> Value {
+    let name = proposal
+        .get("preview")
+        .and_then(|p| p.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("Proposal");
+    json!({
+        "type": "resource",
+        "resource": {
+            "uri": proposal_resource_uri(proposal),
+            "name": name,
+            "mimeType": PROPOSAL_RESOURCE_MIME,
+            "text": serde_json::to_string(proposal).unwrap_or_else(|_| "{}".to_string()),
+        }
+    })
+}
+
+/// Build the proposal resource URI (parity with the bindings'
+/// `proposal_resource_uri`): `intent-proposal://{kind}/{encoded id}` where id
+/// is `applyToolCallId` when present, else `preview.title`.
+fn proposal_resource_uri(proposal: &Value) -> String {
+    let kind = proposal
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let id = proposal
+        .get("applyToolCallId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            proposal
+                .get("preview")
+                .and_then(|p| p.get("title"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("untitled");
+    format!(
+        "intent-proposal://{kind}/{}",
+        percent_encode_path_segment(id)
+    )
+}
+
+/// RFC3986 percent-encoding for URI path segments: everything but unreserved
+/// (A-Z a-z 0-9 - _ . ~) is encoded. Parity with the bindings'
+/// `percent_encode_path_segment`.
+fn percent_encode_path_segment(s: &str) -> String {
+    s.as_bytes()
+        .iter()
+        .flat_map(|&b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![b as char]
+            }
+            _ => format!("%{b:02X}").chars().collect(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +366,101 @@ mod tests {
         assert_eq!(block["id"], "m:3");
         assert_eq!(block["type"], "resource");
         assert_eq!(block["resource"], proposal_item()["resource"]);
+    }
+
+    fn valid_proposal() -> Value {
+        json!({
+            "kind": "settings-change",
+            "preview": { "title": "Update Test Setting" },
+            "payload": { "key": "test.setting", "value": "new-value" },
+        })
+    }
+
+    /// The auggie-collapsed shape: the daemon's own `{ok, proposal}` text-item
+    /// payload pretty-printed into `raw_output.output` (intent-hq/monorepo#511).
+    fn collapsed_output(proposal: &Value) -> Value {
+        let text = serde_json::to_string_pretty(&json!({ "ok": true, "proposal": proposal }))
+            .expect("serialize");
+        json!({ "output": text })
+    }
+
+    #[test]
+    fn lift_proposal_resource_prefers_array_item() {
+        let output = json!([{ "type": "text", "text": "shown" }, proposal_item()]);
+        let item = lift_proposal_resource(&output).expect("array item lifted");
+        assert_eq!(item, proposal_item());
+    }
+
+    #[test]
+    fn lift_proposal_resource_rebuilds_from_collapsed_object_output() {
+        let item =
+            lift_proposal_resource(&collapsed_output(&valid_proposal())).expect("fallback lifted");
+        assert_eq!(item["type"], "resource");
+        let resource = &item["resource"];
+        assert_eq!(resource["mimeType"], PROPOSAL_RESOURCE_MIME);
+        assert_eq!(resource["name"], "Update Test Setting");
+        assert_eq!(
+            resource["uri"],
+            "intent-proposal://settings-change/Update%20Test%20Setting"
+        );
+        // The rebuilt `text` round-trips to the original proposal.
+        let text = resource["text"].as_str().expect("text is a string");
+        let parsed: Value = serde_json::from_str(text).expect("text parses");
+        assert_eq!(parsed, valid_proposal());
+    }
+
+    #[test]
+    fn lift_proposal_resource_rebuilds_from_plain_string_output() {
+        let text =
+            serde_json::to_string_pretty(&json!({ "ok": true, "proposal": valid_proposal() }))
+                .unwrap();
+        let item = lift_proposal_resource(&json!(text)).expect("string fallback lifted");
+        assert_eq!(item["resource"]["mimeType"], PROPOSAL_RESOURCE_MIME);
+    }
+
+    #[test]
+    fn lift_proposal_resource_uri_uses_apply_tool_call_id_when_present() {
+        let mut proposal = valid_proposal();
+        proposal["applyToolCallId"] = json!("tc-apply-1");
+        let item = lift_proposal_resource(&collapsed_output(&proposal)).expect("lifted");
+        assert_eq!(
+            item["resource"]["uri"],
+            "intent-proposal://settings-change/tc-apply-1"
+        );
+    }
+
+    #[test]
+    fn lift_proposal_resource_rejects_non_proposal_collapsed_outputs() {
+        // `ok: false` — the bindings only echo `ok: true` alongside a proposal.
+        let not_ok =
+            serde_json::to_string(&json!({ "ok": false, "proposal": valid_proposal() })).unwrap();
+        assert!(lift_proposal_resource(&json!({ "output": not_ok })).is_none());
+        // No `proposal` field.
+        assert!(lift_proposal_resource(&json!({ "output": "{\"ok\": true}" })).is_none());
+        // Structurally invalid proposal (unknown kind).
+        let mut bad_kind = valid_proposal();
+        bad_kind["kind"] = json!("not-a-kind");
+        assert!(lift_proposal_resource(&collapsed_output(&bad_kind)).is_none());
+        // Missing preview.title.
+        let mut no_title = valid_proposal();
+        no_title["preview"] = json!({});
+        assert!(lift_proposal_resource(&collapsed_output(&no_title)).is_none());
+        // Non-object payload.
+        let mut bad_payload = valid_proposal();
+        bad_payload["payload"] = json!("nope");
+        assert!(lift_proposal_resource(&collapsed_output(&bad_payload)).is_none());
+        // Non-JSON text and ordinary tool outputs.
+        assert!(lift_proposal_resource(&json!({ "output": "12 tests passed" })).is_none());
+        assert!(lift_proposal_resource(&json!({ "output": "(no return value)" })).is_none());
+        assert!(lift_proposal_resource(&json!({ "summary": "ok" })).is_none());
+        assert!(lift_proposal_resource(&json!(42)).is_none());
+        assert!(lift_proposal_resource(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn lift_proposal_resource_rejects_oversized_collapsed_output() {
+        let mut proposal = valid_proposal();
+        proposal["payload"]["filler"] = json!("x".repeat(COLLAPSED_PROPOSAL_MAX_BYTES));
+        assert!(lift_proposal_resource(&collapsed_output(&proposal)).is_none());
     }
 }

@@ -629,6 +629,45 @@ fn chat_tool_delta_proposal_output_emits_standalone_resource_block() {
 }
 
 #[test]
+fn chat_tool_delta_collapsed_proposal_output_emits_standalone_resource_block() {
+    // Provider-collapsed output (auggie flattens the MCP content items into
+    // `{ "output": "<stringified {ok, proposal}>" }`, dropping the resource
+    // item): the fallback lift still emits the standalone proposal block.
+    let mut s = ChatDeltaState::new(&agent());
+    let proposal = json!({
+        "kind": "settings-change",
+        "preview": { "title": "Update" },
+        "payload": { "key": "k" },
+    });
+    let text = serde_json::to_string_pretty(&json!({ "ok": true, "proposal": proposal }))
+        .expect("serialize");
+    let output = json!({ "output": text });
+    let d = s
+        .tool_delta(&tool_event(
+            "msg-c",
+            "msg-c:0",
+            "tc-c",
+            "completed",
+            Some(output.clone()),
+        ))
+        .expect("tool completed delta");
+    let added = d["added"].as_array().unwrap();
+    assert_eq!(added.len(), 3, "tool_use + tool_result + proposal resource");
+    assert_eq!(added[1]["block"]["output"], output, "output unchanged");
+    let block = &added[2]["block"];
+    assert_eq!(block["type"], "resource");
+    assert_eq!(block["id"], "msg-c:2", "proposal follows result by +1");
+    assert_eq!(
+        block["resource"]["mimeType"],
+        "application/vnd.intent.proposal+json"
+    );
+    assert_eq!(
+        block["resource"]["uri"],
+        "intent-proposal://settings-change/Update"
+    );
+}
+
+#[test]
 fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
     // An errored tool must not surface an actionable ProposalCard, even when
     // its output still carries a proposal-MIME resource item.

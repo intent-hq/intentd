@@ -445,14 +445,24 @@ async function handlePrompt(id, params) {
       // Emit tool_call_update with output (creates tool_result block in transcript).
       // The MCP result has { content: [...], isError?: boolean }. Each content item
       // can be text, image, or resource. The daemon will store the full array.
+      //
+      // With collapseToolOutput, emulate providers (e.g. auggie) that flatten
+      // the MCP content items into `{ output: "<first text item's text>" }`,
+      // dropping resource items entirely — the shape behind the proposal-lift
+      // fallback (intent-hq/monorepo#511 regression class).
       if (result && result.content && Array.isArray(result.content)) {
+        let rawOutput = result.content;
+        if (active.collapseToolOutput) {
+          const firstText = result.content.find((c) => c && c.type === 'text');
+          rawOutput = { output: firstText ? firstText.text : '' };
+        }
         note('session/update', {
           sessionId: SESSION_ID,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: result.isError ? 'error' : 'completed',
-            rawOutput: result.content,
+            rawOutput,
           },
         });
       }
