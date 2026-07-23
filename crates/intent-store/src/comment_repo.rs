@@ -199,7 +199,11 @@ impl Store {
         if let Some(raw) = existing {
             if let Ok(Value::Object(old)) = serde_json::from_str::<Value>(&raw) {
                 for (k, v) in old {
-                    if !ExtraFields::KNOWN_KEYS.contains(&k.as_str()) {
+                    // A non-bool `isOrphaned` can only be a legacy value the
+                    // importer preserved verbatim (the store itself only ever
+                    // encodes booleans here) — carry it over too.
+                    let legacy_orphaned = k == "isOrphaned" && !matches!(v, Value::Bool(_));
+                    if !ExtraFields::KNOWN_KEYS.contains(&k.as_str()) || legacy_orphaned {
                         merged.entry(k).or_insert(v);
                     }
                 }

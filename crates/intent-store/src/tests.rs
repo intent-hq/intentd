@@ -929,6 +929,8 @@ async fn comment_update_preserves_legacy_extra_keys() {
     let mut legacy = serde_json::Map::new();
     legacy.insert("legacyMarkId".to_string(), json!("mark-7"));
     legacy.insert("legacyRev".to_string(), json!(3));
+    // Wrong-typed legacy isOrphaned preserved verbatim by the importer.
+    legacy.insert("isOrphaned".to_string(), json!("yes"));
     store
         .insert_comment_with_extras(&ws_id, &c1, &legacy)
         .await
@@ -955,6 +957,9 @@ async fn comment_update_preserves_legacy_extra_keys() {
         serde_json::from_str(&raw.expect("extra_json present")).expect("valid json");
     assert_eq!(blob["legacyMarkId"], json!("mark-7"));
     assert_eq!(blob["legacyRev"], json!(3));
+    // The non-bool isOrphaned survives updates too, even though the key is
+    // otherwise store-owned.
+    assert_eq!(blob["isOrphaned"], json!("yes"));
 }
 
 /// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
