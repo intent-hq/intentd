@@ -2227,13 +2227,48 @@ mod error_tests {
         let e = JsonRpcError {
             code: -32000,
             message: "boom".to_string(),
-            data: Some(json!({"k": 1})),
+            data: None,
         };
         assert_eq!(e.to_string(), "JSON-RPC error -32000: boom");
         // Cloned equality and Debug both exercise their derives.
         let cloned = e.clone();
         assert_eq!(cloned, e);
         assert!(format!("{e:?}").contains("boom"));
+    }
+
+    #[test]
+    fn json_rpc_error_display_appends_string_data_without_quotes() {
+        let e = JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!("failed to send response, receiver dropped")),
+        };
+        assert_eq!(
+            e.to_string(),
+            "JSON-RPC error -32603: Internal error: failed to send response, receiver dropped"
+        );
+    }
+
+    #[test]
+    fn json_rpc_error_display_appends_object_data_as_compact_json() {
+        let e = JsonRpcError {
+            code: -32000,
+            message: "boom".to_string(),
+            data: Some(json!({"k": 1})),
+        };
+        assert_eq!(e.to_string(), r#"JSON-RPC error -32000: boom: {"k":1}"#);
+    }
+
+    #[test]
+    fn json_rpc_error_display_omits_null_and_empty_string_data() {
+        for data in [Some(json!(null)), Some(json!(""))] {
+            let e = JsonRpcError {
+                code: -32000,
+                message: "boom".to_string(),
+                data,
+            };
+            assert_eq!(e.to_string(), "JSON-RPC error -32000: boom");
+        }
     }
 
     #[test]

@@ -224,11 +224,44 @@ async function handlePrompt(id, params) {
   // The exit closes stdout, so the daemon's pending session/prompt fails with
   // "agent stdout closed" — the mid-turn crash the STAB terminal-failure path
   // must surface (agent:failed + requeue for agent.retry).
-  if (typeof behavior.exitDuringPromptAttempts === 'number' && behavior.exitDuringPromptAttempts > 0) {
-    const attempt = getAndIncrementAttempt();
-    if (attempt <= behavior.exitDuringPromptAttempts) {
-      log(`exiting during prompt (attempt ${attempt}/${behavior.exitDuringPromptAttempts})`);
-      process.exit(1);
+  // The attempt counter is read at most once per prompt and shared by every
+  // attempt-gated behavior below, so enabling several of them never
+  // double-increments the counter and shifts a gating window.
+  const exitGate =
+    typeof behavior.exitDuringPromptAttempts === 'number' && behavior.exitDuringPromptAttempts > 0
+      ? behavior.exitDuringPromptAttempts
+      : 0;
+  const rpcGate =
+    typeof behavior.promptRpcErrorAttempts === 'number' && behavior.promptRpcErrorAttempts > 0
+      ? behavior.promptRpcErrorAttempts
+      : 0;
+  const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
+  if (exitGate > 0 && attempt <= exitGate) {
+    log(`exiting during prompt (attempt ${attempt}/${exitGate})`);
+    process.exit(1);
+  }
+  // Provider prompt failure (monorepo#479): optionally stream one
+  // agent_message_chunk (the provider's pre-failure warning) and then answer
+  // `session/prompt` with the configured JSON-RPC error object — mirroring
+  // codex-acp, which forwards its non-fatal "Model metadata … not found"
+  // warning as agent text before the turn dies on a -32603 whose `data`
+  // carries the real backend detail. When `promptRpcErrorAttempts` is set the
+  // failure is attempt-gated (counter in MOCK_AGENT_ATTEMPT_FILE) so a retry
+  // redrive can succeed; otherwise every prompt fails.
+  if (behavior.promptRpcError) {
+    const failing = rpcGate > 0 ? attempt <= rpcGate : true;
+    if (failing) {
+      if (typeof behavior.streamBeforeErrorText === 'string' && behavior.streamBeforeErrorText.length > 0) {
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: behavior.streamBeforeErrorText },
+          },
+        });
+      }
+      log(`failing session/prompt with JSON-RPC error ${behavior.promptRpcError.code}`);
+      return send({ jsonrpc: '2.0', id, error: behavior.promptRpcError });
     }
   }
   // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
