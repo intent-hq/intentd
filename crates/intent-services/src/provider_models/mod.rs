@@ -134,11 +134,9 @@ pub async fn fetch_claude_code_models() -> ProviderModelsFetch {
 /// only the user's configured `model` / `model_reasoning_effort` so that
 /// model appears in the reported catalog.
 pub async fn fetch_codex_models() -> ProviderModelsFetch {
-    let cmd = if let Some(bin) = find_provider_binary("codex", "codex-acp", None) {
-        AcpProbeCommand::binary(bin, Vec::new())
-    } else if let Some(npx) = find_npx() {
-        AcpProbeCommand::npx(npx, intent_providers::config::CODEX_ACP_NPX_PACKAGE)
-    } else {
+    let Some(cmd) =
+        codex_probe_launch(find_provider_binary("codex", "codex-acp", None), find_npx())
+    else {
         return ProviderModelsFetch::unavailable(
             "codex",
             "codex-acp binary not found and npx unavailable for the pinned fallback",
@@ -156,6 +154,25 @@ pub async fn fetch_codex_models() -> ProviderModelsFetch {
     let outcome = run_acp_probe(cmd, parse::parse_codex_acp_models).await;
     drop(codex_home);
     finish("codex", outcome)
+}
+
+/// Pick the codex probe launch: a resolved `codex-acp` binary (the user's
+/// escape hatch) spawns with the daemon env untouched, while the pinned npx
+/// fallback is daemon-managed and gets `CODEX_PATH` / `CODEX_CONFIG` removed
+/// from its inherited env so a stray value cannot redirect the adapter (#555).
+fn codex_probe_launch(
+    resolved_bin: Option<PathBuf>,
+    npx: Option<PathBuf>,
+) -> Option<AcpProbeCommand> {
+    if let Some(bin) = resolved_bin {
+        Some(AcpProbeCommand::binary(bin, Vec::new()))
+    } else {
+        npx.map(|npx| {
+            AcpProbeCommand::npx(npx, intent_providers::config::CODEX_ACP_NPX_PACKAGE)
+                .env_remove("CODEX_PATH")
+                .env_remove("CODEX_CONFIG")
+        })
+    }
 }
 
 /// Attach a freshly created isolated `CODEX_HOME` to the codex probe command.

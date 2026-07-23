@@ -707,6 +707,59 @@ async fn acp_probe_child_receives_env_overrides() {
 }
 
 #[test]
+fn codex_probe_launch_npx_fallback_strips_codex_env() {
+    // The pinned npx fallback is daemon-managed: CODEX_PATH / CODEX_CONFIG
+    // must be removed from its child env (#555).
+    let cmd = super::codex_probe_launch(None, Some(std::path::PathBuf::from("/usr/local/bin/npx")))
+        .expect("npx fallback must produce a probe command");
+    let removed = cmd.removed_env_vars();
+    assert!(removed.iter().any(|k| k == "CODEX_PATH"));
+    assert!(removed.iter().any(|k| k == "CODEX_CONFIG"));
+}
+
+#[test]
+fn codex_probe_launch_resolved_binary_keeps_codex_env() {
+    // A resolved codex-acp binary (providers.paths override / PATH scan) is
+    // the user's escape hatch — its env must be left untouched.
+    let cmd = super::codex_probe_launch(
+        Some(std::path::PathBuf::from("/custom/codex-acp")),
+        Some(std::path::PathBuf::from("/usr/local/bin/npx")),
+    )
+    .expect("resolved binary must produce a probe command");
+    assert!(cmd.removed_env_vars().is_empty());
+    assert!(cmd.env_vars().is_empty());
+}
+
+#[test]
+fn codex_probe_launch_without_binary_or_npx_is_none() {
+    assert!(super::codex_probe_launch(None, None).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_probe_child_env_removals_reach_child() {
+    // `env_remove` must win even over an explicit `env` set, proving the
+    // removal reaches the spawned child's environment.
+    let out = tempfile::tempdir().unwrap();
+    let out_file = out.path().join("codex_path.txt");
+    let script = format!(
+        "printf %s \"${{CODEX_PATH-UNSET}}\" > '{}'",
+        out_file.display()
+    );
+    let cmd = super::probe::AcpProbeCommand::binary(
+        std::path::PathBuf::from("/bin/sh"),
+        vec!["-c".to_string(), script],
+    )
+    .env("CODEX_PATH", "/nonexistent/bogus")
+    .env_remove("CODEX_PATH");
+
+    let _ = super::probe::run_acp_probe(cmd, |_| Vec::new()).await;
+
+    let recorded = std::fs::read_to_string(&out_file).unwrap();
+    assert_eq!(recorded, "UNSET");
+}
+
+#[test]
 fn probe_ok_but_zero_models_degrades_with_warning() {
     // A successful handshake that reports zero models must still degrade to
     // an unavailable fetch with a provider-attributed warning.

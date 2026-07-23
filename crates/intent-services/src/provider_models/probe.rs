@@ -54,6 +54,7 @@ pub(super) struct AcpProbeCommand {
     program: PathBuf,
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
+    envs_removed: Vec<String>,
     /// npx-run probes get the longer cold-install timeout budget.
     via_npx: bool,
 }
@@ -65,6 +66,7 @@ impl AcpProbeCommand {
             program: npx,
             args: vec!["-y".to_string(), package.to_string()],
             envs: Vec::new(),
+            envs_removed: Vec::new(),
             via_npx: true,
         }
     }
@@ -75,6 +77,7 @@ impl AcpProbeCommand {
             program: bin,
             args,
             envs: Vec::new(),
+            envs_removed: Vec::new(),
             via_npx: false,
         }
     }
@@ -85,9 +88,20 @@ impl AcpProbeCommand {
         self
     }
 
+    /// Remove an environment variable from the probe child's inherited env.
+    pub(super) fn env_remove(mut self, key: impl Into<String>) -> Self {
+        self.envs_removed.push(key.into());
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn env_vars(&self) -> &[(String, OsString)] {
         &self.envs
+    }
+
+    #[cfg(test)]
+    pub(super) fn removed_env_vars(&self) -> &[String] {
+        &self.envs_removed
     }
 
     fn initialize_timeout(&self) -> Duration {
@@ -168,6 +182,9 @@ where
         .kill_on_drop(true);
     for (key, value) in &cmd.envs {
         command.env(key, value);
+    }
+    for key in &cmd.envs_removed {
+        command.env_remove(key);
     }
     #[cfg(unix)]
     command.process_group(0);
