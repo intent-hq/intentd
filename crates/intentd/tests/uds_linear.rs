@@ -3,6 +3,8 @@
 //! injected so the slice never touches the network (no `LINEAR_API_KEY`, no
 //! GraphQL call) and the filter/param plumbing is asserted deterministically.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -225,9 +227,7 @@ async fn start(
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_linear_engine(engine),
     );
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

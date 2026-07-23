@@ -12,6 +12,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;

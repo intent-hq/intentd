@@ -5,6 +5,8 @@
 //! `settings:changed` event. Uses an in-memory secret store so the test never
 //! touches the real OS keychain.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,9 +126,7 @@ async fn settings_round_trip_redaction_validation_and_event() {
     // store so sensitive settings never touch the real keychain.
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );

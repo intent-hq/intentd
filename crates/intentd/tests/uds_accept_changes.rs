@@ -2,6 +2,8 @@
 //! (undo-commit / undo-push / reset-to-trunk / rebase-onto-trunk / merge): drive
 //! each action against a real worktree through the daemon over a temp UDS.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -141,9 +143,8 @@ async fn serve(
     }
     let store = Store::open(&config.db_path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-    ));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let handle = tokio::spawn(async move {

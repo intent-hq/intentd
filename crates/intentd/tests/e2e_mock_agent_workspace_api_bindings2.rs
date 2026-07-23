@@ -8,6 +8,8 @@
 //! This file covers: **note**, **file**, **git**, **agent**, and **event** bindings.
 //! See `e2e_mock_agent_workspace_api_bindings.rs` for task and comment.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -91,9 +93,7 @@ async fn event_bindings_recent_files_and_query() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -337,9 +337,7 @@ async fn agent_bindings_list_and_status() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -604,9 +602,7 @@ async fn note_bindings_edit_and_edit_lines() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();

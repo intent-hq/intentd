@@ -6,6 +6,8 @@
 //! real keychain) and a mock node MCP stdio server fixture (skipped if node is
 //! unavailable).
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -139,9 +141,7 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
     );

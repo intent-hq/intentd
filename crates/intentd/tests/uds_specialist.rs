@@ -5,6 +5,8 @@
 //! malformed/unknown ids map to `-32602`. Directory roots are injected via
 //! `Services::with_specialist_dirs` so the test is hermetic.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,9 +130,7 @@ async fn start() -> Harness {
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone())
             .with_specialist_dirs(Some(user.0.clone()), Some(bundled.0.clone())),
     );

@@ -6,6 +6,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
