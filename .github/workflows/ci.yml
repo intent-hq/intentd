@@ -242,7 +242,7 @@ jobs:
   # semantics the daemon's `service install` used to generate (Type=simple,
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
-  # real release tarballs are repacked by .github/workflows/build-deb.yml).
+  # real release tarballs are repacked by .github/workflows/release-sitter.yml).
   deb-packaging:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -253,7 +253,7 @@ jobs:
           unit=packaging/deb/intentd.service
           grep -qx 'Description=Intent backend daemon (intentd)' "$unit"
           grep -qx 'Type=simple' "$unit"
-          grep -qx 'ExecStart=/usr/bin/intentd serve' "$unit"
+          grep -qx 'ExecStart=/usr/bin/intentd serve --resume-all' "$unit"
           grep -qx 'ExecStop=/usr/bin/intentd stop' "$unit"
           grep -qx 'Restart=on-failure' "$unit"
           grep -qx 'WantedBy=default.target' "$unit"

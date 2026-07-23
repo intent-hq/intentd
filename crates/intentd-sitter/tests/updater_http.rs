@@ -1,0 +1,391 @@
+//! Integration tests for the update engine against a local HTTP fixture
+//! server (127.0.0.1 only — no real network access).
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
+use std::thread;
+
+use sha2::{Digest, Sha256};
+
+use intentd_sitter::cli::Channel;
+use intentd_sitter::manifest::TARGET_TRIPLE;
+use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME};
+use intentd_sitter::state::{self, SitterState};
+use intentd_sitter::updater::{UpdateError, UpdateOutcome, Updater};
+
+/// Minimal single-purpose HTTP/1.1 fixture server: serves a fixed
+/// path → body map, closing each connection after one response.
+fn serve(routes: HashMap<String, Vec<u8>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let routes = Arc::new(routes);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let routes = Arc::clone(&routes);
+            thread::spawn(move || handle(stream, &routes));
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn handle(mut stream: TcpStream, routes: &HashMap<String, Vec<u8>>) {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() {
+        return;
+    }
+    loop {
+        let mut header = String::new();
+        match reader.read_line(&mut header) {
+            Ok(_) if header != "\r\n" && !header.is_empty() => continue,
+            _ => break,
+        }
+    }
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    let (status, body) = match routes.get(path) {
+        Some(body) => ("200 OK", body.clone()),
+        None => ("404 Not Found", b"not found".to_vec()),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(&body);
+}
+
+/// A `.tar.xz` archive holding `intentd-<triple>/intentd[.exe]` — the same
+/// layout cargo-dist produces for unix targets.
+fn make_tar_xz(bin_contents: &[u8]) -> Vec<u8> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bin_contents.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    let encoder = liblzma::write::XzEncoder::new(Vec::new(), 6);
+    let mut builder = tar::Builder::new(encoder);
+    builder
+        .append_data(
+            &mut header,
+            format!("intentd-{TARGET_TRIPLE}/{DAEMON_BIN_NAME}"),
+            bin_contents,
+        )
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Schema-v1 manifest with a single platform entry for this build's triple.
+fn manifest_json(version: &str, base_url: &str, asset: &str, sha256: &str) -> Vec<u8> {
+    serde_json::json!({
+        "schema": 1,
+        "channel": "stable",
+        "version": version,
+        "tag": format!("v{version}"),
+        "published_at": "2026-07-21T00:00:00Z",
+        "platforms": {
+            TARGET_TRIPLE: {
+                "asset": asset,
+                "url": format!("{base_url}/{asset}"),
+                "sha256": sha256,
+            }
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Serve a manifest for `version` (on the stable channel) plus its archive.
+/// Returns the base URL. `tamper_sha` swaps in a wrong digest.
+fn serve_release(version: &str, bin_contents: &[u8], tamper_sha: bool) -> String {
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let archive = make_tar_xz(bin_contents);
+    let sha = if tamper_sha {
+        sha256_hex(b"something else entirely")
+    } else {
+        sha256_hex(&archive)
+    };
+
+    // Two-step bind: the manifest embeds absolute archive URLs, so learn the
+    // address first, then register routes against it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/channel-stable/stable.json".to_string(),
+        manifest_json(version, &base_url, &asset, &sha),
+    );
+    routes.insert(format!("/{asset}"), archive);
+    serve_on(routes, &base_url)
+}
+
+fn serve_on(routes: HashMap<String, Vec<u8>>, base_url: &str) -> String {
+    let addr = base_url.strip_prefix("http://").unwrap();
+    let listener = TcpListener::bind(addr).unwrap();
+    let routes = Arc::new(routes);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let routes = Arc::clone(&routes);
+            thread::spawn(move || handle(stream, &routes));
+        }
+    });
+    base_url.to_string()
+}
+
+fn paths_in(dir: &Path) -> SitterPaths {
+    SitterPaths::from_data_dir(dir)
+}
+
+fn preinstall(paths: &SitterPaths, version: &str, channel: Channel) {
+    let bin = paths.daemon_binary(version);
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    fs::write(&bin, format!("fake daemon {version}")).unwrap();
+    let state = SitterState {
+        channel,
+        current_version: Some(version.to_string()),
+        ..SitterState::default()
+    };
+    state::save(&paths.state_path, &state).unwrap();
+}
+
+fn installed_versions(paths: &SitterPaths) -> Vec<String> {
+    let mut versions: Vec<String> = fs::read_dir(&paths.versions_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    versions.sort();
+    versions
+}
+
+#[test]
+fn happy_path_downloads_verifies_installs_and_updates_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let base_url = serve_release("0.2.0", b"#!/bin/sh\necho fake daemon 0.2.0\n", false);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    assert_eq!(
+        outcome,
+        UpdateOutcome::Installed {
+            version: "0.2.0".to_string(),
+            previous: None,
+        }
+    );
+
+    let bin = paths.daemon_binary("0.2.0");
+    assert_eq!(
+        fs::read(&bin).unwrap(),
+        b"#!/bin/sh\necho fake daemon 0.2.0\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&bin).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "expected exec bits, got {mode:o}");
+    }
+
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.current_version.as_deref(), Some("0.2.0"));
+    assert_eq!(state.channel, Channel::Stable);
+
+    // In-flight download dirs are cleaned up.
+    let leftovers = fs::read_dir(&paths.tmp_dir)
+        .map(|e| e.count())
+        .unwrap_or_default();
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn sha256_mismatch_is_rejected_and_nothing_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let base_url = serve_release("0.2.0", b"evil bytes", true);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::Sha256Mismatch { .. }),
+        "expected Sha256Mismatch, got {err:?}"
+    );
+
+    assert!(installed_versions(&paths).is_empty());
+    assert_eq!(state::load(&paths.state_path).current_version, None);
+}
+
+#[test]
+fn invalid_manifest_version_is_rejected_and_nothing_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    // Fresh install (no current version): a non-semver manifest version must
+    // be rejected before it becomes a `versions/` directory name.
+    let base_url = serve_release("../not-semver", b"evil bytes", false);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::InvalidManifestVersion { .. }),
+        "expected InvalidManifestVersion, got {err:?}"
+    );
+
+    assert!(installed_versions(&paths).is_empty());
+    assert_eq!(state::load(&paths.state_path).current_version, None);
+}
+
+#[test]
+fn network_down_is_a_soft_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    // Bind then immediately drop a listener so the port refuses connections.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::Network { .. }),
+        "expected Network, got {err:?}"
+    );
+    assert_eq!(state::load(&paths.state_path).current_version, None);
+}
+
+#[test]
+fn http_error_status_is_a_soft_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let base_url = serve(HashMap::new()); // every path 404s
+
+    let updater = Updater::with_base_url(paths, &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::HttpStatus { status, .. } if status.as_u16() == 404),
+        "expected HttpStatus 404, got {err:?}"
+    );
+}
+
+#[test]
+fn noop_when_manifest_is_equal_or_older() {
+    for manifest_version in ["0.2.0", "0.1.0"] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        preinstall(&paths, "0.2.0", Channel::Stable);
+        let base_url = serve_release(manifest_version, b"newer bytes", false);
+
+        let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+        let outcome = updater.check_and_install(Channel::Stable).unwrap();
+        assert_eq!(
+            outcome,
+            UpdateOutcome::AlreadyCurrent {
+                version: "0.2.0".to_string()
+            },
+            "manifest {manifest_version} should be a no-op"
+        );
+        // The preinstalled binary is untouched.
+        assert_eq!(
+            fs::read(paths.daemon_binary("0.2.0")).unwrap(),
+            b"fake daemon 0.2.0"
+        );
+    }
+}
+
+#[test]
+fn reinstalls_when_state_points_at_a_missing_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    // state.json says 0.2.0 but versions/ was wiped.
+    let state = SitterState {
+        current_version: Some("0.2.0".to_string()),
+        ..SitterState::default()
+    };
+    state::save(&paths.state_path, &state).unwrap();
+    let base_url = serve_release("0.2.0", b"restored daemon", false);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    assert_eq!(
+        outcome,
+        UpdateOutcome::Installed {
+            version: "0.2.0".to_string(),
+            previous: Some("0.2.0".to_string()),
+        }
+    );
+    assert!(paths.daemon_binary("0.2.0").exists());
+}
+
+#[test]
+fn unknown_manifest_schema_is_a_soft_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/channel-stable/stable.json".to_string(),
+        br#"{"schema": 2, "shape": "of things to come"}"#.to_vec(),
+    );
+    let base_url = serve(routes);
+
+    let updater = Updater::with_base_url(paths, &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::Manifest(_)),
+        "expected Manifest, got {err:?}"
+    );
+}
+
+#[test]
+fn missing_platform_entry_is_a_soft_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/channel-stable/stable.json".to_string(),
+        br#"{"schema": 1, "version": "0.2.0", "platforms": {}}"#.to_vec(),
+    );
+    let base_url = serve(routes);
+
+    let updater = Updater::with_base_url(paths, &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::NoPlatformEntry { .. }),
+        "expected NoPlatformEntry, got {err:?}"
+    );
+}
+
+#[test]
+fn prune_keeps_current_and_one_previous_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    // Two older versions on disk; 0.2.0 is current.
+    preinstall(&paths, "0.1.0", Channel::Stable);
+    preinstall(&paths, "0.2.0", Channel::Stable);
+    let base_url = serve_release("0.3.0", b"daemon 0.3.0", false);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    assert_eq!(
+        outcome,
+        UpdateOutcome::Installed {
+            version: "0.3.0".to_string(),
+            previous: Some("0.2.0".to_string()),
+        }
+    );
+
+    assert_eq!(installed_versions(&paths), vec!["0.2.0", "0.3.0"]);
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.3.0")
+    );
+}

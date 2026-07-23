@@ -1,0 +1,43 @@
+[package]
+name = "intentd-sitter"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Self-updating supervisor shim for the intentd daemon (packaged and renamed to `intentd` at release time)"
+
+# The sitter ships through its own release workflow (`sitter-v*` tags), where
+# the binary is renamed to `intentd`. Keep the existing cargo-dist daemon
+# pipeline from picking it up.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+time = { workspace = true, features = ["serde-well-known", "macros"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+sha2 = "0.10.9"
+semver = "1.0.28"
+tar = "0.4.46"
+flate2 = "1.1.9"
+liblzma = { version = "0.4.7", features = ["static"] }
+reqwest = { workspace = true, features = ["blocking"] }
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+flate2 = "1.1.9"
+liblzma = "0.4.7"
+serde_json.workspace = true
+sha2 = "0.10.9"
+tar = "0.4.46"
+tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+zip = { version = "4.2.0", default-features = false, features = ["deflate"] }

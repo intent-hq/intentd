@@ -69,53 +69,83 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 
 ## Install
 
-> **Note:** the installers below download artifacts from public GitHub Release URLs, so
-> they require this repository (and `intent-hq/homebrew-tap`) to be **public**. Both are
-> currently **private**, so these commands will fail with 404/authentication errors until
-> the repos are opened up. In the meantime, build from source (see
+Installing intentd installs the **sitter** — a small self-updating supervisor shim,
+packaged and named `intentd` (built from `crates/intentd-sitter`). On first run it
+downloads the real daemon from the per-channel release manifests (**stable** by default),
+checks for updates at startup and then every 12–24 hours, forwards **all** CLI args to
+the daemon verbatim, and respawns the daemon if it crashes. You never install the daemon
+binary directly.
+
+> **Note:** the install commands below download artifacts from public GitHub Release
+> URLs, so they require this repository (and `intent-hq/homebrew-tap`) to be **public**.
+> Both are currently **private**, so these commands will fail with 404/authentication
+> errors until the repos are opened up. In the meantime, build from source (see
 > [Quickstart](#quickstart)) or download release assets via the GitHub API with a token.
 
 ### Homebrew (macOS / Linux)
 
 ```sh
-brew tap intent-hq/tap
-brew install intentd
-# or in one step:
 brew install intent-hq/tap/intentd
+# Run as a login service (launchd/systemd) — executes `intentd serve --resume-all`:
+brew services start intentd
 ```
 
-The formula lives in [intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap)
-and covers both macOS targets (Apple Silicon `aarch64-apple-darwin` and Intel
-`x86_64-apple-darwin`) as well as Linux. Every `vX.Y.Z` release updates the formula
-automatically, so **the tap tracks the latest release — i.e. the beta channel**;
-promoting a release to stable (see [Releases & channels](#releases--channels)) does not
-touch the tap.
-
-### Shell installer (macOS / Linux)
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/intent-hq/intentd/releases/latest/download/intentd-installer.sh | sh
-```
-
-### PowerShell installer (Windows)
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/intent-hq/intentd/releases/latest/download/intentd-installer.ps1 | iex"
-```
+The formula lives in [intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap),
+ships the sitter for both macOS targets (Apple Silicon `aarch64-apple-darwin` and Intel
+`x86_64-apple-darwin`) as well as Linux, and is updated automatically by every
+`sitter-vX.Y.Z` release. Which **daemon** version you run is decided by the sitter's
+release channel (stable by default), not by the formula version.
 
 ### Debian / Ubuntu (.deb)
 
-Every release also ships Debian packages (`intentd_<version>_amd64.deb` and
-`intentd_<version>_arm64.deb`, built by `.github/workflows/build-deb.yml`) installing
-the binary at `/usr/bin/intentd` and a systemd **user** unit at
-`/usr/lib/systemd/user/intentd.service`. Download the .deb for your architecture from
-the [releases page](https://github.com/intent-hq/intentd/releases), then:
+Sitter releases ship Debian packages (`intentd_<version>_amd64.deb` /
+`intentd_<version>_arm64.deb`, with constant-named `intentd_amd64.deb` /
+`intentd_arm64.deb` copies on the fixed `sitter-latest` release) installing the sitter at
+`/usr/bin/intentd` and a systemd **user** unit at
+`/usr/lib/systemd/user/intentd.service` (runs `intentd serve --resume-all`):
 
 ```sh
-sudo apt install ./intentd_<version>_amd64.deb
+curl -fLO https://github.com/intent-hq/intentd/releases/download/sitter-latest/intentd_amd64.deb
+sudo apt install ./intentd_amd64.deb
 # The package does not auto-enable the unit (it is per-user); start it at login with:
 systemctl --user enable --now intentd
 ```
+
+### Direct download
+
+Download the archive for your platform from the fixed
+[`sitter-latest`](https://github.com/intent-hq/intentd/releases/tag/sitter-latest)
+release — `intentd-<triple>.tar.xz` on macOS/Linux, `intentd-<triple>.zip` on Windows,
+each with a `.sha256` sidecar — extract it, and put `intentd` on your `PATH`:
+
+```sh
+curl -fLO https://github.com/intent-hq/intentd/releases/download/sitter-latest/intentd-aarch64-apple-darwin.tar.xz
+tar -xJf intentd-aarch64-apple-darwin.tar.xz
+# → intentd-aarch64-apple-darwin/intentd
+```
+
+### Channels
+
+The sitter follows the **stable** channel by default. To follow beta, pass
+`--sitter-channel beta` or set `INTENTD_CHANNEL=beta`:
+
+```sh
+intentd --sitter-channel beta serve
+```
+
+`--sitter-*` flags belong to the sitter and are stripped before forwarding; everything
+else (e.g. `serve`, `--resume-all`, `--version`) goes to the daemon verbatim.
+
+### How updates work
+
+- The sitter checks the channel manifest at startup and then on a randomized 12–24 h
+  cadence; when a newer daemon version lands it downloads, sha256-verifies, and installs
+  it atomically, then restarts the daemon on the new version.
+- Sitter state lives under `<data-dir>/sitter/` (`versions/<version>/intentd`,
+  `state.json`, `tmp/`). The current and previous daemon versions are kept; older ones
+  are pruned.
+- If an update check fails (e.g. offline), the sitter falls back to the last installed
+  daemon; only a first run with nothing installed and no network exits with an error.
 
 ## Quickstart
 
@@ -174,7 +204,7 @@ in the monorepo's git history.
   scripts (back-fill-then-tail scrollback, multi-client fan-out, process-group reaping).
 - **CLI:** `serve`, `call`, `status`, `stop`, `doctor`, `import`, and `mcp-bridge`. The daemon
   does not manage its own service unit: supervision is owned by the platform package manager —
-  `brew services start intentd` on macOS, and the distro package (future .deb) on Linux.
+  `brew services start intentd` on macOS, and the .deb's systemd user unit on Linux.
 - **Persistence:** SQLite via `sqlx` with embedded migrations through `0012_known_repo`
   (WAL, `foreign_keys`, `busy_timeout`).
 - Standard JSON-RPC error codes: `-32700`, `-32600`, `-32601`, `-32602`, `-32603`.
@@ -192,15 +222,13 @@ in the monorepo's git history.
 ## Releases & channels
 
 Releases are tag-driven and built by [dist (cargo-dist)](https://axodotdev.github.io/cargo-dist/)
-(`dist-workspace.toml` + the generated `.github/workflows/release.yml`). Pushing a tag
-publishes a GitHub Release with per-platform archives, `.sha256` checksums, and shell /
-PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
-It also pushes an updated Homebrew formula to
-[intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap) (the
-`publish-homebrew-formula` job, authenticated via the `HOMEBREW_TAP_TOKEN` secret). The
-tap always reflects the **latest release (beta channel)**; the stable promotion workflow
-below only updates the stable channel manifest and never touches the tap.
+(`dist-workspace.toml` + the generated `.github/workflows/v-release.yml`). Pushing a tag
+publishes a GitHub Release with per-platform archives and `.sha256` checksums for:
+`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`. User-facing installers
+(Homebrew formula, `.deb` packages) ship the sitter and are owned by the sitter
+release pipeline (`.github/workflows/release-sitter.yml`); the daemon pipeline
+publishes archives, checksums, and channel manifests only.
 
 Channels follow a **promotion model** — channel routing does not depend on prerelease
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
@@ -252,8 +280,8 @@ After each release, CI updates a machine-readable channel manifest on a fixed re
 every tag updates the `beta.json` asset on the `channel-beta` release
 (`.github/workflows/publish-channel-manifest.yml`, run as a dist post-announce hook),
 and promoting a version updates `stable.json` on `channel-stable`
-(`.github/workflows/promote-stable.yml`). Consumers (e.g. cloudlands-fe pin-bump
-automation, installer scripts) resolve "latest per channel" from these fixed URLs.
+(`.github/workflows/promote-stable.yml`). Consumers (the sitter's update checks,
+cloudlands-fe pin-bump automation) resolve "latest per channel" from these fixed URLs.
 Schema (version 1):
 
 ```json

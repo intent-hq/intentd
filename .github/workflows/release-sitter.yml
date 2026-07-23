@@ -1,0 +1,385 @@
+# Release pipeline for the intentd sitter (crates/intentd-sitter).
+#
+# Hand-written, NOT cargo-dist generated: the sitter is `dist = false` so the
+# daemon's dist pipeline (release.yml) never picks it up. Triggered by pushing
+# a `sitter-vX.Y.Z` tag, it:
+#
+# * builds `intentd-sitter` in release mode for the same 5 targets as the
+#   daemon (musl targets cross-built with cargo-zigbuild, mirroring dist)
+# * renames the binary to `intentd` (`intentd.exe` on Windows) and packages it
+#   as `intentd-<triple>.tar.xz` (unix, nested `intentd-<triple>/` dir like
+#   dist tarballs) / `intentd-<triple>.zip` (Windows, flat like dist zips),
+#   plus `.sha256` sidecars — same naming as daemon archives so install
+#   instructions stay uniform
+# * smoke-tests each packaged binary with `--sitter-version`
+# * publishes a GitHub Release on the tag (never marked "latest", so daemon
+#   releases keep `releases/latest` semantics) and refreshes the fixed
+#   `sitter-latest` release so stable install URLs exist
+#
+# Packaging jobs hang off `publish` (the fan-in):
+#
+# * `publish-homebrew` renders packaging/homebrew/intentd.rb.template with the
+#   real version + sha256s and pushes it to intent-hq/homebrew-tap (skipped on
+#   prereleases, mirroring sitter-latest)
+# * `deb` repacks the linux musl archives into intentd_<version>_{amd64,arm64}
+#   .deb packages (scripts/build-deb.sh) and uploads them to the tag release,
+#   refreshing constant-named copies on sitter-latest for stable URLs
+name: Release sitter
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "sitter-v[0-9]+.[0-9]+.[0-9]+*"
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Parse and validate tag
+        id: meta
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^sitter-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "error: '$TAG' is not a valid sitter release tag (expected sitter-vX.Y.Z[-prerelease])" >&2
+            exit 1
+          fi
+          version=${TAG#sitter-v}
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check tag matches crate version
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          crate_version=$(sed -nE 's/^version = "([^"]+)".*/\1/p' crates/intentd-sitter/Cargo.toml | head -n1)
+          if [[ "$crate_version" != "$VERSION" ]]; then
+            echo "error: tag version $VERSION != intentd-sitter crate version $crate_version" >&2
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            zigbuild: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.target }}
+          save-if: false
+      # Mirror the dist pipeline's musl approach: cross-compile with
+      # cargo-zigbuild (the PyPI package bundles the zig toolchain).
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.zigbuild }}
+        shell: bash
+        run: pip3 install cargo-zigbuild
+      - name: Build (cargo)
+        if: ${{ !matrix.zigbuild }}
+        shell: bash
+        run: cargo build --release -p intentd-sitter --target "$TARGET"
+      - name: Build (cargo-zigbuild)
+        if: ${{ matrix.zigbuild }}
+        shell: bash
+        run: cargo zigbuild --release -p intentd-sitter --target "$TARGET"
+      - name: Package (unix tar.xz)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          mkdir -p "staging/intentd-$TARGET"
+          cp "target/$TARGET/release/intentd-sitter" "staging/intentd-$TARGET/intentd"
+          chmod +x "staging/intentd-$TARGET/intentd"
+          tar -cJf "intentd-$TARGET.tar.xz" -C staging "intentd-$TARGET"
+      - name: Package (windows zip)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp "target/$TARGET/release/intentd-sitter.exe" staging/intentd.exe
+          (cd staging && 7z a "../intentd-$TARGET.zip" intentd.exe)
+      - name: Checksum sidecar
+        shell: bash
+        run: |
+          for archive in intentd-"$TARGET".tar.xz intentd-"$TARGET".zip; do
+            if [[ -f "$archive" ]]; then
+              sha256sum --binary "$archive" > "$archive.sha256"
+            fi
+          done
+      # Smoke: the packaged binary must run and exit 0. x86_64-apple-darwin
+      # runs under Rosetta 2 on the arm64 macOS runner; aarch64 musl (statically
+      # linked) runs under qemu-user on the x86_64 ubuntu runner.
+      - name: Smoke test (unix)
+        if: ${{ runner.os != 'Windows' && matrix.target != 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: ./staging/intentd-"$TARGET"/intentd --sitter-version
+      - name: Smoke test (aarch64 musl via qemu)
+        if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user-static
+          qemu-aarch64-static "./staging/intentd-$TARGET/intentd" --sitter-version
+      - name: Smoke test (windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: ./staging/intentd.exe --sitter-version
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: sitter-${{ matrix.target }}
+          path: |
+            intentd-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  # Fan-in: the packaging jobs (publish-homebrew, deb) depend on this job
+  # having published the release assets.
+  publish:
+    needs:
+      - plan
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    # Serialize sitter-latest updates so two tags pushed close together cannot
+    # interleave and leave the fixed release with mixed assets.
+    concurrency:
+      group: intentd-sitter-release-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sitter-*
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub Release on the tag
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          prerelease_flag=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          # --latest=false: daemon releases keep `releases/latest` semantics.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_COMMIT" \
+              --latest=false \
+              "${prerelease_flag[@]}" \
+              --title "intentd sitter $VERSION" \
+              --notes "Self-updating supervisor shim for intentd, installed as \`intentd\`. Archives contain the sitter binary renamed to \`intentd\` (\`intentd.exe\` on Windows)."
+          fi
+          gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+      # Fixed release so install instructions have a stable URL
+      # (releases/download/sitter-latest/intentd-<triple>.tar.xz). Asset names
+      # are constant, so --clobber replaces the full set. Prereleases are not
+      # promoted here, mirroring channel-stable semantics.
+      - name: Refresh sitter-latest release
+        if: ${{ needs.plan.outputs.prerelease == 'false' }}
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          if ! gh release view sitter-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ! gh release create sitter-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_COMMIT" \
+              --latest=false \
+              --title "intentd sitter (latest)" \
+              --notes "Fixed release tracking the newest sitter version for stable install URLs. Do not consume the tag itself; download the intentd-<triple> archives."
+            then
+              # Tolerate only a lost create race; the release must exist now.
+              if ! gh release view sitter-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "error: failed to create release sitter-latest and it does not exist" >&2
+                exit 1
+              fi
+            fi
+          fi
+          gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Render the hand-maintained formula template with the real version +
+  # sha256s and push it to the tap as Formula/intentd.rb. Skipped on
+  # prereleases, mirroring the sitter-latest handling. Authenticates with the
+  # same HOMEBREW_TAP_TOKEN secret the dist daemon pipeline used.
+  publish-homebrew:
+    needs:
+      - plan
+      - publish
+    if: ${{ needs.plan.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    # Serialize tap pushes so two tags pushed close together cannot race the
+    # non-fast-forward push.
+    concurrency:
+      group: intentd-sitter-release-homebrew
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sitter-*
+          path: artifacts
+          merge-multiple: true
+      - name: Render formula
+        run: ./scripts/render-sitter-homebrew-formula.sh "$VERSION" artifacts intentd.rb
+      - name: Style-check rendered formula (advisory)
+        run: |
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          # brew style only accepts formulas inside a tap; stage the rendered
+          # file in a scratch tap (mirroring where it ships: Formula/ in the
+          # real tap) so formula cops apply instead of bare Ruby-file cops.
+          brew tap-new --no-git scratch/sitter
+          cp intentd.rb "$(brew --repository scratch/sitter)/Formula/intentd.rb"
+          brew style --formula scratch/sitter/intentd \
+            || echo "::warning::brew style reported offenses on intentd.rb (non-blocking)"
+      - uses: actions/checkout@v6
+        with:
+          repository: intent-hq/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: true
+          path: tap
+      - name: Commit and push formula
+        run: |
+          install -m 0644 intentd.rb tap/Formula/intentd.rb
+          cd tap
+          git config user.name "intent-hq bot"
+          git config user.email "intent-hq@users.noreply.github.com"
+          git add Formula/intentd.rb
+          if git diff --cached --quiet; then
+            echo "formula unchanged; nothing to push"
+            exit 0
+          fi
+          git commit -m "intentd $VERSION"
+          git push
+
+  # Repack the linux musl archives into Debian packages and attach them to
+  # the tag release; non-prereleases also refresh constant-named copies on
+  # sitter-latest so install URLs stay stable (versioned names would
+  # accumulate on the fixed release).
+  deb:
+    needs:
+      - plan
+      - publish
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    # Own group (not the publish one): asset names are disjoint from the
+    # archives, so deb refreshes only need to serialize against themselves.
+    concurrency:
+      group: intentd-sitter-release-deb
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sitter-*-unknown-linux-musl
+          path: artifacts
+          merge-multiple: true
+      - name: Build .debs
+        run: |
+          # Debian ordering: "-" starts a revision that sorts ABOVE the bare
+          # upstream version (0.2.0-beta.1 > 0.2.0), while "~" sorts below
+          # (0.2.0~beta.1 < 0.2.0), so map prerelease hyphens to "~" to keep
+          # stable releases upgradeable over prerelease installs.
+          deb_version=${VERSION//-/'~'}
+          ./scripts/build-deb.sh artifacts/intentd-x86_64-unknown-linux-musl.tar.xz "$deb_version" amd64
+          ./scripts/build-deb.sh artifacts/intentd-aarch64-unknown-linux-musl.tar.xz "$deb_version" arm64
+          # .sha256 companions, same format as the other release assets
+          # (sha256sum --binary: "HASH *NAME").
+          for deb in intentd_*.deb; do
+            sha256sum --binary "$deb" > "$deb.sha256"
+          done
+      - name: Verify package metadata and contents
+        run: |
+          for deb in intentd_*.deb; do
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+            test "$(dpkg-deb --field "$deb" Package)" = intentd
+            dpkg-deb --contents "$deb" | grep -q ' \./usr/bin/intentd$'
+            dpkg-deb --contents "$deb" | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
+          done
+      - name: Upload .debs to the tag release
+        run: |
+          gh release upload "$TAG" intentd_*.deb intentd_*.deb.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Refresh sitter-latest .debs
+        if: ${{ needs.plan.outputs.prerelease == 'false' }}
+        run: |
+          # Constant asset names so --clobber replaces the previous version
+          # instead of accumulating versioned files on the fixed release.
+          for arch in amd64 arm64; do
+            cp intentd_*_"$arch".deb "intentd_$arch.deb"
+            sha256sum --binary "intentd_$arch.deb" > "intentd_$arch.deb.sha256"
+          done
+          gh release upload sitter-latest \
+            intentd_amd64.deb intentd_amd64.deb.sha256 \
+            intentd_arm64.deb intentd_arm64.deb.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
