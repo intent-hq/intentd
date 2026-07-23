@@ -2215,16 +2215,18 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
+        // monorepo#568: reject nonexistent targets BEFORE enqueueing — a
+        // truncated/mistyped id would otherwise create a queue entry that
+        // never drains (same fail-closed contract as `agent.sendMessage`).
+        let session = self.require_agent_session(&agent_id).await?;
         let (queued, position) =
             self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
         let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
-            if let Ok(session) = self.store.get_agent_session(&agent_id).await {
-                manager
-                    .try_drain_queue(agent_id, session.workspace_id)
-                    .await;
-            }
+            manager
+                .try_drain_queue(agent_id, session.workspace_id)
+                .await;
         }
         Ok(result)
     }
@@ -3256,6 +3258,11 @@ impl Services {
         parent_agent_id: AgentId,
         child_agent_id: AgentId,
     ) -> Result<Value> {
+        // monorepo#568: fail closed on a nonexistent CHILD before any watch
+        // registration — a parent→child watch on an id that does not exist
+        // never fires, leaving the parent in a phantom "waiting" state
+        // (mirrors the SUB-1 sender-watch guard below).
+        let child_session = self.require_agent_session(&child_agent_id).await?;
         let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
         let parent_deleted = parent_session
             .as_ref()
@@ -3267,21 +3274,16 @@ impl Services {
         let parent_name = parent_session.as_ref().map(|s| s.name.clone());
         // Anchor the watch in the parent's HOME workspace (falls back to the
         // call's workspace when the parent session lookup failed) and the
-        // child's own workspace (falls back likewise) — same-workspace pairs
-        // behave exactly as before; a chief parent registers cross-workspace.
-        // `resolved_home` is Some only when read from a real session row: the
-        // reuse path uses it to correct a watch whose anchor was registered
-        // from the fallback.
+        // child's own workspace (already resolved by the fail-closed guard
+        // above) — same-workspace pairs behave exactly as before; a chief
+        // parent registers cross-workspace. `resolved_home` is Some only when
+        // read from a real session row: the reuse path uses it to correct a
+        // watch whose anchor was registered from the fallback.
         let resolved_home = parent_session.as_ref().map(|s| s.workspace_id.clone());
         let parent_home_ws = resolved_home
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
-        let child_ws = self
-            .store
-            .get_agent_session(&child_agent_id)
-            .await
-            .map(|s| s.workspace_id)
-            .unwrap_or_else(|_| workspace_id.clone());
+        let child_ws = child_session.workspace_id;
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
         let id = match self.find_and_refresh_ungrouped_watch(
             &parent_agent_id,

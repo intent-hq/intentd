@@ -3813,6 +3813,73 @@ async fn sender_watch_rejects_unknown_target() {
     );
 }
 
+/// monorepo#568 regression: `agent.queueMessage` to a nonexistent agent id
+/// must fail closed with `-32602` naming the id — NOT create a phantom queue
+/// entry that never drains, and NOT publish `agent:queue:updated`.
+#[tokio::test]
+async fn queue_message_op_rejects_unknown_agent() {
+    let (_t, svc, _ws, bus) = setup_with_bus().await;
+    let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let err = svc
+        .agent_queue_message_op(id.clone(), "hi".into(), None, None)
+        .await
+        .expect_err("unknown agent must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&id.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry may be created for an unknown agent"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "no agent:queue:updated event may be published for an unknown agent"
+    );
+}
+
+/// monorepo#568 regression: `agent.watchCompletion` with a nonexistent CHILD
+/// must fail closed with `-32602` naming the id — no watch may be registered
+/// (the parent would otherwise report a phantom `waitingForAgentIds` entry
+/// for a completion that can never fire).
+#[tokio::test]
+async fn watch_completion_rejects_unknown_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let err = svc
+        .agent_watch_completion_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect_err("unknown child must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&child.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&parent).is_empty(),
+        "no watch may be registered on a nonexistent child"
+    );
+    let lite = svc.agent_get_op(parent, None).await.expect("get parent");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(
+        v["waitingForAgentIds"],
+        json!([]),
+        "parent must not report a phantom waiting-on entry"
+    );
+}
+
 /// The auto-queue fallback still applies when the agent EXISTS but the store
 /// append fails (here: a duplicate client-supplied messageId hits the
 /// primary-key constraint) — only nonexistent agents fail closed.
