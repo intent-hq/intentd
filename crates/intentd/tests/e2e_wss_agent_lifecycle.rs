@@ -5973,6 +5973,310 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     );
 }
 
+/// Stale queued-message redrive over WSS (#576). A message queued to a
+/// delegated child while it is mid-turn — BEFORE the child persists its
+/// completion report — drains only after that report was already delivered
+/// to the parent (`queued_at < completion_report_timestamp`). The redrive
+/// must NOT look like fresh work:
+/// - (a) the redriven user message carries the deterministic `[SYSTEM NOTE]`
+///   annotation telling the child its report was already delivered;
+/// - (b) NO `agent:updated` with `completionReportCleared: true` fires for
+///   the stale turn — the delivered report stays queryable via `agent.get`;
+/// - (c) the parent receives exactly ONE wake for the report (the child
+///   never re-reports, so no duplicate wake).
+/// Fresh messages keep today's clear-on-new-turn behavior (covered by
+/// `completion_report_cleared_when_new_turn_begins_over_wss` above).
+#[tokio::test]
+async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
+    let Some(script) = gate("WSS stale queued-message redrive (#576)") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    const CHILD_TAG: &str = "STALE576_CHILD";
+    const REPORT: &str = "STALE576_REPORT shipped the thing";
+    const STALE_MSG: &str = "STALE576_QUEUED follow-up sent while the child was mid-turn";
+    const PARENT_GO: &str = "STALE576_PARENT_GO";
+    // Stable prefix of the daemon's stale-redrive annotation (#576) — see
+    // `STALE_REDRIVE_NOTE_PREFIX` in `intent-services`'s agent_manager.
+    const NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued before you completed";
+    let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let delegate_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(CHILD_TAG),
+    );
+    // Prompt-matched rules; the STALE_MSG rule comes FIRST so the redriven
+    // turn matches it (and never re-reports). The child's report turn delays
+    // 8s BEFORE its reportToParent tool call so the test can queue STALE_MSG
+    // mid-turn, strictly before the report timestamp is persisted.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": STALE_MSG,
+                "response": "child acknowledged the stale message without re-reporting",
+            },
+            {
+                "ifPromptContains": CHILD_TAG,
+                "delayMs": 8000,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_js, "summary": "child reportToParent" }
+                },
+                "response": "child finished after reportToParent",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the wake",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "delegate stale-redrive child" }
+                },
+                "response": "parent delegated one immediate child",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Stale Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Phase 1 — learn the child id and wait until its report turn is
+    // verifiably in flight (busy slot claimed), so the follow-up send below
+    // QUEUES instead of delivering. The child id is any non-parent agent id
+    // on the wire (only one child exists); mid-turn evidence is its active
+    // `agent:status-changed` or a turn-startup `agent:stream:status` frame —
+    // both fire well inside the child rule's 8s pre-report delay.
+    let mut child_id: Option<String> = None;
+    let mut child_mid_turn = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !child_mid_turn {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out waiting for the child's report turn to begin: child_id={child_id:?}"
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        if ev_agent.is_empty() || ev_agent == parent_id {
+            continue;
+        }
+        if child_id.is_none() {
+            child_id = Some(ev_agent.to_string());
+        }
+        if (ev_type == "agent:status-changed" && ev["data"]["isActive"] == json!(true))
+            || ev_type == "agent:stream:status"
+        {
+            child_mid_turn = true;
+        }
+    }
+    let child_id = child_id.expect("child agent id observed on the wire");
+
+    // Queue the follow-up while the child is mid-turn and its report is NOT
+    // yet persisted (the mock delays 8s before reportToParent): `queued_at`
+    // therefore predates `completion_report_timestamp` — the exact #576
+    // staleness condition. `queued: true` is the deterministic proof the
+    // message parked behind the in-flight turn instead of starting a fresh
+    // one; the NORMAL (non-requeue) stale path is the one under test, so the
+    // redriven row gets the annotation (a persisted terminal-failure requeue
+    // would suppress the clear WITHOUT annotating).
+    let queued = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child_id, "content": STALE_MSG }),
+    )
+    .await;
+    assert_eq!(queued["success"], true, "queued send ok: {queued}");
+    assert_eq!(
+        queued["queued"], true,
+        "message must QUEUE behind the child's in-flight turn: {queued}"
+    );
+
+    // Phase 2 — drive to completion ORDER-INSENSITIVELY (the report-time
+    // wake races the child's own turn end on the wire, see SUB-2 above):
+    // the child ends its report turn AND its redriven stale turn (two
+    // stream:ends) then idles; the parent idles after delegating, runs
+    // exactly ONE wake turn, and idles again. Meanwhile count every
+    // `agent:updated` carrying `completionReportCleared: true` for the
+    // child — the stale redrive must NOT clear the delivered report, and
+    // the subscription's ordered delivery guarantees any turn-begin clear
+    // event would land before the stale turn's stream:end.
+    let mut parent_idle_count = 0u32;
+    let mut parent_wake_ends = 0u32;
+    let mut child_stream_ends = 0u32;
+    let mut child_idle = false;
+    let mut child_cleared_events = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_stream_ends >= 2 && child_idle)
+    {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out waiting for redrive milestones: parent_idle_count={parent_idle_count} \
+                 parent_wake_ends={parent_wake_ends} child_stream_ends={child_stream_ends} \
+                 child_idle={child_idle}"
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        if ev_agent == parent_id {
+            if ev_type == "agent:idle" {
+                parent_idle_count += 1;
+            }
+            // Any parent stream:end after the first parent idle belongs to a
+            // wake turn (the delegating turn's stream:end precedes that idle).
+            if ev_type == "agent:stream:end" && parent_idle_count >= 1 {
+                parent_wake_ends += 1;
+            }
+        } else if ev_agent == child_id {
+            match ev_type {
+                "agent:stream:end" => child_stream_ends += 1,
+                "agent:idle" => child_idle = true,
+                "agent:updated" if ev["data"]["completionReportCleared"] == json!(true) => {
+                    child_cleared_events += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    // (b) the stale redrive suppressed the turn-begin report clear.
+    assert_eq!(
+        child_cleared_events, 0,
+        "NO agent:updated with completionReportCleared:true may fire for the stale turn"
+    );
+    assert_eq!(
+        parent_wake_ends, 1,
+        "exactly one wake-turn stream:end on the parent"
+    );
+
+    // (a) the redriven user message carries the [SYSTEM NOTE] annotation —
+    // and ONLY that message (the delegated-instructions row is untouched).
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": child_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("child messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    let stale_rows: Vec<&String> = texts.iter().filter(|t| t.contains(STALE_MSG)).collect();
+    assert_eq!(
+        stale_rows.len(),
+        1,
+        "the queued message persisted exactly once in the child transcript: {conv}"
+    );
+    assert!(
+        stale_rows[0].contains(NOTE_PREFIX),
+        "the redriven stale message carries the [SYSTEM NOTE] annotation: {}",
+        stale_rows[0]
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(NOTE_PREFIX)).count(),
+        1,
+        "only the stale redrive is annotated: {conv}"
+    );
+
+    // The delivered report stays queryable after the stale turn (the clear
+    // was suppressed, not deferred).
+    let child_got = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": child_id })).await;
+    assert_eq!(
+        child_got["agent"]["metadata"]["completionReport"],
+        json!(REPORT),
+        "completion report still queryable after the stale redrive: {child_got}"
+    );
+
+    // (c) the parent received exactly ONE wake for the report: one
+    // [WORKSPACE EVENTS] message, and the report text appears nowhere else.
+    let conv = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("parent messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+            .count(),
+        1,
+        "exactly one wake message in the parent transcript: {conv}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(REPORT)).count(),
+        1,
+        "the report reached the parent exactly once (inside the single wake): {conv}"
+    );
+}
+
 /// Emit `agent:message` on daemon-side user-row appends: verify that the
 /// direct-send, queue-drain (persist_user), and wake-delivery
 /// (deliver_wake_message runtime) paths all publish `agent:message` with the
