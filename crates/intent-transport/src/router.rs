@@ -981,6 +981,15 @@ async fn dispatch(
             // callers. Empty/whitespace-only string hints are collapsed to
             // `None` at the boundary so downstream selection logic never sees
             // an ambiguous `Some("")` (Copilot #78 review).
+            //
+            // `nameExplicitlySet` lets a client mark a supplied `name` as a
+            // non-explicit placeholder (`false`) so the agent's guarded
+            // opening-turn self-rename (`agent.rename` with
+            // `skipIfExplicitlySet: true`) still applies. Omitted/null keeps
+            // the service default (`name.is_some()`); non-boolean values are
+            // rejected rather than silently dropped because a dropped value
+            // would flip the persisted flag's default.
+            let name_explicitly_set = opt_bool_strict(params, "nameExplicitlySet")?;
             let extra = AgentCreateExtra {
                 provider: opt_nonempty_str(params, "provider"),
                 agent_type: opt_nonempty_str(params, "agentType"),
@@ -990,7 +999,7 @@ async fn dispatch(
                 context_references: opt_value(params, "contextReferences"),
                 image_blocks: opt_value(params, "imageBlocks"),
                 is_background: opt_bool(params, "isBackground"),
-                name_explicitly_set: None,
+                name_explicitly_set,
             };
             // FE/RPC front door: top-level creates stay parentless.
             let result = api
@@ -3264,6 +3273,18 @@ fn parse_script_create(params: &Map<String, Value>) -> Result<ScriptCreateParams
 /// Optional boolean param (absent/null/non-bool → `None`).
 fn opt_bool(params: &Map<String, Value>, name: &str) -> Option<bool> {
     params.get(name).and_then(Value::as_bool)
+}
+
+/// Like [`opt_bool`] but strict: absent/null → `None`, a real bool →
+/// `Some(..)`, anything else → `-32602`. Used where silently dropping a
+/// non-boolean would change a persisted flag's default (e.g. `agent.create`'s
+/// `nameExplicitlySet`).
+fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<bool>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(rpc(INVALID_PARAMS, format!("{name} must be a boolean"))),
+    }
 }
 
 /// Optional string→string map param (absent/non-object → `None`); non-string

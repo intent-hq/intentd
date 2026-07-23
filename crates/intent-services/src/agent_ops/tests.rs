@@ -1967,6 +1967,50 @@ async fn rename_skip_if_explicitly_set() {
     assert_eq!(r["name"], "Chosen");
 }
 
+/// Agent-rename-persistence Bug 2: a client-supplied name created with
+/// `extra.name_explicitly_set: Some(false)` (an FE placeholder) stays
+/// renameable by the guarded opening-turn self-rename, after which the
+/// explicit flag holds and later guarded renames are skipped.
+#[tokio::test]
+async fn create_with_name_explicitly_set_false_stays_renameable() {
+    let (_t, svc, ws) = setup().await;
+    let extra = intent_core::AgentCreateExtra {
+        name_explicitly_set: Some(false),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Placeholder".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create placeholder-named");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    // The guarded rename applies (no `skipped`) despite the supplied name.
+    let r = svc
+        .agent_rename_op(id.clone(), "Self-Chosen".into(), true)
+        .await
+        .expect("rename");
+    assert_eq!(r["name"], "Self-Chosen");
+    assert!(r.get("skipped").is_none());
+    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert_eq!(got.name, "Self-Chosen");
+    assert!(got.name_explicitly_set);
+    // A later guarded rename is now a no-op — a user rename wins.
+    let r = svc
+        .agent_rename_op(id, "Again".into(), true)
+        .await
+        .expect("skip");
+    assert_eq!(r["skipped"], json!(true));
+    assert_eq!(r["name"], "Self-Chosen");
+}
+
 /// `agent.create` harvests the persistence-gap fields (P3-1.2b) from the
 /// `metadata` spawn hint / top-level params and re-serves them via
 /// `agent.get`/`agent.list`: `metadata.delegationDepth`, `metadata.initialMessage`,
