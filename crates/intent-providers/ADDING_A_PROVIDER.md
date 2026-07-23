@@ -68,7 +68,8 @@ needs. Fields that matter most:
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
 + executable), (2) `~/.augment/bin/<command>` (auggie back-compat tier), (3) enhanced-PATH
 scan (nvm/homebrew/volta/asdf dirs). Provider-specific tiers slot in explicitly — see the
-grok native-installer preference (`find_grok_native_binary`, `~/.grok/bin/grok`). At spawn
+native-installer preference (`find_provider_native_binary`: grok `~/.grok/bin/grok`,
+opencode `~/.opencode/bin/opencode`). At spawn
 time `enhanced_path` (`crates/intent-providers/src/args.rs`) prepends the binary's parent
 dir so `#!/usr/bin/env node` shebangs resolve a co-located node.
 
