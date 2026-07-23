@@ -2324,8 +2324,12 @@ mod error_tests {
     fn json_rpc_error_display_truncation_respects_char_boundaries() {
         // A multi-byte char straddling the byte cap must not split (no panic,
         // valid UTF-8): truncation backs off to the previous char boundary.
+        // '€' is 3 bytes, so a cap that is not a multiple of 3 lands mid-char
+        // and the back-off loop genuinely runs.
         let cap = crate::error::MAX_RENDERED_DATA_BYTES;
-        let big = "é".repeat(cap); // 2 bytes each → straddles any even/odd cap
+        let char_len = '€'.len_utf8();
+        assert_ne!(cap % char_len, 0, "cap must land mid-char for this test");
+        let big = "€".repeat(cap); // 3·cap bytes, well past the cap
         let e = JsonRpcError {
             code: -32603,
             message: "Internal error".to_string(),
@@ -2334,6 +2338,14 @@ mod error_tests {
         let rendered = e.to_string();
         assert!(rendered.ends_with("… [truncated]"));
         assert!(rendered.chars().all(|c| c != char::REPLACEMENT_CHARACTER));
+        let data_portion = rendered
+            .strip_prefix("JSON-RPC error -32603: Internal error: ")
+            .expect("code/message prefix intact")
+            .strip_suffix("… [truncated]")
+            .expect("truncation marker suffix");
+        // Backed off from the cap to the previous char boundary.
+        assert_eq!(data_portion.len(), cap - cap % char_len);
+        assert!(data_portion.chars().all(|c| c == '€'));
     }
 
     #[test]
