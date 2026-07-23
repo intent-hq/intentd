@@ -454,7 +454,7 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
         dirs.sort();
         for dir in dirs {
             let manifest = dir.join(".workspace").join("workspace.json");
-            if !manifest.is_file() {
+            if !is_regular_file(&manifest) {
                 continue;
             }
             import_one(store, &dir, &manifest, opts, &mut seen, &mut report).await;
@@ -1555,7 +1555,7 @@ fn setting_is_empty(raw: Option<&str>) -> bool {
 /// "present but unreadable/malformed" (`Err`, counted as a failure).
 fn read_json_object(dir: &Path, name: &str) -> Result<Option<Map<String, Value>>, String> {
     let path = dir.join(name);
-    if !path.is_file() {
+    if !is_regular_file(&path) {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {name}: {e}"))?;
@@ -2795,6 +2795,20 @@ mod tests {
             .unwrap();
         // A real asset next to the symlink still imports.
         std::fs::write(assets_dir.join("real.bin"), b"real").unwrap();
+        // A workspace whose manifest itself is a symlink is skipped whole.
+        let evil_manifest = json!({ "id": "ws-evil-manifest", "title": "Evil" });
+        std::fs::write(
+            outside.join("workspace.json"),
+            serde_json::to_string(&evil_manifest).unwrap(),
+        )
+        .unwrap();
+        let evil_ws = root.join("ws-evil-manifest").join(".workspace");
+        std::fs::create_dir_all(&evil_ws).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("workspace.json"),
+            evil_ws.join("workspace.json"),
+        )
+        .unwrap();
         let assets_root = temp_root("symlink-dest");
         let store = open_store().await;
 
@@ -2808,9 +2822,17 @@ mod tests {
         )
         .await
         .unwrap();
+        // The symlinked manifest never becomes a candidate: no report entry
+        // and no workspace row for it.
+        assert_eq!(report.entries.len(), 1, "{report}");
         let entry = &report.entries[0];
+        assert_eq!(entry.id, "ws-symlink", "{report}");
         assert_eq!(entry.assets.imported, 1, "{report}");
         assert_eq!(entry.notes.total(), 0, "{report}");
+        assert!(store
+            .get_workspace(&WorkspaceId::from("ws-evil-manifest"))
+            .await
+            .is_err());
         let dest = assets_root.join("ws-symlink");
         assert!(dest.join("real.bin").is_file());
         assert!(!dest.join("linked-asset").exists());
