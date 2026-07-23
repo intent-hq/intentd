@@ -1901,6 +1901,88 @@ async fn set_model_preserves_provider_for_bare_or_same_provider() {
     assert_eq!(session.provider.as_deref(), Some("auggie"));
 }
 
+/// `agent.create` hard-fails (-32602 InvalidParams) when the resolved provider
+/// is unknown — explicit `provider` param or a compound-prefix derivation —
+/// and persists no session row.
+#[tokio::test]
+async fn create_rejects_unknown_provider() {
+    let (_t, svc, ws) = setup().await;
+    // Explicit unknown provider param.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("nonexistent".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("unknown explicit provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "unexpected err: {err}"
+    );
+    // Unknown compound-prefix derivation.
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad2".into()),
+            Some("nonexistent:foo".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect_err("unknown compound-prefix provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "unexpected err: {err}"
+    );
+    // Neither rejection persisted a session row.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+    // Absent provider (defaulting) and registered providers stay valid.
+    create_agent(&svc, &ws, "OK").await;
+}
+
+/// `agent.setModel` rejects an unknown compound-prefix provider with -32602
+/// InvalidParams and leaves session.model / session.provider untouched.
+#[tokio::test]
+async fn set_model_rejects_unknown_provider() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Guard").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "nonexistent:foo".into())
+        .await
+        .expect_err("unknown compound-prefix provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.setModel: unknown provider: nonexistent"),
+        "unexpected err: {err}"
+    );
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+}
+
 #[tokio::test]
 async fn rename_missing_agent_is_internal() {
     let (_t, svc, _ws) = setup().await;

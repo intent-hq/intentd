@@ -150,6 +150,20 @@ async fn resolve_default_model_from_settings(
     None
 }
 
+/// Reject a provider id that is not in the ACP registry with `-32602`
+/// (InvalidParams). Persisting an unknown provider would make the spawn path
+/// silently fall back to the default binary; hard-fail at the front door
+/// instead (PROTOCOL §5.5). `method` names the rejecting RPC in the message.
+fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
+    if intent_providers::find_provider(provider_id).is_none() {
+        return Err(Error::InvalidParams(format!(
+            "{method}: unknown provider: {provider_id} (known providers: {})",
+            intent_providers::all_provider_ids().join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -1394,6 +1408,13 @@ impl Services {
                 }
             })
         });
+        // Validate the resolved provider (explicit param or compound-prefix
+        // derived) before persisting anything: an unknown provider is -32602,
+        // never a session row that would silently spawn the default binary.
+        // Absent provider (defaulting) remains valid.
+        if let Some(p) = provider.as_deref() {
+            ensure_known_provider("agent.create", p)?;
+        }
         let session = AgentSession {
             id,
             workspace_id,
@@ -1507,6 +1528,13 @@ impl Services {
         model_id: String,
     ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
+        // Reject unknown compound-prefix providers before any mutation: the
+        // same misroute vector as agent.create — persisting one would make the
+        // next spawn silently fall back to the default binary (-32602).
+        if model_id.contains(':') {
+            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
+            ensure_known_provider("agent.setModel", &model_provider)?;
+        }
         session.model = Some(model_id.clone());
         // Reconcile session.provider when the model carries an explicit provider
         // prefix that differs from the current session provider. This ensures
