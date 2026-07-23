@@ -9,6 +9,10 @@
 # Library crates are internal and never released; only the intentd binary
 # crate (opted in below) is versioned and tagged.
 release = false
+# Only Release-PR merges cut releases: without this, `release-plz release`
+# would tag any main commit whose Cargo.toml version is ahead of the latest
+# tag (e.g. a manual bump in a regular PR).
+release_always = false
 
 [[package]]
 name = "intentd"

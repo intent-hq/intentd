@@ -219,10 +219,12 @@ Versioning is automated by [release-plz](https://release-plz.dev) in Release-PR 
 1. On every push to `main`, release-plz computes the next semver from the conventional
    commits since the last tag (0.x rules: breaking → minor, `feat`/`fix` → patch) and
    opens or updates a **Release PR** that bumps `version` in `crates/intentd/Cargo.toml`
-   and updates `CHANGELOG.md`.
+   and updates `CHANGELOG.md` (created on the first run).
 2. **Merging the Release PR cuts the release**: release-plz pushes the `vX.Y.Z` tag,
    which triggers the cargo-dist `release.yml` pipeline above. Release timing stays
-   human-controlled — merge the Release PR when you want to ship.
+   human-controlled — merge the Release PR when you want to ship. Only Release-PR
+   merges are tagged (`release_always = false`); a manual version bump in a regular
+   PR is never tagged automatically.
 
 Because PRs are squash-merged, only the PR title survives as the commit title on
 `main`. **Breaking changes must be signaled with `!` in the PR title** (e.g.
@@ -231,10 +233,12 @@ squashed body is not a reliable signal.
 
 **One-time bootstrap**: release-plz replays `cargo package` against the latest tag to
 diff released contents, so it requires that tag's manifests to carry version specs on
-internal path dependencies. The existing `v0.2.0` tag predates those specs, so the first
-run on `main` fails until a release is cut manually once: bump `version` in
-`crates/intentd/Cargo.toml` (plus `Cargo.lock`), merge, and push the matching `vX.Y.Z`
-tag. Every subsequent release is fully automated.
+internal path dependencies. The existing `v0.2.0` tag predates those specs, so the
+`Release-plz PR` job fails (expected red runs) until a release is cut manually once:
+bump `version` in `crates/intentd/Cargo.toml` (plus `Cargo.lock`) in a regular PR,
+merge it, and push the matching `vX.Y.Z` tag by hand. With `release_always = false`
+the release job never tags that bootstrap bump itself — the manual tag push described
+here is guaranteed to be the actual flow. Every subsequent release is fully automated.
 
 The workflow authenticates with the `RELEASE_PLZ_TOKEN` repository secret — a PAT with
 `contents` and `pull-requests` write access. It must be a PAT (not the default

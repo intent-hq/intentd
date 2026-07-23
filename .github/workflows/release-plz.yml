@@ -20,12 +20,16 @@ on:
     branches: [main]
 
 jobs:
+  # Neither job uses the implicit GITHUB_TOKEN (all steps authenticate with
+  # the RELEASE_PLZ_TOKEN PAT), so jobs inherit the top-level `permissions: {}`
+  # and the implicit token stays powerless.
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'intent-hq' }}
-    permissions:
-      contents: write
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
         with:
@@ -41,7 +45,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
       - name: Run release-plz release
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release
         env:
@@ -51,11 +55,8 @@ jobs:
     name: Release-plz PR
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'intent-hq' }}
-    permissions:
-      contents: write
-      pull-requests: write
     concurrency:
-      group: release-plz-${{ github.ref }}
+      group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
@@ -72,7 +73,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
       - name: Run release-plz release-pr
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr
         env:
