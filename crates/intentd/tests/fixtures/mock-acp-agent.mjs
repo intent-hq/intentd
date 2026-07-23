@@ -231,6 +231,32 @@ async function handlePrompt(id, params) {
       process.exit(1);
     }
   }
+  // Provider prompt failure (monorepo#479): optionally stream one
+  // agent_message_chunk (the provider's pre-failure warning) and then answer
+  // `session/prompt` with the configured JSON-RPC error object — mirroring
+  // codex-acp, which forwards its non-fatal "Model metadata … not found"
+  // warning as agent text before the turn dies on a -32603 whose `data`
+  // carries the real backend detail. When `promptRpcErrorAttempts` is set the
+  // failure is attempt-gated (counter in MOCK_AGENT_ATTEMPT_FILE) so a retry
+  // redrive can succeed; otherwise every prompt fails.
+  if (behavior.promptRpcError) {
+    const gate = behavior.promptRpcErrorAttempts;
+    const failing =
+      typeof gate === 'number' && gate > 0 ? getAndIncrementAttempt() <= gate : true;
+    if (failing) {
+      if (typeof behavior.streamBeforeErrorText === 'string' && behavior.streamBeforeErrorText.length > 0) {
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: behavior.streamBeforeErrorText },
+          },
+        });
+      }
+      log(`failing session/prompt with JSON-RPC error ${behavior.promptRpcError.code}`);
+      return send({ jsonrpc: '2.0', id, error: behavior.promptRpcError });
+    }
+  }
   // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
   // with zero output. Send session/update with agent_status (thinking) to establish
   // the session without emitting assistant content, then park. The live-turn will
