@@ -1,0 +1,249 @@
+# Release pipeline for the intentd sitter (crates/intentd-sitter).
+#
+# Hand-written, NOT cargo-dist generated: the sitter is `dist = false` so the
+# daemon's dist pipeline (release.yml) never picks it up. Triggered by pushing
+# a `sitter-vX.Y.Z` tag, it:
+#
+# * builds `intentd-sitter` in release mode for the same 5 targets as the
+#   daemon (musl targets cross-built with cargo-zigbuild, mirroring dist)
+# * renames the binary to `intentd` (`intentd.exe` on Windows) and packages it
+#   as `intentd-<triple>.tar.xz` (unix, nested `intentd-<triple>/` dir like
+#   dist tarballs) / `intentd-<triple>.zip` (Windows, flat like dist zips),
+#   plus `.sha256` sidecars — same naming as daemon archives so install
+#   instructions stay uniform
+# * smoke-tests each packaged binary with `--sitter-version`
+# * publishes a GitHub Release on the tag (never marked "latest", so daemon
+#   releases keep `releases/latest` semantics) and refreshes the fixed
+#   `sitter-latest` release so stable install URLs exist
+#
+# Packaging jobs (homebrew formula, .deb) are appended after `publish` by a
+# follow-up change; keep `publish` the fan-in job they hang off.
+name: Release sitter
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "sitter-v[0-9]+.[0-9]+.[0-9]+*"
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Parse and validate tag
+        id: meta
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^sitter-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "error: '$TAG' is not a valid sitter release tag (expected sitter-vX.Y.Z[-prerelease])" >&2
+            exit 1
+          fi
+          version=${TAG#sitter-v}
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check tag matches crate version
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          crate_version=$(sed -nE 's/^version = "([^"]+)".*/\1/p' crates/intentd-sitter/Cargo.toml | head -n1)
+          if [[ "$crate_version" != "$VERSION" ]]; then
+            echo "error: tag version $VERSION != intentd-sitter crate version $crate_version" >&2
+            exit 1
+          fi
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            zigbuild: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+            zigbuild: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.target }}
+          save-if: false
+      # Mirror the dist pipeline's musl approach: cross-compile with
+      # cargo-zigbuild (the PyPI package bundles the zig toolchain).
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.zigbuild }}
+        shell: bash
+        run: pip3 install cargo-zigbuild
+      - name: Build (cargo)
+        if: ${{ !matrix.zigbuild }}
+        shell: bash
+        run: cargo build --release -p intentd-sitter --target "$TARGET"
+      - name: Build (cargo-zigbuild)
+        if: ${{ matrix.zigbuild }}
+        shell: bash
+        run: cargo zigbuild --release -p intentd-sitter --target "$TARGET"
+      - name: Package (unix tar.xz)
+        if: ${{ runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          mkdir -p "staging/intentd-$TARGET"
+          cp "target/$TARGET/release/intentd-sitter" "staging/intentd-$TARGET/intentd"
+          chmod +x "staging/intentd-$TARGET/intentd"
+          tar -cJf "intentd-$TARGET.tar.xz" -C staging "intentd-$TARGET"
+      - name: Package (windows zip)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp "target/$TARGET/release/intentd-sitter.exe" staging/intentd.exe
+          (cd staging && 7z a "../intentd-$TARGET.zip" intentd.exe)
+      - name: Checksum sidecar
+        shell: bash
+        run: |
+          for archive in intentd-"$TARGET".tar.xz intentd-"$TARGET".zip; do
+            if [[ -f "$archive" ]]; then
+              sha256sum --binary "$archive" > "$archive.sha256"
+            fi
+          done
+      # Smoke: the packaged binary must run and exit 0. x86_64-apple-darwin
+      # runs under Rosetta 2 on the arm64 macOS runner; aarch64 musl (statically
+      # linked) runs under qemu-user on the x86_64 ubuntu runner.
+      - name: Smoke test (unix)
+        if: ${{ runner.os != 'Windows' && matrix.target != 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: ./staging/intentd-"$TARGET"/intentd --sitter-version
+      - name: Smoke test (aarch64 musl via qemu)
+        if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-user-static
+          qemu-aarch64-static "./staging/intentd-$TARGET/intentd" --sitter-version
+      - name: Smoke test (windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: bash
+        run: ./staging/intentd.exe --sitter-version
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: sitter-${{ matrix.target }}
+          path: |
+            intentd-${{ matrix.target }}.*
+          if-no-files-found: error
+
+  # Fan-in: everything below (and the follow-up homebrew/.deb packaging jobs)
+  # depends on this job having published the release assets.
+  publish:
+    needs:
+      - plan
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    # Serialize sitter-latest updates so two tags pushed close together cannot
+    # interleave and leave the fixed release with mixed assets.
+    concurrency:
+      group: intentd-sitter-release-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sitter-*
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub Release on the tag
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          prerelease_flag=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            prerelease_flag=(--prerelease)
+          fi
+          # --latest=false: daemon releases keep `releases/latest` semantics.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_COMMIT" \
+              --latest=false \
+              "${prerelease_flag[@]}" \
+              --title "intentd sitter $VERSION" \
+              --notes "Self-updating supervisor shim for intentd, installed as \`intentd\`. Archives contain the sitter binary renamed to \`intentd\` (\`intentd.exe\` on Windows)."
+          fi
+          gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+      # Fixed release so install instructions have a stable URL
+      # (releases/download/sitter-latest/intentd-<triple>.tar.xz). Asset names
+      # are constant, so --clobber replaces the full set. Prereleases are not
+      # promoted here, mirroring channel-stable semantics.
+      - name: Refresh sitter-latest release
+        if: ${{ needs.plan.outputs.prerelease == 'false' }}
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          if ! gh release view sitter-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ! gh release create sitter-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$RELEASE_COMMIT" \
+              --latest=false \
+              --title "intentd sitter (latest)" \
+              --notes "Fixed release tracking the newest sitter version for stable install URLs. Do not consume the tag itself; download the intentd-<triple> archives."
+            then
+              # Tolerate only a lost create race; the release must exist now.
+              if ! gh release view sitter-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "error: failed to create release sitter-latest and it does not exist" >&2
+                exit 1
+              fi
+            fi
+          fi
+          gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
