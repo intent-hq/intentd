@@ -147,6 +147,20 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
         cmd.env(key, value);
     }
 
+    // The pinned codex-acp npx fallback is daemon-managed (not a user escape
+    // hatch), so remove CODEX_PATH / CODEX_CONFIG from its inherited env — a
+    // stray or hostile value could redirect the adapter away from the vendored
+    // binary (#555). Resolved binaries (providers.paths / PATH scan) keep the
+    // daemon env untouched.
+    if opts.provider.id == "codex"
+        && opts.provider_binary.is_none()
+        && opts.npx_fallback_binary.is_some()
+        && opts.npx_fallback_package.is_some()
+    {
+        cmd.env_remove("CODEX_PATH");
+        cmd.env_remove("CODEX_CONFIG");
+    }
+
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
     // (e.g., when spawning npx, node must be findable)
     let path_binary = opts.provider_binary.or_else(|| {
@@ -633,6 +647,74 @@ mod build_command_tests {
         assert!(
             parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
             "codex npx fallback must be pinned to an exact semver version, got: {version}"
+        );
+    }
+
+    /// Whether `cmd` explicitly removes `key` from the child's inherited env
+    /// (`get_envs()` yields `(key, None)` for `env_remove` entries).
+    fn env_removed(cmd: &Command, key: &str) -> bool {
+        cmd.as_std()
+            .get_envs()
+            .any(|(k, v)| k == key && v.is_none())
+    }
+
+    #[test]
+    fn build_command_strips_codex_env_on_npx_fallback_spawn() {
+        // The pinned npx fallback is daemon-managed: a stray CODEX_PATH /
+        // CODEX_CONFIG in the daemon env must not redirect the adapter (#555).
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let cmd = build_command(&opts);
+        assert!(
+            env_removed(&cmd, "CODEX_PATH"),
+            "npx-fallback codex spawn must remove CODEX_PATH from the child env"
+        );
+        assert!(
+            env_removed(&cmd, "CODEX_CONFIG"),
+            "npx-fallback codex spawn must remove CODEX_CONFIG from the child env"
+        );
+    }
+
+    #[test]
+    fn build_command_keeps_codex_env_for_resolved_binary_spawn() {
+        // A resolved codex-acp binary (providers.paths override or PATH scan)
+        // is the user's escape hatch — its env must be left untouched.
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let provider_binary = PathBuf::from("/custom/codex-acp");
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.provider_binary = Some(&provider_binary);
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.fallback_npx_package;
+        let cmd = build_command(&opts);
+        let touched = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == "CODEX_PATH" || k == "CODEX_CONFIG");
+        assert!(
+            !touched,
+            "resolved-binary codex spawn must inherit CODEX_PATH/CODEX_CONFIG untouched"
+        );
+    }
+
+    #[test]
+    fn build_command_leaves_codex_env_alone_for_other_npx_providers() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        let mut opts = SpawnOptions::new(provider);
+        let npx_path = PathBuf::from("/usr/local/bin/npx");
+        opts.npx_fallback_binary = Some(&npx_path);
+        opts.npx_fallback_package = provider.npx_only_package;
+        let cmd = build_command(&opts);
+        let touched = cmd
+            .as_std()
+            .get_envs()
+            .any(|(k, _)| k == "CODEX_PATH" || k == "CODEX_CONFIG");
+        assert!(
+            !touched,
+            "non-codex npx spawns must not touch CODEX_PATH/CODEX_CONFIG"
         );
     }
 }
