@@ -37,7 +37,7 @@ toml = "0.8"
 directories = "5"
 nix = { version = "0.29", features = ["signal", "process"] }
 portable-pty = "0.8"
-grep = "0.3"
+grep = "0.4"
 ignore = "0.4"
 globset = "0.4"
 
