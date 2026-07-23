@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-07-23
+
+### 🐛 Bug Fixes
+
+- Fail closed on nonexistent agent in agent.send and sender-watch paths ([#407](https://github.com/intent-hq/intentd/pull/407))
+
+
 ## [0.2.2] - 2026-07-23
 
 ### 🚀 Features
