@@ -600,14 +600,14 @@ impl ChatDeltaState {
         Some(single_delta(added, entity))
     }
 
-    /// Map an `agent:tool:call`: synthesize a `tool_use` block (and, once the call
-    /// completes WITH output, a `tool_result` block — plus a standalone
-    /// proposal-resource block when a `completed` (not `error`) output carries
-    /// a proposal-MIME resource item, §7.1) matching the persisted
-    /// `record_tool` shape (D6). The
-    /// `tool_result` block id is the `tool_use` index + 1 (it is appended right
-    /// after) and the proposal block follows at + 2; a mispredicted id
-    /// self-heals at the terminal reconcile via `removedIds`.
+    /// Map an `agent:tool:call`: synthesize a `tool_use` block matching the
+    /// persisted `record_tool` shape (D6). Once the call completes WITH
+    /// output, also synthesize a `tool_result` block, and — when a `completed`
+    /// (not `error`) output carries a proposal-MIME resource item (§7.1) — a
+    /// standalone proposal-resource block. The `tool_result` block id is the
+    /// `tool_use` index + 1 (it is appended right after) and the proposal
+    /// block follows at + 2; a mispredicted id self-heals at the terminal
+    /// reconcile via `removedIds`.
     fn tool_delta(&mut self, event: &Event) -> Option<Value> {
         let d = &event.data;
         let block_id = d.get("blockId").and_then(Value::as_str)?.to_string();
