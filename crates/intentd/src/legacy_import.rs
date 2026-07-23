@@ -396,9 +396,12 @@ pub fn default_roots() -> Vec<PathBuf> {
     if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
         return Vec::new();
     }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    // `directories` resolves the home dir platform-natively (Known Folder API
+    // on Windows), so discovery works even when `HOME` is unset.
+    let Some(base) = directories::BaseDirs::new() else {
         return Vec::new();
     };
+    let home = base.home_dir();
     vec![
         home.join("intent").join("workspaces"),
         home.join("intent"),
@@ -421,16 +424,12 @@ pub fn default_app_dir() -> Option<PathBuf> {
     if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    if cfg!(target_os = "macos") {
-        Some(
-            home.join("Library")
-                .join("Application Support")
-                .join("intent"),
-        )
-    } else {
-        Some(home.join(".config").join("intent"))
-    }
+    // `BaseDirs::config_dir()` matches Electron's `userData` parent on every
+    // platform: `~/Library/Application Support` (macOS), `%APPDATA%`
+    // (Windows Roaming), `$XDG_CONFIG_HOME`/`~/.config` (Linux) — and does
+    // not require `HOME` on Windows.
+    let base = directories::BaseDirs::new()?;
+    Some(base.config_dir().join("intent"))
 }
 
 /// Scan `opts.roots` in order and import every legacy workspace found. Missing

@@ -117,7 +117,8 @@ enum Command {
         /// Print the per-workspace plan without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Update rows whose workspace id already exists instead of skipping.
+        /// Re-run even when the completion marker is already set, and update
+        /// rows whose workspace id already exists instead of skipping.
         #[arg(long)]
         force: bool,
     },
@@ -327,10 +328,11 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
 
 /// Import legacy per-directory Intent workspaces into the configured SQLite
 /// store. `--root` (repeatable) narrows the scan to explicit directories
-/// (each must exist); otherwise the default legacy roots are scanned. A
-/// non-dry-run run always ends by writing the first-boot marker so `serve`
-/// never re-imports — even when every workspace was skipped or failed softly
-/// (the run itself "completed"; re-run the CLI to retry problem workspaces).
+/// (each must exist); otherwise the default legacy roots are scanned. When
+/// the completion marker is already set, the run is skipped unless `--force`
+/// or `--dry-run` is passed. A non-dry-run run always ends by rewriting the
+/// marker — even when every workspace was skipped or failed softly (the run
+/// itself "completed"; `--force` re-runs to retry problem workspaces).
 /// Per-workspace problems are soft (reported, exit 0); only an unusable
 /// explicit `--root` or a store-open failure exits non-zero. A dry-run
 /// against a not-yet-created DB removes the freshly created DB file
@@ -359,6 +361,21 @@ async fn cmd_import_legacy(
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Marker gate: a completed import is not repeated unless forced. Dry-run
+    // stays allowed (it writes nothing, so previewing is always safe).
+    if !dry_run && !force {
+        if let Some(at) = store
+            .get_setting(legacy_import::LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        {
+            println!(
+                "legacy import already completed at {at}; use --force to re-run \
+                 or --dry-run to preview"
+            );
+            return Ok(());
+        }
+    }
     let report = legacy_import::run(
         &store,
         &legacy_import::Options {
