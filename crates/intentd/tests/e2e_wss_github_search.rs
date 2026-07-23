@@ -471,13 +471,15 @@ async fn issues_search_forwards_query_and_cursor() {
         json!({
             "owner": "o", "repo": "r", "state": "closed",
             "query": "  login bug  ",
-            "nextToken": wire_next_token("2"),
+            "nextToken": wire_next_token("5"),
         }),
     )
     .await;
     assert_eq!(r["issues"][0]["number"], 11);
     assert_eq!(r["issues"][0]["owner"], "o");
     assert_eq!(r["issues"][0]["repo"], "r");
+    // The response token encodes the engine's returned next_cursor ("2"),
+    // not an echo of the request token (cursor "5").
     assert_eq!(r["nextToken"], json!(wire_next_token("2")));
 
     let queries = fx.forge.issue_queries.lock().unwrap();
@@ -485,7 +487,7 @@ async fn issues_search_forwards_query_and_cursor() {
     let q = &queries[0];
     assert_eq!(q.search.as_deref(), Some("login bug"));
     assert_eq!(q.state.as_deref(), Some("closed"));
-    assert_eq!(q.cursor.as_deref(), Some("2"));
+    assert_eq!(q.cursor.as_deref(), Some("5"));
 }
 
 /// Without a `query` (or with a blank one) the engine sees `search: None` —
