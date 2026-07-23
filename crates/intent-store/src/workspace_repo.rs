@@ -128,6 +128,8 @@ impl Store {
     /// `deleted_workspace_id` (same transaction as the row delete) so
     /// `workspace.create` never recycles the id for a later workspace (FE
     /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
+    /// Also removes the workspace's `draft` rows explicitly — `draft` has no
+    /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
     ///
     /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
@@ -148,6 +150,11 @@ impl Store {
             if res.rows_affected() == 0 {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
+            sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
+                .bind(&id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
             sqlx::query(
                 "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)",
             )
