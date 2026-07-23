@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use crate::client::SentryClient;
 use crate::error::{Error, Result};
 use crate::model::{
-    FetchIssuesRequest, IssueStatusFilter, SentryAuthState, SentryIssueLevel, SentryIssueResult,
-    SentryIssueStatus, SentryProject,
+    FetchIssuesRequest, IssueStatusFilter, SentryAuthState, SentryIssueLevel, SentryIssuePage,
+    SentryIssueResult, SentryIssueStatus, SentryProject,
 };
 
 /// Default page size when the caller does not specify one (matches the FE).
@@ -27,16 +27,21 @@ pub trait SentryEngine: Send + Sync {
     async fn auth_status(&self) -> Result<SentryAuthState>;
 
     /// List issues matching `request` (status, project, query, limit).
-    async fn list_issues(&self, request: FetchIssuesRequest) -> Result<Vec<SentryIssueResult>>;
+    /// `request.cursor` is the raw Sentry page cursor from a previous page
+    /// (threaded as the `cursor` query param); absent → first page. The
+    /// returned page carries the next cursor only when another page exists.
+    async fn list_issues(&self, request: FetchIssuesRequest) -> Result<SentryIssuePage>;
 
     /// Full-text search issues. Delegates to [`Self::list_issues`] with the
-    /// supplied query; status defaults to `unresolved`.
+    /// supplied query; status defaults to `unresolved`. `cursor` paginates
+    /// like [`Self::list_issues`].
     async fn search_issues(
         &self,
         query: &str,
         project: Option<&str>,
         limit: Option<u32>,
-    ) -> Result<Vec<SentryIssueResult>>;
+        cursor: Option<&str>,
+    ) -> Result<SentryIssuePage>;
 
     /// List projects for the configured organization (P1 read).
     /// `GET /organizations/{org}/projects/`.
@@ -90,20 +95,21 @@ impl SentryEngine for SentryEngineImpl {
         }
     }
 
-    async fn list_issues(&self, request: FetchIssuesRequest) -> Result<Vec<SentryIssueResult>> {
+    async fn list_issues(&self, request: FetchIssuesRequest) -> Result<SentryIssuePage> {
         let path = format!("/organizations/{}/issues/", self.client.organization());
         let limit = clamp_limit(request.limit).to_string();
         let query = build_query(request.status, request.query.as_deref());
-        let mut params: Vec<(&str, &str)> = Vec::with_capacity(3);
-        if let Some(q) = query.as_deref() {
-            params.push(("query", q));
-        }
-        if let Some(project) = request.project.as_deref() {
-            params.push(("project", project));
-        }
-        params.push(("limit", &limit));
-        let data = self.client.get_with_query(&path, &params).await?;
-        Ok(map_issue_nodes(&data))
+        let params = build_issue_params(
+            query.as_deref(),
+            request.project.as_deref(),
+            &limit,
+            request.cursor.as_deref(),
+        );
+        let (data, next_cursor) = self.client.get_with_query_paged(&path, &params).await?;
+        Ok(SentryIssuePage {
+            issues: map_issue_nodes(&data),
+            next_token: next_cursor,
+        })
     }
 
     async fn search_issues(
@@ -111,12 +117,14 @@ impl SentryEngine for SentryEngineImpl {
         query: &str,
         project: Option<&str>,
         limit: Option<u32>,
-    ) -> Result<Vec<SentryIssueResult>> {
+        cursor: Option<&str>,
+    ) -> Result<SentryIssuePage> {
         self.list_issues(FetchIssuesRequest {
             project: project.map(str::to_string),
             status: None,
             query: Some(query.to_string()),
             limit,
+            cursor: cursor.map(str::to_string),
         })
         .await
     }
@@ -180,6 +188,29 @@ impl SentryEngineImpl {
 /// Clamp an optional limit into `[1, MAX_LIMIT]`, defaulting when absent.
 pub(crate) fn clamp_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+/// Build the query params for the `/issues/` endpoint: optional `query` /
+/// `project`, the clamped `limit`, and the `cursor` only when paginating past
+/// the first page.
+pub(crate) fn build_issue_params<'a>(
+    query: Option<&'a str>,
+    project: Option<&'a str>,
+    limit: &'a str,
+    cursor: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut params: Vec<(&'static str, &'a str)> = Vec::with_capacity(4);
+    if let Some(q) = query {
+        params.push(("query", q));
+    }
+    if let Some(p) = project {
+        params.push(("project", p));
+    }
+    params.push(("limit", limit));
+    if let Some(c) = cursor {
+        params.push(("cursor", c));
+    }
+    params
 }
 
 /// Build the `query=` value for the issues endpoint, mirroring the FE's
@@ -379,6 +410,25 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(50)), 50);
         assert_eq!(clamp_limit(Some(9999)), MAX_LIMIT);
+    }
+
+    #[test]
+    fn issue_params_thread_cursor() {
+        assert_eq!(
+            build_issue_params(Some("is:unresolved"), Some("web"), "5", Some("0:100:0")),
+            vec![
+                ("query", "is:unresolved"),
+                ("project", "web"),
+                ("limit", "5"),
+                ("cursor", "0:100:0"),
+            ]
+        );
+
+        // First page: no cursor → the param is omitted entirely.
+        assert_eq!(
+            build_issue_params(None, None, "100", None),
+            vec![("limit", "100")]
+        );
     }
 
     #[test]

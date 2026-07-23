@@ -2287,8 +2287,12 @@ async fn dispatch(
             let status = opt_str(params, "status");
             let query = opt_str(params, "query");
             let limit = opt_int(params, "limit");
-            match api.sentry_list_issues(project, status, query, limit).await {
-                Ok(issues) => Ok(issues),
+            let next_token = opt_str(params, "nextToken");
+            match api
+                .sentry_list_issues(project, status, query, limit, next_token)
+                .await
+            {
+                Ok(page) => Ok(page),
                 Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -2297,8 +2301,9 @@ async fn dispatch(
             let query = require_str_param(params, "query")?;
             let project = opt_str(params, "project");
             let limit = opt_int(params, "limit");
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .sentry_search_issues(query, project, limit)
+                .sentry_search_issues(query, project, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

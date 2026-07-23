@@ -56,6 +56,11 @@ pub struct FetchIssuesRequest {
     /// Page-size hint (clamped at the engine layer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Raw Sentry page cursor from a previous page's `Link` header (threaded
+    /// as the `cursor` query param); absent → first page. Engine-level only —
+    /// not part of the FE request shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Auth / connectivity probe result (`sentry.authStatus`).
@@ -125,6 +130,21 @@ pub struct SentryIssueResult {
     /// Function name from `metadata.function`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
+}
+
+/// One engine-level page of issues backing `sentry.listIssues` /
+/// `sentry.searchIssues`.
+///
+/// `next_token` carries the **raw** Sentry page cursor parsed from the
+/// response `Link` header (`rel="next"` with `results="true"`) and is absent
+/// on the last page. The services layer wraps it into the opaque base64 wire
+/// `nextToken` (and emits explicit `null` on the last page) per the §5.5
+/// uniform-pagination conventions — this struct never crosses the wire
+/// directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentryIssuePage {
+    pub issues: Vec<SentryIssueResult>,
+    pub next_token: Option<String>,
 }
 
 #[cfg(test)]

@@ -3470,16 +3470,20 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `sentry.listIssues`: issues matching the typed `status` filter
     /// (`unresolved`|`resolved`|`ignored`|`all`, default `unresolved`),
-    /// optional `project` slug, optional free-text `query`, returned as a bare
-    /// `SentryIssueResult[]` (PROTOCOL §5.29).
+    /// optional `project` slug, optional free-text `query`, returned as
+    /// `{ issues: SentryIssueResult[], nextToken }`. `next_token` is the
+    /// opaque base64 token from a previous page (§5.5; malformed → first
+    /// page); the result's `nextToken` is an opaque base64 string when
+    /// another page exists, else `null` (PROTOCOL §5.29).
     fn sentry_list_issues(
         &self,
         project: Option<String>,
         status: Option<String>,
         query: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (project, status, query, limit);
+        let _ = (project, status, query, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::sentry_list_issues not implemented".to_string(),
@@ -3488,14 +3492,16 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `sentry.searchIssues`: full-text issue search by `query`, optional
-    /// `project` slug, returned as a bare `SentryIssueResult[]` (PROTOCOL §5.29).
+    /// `project` slug, returned as `{ issues: SentryIssueResult[], nextToken }`
+    /// with the same cursor semantics as `sentry.listIssues` (PROTOCOL §5.29).
     fn sentry_search_issues(
         &self,
         query: String,
         project: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, project, limit);
+        let _ = (query, project, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::sentry_search_issues not implemented".to_string(),
