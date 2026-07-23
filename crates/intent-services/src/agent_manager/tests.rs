@@ -5291,6 +5291,100 @@ mod stale_redrive_tests {
         );
     }
 
+    /// Fail open: an unparseable `queued_at` (or report timestamp) disables
+    /// the staleness verdict for that message — treated as fresh, content
+    /// untouched (the `else` arm logs a warn for diagnosability).
+    #[tokio::test]
+    async fn unparseable_timestamps_fail_open_as_fresh() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-g"), AgentId::from("a-576-g"));
+        seed_agent(&mgr, &ws, &id).await;
+        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
+
+        // Garbage queued_at.
+        let mut msg = queued_msg("hello", "not-a-timestamp", false);
+        assert!(!mgr.annotate_stale_redrive(&id, &mut msg).await);
+        assert_eq!(msg.content, "hello");
+
+        // Garbage report timestamp.
+        set_delegated_report(&mgr, &ws, &id, "garbage-ts").await;
+        let mut msg = queued_msg("hello", &now_iso(), false);
+        assert!(!mgr.annotate_stale_redrive(&id, &mut msg).await);
+        assert_eq!(msg.content, "hello");
+    }
+
+    /// STAB-112 requeue keeps staleness sticky (#576): a drained stale entry
+    /// whose turn fails terminally is requeued with its ORIGINAL `queued_at`
+    /// (threaded via [`TurnOptions::queued_at`]), so the retry drain still
+    /// classifies it stale and keeps suppressing the report clear. Direct
+    /// sends (`queued_at: None`) stamp a fresh timestamp as before.
+    #[tokio::test]
+    async fn terminal_failure_requeue_preserves_staleness() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-h"), AgentId::from("a-576-h"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+
+        // Simulate the terminal-failure requeue of a drained stale entry.
+        let options = super::super::TurnOptions {
+            queued_at: Some(queued_at.clone()),
+            ..super::super::TurnOptions::default()
+        };
+        super::super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            "stale work",
+            &options,
+            true,
+            "boom",
+        )
+        .await;
+
+        let mut requeued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("requeued entry present");
+        assert_eq!(
+            requeued.queued_at, queued_at,
+            "requeue carries the original queued_at, not now_iso()"
+        );
+        assert!(requeued.requeued_after_failure);
+        assert!(
+            mgr.annotate_stale_redrive(&id, &mut requeued).await,
+            "the retry drain still classifies the requeued entry as stale"
+        );
+        assert_eq!(
+            requeued.content, "stale work",
+            "persisted requeues are never rewritten"
+        );
+
+        // Direct sends have no drained timestamp: the requeue stamps fresh.
+        let options = super::super::TurnOptions::default();
+        super::super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            "direct send",
+            &options,
+            true,
+            "boom",
+        )
+        .await;
+        let mut requeued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("requeued entry present");
+        assert!(
+            !mgr.annotate_stale_redrive(&id, &mut requeued).await,
+            "a direct-send requeue is stamped fresh (queued_at >= report_ts)"
+        );
+    }
+
     /// Full drain-path flow (#576): a delegated agent with a delivered
     /// completion report drains a STALE queued message through a real mock-ACP
     /// turn — the persisted user row carries the annotation and the report

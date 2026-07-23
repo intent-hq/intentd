@@ -132,6 +132,13 @@ pub struct TurnOptions {
     /// delivered report queryable via `agent.get`. Fresh turns leave this
     /// `false` and clear as today.
     pub suppress_report_clear: bool,
+    /// The drained entry's original `queued_at`, threaded through so a
+    /// terminal-failure requeue (STAB-112) re-enqueues with the ORIGINAL
+    /// timestamp instead of stamping `now_iso()` — keeping the #576 staleness
+    /// verdict sticky across retries (a stale redrive that fails stays stale,
+    /// so the retry still suppresses the report clear). `None` for direct
+    /// sends, whose requeue stamps `now_iso()` as before.
+    pub queued_at: Option<String>,
 }
 
 /// Conservative cap used when total system memory cannot be determined.
@@ -2330,6 +2337,12 @@ impl AgentManager {
         };
         let (Some(queued), Some(reported)) = (parse_iso(&msg.queued_at), parse_iso(&report_ts))
         else {
+            tracing::warn!(
+                agent = %agent_id,
+                queued_at = %msg.queued_at,
+                report_timestamp = %report_ts,
+                "stale-redrive check skipped: timestamp parse failed (treating as fresh)"
+            );
             return false;
         };
         if queued >= reported {
@@ -2707,6 +2720,7 @@ impl AgentManager {
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
+            queued_at: Some(next.queued_at.clone()),
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -3012,12 +3026,16 @@ impl AgentManager {
                                 // `persisted: true` prevents duplicate transcript append;
                                 // `requeued_after_failure: false` so the FE does not show
                                 // "failed — will retry" (interrupt ≠ failure, STAB-114).
+                                // `queued_at` carries the interrupted user row's
+                                // ORIGINAL timestamp so the #576 staleness verdict
+                                // stays sticky across the requeue (an interrupted
+                                // stale redrive is still stale on redelivery).
                                 let queued = crate::agent_ops::QueuedMessage {
                                     id: crate::agent_ops::new_message_id(),
                                     content: text_content,
                                     image_blocks,
                                     file_blocks,
-                                    queued_at: crate::now_iso(),
+                                    queued_at: last_user_msg.created_at.clone(),
                                     editing: false,
                                     persisted: true,
                                     requeued_after_failure: false,
@@ -4231,6 +4249,7 @@ async fn run_message_worker(
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                queued_at: Some(next.queued_at.clone()),
                 ..TurnOptions::default()
             };
             // Fail closed (#547): a persist failure that survived the bounded
@@ -4286,6 +4305,7 @@ async fn run_message_worker(
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                queued_at: Some(next.queued_at.clone()),
                 ..TurnOptions::default()
             };
             // Fail closed (#547): same contract as the pre-release drain arm.
@@ -4671,13 +4691,16 @@ async fn persist_error_and_requeue(
     // when the pre-turn transcript append succeeded, so the retry drain skips
     // the duplicate append; `false` when it failed, so the retry drain
     // re-attempts it. `requeued_after_failure` is set so the wire emits
-    // `requeuedAfterFailure: true` (STAB-112).
+    // `requeuedAfterFailure: true` (STAB-112). Drained turns carry the
+    // entry's ORIGINAL `queued_at` in `options` so the #576 staleness verdict
+    // stays sticky across the requeue (a failed stale redrive is still stale
+    // on retry); direct sends have no prior timestamp and stamp `now_iso()`.
     let queued = crate::agent_ops::QueuedMessage {
         id: new_message_id(),
         content: content.to_string(),
         image_blocks: options.image_blocks.clone(),
         file_blocks: options.file_blocks.clone(),
-        queued_at: now_iso(),
+        queued_at: options.queued_at.clone().unwrap_or_else(now_iso),
         editing: false,
         persisted,
         requeued_after_failure: true,
