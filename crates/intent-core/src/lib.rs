@@ -20,8 +20,8 @@ pub mod slug;
 pub mod traits;
 
 pub use agent_logs::{
-    agent_logs_root, current_agent_log_file_name, sweep_agent_logs, AGENT_LOGS_DIR_NAME,
-    AGENT_LOG_RETENTION_DAYS,
+    agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
+    sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
 };
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
