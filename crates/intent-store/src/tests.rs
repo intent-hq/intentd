@@ -2446,11 +2446,13 @@ async fn draft_round_trip_for_workspace_id_without_row() {
         .is_none());
 }
 
-/// The 0050 rebuild (drop the draft→workspace FK) preserves existing rows —
-/// text, attachments, and the NULL-attachments shape all survive the
-/// create-new → copy → drop → rename cycle. Exercised by re-running the
-/// migration SQL against a populated `draft` table (the embedded migrator has
-/// already run against an empty DB by the time we can insert rows).
+/// The 0050 rebuild (drop the draft→workspace FK) upgrades the pre-0050
+/// schema in place without losing rows — text, attachments, and the
+/// NULL-attachments shape all survive the create-new → copy → drop → rename
+/// cycle, and the workspace FK is actually gone afterwards. The embedded
+/// migrator has already run against an empty DB by the time we can insert
+/// rows, so the old 0007+0048 table shape (workspace FK included) is rebuilt
+/// by hand before replaying the migration SQL.
 #[tokio::test]
 async fn draft_fk_drop_migration_preserves_existing_rows() {
     let tmp = TempDb::new();
@@ -2462,6 +2464,26 @@ async fn draft_fk_drop_migration_preserves_existing_rows() {
         .expect("insert ws");
     let client = ClientId::from_string("cli-1");
     store.upsert_client(&client, None, None).await.unwrap();
+
+    // Restore the pre-0050 shape: 0007 columns + workspace FK, with the 0048
+    // `attachments` column appended.
+    sqlx::raw_sql(
+        "DROP TABLE draft;
+         CREATE TABLE draft (
+           workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+           agent_id     TEXT NOT NULL,
+           client_id    TEXT NOT NULL REFERENCES client(id) ON DELETE CASCADE,
+           text         TEXT NOT NULL,
+           updated_at   TEXT NOT NULL,
+           attachments  TEXT,
+           PRIMARY KEY (workspace_id, agent_id, client_id)
+         );
+         CREATE INDEX idx_draft_client ON draft(client_id);",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("rebuild pre-0050 shape");
+
     let agent = AgentId::from_string("agent-1");
     let attachments = json!([{ "type": "image", "imageData": "aGk=" }]);
     store
@@ -2473,13 +2495,25 @@ async fn draft_fk_drop_migration_preserves_existing_rows() {
         .upsert_draft(&ws, &plain_agent, &client, "no attachments", None)
         .await
         .unwrap();
+    let sentinel_ws = WorkspaceId::from("__new-workspace__");
+    let sentinel_agent = AgentId::from_string("__initializer__");
+    store
+        .upsert_draft(&sentinel_ws, &sentinel_agent, &client, "rejected", None)
+        .await
+        .expect_err("pre-0050 FK rejects the sentinel workspaceId");
 
     sqlx::raw_sql(include_str!(
         "../migrations/0050_draft_drop_workspace_fk.sql"
     ))
     .execute(store.write_pool())
     .await
-    .expect("re-run rebuild");
+    .expect("run rebuild against the old shape");
+
+    // The FK is really gone: the sentinel write now succeeds.
+    store
+        .upsert_draft(&sentinel_ws, &sentinel_agent, &client, "accepted", None)
+        .await
+        .expect("post-0050 sentinel write succeeds");
 
     let got = store
         .get_draft(&ws, &agent, &client)

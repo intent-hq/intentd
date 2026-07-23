@@ -142,6 +142,13 @@ impl Store {
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace tx failed: {e}")))?;
+            // Child-table cleanup first (defensive ordering); on the NotFound
+            // early-return below the rollback undoes it.
+            sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
+                .bind(&id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
             let res = sqlx::query("DELETE FROM workspace WHERE id = ?")
                 .bind(&id.0)
                 .execute(&mut *tx)
@@ -150,11 +157,6 @@ impl Store {
             if res.rows_affected() == 0 {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
-            sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
-                .bind(&id.0)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
             sqlx::query(
                 "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)",
             )
