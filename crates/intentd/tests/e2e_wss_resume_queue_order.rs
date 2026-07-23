@@ -19,7 +19,6 @@
 
 mod common;
 
-use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -35,7 +34,6 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
@@ -170,32 +168,8 @@ async fn connect_ws(
     port: u16,
     cfg: ClientConfig,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    // Bound all network handshakes (TCP, TLS, WS) with 5s timeouts to prevent
-    // indefinite hangs.
-    let tcp = timeout(
-        Duration::from_secs(5),
-        TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-    )
-    .await
-    .expect("tcp connect timed out")
-    .expect("tcp connect");
-    let name = ServerName::try_from("localhost").unwrap();
-    let tls = timeout(
-        Duration::from_secs(5),
-        TlsConnector::from(Arc::new(cfg)).connect(name, tcp),
-    )
-    .await
-    .expect("tls handshake timed out")
-    .expect("tls connect");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = timeout(
-        Duration::from_secs(5),
-        tokio_tungstenite::client_async(url, tls),
-    )
-    .await
-    .expect("ws handshake timed out")
-    .expect("ws handshake");
-    ws
+    common::wss_connect_with_retry(port, Arc::new(cfg), &url).await
 }
 
 async fn wss_rpc(

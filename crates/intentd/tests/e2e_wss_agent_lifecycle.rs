@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -29,7 +28,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{sleep, timeout};
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
@@ -193,14 +191,7 @@ async fn tls_connect(
     port: u16,
     cfg: Arc<ClientConfig>,
 ) -> tokio_rustls::client::TlsStream<TcpStream> {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
-    let name = ServerName::try_from("localhost").unwrap();
-    TlsConnector::from(cfg)
-        .connect(name, tcp)
-        .await
-        .expect("tls connect")
+    common::tls_connect_with_retry(port, cfg).await
 }
 
 /// Open an authenticated WSS connection (token in the query string).
@@ -208,12 +199,8 @@ async fn connect_ws(
     port: u16,
     cfg: Arc<ClientConfig>,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tls = tls_connect(port, cfg).await;
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
-    ws
+    common::wss_connect_with_retry(port, cfg, &url).await
 }
 
 /// Send one JSON-RPC frame and return the result whose id matches; any

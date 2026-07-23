@@ -30,7 +30,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 
 mod common;
@@ -162,19 +161,8 @@ async fn start_server() -> (WsApiServer, u16, Arc<ClientConfig>, std::path::Path
 type WsClient = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> WsClient {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
-    let name = ServerName::try_from("localhost").unwrap();
-    let tls = TlsConnector::from(cfg)
-        .connect(name, tcp)
-        .await
-        .expect("tls connect");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
-    ws
+    common::wss_connect_with_retry(port, cfg, &url).await
 }
 
 /// RAII guard: sets `INTENTD_TEST_PANIC_METHOD` and removes it on drop, so

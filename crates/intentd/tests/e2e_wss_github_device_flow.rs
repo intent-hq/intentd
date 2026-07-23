@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
@@ -196,19 +195,8 @@ async fn connect_ws(
     port: u16,
     cfg: Arc<ClientConfig>,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
-    let name = ServerName::try_from("localhost").unwrap();
-    let tls = TlsConnector::from(cfg)
-        .connect(name, tcp)
-        .await
-        .expect("tls connect");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
-    ws
+    common::wss_connect_with_retry(port, cfg, &url).await
 }
 
 /// One WSS JSON-RPC round-trip returning the full envelope (so callers can
