@@ -229,7 +229,7 @@ async fn wss_rpc(
 async fn boot(data_dir: &Path) -> (u16, String) {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let actual_port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()

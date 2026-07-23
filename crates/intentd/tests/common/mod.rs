@@ -89,6 +89,85 @@ pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: 
     }
 }
 
+/// One `system.status` round-trip over the daemon's UDS control socket. The
+/// whole connect + write + read sequence shares a single `budget` timeout so a
+/// wedged daemon cannot stall the readiness poll below beyond that bound.
+#[cfg(unix)]
+async fn try_status_rpc(socket: &Path, budget: Duration) -> Result<serde_json::Value, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let rpc = async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|e| format!("uds connect failed: {e}"))?;
+        let (read_half, mut write_half) = stream.into_split();
+        let frame = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"system.status\",\"params\":{}}\n";
+        write_half
+            .write_all(frame.as_bytes())
+            .await
+            .map_err(|e| format!("uds write failed: {e}"))?;
+        write_half
+            .flush()
+            .await
+            .map_err(|e| format!("uds write failed: {e}"))?;
+        let mut buf = String::new();
+        BufReader::new(read_half)
+            .read_line(&mut buf)
+            .await
+            .map_err(|e| format!("uds read failed: {e}"))?;
+        serde_json::from_str(buf.trim_end()).map_err(|e| format!("invalid JSON frame: {e}"))
+    };
+    tokio::time::timeout(budget, rpc)
+        .await
+        .map_err(|_| format!("status rpc timed out after {budget:?}"))?
+}
+
+/// Poll `system.status` over the daemon's UDS control socket until the WSS
+/// listener is bound — i.e. the response carries `result.port` — and return
+/// that full JSON-RPC response (intent-hq/monorepo#559). The UDS socket can
+/// accept (and `system.status` answer) while the status snapshot still lacks
+/// the WSS port, so a single-shot lookup panics on `expect("port")` under
+/// parallel load. Bounded by [`daemon_startup_timeout`] with a short
+/// exponential backoff; a daemon whose WSS listener never binds still fails
+/// deterministically, panicking with the last observed response. Readiness
+/// poll ONLY — callers must not use this to retry assertions or other RPCs.
+#[cfg(unix)]
+pub async fn await_wss_status(socket: &Path) -> serde_json::Value {
+    let budget = daemon_startup_timeout();
+    let deadline = tokio::time::Instant::now() + budget;
+    let rpc_budget = test_timeout(Duration::from_secs(5));
+    let mut backoff = Duration::from_millis(25);
+    let mut attempts: u32 = 0;
+    let mut last: String;
+    loop {
+        attempts += 1;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match try_status_rpc(
+            socket,
+            rpc_budget.min(remaining.max(Duration::from_millis(1))),
+        )
+        .await
+        {
+            Ok(resp) => {
+                if resp["result"]["port"].as_u64().is_some() {
+                    return resp;
+                }
+                last = resp.to_string();
+            }
+            Err(e) => last = e,
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "WSS listener not ready: system.status returned no result.port on {} within \
+             {budget:?} ({attempts} attempts); last: {last}",
+            socket.display()
+        );
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = (backoff * 2).min(Duration::from_millis(500));
+    }
+}
+
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`

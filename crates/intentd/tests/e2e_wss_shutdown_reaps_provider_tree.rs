@@ -325,7 +325,7 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         panic!("daemon did not start");
     }
 
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

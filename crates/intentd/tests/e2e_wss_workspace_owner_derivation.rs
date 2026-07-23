@@ -21,7 +21,6 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -83,28 +82,6 @@ async fn await_uds(socket: &Path) -> bool {
     .is_ok()
 }
 
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (reader, mut writer) = stream.into_split();
-    let req = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params
-    });
-    writer
-        .write_all(format!("{}\n", req).as_bytes())
-        .await
-        .expect("write request");
-    let mut lines = BufReader::new(reader).lines();
-    let line = timeout(Duration::from_secs(10), lines.next_line())
-        .await
-        .expect("wait for response")
-        .expect("read line")
-        .expect("response line");
-    serde_json::from_str(&line).expect("parse response")
-}
-
 async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).expect("mkdir data");
@@ -112,7 +89,7 @@ async fn boot(root: &Path) -> (Daemon, u16, Arc<ClientConfig>) {
     let child = spawn_serve(&data_dir, &env);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp_hex = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint");

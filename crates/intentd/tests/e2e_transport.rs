@@ -311,7 +311,7 @@ async fn e2e_transport_full() {
     );
 
     // --- bind on UDS + TCP/TLS: the live control RPC reports both transports ---
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let r = &status["result"];
     assert_eq!(r["running"], true, "status: {status}");
     assert_eq!(r["listenMode"], "both");
@@ -430,7 +430,7 @@ async fn e2e_transport_full() {
         data_dir: data_dir.clone(),
     };
     assert!(await_uds(&socket).await, "daemon did not restart cleanly");
-    let again = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    let again = common::await_wss_status(&socket).await;
     assert_eq!(again["result"]["running"], true, "restart status: {again}");
     assert_eq!(
         again["result"]["transports"],
