@@ -4152,16 +4152,29 @@ fn skills_changed_event(workspace_id: &WorkspaceId) -> NewEvent {
 
 /// Bounded head/tail snippet of a client-supplied anchoring needle for the
 /// `comment.add` failure WARN: first/last 24 chars joined by `…`, or the whole
-/// string when it is short enough. Never logs full note-scale text.
+/// string when it is short enough. Never logs full note-scale text, and the
+/// work/allocation is bounded too (only the edges are walked — no full
+/// collect, so an oversized client-supplied needle costs O(EDGE)). Edges are
+/// char-boundary safe; a grapheme cluster (combining marks, emoji ZWJ) may
+/// still be split cosmetically at the cut, which is acceptable for a log line.
 fn bounded_needle_snippet(s: &str) -> String {
     const EDGE: usize = 24;
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= EDGE * 2 {
-        return s.to_string();
+    // Byte offset after the first EDGE chars; None when the string has no
+    // more than EDGE chars.
+    let head_end = s.char_indices().nth(EDGE).map(|(i, _)| i);
+    // Byte offset of the EDGE-th char from the end.
+    let tail_start = s
+        .char_indices()
+        .rev()
+        .nth(EDGE - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    match head_end {
+        Some(head_end) if head_end < tail_start => {
+            format!("{}…{}", &s[..head_end], &s[tail_start..])
+        }
+        _ => s.to_string(),
     }
-    let head: String = chars[..EDGE].iter().collect();
-    let tail: String = chars[chars.len() - EDGE..].iter().collect();
-    format!("{head}…{tail}")
 }
 
 /// Build a `comment:added` change event with the self-sufficient payload

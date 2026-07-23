@@ -1715,6 +1715,21 @@ mod tests {
     }
 
     #[test]
+    fn anchor_plaintext_fallback_at_ambiguity_fails_closed() {
+        // With `@` normalized away, a fallback needle that used to match only
+        // the literal `@alice` occurrence now also matches the bare `alice`
+        // one — the ambiguity guard fails closed (error, never a wrong
+        // anchor). Emphasis in the source keeps the exact-match path from
+        // short-circuiting so the plaintext fallback is exercised.
+        let content = "Ping **@alice** for details.\n\nPing **alice** for details.";
+        let err = find_and_anchor_text(content, "Ping @alice for details", "@alice").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn anchor_plaintext_fallback_literal_at_still_matches() {
         // A literal `@` present in BOTH the markdown and the needle keeps
         // matching after the symmetric drop.
