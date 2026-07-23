@@ -382,8 +382,9 @@ impl fmt::Display for Report {
     }
 }
 
-/// Default legacy roots. `INTENTD_LEGACY_IMPORT_ROOTS` (colon-separated; empty
-/// disables the scan) overrides; under a hermetic test harness
+/// Default legacy roots. `INTENTD_LEGACY_IMPORT_ROOTS` (PATH-style list —
+/// `:`-separated on Unix, `;` on Windows; empty disables the scan)
+/// overrides; under a hermetic test harness
 /// (`INTENTD_ASSERT_HERMETIC_ROOT`, see STAB-138) with no override the scan is
 /// disabled so tests can never read the developer's real `~/intent`.
 pub fn default_roots() -> Vec<PathBuf> {
@@ -472,6 +473,15 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
         }
     }
     Ok(report)
+}
+
+/// True when `path` is a regular file WITHOUT following symlinks
+/// (`symlink_metadata`). The per-workspace importers use this instead of
+/// `Path::is_file()` so a hostile symlink under `.workspace/` can never pull
+/// arbitrary files from outside the legacy tree into the DB or the asset
+/// root.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// True when `id` is exactly one normal path component: no `/` or `\`
@@ -635,7 +645,7 @@ fn import_workspace_assets(workspace: &Workspace, legacy_dir: &Path, root: &Path
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.is_file()
+            is_regular_file(p)
                 && !p
                     .file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with('.'))
@@ -690,7 +700,7 @@ async fn import_workspace_notes(
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.is_file()
+            is_regular_file(p)
                 && p.extension().is_some_and(|ext| ext == "md")
                 && !p
                     .file_name()
@@ -846,7 +856,7 @@ async fn import_workspace_comments(
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.is_file()
+            is_regular_file(p)
                 && p.file_name()
                     .is_some_and(|n| n.to_string_lossy().ends_with(LEGACY_COMMENTS_SUFFIX))
         })
@@ -1111,7 +1121,7 @@ async fn import_workspace_agents(
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.is_file()
+            is_regular_file(p)
                 && p.extension().is_some_and(|ext| ext == "json")
                 && !p
                     .file_name()
@@ -2764,6 +2774,51 @@ mod tests {
         assert!(!session.is_active);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Symlinks under `.workspace/` are never followed: a hostile link
+    /// pointing outside the legacy tree must not be imported as an asset,
+    /// note, or agent transcript.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_files_are_never_imported() {
+        let root = temp_root("symlink");
+        let outside = temp_root("symlink-outside");
+        std::fs::write(outside.join("secret.txt"), b"outside-data").unwrap();
+        let ws_dir = write_legacy_workspace(&root, "ws-symlink", json!({}));
+        let assets_dir = ws_dir.join(".workspace").join("assets");
+        let notes_dir = ws_dir.join(".workspace").join("notes");
+        std::fs::create_dir_all(&assets_dir).unwrap();
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), assets_dir.join("linked-asset"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), notes_dir.join("linked.md"))
+            .unwrap();
+        // A real asset next to the symlink still imports.
+        std::fs::write(assets_dir.join("real.bin"), b"real").unwrap();
+        let assets_root = temp_root("symlink-dest");
+        let store = open_store().await;
+
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                assets_root: Some(assets_root.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let entry = &report.entries[0];
+        assert_eq!(entry.assets.imported, 1, "{report}");
+        assert_eq!(entry.notes.total(), 0, "{report}");
+        let dest = assets_root.join("ws-symlink");
+        assert!(dest.join("real.bin").is_file());
+        assert!(!dest.join("linked-asset").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+        std::fs::remove_dir_all(&assets_root).ok();
     }
 
     #[tokio::test]

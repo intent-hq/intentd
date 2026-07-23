@@ -39,13 +39,37 @@ struct ExtraFields {
 }
 
 impl ExtraFields {
-    fn is_empty(&self) -> bool {
-        self.anchor_before.is_none()
-            && self.anchor_after.is_none()
-            && self.suggestion_original.is_none()
-            && self.suggestion_proposed.is_none()
-            && self.agent_id.is_none()
-            && self.is_orphaned.is_none()
+    /// The camelCase keys this struct owns inside `extra_json`. Anything else
+    /// in the blob is a preserved legacy/unknown key (see
+    /// [`Store::insert_comment_with_extras`]) that updates must not drop.
+    const KNOWN_KEYS: [&'static str; 6] = [
+        "anchorBefore",
+        "anchorAfter",
+        "suggestionOriginal",
+        "suggestionProposed",
+        "agentId",
+        "isOrphaned",
+    ];
+
+    /// Serialize into the `extra_json` object map (`None` fields omitted).
+    fn to_map(&self) -> Result<Map<String, Value>> {
+        match serde_json::to_value(self) {
+            Ok(Value::Object(m)) => Ok(m),
+            Ok(_) => Err(Error::Internal("encode extra failed: not an object".into())),
+            Err(e) => Err(Error::Internal(format!("encode extra failed: {e}"))),
+        }
+    }
+}
+
+/// Encode a merged `extra_json` map for persistence: empty → SQL `NULL`.
+fn extra_map_to_json(merged: Map<String, Value>) -> Result<Option<String>> {
+    if merged.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(
+            serde_json::to_string(&Value::Object(merged))
+                .map_err(|e| Error::Internal(format!("encode extra failed: {e}")))?,
+        ))
     }
 }
 
@@ -80,22 +104,11 @@ impl Store {
             agent_id: c.agent_id.clone(),
             is_orphaned: c.is_orphaned,
         };
-        let mut merged = match serde_json::to_value(&extra) {
-            Ok(Value::Object(m)) => m,
-            Ok(_) => return Err(Error::Internal("encode extra failed: not an object".into())),
-            Err(e) => return Err(Error::Internal(format!("encode extra failed: {e}"))),
-        };
+        let mut merged = extra.to_map()?;
         for (k, v) in legacy_extra {
             merged.entry(k.clone()).or_insert_with(|| v.clone());
         }
-        let extra_json = if merged.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&Value::Object(merged))
-                    .map_err(|e| Error::Internal(format!("encode extra failed: {e}")))?,
-            )
-        };
+        let extra_json = extra_map_to_json(merged)?;
         let sql = format!(
             "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -140,6 +153,11 @@ impl Store {
     /// (defense-in-depth) so a caller bound to workspace B cannot mutate a
     /// comment row that belongs to workspace A. `NotFound` if the row is absent
     /// or the workspace does not match.
+    ///
+    /// `extra_json` is rebuilt from the comment's own fields but any
+    /// unknown/legacy keys already present on the row (preserved by
+    /// [`Store::insert_comment_with_extras`]) are carried over, so updates
+    /// never silently drop imported legacy data.
     pub async fn update_comment(&self, workspace_id: &WorkspaceId, c: &Comment) -> Result<()> {
         let anchor_json = serde_json::to_string(&c.anchor)
             .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
@@ -151,14 +169,26 @@ impl Store {
             agent_id: c.agent_id.clone(),
             is_orphaned: c.is_orphaned,
         };
-        let extra_json = if extra.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_string(&extra)
-                    .map_err(|e| Error::Internal(format!("encode extra failed: {e}")))?,
-            )
-        };
+        let mut merged = extra.to_map()?;
+        // Carry over preserved legacy/unknown keys from the existing row.
+        let existing: Option<String> =
+            sqlx::query("SELECT extra_json FROM comment WHERE id = ? AND workspace_id = ?")
+                .bind(&c.id)
+                .bind(&workspace_id.0)
+                .fetch_optional(self.read_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("read comment extras failed: {e}")))?
+                .and_then(|r| r.get::<Option<String>, _>("extra_json"));
+        if let Some(raw) = existing {
+            if let Ok(Value::Object(old)) = serde_json::from_str::<Value>(&raw) {
+                for (k, v) in old {
+                    if !ExtraFields::KNOWN_KEYS.contains(&k.as_str()) {
+                        merged.entry(k).or_insert(v);
+                    }
+                }
+            }
+        }
+        let extra_json = extra_map_to_json(merged)?;
         let res = sqlx::query(
             "UPDATE comment SET thread_id=?, note_id=?, kind=?, content=?, author=?, \
              author_type=?, status=?, parent_id=?, anchor_json=?, anchor_text=?, extra_json=?, \

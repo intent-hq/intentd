@@ -910,6 +910,53 @@ async fn comment_round_trip_update_delete_and_thread() {
     );
 }
 
+/// `update_comment` must not drop legacy/unknown `extra_json` keys preserved
+/// by `insert_comment_with_extras` (legacy importer): the update rebuilds the
+/// known fields but carries unknown keys over from the existing row.
+#[tokio::test]
+async fn comment_update_preserves_legacy_extra_keys() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+
+    let c1 = sample_comment(&note.id, "thread-1", "c1");
+    let mut legacy = serde_json::Map::new();
+    legacy.insert("legacyMarkId".to_string(), json!("mark-7"));
+    legacy.insert("legacyRev".to_string(), json!(3));
+    store
+        .insert_comment_with_extras(&ws_id, &c1, &legacy)
+        .await
+        .expect("insert with extras");
+
+    let mut updated = c1.clone();
+    updated.status = CommentStatus::Resolved;
+    store
+        .update_comment(&ws_id, &updated)
+        .await
+        .expect("update c1");
+
+    // Known fields round-trip through the wire-facing Comment...
+    let reread = store.get_comment("c1").await.expect("reget c1");
+    assert_eq!(reread.status, CommentStatus::Resolved);
+    assert_eq!(reread.anchor_before, c1.anchor_before);
+    // ...and the raw extra_json blob still carries the legacy keys.
+    let row = sqlx::query("SELECT extra_json FROM comment WHERE id = 'c1'")
+        .fetch_one(store.read_pool())
+        .await
+        .expect("raw extra_json");
+    let raw: Option<String> = sqlx::Row::get(&row, "extra_json");
+    let blob: serde_json::Value =
+        serde_json::from_str(&raw.expect("extra_json present")).expect("valid json");
+    assert_eq!(blob["legacyMarkId"], json!("mark-7"));
+    assert_eq!(blob["legacyRev"], json!(3));
+}
+
 /// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
 /// `set_thread_status` all scope by `(id, workspace_id)`, so a caller
 /// declaring workspace B cannot mutate a comment row that belongs to
