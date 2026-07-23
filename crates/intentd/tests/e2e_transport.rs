@@ -280,11 +280,8 @@ async fn http_status(port: u16, cfg: Arc<ClientConfig>, request: &str) -> u16 {
 
 /// One authenticated WSS JSON-RPC round-trip (token in the query string).
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
-    let tls = tls_connect(port, cfg).await;
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (mut ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
+    let mut ws = common::wss_connect_with_retry(port, cfg, &url).await;
     ws.send(Message::Text(frame.to_string()))
         .await
         .expect("send");

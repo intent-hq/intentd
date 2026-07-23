@@ -277,8 +277,13 @@ pub async fn tls_connect_with_retry(
 /// Establish a pinned-TLS WebSocket connection to `url`, retrying transient
 /// connect-phase failures (each retry redoes TCP + TLS + upgrade on a fresh
 /// socket). Only connection establishment is retried — RPCs, event waits, and
-/// assertions never pass through this helper.
+/// assertions never pass through this helper. `url` must target the same
+/// `port` the socket is opened against (`wss://localhost:{port}/…`).
 pub async fn wss_connect_with_retry(port: u16, cfg: Arc<rustls::ClientConfig>, url: &str) -> TlsWs {
+    assert!(
+        url.starts_with(&format!("wss://localhost:{port}/")),
+        "wss_connect_with_retry: url {url:?} does not target wss://localhost:{port}/"
+    );
     let mut backoff = CONNECT_INITIAL_BACKOFF;
     let mut attempt = 1;
     loop {
