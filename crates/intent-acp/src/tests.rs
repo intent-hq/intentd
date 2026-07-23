@@ -2277,6 +2277,83 @@ mod error_tests {
     }
 
     #[test]
+    fn json_rpc_error_display_keeps_data_at_cap_untruncated() {
+        let at_cap = "x".repeat(crate::error::MAX_RENDERED_DATA_BYTES);
+        let e = JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!(at_cap.clone())),
+        };
+        let rendered = e.to_string();
+        assert_eq!(
+            rendered,
+            format!("JSON-RPC error -32603: Internal error: {at_cap}")
+        );
+        assert!(!rendered.contains("[truncated]"));
+    }
+
+    #[test]
+    fn json_rpc_error_display_truncates_oversized_data_with_marker() {
+        // monorepo#519: `data` is provider-controlled and unbounded, and the
+        // rendered string flows into stop_reason persistence, agent:failed
+        // events, and logs — cap it, keeping the leading detail intact.
+        let cap = crate::error::MAX_RENDERED_DATA_BYTES;
+        let big = "x".repeat(cap + 4096);
+        let e = JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!(big)),
+        };
+        let rendered = e.to_string();
+        let data_portion = rendered
+            .strip_prefix("JSON-RPC error -32603: Internal error: ")
+            .expect("code/message prefix intact");
+        assert!(data_portion.starts_with(&"x".repeat(cap)));
+        assert!(data_portion.ends_with("… [truncated]"));
+        assert_eq!(data_portion.len(), cap + "… [truncated]".len());
+        // Oversized object data is bounded too (compact-JSON rendering).
+        let e = JsonRpcError {
+            code: -32000,
+            message: "boom".to_string(),
+            data: Some(json!({ "detail": "y".repeat(cap + 4096) })),
+        };
+        assert!(e.to_string().ends_with("… [truncated]"));
+    }
+
+    #[test]
+    fn json_rpc_error_display_truncation_respects_char_boundaries() {
+        // A multi-byte char straddling the byte cap must not split (no panic,
+        // valid UTF-8): truncation backs off to the previous char boundary.
+        let cap = crate::error::MAX_RENDERED_DATA_BYTES;
+        let big = "é".repeat(cap); // 2 bytes each → straddles any even/odd cap
+        let e = JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!(big)),
+        };
+        let rendered = e.to_string();
+        assert!(rendered.ends_with("… [truncated]"));
+        assert!(rendered.chars().all(|c| c != char::REPLACEMENT_CHARACTER));
+    }
+
+    #[test]
+    fn json_rpc_error_display_keeps_codex_backend_400_detail_untruncated() {
+        // monorepo#479 regression guard: the codex-acp -32603 whose `data`
+        // object nests the ChatGPT backend 400 (as a JSON string) must still
+        // render in full — that detail is the actionable failure cause.
+        let backend_400 = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}}"#;
+        let e = JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!({ "message": backend_400, "codex_error_info": "other" })),
+        };
+        let rendered = e.to_string();
+        assert!(rendered.contains("requires a newer version of Codex"));
+        assert!(rendered.contains("Please upgrade to the latest app or CLI and try again."));
+        assert!(!rendered.contains("[truncated]"));
+    }
+
+    #[test]
     fn json_rpc_error_display_omits_null_and_empty_string_data() {
         for data in [Some(json!(null)), Some(json!(""))] {
             let e = JsonRpcError {

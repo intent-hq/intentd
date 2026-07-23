@@ -13,20 +13,44 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
+/// Cap on the rendered `data` payload appended by [`JsonRpcError`]'s Display
+/// (monorepo#519): `data` is provider-controlled and unbounded, and the
+/// rendered string flows into `stop_reason` persistence, `agent:failed`
+/// events, and logs. Sized so real actionable details (e.g. the ChatGPT
+/// backend 400 nested by codex-acp, ~300 bytes — monorepo#479) render in
+/// full while pathological payloads stay bounded.
+pub(crate) const MAX_RENDERED_DATA_BYTES: usize = 1024;
+
 impl fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "JSON-RPC error {}: {}", self.code, self.message)?;
         // Providers put the real failure detail in `data` (e.g. codex-acp's
         // -32603 "Internal error" carries the actual cause there), so append
         // it when present. Strings render raw (no JSON quoting noise); other
-        // values render as compact JSON; null/absent/empty add nothing.
+        // values render as compact JSON; null/absent/empty add nothing. The
+        // appended portion is capped at [`MAX_RENDERED_DATA_BYTES`] — the
+        // leading detail is where the actionable message lives.
         match &self.data {
             None | Some(serde_json::Value::Null) => Ok(()),
             Some(serde_json::Value::String(s)) if s.is_empty() => Ok(()),
-            Some(serde_json::Value::String(s)) => write!(f, ": {s}"),
-            Some(other) => write!(f, ": {other}"),
+            Some(serde_json::Value::String(s)) => write_bounded_data(f, s),
+            Some(other) => write_bounded_data(f, &other.to_string()),
         }
     }
+}
+
+/// Append `: {data}` to the rendered error, truncating past
+/// [`MAX_RENDERED_DATA_BYTES`] with an ellipsis marker (backing off to the
+/// previous char boundary so multi-byte chars never split).
+fn write_bounded_data(f: &mut fmt::Formatter<'_>, data: &str) -> fmt::Result {
+    if data.len() <= MAX_RENDERED_DATA_BYTES {
+        return write!(f, ": {data}");
+    }
+    let mut end = MAX_RENDERED_DATA_BYTES;
+    while !data.is_char_boundary(end) {
+        end -= 1;
+    }
+    write!(f, ": {}… [truncated]", &data[..end])
 }
 
 /// Errors raised while spawning, talking to, or handshaking with an ACP agent.
