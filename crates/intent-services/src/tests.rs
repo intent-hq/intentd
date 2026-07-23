@@ -12718,6 +12718,12 @@ mod sentry {
             .await
             .unwrap();
         assert_eq!(page["nextToken"], serde_json::Value::Null);
+
+        let page = s
+            .sentry_search_issues("boom".into(), None, None, Some("!!not-base64!!".into()))
+            .await
+            .unwrap();
+        assert_eq!(page["nextToken"], wire_token);
     }
 
     #[tokio::test]
