@@ -1,13 +1,14 @@
 //! intentd-sitter binary entry point.
 //!
-//! Skeleton only: parses the sitter-owned `--sitter-*` flags, resolves the
-//! data-dir/state layout, and reports what is (not yet) installed. The
-//! update engine lives in [`intentd_sitter::updater`]; wiring it up plus
-//! daemon supervision land in follow-up changes.
+//! Parses the sitter-owned `--sitter-*` flags, resolves the data-dir/state
+//! layout, and hands off to [`intentd_sitter::supervisor`]: startup update
+//! check, spawn the installed daemon with all forwarded args verbatim, keep
+//! it updated on the randomized 12–24h cadence, and babysit crashes.
 
 use intentd_sitter::cli::{self, SitterArgs};
+use intentd_sitter::manifest;
 use intentd_sitter::paths::SitterPaths;
-use intentd_sitter::state;
+use intentd_sitter::supervisor::{self, SupervisorConfig, MANIFEST_BASE_URL_ENV};
 
 fn main() {
     std::process::exit(run());
@@ -38,28 +39,16 @@ fn run() -> i32 {
         }
     };
 
-    let state = state::load(&paths.state_path);
-    let installed = state
-        .current_version
-        .as_deref()
-        .map(|v| paths.daemon_binary(v))
-        .filter(|bin| bin.exists());
+    let base_url = std::env::var(MANIFEST_BASE_URL_ENV)
+        .ok()
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| manifest::DEFAULT_MANIFEST_BASE_URL.to_string());
 
-    match installed {
-        Some(bin) => {
-            eprintln!(
-                "intentd-sitter: daemon {} is installed at {} but launch/supervision is not implemented yet",
-                state.current_version.as_deref().unwrap_or_default(),
-                bin.display()
-            );
-            1
-        }
-        None => {
-            eprintln!(
-                "intentd-sitter: no intentd daemon is installed for channel {} (update support is not implemented yet)",
-                args.channel
-            );
-            1
-        }
-    }
+    supervisor::run(
+        paths,
+        args.channel,
+        args.passthrough,
+        SupervisorConfig::from_env(),
+        base_url,
+    )
 }

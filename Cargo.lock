@@ -2163,6 +2163,7 @@ dependencies = [
  "directories",
  "flate2",
  "liblzma",
+ "nix 0.29.0",
  "reqwest",
  "semver",
  "serde",
@@ -2172,6 +2173,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "time",
+ "tokio",
  "tracing",
  "zip",
 ]

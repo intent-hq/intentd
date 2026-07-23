@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 directories = { workspace = true }
 time = { workspace = true, features = ["serde-well-known", "macros"] }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 sha2 = "0.10.9"
 semver = "1.0.28"
@@ -26,6 +27,9 @@ tar = "0.4.46"
 flate2 = "1.1.9"
 liblzma = { version = "0.4.7", features = ["static"] }
 reqwest = { workspace = true, features = ["blocking"] }
+
+[target."cfg(unix)".dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 flate2 = "1.1.9"
