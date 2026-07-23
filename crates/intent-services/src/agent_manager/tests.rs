@@ -3396,6 +3396,82 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
     assert!(!session.is_active, "is_active stays 0");
 }
 
+/// monorepo#564 regression: `send_message` to a nonexistent agent id (e.g. a
+/// truncated id) must fail closed with InvalidParams naming the id — NOT
+/// claim the slot, NOT queue a phantom message, NOT persist a transcript row.
+#[tokio::test]
+async fn send_message_rejects_unknown_agent() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-ghost"),
+        AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
+    );
+
+    let err = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "hello?".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect_err("unknown agent must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&id.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(!mgr.is_busy(&id), "no slot claim for an unknown agent");
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry for an unknown agent"
+    );
+    assert!(
+        mgr.workers.lock().unwrap().is_empty(),
+        "no worker spawned for an unknown agent"
+    );
+}
+
+/// monorepo#564 regression: the interrupt-priority path fails closed the same
+/// way — `interrupt_send_message` to an unknown agent is rejected without
+/// recording a duplicate-delivery interrupt id.
+#[tokio::test]
+async fn interrupt_send_message_rejects_unknown_agent() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-ghost"),
+        AgentId::from("agent-00000000-0000-0000-0000-000000000000"),
+    );
+
+    let err = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent!".to_string(),
+            Some("msg-564".to_string()),
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect_err("unknown agent must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected Error::InvalidParams, got {err:?}"
+    );
+    assert!(
+        !mgr.interrupt_ids.lock().unwrap().contains_key(&id),
+        "no interrupt-dedup entry for an unknown agent"
+    );
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry for an unknown agent"
+    );
+}
+
 /// STAB-52 regression (full loop): a message sent to an agent whose spawn
 /// always fails terminally must land the row in exactly `status = Error,
 /// is_active = 0` after a single failure — and a subsequent queue kick must
@@ -3927,6 +4003,7 @@ async fn send_message_queues_when_already_busy() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-q"), AgentId::from("a-q"));
+    seed_agent(&mgr, &ws, &id).await;
     // Claim the in-flight slot so `send_message` must enqueue.
     assert!(mgr.try_begin(&id, &ws).await);
 
@@ -4106,6 +4183,7 @@ async fn send_message_auto_queue_preserves_image_and_file_blocks() {
         WorkspaceId::from("ws-q-blocks"),
         AgentId::from("a-q-blocks"),
     );
+    seed_agent(&mgr, &ws, &id).await;
     assert!(mgr.try_begin(&id, &ws).await);
 
     let options = super::TurnOptions {

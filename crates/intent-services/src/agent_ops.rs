@@ -2332,8 +2332,26 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// Resolve the target agent session, failing closed on a nonexistent id
+    /// (monorepo#564): a truncated/mistyped `agentId` must surface a
+    /// client-facing `-32602` naming the id instead of silently proceeding
+    /// (auto-queue / phantom watch). Only `NotFound` maps to `InvalidParams`;
+    /// internal store failures propagate unchanged — mirrors the
+    /// `app_agents_wait_op` target-validation loop.
+    pub(crate) async fn require_agent_session(&self, agent_id: &AgentId) -> Result<AgentSession> {
+        self.store
+            .get_agent_session(agent_id)
+            .await
+            .map_err(|e| match e {
+                Error::NotFound(_) => {
+                    Error::InvalidParams(format!("unknown agent id: {}", agent_id.0))
+                }
+                other => other,
+            })
+    }
+
     /// `agent.sendMessage`: persist the user message; on failure auto-queue
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). Fails closed on a nonexistent target (monorepo#564).
     pub(crate) async fn agent_send_message_op(
         &self,
         agent_id: AgentId,
@@ -2352,6 +2370,10 @@ impl Services {
                 )));
             }
         }
+        // monorepo#564: reject nonexistent targets BEFORE any state change —
+        // the auto-queue fallback below is for store-append failures on a
+        // REAL agent, not a phantom queue for an id that will never drain.
+        let session = self.require_agent_session(&agent_id).await?;
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
@@ -2385,38 +2407,40 @@ impl Services {
             Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
-                // Fetch the session to get workspace_id; best-effort (logged on error).
-                match self.store.get_agent_session(&agent_id).await {
-                    Ok(session) => {
-                        if let Err(e) = self
-                            .store
-                            .refresh_agent_session_timestamp(
-                                &session.workspace_id,
-                                &agent_id,
-                                &created_at,
-                            )
-                            .await
-                        {
-                            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-                        }
-                        // Publish agent:message event using the store-returned message id.
-                        self.publish_agent_mutation_event(
-                            &session.workspace_id,
-                            &agent_id,
-                            AGENT_MESSAGE,
-                            agent_message_event_payload(&agent_id, &message),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(agent = %agent_id, error = %e, "get_agent_session failed; skipping timestamp refresh and agent:message event");
-                    }
+                // Reuses the session validated above; best-effort (logged on error).
+                if let Err(e) = self
+                    .store
+                    .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
+                // Publish agent:message event using the store-returned message id.
+                self.publish_agent_mutation_event(
+                    &session.workspace_id,
+                    &agent_id,
+                    AGENT_MESSAGE,
+                    agent_message_event_payload(&agent_id, &message),
+                )
+                .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
-            Err(_) => {
-                // STAB-7: preserve image_blocks and file_blocks when auto-queueing
-                // on store failure, matching the runtime-manager path's behavior.
+            Err(append_err) => {
+                // Check-then-act race guard (monorepo#564): if the session
+                // vanished between the up-front validation and the append
+                // (concurrent delete), fail closed like the guard rather than
+                // auto-queueing a phantom message for a gone agent.
+                if self.store.get_agent_session(&agent_id).await.is_err() {
+                    tracing::warn!(agent = %agent_id, error = %append_err, "agent session vanished mid-send; rejecting instead of auto-queueing");
+                    return Err(Error::InvalidParams(format!(
+                        "unknown agent id: {}",
+                        agent_id.0
+                    )));
+                }
+                // The agent exists but the append failed (e.g. duplicate
+                // client-supplied messageId). STAB-7: preserve image_blocks and
+                // file_blocks when auto-queueing, matching the runtime-manager
+                // path's behavior.
                 let (queued, position) =
                     self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
                 let result = json!({
@@ -3296,6 +3320,10 @@ impl Services {
         caller_agent_id: AgentId,
         target_agent_id: AgentId,
     ) -> Result<Value> {
+        // monorepo#564: fail closed on a nonexistent TARGET before any watch
+        // registration — a caller→target watch on an id that does not exist
+        // never fires, leaving the sender in a phantom "waiting" state.
+        let target_session = self.require_agent_session(&target_agent_id).await?;
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         let skip = caller_session
             .as_ref()
@@ -3319,20 +3347,16 @@ impl Services {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
-        // Anchor the watch in the caller's HOME workspace and the target's
-        // workspace (each falls back to the call's workspace when the session
-        // lookup fails), mirroring `agent_watch_completion_op` — including the
+        // Anchor the watch in the caller's HOME workspace (falls back to the
+        // call's workspace when the session lookup fails) and the target's own
+        // workspace (already resolved by the fail-closed guard above),
+        // mirroring `agent_watch_completion_op` — including the
         // `resolved_home` anchor-correction on the reuse path.
         let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
         let caller_home_ws = resolved_home
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
-        let target_ws = self
-            .store
-            .get_agent_session(&target_agent_id)
-            .await
-            .map(|s| s.workspace_id)
-            .unwrap_or_else(|_| workspace_id.clone());
+        let target_ws = target_session.workspace_id;
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
         let id = match self.find_and_refresh_ungrouped_watch(
             &caller_agent_id,
