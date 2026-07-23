@@ -3859,6 +3859,192 @@ fn cleanup_detached_worktree(trash: &Path) {
     }
 }
 
+/// Startup sweep for orphaned worktree trash directories (monorepo#473). If
+/// the daemon crashes or restarts between the locked detach rename (which
+/// moved the checkout to a `*.deleting-*` sibling trash path) and the
+/// unlocked recursive removal, the trash directory leaks — the workspace row
+/// is already deleted so nothing retries. Scans one level of workspace dirs
+/// under `root` (`<root>/<wsId>/`) for entries whose name matches the
+/// [`detached_trash_path`](intent_git::worktree) pattern, recursively removes
+/// each, then best-effort `remove_dir`s the (empty-only) parent workspace
+/// dir. Best-effort throughout: per-entry failures are logged and never abort
+/// the sweep. A missing root is a silent no-op. Returns the number of trash
+/// dirs removed.
+fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                root = %root.display(),
+                "orphaned trash sweep: cannot read workspaces root"
+            );
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for ws_entry in entries.flatten() {
+        if !ws_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let ws_dir = ws_entry.path();
+        let children = match std::fs::read_dir(&ws_dir) {
+            Ok(children) => children,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dir = %ws_dir.display(),
+                    "orphaned trash sweep: cannot read workspace dir"
+                );
+                continue;
+            }
+        };
+        let mut swept_any = false;
+        for child in children.flatten() {
+            // Conservative match: only `detached_trash_path` produces names
+            // containing `.deleting-`, and it only ever renames directories.
+            // Everything else (live worktrees, `.workspace` metadata, clone
+            // targets, stray files) is left untouched.
+            if !child.file_name().to_string_lossy().contains(".deleting-") {
+                continue;
+            }
+            if !child.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let trash = child.path();
+            match std::fs::remove_dir_all(&trash) {
+                Ok(()) => {
+                    tracing::info!(
+                        path = %trash.display(),
+                        "orphaned trash sweep: removed leaked worktree trash dir"
+                    );
+                    removed += 1;
+                    swept_any = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %trash.display(),
+                        "orphaned trash sweep: failed to remove trash dir"
+                    );
+                }
+            }
+        }
+        // Only a workspace dir we actually swept trash from is a deletion
+        // leftover; the empty-only `remove_dir` never touches live content.
+        if swept_any {
+            let _ = std::fs::remove_dir(&ws_dir);
+        }
+    }
+    removed
+}
+
+/// Startup sweep entry point for [`sweep_orphaned_worktree_trash`]
+/// (monorepo#473). Resolves the workspaces root the same way the
+/// `workspace.*` operations do (injected root, else
+/// [`default_workspaces_root`]) and runs the potentially multi-GB removal on
+/// the blocking pool. Best-effort: a failed (or panicked) sweep task is
+/// logged and reported as 0 removals.
+impl Services {
+    pub async fn sweep_orphaned_worktree_trash(&self) -> usize {
+        let root = self.workspaces_root.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let root = root.unwrap_or_else(default_workspaces_root);
+            sweep_orphaned_worktree_trash(&root)
+        })
+        .await;
+        match task {
+            Ok(removed) => removed,
+            Err(e) => {
+                tracing::warn!(error = %e, "orphaned trash sweep task failed");
+                0
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod orphan_trash_sweep_tests {
+    use super::sweep_orphaned_worktree_trash;
+    use std::path::{Path, PathBuf};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("itd-trash-sweep-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn seed_dir_with_file(dir: &Path) {
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested").join("f.txt"), "x").unwrap();
+    }
+
+    #[test]
+    fn removes_trash_dirs_and_empty_parent_only() {
+        let root = temp_root("basic");
+        // ws-a holds only trash → trash and the emptied parent both go.
+        seed_dir_with_file(&root.join("ws-a").join("repo.deleting-abc-0"));
+        // ws-b holds trash next to a live worktree and metadata → only the
+        // trash goes; the live dir, metadata dir, and parent survive.
+        seed_dir_with_file(&root.join("ws-b").join("repo.deleting-def-1"));
+        seed_dir_with_file(&root.join("ws-b").join("repo"));
+        seed_dir_with_file(&root.join("ws-b").join(".workspace"));
+        // A stray FILE with a trash-looking name is never touched.
+        std::fs::create_dir_all(root.join("ws-c")).unwrap();
+        std::fs::write(root.join("ws-c").join("notes.deleting-x"), "keep").unwrap();
+
+        let removed = sweep_orphaned_worktree_trash(&root);
+
+        assert_eq!(removed, 2);
+        assert!(!root.join("ws-a").exists(), "emptied parent removed");
+        assert!(!root.join("ws-b").join("repo.deleting-def-1").exists());
+        assert!(root
+            .join("ws-b")
+            .join("repo")
+            .join("nested")
+            .join("f.txt")
+            .exists());
+        assert!(root.join("ws-b").join(".workspace").exists());
+        assert!(root.join("ws-c").join("notes.deleting-x").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn leaves_untouched_workspace_dirs_alone_even_when_empty() {
+        let root = temp_root("no-trash");
+        std::fs::create_dir_all(root.join("ws-fresh")).unwrap();
+        assert_eq!(sweep_orphaned_worktree_trash(&root), 0);
+        assert!(
+            root.join("ws-fresh").exists(),
+            "a workspace dir without trash is never removed (mid-provision safety)"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tolerates_missing_and_empty_root() {
+        let missing =
+            std::env::temp_dir().join(format!("itd-trash-sweep-missing-{}", uuid::Uuid::new_v4()));
+        assert_eq!(sweep_orphaned_worktree_trash(&missing), 0);
+        let empty = temp_root("empty");
+        assert_eq!(sweep_orphaned_worktree_trash(&empty), 0);
+        std::fs::remove_dir_all(&empty).unwrap();
+    }
+
+    #[test]
+    fn skips_top_level_files_and_continues_past_odd_entries() {
+        let root = temp_root("mixed");
+        std::fs::write(root.join("stray.txt"), "x").unwrap();
+        seed_dir_with_file(&root.join("ws-a").join("repo.deleting-1-0"));
+        assert_eq!(sweep_orphaned_worktree_trash(&root), 1);
+        assert!(root.join("stray.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
 /// Upsert into the registry every workspace that carries a `repository_path`
 /// (TS `repo.list` one-time sync). Best-effort: callers ignore the result so a
 /// sync failure never blocks/fails the `repo.list` response.
