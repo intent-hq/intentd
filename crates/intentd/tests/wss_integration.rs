@@ -606,6 +606,80 @@ async fn wss_agent_send_message_rejects_unknown_agent() {
     srv.ws.stop().await;
 }
 
+/// monorepo#568: `agent.queueMessage` to a nonexistent agent id fails closed
+/// with `-32602` naming the unknown id — it must NOT create a queue entry
+/// that never drains. A queue to a real agent on the same connection still
+/// succeeds.
+#[tokio::test]
+async fn wss_agent_queue_message_rejects_unknown_agent() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Queue Unknown"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Nonexistent (truncated-style) id → -32602 naming the id, no queueing.
+    let ghost = "agent-00000000-0000-0000-0000-000000000000";
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{ghost}","content":"hello?"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "queueMessage to an unknown agent must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(ghost),
+        "error must name the unknown agent id: {rejected}"
+    );
+
+    // No phantom queue entry was created for the ghost id.
+    let queue_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{ghost}"}}}}"#
+    );
+    let queue = wss_call(srv.port, srv.cfg.clone(), &queue_frame).await;
+    assert_eq!(
+        queue["result"]["queue"].as_array().map(Vec::len),
+        Some(0),
+        "no phantom queue entry for an unknown agent: {queue}"
+    );
+
+    // A queue to a REAL agent still succeeds.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Real Queue Recv"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let queue_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hi"}}}}"#
+    );
+    let queued = wss_call(srv.port, srv.cfg.clone(), &queue_frame).await;
+    assert_eq!(
+        queued["result"]["success"],
+        Value::Bool(true),
+        "queue to a real agent succeeds: {queued}"
+    );
+    assert_eq!(
+        queued["result"]["queuedMessage"]["content"], "hi",
+        "queued entry carries the content: {queued}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
