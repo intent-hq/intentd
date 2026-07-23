@@ -207,7 +207,7 @@ fn registry_version_keys_follow_adapter_pins() {
         key("claude-code"),
         intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
     );
-    assert_eq!(key("pi"), crate::provider_models::PI_ACP_NPX_PACKAGE);
+    assert_eq!(key("pi"), intent_providers::PI_ACP_NPX_PACKAGE);
     assert_eq!(key("droid"), "");
     assert_eq!(key("opencode"), "");
     assert_eq!(key("grok"), "");

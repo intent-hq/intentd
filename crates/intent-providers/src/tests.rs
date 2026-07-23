@@ -15,6 +15,7 @@ fn registry_default_and_lookups() {
             "codex",
             "cortex",
             "opencode",
+            "pi",
             "droid",
             "grok",
             "mock"
@@ -72,6 +73,18 @@ fn registry_field_parity() {
     assert_eq!(oc.auth_check_args, Some(&["models"][..]));
     assert!(oc.model_flag.is_none());
 
+    let pi = find_provider("pi").unwrap();
+    assert_eq!(pi.display_name, "Pi");
+    assert_eq!(pi.command, "pi-acp");
+    assert_eq!(pi.base_args, &[] as &[&str]);
+    assert!(pi.model_flag.is_none() && pi.can_be_disabled);
+    assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
+    assert_eq!(pi.fallback_npx_package, None);
+    assert_eq!(
+        pi.login_docs_url,
+        Some("https://pi.dev/docs/latest/quickstart")
+    );
+
     let droid = find_provider("droid").unwrap();
     assert_eq!(droid.base_args, &["exec", "--output-format", "acp"]);
     assert_eq!(droid.model_flag, Some("--model"));
@@ -120,14 +133,14 @@ fn session_mcp_servers_partition() {
     }
 }
 
-/// Exactly claude-code applies the stored model post-session via
-/// `session/set_config_option { configId: "model" }` (its pinned adapter
-/// exposes the model as a `configOptions[id="model"]` select and has no CLI
+/// Exactly claude-code and pi apply the stored model post-session via
+/// `session/set_config_option { configId: "model" }` (their pinned adapters
+/// expose the model as a `configOptions[id="model"]` select and have no CLI
 /// model flag). Asserted over the full registry so a newly added provider
 /// can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code"];
+    let opted_in = ["claude-code", "pi"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -143,9 +156,24 @@ fn config_option_model_partition() {
             "{id}: supports_set_model and supports_config_option_model are mutually exclusive"
         );
     }
-    // claude-code additionally has no CLI model flag and no set_model path.
+    // claude-code and pi additionally have no CLI model flag and no
+    // set_model path.
     let cc = find_provider("claude-code").unwrap();
     assert!(cc.model_flag.is_none() && !cc.supports_set_model);
+    let pi = find_provider("pi").unwrap();
+    assert!(pi.model_flag.is_none() && !pi.supports_set_model);
+}
+
+/// Regression (pi harness selection): `provider_config("pi")` must resolve to
+/// the pi entry — before pi was registered it silently fell back to the
+/// default provider (auggie), which then rejected pi model ids.
+#[test]
+fn pi_resolves_in_registry_with_pinned_npx_package() {
+    assert_eq!(provider_config("pi").id, "pi");
+    let pi = find_provider("pi").expect("pi is registered");
+    assert_eq!(pi.command, "pi-acp");
+    assert_eq!(PI_ACP_NPX_PACKAGE, "pi-acp@0.0.31");
+    assert_eq!(pi.npx_only_package, Some(PI_ACP_NPX_PACKAGE));
 }
 
 #[test]
@@ -803,6 +831,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "codex",
             "cortex",
             "opencode",
+            "pi",
             "droid",
             "grok",
             "mock"
@@ -910,6 +939,10 @@ fn injection_mechanism_registry() {
     );
     assert_eq!(
         find_provider("grok").unwrap().injection_mechanism,
+        FirstTurnPrepend
+    );
+    assert_eq!(
+        find_provider("pi").unwrap().injection_mechanism,
         FirstTurnPrepend
     );
     assert_eq!(
