@@ -90,7 +90,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49
+            47, 48, 49, 50
         ]
     );
     assert_eq!(
@@ -98,7 +98,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49
+            47, 48, 49, 50
         ]
     );
 }
@@ -2407,8 +2407,132 @@ async fn draft_round_trip_upsert_get_delete() {
         .is_none());
 }
 
+/// Regression (PROTOCOL §5.16 "Opaque keys & reserved sentinels"): draft keys
+/// are opaque — the daemon never validates `workspace_id` against live
+/// workspaces, so a `drafts.set` under the FE's `__new-workspace__` /
+/// `__initializer__` sentinel pair (no workspace row exists yet) must succeed
+/// and round-trip.
 #[tokio::test]
-async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
+async fn draft_round_trip_for_workspace_id_without_row() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let client = ClientId::from_string("cli-1");
+    store
+        .upsert_client(&client, None, None)
+        .await
+        .expect("client");
+    let ws = WorkspaceId::from("__new-workspace__");
+    let agent = AgentId::from_string("__initializer__");
+
+    store
+        .upsert_draft(&ws, &agent, &client, "pre-create draft", None)
+        .await
+        .expect("drafts.set succeeds for a workspaceId with no workspace row");
+    let got = store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(got.text, "pre-create draft");
+
+    assert!(
+        store.delete_draft(&ws, &agent, &client).await.unwrap(),
+        "clear removes the sentinel draft"
+    );
+    assert!(store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// The 0050 rebuild (drop the draft→workspace FK) upgrades the pre-0050
+/// schema in place without losing rows — text, attachments, and the
+/// NULL-attachments shape all survive the create-new → copy → drop → rename
+/// cycle, and the workspace FK is actually gone afterwards. The embedded
+/// migrator has already run against an empty DB by the time we can insert
+/// rows, so the old 0007+0048 table shape (workspace FK included) is rebuilt
+/// by hand before replaying the migration SQL.
+#[tokio::test]
+async fn draft_fk_drop_migration_preserves_existing_rows() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let client = ClientId::from_string("cli-1");
+    store.upsert_client(&client, None, None).await.unwrap();
+
+    // Restore the pre-0050 shape: 0007 columns + workspace FK, with the 0048
+    // `attachments` column appended.
+    sqlx::raw_sql(
+        "DROP TABLE draft;
+         CREATE TABLE draft (
+           workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+           agent_id     TEXT NOT NULL,
+           client_id    TEXT NOT NULL REFERENCES client(id) ON DELETE CASCADE,
+           text         TEXT NOT NULL,
+           updated_at   TEXT NOT NULL,
+           attachments  TEXT,
+           PRIMARY KEY (workspace_id, agent_id, client_id)
+         );
+         CREATE INDEX idx_draft_client ON draft(client_id);",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("rebuild pre-0050 shape");
+
+    let agent = AgentId::from_string("agent-1");
+    let attachments = json!([{ "type": "image", "imageData": "aGk=" }]);
+    store
+        .upsert_draft(&ws, &agent, &client, "keep me", Some(&attachments))
+        .await
+        .unwrap();
+    let plain_agent = AgentId::from_string("agent-2");
+    store
+        .upsert_draft(&ws, &plain_agent, &client, "no attachments", None)
+        .await
+        .unwrap();
+    let sentinel_ws = WorkspaceId::from("__new-workspace__");
+    let sentinel_agent = AgentId::from_string("__initializer__");
+    store
+        .upsert_draft(&sentinel_ws, &sentinel_agent, &client, "rejected", None)
+        .await
+        .expect_err("pre-0050 FK rejects the sentinel workspaceId");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0050_draft_drop_workspace_fk.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .expect("run rebuild against the old shape");
+
+    // The FK is really gone: the sentinel write now succeeds.
+    store
+        .upsert_draft(&sentinel_ws, &sentinel_agent, &client, "accepted", None)
+        .await
+        .expect("post-0050 sentinel write succeeds");
+
+    let got = store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .expect("row survives the rebuild");
+    assert_eq!(got.text, "keep me");
+    assert_eq!(got.attachments, Some(attachments));
+    let got = store
+        .get_draft(&ws, &plain_agent, &client)
+        .await
+        .unwrap()
+        .expect("attachment-less row survives too");
+    assert_eq!(got.text, "no attachments");
+    assert_eq!(got.attachments, None);
+}
+
+#[tokio::test]
+async fn drafts_are_isolated_by_client_and_removed_on_workspace_delete() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -2452,7 +2576,11 @@ async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
     store.delete_workspace(&ws).await.expect("delete ws");
     assert!(
         store.get_draft(&ws, &agent, &a).await.unwrap().is_none(),
-        "ON DELETE CASCADE removes drafts with their workspace"
+        "delete_workspace removes the workspace's drafts"
+    );
+    assert!(
+        store.get_draft(&ws, &agent, &b).await.unwrap().is_none(),
+        "delete_workspace removes drafts for every client"
     );
 }
 

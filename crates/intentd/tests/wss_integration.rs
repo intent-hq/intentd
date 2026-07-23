@@ -377,6 +377,41 @@ async fn wss_client_hello_and_drafts_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Regression (PROTOCOL §5.16 "Opaque keys & reserved sentinels"): draft keys
+/// are opaque — the FE's New Workspace modal saves its pre-creation draft
+/// under `__new-workspace__` / `__initializer__` before any workspace row
+/// exists, so `drafts.set` → `drafts.get` → `drafts.clear` must round-trip
+/// without a workspace.
+#[tokio::test]
+async fn wss_drafts_sentinel_keys_round_trip_without_workspace() {
+    let srv = start(WsOptions::default()).await;
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":"cli-sentinel","name":"WSS"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"drafts.set","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__","text":"pre-create draft"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"drafts.get","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"method":"drafts.clear","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":5,"method":"drafts.get","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__"}}"#.to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["clientId"], "cli-sentinel");
+    assert_eq!(
+        sess[1]["result"]["ok"], true,
+        "drafts.set under the sentinel keys succeeds with no workspace row (§5.16)"
+    );
+    assert!(sess[1]["result"]["updatedAt"].is_string());
+    assert_eq!(sess[2]["result"]["text"], "pre-create draft");
+    assert_eq!(sess[3]["result"]["ok"], true);
+    assert!(
+        sess[4]["result"].is_null(),
+        "cleared sentinel draft reads back null"
+    );
+    srv.ws.stop().await;
+}
+
 /// Transport size-limit regression (monorepo#472, monorepo#495): a text
 /// message past the 40 MiB cap terminates the connection with a 1009
 /// (Message Too Big) close frame; a large-but-legit single-frame message
