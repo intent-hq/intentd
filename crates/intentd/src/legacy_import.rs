@@ -141,8 +141,9 @@ pub struct AgentCounts {
     pub sessions_failed: usize,
     /// Message rows inserted across all imported sessions.
     pub messages_imported: usize,
-    /// Malformed message entries or failed message inserts (logged, never
-    /// fatal; the rest of the transcript still lands).
+    /// Malformed message entries dropped before persistence (logged, never
+    /// fatal; the rest of the transcript still lands atomically with the
+    /// session).
     pub messages_failed: usize,
 }
 
@@ -473,6 +474,22 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
     Ok(report)
 }
 
+/// True when `id` is exactly one normal path component: no `/` or `\`
+/// separators, not `..`/`.`, not absolute, no prefix/root components. Ids
+/// failing this are unsafe to join onto the asset root or embed in
+/// `workspace-asset://<wsId>/<assetId>` URLs.
+fn id_is_single_path_component(id: &str) -> bool {
+    use std::path::Component;
+    if id.contains('/') || id.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(id).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
+
 /// Import one candidate workspace directory, appending its outcome to `report`.
 async fn import_one(
     store: &Store,
@@ -520,6 +537,15 @@ async fn import_one(
     };
     if id == intent_core::CHIEF_WORKSPACE_ID {
         report.skip(id, dir, "virtual workspace id");
+        return;
+    }
+    // Reject ids that are not a single normal path component: the id is used
+    // verbatim as a DB key, in `workspace-asset://<wsId>/<assetId>` URLs
+    // (split on `/`), and joined onto the asset root for the copy — a hostile
+    // `../…`/absolute/multi-segment id could otherwise write outside
+    // `<data_dir>/assets/`.
+    if !id_is_single_path_component(&id) {
+        report.skip(id, dir, "workspace id is not a plain path segment");
         return;
     }
     if !seen.insert(id.clone()) {
@@ -1063,9 +1089,13 @@ fn is_valid_agent_id(s: &str) -> bool {
 /// Best-effort and idempotent: sessions already present (by id, or by the
 /// legacy id preserved under `metadata.legacyImport.originalId` when a new id
 /// was minted) are skipped whole; malformed files and failed inserts are
-/// logged and counted without ever failing the workspace import. Imported
-/// sessions are always terminal (`Completed`, not active) so the startup
-/// interrupted-agent heal sweep never resumes them.
+/// logged and counted without ever failing the workspace import. Each session
+/// and its full transcript persist in ONE store transaction
+/// ([`Store::insert_agent_session_with_messages`]) — all-or-nothing, so a
+/// crash or insert failure mid-transcript leaves no session row behind and
+/// the re-run imports it cleanly. Imported sessions are always terminal
+/// (`Completed`, not active) so the startup interrupted-agent heal sweep
+/// never resumes them.
 async fn import_workspace_agents(
     store: &Store,
     workspace: &Workspace,
@@ -1178,40 +1208,46 @@ async fn import_workspace_agents(
         if session.id.as_str() != original_id {
             tracing::info!(path = %path.display(), original_id, minted_id = %session.id, "legacy agent id invalid; minted a new id (original preserved in metadata)");
         }
-        if let Err(e) = store.insert_agent_session(&session).await {
+        // Parse the whole transcript up front (malformed entries are dropped
+        // and counted), then persist session + messages in ONE store
+        // transaction: a partial transcript can never land, so the
+        // session-id-presence idempotency check stays safe across re-runs.
+        let mut parsed: Vec<(String, Value, Option<Value>, String)> = Vec::new();
+        let mut malformed = 0usize;
+        for raw in messages {
+            match message_from_legacy_json(raw) {
+                Ok(parts) => parsed.push(parts),
+                Err(reason) => {
+                    tracing::warn!(path = %path.display(), agent_id = %session.id, reason, "legacy agent message malformed; skipping");
+                    malformed += 1;
+                }
+            }
+        }
+        let rows: Vec<intent_store::ReplaceMessage<'_>> = parsed
+            .iter()
+            .map(
+                |(role, content, metadata, created_at)| intent_store::ReplaceMessage {
+                    role,
+                    content,
+                    metadata: metadata.as_ref(),
+                    created_at,
+                },
+            )
+            .collect();
+        if let Err(e) = store
+            .insert_agent_session_with_messages(&session, &rows)
+            .await
+        {
             tracing::warn!(path = %path.display(), agent_id = %session.id, error = %e, "legacy agent session insert failed");
             counts.sessions_failed += 1;
+            counts.messages_failed += malformed;
             continue;
         }
         existing.insert(original_id);
         existing.insert(session.id.0.clone());
         counts.sessions_imported += 1;
-        for raw in messages {
-            let (role, content, metadata, created_at) = match message_from_legacy_json(raw) {
-                Ok(parts) => parts,
-                Err(reason) => {
-                    tracing::warn!(path = %path.display(), agent_id = %session.id, reason, "legacy agent message malformed; skipping");
-                    counts.messages_failed += 1;
-                    continue;
-                }
-            };
-            match store
-                .append_agent_message_with_metadata(
-                    &session.id,
-                    &role,
-                    &content,
-                    metadata.as_ref(),
-                    &created_at,
-                )
-                .await
-            {
-                Ok(_) => counts.messages_imported += 1,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), agent_id = %session.id, error = %e, "legacy agent message insert failed");
-                    counts.messages_failed += 1;
-                }
-            }
-        }
+        counts.messages_imported += parsed.len();
+        counts.messages_failed += malformed;
     }
     counts
 }
@@ -1486,7 +1522,9 @@ const CHANGE_HISTORY_KEY: &str = "workspace.changeHistory";
 
 /// True when a raw settings value is absent or semantically empty (null /
 /// empty array / empty object / empty string) — i.e. safe to overwrite
-/// without clobbering user data.
+/// without clobbering user data. A present-but-unparseable value counts as
+/// NON-empty: it may be user data in a shape we don't understand, so the
+/// import preserves it.
 fn setting_is_empty(raw: Option<&str>) -> bool {
     let Some(raw) = raw else {
         return true;
@@ -1497,7 +1535,9 @@ fn setting_is_empty(raw: Option<&str>) -> bool {
         Ok(Value::Object(o)) => o.is_empty(),
         Ok(Value::String(s)) => s.is_empty(),
         Ok(_) => false,
-        Err(_) => true, // unparseable → treat as absent
+        // Unparseable → treat as PRESENT (preserve): the importer must stay
+        // strictly non-clobbering, even toward malformed existing values.
+        Err(_) => false,
     }
 }
 
@@ -1635,6 +1675,16 @@ pub async fn write_completion_marker(store: &Store) -> anyhow::Result<()> {
 /// after migrations (inside `Store::open`) and before any transport serves
 /// RPCs. Never fails startup — every failure is logged and swallowed; the
 /// marker is written only when the run completes.
+///
+/// Empty `roots` (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the hermetic test
+/// harness) disables the hook entirely: it returns before reading the marker
+/// or touching the app-level dir, and writes nothing.
+///
+/// Note on startup cost: this runs to completion inline (blocking `std::fs`
+/// on the async runtime) before any transport serves, so a very large legacy
+/// tree delays first boot proportionally. Accepted tradeoff for a one-time
+/// first-boot migration — it can never fail startup, only slow the very
+/// first one.
 pub async fn maybe_import_on_first_boot(
     store: &Store,
     db_existed: bool,
@@ -1642,7 +1692,7 @@ pub async fn maybe_import_on_first_boot(
     assets_root: Option<PathBuf>,
     app_dir: Option<PathBuf>,
 ) {
-    if db_existed {
+    if db_existed || roots.is_empty() {
         return;
     }
     match store.get_setting(LEGACY_IMPORT_MARKER_KEY).await {
@@ -1785,6 +1835,67 @@ mod tests {
         assert!(b.archived);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Hostile manifest ids (path traversal, absolute paths, separators) are
+    /// rejected before any row insert or asset copy can use them.
+    #[tokio::test]
+    async fn rejects_workspace_ids_that_are_not_plain_path_segments() {
+        let root = temp_root("hostile-id");
+        let assets_root = temp_root("hostile-id-assets");
+        for (dir_name, hostile_id) in [
+            ("evil-a", "../../escape"),
+            ("evil-b", "/abs/path"),
+            ("evil-c", "a/b"),
+            ("evil-d", "a\\b"),
+            ("evil-e", ".."),
+            ("evil-f", "."),
+        ] {
+            let dir = write_legacy_workspace(&root, dir_name, json!({ "id": hostile_id }));
+            // Give each one an asset so a missed guard would attempt a copy.
+            let assets_dir = dir.join(".workspace").join("assets");
+            std::fs::create_dir_all(&assets_dir).unwrap();
+            std::fs::write(assets_dir.join("asset-1"), "payload").unwrap();
+        }
+        let store = open_store().await;
+
+        let report = run(
+            &store,
+            &Options {
+                roots: vec![root.clone()],
+                assets_root: Some(assets_root.clone()),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.imported(), 0, "{report}");
+        assert_eq!(report.skipped(), 6, "{report}");
+        for entry in &report.entries {
+            assert!(
+                matches!(&entry.outcome, Outcome::Skipped(r) if r.contains("plain path segment")),
+                "{report}"
+            );
+        }
+        assert!(store.list_workspaces(true).await.unwrap().is_empty());
+        // Nothing escaped the assets root (nothing was written at all).
+        assert!(std::fs::read_dir(&assets_root).unwrap().next().is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&assets_root).ok();
+    }
+
+    #[test]
+    fn single_path_component_probe() {
+        assert!(id_is_single_path_component("ws-a"));
+        assert!(id_is_single_path_component("workspace_1.bak"));
+        assert!(!id_is_single_path_component(".."));
+        assert!(!id_is_single_path_component("."));
+        assert!(!id_is_single_path_component("a/b"));
+        assert!(!id_is_single_path_component("a\\b"));
+        assert!(!id_is_single_path_component("/abs"));
+        assert!(!id_is_single_path_component("../up"));
+        assert!(!id_is_single_path_component(""));
     }
 
     #[tokio::test]
@@ -1955,6 +2066,31 @@ mod tests {
             .is_none());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Empty roots fully disable the hook: no app-dir read, no marker write —
+    /// so `INTENTD_LEGACY_IMPORT_ROOTS=""` really turns the feature off.
+    #[tokio::test]
+    async fn first_boot_hook_disabled_by_empty_roots() {
+        let app_dir = temp_root("boot-empty-app");
+        std::fs::write(
+            app_dir.join("repo-registry.json"),
+            r#"{"knownRepos": [{"path": "/tmp/repo"}]}"#,
+        )
+        .unwrap();
+        let store = open_store().await;
+
+        maybe_import_on_first_boot(&store, false, Vec::new(), None, Some(app_dir.clone())).await;
+        assert!(store.list_workspaces(true).await.unwrap().is_empty());
+        // App-level blobs were NOT imported and no marker was written.
+        assert!(store.get_setting("repos.known").await.unwrap().is_none());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&app_dir).ok();
     }
 
     #[tokio::test]
@@ -2899,7 +3035,8 @@ mod tests {
         assert!(setting_is_empty(Some("[]")));
         assert!(setting_is_empty(Some("{}")));
         assert!(setting_is_empty(Some("\"\"")));
-        assert!(setting_is_empty(Some("not json")));
+        // Unparseable → preserved (non-empty), never overwritten.
+        assert!(!setting_is_empty(Some("not json")));
         assert!(!setting_is_empty(Some("[1]")));
         assert!(!setting_is_empty(Some("{\"a\":1}")));
         assert!(!setting_is_empty(Some("\"x\"")));

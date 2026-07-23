@@ -106,9 +106,10 @@ enum Command {
     /// idempotent (ids already in the DB are skipped) and read-only toward the
     /// source. The same module backs the automatic first-boot import in `serve`.
     ImportLegacy {
-        /// Scan only this directory instead of the default legacy roots.
+        /// Scan only these directories instead of the default legacy roots
+        /// (repeatable: `--root a --root b`; each must exist).
         #[arg(long)]
-        root: Option<PathBuf>,
+        root: Vec<PathBuf>,
         /// Legacy Electron app-level dir holding `config.json` /
         /// `repo-registry.json`; defaults to the platform userData dir.
         #[arg(long)]
@@ -175,7 +176,7 @@ async fn main() -> ExitCode {
             app_dir,
             dry_run,
             force,
-        } => to_exit(cmd_import_legacy(root.as_deref(), app_dir, dry_run, force).await),
+        } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
         Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
         #[cfg(feature = "js-engine")]
@@ -325,29 +326,36 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
 }
 
 /// Import legacy per-directory Intent workspaces into the configured SQLite
-/// store. `--root` narrows the scan to one explicit directory (which must
-/// exist); otherwise the default legacy roots are scanned. A non-dry-run
-/// completion writes the first-boot marker so `serve` never re-imports.
+/// store. `--root` (repeatable) narrows the scan to explicit directories
+/// (each must exist); otherwise the default legacy roots are scanned. A
+/// non-dry-run run always ends by writing the first-boot marker so `serve`
+/// never re-imports — even when every workspace was skipped or failed softly
+/// (the run itself "completed"; re-run the CLI to retry problem workspaces).
 /// Per-workspace problems are soft (reported, exit 0); only an unusable
-/// explicit `--root` or a store-open failure exits non-zero.
+/// explicit `--root` or a store-open failure exits non-zero. A dry-run
+/// against a not-yet-created DB removes the freshly created DB file
+/// afterwards, so a later `serve` still sees a fresh DB and the first-boot
+/// auto-import still fires.
 async fn cmd_import_legacy(
-    root: Option<&Path>,
+    roots: Vec<PathBuf>,
     app_dir: Option<PathBuf>,
     dry_run: bool,
     force: bool,
 ) -> anyhow::Result<()> {
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
-    let roots = match root {
-        Some(dir) => {
+    let roots = if roots.is_empty() {
+        legacy_import::default_roots()
+    } else {
+        for dir in &roots {
             if !dir.is_dir() {
                 anyhow::bail!("--root is not a directory: {}", dir.display());
             }
-            vec![dir.to_path_buf()]
         }
-        None => legacy_import::default_roots(),
+        roots
     };
     let app_dir = app_dir.or_else(legacy_import::default_app_dir);
+    let db_existed = config.db_path.exists();
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -365,6 +373,16 @@ async fn cmd_import_legacy(
     println!("{report}");
     if !dry_run {
         legacy_import::write_completion_marker(&store).await?;
+    } else if !db_existed {
+        // Dry-run on a fresh install: don't leave behind the DB file that
+        // `Store::open` just created, or the first-boot auto-import in
+        // `serve` (gated on DB-file existence) would silently never fire.
+        store.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = config.db_path.as_os_str().to_owned();
+            path.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(path));
+        }
     }
     Ok(())
 }
@@ -538,8 +556,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // First-boot legacy workspace import: on a fresh DB with no completion
     // marker, scan the legacy roots and import `.workspace/workspace.json`
-    // workspaces. Runs after migrations (inside `Store::open`) and before any
-    // transport serves RPCs; never fails startup.
+    // workspaces. Runs to completion inline after migrations (inside
+    // `Store::open`) and before any transport serves RPCs; it never fails
+    // startup, but a large legacy tree does delay this first boot (accepted
+    // one-time tradeoff — see `maybe_import_on_first_boot`).
     legacy_import::maybe_import_on_first_boot(
         &store,
         db_existed,
