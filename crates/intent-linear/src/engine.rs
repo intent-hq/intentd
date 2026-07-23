@@ -631,26 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn issue_page_serializes_envelope_and_omits_absent_token() {
-        let page = LinearIssuePage {
-            issues: vec![],
-            next_token: Some("cursor-3".into()),
-        };
-        assert_eq!(
-            serde_json::to_value(&page).unwrap(),
-            json!({ "issues": [], "nextToken": "cursor-3" })
-        );
-        let page = LinearIssuePage {
-            issues: vec![],
-            next_token: None,
-        };
-        assert_eq!(
-            serde_json::to_value(&page).unwrap(),
-            json!({ "issues": [] })
-        );
-    }
-
-    #[test]
     fn maps_empty_and_missing_nodes() {
         assert!(map_issue_nodes(None).is_empty());
         assert!(map_issue_nodes(Some(&json!(null))).is_empty());

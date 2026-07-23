@@ -215,6 +215,14 @@ impl LinearEngine for StubEngine {
     }
 }
 
+/// The opaque wire `nextToken` for an engine page cursor: no-pad base64 of
+/// `{"c":"<cursor>"}` (mirrors the services-layer §5.5 encoding).
+fn wire_next_token(cursor: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(serde_json::to_vec(&json!({ "c": cursor })).unwrap())
+}
+
 async fn send(socket: &Path, frame: &str) -> Value {
     let stream = UnixStream::connect(socket).await.expect("connect");
     let (read_half, mut write_half) = stream.into_split();
@@ -300,7 +308,8 @@ async fn uds_linear_read_surface_round_trip() {
     assert_eq!(resp["result"]["scopes"], json!([]));
 
     // (b) listIssues with no filter → `{ issues, nextToken }` envelope; engine
-    // sees the `assigned` default and no cursor, and reports a next page.
+    // sees the `assigned` default and no cursor, and reports a next page whose
+    // cursor comes back as the opaque base64 wire token (§5.5).
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":2,"method":"linear.listIssues","params":{}}"#,
@@ -309,22 +318,23 @@ async fn uds_linear_read_surface_round_trip() {
     let issues = resp["result"]["issues"].as_array().expect("issues array");
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["identifier"], json!("ENG-1"));
-    assert_eq!(resp["result"]["nextToken"], json!("cursor-2"));
+    assert_eq!(
+        resp["result"]["nextToken"],
+        json!(wire_next_token("cursor-2"))
+    );
     assert_eq!(*seen_filter.lock().unwrap(), Some(IssueFilter::Assigned));
     assert_eq!(*seen_list_token.lock().unwrap(), Some(None));
 
-    // (c) an explicit typed filter maps through server-side, and a `nextToken`
-    // param round-trips to the engine cursor; the last page omits the token.
-    let resp = send(
-        &socket,
-        r#"{"jsonrpc":"2.0","id":3,"method":"linear.listIssues","params":{"filter":"created","limit":5,"nextToken":"cursor-2"}}"#,
-    )
-    .await;
-    assert!(resp["result"]["issues"].is_array());
-    assert!(
-        resp["result"].get("nextToken").is_none(),
-        "last page omits nextToken"
+    // (c) an explicit typed filter maps through server-side, and the wire
+    // `nextToken` decodes onto the engine cursor; the last page carries an
+    // explicit `nextToken: null`.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"linear.listIssues","params":{{"filter":"created","limit":5,"nextToken":"{}"}}}}"#,
+        wire_next_token("cursor-2")
     );
+    let resp = send(&socket, &frame).await;
+    assert!(resp["result"]["issues"].is_array());
+    assert_eq!(resp["result"]["nextToken"], json!(null));
     assert_eq!(*seen_filter.lock().unwrap(), Some(IssueFilter::Created));
     assert_eq!(
         *seen_list_token.lock().unwrap(),
@@ -340,7 +350,7 @@ async fn uds_linear_read_surface_round_trip() {
     assert_eq!(resp["error"]["code"], json!(-32602));
 
     // (e) searchIssues forwards the query and returns the paginated envelope;
-    // a follow-up call threads the `nextToken` param through to the engine.
+    // a follow-up call decodes the wire `nextToken` onto the engine cursor.
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":5,"method":"linear.searchIssues","params":{"query":"login bug"}}"#,
@@ -348,19 +358,19 @@ async fn uds_linear_read_surface_round_trip() {
     .await;
     let issues = resp["result"]["issues"].as_array().expect("issues array");
     assert_eq!(issues[0]["identifier"], json!("ENG-2"));
-    assert_eq!(resp["result"]["nextToken"], json!("cursor-2"));
+    assert_eq!(
+        resp["result"]["nextToken"],
+        json!(wire_next_token("cursor-2"))
+    );
     assert_eq!(*seen_query.lock().unwrap(), Some("login bug".to_string()));
     assert_eq!(*seen_search_token.lock().unwrap(), Some(None));
 
-    let resp = send(
-        &socket,
-        r#"{"jsonrpc":"2.0","id":15,"method":"linear.searchIssues","params":{"query":"login bug","nextToken":"cursor-2"}}"#,
-    )
-    .await;
-    assert!(
-        resp["result"].get("nextToken").is_none(),
-        "last page omits nextToken"
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":15,"method":"linear.searchIssues","params":{{"query":"login bug","nextToken":"{}"}}}}"#,
+        wire_next_token("cursor-2")
     );
+    let resp = send(&socket, &frame).await;
+    assert_eq!(resp["result"]["nextToken"], json!(null));
     assert_eq!(
         *seen_search_token.lock().unwrap(),
         Some(Some("cursor-2".to_string()))

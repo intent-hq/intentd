@@ -12389,34 +12389,45 @@ mod linear {
 
     #[tokio::test]
     async fn list_and_search_serialize_paginated_envelope() {
-        let (_tmp, s) = svc(false).await;
+        use crate::github_ops::encode_next_token;
 
-        // First page (no cursor): `{ issues, nextToken }` with the token set.
+        let (_tmp, s) = svc(false).await;
+        let wire_token = encode_next_token("cursor-2");
+
+        // First page (no cursor): `{ issues, nextToken }` with the engine
+        // cursor wrapped into the opaque base64 wire token (§5.5).
         let page = s.linear_list_issues(None, None, None).await.unwrap();
         assert_eq!(page["issues"][0]["identifier"], "ENG-1");
-        assert_eq!(page["nextToken"], "cursor-2");
+        assert_eq!(page["nextToken"], wire_token);
 
-        // Passing the token reaches the engine cursor; the stub reports no
-        // further page → `nextToken` is omitted from the JSON.
+        // Passing the wire token decodes onto the engine cursor; the stub
+        // reports no further page → explicit `nextToken: null`.
         let page = s
-            .linear_list_issues(None, None, Some("cursor-2".into()))
+            .linear_list_issues(None, None, Some(wire_token.clone()))
             .await
             .unwrap();
         assert_eq!(page["issues"][0]["identifier"], "ENG-1");
-        assert!(page.get("nextToken").is_none(), "last page omits nextToken");
+        assert_eq!(page["nextToken"], serde_json::Value::Null);
+
+        // A malformed token degrades to the first page (github parity).
+        let page = s
+            .linear_list_issues(None, None, Some("!!not-base64!!".into()))
+            .await
+            .unwrap();
+        assert_eq!(page["nextToken"], wire_token);
 
         let page = s
             .linear_search_issues("t".into(), None, None)
             .await
             .unwrap();
         assert_eq!(page["issues"][0]["identifier"], "ENG-1");
-        assert_eq!(page["nextToken"], "cursor-2");
+        assert_eq!(page["nextToken"], wire_token);
 
         let page = s
-            .linear_search_issues("t".into(), None, Some("cursor-2".into()))
+            .linear_search_issues("t".into(), None, Some(wire_token.clone()))
             .await
             .unwrap();
-        assert!(page.get("nextToken").is_none(), "last page omits nextToken");
+        assert_eq!(page["nextToken"], serde_json::Value::Null);
     }
 
     #[tokio::test]

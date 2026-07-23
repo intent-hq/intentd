@@ -3317,9 +3317,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `linear.listIssues`: the viewer's issues for the typed `filter`
     /// (`assigned`|`created`|`subscribed`|`team`|`all`, default `assigned`),
-    /// returned as `{ issues: LinearIssueResult[], nextToken? }`. `next_token`
-    /// is the opaque cursor from a previous page; the result's `nextToken` is
-    /// present only when another page exists (PROTOCOL §5.28).
+    /// returned as `{ issues: LinearIssueResult[], nextToken }`. `next_token`
+    /// is the opaque base64 token from a previous page (§5.5; malformed →
+    /// first page); the result's `nextToken` is an opaque base64 string when
+    /// another page exists, else `null` (PROTOCOL §5.28).
     fn linear_list_issues(
         &self,
         filter: Option<String>,
@@ -3335,7 +3336,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `linear.searchIssues`: full-text issue search by `query`, returned as
-    /// `{ issues: LinearIssueResult[], nextToken? }` with the same cursor
+    /// `{ issues: LinearIssueResult[], nextToken }` with the same cursor
     /// semantics as `linear.listIssues` (PROTOCOL §5.28).
     fn linear_search_issues(
         &self,

@@ -339,9 +339,18 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
     .expect("response timeout")
 }
 
+/// The opaque wire `nextToken` for an engine page cursor: no-pad base64 of
+/// `{"c":"<cursor>"}` (mirrors the services-layer §5.5 encoding).
+fn wire_next_token(cursor: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .encode(serde_json::to_vec(&json!({ "c": cursor })).unwrap())
+}
+
 /// `linear.listIssues`: the first page (no `nextToken`) returns the paginated
-/// envelope with the engine's cursor as `nextToken`; passing that token back
-/// reaches the engine as the page cursor, and the last page omits `nextToken`.
+/// envelope with the engine's cursor wrapped into the opaque wire `nextToken`;
+/// passing that token back decodes onto the engine cursor, and the last page
+/// carries an explicit `nextToken: null`.
 #[tokio::test]
 async fn list_issues_next_token_round_trips() {
     let fx = boot().await;
@@ -355,20 +364,17 @@ async fn list_issues_next_token_round_trips() {
     )
     .await;
     assert_eq!(r["issues"][0]["identifier"], "ENG-1");
-    assert_eq!(r["nextToken"], json!("cursor-2"));
+    assert_eq!(r["nextToken"], json!(wire_next_token("cursor-2")));
 
     let r = wss_rpc(
         &mut ws,
         2,
         "linear.listIssues",
-        json!({ "filter": "created", "limit": 5, "nextToken": "cursor-2" }),
+        json!({ "filter": "created", "limit": 5, "nextToken": wire_next_token("cursor-2") }),
     )
     .await;
     assert_eq!(r["issues"][0]["identifier"], "ENG-1");
-    assert!(
-        r.get("nextToken").is_none(),
-        "last page omits nextToken: {r}"
-    );
+    assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
 
     let calls = fx.engine.list_calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
@@ -394,20 +400,17 @@ async fn search_issues_next_token_round_trips() {
     )
     .await;
     assert_eq!(r["issues"][0]["identifier"], "ENG-2");
-    assert_eq!(r["nextToken"], json!("cursor-2"));
+    assert_eq!(r["nextToken"], json!(wire_next_token("cursor-2")));
 
     let r = wss_rpc(
         &mut ws,
         2,
         "linear.searchIssues",
-        json!({ "query": "login bug", "nextToken": "cursor-2" }),
+        json!({ "query": "login bug", "nextToken": wire_next_token("cursor-2") }),
     )
     .await;
     assert_eq!(r["issues"][0]["identifier"], "ENG-2");
-    assert!(
-        r.get("nextToken").is_none(),
-        "last page omits nextToken: {r}"
-    );
+    assert_eq!(r["nextToken"], json!(null), "last page is nextToken null");
 
     let calls = fx.engine.search_calls.lock().unwrap();
     assert_eq!(calls.len(), 2);

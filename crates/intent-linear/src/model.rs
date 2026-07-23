@@ -78,17 +78,17 @@ pub struct LinearIssueResult {
     pub updated_at: Option<String>,
 }
 
-/// One page of issues returned by `linear.listIssues` / `linear.searchIssues`:
-/// `{ issues, nextToken? }`.
+/// One engine-level page of issues backing `linear.listIssues` /
+/// `linear.searchIssues`.
 ///
-/// `next_token` carries the Linear GraphQL `pageInfo.endCursor` and is present
-/// only when `pageInfo.hasNextPage` is true; pass it back as the `nextToken`
-/// param (threaded as the GraphQL `after` cursor) to fetch the next page.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// `next_token` carries the **raw** Linear GraphQL `pageInfo.endCursor` and is
+/// present only when `pageInfo.hasNextPage` is true. The services layer wraps
+/// it into the opaque base64 wire `nextToken` (and emits explicit `null` on
+/// the last page) per the §5.5 uniform-pagination conventions — this struct
+/// never crosses the wire directly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LinearIssuePage {
     pub issues: Vec<LinearIssueResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
 }
 
