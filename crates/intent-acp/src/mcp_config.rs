@@ -273,7 +273,8 @@ fn acp_remote(
 
 /// Convert to the typed ACP schema [`McpServer`] list carried in the
 /// `session/new` / `session/load` request for providers that consume MCP
-/// servers from the ACP session setup (claude-code, codex, droid). Same wire
+/// servers from the ACP session setup (claude-code, codex, droid, grok).
+/// Same wire
 /// shape as [`to_acp_mcp_servers`] — stdio entries serialize untagged (no
 /// `type` field), remotes carry `type: http|sse` — but typed so the session
 /// lifecycle helpers take `Vec<McpServer>` directly.

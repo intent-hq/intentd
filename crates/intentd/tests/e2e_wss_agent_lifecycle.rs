@@ -561,7 +561,8 @@ async fn mock_agent_full_turn_over_wss() {
 }
 
 /// STAB-156 — workspace-MCP delivery via ACP session setup (`session/new`
-/// `mcpServers`), the wire path claude-code/codex/droid use. Same full turn as
+/// `mcpServers`), the wire path claude-code/codex/droid/grok use. Same full
+/// turn as
 /// [`mock_agent_full_turn_over_wss`], but `MOCK_AGENT_SESSION_MCP=1` flips the
 /// mock provider to `supports_session_mcp_servers` with NO `--mcp-config`
 /// flag: the only way the mock child can reach the workspace bridge is the

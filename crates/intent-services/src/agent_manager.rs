@@ -664,7 +664,7 @@ struct AgentHandle {
     _rules_config: Option<TempConfigFile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
-    /// consume them there (claude-code, codex, droid). Empty for providers
+    /// consume them there (claude-code, codex, droid, grok). Empty for providers
     /// that receive MCP config out-of-band (auggie `--mcp-config`, opencode
     /// env config) — passing servers they'd ignore is avoided for wire parity.
     session_mcp_servers: Vec<McpServer>,
@@ -944,7 +944,7 @@ impl AgentManager {
         }
 
         // For providers that consume MCP servers from the ACP session setup
-        // (claude-code, codex, droid), the same normalized server set is
+        // (claude-code, codex, droid, grok), the same normalized server set is
         // carried as the typed `session/new` / `session/load` `mcpServers`
         // field, pointing at the same bridge endpoint. Kept on the handle so
         // `start_session` (which runs after `create_agent`) can pass it into
@@ -1312,7 +1312,7 @@ impl AgentManager {
     /// mechanism: out-of-band via the generated `--mcp-config` (auggie) or env
     /// config (opencode) — those sessions carry no `mcpServers` — or in the
     /// `session/new` / `session/load` `mcpServers` field for providers with
-    /// `supports_session_mcp_servers` (claude-code, codex, droid), using the
+    /// `supports_session_mcp_servers` (claude-code, codex, droid, grok), using the
     /// server list `create_agent` stashed on the handle. On a daemon respawn
     /// the agent may already have a persisted `acpSessionId`:
     ///
@@ -3832,8 +3832,8 @@ fn resolve_spawn(
             .ok_or_else(|| Error::Internal("mock provider missing from registry".to_string()))?;
         // `MOCK_AGENT_SESSION_MCP=1` flips the mock from `--mcp-config` file
         // delivery to ACP session-setup delivery (`session/new` `mcpServers`),
-        // so the E2E suite can exercise the claude-code/codex/droid wire path
-        // (STAB-156) against the real daemon.
+        // so the E2E suite can exercise the claude-code/codex/droid/grok wire
+        // path (STAB-156) against the real daemon.
         let session_mcp = std::env::var("MOCK_AGENT_SESSION_MCP").is_ok_and(|v| v == "1");
         // `MOCK_AGENT_CONFIG_OPTION_MODEL=1` marks the mock as a
         // config-option-model provider (claude-code-like), so the E2E suite

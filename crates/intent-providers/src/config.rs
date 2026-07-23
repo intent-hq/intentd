@@ -110,7 +110,8 @@ pub struct ProviderConfig {
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
-    /// `session/load` request's `mcpServers` field (claude-code, codex, droid).
+    /// `session/load` request's `mcpServers` field (claude-code, codex,
+    /// droid, grok).
     pub supports_session_mcp_servers: bool,
     /// Whether the provider supports rules files via CLI args.
     pub supports_rules_file: bool,
@@ -328,6 +329,12 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         can_be_disabled: true,
         supports_set_model: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // grok's ACP stdio mode accepts `session/new` `mcpServers` (the
+        // standard ACP session-setup field; verified on grok 0.2.111 — stdio
+        // entries are exposed and callable); the CLI has no per-spawn MCP
+        // flag, so the ACP request is the only spawn-scoped delivery
+        // mechanism.
+        supports_session_mcp_servers: true,
         login_command_hint: Some("grok login"),
         // `grok models` prints auth/readiness details to stdout (exit code 0
         // in both auth states); the daemon parses that output instead of
