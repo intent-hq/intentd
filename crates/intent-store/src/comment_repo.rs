@@ -34,8 +34,25 @@ struct ExtraFields {
     suggestion_proposed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_id: Option<AgentId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_bool"
+    )]
     is_orphaned: Option<bool>,
+}
+
+/// Tolerate wrong-typed legacy `isOrphaned` values preserved verbatim in
+/// `extra_json` by the legacy importer: anything but a JSON boolean decodes
+/// as `None` instead of failing the whole row.
+fn lenient_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer) {
+        Ok(Some(Value::Bool(b))) => Some(b),
+        _ => None,
+    })
 }
 
 impl ExtraFields {

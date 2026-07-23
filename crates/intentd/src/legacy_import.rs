@@ -998,7 +998,12 @@ fn comment_from_legacy_json(
     let agent_id = take_string(&mut obj, "agentId").map(AgentId::from);
     let is_orphaned = match obj.remove("isOrphaned") {
         Some(Value::Bool(b)) => Some(b),
-        _ => None,
+        None | Some(Value::Null) => None,
+        // Wrong-typed values stay behind so they land in `extra_json`.
+        Some(other) => {
+            obj.insert("isOrphaned".to_string(), other);
+            None
+        }
     };
     // The sidecar duplicates the note id per entry; the file location is
     // authoritative, so drop it rather than persisting a stale copy.
@@ -2367,6 +2372,7 @@ mod tests {
                     "status": "pending",
                     "createdAt": "2025-06-01T02:00:00Z",
                     "updatedAt": "2025-06-01T02:00:00Z",
+                    "isOrphaned": "yes",
                     "suggestionDiff": {
                         "original": "foo",
                         "proposed": "bar",
@@ -2441,6 +2447,8 @@ mod tests {
         let sugg_extra: Value =
             serde_json::from_str(&comment_extra_json(&store, "c-sugg").await.unwrap()).unwrap();
         assert_eq!(sugg_extra["suggestionDiff"], json!({"lineStart": 3}));
+        // A wrong-typed `isOrphaned` is preserved verbatim, not dropped.
+        assert_eq!(sugg_extra["isOrphaned"], json!("yes"));
 
         assert!(store.get_comment("c-ghost").await.is_err());
 
