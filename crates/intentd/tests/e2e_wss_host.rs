@@ -1205,6 +1205,16 @@ async fn host_find_binary_uses_login_shell_path() {
         "Binary path should match: {result}"
     );
 
+    // GUI clients seed child-process PATH from this daemon-owned value.
+    let host_env = wss_rpc(&mut ws, 3, "host.env", json!({})).await;
+    let enhanced_path = host_env["enhancedPath"]
+        .as_str()
+        .expect("host.env enhancedPath");
+    assert!(
+        std::env::split_paths(enhanced_path).any(|entry| entry == fake_bin_dir),
+        "host.env should include login-shell PATH directory: {host_env}"
+    );
+
     drop(daemon);
 }
 

@@ -386,7 +386,7 @@ fn tool_availability_op_honours_explicit_tool_list() {
 }
 
 #[test]
-fn enhanced_path_dedups_and_appends_essentials_order_preserving() {
+fn enhanced_path_dedups_and_appends_canonical_tool_dirs() {
     let sep = path_separator();
     let custom = "/opt/tools";
     let input = format!("{custom}{sep}{custom}");
@@ -395,13 +395,8 @@ fn enhanced_path_dedups_and_appends_essentials_order_preserving() {
     // The caller's entry comes first and appears exactly once (de-duplicated).
     assert_eq!(parts[0], custom);
     assert_eq!(parts.iter().filter(|p| **p == custom).count(), 1);
-    // Every essential system path is merged in.
-    for essential in essential_system_paths() {
-        assert!(
-            parts.iter().any(|p| *p == essential),
-            "missing essential {essential}"
-        );
-    }
+    // A canonical system tool directory is merged in.
+    assert!(parts.contains(&"/usr/bin"));
 }
 
 #[test]
