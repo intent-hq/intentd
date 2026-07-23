@@ -430,6 +430,35 @@ fn crash_respawn_backs_off_exponentially() {
 }
 
 #[test]
+fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &crash_script(7));
+
+    // A non-`serve` invocation (e.g. `doctor`) is one-shot: a non-zero exit
+    // is the daemon's answer, not a crash — no respawn, status passes through.
+    let mut sitter = sitter_command(dir.path(), &dead_url())
+        .env(BACKOFF_INITIAL_ENV, "50")
+        .arg("doctor")
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "one-shot exit status passes through"
+    );
+
+    let runs = read_or_empty(&daemon_log_path(dir.path()))
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 1, "one-shot subcommands must run exactly once");
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(!stderr.contains("respawning"), "stderr: {stderr}");
+}
+
+#[test]
 fn sitter_initiated_stop_does_not_respawn() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());

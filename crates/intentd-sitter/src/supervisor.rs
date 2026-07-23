@@ -15,7 +15,10 @@
 //!    windows) and respawn the new version with the same args
 //! 5. unexpected child exit (non-zero or signal) → respawn the same version
 //!    forever with exponential backoff; clean exit 0 → sitter exits 0;
-//!    sitter-initiated stops never respawn
+//!    sitter-initiated stops never respawn. Only a `serve` invocation is
+//!    babysat this way: one-shot subcommands (`status`, `stop`, `doctor`,
+//!    `call`, …) legitimately exit non-zero, so they run exactly once and
+//!    their exit status passes through
 //! 6. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
 //!
@@ -232,6 +235,10 @@ impl Supervisor {
             }
         };
         let mut backoff = self.config.backoff_initial;
+        // Only a long-running `serve` child is babysat (crash respawn and
+        // mid-run update restarts); one-shot subcommands run exactly once
+        // and their exit status passes through.
+        let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
 
         loop {
             let binary = self.paths.daemon_binary(&current_version);
@@ -241,6 +248,9 @@ impl Supervisor {
                 Ok(child) => child,
                 Err(e) => {
                     eprintln!("intentd-sitter: failed to spawn {}: {e}", binary.display());
+                    if !supervised {
+                        return 1;
+                    }
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
                         Some(code) => return code,
                         None => continue,
@@ -255,10 +265,17 @@ impl Supervisor {
                     status = child.wait() => {
                         match status {
                             Ok(status) if status.success() => return 0,
+                            Ok(status) if !supervised => return exit_code(status),
                             Ok(status) => eprintln!(
                                 "intentd-sitter: intentd {current_version} exited unexpectedly ({}); respawning",
                                 describe_exit(status)
                             ),
+                            Err(e) if !supervised => {
+                                eprintln!(
+                                    "intentd-sitter: failed waiting on intentd {current_version}: {e}"
+                                );
+                                return 1;
+                            }
                             Err(e) => eprintln!(
                                 "intentd-sitter: failed waiting on intentd {current_version}: {e}; respawning"
                             ),
@@ -271,7 +288,7 @@ impl Supervisor {
                         }
                         break; // respawn the same version
                     }
-                    _ = tokio::time::sleep_until(next_check_at) => {
+                    _ = tokio::time::sleep_until(next_check_at), if supervised => {
                         match self.check().await {
                             Ok(UpdateOutcome::Installed { version, previous }) => {
                                 eprintln!(
