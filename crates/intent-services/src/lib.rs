@@ -12559,6 +12559,7 @@ impl WorkspaceApi for Services {
                         image_blocks,
                         file_blocks,
                         message_metadata,
+                        ..crate::agent_manager::TurnOptions::default()
                     };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
                         manager
@@ -12617,6 +12618,7 @@ impl WorkspaceApi for Services {
                 image_blocks,
                 file_blocks,
                 message_metadata: message_metadata.clone(),
+                ..crate::agent_manager::TurnOptions::default()
             };
             match self.agent_manager() {
                 Some(manager) => {
