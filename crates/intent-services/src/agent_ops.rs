@@ -1415,6 +1415,16 @@ impl Services {
         if let Some(p) = provider.as_deref() {
             ensure_known_provider("agent.create", p)?;
         }
+        // Also validate the resolved model's compound prefix unconditionally:
+        // the spawn path (`resolve_provider_id`) gives the model prefix
+        // precedence over session.provider, so a valid explicit provider must
+        // not smuggle in an unknown-prefixed model.
+        if let Some(m) = resolved_model.as_deref() {
+            if m.contains(':') {
+                let (model_provider, _) = intent_providers::parse_compound_model_id(m);
+                ensure_known_provider("agent.create", &model_provider)?;
+            }
+        }
         let session = AgentSession {
             id,
             workspace_id,
@@ -1528,19 +1538,21 @@ impl Services {
         model_id: String,
     ) -> Result<Value> {
         let mut session = self.load_session_internal(&agent_id).await?;
-        // Reject unknown compound-prefix providers before any mutation: the
-        // same misroute vector as agent.create — persisting one would make the
-        // next spawn silently fall back to the default binary (-32602).
-        if model_id.contains(':') {
+        // Parse the compound prefix once: reject unknown providers before any
+        // mutation (the same misroute vector as agent.create — persisting one
+        // would make the next spawn silently fall back to the default binary,
+        // -32602), then reuse the derived provider for session.provider
+        // reconciliation so cross-provider model switches spawn the new
+        // provider's binary.
+        let model_provider = if model_id.contains(':') {
             let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
             ensure_known_provider("agent.setModel", &model_provider)?;
-        }
+            Some(model_provider)
+        } else {
+            None
+        };
         session.model = Some(model_id.clone());
-        // Reconcile session.provider when the model carries an explicit provider
-        // prefix that differs from the current session provider. This ensures
-        // cross-provider model switches spawn the new provider's binary.
-        if model_id.contains(':') {
-            let (model_provider, _) = intent_providers::parse_compound_model_id(&model_id);
+        if let Some(model_provider) = model_provider {
             if session.provider.as_ref() != Some(&model_provider) {
                 session.provider = Some(model_provider);
             }

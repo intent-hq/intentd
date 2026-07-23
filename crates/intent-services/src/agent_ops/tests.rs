@@ -1951,7 +1951,33 @@ async fn create_rejects_unknown_provider() {
             .contains("agent.create: unknown provider: nonexistent"),
         "unexpected err: {err}"
     );
-    // Neither rejection persisted a session row.
+    // Explicit VALID provider + unknown compound model prefix: the spawn path
+    // gives the model prefix precedence over session.provider, so this must be
+    // rejected too (regression for PR #378 review).
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad3".into()),
+            Some("nonexistent:foo".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("valid provider must not smuggle an unknown-prefixed model");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "unexpected err: {err}"
+    );
+    // No rejection persisted a session row.
     let agents = svc.agent_list_op(ws.clone()).await.expect("list");
     assert!(agents.is_empty(), "no session row persisted: {agents:?}");
     // Absent provider (defaulting) and registered providers stay valid.

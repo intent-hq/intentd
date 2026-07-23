@@ -598,7 +598,26 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         "error must name the unknown provider: {rejected}"
     );
 
-    // Neither rejection persisted a session row.
+    // Explicit VALID provider + unknown compound model prefix → also -32602
+    // (the spawn path gives the model prefix precedence over session.provider).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad3","provider":"auggie","model":"nonexistent:foo"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "valid provider + unknown model prefix must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // No rejection persisted a session row.
     let list_frame = format!(
         r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
     );
@@ -618,6 +637,7 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         .as_str()
         .expect("server-minted id")
         .to_string();
+    let model_before = created["result"]["agent"]["model"].clone();
 
     // …and agent.setModel rejects an unknown compound prefix the same way.
     let set_frame = format!(
@@ -642,8 +662,8 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
     );
     let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
-    assert!(
-        got["result"]["agent"]["model"].is_null(),
+    assert_eq!(
+        got["result"]["agent"]["model"], model_before,
         "model must be unchanged after the rejected setModel: {got}"
     );
 
