@@ -4477,6 +4477,15 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
         .expect("chief without root resolves");
     assert_eq!(resolved.cwd, std::env::temp_dir());
 
+    // Creation failure (a regular FILE squats on the chief cwd path) →
+    // the root is not a dir, so the spawn falls through to the temp-dir
+    // catch-all instead of failing.
+    let blocked_root = data_dir.join("blocked-chief-cwd");
+    std::fs::write(&blocked_root, b"not a dir").unwrap();
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&blocked_root))
+        .expect("chief resolves despite blocked root");
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+
     let _ = std::fs::remove_dir_all(&data_dir);
 }
 
