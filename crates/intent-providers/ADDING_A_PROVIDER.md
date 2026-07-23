@@ -46,7 +46,7 @@ needs. Fields that matter most:
 - **`supports_mcp_config` / `mcp_config_flag`** — provider takes an MCP config *file* via
   CLI flag (auggie: `--mcp-config`). See §3a.
 - **`supports_session_mcp_servers`** — provider consumes the typed `mcpServers` field on
-  ACP `session/new` / `session/load` (claude-code, codex, droid). See §3c.
+  ACP `session/new` / `session/load` (claude-code, codex, droid, grok). See §3c.
 - **`model_flag`** — CLI model selection (auggie/droid: `--model`). Providers that select
   models post-session via `session/set_model` (grok) set `supports_set_model: true` and no
   flag; see `AgentManager::maybe_apply_session_model`
@@ -114,7 +114,7 @@ per provider — pick exactly one delivery path:
   `opencode_env_mcp_config` → `to_opencode_mcp_config` serializes the set as the
   OpenCode `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` by `build_provider_env`
   (`SpawnOptions.env_mcp_config`, `crates/intent-acp/src/spawn.rs`).
-- **(c) ACP session field** (claude-code, codex, droid):
+- **(c) ACP session field** (claude-code, codex, droid, grok):
   `supports_session_mcp_servers: true`. `create_agent` stashes
   `to_acp_session_mcp_servers(...)` on the agent handle; `start_session`
   (`crates/intent-services/src/agent_manager.rs`) passes it into every session-open
@@ -237,7 +237,7 @@ Then, in a fresh workspace, spawn an agent on the new provider and verify:
 
 ## Known follow-ups / gotchas
 
-- **claude-code / codex / droid naming-nudge spelling** — these providers receive the
+- **claude-code / codex / droid / grok naming-nudge spelling** — these providers receive the
   workspace bridge via `session/new` `mcpServers` (§3c), but their exact MCP tool
   spellings have not been empirically captured yet, so
   `workspace_naming_tool_reference` intentionally uses the generic phrasing for them.
@@ -248,6 +248,6 @@ Then, in a fresh workspace, spawn an agent on the new provider and verify:
   conventions (e.g. opencode's prefixed `workspace-mcp_workspace_api`) are not listed;
   extend it when tightening restrictions for prefix-style providers.
 - **No workspace-MCP delivery = no workspace tools** — a provider with none of the three
-  §3 paths (today: cortex, grok) spawns fine but gets no workspace tools, which also
+  §3 paths (today: cortex) spawns fine but gets no workspace tools, which also
   means no naming nudge can succeed. Prefer wiring §3c if the provider accepts
   `session/new` `mcpServers`.

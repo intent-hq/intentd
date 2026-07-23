@@ -119,7 +119,10 @@ fn registry_field_parity() {
     // CLI model flag.
     assert!(grok.model_flag.is_none() && grok.supports_set_model);
     assert!(!grok.supports_authenticate && !grok.supports_set_mode);
-    assert!(!grok.supports_mcp_config && !grok.supports_rules_file);
+    // No CLI MCP flag — the workspace bridge rides the ACP `session/new`
+    // `mcpServers` field instead.
+    assert!(!grok.supports_mcp_config && grok.supports_session_mcp_servers);
+    assert!(!grok.supports_rules_file);
     assert!(grok.can_be_disabled);
     assert_eq!(grok.login_command_hint, Some("grok login"));
     assert_eq!(grok.auth_check_args, Some(&["models"][..]));
@@ -135,14 +138,14 @@ fn registry_field_parity() {
     assert_eq!(mock.requires_env_var, Some("MOCK_AGENT_SCRIPT_PATH"));
 }
 
-/// Exactly claude-code, codex, and droid consume MCP servers from the ACP
-/// `session/new` / `session/load` `mcpServers` field; every other provider
-/// receives MCP config out-of-band (auggie `--mcp-config`, opencode env
-/// config) or not at all. Asserted over the full registry so a newly added
-/// provider can't accidentally opt in without updating this partition.
+/// Exactly claude-code, codex, droid, and grok consume MCP servers from the
+/// ACP `session/new` / `session/load` `mcpServers` field; every other
+/// provider receives MCP config out-of-band (auggie `--mcp-config`, opencode
+/// env config) or not at all. Asserted over the full registry so a newly
+/// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid"];
+    let opted_in = ["claude-code", "codex", "droid", "grok"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(

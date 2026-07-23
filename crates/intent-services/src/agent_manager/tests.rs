@@ -1375,7 +1375,7 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
 
 /// The typed workspace-MCP bridge entry stashed on the handle (STAB-156):
 /// built from the same normalized-server shape `create_agent` uses for
-/// `supports_session_mcp_servers` providers (claude-code, codex, droid).
+/// `supports_session_mcp_servers` providers (claude-code, codex, droid, grok).
 fn test_session_mcp_servers() -> Vec<intent_acp::session::McpServer> {
     let mut servers = intent_acp::NormalizedMcpServers::new();
     servers.insert(
@@ -1394,7 +1394,7 @@ fn test_session_mcp_servers() -> Vec<intent_acp::session::McpServer> {
 }
 
 /// For providers that consume MCP servers from the ACP session setup
-/// (claude-code, codex, droid — STAB-156), the handle's stashed server list
+/// (claude-code, codex, droid, grok — STAB-156), the handle's stashed server list
 /// rides the `session/new` request's `mcpServers` field, with the stdio bridge
 /// entry serialized untagged (no `type`) as the ACP schema requires.
 #[tokio::test]
@@ -2039,9 +2039,10 @@ async fn build_turn_prompt_naming_instruction_ignores_empty_compound_prefix() {
     );
 }
 
-/// Providers with unknown MCP tool naming (claude-code here; also codex/droid
-/// until their MCP tool spellings are empirically captured) → the nudge falls
-/// back to the generic phrasing instead of guessing an affixed tool name.
+/// Providers with unknown MCP tool naming (claude-code here; also
+/// codex/droid/grok until their MCP tool spellings are empirically captured)
+/// → the nudge falls back to the generic phrasing instead of guessing an
+/// affixed tool name.
 #[tokio::test]
 async fn build_turn_prompt_naming_instruction_generic_for_unknown_provider() {
     let (_tmp, mgr) = manager().await;
