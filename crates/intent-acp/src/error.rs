@@ -15,7 +15,17 @@ pub struct JsonRpcError {
 
 impl fmt::Display for JsonRpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "JSON-RPC error {}: {}", self.code, self.message)
+        write!(f, "JSON-RPC error {}: {}", self.code, self.message)?;
+        // Providers put the real failure detail in `data` (e.g. codex-acp's
+        // -32603 "Internal error" carries the actual cause there), so append
+        // it when present. Strings render raw (no JSON quoting noise); other
+        // values render as compact JSON; null/absent/empty add nothing.
+        match &self.data {
+            None | Some(serde_json::Value::Null) => Ok(()),
+            Some(serde_json::Value::String(s)) if s.is_empty() => Ok(()),
+            Some(serde_json::Value::String(s)) => write!(f, ": {s}"),
+            Some(other) => write!(f, ": {other}"),
+        }
     }
 }
 
