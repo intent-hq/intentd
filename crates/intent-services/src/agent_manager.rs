@@ -2474,12 +2474,30 @@ impl AgentManager {
             .await
         {
             Ok(message) => message,
-            Err(_) => {
-                // Store write failed (e.g. session not yet persisted) → auto-queue,
-                // matching the `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
-                // the slot we just released will be reclaimed below if the queue is
-                // ready and the agent is otherwise free.
+            Err(append_err) => {
+                // Store write failed on a validated agent (e.g. duplicate
+                // client-supplied messageId) → auto-queue, matching the
+                // `agent.sendMessage` fallback (PROTOCOL §5.5). Self-drain:
+                // the slot we just released will be reclaimed below if the
+                // queue is ready and the agent is otherwise free.
                 self.end_turn(&agent_id).await;
+                // Check-then-act race guard (monorepo#564): if the session
+                // vanished between the up-front validation and the append
+                // (concurrent delete), fail closed like the guard rather than
+                // auto-queueing a phantom message for a gone agent.
+                if self
+                    .services
+                    .store
+                    .get_agent_session(&agent_id)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(agent = %agent_id, error = %append_err, "agent session vanished mid-send; rejecting instead of auto-queueing");
+                    return Err(Error::InvalidParams(format!(
+                        "unknown agent id: {}",
+                        agent_id.0
+                    )));
+                }
                 let (queued, position) = self.services.enqueue_message(
                     &agent_id,
                     content,

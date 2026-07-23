@@ -2373,7 +2373,7 @@ impl Services {
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // the auto-queue fallback below is for store-append failures on a
         // REAL agent, not a phantom queue for an id that will never drain.
-        self.require_agent_session(&agent_id).await?;
+        let session = self.require_agent_session(&agent_id).await?;
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
@@ -2407,38 +2407,40 @@ impl Services {
             Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
-                // Fetch the session to get workspace_id; best-effort (logged on error).
-                match self.store.get_agent_session(&agent_id).await {
-                    Ok(session) => {
-                        if let Err(e) = self
-                            .store
-                            .refresh_agent_session_timestamp(
-                                &session.workspace_id,
-                                &agent_id,
-                                &created_at,
-                            )
-                            .await
-                        {
-                            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-                        }
-                        // Publish agent:message event using the store-returned message id.
-                        self.publish_agent_mutation_event(
-                            &session.workspace_id,
-                            &agent_id,
-                            AGENT_MESSAGE,
-                            agent_message_event_payload(&agent_id, &message),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(agent = %agent_id, error = %e, "get_agent_session failed; skipping timestamp refresh and agent:message event");
-                    }
+                // Reuses the session validated above; best-effort (logged on error).
+                if let Err(e) = self
+                    .store
+                    .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
+                // Publish agent:message event using the store-returned message id.
+                self.publish_agent_mutation_event(
+                    &session.workspace_id,
+                    &agent_id,
+                    AGENT_MESSAGE,
+                    agent_message_event_payload(&agent_id, &message),
+                )
+                .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
-            Err(_) => {
-                // STAB-7: preserve image_blocks and file_blocks when auto-queueing
-                // on store failure, matching the runtime-manager path's behavior.
+            Err(append_err) => {
+                // Check-then-act race guard (monorepo#564): if the session
+                // vanished between the up-front validation and the append
+                // (concurrent delete), fail closed like the guard rather than
+                // auto-queueing a phantom message for a gone agent.
+                if self.store.get_agent_session(&agent_id).await.is_err() {
+                    tracing::warn!(agent = %agent_id, error = %append_err, "agent session vanished mid-send; rejecting instead of auto-queueing");
+                    return Err(Error::InvalidParams(format!(
+                        "unknown agent id: {}",
+                        agent_id.0
+                    )));
+                }
+                // The agent exists but the append failed (e.g. duplicate
+                // client-supplied messageId). STAB-7: preserve image_blocks and
+                // file_blocks when auto-queueing, matching the runtime-manager
+                // path's behavior.
                 let (queued, position) =
                     self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
                 let result = json!({
