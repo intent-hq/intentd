@@ -345,8 +345,8 @@ pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
-/// `_meta` injection (auggie, codex, droid, opencode, cortex, grok, mock use
-/// other mechanisms — codex moved to the first-turn prepend fallback because
+/// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
+/// use other mechanisms — codex moved to the first-turn prepend fallback because
 /// the pinned codex-acp adapter (1.1.7) ignores `_meta.developerInstructions`,
 /// #479).
 /// Provider-specific shapes:

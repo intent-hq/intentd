@@ -66,7 +66,7 @@ pub enum InjectionMechanism {
     SessionMeta,
     /// Environment variable config (opencode: `OPENCODE_CONFIG_CONTENT` with `instructions`).
     EnvConfig,
-    /// First-turn prepend in a `<system>` block (codex, cortex, grok, mock — fallback).
+    /// First-turn prepend in a `<system>` block (codex, cortex, pi, grok, mock — fallback).
     FirstTurnPrepend,
     /// No injection mechanism (provider doesn't support system prompts).
     None,

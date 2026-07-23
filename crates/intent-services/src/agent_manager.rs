@@ -716,7 +716,7 @@ pub struct AgentManager {
     /// Agents whose NEXT turn must carry the assembled system prompt prepended
     /// as a `<system>` block — the FirstTurnPrepend fallback (§18.1) for
     /// providers with no (usable) native injection mechanism (codex, cortex,
-    /// grok, mock). Set when a
+    /// pi, grok, mock). Set when a
     /// FRESH ACP session is opened (`session/new`, brand-new or recreate) for a
     /// provider whose `injection_mechanism` is
     /// [`InjectionMechanism::FirstTurnPrepend`]; NOT set on `session/load`
@@ -1829,7 +1829,7 @@ impl AgentManager {
             },
         };
         // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
-        // native system-prompt mechanism (codex, cortex, grok, mock), the
+        // native system-prompt mechanism (codex, cortex, pi, grok, mock), the
         // assembled system prompt
         // is delivered as the OUTERMOST `<system>` block on the first prompt
         // of each fresh ACP session — before context/naming/reminder/user
