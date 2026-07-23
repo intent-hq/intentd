@@ -16,8 +16,14 @@
 #   releases keep `releases/latest` semantics) and refreshes the fixed
 #   `sitter-latest` release so stable install URLs exist
 #
-# Packaging jobs (homebrew formula, .deb) are appended after `publish` by a
-# follow-up change; keep `publish` the fan-in job they hang off.
+# Packaging jobs hang off `publish` (the fan-in):
+#
+# * `publish-homebrew` renders packaging/homebrew/intentd.rb.template with the
+#   real version + sha256s and pushes it to intent-hq/homebrew-tap (skipped on
+#   prereleases, mirroring sitter-latest)
+# * `deb` repacks the linux musl archives into intentd_<version>_{amd64,arm64}
+#   .deb packages (scripts/build-deb.sh) and uploads them to the tag release,
+#   refreshing constant-named copies on sitter-latest for stable URLs
 name: Release sitter
 
 permissions:
@@ -175,8 +181,8 @@ jobs:
             intentd-${{ matrix.target }}.*
           if-no-files-found: error
 
-  # Fan-in: everything below (and the follow-up homebrew/.deb packaging jobs)
-  # depends on this job having published the release assets.
+  # Fan-in: the packaging jobs (publish-homebrew, deb) depend on this job
+  # having published the release assets.
   publish:
     needs:
       - plan
@@ -247,3 +253,133 @@ jobs:
             fi
           fi
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Render the hand-maintained formula template with the real version +
+  # sha256s and push it to the tap as Formula/intentd.rb. Skipped on
+  # prereleases, mirroring the sitter-latest handling. Authenticates with the
+  # same HOMEBREW_TAP_TOKEN secret the dist daemon pipeline used.
+  publish-homebrew:
+    needs:
+      - plan
+      - publish
+    if: ${{ needs.plan.outputs.prerelease == 'false' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    # Serialize tap pushes so two tags pushed close together cannot race the
+    # non-fast-forward push.
+    concurrency:
+      group: intentd-sitter-release-homebrew
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sitter-*
+          path: artifacts
+          merge-multiple: true
+      - name: Render formula
+        run: ./scripts/render-sitter-homebrew-formula.sh "$VERSION" artifacts intentd.rb
+      - name: Style-check rendered formula (advisory)
+        run: |
+          export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+          # brew style only accepts formulas inside a tap; stage the rendered
+          # file in a scratch tap (mirroring where it ships: Formula/ in the
+          # real tap) so formula cops apply instead of bare Ruby-file cops.
+          brew tap-new --no-git scratch/sitter
+          cp intentd.rb "$(brew --repository scratch/sitter)/Formula/intentd.rb"
+          brew style --formula scratch/sitter/intentd \
+            || echo "::warning::brew style reported offenses on intentd.rb (non-blocking)"
+      - uses: actions/checkout@v6
+        with:
+          repository: intent-hq/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: true
+          path: tap
+      - name: Commit and push formula
+        run: |
+          install -m 0644 intentd.rb tap/Formula/intentd.rb
+          cd tap
+          git config user.name "intent-hq bot"
+          git config user.email "intent-hq@users.noreply.github.com"
+          git add Formula/intentd.rb
+          if git diff --cached --quiet; then
+            echo "formula unchanged; nothing to push"
+            exit 0
+          fi
+          git commit -m "intentd $VERSION"
+          git push
+
+  # Repack the linux musl archives into Debian packages and attach them to
+  # the tag release; non-prereleases also refresh constant-named copies on
+  # sitter-latest so install URLs stay stable (versioned names would
+  # accumulate on the fixed release).
+  deb:
+    needs:
+      - plan
+      - publish
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    # Own group (not the publish one): asset names are disjoint from the
+    # archives, so deb refreshes only need to serialize against themselves.
+    concurrency:
+      group: intentd-sitter-release-deb
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: sitter-*-unknown-linux-musl
+          path: artifacts
+          merge-multiple: true
+      - name: Build .debs
+        run: |
+          # Debian ordering: "-" starts a revision that sorts ABOVE the bare
+          # upstream version (0.2.0-beta.1 > 0.2.0), while "~" sorts below
+          # (0.2.0~beta.1 < 0.2.0), so map prerelease hyphens to "~" to keep
+          # stable releases upgradeable over prerelease installs.
+          deb_version=${VERSION//-/'~'}
+          ./scripts/build-deb.sh artifacts/intentd-x86_64-unknown-linux-musl.tar.xz "$deb_version" amd64
+          ./scripts/build-deb.sh artifacts/intentd-aarch64-unknown-linux-musl.tar.xz "$deb_version" arm64
+          # .sha256 companions, same format as the other release assets
+          # (sha256sum --binary: "HASH *NAME").
+          for deb in intentd_*.deb; do
+            sha256sum --binary "$deb" > "$deb.sha256"
+          done
+      - name: Verify package metadata and contents
+        run: |
+          for deb in intentd_*.deb; do
+            dpkg-deb --info "$deb"
+            dpkg-deb --contents "$deb"
+            test "$(dpkg-deb --field "$deb" Package)" = intentd
+            dpkg-deb --contents "$deb" | grep -q ' \./usr/bin/intentd$'
+            dpkg-deb --contents "$deb" | grep -q ' \./usr/lib/systemd/user/intentd\.service$'
+          done
+      - name: Upload .debs to the tag release
+        run: |
+          gh release upload "$TAG" intentd_*.deb intentd_*.deb.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Refresh sitter-latest .debs
+        if: ${{ needs.plan.outputs.prerelease == 'false' }}
+        run: |
+          # Constant asset names so --clobber replaces the previous version
+          # instead of accumulating versioned files on the fixed release.
+          for arch in amd64 arm64; do
+            cp intentd_*_"$arch".deb "intentd_$arch.deb"
+            sha256sum --binary "intentd_$arch.deb" > "intentd_$arch.deb.sha256"
+          done
+          gh release upload sitter-latest \
+            intentd_amd64.deb intentd_amd64.deb.sha256 \
+            intentd_arm64.deb intentd_arm64.deb.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
