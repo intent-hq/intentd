@@ -27,6 +27,26 @@ fn registry_default_and_lookups() {
     assert_eq!(find_provider("codex").unwrap().command, "codex-acp");
 }
 
+/// Unknown provider ids still resolve to the default config (behavior
+/// unchanged), and the warn gate fires only for genuinely unknown ids —
+/// not for empty ids or legacy default aliases.
+#[test]
+fn unknown_provider_fallback_warn_gate() {
+    // Fallback behavior is preserved for every suppressed alias and for
+    // genuinely unknown ids.
+    for id in ["", "default", "acp", "augment", "nope"] {
+        assert_eq!(provider_config(id).id, default_provider_id());
+    }
+    // Genuinely unknown ids warn.
+    assert!(config::warns_on_unknown_provider("nope"));
+    assert!(config::warns_on_unknown_provider("pi-typo"));
+    // Empty ids and legacy default aliases stay silent.
+    assert!(!config::warns_on_unknown_provider(""));
+    assert!(!config::warns_on_unknown_provider("default"));
+    assert!(!config::warns_on_unknown_provider("acp"));
+    assert!(!config::warns_on_unknown_provider("augment"));
+}
+
 #[test]
 fn claude_agent_acp_pin_is_single_sourced() {
     assert!(!CLAUDE_AGENT_ACP_VERSION.is_empty());

@@ -362,10 +362,34 @@ pub fn default_provider_id() -> &'static str {
     default_provider_config().id
 }
 
+/// Legacy aliases for the default provider that are expected to miss the
+/// registry and must not trigger the unknown-provider warning. Port of the
+/// suppression list in `getProviderConfig`.
+const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
+
 /// Resolve a provider by id, falling back to the default when unknown.
+/// Unknown ids warn (see [`warns_on_unknown_provider`]) so registry gaps
+/// surface in logs instead of silently spawning the default agent.
 /// Port of `getProviderConfig`.
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
-    find_provider(provider_id).unwrap_or_else(default_provider_config)
+    find_provider(provider_id).unwrap_or_else(|| {
+        let fallback = default_provider_config();
+        if warns_on_unknown_provider(provider_id) {
+            tracing::warn!(
+                provider_id = provider_id,
+                fallback_id = fallback.id,
+                "unknown provider id; falling back to default provider"
+            );
+        }
+        fallback
+    })
+}
+
+/// Whether an id missing from the registry should emit the unknown-provider
+/// warning: empty ids and legacy default aliases ([`DEFAULT_PROVIDER_ALIASES`])
+/// are expected fallbacks and stay silent.
+pub(crate) fn warns_on_unknown_provider(provider_id: &str) -> bool {
+    !provider_id.is_empty() && !DEFAULT_PROVIDER_ALIASES.contains(&provider_id)
 }
 
 /// All registered provider ids, in definition order. Port of `getAllProviderIds`.
