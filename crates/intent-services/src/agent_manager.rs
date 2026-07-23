@@ -2584,8 +2584,12 @@ impl AgentManager {
             .await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
-        // began; otherwise persist now and carry the durability outcome to
-        // the worker so a terminal failure requeues with the true state.
+        // began; otherwise persist now (with `persist_user`'s bounded retry).
+        // Fail closed (#547): if the append still fails, do NOT start the
+        // turn — park the agent in `Error` with the message requeued
+        // (`persisted: false`) so `agent.retry` re-attempts the append,
+        // instead of producing assistant output for a user row that never
+        // reached the transcript.
         let user_persisted = if next.persisted {
             true
         } else {
@@ -2610,6 +2614,14 @@ impl AgentManager {
             message_metadata: next.message_metadata.clone(),
             ..TurnOptions::default()
         };
+        if !user_persisted {
+            handle_drain_persist_failure(&self, &agent_id, &workspace_id, &next.content, &options)
+                .await;
+            // Release the slot without overwriting the Error status just
+            // persisted, so `agent.retry` (or a future message) can redrive.
+            self.release_in_flight_slot(&agent_id).await;
+            return;
+        }
         self.spawn_worker(
             agent_id,
             workspace_id,
@@ -4112,6 +4124,14 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 ..TurnOptions::default()
             };
+            // Fail closed (#547): a persist failure that survived the bounded
+            // retry parks the agent in Error instead of running the turn.
+            if !user_persisted {
+                handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
+                    .await;
+                mgr.release_in_flight_slot(&agent_id).await;
+                break 'outer;
+            }
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -4154,6 +4174,13 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 ..TurnOptions::default()
             };
+            // Fail closed (#547): same contract as the pre-release drain arm.
+            if !user_persisted {
+                handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
+                    .await;
+                mgr.release_in_flight_slot(&agent_id).await;
+                break 'outer;
+            }
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message back to it and
@@ -4191,9 +4218,12 @@ async fn run_message_worker(
 /// logged and the turn still proceeds.
 ///
 /// Returns `true` when the user row was durably appended to the transcript,
-/// `false` when the store append failed (STAB-51). Callers thread the outcome
-/// into the terminal-failure requeue so `QueuedMessage.persisted` reflects
-/// confirmed durability and a failed append is re-attempted on `agent.retry`.
+/// `false` when the store append failed for every bounded retry attempt
+/// (STAB-51 / #547). A transient store blip (busy database, lock contention)
+/// self-heals inside the bounded retry (delays from
+/// [`persist_retry_backoff_ms`]); on exhaustion the drain call sites fail
+/// closed — they do NOT start the turn, park the agent in `Error`, and
+/// requeue with `persisted: false` so `agent.retry` re-attempts the append.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -4218,73 +4248,112 @@ async fn persist_user(
             text_block.insert("messageMetadata".into(), md);
         }
     }
-    match mgr
+    // Bounded retry (#547): initial attempt + one retry per backoff delay.
+    let backoff = persist_retry_backoff_ms();
+    let mut attempt = 0usize;
+    let message = loop {
+        match mgr
+            .services
+            .store
+            .append_agent_message_with_metadata(
+                agent_id,
+                "user",
+                &blocks,
+                message_metadata,
+                &created_at,
+            )
+            .await
+        {
+            Ok(message) => break message,
+            Err(e) => {
+                let Some(&delay_ms) = backoff.get(attempt) else {
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        attempts = attempt + 1,
+                        "failed to persist queued user message (all retries exhausted)"
+                    );
+                    return false;
+                };
+                attempt += 1;
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    attempt,
+                    "failed to persist queued user message; retrying in {delay_ms}ms"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    };
+    // Refresh agent_session.updated_at so the FE agent-card timestamp
+    // reflects message activity, not just status transitions (STAB-19).
+    if let Err(e) = mgr
         .services
         .store
-        .append_agent_message_with_metadata(
-            agent_id,
-            "user",
-            &blocks,
-            message_metadata,
-            &created_at,
-        )
+        .refresh_agent_session_timestamp(workspace_id, agent_id, &created_at)
         .await
     {
-        Ok(message) => {
-            // Refresh agent_session.updated_at so the FE agent-card timestamp
-            // reflects message activity, not just status transitions (STAB-19).
-            if let Err(e) = mgr
-                .services
-                .store
-                .refresh_agent_session_timestamp(workspace_id, agent_id, &created_at)
-                .await
-            {
-                tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-            } else {
-                // Schedule debounced lastActivity event (§10.1).
-                mgr.services
-                    .schedule_last_activity_event(workspace_id.clone());
-            }
-            mgr.services
-                .publish_agent_mutation_event(
-                    workspace_id,
-                    agent_id,
-                    intent_core::events::AGENT_MESSAGE,
-                    crate::agent_ops::agent_message_event_payload(agent_id, &message),
-                )
-                .await;
-            true
-        }
-        Err(e) => {
-            tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
-            false
-        }
+        tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
+    } else {
+        // Schedule debounced lastActivity event (§10.1).
+        mgr.services
+            .schedule_last_activity_event(workspace_id.clone());
     }
+    mgr.services
+        .publish_agent_mutation_event(
+            workspace_id,
+            agent_id,
+            intent_core::events::AGENT_MESSAGE,
+            crate::agent_ops::agent_message_event_payload(agent_id, &message),
+        )
+        .await;
+    true
 }
 
 /// Max number of spawn attempts (includes the initial attempt).
 const MAX_SPAWN_ATTEMPTS: u32 = 3;
 /// Default backoff delays between retry attempts (in milliseconds).
 const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+/// Default backoff delays between pre-turn persist retry attempts (#547).
+/// Short: the append is a local SQLite write, so a transient failure (busy
+/// database, lock contention) clears quickly or not at all.
+const DEFAULT_PERSIST_RETRY_BACKOFF_MS: &[u64] = &[250, 1000];
 
-/// Get retry backoff delays, overridable via INTENTD_SPAWN_RETRY_BACKOFF_MS
-/// (comma-separated milliseconds, e.g. "100,200"). Primarily for tests/CI.
-fn retry_backoff_ms() -> Vec<u64> {
-    if let Ok(val) = std::env::var("INTENTD_SPAWN_RETRY_BACKOFF_MS") {
+/// Parse comma-separated millisecond delays from `var`, falling back to
+/// `default` when unset, empty, or malformed. Primarily for tests/CI.
+fn env_backoff_ms(var: &str, default: &[u64]) -> Vec<u64> {
+    if let Ok(val) = std::env::var(var) {
         let mut delays = Vec::new();
         for part in val.split(',') {
             if let Ok(ms) = part.trim().parse::<u64>() {
                 delays.push(ms);
             } else {
                 // Invalid format, fall back to default
-                return DEFAULT_RETRY_BACKOFF_MS.to_vec();
+                return default.to_vec();
             }
         }
         if !delays.is_empty() {
             return delays;
         }
     }
-    DEFAULT_RETRY_BACKOFF_MS.to_vec()
+    default.to_vec()
+}
+
+/// Get spawn retry backoff delays, overridable via
+/// INTENTD_SPAWN_RETRY_BACKOFF_MS (comma-separated milliseconds, e.g.
+/// "100,200"). Primarily for tests/CI.
+fn retry_backoff_ms() -> Vec<u64> {
+    env_backoff_ms("INTENTD_SPAWN_RETRY_BACKOFF_MS", DEFAULT_RETRY_BACKOFF_MS)
+}
+
+/// Get persist retry backoff delays (#547), overridable via
+/// INTENTD_PERSIST_RETRY_BACKOFF_MS with the same format.
+fn persist_retry_backoff_ms() -> Vec<u64> {
+    env_backoff_ms(
+        "INTENTD_PERSIST_RETRY_BACKOFF_MS",
+        DEFAULT_PERSIST_RETRY_BACKOFF_MS,
+    )
 }
 
 /// Classify whether an error from `ensure_started` is retryable. Retryable
@@ -4534,6 +4603,34 @@ async fn handle_terminal_spawn_failure(
         content,
         options,
         persisted,
+        &error_text,
+    )
+    .await;
+}
+
+/// Handle a pre-turn persist failure after `persist_user` exhausted its
+/// bounded retry (#547, fail-closed drain). The turn was NOT started, so —
+/// unlike the spawn/turn failure handlers — there is no child to tear down
+/// and no partial stream to close; the terminal event pair + Error park +
+/// front requeue (`persisted: false`) make the failure observable and
+/// redrivable via `agent.retry`. Callers release the in-flight slot after.
+async fn handle_drain_persist_failure(
+    mgr: &AgentManager,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    content: &str,
+    options: &TurnOptions,
+) {
+    let error_text = "failed to persist user message to transcript; turn not started".to_string();
+    tracing::warn!(agent = %agent_id, "queue drain failed closed: {error_text}");
+    publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
+    persist_error_and_requeue(
+        mgr,
+        agent_id,
+        workspace_id,
+        content,
+        options,
+        false,
         &error_text,
     )
     .await;

@@ -49,26 +49,56 @@ impl Drop for TempDb {
     }
 }
 
-/// Unsets an env var for the guard's lifetime and restores the prior value on
-/// drop so tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
+/// Serializes env-mutating tests: process env is global, so a test that SETS
+/// `MOCK_AGENT_SCRIPT_PATH` (or a retry-backoff knob) must not interleave
+/// with one that unsets it.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Pins env vars for the guard's lifetime — holding [`ENV_LOCK`] so
+/// env-mutating tests serialize — and restores the prior values on drop so
+/// tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
 struct EnvGuard {
-    key: &'static str,
-    prev: Option<String>,
+    saved: Vec<(&'static str, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
+    fn acquire() -> std::sync::MutexGuard<'static, ()> {
+        // A panicked test already restored its env in Drop before poisoning.
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn unset(key: &'static str) -> Self {
+        let lock = Self::acquire();
         let prev = std::env::var(key).ok();
         std::env::remove_var(key);
-        Self { key, prev }
+        Self {
+            saved: vec![(key, prev)],
+            _lock: lock,
+        }
+    }
+
+    /// Set every `(key, value)` pair for the guard's lifetime.
+    fn set_all(pairs: &[(&'static str, &str)]) -> Self {
+        let lock = Self::acquire();
+        let mut saved = Vec::new();
+        for (key, value) in pairs {
+            saved.push((*key, std::env::var(key).ok()));
+            std::env::set_var(key, value);
+        }
+        Self { saved, _lock: lock }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
+        for (key, prev) in &self.saved {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
@@ -3624,6 +3654,261 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
         user_rows.len(),
         1,
         "retry must not duplicate an already-persisted user row: {messages:?}"
+    );
+}
+
+/// Absolute path to the deterministic mock ACP agent fixture so a unit test
+/// can exercise a REAL successful turn (node child, ACP handshake, default
+/// "Mock agent completed." response) through the drain paths.
+fn mock_agent_script() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
+        .canonicalize()
+        .expect("mock-acp-agent.mjs fixture exists")
+        .display()
+        .to_string()
+}
+
+/// #547 regression (fail-closed drain): when the pre-turn `persist_user`
+/// append fails for ALL bounded retry attempts, the drain must NOT start the
+/// turn — even with a healthy provider that would succeed. The agent parks in
+/// `Error` with the persist failure as `stop_reason` and the message requeued
+/// `persisted: false`; `agent.retry` against a restored store then lands the
+/// user row exactly once and the turn completes. Before the fix the drain
+/// started the turn anyway, producing observable assistant output for a user
+/// message that never reached the transcript.
+#[tokio::test]
+async fn failed_drain_persist_parks_error_without_starting_turn() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "10,10"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-547"), AgentId::from("a-547"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // Queue an unpersisted message, then hide the transcript table so every
+    // pre-turn `persist_user` attempt (initial + bounded retries) fails.
+    mgr.services
+        .enqueue_message(&id, "boom".to_string(), None, None, None);
+    sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("hide agent_message table");
+
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    // The drain must park the session in Error WITHOUT starting the turn.
+    // Poll the status-only read: the full session read joins the (hidden)
+    // transcript table.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let status = mgr
+                .services
+                .store
+                .get_agent_session_status(&id)
+                .await
+                .unwrap();
+            if status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("drain parks the session in error without a worker");
+
+    // The message is requeued front with CONFIRMED durability state.
+    let requeued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued for agent.retry");
+    assert_eq!(requeued.content, "boom");
+    assert!(
+        !requeued.persisted,
+        "requeue must carry persisted: false so the retry drain re-attempts the append"
+    );
+    assert!(
+        requeued.requeued_after_failure,
+        "requeue is a terminal-failure requeue (STAB-112)"
+    );
+    mgr.services.requeue_front(&id, requeued);
+
+    // The turn never ran: no assistant chunks were streamed. Drain the bus
+    // until quiet — pre-fix the turn started and the mock agent's response
+    // chunk reached subscribers before the terminal failure parked the agent.
+    let mut streamed_chunks = 0;
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        for ev in batch {
+            if ev.event_type == intent_core::events::AGENT_STREAM_CHUNK
+                || ev.event_type == intent_core::events::AGENT_STREAM_CONTENT_BLOCKS
+            {
+                streamed_chunks += 1;
+            }
+        }
+    }
+    assert_eq!(
+        streamed_chunks, 0,
+        "an unpersisted drained message must not produce assistant output"
+    );
+
+    // Restore the store: the stop_reason names the persist failure (not a
+    // spawn/turn error) and the transcript holds NO rows for the failed drain.
+    sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("restore agent_message table");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stop_reason = session.stop_reason.expect("stop_reason persisted");
+    assert!(
+        stop_reason.contains("persist") && stop_reason.contains("turn not started"),
+        "stop_reason names the persist failure: {stop_reason}"
+    );
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(
+        messages.is_empty(),
+        "no transcript rows before the retry: {messages:?}"
+    );
+
+    // agent.retry redrives: the persist is re-attempted against the healthy
+    // store and the turn completes.
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("boom"))
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "the drained message lands in the transcript exactly once: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.role == "assistant"),
+        "the retried turn completed with assistant output: {messages:?}"
+    );
+}
+
+/// #547 companion (bounded retry): a TRANSIENT persist failure on the first
+/// attempt self-heals inside `persist_user`'s bounded retry — the turn
+/// proceeds normally with exactly one user row and no Error park. Before the
+/// fix `persist_user` was single-attempt, so the blip lost the user row.
+#[tokio::test]
+async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "2000"),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-547-blip"),
+        AgentId::from("a-547-blip"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    mgr.services
+        .enqueue_message(&id, "blip".to_string(), None, None, None);
+    sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("hide agent_message table");
+
+    // Kick the drain in the background: the first persist attempt fails
+    // immediately; restore the table well before the 2s-backoff retry runs.
+    let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("restore agent_message table");
+    drain.await.expect("drain task");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn completes after the transient blip self-heals");
+
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::RuntimeIdle, "no Error park");
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("blip"))
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "the blipped message lands in the transcript exactly once: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.role == "assistant"),
+        "the turn proceeded to completion: {messages:?}"
     );
 }
 
