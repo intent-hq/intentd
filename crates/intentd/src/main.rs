@@ -618,6 +618,21 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
         Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
     }
+    // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
+    // prior daemon crashed between the locked detach rename and the unlocked
+    // recursive removal (monorepo#473). Spawned so the potentially multi-GB
+    // removal never blocks startup; best-effort throughout — a failure never
+    // aborts startup, and a missing workspaces root is a silent no-op.
+    let services_trash_sweep = services.clone();
+    tokio::spawn(async move {
+        let removed = services_trash_sweep.sweep_orphaned_worktree_trash().await;
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                "startup sweep removed orphaned worktree trash dirs"
+            );
+        }
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
