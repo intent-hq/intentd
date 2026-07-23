@@ -3764,12 +3764,83 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     );
 }
 
+/// monorepo#564 regression: `agent.sendMessage` to a nonexistent agent id
+/// (e.g. a truncated id) must fail closed with `-32602` naming the id —
+/// NOT auto-queue a phantom message the sender then waits on forever.
 #[tokio::test]
-async fn send_message_auto_queues_for_unknown_agent() {
+async fn send_message_op_rejects_unknown_agent() {
     let (_t, svc, _ws) = setup().await;
     let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let err = svc
+        .agent_send_message_op(id.clone(), "hi".into(), None, None, None, None)
+        .await
+        .expect_err("unknown agent must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&id.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry may be created for an unknown agent"
+    );
+}
+
+/// monorepo#564 regression: the SUB-1 sender auto-subscribe must fail closed
+/// when the TARGET agent does not exist — no caller→target watch may be
+/// registered for a nonexistent target (the phantom "waiting" state).
+#[tokio::test]
+async fn sender_watch_rejects_unknown_target() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let err = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
+        .await
+        .expect_err("unknown target must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&target.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&caller).is_empty(),
+        "no watch may be registered on a nonexistent target"
+    );
+}
+
+/// The auto-queue fallback still applies when the agent EXISTS but the store
+/// append fails (here: a duplicate client-supplied messageId hits the
+/// primary-key constraint) — only nonexistent agents fail closed.
+#[tokio::test]
+async fn send_message_auto_queues_on_store_failure_for_existing_agent() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "QueueRecv").await;
+    let first = svc
+        .agent_send_message_op(
+            id.clone(),
+            "first".into(),
+            Some("dup-id".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first send");
+    assert_eq!(first["queued"], false);
     let r = svc
-        .agent_send_message_op(id, "hi".into(), None, None, None, None)
+        .agent_send_message_op(
+            id.clone(),
+            "hi".into(),
+            Some("dup-id".into()),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
@@ -3778,11 +3849,22 @@ async fn send_message_auto_queues_for_unknown_agent() {
 
 /// STAB-7: agent_send_message_op fallback must preserve image_blocks and
 /// file_blocks when auto-queueing on store failure (matching the runtime
-/// manager path's behavior).
+/// manager path's behavior). Uses a duplicate messageId on an EXISTING agent
+/// to force the store failure (monorepo#564: unknown agents now fail closed).
 #[tokio::test]
 async fn send_message_op_preserves_attachments_on_auto_queue() {
-    let (_t, svc, _ws) = setup().await;
-    let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttachQueue").await;
+    svc.agent_send_message_op(
+        id.clone(),
+        "first".into(),
+        Some("dup-id".into()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("first send");
     let image_blocks = json!([
         { "type": "image", "data": "base64data", "mimeType": "image/png" }
     ]);
@@ -3793,7 +3875,7 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
         .agent_send_message_op(
             id.clone(),
             "check these".into(),
-            None,
+            Some("dup-id".into()),
             Some(image_blocks.clone()),
             Some(file_blocks.clone()),
             None,

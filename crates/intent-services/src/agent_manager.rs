@@ -2428,6 +2428,10 @@ impl AgentManager {
                 )));
             }
         }
+        // monorepo#564: reject nonexistent targets BEFORE any state change —
+        // a truncated/mistyped id must not claim the slot or queue a phantom
+        // message that never drains (the sender then waits forever).
+        self.services.require_agent_session(&agent_id).await?;
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
@@ -2783,6 +2787,9 @@ impl AgentManager {
         message_id: Option<String>,
         options: TurnOptions,
     ) -> Result<Value> {
+        // monorepo#564: reject nonexistent targets BEFORE the dedup record or
+        // any preemption — same fail-closed guard as `send_message`.
+        self.services.require_agent_session(&agent_id).await?;
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds to preempt.
         if let Some(mid) = message_id.as_deref() {
