@@ -57,6 +57,11 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Pins env vars for the guard's lifetime — holding [`ENV_LOCK`] so
 /// env-mutating tests serialize — and restores the prior values on drop so
 /// tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
+///
+/// The lock is held until the guard drops, so a test must use exactly ONE
+/// guard: constructing a second before the first drops deadlocks the test
+/// thread. Mutate every var (sets AND unsets) through a single
+/// [`EnvGuard::apply`] call instead.
 struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -70,25 +75,30 @@ impl EnvGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn unset(key: &'static str) -> Self {
-        let lock = Self::acquire();
-        let prev = std::env::var(key).ok();
-        std::env::remove_var(key);
-        Self {
-            saved: vec![(key, prev)],
-            _lock: lock,
-        }
-    }
-
-    /// Set every `(key, value)` pair for the guard's lifetime.
-    fn set_all(pairs: &[(&'static str, &str)]) -> Self {
+    /// Apply every `(key, value)` mutation under one guard: `Some(v)` sets
+    /// the var, `None` unsets it. Prior values are restored on drop.
+    fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
         let lock = Self::acquire();
         let mut saved = Vec::new();
         for (key, value) in pairs {
             saved.push((*key, std::env::var(key).ok()));
-            std::env::set_var(key, value);
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
         }
         Self { saved, _lock: lock }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        Self::apply(&[(key, None)])
+    }
+
+    /// Set every `(key, value)` pair for the guard's lifetime.
+    fn set_all(pairs: &[(&'static str, &str)]) -> Self {
+        let pairs: Vec<(&'static str, Option<&str>)> =
+            pairs.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        Self::apply(&pairs)
     }
 }
 
