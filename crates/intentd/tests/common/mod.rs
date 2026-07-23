@@ -8,7 +8,9 @@
 // uses a subset of it, so unused items are expected.
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Child;
 use std::time::Duration;
 
@@ -57,7 +59,10 @@ pub fn hermetic_workspaces_root() -> PathBuf {
 /// Wait until a freshly spawned `intentd serve` child accepts connections on
 /// its UDS `socket`, budgeted by [`daemon_startup_timeout`]. Fails fast —
 /// panicking with the daemon log — if the child exits before listening, so
-/// tests don't keep polling a dead daemon for the full window.
+/// tests don't keep polling a dead daemon for the full window. Unix-only
+/// (UDS); gated so test binaries without `#![cfg(unix)]` still compile
+/// `common` on non-Unix targets and keep the ctor guard.
+#[cfg(unix)]
 pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: &Path) {
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
