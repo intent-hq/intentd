@@ -12,6 +12,7 @@
 //! ```text
 //! sitter/
 //! ├── versions/<version>/intentd[.exe]   # installed daemon binaries
+//! ├── tmp/                               # in-flight downloads/extractions
 //! └── state.json                         # persisted sitter state
 //! ```
 
@@ -42,6 +43,8 @@ pub struct SitterPaths {
     pub sitter_dir: PathBuf,
     /// `<sitter_dir>/versions/` — one subdirectory per installed version.
     pub versions_dir: PathBuf,
+    /// `<sitter_dir>/tmp/` — in-flight downloads and extractions.
+    pub tmp_dir: PathBuf,
     /// `<sitter_dir>/state.json`.
     pub state_path: PathBuf,
 }
@@ -71,6 +74,7 @@ impl SitterPaths {
         Self {
             data_dir: data_dir.to_path_buf(),
             versions_dir: sitter_dir.join("versions"),
+            tmp_dir: sitter_dir.join("tmp"),
             state_path: sitter_dir.join("state.json"),
             sitter_dir,
         }
@@ -113,6 +117,7 @@ mod tests {
         let sitter = PathBuf::from("/data").join("sitter");
         assert_eq!(paths.state_path, sitter.join("state.json"));
         assert_eq!(paths.versions_dir, sitter.join("versions"));
+        assert_eq!(paths.tmp_dir, sitter.join("tmp"));
         let bin = paths.daemon_binary("1.2.3");
         assert_eq!(
             bin,

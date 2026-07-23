@@ -1,9 +1,9 @@
 //! intentd-sitter binary entry point.
 //!
 //! Skeleton only: parses the sitter-owned `--sitter-*` flags, resolves the
-//! data-dir/state layout, and reports what is (not yet) installed. Manifest
-//! fetch, download/verify/install, and daemon supervision land in follow-up
-//! changes.
+//! data-dir/state layout, and reports what is (not yet) installed. The
+//! update engine lives in [`intentd_sitter::updater`]; wiring it up plus
+//! daemon supervision land in follow-up changes.
 
 use intentd_sitter::cli::{self, SitterArgs};
 use intentd_sitter::paths::SitterPaths;

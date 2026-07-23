@@ -3,10 +3,13 @@
 //! The sitter is the binary users install (packaged and renamed to `intentd`
 //! at release time). It downloads the real daemon from the per-channel
 //! release manifests, keeps it updated, and forwards all CLI args to it
-//! verbatim. This crate currently holds the skeleton: CLI parsing
-//! ([`cli`]), data-dir/state layout ([`paths`]), and persisted sitter state
-//! ([`state`]). Update and supervision logic land separately.
+//! verbatim. This crate holds: CLI parsing ([`cli`]), data-dir/state layout
+//! ([`paths`]), persisted sitter state ([`state`]), the channel-manifest
+//! schema ([`manifest`]), and the update engine ([`updater`]). Daemon
+//! supervision lands separately.
 
 pub mod cli;
+pub mod manifest;
 pub mod paths;
 pub mod state;
+pub mod updater;

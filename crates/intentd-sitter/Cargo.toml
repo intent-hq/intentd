@@ -20,6 +20,20 @@ directories = { workspace = true }
 time = { workspace = true, features = ["serde-well-known", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+sha2 = "0.10.9"
+semver = "1.0.28"
+tar = "0.4.46"
+flate2 = "1.1.9"
+liblzma = { version = "0.4.7", features = ["static"] }
+reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
+flate2 = "1.1.9"
+liblzma = "0.4.7"
+serde_json.workspace = true
+sha2 = "0.10.9"
+tar = "0.4.46"
 tempfile = "3"
+
+[target."cfg(windows)".dependencies]
+zip = { version = "4.2.0", default-features = false, features = ["deflate"] }
