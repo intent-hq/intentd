@@ -32,6 +32,38 @@ pub fn current_agent_log_file_name() -> String {
     )
 }
 
+/// Create the per-agent log directory (and any missing parents). On Unix
+/// every directory created here gets mode `0700` at creation time (STAB-56),
+/// so captured stderr — which may contain tokens, paths, or prompt fragments
+/// — is never world-readable; on other platforms this is a plain
+/// `create_dir_all`. Pre-existing directories are left untouched.
+pub fn create_agent_log_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Open (creating if needed) a per-agent daily log file in append mode. On
+/// Unix a freshly created file gets mode `0600` at creation time (STAB-56),
+/// so there is no window where it exists with umask-derived permissions;
+/// pre-existing files keep their mode. On other platforms this is a plain
+/// create+append open.
+pub fn open_agent_log_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// Best-effort retention sweep: delete files under `root` (the agent-logs
 /// root, one subdirectory per agent) whose modification time is older than
 /// `max_age`, then remove any agent directory the sweep left empty. Returns
@@ -145,5 +177,44 @@ mod tests {
         let name = current_agent_log_file_name();
         assert_eq!(name.len(), "2026-07-16.log".len());
         assert!(name.ends_with(".log"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_log_dir_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("intentd-agent-logs-{}", uuid::Uuid::new_v4()));
+        let dir = base.join("agent-logs").join("agent-1");
+        create_agent_log_dir(&dir).unwrap();
+        for path in [dir.as_path(), dir.parent().unwrap()] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be owner-only", path.display());
+        }
+        // Re-creating an existing dir is a no-op, not an error.
+        create_agent_log_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_log_file_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("intentd-agent-logs-{}", uuid::Uuid::new_v4()));
+        create_agent_log_dir(&dir).unwrap();
+        let path = dir.join("2026-07-16.log");
+        drop(open_agent_log_file(&path).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "log file must be owner-only");
+        // Re-opening an existing file appends rather than failing.
+        open_agent_log_file(&path).unwrap();
+        // A pre-existing file keeps its mode (no retroactive chmod).
+        let pre = dir.join("2026-07-15.log");
+        std::fs::write(&pre, "x").unwrap();
+        std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_agent_log_file(&pre).unwrap();
+        let pre_mode = std::fs::metadata(&pre).unwrap().permissions().mode() & 0o777;
+        assert_eq!(pre_mode, 0o644, "pre-existing file mode is untouched");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

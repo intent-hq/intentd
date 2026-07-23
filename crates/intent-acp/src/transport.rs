@@ -153,13 +153,22 @@ async fn write_stderr_log_line(
 ) -> std::io::Result<()> {
     let name = intent_core::current_agent_log_file_name();
     if current.as_ref().map(|(n, _)| n.as_str()) != Some(name.as_str()) {
-        tokio::fs::create_dir_all(dir).await?;
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(&name))
-            .await?;
-        *current = Some((name, file));
+        // Hardened creation (STAB-56): dir `0700` / file `0600` on Unix via
+        // the shared intent-core helpers, applied at creation time so there
+        // is no world-readable window. `spawn_blocking` keeps the rare sync
+        // open (once per day/connection) off the async runtime; failures
+        // surface exactly like the previous create/open errors — the writer
+        // exits and capture is disabled — and the bounded channel still
+        // shields the stderr drain loop (STAB-53).
+        let dir_owned = dir.to_path_buf();
+        let path = dir.join(&name);
+        let file = tokio::task::spawn_blocking(move || {
+            intent_core::create_agent_log_dir(&dir_owned)?;
+            intent_core::open_agent_log_file(&path)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        *current = Some((name, tokio::fs::File::from_std(file)));
     }
     let (_, file) = current.as_mut().expect("sink file just opened");
     file.write_all(line.as_bytes()).await?;

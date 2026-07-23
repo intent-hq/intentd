@@ -230,6 +230,24 @@ async fn stderr_capture_written_to_daily_log_file() {
         "second stderr line captured; got: {content:?}"
     );
 
+    // STAB-56: the capture dir and daily log file are created owner-only.
+    use std::os::unix::fs::PermissionsExt;
+    let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "capture dir must be owner-only");
+    let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+    let mut checked = 0;
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let mode = entry.metadata().await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "log file {} must be owner-only",
+            entry.path().display()
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "at least one daily log file was checked");
+
     agent.kill().await.ok();
     tokio::fs::remove_dir_all(&dir).await.ok();
 }
