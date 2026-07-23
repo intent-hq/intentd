@@ -231,15 +231,12 @@ impl Report {
         self.count(|o| matches!(o, Outcome::Skipped(_)))
     }
 
-    /// Whether any workspace manifest could not be decoded into a workspace.
+    /// Whether any non-operational workspace skip should block the completion marker.
     pub fn has_compatibility_failures(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(
                 &entry.outcome,
-                Outcome::Skipped(reason)
-                    if reason.starts_with("workspace.json parse failed:")
-                        || reason.starts_with("invalid JSON in workspace.json:")
-                        || reason == "workspace.json is not a JSON object"
+                Outcome::Skipped(reason) if !is_operational_skip(reason)
             )
         })
     }
@@ -290,6 +287,13 @@ impl Report {
             assets: AssetCounts::default(),
         });
     }
+}
+
+fn is_operational_skip(reason: &str) -> bool {
+    reason == "already in DB"
+        || reason.starts_with("update failed:")
+        || reason.starts_with("insert failed:")
+        || reason.starts_with("lookup failed:")
 }
 
 impl fmt::Display for Report {
@@ -1850,6 +1854,32 @@ mod tests {
         Options {
             roots,
             ..Options::default()
+        }
+    }
+
+    #[test]
+    fn compatibility_failures_include_manifest_failures() {
+        for reason in [
+            "cannot read workspace.json: permission denied",
+            "workspace.json has no id",
+        ] {
+            let mut report = Report::default();
+            report.skip("ws-bad", Path::new("."), reason);
+            assert!(report.has_compatibility_failures(), "{reason}");
+        }
+    }
+
+    #[test]
+    fn compatibility_failures_exclude_operational_skips() {
+        for reason in [
+            "already in DB",
+            "update failed: database busy",
+            "insert failed: database busy",
+            "lookup failed: database busy",
+        ] {
+            let mut report = Report::default();
+            report.skip("ws-existing", Path::new("."), reason);
+            assert!(!report.has_compatibility_failures(), "{reason}");
         }
     }
 
