@@ -606,7 +606,7 @@ async fn boot_restart_daemon(
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "restart daemon did not start");
 
-    let status = uds_rpc(&socket, 10, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")

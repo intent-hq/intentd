@@ -251,7 +251,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     // Get the actual bound port from system.status
-    let status = uds_rpc(&socket, 999, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let port_value = status["result"]["port"].as_u64().expect("port");
 
     // Persist the ephemeral port to the setting so re-enable uses the same port
@@ -268,7 +268,7 @@ async fn runtime_ws_listener_toggle_over_wss() {
     );
 
     // Verify initial system.status shows the WSS listener (started at boot)
-    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let initial_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set at boot") as u16;
@@ -665,7 +665,7 @@ async fn wss_system_status_includes_capacity_version_uptime() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     // Get status over UDS to find WSS port + fingerprint
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
