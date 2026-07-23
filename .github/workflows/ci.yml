@@ -242,7 +242,7 @@ jobs:
   # semantics the daemon's `service install` used to generate (Type=simple,
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
-  # real release tarballs are repacked by .github/workflows/build-deb.yml).
+  # real release tarballs are repacked by .github/workflows/release-sitter.yml).
   deb-packaging:
     runs-on: ubuntu-latest
     timeout-minutes: 5

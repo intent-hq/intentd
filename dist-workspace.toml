@@ -7,22 +7,24 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# A GitHub repo to push Homebrew formulas to
-tap = "intent-hq/homebrew-tap"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# No installers: user-facing installs (Homebrew, .deb, shell/powershell) are
+# owned by the sitter release pipeline (release-sitter.yml); the daemon ships
+# archives + checksums + channel manifests only.
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
+# Only respond to v-prefixed tags (vX.Y.Z). Without this, the generated tag
+# glob also matches sitter-vX.Y.Z tags, firing spurious daemon dist runs on
+# sitter releases. Note: this renames the generated workflow to
+# .github/workflows/v-release.yml.
+tag-namespace = "v"
 # Whether to install an updater program
 install-updater = false
 # Post-announce: publish/update the stable.json / beta.json channel manifests
-post-announce-jobs = ["./publish-channel-manifest", "./build-deb"]
+post-announce-jobs = ["./publish-channel-manifest"]
 
 # aarch64 linux would default to the `ubuntu-22.04-arm` runner, which is only
 # available on public repos. Build it on x86_64 instead (dist cross-compiles

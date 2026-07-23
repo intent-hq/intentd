@@ -106,7 +106,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/intent-hq/intentd/
 ### Debian / Ubuntu (.deb)
 
 Every release also ships Debian packages (`intentd_<version>_amd64.deb` and
-`intentd_<version>_arm64.deb`, built by `.github/workflows/build-deb.yml`) installing
+`intentd_<version>_arm64.deb`, built by `.github/workflows/release-sitter.yml`) installing
 the binary at `/usr/bin/intentd` and a systemd **user** unit at
 `/usr/lib/systemd/user/intentd.service`. Download the .deb for your architecture from
 the [releases page](https://github.com/intent-hq/intentd/releases), then:
@@ -192,15 +192,13 @@ in the monorepo's git history.
 ## Releases & channels
 
 Releases are tag-driven and built by [dist (cargo-dist)](https://axodotdev.github.io/cargo-dist/)
-(`dist-workspace.toml` + the generated `.github/workflows/release.yml`). Pushing a tag
-publishes a GitHub Release with per-platform archives, `.sha256` checksums, and shell /
-PowerShell installer scripts for: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
-It also pushes an updated Homebrew formula to
-[intent-hq/homebrew-tap](https://github.com/intent-hq/homebrew-tap) (the
-`publish-homebrew-formula` job, authenticated via the `HOMEBREW_TAP_TOKEN` secret). The
-tap always reflects the **latest release (beta channel)**; the stable promotion workflow
-below only updates the stable channel manifest and never touches the tap.
+(`dist-workspace.toml` + the generated `.github/workflows/v-release.yml`). Pushing a tag
+publishes a GitHub Release with per-platform archives and `.sha256` checksums for:
+`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, `x86_64-pc-windows-msvc`. User-facing installers
+(Homebrew formula, `.deb` packages) ship the sitter and are owned by the sitter
+release pipeline (`.github/workflows/release-sitter.yml`); the daemon pipeline
+publishes archives, checksums, and channel manifests only.
 
 Channels follow a **promotion model** — channel routing does not depend on prerelease
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
