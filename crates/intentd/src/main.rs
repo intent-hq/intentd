@@ -398,7 +398,17 @@ async fn cmd_import_legacy(
     .await?;
     println!("{report}");
     if !dry_run {
-        legacy_import::write_completion_marker(&store).await?;
+        // Marker write failure is a warning, not a command failure — the
+        // import itself completed (mirrors the first-boot hook in `serve`).
+        // Without the marker a later run/first-boot may re-import, which is
+        // safe: the import is idempotent.
+        if let Err(e) = legacy_import::write_completion_marker(&store).await {
+            eprintln!(
+                "warning: import completed but the completion marker could not \
+                 be written ({e}); a later run or first boot may re-import \
+                 (idempotent, existing rows are skipped)"
+            );
+        }
     } else if !db_existed {
         // Dry-run on a fresh install: don't leave behind the DB file that
         // `Store::open` just created, or the first-boot auto-import in
