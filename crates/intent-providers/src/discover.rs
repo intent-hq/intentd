@@ -153,8 +153,9 @@ pub fn probe_npx() -> NpxStatus {
 
 /// Resolve a provider binary to an absolute path using the precedence order:
 /// 1. Explicit path from `providers.paths` map (keyed by provider ID)
-/// 2. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
-/// 3. Scan enhanced PATH directories
+/// 2. Native installer location (grok: `~/.grok/bin`, opencode: `~/.opencode/bin`)
+/// 3. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
+/// 4. Scan enhanced PATH directories
 ///
 /// Returns `None` when the binary cannot be resolved. Reuses the discovery
 /// logic from `intent_context::discovery` but generalized for all providers.
@@ -163,6 +164,18 @@ pub fn find_provider_binary(
     provider_id: &str,
     command: &str,
     explicit_path: Option<&str>,
+) -> Option<PathBuf> {
+    find_provider_binary_with_home(provider_id, command, explicit_path, home_dir().as_deref())
+}
+
+/// [`find_provider_binary`] with an explicit `home` for the native-installer
+/// tier (test seam — avoids mutating the process-global `HOME` in parallel
+/// tests).
+fn find_provider_binary_with_home(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+    home: Option<&std::path::Path>,
 ) -> Option<PathBuf> {
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
@@ -182,22 +195,24 @@ pub fn find_provider_binary(
         }
     }
 
-    // 2a. Native installer locations (grok: `~/.grok/bin/grok`, opencode:
+    // 2. Native installer locations (grok: `~/.grok/bin/grok`, opencode:
     // `~/.opencode/bin/opencode`) are preferred over any PATH-resolved
     // npm-global wrapper (parity with `grok-resolver.ts` / `opencode-resolver.ts`:
     // wrappers can emit update banners before real stdout).
-    if let Some(native) = find_provider_native_binary(provider_id, command) {
-        return Some(native);
+    if let Some(home) = home {
+        if let Some(native) = find_provider_native_binary_in(provider_id, command, home) {
+            return Some(native);
+        }
     }
 
-    // 2b. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
+    // 3. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
     if let Some(managed) = managed_binary_path(command) {
         if is_executable_file(&managed) {
             return Some(managed);
         }
     }
 
-    // 3. Scan enhanced PATH directories
+    // 4. Scan enhanced PATH directories
     find_in_enhanced_dirs(command)
 }
 
@@ -600,15 +615,36 @@ mod find_provider_binary_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn find_provider_binary_explicit_setting_wins_over_native_for_opencode() {
-        // Precedence: explicit `providers.paths` setting beats the native
-        // installer tier (the explicit check runs first).
-        let dir = unique_temp_dir("opencode-explicit");
-        let bin = dir.join("opencode");
-        make_executable(&bin);
-        let result = find_provider_binary("opencode", "opencode", Some(bin.to_str().unwrap()));
-        assert_eq!(result, Some(bin));
+        // Precedence: with a native binary present in the fake home, the
+        // explicit `providers.paths` setting still wins; without the explicit
+        // setting, the native tier resolves.
+        let home = unique_temp_dir("opencode-precedence-home");
+        let native_dir = home.join(".opencode").join("bin");
+        fs::create_dir_all(&native_dir).unwrap();
+        let native = native_dir.join("opencode");
+        make_executable(&native);
+
+        let explicit_dir = unique_temp_dir("opencode-explicit");
+        let explicit = explicit_dir.join("opencode");
+        make_executable(&explicit);
+
+        let result = find_provider_binary_with_home(
+            "opencode",
+            "opencode",
+            Some(explicit.to_str().unwrap()),
+            Some(&home),
+        );
+        assert_eq!(result, Some(explicit), "explicit setting must beat native");
+
+        let result = find_provider_binary_with_home("opencode", "opencode", None, Some(&home));
+        assert_eq!(
+            result,
+            Some(native),
+            "native tier must resolve without an explicit setting"
+        );
     }
 
     #[test]

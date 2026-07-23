@@ -66,10 +66,10 @@ needs. Fields that matter most:
 
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
-+ executable), (2) `~/.augment/bin/<command>` (auggie back-compat tier), (3) enhanced-PATH
-scan (nvm/homebrew/volta/asdf dirs). Provider-specific tiers slot in explicitly — see the
-native-installer preference (`find_provider_native_binary`: grok `~/.grok/bin/grok`,
-opencode `~/.opencode/bin/opencode`). At spawn
++ executable), (2) the provider's native-installer location where one exists
+(`find_provider_native_binary`: grok `~/.grok/bin/grok`, opencode
+`~/.opencode/bin/opencode`), (3) `~/.augment/bin/<command>` (auggie back-compat tier),
+(4) enhanced-PATH scan (nvm/homebrew/volta/asdf dirs). At spawn
 time `enhanced_path` (`crates/intent-providers/src/args.rs`) prepends the binary's parent
 dir so `#!/usr/bin/env node` shebangs resolve a co-located node.
 
