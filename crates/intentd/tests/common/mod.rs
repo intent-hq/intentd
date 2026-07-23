@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Force the hermetic-root guard on for every integration-test binary that
@@ -123,6 +124,187 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
         "\n[server.wsApi]\nenabled = true\nport = {port}\n"
     ));
     std::fs::write(&path, text).expect("seed config.toml with server.wsApi.enabled");
+}
+
+/// The pinned-TLS WebSocket client stream type shared by the WSS e2e suites.
+pub type TlsWs =
+    tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// Bounded retry budget for WSS/TLS connection establishment (#553): up to 5
+/// attempts with a short exponential backoff. Retries cover **connection
+/// establishment only** — TCP connect, TLS handshake, WebSocket upgrade — and
+/// trigger only on transient connect-phase I/O errors (reset / refused /
+/// aborted / broken pipe / unexpected EOF), which the daemon's accept path can
+/// produce when the machine is saturated by the parallel test suite. Genuine
+/// failures (auth rejections, fingerprint mismatches, timeouts) stay fatal on
+/// the first attempt, so a daemon that never accepts still fails the test
+/// within a bounded time.
+const CONNECT_ATTEMPTS: u32 = 5;
+const CONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Per-phase budget for one connection attempt, scaled by
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER` like every other test budget.
+fn connect_phase_timeout() -> Duration {
+    test_timeout(Duration::from_secs(5))
+}
+
+/// One failed connection-establishment phase. `transient` marks the
+/// load-induced I/O errors worth retrying; everything else is fatal.
+struct ConnectAttemptError {
+    phase: &'static str,
+    message: String,
+    transient: bool,
+}
+
+fn transient_connect_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// One TCP + TLS connection attempt, each phase bounded by
+/// [`connect_phase_timeout`].
+async fn try_tls_connect(
+    port: u16,
+    cfg: Arc<rustls::ClientConfig>,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, ConnectAttemptError> {
+    let budget = connect_phase_timeout();
+    let tcp = match tokio::time::timeout(
+        budget,
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    )
+    .await
+    {
+        Err(_) => {
+            return Err(ConnectAttemptError {
+                phase: "tcp connect",
+                message: format!("timed out after {budget:?}"),
+                transient: false,
+            })
+        }
+        Ok(Err(e)) => {
+            return Err(ConnectAttemptError {
+                phase: "tcp connect",
+                transient: transient_connect_kind(e.kind()),
+                message: e.to_string(),
+            })
+        }
+        Ok(Ok(tcp)) => tcp,
+    };
+    let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+    match tokio::time::timeout(
+        budget,
+        tokio_rustls::TlsConnector::from(cfg).connect(name, tcp),
+    )
+    .await
+    {
+        Err(_) => Err(ConnectAttemptError {
+            phase: "tls connect",
+            message: format!("timed out after {budget:?}"),
+            transient: false,
+        }),
+        Ok(Err(e)) => Err(ConnectAttemptError {
+            phase: "tls connect",
+            transient: transient_connect_kind(e.kind()),
+            message: e.to_string(),
+        }),
+        Ok(Ok(tls)) => Ok(tls),
+    }
+}
+
+/// One full connection-establishment attempt: TCP + TLS + WebSocket upgrade.
+async fn try_wss_connect(
+    port: u16,
+    cfg: Arc<rustls::ClientConfig>,
+    url: &str,
+) -> Result<TlsWs, ConnectAttemptError> {
+    let tls = try_tls_connect(port, cfg).await?;
+    let budget = connect_phase_timeout();
+    match tokio::time::timeout(budget, tokio_tungstenite::client_async(url, tls)).await {
+        Err(_) => Err(ConnectAttemptError {
+            phase: "ws handshake",
+            message: format!("timed out after {budget:?}"),
+            transient: false,
+        }),
+        Ok(Err(e)) => Err(ConnectAttemptError {
+            phase: "ws handshake",
+            transient: matches!(
+                &e,
+                tokio_tungstenite::tungstenite::Error::Io(io) if transient_connect_kind(io.kind())
+            ),
+            message: e.to_string(),
+        }),
+        Ok(Ok((ws, _resp))) => Ok(ws),
+    }
+}
+
+/// Open a pinned TLS stream to `127.0.0.1:port` (SNI `localhost`), retrying
+/// transient connect-phase failures per the bounded policy above. Panics —
+/// like the `expect`-based helpers it replaces — once the attempt budget is
+/// exhausted or on any non-transient failure.
+pub async fn tls_connect_with_retry(
+    port: u16,
+    cfg: Arc<rustls::ClientConfig>,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let mut backoff = CONNECT_INITIAL_BACKOFF;
+    let mut attempt = 1;
+    loop {
+        match try_tls_connect(port, cfg.clone()).await {
+            Ok(tls) => return tls,
+            Err(e) if e.transient && attempt < CONNECT_ATTEMPTS => {
+                eprintln!(
+                    "tls connect attempt {attempt}/{CONNECT_ATTEMPTS} failed during {} ({}); \
+                     retrying in {backoff:?}",
+                    e.phase, e.message
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                attempt += 1;
+            }
+            Err(e) => panic!(
+                "{} failed on attempt {attempt}/{CONNECT_ATTEMPTS}: {}",
+                e.phase, e.message
+            ),
+        }
+    }
+}
+
+/// Establish a pinned-TLS WebSocket connection to `url`, retrying transient
+/// connect-phase failures (each retry redoes TCP + TLS + upgrade on a fresh
+/// socket). Only connection establishment is retried — RPCs, event waits, and
+/// assertions never pass through this helper. `url` must target the same
+/// `port` the socket is opened against (`wss://localhost:{port}/…`).
+pub async fn wss_connect_with_retry(port: u16, cfg: Arc<rustls::ClientConfig>, url: &str) -> TlsWs {
+    assert!(
+        url.starts_with(&format!("wss://localhost:{port}/")),
+        "wss_connect_with_retry: url {url:?} does not target wss://localhost:{port}/"
+    );
+    let mut backoff = CONNECT_INITIAL_BACKOFF;
+    let mut attempt = 1;
+    loop {
+        match try_wss_connect(port, cfg.clone(), url).await {
+            Ok(ws) => return ws,
+            Err(e) if e.transient && attempt < CONNECT_ATTEMPTS => {
+                eprintln!(
+                    "wss connect attempt {attempt}/{CONNECT_ATTEMPTS} failed during {} ({}); \
+                     retrying in {backoff:?}",
+                    e.phase, e.message
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                attempt += 1;
+            }
+            Err(e) => panic!(
+                "{} failed on attempt {attempt}/{CONNECT_ATTEMPTS}: {}",
+                e.phase, e.message
+            ),
+        }
+    }
 }
 
 /// RAII guard for a spawned `intentd serve` process.

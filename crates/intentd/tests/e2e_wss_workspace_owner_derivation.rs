@@ -24,7 +24,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
@@ -209,24 +208,8 @@ async fn connect_ws(
     port: u16,
     tls_cfg: Arc<ClientConfig>,
 ) -> WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let stream = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .expect("tcp connect");
-    let connector = TlsConnector::from(tls_cfg);
-    let domain = ServerName::try_from("localhost").unwrap();
-    let tls = connector.connect(domain, stream).await.expect("tls");
-    let (ws, _) = timeout(
-        Duration::from_secs(5),
-        tokio_tungstenite::client_async_with_config(
-            format!("wss://localhost:{}/ws?token={}", port, TOKEN),
-            tls,
-            None,
-        ),
-    )
-    .await
-    .expect("timeout")
-    .expect("ws upgrade");
-    ws
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    common::wss_connect_with_retry(port, tls_cfg, &url).await
 }
 
 async fn wss_rpc(

@@ -26,7 +26,6 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
@@ -164,30 +163,12 @@ async fn start() -> Server {
     }
 }
 
-async fn tls_connect(
-    port: u16,
-    cfg: Arc<ClientConfig>,
-) -> tokio_rustls::client::TlsStream<TcpStream> {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
-    let name = ServerName::try_from("localhost").unwrap();
-    TlsConnector::from(cfg)
-        .connect(name, tcp)
-        .await
-        .expect("tls connect")
-}
-
 async fn connect_ws(
     port: u16,
     cfg: Arc<ClientConfig>,
 ) -> tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>> {
-    let tls = tls_connect(port, cfg).await;
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
-    ws
+    common::wss_connect_with_retry(port, cfg, &url).await
 }
 
 async fn wss_call(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> Value {
