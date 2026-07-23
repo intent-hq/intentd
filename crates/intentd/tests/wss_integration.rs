@@ -543,6 +543,133 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     srv.ws.stop().await;
 }
 
+/// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
+/// `agent.create` with an unknown explicit `provider` or an unknown compound
+/// model prefix, and `agent.setModel` with an unknown compound prefix, are all
+/// rejected with `-32602` naming the unknown id — no session row is persisted
+/// and no default-provider fallback occurs.
+#[tokio::test]
+async fn wss_agent_create_and_set_model_reject_unknown_provider() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Unknown Provider"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Explicit unknown `provider` param → -32602 naming the unknown id.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","provider":"nonexistent"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown explicit provider must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // Unknown compound model prefix → the same -32602.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad2","model":"nonexistent:foo"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "unknown compound-prefix provider must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // Explicit VALID provider + unknown compound model prefix → also -32602
+    // (the spawn path gives the model prefix precedence over session.provider).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":8,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad3","provider":"auggie","model":"nonexistent:foo"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "valid provider + unknown model prefix must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.create: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // No rejection persisted a session row.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row may persist after the rejections: {listed}"
+    );
+
+    // A create without a provider still succeeds (defaulting stays valid)…
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Good"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("server-minted id")
+        .to_string();
+    let model_before = created["result"]["agent"]["model"].clone();
+
+    // …and agent.setModel rejects an unknown compound prefix the same way.
+    let set_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"nonexistent:foo"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &set_frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "setModel with unknown compound-prefix provider must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agent.setModel: unknown provider: nonexistent"),
+        "error must name the unknown provider: {rejected}"
+    );
+
+    // The rejected setModel left the session untouched.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["model"], model_before,
+        "model must be unchanged after the rejected setModel: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `agent.create` accepts the widened P2-12a wire shape (optional `provider`,
 /// `agentType`, `metadata`, `workspacePath`, `workspaceContext`) and returns
 /// the full `AgentLite` projection instead of the pre-widening `{id, name}`

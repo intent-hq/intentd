@@ -501,9 +501,28 @@ mod find_provider_binary_tests {
     }
 
     #[test]
+    fn discover_providers_reports_pi_as_npx_only() {
+        let providers = discover_providers();
+        let pi = providers.iter().find(|p| p.id == "pi").unwrap();
+        assert_eq!(
+            pi.npx_only_package,
+            Some(crate::config::PI_ACP_NPX_PACKAGE),
+            "pi availability must carry the pinned npx package"
+        );
+        // Installed reflects npx availability, never a local pi-acp binary;
+        // the resolved path (when present) is npx itself.
+        let npx = find_npx();
+        assert_eq!(pi.installed, npx.is_some());
+        assert_eq!(pi.resolved_path, npx);
+    }
+
+    #[test]
     fn discover_providers_non_npx_only_providers_unchanged() {
         let providers = discover_providers();
-        for p in providers.iter().filter(|p| p.id != "claude-code") {
+        for p in providers
+            .iter()
+            .filter(|p| p.id != "claude-code" && p.id != "pi")
+        {
             assert_eq!(p.npx_only_package, None, "{} must not be npx-only", p.id);
         }
     }

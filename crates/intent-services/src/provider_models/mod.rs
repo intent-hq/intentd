@@ -18,8 +18,8 @@
 //!   exists to reuse its Electron-managed codex runtime; daemon-side the
 //!   codex-acp probe reaches the same catalog (codex-acp itself queries the
 //!   codex CLI), so probe-only is sufficient here.
-//! - `pi` — ACP probe via the pinned npx adapter ([`PI_ACP_NPX_PACKAGE`];
-//!   `pi` has no entry in the ACP provider registry, so the pin lives here).
+//! - `pi` — ACP probe via the pinned npx adapter
+//!   ([`intent_providers::PI_ACP_NPX_PACKAGE`]).
 //! - `droid` — ACP probe via a resolved `droid` binary
 //!   (`droid exec --output-format acp`), with auth-required detection.
 //! - `opencode` — native CLI: `opencode models`, one `provider/model` per
@@ -43,11 +43,6 @@ mod parse;
 mod probe;
 
 use probe::{run_acp_probe, AcpProbeCommand, ProbeError};
-
-/// Pinned npx package spec for the pi ACP adapter. Mirrors the FE pin
-/// (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`); bumping the version is a
-/// deliberate code change.
-pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.31";
 
 /// Timeout for the one-shot `opencode models` CLI invocation.
 const OPENCODE_CLI_TIMEOUT: Duration = Duration::from_secs(10);
@@ -269,7 +264,7 @@ pub async fn fetch_pi_models() -> ProviderModelsFetch {
             "npx not found; cannot run the pinned pi-acp adapter",
         );
     };
-    let cmd = AcpProbeCommand::npx(npx, PI_ACP_NPX_PACKAGE);
+    let cmd = AcpProbeCommand::npx(npx, intent_providers::PI_ACP_NPX_PACKAGE);
     finish(
         "pi",
         run_acp_probe(cmd, |v| parse::parse_acp_models(v, "pi")).await,
@@ -335,7 +330,7 @@ pub(crate) async fn probe_droid_auth(bin: PathBuf) -> Option<bool> {
 /// adapter.
 pub(crate) async fn probe_pi_auth() -> Option<bool> {
     let npx = find_npx()?;
-    let cmd = AcpProbeCommand::npx(npx, PI_ACP_NPX_PACKAGE);
+    let cmd = AcpProbeCommand::npx(npx, intent_providers::PI_ACP_NPX_PACKAGE);
     let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "pi")).await;
     match outcome {
         Ok(models) if !models.is_empty() => Some(true),

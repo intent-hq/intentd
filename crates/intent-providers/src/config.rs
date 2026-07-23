@@ -36,6 +36,12 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
 pub const CODEX_ACP_NPX_PACKAGE: &str = "@zed-industries/codex-acp@0.16.0";
 
+/// Pinned npx package spec the pi provider is ALWAYS spawned with (via
+/// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
+/// bumping the version is a deliberate code change. Also feeds the pi
+/// model-catalog probe in `intent-services::provider_models`.
+pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.31";
+
 /// The runtime a provider's subprocess executes on. Drives runtime-specific
 /// env assembly — V8-backed runtimes (`Node`, `Electron`) get a
 /// `--max-old-space-size` heap cap injected via `NODE_OPTIONS` (STAB-50);
@@ -279,6 +285,23 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
     },
     ProviderConfig {
+        runtime: ProviderRuntime::Node,
+        can_be_disabled: true,
+        // pi-acp (0.0.31) has no `_meta` system-prompt path and no rules/MCP
+        // CLI flags (it advertises `mcpCapabilities: { http: false, sse:
+        // false }` and does not wire `session/new` `mcpServers` into the pi
+        // process), so the assembled prompt is prepended on the first turn.
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // The adapter's `session/new` result advertises the model as a
+        // `configOptions[id="model"]` select; the stored model is applied
+        // post-session via `session/set_config_option` (verified against
+        // pi-acp@0.0.31's `setSessionConfigOption`; no CLI model flag).
+        supports_config_option_model: true,
+        login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
+        npx_only_package: Some(PI_ACP_NPX_PACKAGE),
+        ..ProviderConfig::empty("pi", "Pi", "pi-acp")
+    },
+    ProviderConfig {
         // Native binary (the `empty()` default): no V8 heap-cap env.
         base_args: &["exec", "--output-format", "acp"],
         model_flag: Some("--model"),
@@ -339,10 +362,34 @@ pub fn default_provider_id() -> &'static str {
     default_provider_config().id
 }
 
+/// Legacy aliases for the default provider that are expected to miss the
+/// registry and must not trigger the unknown-provider warning. Port of the
+/// suppression list in `getProviderConfig`.
+const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
+
 /// Resolve a provider by id, falling back to the default when unknown.
+/// Unknown ids warn (see [`warns_on_unknown_provider`]) so registry gaps
+/// surface in logs instead of silently spawning the default agent.
 /// Port of `getProviderConfig`.
 pub fn provider_config(provider_id: &str) -> &'static ProviderConfig {
-    find_provider(provider_id).unwrap_or_else(default_provider_config)
+    find_provider(provider_id).unwrap_or_else(|| {
+        let fallback = default_provider_config();
+        if warns_on_unknown_provider(provider_id) {
+            tracing::warn!(
+                provider_id = provider_id,
+                fallback_id = fallback.id,
+                "unknown provider id; falling back to default provider"
+            );
+        }
+        fallback
+    })
+}
+
+/// Whether an id missing from the registry should emit the unknown-provider
+/// warning: empty ids and legacy default aliases ([`DEFAULT_PROVIDER_ALIASES`])
+/// are expected fallbacks and stay silent.
+pub(crate) fn warns_on_unknown_provider(provider_id: &str) -> bool {
+    !provider_id.is_empty() && !DEFAULT_PROVIDER_ALIASES.contains(&provider_id)
 }
 
 /// All registered provider ids, in definition order. Port of `getAllProviderIds`.

@@ -185,7 +185,7 @@ fn pi_fetch() -> BoxFuture<'static, ModelFetchResult> {
 /// pi cache entries are keyed to the adapter pin (the probe always runs the
 /// pinned npx package).
 fn pi_version() -> String {
-    crate::provider_models::PI_ACP_NPX_PACKAGE.to_string()
+    intent_providers::PI_ACP_NPX_PACKAGE.to_string()
 }
 
 /// droid source: ACP probe via a resolved `droid` binary (no adapter pin).
