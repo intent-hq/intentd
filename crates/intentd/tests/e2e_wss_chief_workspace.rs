@@ -596,11 +596,12 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
         Path::new("/tmp"),
         "chief child must never spawn in /tmp"
     );
-    assert_ne!(
-        std::fs::canonicalize("/tmp").unwrap(),
-        actual,
-        "chief child must never spawn in the shared temp dir"
-    );
+    if let Ok(shared_tmp) = std::fs::canonicalize("/tmp") {
+        assert_ne!(
+            shared_tmp, actual,
+            "chief child must never spawn in the shared temp dir"
+        );
+    }
 
     // The dedicated cwd stays empty: nothing to index.
     let entries = std::fs::read_dir(&chief_cwd)

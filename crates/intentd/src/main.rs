@@ -700,8 +700,17 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
         // STAB-50: chief provider children spawn in the dedicated, empty
-        // `<data_dir>/chief-cwd` directory instead of `/tmp`.
-        .with_chief_cwd_root(intent_core::chief_cwd_root(&config.data_dir)),
+        // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
+        // startup (no chief child is live yet) so leftovers a provider
+        // scribbled into its cwd don't accumulate across daemon runs and
+        // get re-indexed.
+        .with_chief_cwd_root({
+            let root = intent_core::chief_cwd_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_chief_cwd(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "chief-cwd sweep failed");
+            }
+            root
+        }),
     );
     // Attach the manager to the services surface so the `agent.*` RPC handlers
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is

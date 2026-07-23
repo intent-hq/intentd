@@ -34,6 +34,28 @@ pub fn create_chief_cwd_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
+/// Remove any leftover contents of the chief spawn-cwd directory so chief
+/// children always start in an EMPTY directory. Providers may scribble into
+/// their cwd during a run; without a sweep those files would accumulate
+/// across daemon runs and be re-indexed by `--allow-indexing` providers —
+/// the same pressure the shared `/tmp` caused. The composition root calls
+/// this once at startup, before any chief child spawns, so nothing inside
+/// is live. A missing directory is a no-op.
+pub fn sweep_chief_cwd(dir: &Path) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +88,22 @@ mod tests {
             let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{} must be owner-only", path.display());
         }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn sweep_chief_cwd_empties_leftovers_and_tolerates_missing_dir() {
+        let base = std::env::temp_dir().join(format!("intentd-chief-cwd-{}", uuid::Uuid::new_v4()));
+        let dir = chief_cwd_root(&base);
+        // Missing dir is a no-op.
+        sweep_chief_cwd(&dir).unwrap();
+        create_chief_cwd_dir(&dir).unwrap();
+        std::fs::write(dir.join("leftover.txt"), b"scribble").unwrap();
+        std::fs::create_dir_all(dir.join("nested/deep")).unwrap();
+        std::fs::write(dir.join("nested/deep/file"), b"x").unwrap();
+        sweep_chief_cwd(&dir).unwrap();
+        assert!(dir.is_dir(), "dir itself survives the sweep");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "emptied");
         std::fs::remove_dir_all(&base).ok();
     }
 }
