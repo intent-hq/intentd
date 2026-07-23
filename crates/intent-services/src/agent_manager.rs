@@ -4549,6 +4549,14 @@ const PROMPT_FAILED_PREFIX: &str = "session/prompt failed:";
 /// shapes: the JSON-RPC `-32800` request-cancelled code (rendered as
 /// `JSON-RPC error -32800: …` by `intent-acp`'s `JsonRpcError` Display), or a
 /// provider resolving the prompt with a "cancelled" error message.
+///
+/// RPC-shaped errors anchor on the code alone (monorepo#518): Display appends
+/// the provider-controlled `error.data` payload after the message, and the
+/// two are indistinguishable once flattened — a terminal error whose data
+/// merely mentions "cancelled" must not be misclassified as benign. The ACP
+/// spec's only sanctioned cancel-error shape is code `-32800` (the message is
+/// free text there too). The "cancelled" substring heuristic remains for
+/// non-RPC renderings, which carry no data suffix.
 fn prompt_cancellation_error(err: &Error) -> bool {
     let Error::Internal(msg) = err else {
         return false;
@@ -4556,7 +4564,11 @@ fn prompt_cancellation_error(err: &Error) -> bool {
     let Some(inner) = msg.strip_prefix(PROMPT_FAILED_PREFIX) else {
         return false;
     };
-    inner.contains("-32800") || inner.to_ascii_lowercase().contains("cancelled")
+    if let Some(rest) = inner.trim_start().strip_prefix("JSON-RPC error ") {
+        let code = rest.split(':').next().unwrap_or("").trim();
+        return code == "-32800";
+    }
+    inner.to_ascii_lowercase().contains("cancelled")
 }
 
 /// Classify a [`AgentManager::run_turn`] error as benign (an expected outcome
@@ -5411,6 +5423,45 @@ mod turn_failure_tests {
             r#"session/prompt failed: JSON-RPC error -32800: Request cancelled: {"reason":"turn aborted"}"#
                 .to_string(),
         );
+        assert!(is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn terminal_rpc_error_with_cancelled_in_data_is_terminal() {
+        // monorepo#518 inverse case: a terminal provider error whose appended
+        // `data` detail merely mentions "cancelled" must NOT be misclassified
+        // as a benign cancel — it needs the full agent:failed / requeue /
+        // Retry surface.
+        let err = Error::Internal(
+            r#"session/prompt failed: JSON-RPC error -32603: Internal error: {"message":"stream cancelled by backend","codex_error_info":"other"}"#
+                .to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error -32603: Internal error: request cancelled upstream"
+                .to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn rpc_error_with_cancelled_message_but_non_cancel_code_is_terminal() {
+        // RPC-shaped errors anchor on the -32800 code alone: past the code,
+        // the rendered message/data suffix is provider-controlled free text
+        // (message and data are indistinguishable once flattened), so a
+        // "cancelled" mention there errs toward terminal by design.
+        let err = Error::Internal(
+            "session/prompt failed: JSON-RPC error -32603: task cancelled".to_string(),
+        );
+        assert!(!is_benign_turn_error(&err));
+    }
+
+    #[test]
+    fn non_rpc_cancelled_message_is_benign() {
+        // The second known cancel shape: a provider resolving the prompt with
+        // a plain "cancelled" error message. Non-RPC renderings carry no
+        // provider-controlled data suffix, so the substring match is safe.
+        let err = Error::Internal("session/prompt failed: prompt was cancelled".to_string());
         assert!(is_benign_turn_error(&err));
     }
 
