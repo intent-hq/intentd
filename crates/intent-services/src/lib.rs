@@ -4400,6 +4400,33 @@ fn skills_changed_event(workspace_id: &WorkspaceId) -> NewEvent {
     }
 }
 
+/// Bounded head/tail snippet of a client-supplied anchoring needle for the
+/// `comment.add` failure WARN: first/last 24 chars joined by `…`, or the whole
+/// string when it is short enough. Never logs full note-scale text, and the
+/// work/allocation is bounded too (only the edges are walked — no full
+/// collect, so an oversized client-supplied needle costs O(EDGE)). Edges are
+/// char-boundary safe; a grapheme cluster (combining marks, emoji ZWJ) may
+/// still be split cosmetically at the cut, which is acceptable for a log line.
+fn bounded_needle_snippet(s: &str) -> String {
+    const EDGE: usize = 24;
+    // Byte offset after the first EDGE chars; None when the string has no
+    // more than EDGE chars.
+    let head_end = s.char_indices().nth(EDGE).map(|(i, _)| i);
+    // Byte offset of the EDGE-th char from the end.
+    let tail_start = s
+        .char_indices()
+        .rev()
+        .nth(EDGE - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    match head_end {
+        Some(head_end) if head_end < tail_start => {
+            format!("{}…{}", &s[..head_end], &s[tail_start..])
+        }
+        _ => s.to_string(),
+    }
+}
+
 /// Build a `comment:added` change event with the self-sufficient payload
 /// `{ noteId, commentId }` (PROTOCOL §6.5; intentd carries the ids so a client
 /// can locate/fetch the new comment).
@@ -10391,6 +10418,13 @@ impl WorkspaceApi for Services {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let warn_note_id = note_id.clone();
+            // Bounded diagnostics captured BEFORE the params move into the
+            // idempotency closure: lengths + head/tail snippets (never the
+            // full text) so a failed add is reconstructable from the log.
+            let diag_ctx = bounded_needle_snippet(&search_context);
+            let diag_tgt = bounded_needle_snippet(&comment_target);
+            let diag_ctx_len = search_context.chars().count();
+            let diag_tgt_len = comment_target.chars().count();
             // Emission lives inside the idempotency scope so a replayed add
             // (same idempotencyKey) returns the cached result without a second
             // `comment:added` (design note TB-0 §5).
@@ -10521,6 +10555,10 @@ impl WorkspaceApi for Services {
                 tracing::warn!(
                     note_id = %warn_note_id.as_str(),
                     error = %e,
+                    search_context_len = diag_ctx_len,
+                    search_context = %diag_ctx,
+                    comment_target_len = diag_tgt_len,
+                    comment_target = %diag_tgt,
                     "comment.add failed"
                 );
             }

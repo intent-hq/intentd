@@ -1978,6 +1978,45 @@ async fn comment_add_context_not_found_is_invalid_params() {
     );
 }
 
+#[test]
+fn bounded_needle_snippet_bounds_long_needles() {
+    let short = "short needle";
+    assert_eq!(crate::bounded_needle_snippet(short), short);
+    let long = "a".repeat(30) + &"b".repeat(30);
+    let snippet = crate::bounded_needle_snippet(&long);
+    assert_eq!(snippet, format!("{}…{}", "a".repeat(24), "b".repeat(24)));
+    // Char-based edges: multi-byte input must not split codepoints.
+    let unicode = "é".repeat(60);
+    assert_eq!(
+        crate::bounded_needle_snippet(&unicode),
+        format!("{}…{}", "é".repeat(24), "é".repeat(24))
+    );
+}
+
+#[tokio::test]
+async fn comment_add_mention_at_prefixed_needle_anchors() {
+    // Round-4 repro: the FE needle carries `@KNOWN_ISSUES.md` (mention chip
+    // canonical text) where the markdown has the bare filename.
+    let (_tmp, svc, ws, id) =
+        setup("issue filed+closed; KNOWN_ISSUES.md was retired on main.").await;
+    let res = svc
+        .comment_add(
+            ws,
+            id,
+            "filed+closed; @KNOWN_ISSUES.md was retired".into(),
+            "@KNOWN_ISSUES.md was retired".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(res.anchored);
+    assert_eq!(res.location.anchored_text, "KNOWN_ISSUES.md was retired");
+}
+
 #[tokio::test]
 async fn comment_add_empty_target_is_invalid_params() {
     // Caret-only selections send an empty commentTarget.
