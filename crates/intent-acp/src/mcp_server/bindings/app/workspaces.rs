@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId};
+use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId, WorkspaceStatus};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
@@ -358,18 +358,23 @@ fn string_value(params: &serde_json::Map<String, Value>, key: &str) -> Option<St
         .map(str::to_string)
 }
 
-/// Strip a trailing `.git` suffix (case-insensitive).
+/// Strip a trailing `.git` suffix (case-insensitive). Compares bytes so
+/// non-ASCII input can't hit a char-boundary panic; an ASCII byte match
+/// guarantees the re-slice boundary is valid.
 fn strip_git_suffix(s: &str) -> &str {
-    if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(".git") {
+    if s.len() >= 4 && s.as_bytes()[s.len() - 4..].eq_ignore_ascii_case(b".git") {
         &s[..s.len() - 4]
     } else {
         s
     }
 }
 
-/// Case-insensitive prefix strip.
+/// Case-insensitive prefix strip. Compares bytes so non-ASCII input can't
+/// hit a char-boundary panic (prefixes are pure ASCII).
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    if s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    {
         Some(&s[prefix.len()..])
     } else {
         None
@@ -455,7 +460,7 @@ fn repository_to_local_path(repository: &str) -> Option<String> {
 fn parse_github_pr_or_issue_url(url: &str) -> Option<(String, Option<u64>)> {
     let rest = strip_prefix_ci(url.trim(), "https://")?;
     let (host, path) = rest.split_once('/')?;
-    if !host.eq_ignore_ascii_case("github.com") {
+    if !host.eq_ignore_ascii_case("github.com") && !host.eq_ignore_ascii_case("www.github.com") {
         return None;
     }
     let path = path.split(['?', '#']).next().unwrap_or("");
@@ -518,10 +523,6 @@ fn normalize_workspace_create_fields(
         string_value(params, "githubUrl").and_then(|s| parse_github_pr_or_issue_url(&s));
     let pr_url_parsed =
         string_value(params, "prUrl").and_then(|s| parse_github_pr_or_issue_url(&s));
-    let pr_number = github_url_parsed
-        .as_ref()
-        .and_then(|(_, n)| *n)
-        .or_else(|| pr_url_parsed.as_ref().and_then(|(_, n)| *n));
     let github_url = github_url_parsed
         .as_ref()
         .map(|(u, _)| u.clone())
@@ -529,6 +530,21 @@ fn normalize_workspace_create_fields(
         .or_else(|| repository.as_deref().and_then(repository_to_github_url))
         .or(owner_name_github_url)
         .or_else(|| pr_url_parsed.as_ref().map(|(u, _)| u.clone()));
+    // Only take `prUrl`'s number when its repo matches the resolved
+    // `githubUrl`, so an issues URL of repo A plus a pull URL of repo B
+    // can't yield a mismatched `(githubUrl, prNumber)` pair.
+    let pr_number = github_url_parsed
+        .as_ref()
+        .and_then(|(_, n)| *n)
+        .or_else(|| {
+            pr_url_parsed.as_ref().and_then(|(u, n)| {
+                if github_url.as_deref() == Some(u.as_str()) {
+                    *n
+                } else {
+                    None
+                }
+            })
+        });
 
     let repo_path = string_value(params, "repositoryPath")
         .or_else(|| string_value(params, "repoPath"))
@@ -540,11 +556,15 @@ fn normalize_workspace_create_fields(
             }
         });
 
+    // Intentional divergence from TS truthiness (`params.environmentConfig ?
+    // 'remote' : 'local'`): only object values count as an environment
+    // config, so `false` / `0` / `""` stay "local" here too.
     let repo_type = if github_url.is_some() {
         "github"
     } else if params
         .get("environmentConfig")
-        .is_some_and(|v| !v.is_null())
+        .and_then(Value::as_object)
+        .is_some()
     {
         "remote"
     } else {
@@ -637,10 +657,15 @@ async fn lookup_known_repo_local_path(
     let mut name_only = Vec::new();
     let mut basename_only = Vec::new();
     for ws in &workspaces {
+        // Skip deleted workspaces: their repositoryPath may no longer exist
+        // on disk (the FE lookup consults user-visible checkouts only).
+        if ws.status == WorkspaceStatus::Deleted {
+            continue;
+        }
         let Some(path) = ws.repository_path.as_deref().filter(|p| !p.is_empty()) else {
             continue;
         };
-        if path.contains("/.clones/") {
+        if path.contains("/.clones/") || path.contains("\\.clones\\") {
             continue;
         }
         let entry_owner = ws
@@ -729,19 +754,13 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         payload_params.insert("githubUrl".to_string(), json!(url));
     }
     if let Some(n) = fields.pr_number {
-        payload_params
-            .entry("prNumber".to_string())
-            .or_insert(json!(n));
+        payload_params.insert("prNumber".to_string(), json!(n));
     }
     if let Some(path) = &fields.repo_path {
-        payload_params
-            .entry("repositoryPath".to_string())
-            .or_insert(json!(path));
+        payload_params.insert("repositoryPath".to_string(), json!(path));
     }
     if let Some(path) = &fields.clone_path {
-        payload_params
-            .entry("clonePath".to_string())
-            .or_insert(json!(path));
+        payload_params.insert("clonePath".to_string(), json!(path));
     }
 
     let proposal = json!({
@@ -1605,6 +1624,130 @@ mod tests {
         );
         assert_eq!(repository_to_github_url("/local/path"), None);
         assert_eq!(repository_to_github_url("just-a-name"), None);
+    }
+
+    #[tokio::test]
+    async fn test_create_non_ascii_github_url_does_not_panic() {
+        // Regression: strip_prefix_ci used to slice at a byte offset that
+        // could split a multi-byte char ("aaaaaaa€rest"[..8] panics).
+        let proposal = create_proposal(json!({ "githubUrl": "aaaaaaa\u{20AC}rest" })).await;
+        let fields = preview_fields(&proposal);
+        // Falls through as an opaque githubUrl string, no panic.
+        assert_eq!(
+            fields.get("githubUrl").unwrap().as_str().unwrap(),
+            "aaaaaaa\u{20AC}rest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_non_ascii_repository_does_not_panic() {
+        // Regression: strip_git_suffix used to slice s[s.len()-4..] which
+        // panics on "€€" (4 bytes, boundary at 2).
+        let proposal = create_proposal(json!({ "repository": "\u{20AC}\u{20AC}" })).await;
+        let fields = preview_fields(&proposal);
+        assert!(fields.get("githubUrl").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_www_github_pull_url_normalized() {
+        let proposal = create_proposal(json!({
+            "githubUrl": "https://www.github.com/o/r/pull/7"
+        }))
+        .await;
+        let fields = preview_fields(&proposal);
+        assert_eq!(
+            fields.get("githubUrl").unwrap().as_str().unwrap(),
+            "https://github.com/o/r"
+        );
+        assert_eq!(fields.get("prNumber").unwrap().as_u64().unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_create_caller_pr_number_overridden_by_derived() {
+        // Payload must agree with the preview: a caller-supplied prNumber is
+        // replaced by the URL-derived one.
+        let proposal = create_proposal(json!({
+            "githubUrl": "https://github.com/o/r/pull/123",
+            "prNumber": 999
+        }))
+        .await;
+        assert_eq!(
+            preview_fields(&proposal)
+                .get("prNumber")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            123
+        );
+        assert_eq!(
+            payload_params(&proposal)
+                .get("prNumber")
+                .unwrap()
+                .as_u64()
+                .unwrap(),
+            123
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_foreign_pr_url_number_not_mixed_with_other_repo() {
+        // githubUrl resolves to repo A; prUrl points at repo B. The PR
+        // number must not be attached to repo A.
+        let proposal = create_proposal(json!({
+            "githubUrl": "https://github.com/a/a/issues/1",
+            "prUrl": "https://github.com/b/b/pull/2"
+        }))
+        .await;
+        let fields = preview_fields(&proposal);
+        assert_eq!(
+            fields.get("githubUrl").unwrap().as_str().unwrap(),
+            "https://github.com/a/a"
+        );
+        assert!(fields.get("prNumber").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_environment_config_non_object_stays_local() {
+        let proposal = create_proposal(json!({ "environmentConfig": false })).await;
+        let fields = preview_fields(&proposal);
+        assert_eq!(fields.get("repoType").unwrap().as_str().unwrap(), "local");
+    }
+
+    #[tokio::test]
+    async fn test_create_shorthand_repository_coexists_with_derived_github_url() {
+        // Payload keeps the original `repository` param alongside the
+        // derived githubUrl.
+        let proposal = create_proposal(json!({ "repository": "octo/repo" })).await;
+        let params = payload_params(&proposal);
+        assert_eq!(
+            params.get("repository").unwrap().as_str().unwrap(),
+            "octo/repo"
+        );
+        assert_eq!(
+            params.get("githubUrl").unwrap().as_str().unwrap(),
+            "https://github.com/octo/repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_hydration_skips_deleted_workspaces() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            let mut ws = make_workspace("ws-1", "Deleted");
+            ws.status = WorkspaceStatus::Deleted;
+            workspaces.push(ws);
+        }
+
+        let proposal = create_proposal_with(
+            fake,
+            json!({ "githubUrl": "https://github.com/owner/repo" }),
+        )
+        .await;
+
+        let fields = preview_fields(&proposal);
+        assert!(fields.get("repoPath").is_none());
+        assert!(fields.get("clonePath").is_none());
     }
 
     #[tokio::test]
