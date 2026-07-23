@@ -27,6 +27,8 @@
 //! fails. This is the realistic "best-effort/local" form: CI does not provision
 //! auggie credentials, so the gated path simply does not run there.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -97,9 +99,7 @@ async fn auggie_context_engine_real_retrieve_e2e() {
         .await
         .expect("insert workspace");
     let svc = Services::new(store)
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_context_engine(std::sync::Arc::new(engine));
 
     eprintln!(

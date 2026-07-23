@@ -13,6 +13,8 @@
 //!   `delete` on `__chief__` are safe no-ops that return the synthesized shape
 //!   (or `success: true` for delete) — the seeded row is never mutated.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,9 +53,8 @@ async fn chief_workspace_over_uds() {
     // test only exercises the Chief-only slice.
     let store = Store::open(&config.db_path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-    ));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = tokio::spawn(async move {

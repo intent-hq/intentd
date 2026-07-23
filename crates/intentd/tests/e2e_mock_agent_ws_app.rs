@@ -9,6 +9,8 @@
 //!
 //! Pattern: reuses the harness from e2e_mock_agent_workspace_api_bindings.rs.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -91,9 +93,7 @@ async fn chief_agent_ws_app_workspaces_list() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     // Seed 2+ user workspaces
@@ -257,9 +257,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     // Create a chief-workspace agent
@@ -401,9 +399,7 @@ async fn non_chief_agent_ws_app_gating_error() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     // Create a regular (non-chief) workspace

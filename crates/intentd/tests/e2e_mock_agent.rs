@@ -11,6 +11,8 @@
 //! Gated by `MOCK_AGENT_SCRIPT_PATH` (the CI ACP gate); skips cleanly when the
 //! script or `node` is absent.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -88,9 +90,7 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();

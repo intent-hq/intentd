@@ -1,6 +1,8 @@
 //! End-to-end UDS slice test: seed via the store, then drive the daemon as a
 //! JSON-RPC client over a temp Unix-domain socket (§5.7 DoD).
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,9 +138,7 @@ async fn uds_slice_end_to_end() {
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             // Keep the (y) github.* section hermetic: `github.connect` must
             // deterministically fail fast (port 0 is never a valid
             // destination), never touch the real github.com.

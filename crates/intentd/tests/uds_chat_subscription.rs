@@ -9,6 +9,8 @@
 //! and asserted to equal a fresh `agent.getConversation` snapshot (the
 //! reconciliation invariant).
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,9 +93,7 @@ async fn boot(
     // server is handed the same handle coerced to `Arc<dyn WorkspaceApi>`).
     let services = Arc::new(
         Services::new(bus.store().clone())
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone()),
     );
     let api: Arc<dyn intent_core::WorkspaceApi> = services.clone();

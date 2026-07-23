@@ -5,6 +5,8 @@
 //! (< 2s), proving the single-writer/read pool split (fix/sqlite-pool-contention)
 //! prevents pool exhaustion and `database is locked` errors.
 
+mod common;
+
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;

@@ -199,9 +199,8 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let ws = WorkspaceId::new();
     let note_id = {
         let store = Store::open(&db_path).await.expect("open store");
-        let services = Services::new(store.clone()).with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        );
+        let services =
+            Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
         store
             .insert_workspace(&workspace(&ws))
             .await

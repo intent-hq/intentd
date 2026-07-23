@@ -10,6 +10,8 @@
 //!
 //! Pattern: modeled after `tests/e2e_mock_agent.rs` single-turn execution.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -93,9 +95,7 @@ async fn task_bindings_update_status_and_get() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();
@@ -231,9 +231,7 @@ async fn comment_bindings_add_and_list() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     let ws = WorkspaceId::new();

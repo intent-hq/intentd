@@ -2,6 +2,8 @@
 //!
 //! Tests token generation/rotation and config resolution WITHOUT spawning a daemon.
 
+mod common;
+
 use intent_core::Config;
 use intent_transport::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore};
 use std::sync::{Arc, Mutex};

@@ -4,6 +4,8 @@
 //! `{ added, updated, removedIds }` deltas mapped from bus change events via the
 //! re-read strategy (PROTOCOL §6, TB-0 §2/§3).
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,9 +119,7 @@ async fn boot(bus: &EventBus) -> (PathBuf, tokio::task::JoinHandle<()>, oneshot:
     let socket = std::env::temp_dir().join(format!("intentd-uds-{}.sock", Uuid::new_v4()));
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
         Services::new(bus.store().clone())
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone()),
     );
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

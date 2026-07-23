@@ -7,6 +7,8 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
+mod common;
+
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 use std::path::Path;
 use std::sync::{Arc, Mutex};

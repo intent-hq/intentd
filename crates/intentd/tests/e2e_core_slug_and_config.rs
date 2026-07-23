@@ -3,6 +3,8 @@
 //! Calls Services directly to exercise slug generation (extract_local_slug,
 //! generate_workspace_slug) and config parsing WITHOUT spawning a daemon.
 
+mod common;
+
 use intent_core::{Config, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent};
 use intent_services::Services;
 use intent_store::Store;

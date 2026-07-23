@@ -14,6 +14,8 @@
 //! an in-process shortcut — it exercises the same wire path production agents
 //! use to rename their workspace on the first turn.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -92,9 +94,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
-        .with_workspaces_root(
-            std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-        )
+        .with_workspaces_root(common::hermetic_workspaces_root())
         .with_event_bus(bus.clone());
 
     // A fresh workspace whose title still matches its id — the initial-agent

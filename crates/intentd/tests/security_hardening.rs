@@ -12,6 +12,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -55,9 +57,8 @@ async fn uds_socket_is_owner_only_0600() {
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-    ));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_task = socket.clone();
@@ -98,9 +99,8 @@ async fn uds_oversized_line_rejected_and_connection_closed() {
         .await
         .expect("open store");
     let bus = EventBus::new(store.clone());
-    let services: Arc<dyn WorkspaceApi> = Arc::new(Services::new(store).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-    ));
+    let services: Arc<dyn WorkspaceApi> =
+        Arc::new(Services::new(store).with_workspaces_root(common::hermetic_workspaces_root()));
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_task = socket.clone();

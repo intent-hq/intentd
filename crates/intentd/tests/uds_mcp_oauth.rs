@@ -5,6 +5,8 @@
 //! presence-only. Uses a dummy bag literal so tests can assert its absence
 //! from every response frame.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,9 +110,7 @@ async fn mcp_oauth_round_trip_never_echoes_bag_and_validates_params() {
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone()),
     );
     // Shortened prefix so the full path stays under the macOS UDS 104-char cap.

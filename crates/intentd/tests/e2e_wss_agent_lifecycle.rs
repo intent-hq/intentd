@@ -2766,9 +2766,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
-    let services = Services::new(store.clone()).with_workspaces_root(
-        std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-    );
+    let services =
+        Services::new(store.clone()).with_workspaces_root(common::hermetic_workspaces_root());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))

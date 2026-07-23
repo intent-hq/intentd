@@ -4,6 +4,8 @@
 //! file-sourced (`CLAUDE.md`) entry, and that an edit surfaces via
 //! `settings:changed` carrying the `endUserRules` payload (no extra fetch).
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,9 +151,7 @@ async fn rules_round_trip_overrides_files_and_event() {
     let bus = EventBus::new(store.clone());
     let services: Arc<dyn WorkspaceApi> = Arc::new(
         Services::new(store)
-            .with_workspaces_root(
-                std::env::temp_dir().join(format!("itd-hermetic-ws-{}", uuid::Uuid::new_v4())),
-            )
+            .with_workspaces_root(common::hermetic_workspaces_root())
             .with_event_bus(bus.clone()),
     );
     // Keep the socket name short — the macOS AF_UNIX path limit is ~104 bytes.
