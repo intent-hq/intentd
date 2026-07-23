@@ -3864,12 +3864,12 @@ fn cleanup_detached_worktree(trash: &Path) {
 /// moved the checkout to a `*.deleting-*` sibling trash path) and the
 /// unlocked recursive removal, the trash directory leaks — the workspace row
 /// is already deleted so nothing retries. Scans one level of workspace dirs
-/// under `root` (`<root>/<wsId>/`) for entries whose name matches the
-/// [`detached_trash_path`](intent_git::worktree) pattern, recursively removes
-/// each, then best-effort `remove_dir`s the (empty-only) parent workspace
-/// dir. Best-effort throughout: per-entry failures are logged and never abort
-/// the sweep. A missing root is a silent no-op. Returns the number of trash
-/// dirs removed.
+/// under `root` (`<root>/<wsId>/`) for directory entries whose name contains
+/// `.deleting-` — produced only by `detached_trash_path` in
+/// `intent-git::worktree` — recursively removes each, then best-effort
+/// `remove_dir`s the (empty-only) parent workspace dir. Best-effort
+/// throughout: per-entry failures are logged and never abort the sweep. A
+/// missing root is a silent no-op. Returns the number of trash dirs removed.
 fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -3884,7 +3884,18 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
         }
     };
     let mut removed = 0;
-    for ws_entry in entries.flatten() {
+    for ws_entry in entries {
+        let ws_entry = match ws_entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    root = %root.display(),
+                    "orphaned trash sweep: failed to read a workspaces-root entry"
+                );
+                continue;
+            }
+        };
         if !ws_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -3901,7 +3912,18 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
             }
         };
         let mut swept_any = false;
-        for child in children.flatten() {
+        for child in children {
+            let child = match child {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %ws_dir.display(),
+                        "orphaned trash sweep: failed to read a workspace-dir entry"
+                    );
+                    continue;
+                }
+            };
             // Conservative match: only `detached_trash_path` produces names
             // containing `.deleting-`, and it only ever renames directories.
             // Everything else (live worktrees, `.workspace` metadata, clone
@@ -3941,13 +3963,13 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
     removed
 }
 
-/// Startup sweep entry point for [`sweep_orphaned_worktree_trash`]
-/// (monorepo#473). Resolves the workspaces root the same way the
-/// `workspace.*` operations do (injected root, else
-/// [`default_workspaces_root`]) and runs the potentially multi-GB removal on
-/// the blocking pool. Best-effort: a failed (or panicked) sweep task is
-/// logged and reported as 0 removals.
 impl Services {
+    /// Startup sweep entry point for [`sweep_orphaned_worktree_trash`]
+    /// (monorepo#473). Resolves the workspaces root the same way the
+    /// `workspace.*` operations do (injected root, else
+    /// [`default_workspaces_root`]) and runs the potentially multi-GB removal
+    /// on the blocking pool. Best-effort: a failed (or panicked) sweep task
+    /// is logged and reported as 0 removals.
     pub async fn sweep_orphaned_worktree_trash(&self) -> usize {
         let root = self.workspaces_root.clone();
         let task = tokio::task::spawn_blocking(move || {

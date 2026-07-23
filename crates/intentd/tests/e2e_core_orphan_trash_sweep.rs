@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -56,19 +55,6 @@ fn spawn_daemon(dirs: &TestDirs) -> Child {
         .expect("spawn intentd serve")
 }
 
-async fn await_socket(socket: &Path) -> bool {
-    timeout(common::daemon_startup_timeout(), async {
-        loop {
-            if UnixStream::connect(socket).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .is_ok()
-}
-
 /// Poll until `path` no longer exists, bounded by the shared startup budget
 /// (the sweep runs as a background task after the socket is ready).
 async fn await_removed(path: &Path) -> bool {
@@ -107,8 +93,9 @@ async fn startup_sweep_removes_orphaned_trash_dirs_only() {
     std::fs::write(live_dir.join("keep.txt"), "keep").expect("seed live file");
 
     let socket = dirs.data_dir.join("intentd.sock");
-    let _daemon = common::DaemonGuard::new(spawn_daemon(&dirs), dirs.base.clone(), true);
-    assert!(await_socket(&socket).await, "daemon did not start");
+    let log_path = dirs.data_dir.join("daemon.log");
+    let mut daemon = common::DaemonGuard::new(spawn_daemon(&dirs), dirs.base.clone(), true);
+    common::await_daemon_listening(daemon.child_mut(), &socket, &log_path).await;
 
     assert!(
         await_removed(&orphan_trash).await,
