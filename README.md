@@ -211,9 +211,29 @@ version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
   stable) with the version to promote; it validates that the release exists and updates
   the stable channel manifest to point at it.
 
-To cut a release: bump `version` in `crates/intentd/Cargo.toml` to the release version
-via a normal PR (branch protection requires it); once that PR merges, push the tag
-pointing at the merged `main` commit.
+### Cutting a release
+
+Versioning is automated by [release-plz](https://release-plz.dev) in Release-PR mode
+(`release-plz.toml` + `.github/workflows/release-plz.yml`):
+
+1. On every push to `main`, release-plz computes the next semver from the conventional
+   commits since the last tag (0.x rules: breaking → minor, `feat`/`fix` → patch) and
+   opens or updates a **Release PR** that bumps `version` in `crates/intentd/Cargo.toml`
+   and updates `CHANGELOG.md`.
+2. **Merging the Release PR cuts the release**: release-plz pushes the `vX.Y.Z` tag,
+   which triggers the cargo-dist `release.yml` pipeline above. Release timing stays
+   human-controlled — merge the Release PR when you want to ship.
+
+Because PRs are squash-merged, only the PR title survives as the commit title on
+`main`. **Breaking changes must be signaled with `!` in the PR title** (e.g.
+`feat!: drop the legacy memories RPC`); a `BREAKING CHANGE:` footer buried in the
+squashed body is not a reliable signal.
+
+The workflow authenticates with the `RELEASE_PLZ_TOKEN` repository secret — a PAT with
+`contents` and `pull-requests` write access. It must be a PAT (not the default
+`GITHUB_TOKEN`) because tags pushed with `GITHUB_TOKEN` do not trigger other workflows,
+and the `vX.Y.Z` tag has to fire `release.yml`. Provisioning/rotating this secret is a
+manual step (repo Settings → Secrets and variables → Actions).
 
 ### Channel manifests
 

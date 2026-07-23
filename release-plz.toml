@@ -1,0 +1,64 @@
+# release-plz configuration — https://release-plz.dev/docs/config
+#
+# Release-PR mode: on every push to main, release-plz opens/updates a Release PR
+# that bumps `crates/intentd/Cargo.toml` and updates CHANGELOG.md based on
+# conventional commits. Merging that PR makes release-plz push the `vX.Y.Z` tag,
+# which triggers the existing cargo-dist release.yml unchanged.
+
+[workspace]
+# Library crates are internal and never released; only the intentd binary
+# crate (opted in below) is versioned and tagged.
+release = false
+
+[[package]]
+name = "intentd"
+release = true
+# No crates.io publishing — releases are git-tag-only: versions are determined
+# from git tags matching git_tag_name, never from the cargo registry.
+publish = false
+git_only = true
+# cargo-dist (release.yml) owns the GitHub Release; release-plz only tags.
+git_release_enable = false
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_update = true
+# Keep the changelog at the repository root rather than crates/intentd/.
+changelog_path = "./CHANGELOG.md"
+
+# Changelog rendering aligned with the monorepo cliff.toml conventions
+# (same groups and body layout; release-plz runs git-cliff under the hood).
+[changelog]
+header = """
+# Changelog\n
+All notable changes to this project will be documented in this file.\n
+"""
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | upper_first }}\
+    {% endfor %}
+{% endfor %}\n
+"""
+trim = true
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->🚀 Features" },
+    { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+    { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+    { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+    { message = "^refactor", group = "<!-- 2 -->🔧 Refactor" },
+    { message = "^style", group = "<!-- 5 -->🎨 Styling" },
+    { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+    { body = ".*security", group = "<!-- 8 -->🛡️ Security" },
+]
+protect_breaking_commits = false
+sort_commits = "oldest"
