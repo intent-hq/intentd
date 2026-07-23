@@ -12,9 +12,9 @@
 //!   `<specialist_role>` section) BEFORE the role reminder and user content.
 //! * Turn 2 (same session) does NOT repeat the block.
 //!
-//! SessionMeta note: the `_meta` mechanism (claude-code / codex) is keyed off
-//! the provider ID in `build_session_meta`, and the mock provider cannot be
-//! spawned under either of those IDs (spawn resolution and binary lookup are
+//! SessionMeta note: the `_meta` mechanism (claude-code) is keyed off the
+//! provider ID in `build_session_meta`, and the mock provider cannot be
+//! spawned under that ID (spawn resolution and binary lookup are
 //! provider-ID-keyed). The `_meta` payload shapes are covered by the unit
 //! suites in `intent-services/src/agent_session/tests_meta.rs` and
 //! `intent-acp/src/tests.rs` instead.

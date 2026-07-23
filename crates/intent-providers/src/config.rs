@@ -34,7 +34,7 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// Pinned npx package spec for the codex ACP fallback. Matches the
 /// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
 /// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@zed-industries/codex-acp@0.16.0";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.7";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
@@ -62,11 +62,11 @@ pub enum ProviderRuntime {
 pub enum InjectionMechanism {
     /// CLI flag pointing to a rules file (e.g. `--rules`, `--append-system-prompt-file`).
     RulesFileFlag,
-    /// ACP `session/new` / `session/load` `_meta` field (claude-code, codex).
+    /// ACP `session/new` / `session/load` `_meta` field (claude-code).
     SessionMeta,
     /// Environment variable config (opencode: `OPENCODE_CONFIG_CONTENT` with `instructions`).
     EnvConfig,
-    /// First-turn prepend in a `<system>` block (cortex, mock — fallback).
+    /// First-turn prepend in a `<system>` block (codex, cortex, pi, grok, mock — fallback).
     FirstTurnPrepend,
     /// No injection mechanism (provider doesn't support system prompts).
     None,
@@ -256,7 +256,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         // Rust binary — Native (the `empty()` default): no V8 heap-cap env.
         can_be_disabled: true,
-        injection_mechanism: InjectionMechanism::SessionMeta,
+        // The pinned @agentclientprotocol/codex-acp adapter (1.1.7) ignores
+        // `_meta.developerInstructions` (verified empirically, #479), so the
+        // system prompt is delivered via the first-turn `<system>` prepend
+        // instead of SessionMeta.
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         // codex-acp folds `session/new` `mcpServers` (stdio + http) into its
         // session config (`build_session_config`), so the workspace bridge
         // rides the ACP request rather than `-c mcp_servers.*` overrides.

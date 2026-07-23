@@ -625,8 +625,8 @@ mod build_command_tests {
             .expect("codex should have fallback_npx_package configured");
         assert_eq!(pkg, intent_providers::config::CODEX_ACP_NPX_PACKAGE);
         assert!(
-            pkg.starts_with("@zed-industries/codex-acp@"),
-            "codex npx fallback should use the @zed-industries package, got: {pkg}"
+            pkg.starts_with("@agentclientprotocol/codex-acp@"),
+            "codex npx fallback should use the @agentclientprotocol package, got: {pkg}"
         );
         let version = pkg.rsplit('@').next().unwrap();
         let parts: Vec<&str> = version.split('.').collect();
