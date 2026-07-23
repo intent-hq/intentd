@@ -13915,6 +13915,7 @@ impl WorkspaceApi for Services {
                         head,
                         author: None,
                         involvement: None,
+                        search: None,
                         limit: Some(limit),
                         cursor,
                     },
@@ -13929,21 +13930,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
         repo: String,
         filter: Option<String>,
         state: Option<String>,
+        query: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
+            let search = github_ops::normalize_search_query(query);
             // Search defaults to open PRs (FE `searchGitHubPullRequests`); a
-            // `filter:"all"` carries no involvement constraint and so degrades
-            // to the plain `github.pulls.list` listing the engine performs.
+            // `filter:"all"` with no free-text `query` carries no constraint
+            // and so degrades to the plain `github.pulls.list` listing the
+            // engine performs, while involvement and/or free text route
+            // through `GET /search/issues`.
             let state = match state {
                 Some(s) => github_ops::parse_pr_state(Some(s.as_str()))?,
                 None => Some(intent_sourcecontrol::PrState::Open),
@@ -13961,6 +13967,7 @@ impl WorkspaceApi for Services {
                         head: None,
                         author: None,
                         involvement,
+                        search,
                         limit: Some(limit),
                         cursor,
                     },
@@ -14108,6 +14115,7 @@ impl WorkspaceApi for Services {
                     intent_sourcecontrol::IssueQuery {
                         state: Some(state),
                         labels,
+                        search: None,
                         limit: Some(limit),
                         cursor,
                     },
@@ -14133,17 +14141,20 @@ impl WorkspaceApi for Services {
         repo: String,
         filter: Option<String>,
         state: Option<String>,
+        query: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
             // Validate `filter` against the FE value set. The host-agnostic
-            // engine has no `/search/issues` capability for issues, so `@me`
-            // involvement cannot be expressed; the search degrades to the
-            // engine's repo-issue listing filtered by state (v1 limitation —
-            // full involvement search needs an engine `search_issues` method).
+            // engine cannot express `@me` involvement for issues (v1
+            // limitation — that needs an involvement clause on `IssueQuery`);
+            // a free-text `query` routes through the engine's
+            // `GET /search/issues` path, and without one the search degrades
+            // to the repo-issue listing filtered by state.
             let _ = github_ops::parse_pr_involvement(filter.as_deref())?;
+            let search = github_ops::normalize_search_query(query);
             let state = match state {
                 Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,
                 None => "open".to_string(),
@@ -14158,6 +14169,7 @@ impl WorkspaceApi for Services {
                     intent_sourcecontrol::IssueQuery {
                         state: Some(state),
                         labels: None,
+                        search,
                         limit: Some(limit),
                         cursor,
                     },

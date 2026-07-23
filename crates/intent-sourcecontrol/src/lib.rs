@@ -179,6 +179,7 @@ pub trait SourceControl: Send + Sync {
     async fn get_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue>;
 
     /// List issues matching `query` (PRs excluded), one §5.5 page at a time (the
-    /// page cursor / size travel in `query`). Backs `github.issues.list/search`.
+    /// page cursor / size travel in `query`). A free-text `query.search` routes
+    /// through `GET /search/issues`. Backs `github.issues.list/search`.
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>>;
 }

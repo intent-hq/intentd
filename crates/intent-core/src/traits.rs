@@ -3015,17 +3015,19 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `github.pulls.search`: `GET /search/issues` (`is:pr` + `@me`
-    /// involvement) → `{ pulls, nextToken }`.
+    /// involvement + free-text `query`) → `{ pulls, nextToken }`.
+    #[allow(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
         repo: String,
         filter: Option<String>,
         state: Option<String>,
+        query: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, limit, next_token);
+        let _ = (owner, repo, filter, state, query, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_pulls_search not implemented".to_string(),
@@ -3145,18 +3147,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `github.issues.search`: `GET /search/issues` (`is:issue`) →
-    /// `{ issues, nextToken }`.
+    /// `github.issues.search`: `GET /search/issues` (`is:issue` + free-text
+    /// `query`) → `{ issues, nextToken }`.
+    #[allow(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
         repo: String,
         filter: Option<String>,
         state: Option<String>,
+        query: Option<String>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (owner, repo, filter, state, limit, next_token);
+        let _ = (owner, repo, filter, state, query, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::github_issues_search not implemented".to_string(),
