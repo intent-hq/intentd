@@ -540,6 +540,11 @@ mod tests {
     /// Generous deadline so the real-PTY tests stay green under loaded CI.
     const TIMEOUT: Duration = Duration::from_secs(8);
 
+    /// Extra-generous deadline for awaiting a child's natural exit under
+    /// full-suite load (monorepo#573): it bounds only how long a *failure*
+    /// takes to surface, never how long a passing run waits.
+    const LONG_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// A temp SQLite path cleaned up on drop (mirrors `events::bus_tests`).
     struct TempDb {
         path: PathBuf,
@@ -1331,34 +1336,53 @@ mod tests {
 
     // ---- ACP `PtyTerminalHost` adapter ----
 
+    /// ACP terminal create → output → wait_for_exit happy path.
+    ///
+    /// Load-independent (monorepo#573): the child prints the marker and then
+    /// stays alive (`exec cat`) until the test has *observed* the output, so
+    /// the host's reader thread can never lose the race where a fast-exiting
+    /// child closes the PTY slave before the first `read()` and macOS discards
+    /// the buffered output. Only then does the test send canonical-mode EOF
+    /// (`^D`) so `cat` — and thus the child — exits 0 naturally, awaited with
+    /// a generous bounded deadline.
     #[tokio::test]
     async fn acp_create_output_and_wait_for_exit() {
         let pty = host();
         let adapter = PtyTerminalHost::new(pty.clone());
         let params = TerminalCreateParams {
             session_id: "sess-1".to_string(),
-            command: "echo".to_string(),
-            args: vec!["acp-output".to_string()],
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'acp-output\\n'; exec cat".to_string(),
+            ],
             env: Vec::new(),
             cwd: None,
             output_byte_limit: None,
         };
         let id = adapter.create(params).await.unwrap();
-        assert!(PtyId::parse(&id).is_some());
+        let pty_id = PtyId::parse(&id).expect("wire id parses");
 
-        let mut found = false;
-        let deadline = Instant::now() + TIMEOUT;
-        while Instant::now() < deadline {
+        let deadline = Instant::now() + LONG_TIMEOUT;
+        loop {
             let info = adapter.output(id.clone()).await.unwrap();
             if info.output.contains("acp-output") {
-                found = true;
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "ACP output must surface the child's stdout; got: {:?}",
+                info.output
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(found, "ACP output must surface the child's stdout");
 
-        let exit = adapter.wait_for_exit(id).await.unwrap();
+        pty.write(pty_id, b"\x04").unwrap();
+
+        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id))
+            .await
+            .expect("child exits within the generous deadline")
+            .unwrap();
         assert_eq!(exit.exit_code, Some(0));
         assert!(exit.signal.is_none());
     }

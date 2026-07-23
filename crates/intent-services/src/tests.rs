@@ -8871,50 +8871,46 @@ mod script {
         assert_eq!(out, Value::String("No output yet.".to_string()));
     }
 
-    /// A service that exits faster than the 2s floor is treated as a config error
-    /// and is NOT auto-restarted (the ported backoff guard).
+    /// A service that exits faster than the too-fast floor is treated as a
+    /// config error and is NOT auto-restarted (the ported backoff guard).
     ///
-    /// Deterministic against scheduling jitter: after observing `exited`, keep
-    /// draining `script:state` events across a window that comfortably exceeds
-    /// `AUTO_RESTART_DELAY` and assert no second `running` arrives. A spurious
-    /// restart shows up as an event (failure with a clear message) rather than
-    /// hiding behind a wall-clock poll.
+    /// Load-independent (monorepo#514): the floor is raised far above any
+    /// plausible scheduling stall so the supervisor's wall-clock measurement of
+    /// the `echo` run can never legitimately cross it, and the test awaits the
+    /// supervisor's *positive* "Exited too quickly" separator (emitted right
+    /// before it stops supervising) instead of watching a fixed window for the
+    /// absence of a restart. A spurious restart still fails fast: the restart
+    /// separator or a `running` state with `restartCount` >= 1 would arrive
+    /// before the too-fast separator ever could.
     #[tokio::test]
     async fn service_too_fast_exit_does_not_restart() {
-        let h = harness().await;
+        let mut h = harness().await;
+        h.services = h.services.with_script_too_fast_ms(10 * 60 * 1000);
         let mut sub = subscribe(&h);
         let id = create(&h, "boom", "echo boom", ScriptMode::Service).await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(5), |v| {
-            (v["type"] == "script:state" && v["data"]["status"] == "exited").then_some(())
+        drain_until(&mut sub, Duration::from_secs(60), |v| {
+            if v["type"] == "script:state"
+                && v["data"]["status"] == "running"
+                && v["data"]["restartCount"].as_i64().unwrap_or(0) >= 1
+            {
+                panic!(
+                    "too-fast-exit service must NOT auto-restart; saw restarted `running` script:state: {v}",
+                );
+            }
+            if v["type"] == "script:output" {
+                let chunk = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
+                if contains(&chunk, b"Restarting (attempt") {
+                    panic!("too-fast-exit service must NOT auto-restart; saw restart separator");
+                }
+                return contains(&chunk, b"Exited too quickly").then_some(());
+            }
+            None
         })
         .await;
-        // Observation window > AUTO_RESTART_DELAY (1s) so any restart attempt
-        // emits a `running` `script:state` we'd catch deterministically.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(3000);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, sub.recv()).await {
-                Err(_) => break,
-                Ok(None) => break,
-                Ok(Some(batch)) => {
-                    for ev in &batch {
-                        let v = serde_json::to_value(ev).expect("serialize");
-                        if v["type"] == "script:state" && v["data"]["status"] == "running" {
-                            panic!(
-                                "too-fast-exit service must NOT auto-restart; saw second `running` script:state: {v}",
-                            );
-                        }
-                    }
-                }
-            }
-        }
         let st = h
             .services
             .script_status(h.ws.clone(), id)
