@@ -155,6 +155,42 @@ fn prompt_updates_with_tool_result() -> Vec<String> {
     vec![chunk, tool_call, tool_done]
 }
 
+/// A prompt turn whose tool completes with an MCP content-item array output
+/// carrying a proposal-MIME resource item — exercises the standalone
+/// proposal-resource block extraction (§7.1).
+fn prompt_updates_with_proposal_resource() -> Vec<String> {
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "workspace_api", "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "ws.app.proposal.show(p)" } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed",
+                "rawOutput": [
+                    { "type": "text", "text": "Proposal shown" },
+                    { "type": "resource", "resource": {
+                        "uri": "intent-proposal://settings-change/Update",
+                        "name": "Update",
+                        "mimeType": "application/vnd.intent.proposal+json",
+                        "text": "{\"kind\":\"settings-change\"}" } }
+                ] }
+        }
+    })
+    .to_string();
+    vec![tool_call, tool_done]
+}
+
 /// A prompt turn whose FIRST update is a stale `tool_call_update` for a
 /// toolCallId this turn never saw (the shape a cancelled child emits after an
 /// interrupt: no title, no rawInput → derived name ""), followed by a real
@@ -715,6 +751,60 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     assert_eq!(
         tool_events[1].data["output"],
         json!({ "summary": "12 passed" })
+    );
+}
+
+/// A tool completing with a proposal-MIME resource item in its output array
+/// persists the `tool_result` (output unchanged) AND a standalone
+/// proposal-resource block right after it (§7.1).
+#[tokio::test]
+async fn tool_output_with_proposal_resource_appends_standalone_block() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_proposal_resource());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    let output = json!([
+        { "type": "text", "text": "Proposal shown" },
+        { "type": "resource", "resource": {
+            "uri": "intent-proposal://settings-change/Update",
+            "name": "Update",
+            "mimeType": "application/vnd.intent.proposal+json",
+            "text": "{\"kind\":\"settings-change\"}" } }
+    ]);
+    // tool_use(0) → tool_result(1, output unchanged) → standalone proposal(2).
+    assert_eq!(
+        messages[0].content,
+        json!([
+            { "type": "tool_use", "id": format!("{mid}:0"), "name": "workspace_api",
+              "input": { "code": "ws.app.proposal.show(p)", "_acpTitle": "workspace_api" },
+              "toolCallId": "t1",
+              "metadata": { "toolKind": "other", "status": "completed" } },
+            { "type": "tool_result", "id": format!("{mid}:1"), "tool_use_id": "t1",
+              "output": output, "is_error": false },
+            { "type": "resource", "id": format!("{mid}:2"), "resource": {
+                "uri": "intent-proposal://settings-change/Update",
+                "name": "Update",
+                "mimeType": "application/vnd.intent.proposal+json",
+                "text": "{\"kind\":\"settings-change\"}" } },
+        ])
     );
 }
 

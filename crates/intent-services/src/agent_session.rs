@@ -69,6 +69,9 @@ struct Transcript {
     tool_use_index: HashMap<String, usize>,
     /// `toolCallId` → index of its `tool_result` block (append-once, then patch).
     tool_result_index: HashMap<String, usize>,
+    /// `toolCallId` → index of its standalone proposal-resource block (§7.1;
+    /// append-once, then patch — mirrors `tool_result_index`).
+    proposal_index: HashMap<String, usize>,
 }
 
 impl Transcript {
@@ -79,6 +82,7 @@ impl Transcript {
             text: String::new(),
             tool_use_index: HashMap::new(),
             tool_result_index: HashMap::new(),
+            proposal_index: HashMap::new(),
         }
     }
 
@@ -122,7 +126,11 @@ impl Transcript {
     /// Record a tool call into the transcript (CS-0 D6). On first sight of a
     /// `toolCallId`, flush any open text and push a `tool_use` block; on repeats,
     /// patch its `metadata.status`. When the tool reaches `completed`/`error`
-    /// WITH output, append (then patch) a matching `tool_result` block. Returns
+    /// WITH output, append (then patch) a matching `tool_result` block; when a
+    /// `completed` (not `error`) output carries a proposal-MIME resource item
+    /// (§7.1), a standalone proposal-resource block is additionally appended
+    /// right after the `tool_result` (the resource stays in
+    /// `tool_result.output` too). Returns
     /// `Some(index)` of the `tool_use` block (the block the `agent:tool:call`
     /// event is enriched against), or `None` when the update was dropped —
     /// callers must skip event publishing for dropped updates.
@@ -188,6 +196,35 @@ impl Transcript {
                         }));
                         self.tool_result_index
                             .insert(tc.tool_call_id.clone(), rindex);
+                    }
+                }
+                // §7.1: lift a proposal-MIME resource item out of the output
+                // into its own standalone block so the FE can render it
+                // directly (the item also stays in `tool_result.output`).
+                // Gated on `completed` only — an errored tool must not surface
+                // an actionable ProposalCard. Asymmetry: a re-completion whose
+                // output DROPS the item leaves a previously appended block in
+                // place (the transcript is append-only; index-derived ids
+                // preclude removal).
+                if tc.status == "completed" {
+                    if let Some(item) = crate::tool_block::find_proposal_resource(output) {
+                        match self.proposal_index.get(&tc.tool_call_id) {
+                            Some(&pi) => {
+                                let id = self.block_id(pi);
+                                self.blocks[pi] =
+                                    crate::tool_block::build_proposal_resource_block(&id, item);
+                            }
+                            None => {
+                                self.flush_text();
+                                let pindex = self.blocks.len();
+                                let pid = self.block_id(pindex);
+                                self.blocks
+                                    .push(crate::tool_block::build_proposal_resource_block(
+                                        &pid, item,
+                                    ));
+                                self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
+                            }
+                        }
                     }
                 }
             }

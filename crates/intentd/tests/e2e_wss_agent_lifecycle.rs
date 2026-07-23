@@ -7983,3 +7983,199 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
         "the streamed-so-far text persisted: {assistant}"
     );
 }
+
+/// §7.1: a tool completing with a proposal-MIME resource item in its output
+/// surfaces a STANDALONE `resource` block over the live `chat.subscribe`
+/// channel — in addition to the `tool_result` that still carries the item in
+/// its `output` array — and the terminal reconcile KEEPS that block (its id
+/// matches the persisted transcript, so `removedIds` stays empty for it).
+#[tokio::test]
+async fn proposal_resource_standalone_block_over_chat_subscribe() {
+    let Some(script) = gate("WSS proposal-resource chat.subscribe E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // The mock echoes a canned tool_call → tool_call_update pair whose
+    // rawOutput carries the proposal-MIME resource item (no MCP round-trip).
+    let behavior = json!({
+        "response": "proposal shown",
+        "rawUpdates": [
+            { "sessionUpdate": "tool_call", "toolCallId": "tc_prop",
+              "title": "workspace_api", "kind": "other", "status": "in_progress",
+              "rawInput": { "code": "ws.app.proposal.show(p)" } },
+            { "sessionUpdate": "tool_call_update", "toolCallId": "tc_prop",
+              "status": "completed",
+              "rawOutput": [
+                  { "type": "text", "text": "Proposal shown" },
+                  { "type": "resource", "resource": {
+                      "uri": "intent-proposal://settings-change/Update",
+                      "name": "Update",
+                      "mimeType": "application/vnd.intent.proposal+json",
+                      "text": "{\"kind\":\"settings-change\"}" } }
+              ] }
+        ]
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // RPC conn — create the agent.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Proposer", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // CHAT conn — subscribe BEFORE the turn so every stream delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "show proposal" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The live channel delivers the standalone proposal block. Single total
+    // deadline (per-frame reads would reset on heartbeat Pings).
+    let proposal_block_id = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = &frame["params"]["delta"];
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["type"] == "resource"
+                        && e["block"]["resource"]["mimeType"]
+                            == "application/vnd.intent.proposal+json"
+                })
+            {
+                assert_eq!(
+                    entity["block"]["resource"]["text"],
+                    json!("{\"kind\":\"settings-change\"}"),
+                    "resource echoed verbatim: {entity}"
+                );
+                return entity["block"]["id"].as_str().map(String::from);
+            }
+        }
+    })
+    .await
+    .expect("standalone proposal block reached chat channel in time")
+    .expect("standalone proposal block carries an id");
+
+    // Terminal reconcile: the proposal block's id matches the persisted
+    // transcript, so it is NOT in `removedIds` (clean reconcile).
+    let terminal = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = frame["params"]["delta"].clone();
+            let is_terminal = ["added", "updated"].iter().any(|key| {
+                delta[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+            });
+            if is_terminal {
+                return delta;
+            }
+        }
+    })
+    .await
+    .expect("terminal (streamingComplete) delta arrived");
+    assert!(
+        !terminal["removedIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|id| id.as_str() == Some(proposal_block_id.as_str())),
+        "the proposal block {proposal_block_id} survives the reconcile: {terminal}"
+    );
+
+    // The persisted transcript holds the same standalone block under the SAME
+    // id — the byte-for-byte agreement the live channel depends on.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let persisted_proposal = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| {
+            b["type"] == "resource"
+                && b["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+        })
+        .expect("standalone proposal block persisted");
+    assert_eq!(
+        persisted_proposal["id"].as_str(),
+        Some(proposal_block_id.as_str()),
+        "live and persisted block ids agree: {persisted_proposal}"
+    );
+    // The tool_result still carries the resource item in its output array.
+    let tool_result = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .expect("tool_result persisted");
+    assert!(
+        tool_result["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|item| item["resource"]["mimeType"] == "application/vnd.intent.proposal+json"),
+        "tool_result.output keeps the resource item: {tool_result}"
+    );
+}

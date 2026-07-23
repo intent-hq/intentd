@@ -586,6 +586,100 @@ fn chat_tool_delta_synthesizes_name_and_acp_title_from_event() {
     );
 }
 
+fn proposal_output_item() -> Value {
+    json!({
+        "type": "resource",
+        "resource": {
+            "uri": "intent-proposal://settings-change/Update",
+            "name": "Update",
+            "mimeType": "application/vnd.intent.proposal+json",
+            "text": "{\"kind\":\"settings-change\"}",
+        }
+    })
+}
+
+#[test]
+fn chat_tool_delta_proposal_output_emits_standalone_resource_block() {
+    // A completed tool whose output carries a proposal-MIME resource item emits
+    // the standalone proposal block right after the tool_result (§7.1), with
+    // the resource left in `tool_result.output` untouched.
+    let mut s = ChatDeltaState::new(&agent());
+    let output = json!([{ "type": "text", "text": "shown" }, proposal_output_item()]);
+    let d = s
+        .tool_delta(&tool_event(
+            "msg-p",
+            "msg-p:0",
+            "tc-p",
+            "completed",
+            Some(output.clone()),
+        ))
+        .expect("tool completed delta");
+    let added = d["added"].as_array().unwrap();
+    assert_eq!(added.len(), 3, "tool_use + tool_result + proposal resource");
+    assert_eq!(added[1]["block"]["type"], "tool_result");
+    assert_eq!(added[1]["block"]["output"], output, "output unchanged");
+    let proposal = &added[2]["block"];
+    assert_eq!(proposal["type"], "resource");
+    assert_eq!(proposal["id"], "msg-p:2", "proposal follows result by +1");
+    assert_eq!(
+        proposal["resource"]["mimeType"],
+        "application/vnd.intent.proposal+json"
+    );
+    assert_eq!(proposal["resource"], proposal_output_item()["resource"]);
+}
+
+#[test]
+fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
+    // An errored tool must not surface an actionable ProposalCard, even when
+    // its output still carries a proposal-MIME resource item.
+    let mut s = ChatDeltaState::new(&agent());
+    let d = s
+        .tool_delta(&tool_event(
+            "msg-e",
+            "msg-e:0",
+            "tc-e",
+            "error",
+            Some(json!([proposal_output_item()])),
+        ))
+        .expect("tool errored delta");
+    assert_eq!(d["added"].as_array().unwrap().len(), 2, "use + result only");
+}
+
+#[test]
+fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
+    let mut s = ChatDeltaState::new(&agent());
+    let d = s
+        .tool_delta(&tool_event(
+            "msg-q",
+            "msg-q:0",
+            "tc-q",
+            "completed",
+            Some(json!([{ "type": "text", "text": "plain" }])),
+        ))
+        .expect("tool completed delta");
+    assert_eq!(d["added"].as_array().unwrap().len(), 2, "use + result only");
+}
+
+#[test]
+fn chat_tool_delta_malformed_proposal_resource_emits_no_extra_block() {
+    // Wrong MIME / missing text → not a proposal resource; no standalone block.
+    let mut s = ChatDeltaState::new(&agent());
+    let mut wrong_mime = proposal_output_item();
+    wrong_mime["resource"]["mimeType"] = json!("text/plain");
+    let mut no_text = proposal_output_item();
+    no_text["resource"].as_object_mut().unwrap().remove("text");
+    let d = s
+        .tool_delta(&tool_event(
+            "msg-r",
+            "msg-r:0",
+            "tc-r",
+            "completed",
+            Some(json!([wrong_mime, no_text])),
+        ))
+        .expect("tool completed delta");
+    assert_eq!(d["added"].as_array().unwrap().len(), 2, "use + result only");
+}
+
 #[test]
 fn chat_tool_delta_completed_without_output_only_emits_use_block() {
     let mut s = ChatDeltaState::new(&agent());

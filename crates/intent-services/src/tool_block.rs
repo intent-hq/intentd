@@ -63,6 +63,37 @@ pub fn build_tool_use_block(
     })
 }
 
+/// MIME type identifying a proposal resource content item (§7.1). Parity with
+/// the FE contract in `cloudlands-fe/src/shared/types/proposal-resource.ts`.
+pub const PROPOSAL_RESOURCE_MIME: &str = "application/vnd.intent.proposal+json";
+
+/// Find the first well-formed proposal resource item in a `tool_result` output
+/// array: `{ type: "resource", resource: { mimeType: <proposal MIME>, text } }`
+/// with `text` a string (the JSON the FE parses into a `Proposal`). Returns
+/// `None` for a non-array output, no matching item, or a malformed resource
+/// (wrong MIME, missing/non-string `text`).
+pub fn find_proposal_resource(output: &Value) -> Option<&Value> {
+    output.as_array()?.iter().find(|item| {
+        item.get("type").and_then(Value::as_str) == Some("resource")
+            && item.get("resource").is_some_and(|r| {
+                r.get("mimeType").and_then(Value::as_str) == Some(PROPOSAL_RESOURCE_MIME)
+                    && r.get("text").is_some_and(Value::is_string)
+            })
+    })
+}
+
+/// Build the standalone proposal-resource block (§7.1): the output item echoed
+/// verbatim (`{ type: "resource", resource: {…} }`) with the stable block id
+/// stamped on. Shared by `record_tool` (persisted) and `tool_delta` (live) so
+/// the shapes agree byte-for-byte.
+pub fn build_proposal_resource_block(block_id: &str, item: &Value) -> Value {
+    let mut block = item.clone();
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert("id".to_string(), Value::String(block_id.to_string()));
+    }
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +165,57 @@ mod tests {
             "started",
         );
         assert!(block["input"].is_array());
+    }
+
+    fn proposal_item() -> Value {
+        json!({
+            "type": "resource",
+            "resource": {
+                "uri": "intent-proposal://settings-change/Update",
+                "name": "Update",
+                "mimeType": PROPOSAL_RESOURCE_MIME,
+                "text": "{\"kind\":\"settings-change\"}",
+            }
+        })
+    }
+
+    #[test]
+    fn find_proposal_resource_matches_well_formed_item() {
+        let output = json!([{ "type": "text", "text": "shown" }, proposal_item()]);
+        let found = find_proposal_resource(&output).expect("proposal item found");
+        assert_eq!(found["resource"]["mimeType"], PROPOSAL_RESOURCE_MIME);
+    }
+
+    #[test]
+    fn find_proposal_resource_absent_or_non_array_yields_none() {
+        assert!(find_proposal_resource(&json!([{ "type": "text", "text": "hi" }])).is_none());
+        assert!(find_proposal_resource(&json!("plain string output")).is_none());
+        assert!(find_proposal_resource(&json!({ "summary": "ok" })).is_none());
+    }
+
+    #[test]
+    fn find_proposal_resource_rejects_malformed_items() {
+        // Wrong MIME.
+        let mut wrong_mime = proposal_item();
+        wrong_mime["resource"]["mimeType"] = json!("text/plain");
+        assert!(find_proposal_resource(&json!([wrong_mime])).is_none());
+        // Missing `text`.
+        let mut no_text = proposal_item();
+        no_text["resource"].as_object_mut().unwrap().remove("text");
+        assert!(find_proposal_resource(&json!([no_text])).is_none());
+        // Non-string `text`.
+        let mut bad_text = proposal_item();
+        bad_text["resource"]["text"] = json!({ "kind": "settings-change" });
+        assert!(find_proposal_resource(&json!([bad_text])).is_none());
+        // `resource` not an object with the expected fields.
+        assert!(find_proposal_resource(&json!([{ "type": "resource" }])).is_none());
+    }
+
+    #[test]
+    fn build_proposal_resource_block_echoes_item_and_stamps_id() {
+        let block = build_proposal_resource_block("m:3", &proposal_item());
+        assert_eq!(block["id"], "m:3");
+        assert_eq!(block["type"], "resource");
+        assert_eq!(block["resource"], proposal_item()["resource"]);
     }
 }
