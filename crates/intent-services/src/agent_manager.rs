@@ -715,7 +715,8 @@ pub struct AgentManager {
     recreated: Arc<Mutex<HashSet<AgentId>>>,
     /// Agents whose NEXT turn must carry the assembled system prompt prepended
     /// as a `<system>` block — the FirstTurnPrepend fallback (§18.1) for
-    /// providers with no native injection mechanism (cortex, mock). Set when a
+    /// providers with no (usable) native injection mechanism (codex, cortex,
+    /// grok, mock). Set when a
     /// FRESH ACP session is opened (`session/new`, brand-new or recreate) for a
     /// provider whose `injection_mechanism` is
     /// [`InjectionMechanism::FirstTurnPrepend`]; NOT set on `session/load`
@@ -1827,8 +1828,9 @@ impl AgentManager {
                 _ => prompt_text,
             },
         };
-        // FirstTurnPrepend fallback (§18.1): for providers with no native
-        // system-prompt mechanism (cortex, mock), the assembled system prompt
+        // FirstTurnPrepend fallback (§18.1): for providers with no (usable)
+        // native system-prompt mechanism (codex, cortex, grok, mock), the
+        // assembled system prompt
         // is delivered as the OUTERMOST `<system>` block on the first prompt
         // of each fresh ACP session — before context/naming/reminder/user
         // content. Armed by `start_session` on `session/new` (brand-new or
@@ -5029,7 +5031,7 @@ mod role_reminder_tests {
         set_system_prompt(&mgr, &agent_id, "native SP").await;
         // Native-mechanism providers (rules file / _meta / env) never arm the
         // fallback — no double injection.
-        for id in ["auggie", "claude-code", "codex", "opencode", "droid"] {
+        for id in ["auggie", "claude-code", "opencode", "droid"] {
             let provider = intent_providers::find_provider(id).unwrap();
             mgr.arm_first_turn_prepend(&agent_id, provider);
         }

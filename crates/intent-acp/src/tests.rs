@@ -513,17 +513,16 @@ mod session_tests {
     }
 
     #[tokio::test]
-    async fn codex_new_session_injects_developer_instructions() {
+    async fn new_session_passes_through_top_level_meta_keys() {
         use crate::session::Meta;
         use serde_json::json;
         let (conn, responder) = connect_session();
 
-        // Build meta with developerInstructions (as build_session_meta does for codex)
+        // Bare top-level _meta keys must ride session/new unchanged (codex used
+        // this shape for developerInstructions before moving to the first-turn
+        // prepend fallback, #479).
         let mut meta = Meta::new();
-        meta.insert(
-            "developerInstructions".to_string(),
-            json!("Codex test prompt"),
-        );
+        meta.insert("customKey".to_string(), json!("custom value"));
 
         session::new_session(&conn, "/tmp/ws", Vec::new(), Some(meta))
             .await
@@ -536,9 +535,9 @@ mod session_tests {
             .expect("agent received session/new");
         let meta_payload = &new_req["params"]["_meta"];
         assert_eq!(
-            meta_payload["developerInstructions"],
-            json!("Codex test prompt"),
-            "session/new for codex must inject developerInstructions under _meta"
+            meta_payload["customKey"],
+            json!("custom value"),
+            "session/new must pass top-level _meta keys through unchanged"
         );
     }
 

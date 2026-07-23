@@ -125,21 +125,17 @@ fn claude_code_meta_appends_system_prompt() {
 }
 
 #[test]
-fn codex_meta_has_developer_instructions() {
-    let meta = build_session_meta("codex", Some("Test prompt"));
-    assert!(meta.is_some(), "codex gets _meta");
-    let meta_map = meta.unwrap();
-    assert_eq!(meta_map.len(), 1, "codex _meta has exactly one key");
-    let dev_instructions = meta_map.get("developerInstructions");
-    assert!(
-        dev_instructions.is_some(),
-        "codex _meta contains developerInstructions"
-    );
-    assert_eq!(
-        dev_instructions.unwrap().as_str(),
-        Some("Test prompt"),
-        "codex _meta.developerInstructions is the prompt text"
-    );
+fn codex_gets_no_meta() {
+    // The pinned codex-acp adapter (1.1.7) ignores `_meta.developerInstructions`
+    // (#479); codex uses the first-turn prepend fallback, so no _meta is built
+    // regardless of the prompt.
+    for prompt in [Some("Test prompt"), None, Some(""), Some("   \n\t  ")] {
+        let meta = build_session_meta("codex", prompt);
+        assert!(
+            meta.is_none(),
+            "codex uses first-turn prepend fallback, not _meta (prompt {prompt:?})"
+        );
+    }
 }
 
 #[test]
@@ -196,18 +192,6 @@ fn resolved_provider_with_claude_code_compound_model_gets_meta() {
         meta.is_some(),
         "claude-code compound model → claude-code provider → _meta"
     );
-}
-
-#[test]
-fn codex_no_prompt_returns_none() {
-    let meta = build_session_meta("codex", None);
-    assert!(meta.is_none(), "codex with no prompt → no _meta");
-}
-
-#[test]
-fn codex_blank_prompt_returns_none() {
-    let meta = build_session_meta("codex", Some(""));
-    assert!(meta.is_none(), "codex with blank prompt → no _meta");
 }
 
 #[test]
@@ -297,10 +281,4 @@ fn claude_code_blank_prompt_still_injects_disallowed_tools() {
 
     // No systemPrompt key (blank filtered)
     assert!(meta_map.get("systemPrompt").is_none());
-}
-
-#[test]
-fn whitespace_prompt_returns_none() {
-    let meta = build_session_meta("codex", Some("   \n\t  "));
-    assert!(meta.is_none(), "whitespace-only prompt → no _meta");
 }

@@ -945,9 +945,11 @@ fn injection_mechanism_registry() {
         find_provider("claude-code").unwrap().injection_mechanism,
         SessionMeta
     );
+    // codex uses FirstTurnPrepend: the pinned codex-acp adapter (1.1.7)
+    // ignores `_meta.developerInstructions` (#479).
     assert_eq!(
         find_provider("codex").unwrap().injection_mechanism,
-        SessionMeta
+        FirstTurnPrepend
     );
     assert_eq!(
         find_provider("opencode").unwrap().injection_mechanism,

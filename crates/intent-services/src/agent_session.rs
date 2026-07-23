@@ -345,12 +345,13 @@ pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -
 
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
-/// `_meta` injection (auggie, droid, opencode, cortex, grok, mock use other
-/// mechanisms).
+/// `_meta` injection (auggie, codex, droid, opencode, cortex, grok, mock use
+/// other mechanisms — codex moved to the first-turn prepend fallback because
+/// the pinned codex-acp adapter (1.1.7) ignores `_meta.developerInstructions`,
+/// #479).
 /// Provider-specific shapes:
 /// - claude-code: `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": { "append": "<prompt>" }? }`
 ///   (disallowedTools always present; systemPrompt.append present only when non-blank prompt)
-/// - codex: `{ "developerInstructions": "<prompt>" }` (bare top-level key, when non-blank prompt)
 fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<Meta> {
     match provider_id {
         "claude-code" => {
@@ -379,18 +380,6 @@ fn build_session_meta(provider_id: &str, system_prompt: Option<&str>) -> Option<
                 }
             }
 
-            Some(meta)
-        }
-        "codex" => {
-            let prompt = system_prompt?.trim();
-            if prompt.is_empty() {
-                return None;
-            }
-            let mut meta = Meta::new();
-            meta.insert(
-                "developerInstructions".to_string(),
-                Value::String(prompt.to_string()),
-            );
             Some(meta)
         }
         _ => None,
