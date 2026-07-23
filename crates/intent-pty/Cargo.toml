@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Unified PTY host for terminals and scripts: scrollback, multi-client attach (§12)"
 
 [dependencies]
-intent-core = { path = "../intent-core" }
+intent-core = { path = "../intent-core", version = "0.1.0" }
 nix.workspace = true
 portable-pty.workspace = true
 tokio.workspace = true

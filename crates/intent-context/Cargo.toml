@@ -7,7 +7,7 @@ repository.workspace = true
 description = "ContextEngine implementation (AuggieContextEngine) + discovery"
 
 [dependencies]
-intent-core = { path = "../intent-core" }
+intent-core = { path = "../intent-core", version = "0.1.0" }
 async-trait = "0.1"
 tokio = { workspace = true }
 serde_json = { workspace = true }
