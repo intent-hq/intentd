@@ -2136,6 +2136,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "intentd-sitter"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "ioctl-rs"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
