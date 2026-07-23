@@ -189,7 +189,7 @@ fn find_provider_binary_with_home(
             tracing::warn!(
                 provider_id = provider_id,
                 configured_path = trimmed,
-                "providers.paths[\"{}\"] must be absolute and executable; falling back to managed bin / PATH scan",
+                "providers.paths[\"{}\"] must be absolute and executable; falling back to native install dir / managed bin / PATH scan",
                 provider_id
             );
         }
