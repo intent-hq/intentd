@@ -261,9 +261,9 @@ pub struct Services {
     /// per workspace (modeled after `intent-git::WorktreeLocks`).
     script_bootstrap_locks: script_ops::WorkspaceScriptLocks,
     /// The `script.*` too-fast-exit floor in milliseconds
-    /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via
-    /// [`with_script_too_fast_ms`](Self::with_script_too_fast_ms) so the
-    /// no-restart decision cannot flip under scheduler load (monorepo#514).
+    /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
+    /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
+    /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
