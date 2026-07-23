@@ -107,9 +107,10 @@ fn gated_reason(provider: &ProviderConfig) -> Option<String> {
 /// order. Gated providers report `gated_off` and are not probed on `PATH`.
 /// npx-only providers (claude-code) are probed for `npx` availability instead
 /// of a local provider binary — there is no local-binary path for them.
-/// grok prefers its native installer location (`~/.grok/bin/grok`) over the
-/// `PATH` scan because npm-global wrappers can emit update banners before
-/// real stdout (parity with `grok-resolver.ts`).
+/// Providers with native installers (grok: `~/.grok/bin/grok`, opencode:
+/// `~/.opencode/bin/opencode`) prefer that location over the `PATH` scan
+/// because npm-global wrappers can emit update banners before real stdout
+/// (parity with `grok-resolver.ts` / `opencode-resolver.ts`).
 pub fn discover_providers() -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
@@ -119,10 +120,9 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
                 None
             } else if provider.npx_only_package.is_some() {
                 find_npx()
-            } else if provider.id == "grok" {
-                find_grok_native_binary().or_else(|| resolve_on_path(provider.command))
             } else {
-                resolve_on_path(provider.command)
+                find_provider_native_binary(provider.id, provider.command)
+                    .or_else(|| resolve_on_path(provider.command))
             };
             ProviderAvailability {
                 id: provider.id,
@@ -153,8 +153,9 @@ pub fn probe_npx() -> NpxStatus {
 
 /// Resolve a provider binary to an absolute path using the precedence order:
 /// 1. Explicit path from `providers.paths` map (keyed by provider ID)
-/// 2. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
-/// 3. Scan enhanced PATH directories
+/// 2. Native installer location (grok: `~/.grok/bin`, opencode: `~/.opencode/bin`)
+/// 3. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
+/// 4. Scan enhanced PATH directories
 ///
 /// Returns `None` when the binary cannot be resolved. Reuses the discovery
 /// logic from `intent_context::discovery` but generalized for all providers.
@@ -163,6 +164,18 @@ pub fn find_provider_binary(
     provider_id: &str,
     command: &str,
     explicit_path: Option<&str>,
+) -> Option<PathBuf> {
+    find_provider_binary_with_home(provider_id, command, explicit_path, home_dir().as_deref())
+}
+
+/// [`find_provider_binary`] with an explicit `home` for the native-installer
+/// tier (test seam — avoids mutating the process-global `HOME` in parallel
+/// tests).
+fn find_provider_binary_with_home(
+    provider_id: &str,
+    command: &str,
+    explicit_path: Option<&str>,
+    home: Option<&std::path::Path>,
 ) -> Option<PathBuf> {
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
@@ -176,54 +189,73 @@ pub fn find_provider_binary(
             tracing::warn!(
                 provider_id = provider_id,
                 configured_path = trimmed,
-                "providers.paths[\"{}\"] must be absolute and executable; falling back to managed bin / PATH scan",
+                "providers.paths[\"{}\"] must be absolute and executable; falling back to native install dir / managed bin / PATH scan",
                 provider_id
             );
         }
     }
 
-    // 2a. grok's native installer location (`~/.grok/bin/grok`) is preferred
-    // over any PATH-resolved npm-global wrapper (parity with `grok-resolver.ts`:
+    // 2. Native installer locations (grok: `~/.grok/bin/grok`, opencode:
+    // `~/.opencode/bin/opencode`) are preferred over any PATH-resolved
+    // npm-global wrapper (parity with `grok-resolver.ts` / `opencode-resolver.ts`:
     // wrappers can emit update banners before real stdout).
-    if provider_id == "grok" {
-        if let Some(native) = find_grok_native_binary() {
+    if let Some(home) = home {
+        if let Some(native) = find_provider_native_binary_in(provider_id, command, home) {
             return Some(native);
         }
     }
 
-    // 2b. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
+    // 3. ~/.augment/bin (auggie's install location; kept for auggie back-compat)
     if let Some(managed) = managed_binary_path(command) {
         if is_executable_file(&managed) {
             return Some(managed);
         }
     }
 
-    // 3. Scan enhanced PATH directories
+    // 4. Scan enhanced PATH directories
     find_in_enhanced_dirs(command)
 }
 
-/// Candidate paths for grok's native installer location under `home`
-/// (`~/.grok/bin/grok`, plus `.exe`/`.cmd` variants on Windows). Port of
-/// `GROK_NATIVE_PATHS` from `grok-resolver.ts`.
-fn grok_native_candidates(home: &std::path::Path) -> Vec<PathBuf> {
-    let bin = home.join(".grok").join("bin");
-    let mut candidates = vec![bin.join("grok")];
+/// The `$HOME`-relative directory a provider's native installer places its
+/// binary under (`~/<dot_dir>/bin/<command>`), or `None` for providers without
+/// a native-installer tier.
+fn native_install_dir(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "grok" => Some(".grok"),
+        "opencode" => Some(".opencode"),
+        _ => None,
+    }
+}
+
+/// Candidate paths for a provider's native installer location under `home`
+/// (`~/<dot_dir>/bin/<command>`, plus `.exe`/`.cmd` variants on Windows).
+/// Port of `GROK_NATIVE_PATHS` / `OPENCODE_NATIVE_PATHS` from the FE resolvers.
+fn native_install_candidates(home: &std::path::Path, dot_dir: &str, command: &str) -> Vec<PathBuf> {
+    let bin = home.join(dot_dir).join("bin");
+    let mut candidates = vec![bin.join(command)];
     if cfg!(windows) {
-        candidates.push(bin.join("grok.exe"));
-        candidates.push(bin.join("grok.cmd"));
+        candidates.push(bin.join(format!("{command}.exe")));
+        candidates.push(bin.join(format!("{command}.cmd")));
     }
     candidates
 }
 
-/// Resolve grok's native installer binary (`~/.grok/bin/grok`), or `None`.
-fn find_grok_native_binary() -> Option<PathBuf> {
-    find_grok_native_binary_in(&home_dir()?)
+/// Resolve a provider's native installer binary (e.g. `~/.grok/bin/grok`,
+/// `~/.opencode/bin/opencode`), or `None` when the provider has no native
+/// tier or the binary is absent.
+fn find_provider_native_binary(provider_id: &str, command: &str) -> Option<PathBuf> {
+    find_provider_native_binary_in(provider_id, command, &home_dir()?)
 }
 
-/// Resolve grok's native installer binary under an explicit `home` (test seam
-/// — avoids mutating the process-global `HOME` in parallel tests).
-fn find_grok_native_binary_in(home: &std::path::Path) -> Option<PathBuf> {
-    grok_native_candidates(home)
+/// Resolve a provider's native installer binary under an explicit `home`
+/// (test seam — avoids mutating the process-global `HOME` in parallel tests).
+fn find_provider_native_binary_in(
+    provider_id: &str,
+    command: &str,
+    home: &std::path::Path,
+) -> Option<PathBuf> {
+    let dot_dir = native_install_dir(provider_id)?;
+    native_install_candidates(home, dot_dir, command)
         .into_iter()
         .find(|p| is_executable_file(p))
 }
@@ -479,7 +511,7 @@ mod find_provider_binary_tests {
     #[test]
     fn grok_native_candidates_prefer_home_grok_bin() {
         let home = PathBuf::from("/home/tester");
-        let candidates = grok_native_candidates(&home);
+        let candidates = native_install_candidates(&home, ".grok", "grok");
         assert_eq!(
             candidates[0],
             home.join(".grok").join("bin").join("grok"),
@@ -497,6 +529,27 @@ mod find_provider_binary_tests {
         }
     }
 
+    #[test]
+    fn opencode_native_candidates_prefer_home_opencode_bin() {
+        let home = PathBuf::from("/home/tester");
+        let candidates = native_install_candidates(&home, ".opencode", "opencode");
+        assert_eq!(
+            candidates[0],
+            home.join(".opencode").join("bin").join("opencode"),
+            "native installer path must be the first candidate"
+        );
+        if cfg!(windows) {
+            assert!(candidates
+                .iter()
+                .any(|p| p.ends_with(PathBuf::from("bin").join("opencode.exe"))));
+            assert!(candidates
+                .iter()
+                .any(|p| p.ends_with(PathBuf::from("bin").join("opencode.cmd"))));
+        } else {
+            assert_eq!(candidates.len(), 1);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn find_grok_native_binary_in_requires_executable_at_native_path() {
@@ -505,14 +558,93 @@ mod find_provider_binary_tests {
         let home = unique_temp_dir("grok-home");
         let bin_dir = home.join(".grok").join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        assert_eq!(find_grok_native_binary_in(&home), None);
+        assert_eq!(find_provider_native_binary_in("grok", "grok", &home), None);
 
         let bin = bin_dir.join("grok");
         fs::write(&bin, "not executable").unwrap();
-        assert_eq!(find_grok_native_binary_in(&home), None);
+        assert_eq!(find_provider_native_binary_in("grok", "grok", &home), None);
 
         make_executable(&bin);
-        assert_eq!(find_grok_native_binary_in(&home), Some(bin));
+        assert_eq!(
+            find_provider_native_binary_in("grok", "grok", &home),
+            Some(bin)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_opencode_native_binary_in_requires_executable_at_native_path() {
+        // Regression for opencode installed only via its native installer
+        // (`<home>/.opencode/bin/opencode`, no PATH entry): resolution must
+        // find it, and only once it is executable.
+        let home = unique_temp_dir("opencode-home");
+        let bin_dir = home.join(".opencode").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        assert_eq!(
+            find_provider_native_binary_in("opencode", "opencode", &home),
+            None
+        );
+
+        let bin = bin_dir.join("opencode");
+        fs::write(&bin, "not executable").unwrap();
+        assert_eq!(
+            find_provider_native_binary_in("opencode", "opencode", &home),
+            None
+        );
+
+        make_executable(&bin);
+        assert_eq!(
+            find_provider_native_binary_in("opencode", "opencode", &home),
+            Some(bin)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_provider_native_binary_in_ignores_providers_without_native_installs() {
+        // Only grok/opencode have native-installer tiers; other providers must
+        // not resolve from a lookalike dot-dir layout.
+        let home = unique_temp_dir("native-other");
+        let bin_dir = home.join(".auggie").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("auggie");
+        make_executable(&bin);
+        assert_eq!(
+            find_provider_native_binary_in("auggie", "auggie", &home),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_provider_binary_explicit_setting_wins_over_native_for_opencode() {
+        // Precedence: with a native binary present in the fake home, the
+        // explicit `providers.paths` setting still wins; without the explicit
+        // setting, the native tier resolves.
+        let home = unique_temp_dir("opencode-precedence-home");
+        let native_dir = home.join(".opencode").join("bin");
+        fs::create_dir_all(&native_dir).unwrap();
+        let native = native_dir.join("opencode");
+        make_executable(&native);
+
+        let explicit_dir = unique_temp_dir("opencode-explicit");
+        let explicit = explicit_dir.join("opencode");
+        make_executable(&explicit);
+
+        let result = find_provider_binary_with_home(
+            "opencode",
+            "opencode",
+            Some(explicit.to_str().unwrap()),
+            Some(&home),
+        );
+        assert_eq!(result, Some(explicit), "explicit setting must beat native");
+
+        let result = find_provider_binary_with_home("opencode", "opencode", None, Some(&home));
+        assert_eq!(
+            result,
+            Some(native),
+            "native tier must resolve without an explicit setting"
+        );
     }
 
     #[test]
