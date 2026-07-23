@@ -66,6 +66,17 @@ impl SentryClient {
     /// `params` is a slice of `(name, value)` pairs which reqwest
     /// percent-encodes for us.
     pub async fn get_with_query(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
+        Ok(self.get_with_query_paged(path, params).await?.0)
+    }
+
+    /// Execute `GET {base}{path}?<params>` and return the parsed JSON body
+    /// plus the next-page cursor from the response `Link` header (`None` when
+    /// no further page exists). Used by the cursor-paginated issue reads.
+    pub async fn get_with_query_paged(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<(Value, Option<String>)> {
         let url = format!("{}{}", self.base_url, path);
         let mut req = self
             .http
@@ -92,8 +103,13 @@ impl SentryClient {
         if !status.is_success() {
             return Err(Error::Api(format!("sentry returned {status}")));
         }
+        let next_cursor = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_next_cursor);
         let body: Value = resp.json().await?;
-        Ok(body)
+        Ok((body, next_cursor))
     }
 
     /// Execute `PUT {base}{path}` with `body` as JSON and return the parsed
@@ -130,6 +146,37 @@ impl SentryClient {
     }
 }
 
+/// Parse the next-page cursor out of a Sentry `Link` response header.
+///
+/// Sentry paginates with a header of the shape
+/// `<url>; rel="previous"; results="false"; cursor="0:0:1", <url>;
+/// rel="next"; results="true"; cursor="0:100:0"` — the cursor is returned
+/// only from the `rel="next"` entry when `results="true"` (i.e. another page
+/// actually exists; Sentry emits `results="false"` on the last page).
+pub(crate) fn parse_next_cursor(link_header: &str) -> Option<String> {
+    for entry in link_header.split(',') {
+        let mut rel_next = false;
+        let mut has_results = false;
+        let mut cursor: Option<String> = None;
+        for attr in entry.split(';').skip(1) {
+            let Some((key, value)) = attr.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            match key.trim() {
+                "rel" => rel_next = value == "next",
+                "results" => has_results = value == "true",
+                "cursor" => cursor = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        if rel_next && has_results {
+            return cursor;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +195,35 @@ mod tests {
     fn organization_accessor_returns_slug() {
         let client = SentryClient::new("tok", "acme", None).unwrap();
         assert_eq!(client.organization(), "acme");
+    }
+
+    #[test]
+    fn parses_next_cursor_when_results_true() {
+        let header = "<https://sentry.io/api/0/organizations/acme/issues/?&cursor=0:0:1>; \
+                      rel=\"previous\"; results=\"false\"; cursor=\"0:0:1\", \
+                      <https://sentry.io/api/0/organizations/acme/issues/?&cursor=0:100:0>; \
+                      rel=\"next\"; results=\"true\"; cursor=\"0:100:0\"";
+        assert_eq!(parse_next_cursor(header).as_deref(), Some("0:100:0"));
+    }
+
+    #[test]
+    fn no_cursor_when_results_false_or_header_malformed() {
+        // Last page: rel="next" present but results="false" → no cursor.
+        let header = "<https://sentry.io/api/0/organizations/acme/issues/?&cursor=0:0:1>; \
+                      rel=\"previous\"; results=\"false\"; cursor=\"0:0:1\", \
+                      <https://sentry.io/api/0/organizations/acme/issues/?&cursor=0:200:0>; \
+                      rel=\"next\"; results=\"false\"; cursor=\"0:200:0\"";
+        assert_eq!(parse_next_cursor(header), None);
+
+        // Only a previous entry.
+        let header =
+            "<https://sentry.io/api/0/x/>; rel=\"previous\"; results=\"true\"; cursor=\"0:0:1\"";
+        assert_eq!(parse_next_cursor(header), None);
+
+        // Missing cursor attribute / degenerate inputs.
+        let header = "<https://sentry.io/api/0/x/>; rel=\"next\"; results=\"true\"";
+        assert_eq!(parse_next_cursor(header), None);
+        assert_eq!(parse_next_cursor(""), None);
+        assert_eq!(parse_next_cursor("garbage"), None);
     }
 }

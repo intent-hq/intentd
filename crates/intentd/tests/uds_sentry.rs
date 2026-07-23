@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use intent_core::{Config, WorkspaceApi};
 use intent_sentry::{
     Error as SentryError, FetchIssuesRequest, SentryAuthState, SentryEngine, SentryIssueLevel,
-    SentryIssueResult, SentryIssueStatus, SentryProject,
+    SentryIssuePage, SentryIssueResult, SentryIssueStatus, SentryProject,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -98,12 +98,21 @@ impl SentryEngine for StubEngine {
     async fn list_issues(
         &self,
         request: FetchIssuesRequest,
-    ) -> intent_sentry::Result<Vec<SentryIssueResult>> {
+    ) -> intent_sentry::Result<SentryIssuePage> {
         if self.fail {
             return Err(SentryError::NotConfigured("no creds".into()));
         }
+        // Report a next page only on the first page (no cursor) so the wire
+        // token round-trips exactly once.
+        let next_token = match request.cursor {
+            None => Some("0:100:0".to_string()),
+            Some(_) => None,
+        };
         *self.seen_request.lock().unwrap() = Some(request);
-        Ok(vec![issue("PROJ-1")])
+        Ok(SentryIssuePage {
+            issues: vec![issue("PROJ-1")],
+            next_token,
+        })
     }
 
     async fn search_issues(
@@ -111,13 +120,20 @@ impl SentryEngine for StubEngine {
         query: &str,
         project: Option<&str>,
         _limit: Option<u32>,
-    ) -> intent_sentry::Result<Vec<SentryIssueResult>> {
+        cursor: Option<&str>,
+    ) -> intent_sentry::Result<SentryIssuePage> {
         if self.fail {
             return Err(SentryError::NotConfigured("no creds".into()));
         }
         *self.seen_query.lock().unwrap() = Some(query.to_string());
         *self.seen_search_project.lock().unwrap() = project.map(str::to_string);
-        Ok(vec![issue("PROJ-2")])
+        Ok(SentryIssuePage {
+            issues: vec![issue("PROJ-2")],
+            next_token: match cursor {
+                None => Some("0:100:0".to_string()),
+                Some(_) => None,
+            },
+        })
     }
 
     async fn list_projects(&self, limit: Option<u32>) -> intent_sentry::Result<Vec<SentryProject>> {
@@ -241,19 +257,40 @@ async fn uds_sentry_read_surface_round_trip() {
     assert_eq!(resp["result"]["authenticated"], json!(true));
     assert_eq!(resp["result"]["organization"], json!("acme"));
 
-    // (b) listIssues with no params → bare array; engine sees defaults (no status).
+    // (b) listIssues with no params → `{ issues, nextToken }` envelope; engine
+    // sees defaults (no status, no cursor) and the first page carries an
+    // opaque non-null nextToken (§5.5).
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":2,"method":"sentry.listIssues","params":{}}"#,
     )
     .await;
-    let arr = resp["result"].as_array().expect("bare array");
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["shortId"], json!("PROJ-1"));
+    let issues = resp["result"]["issues"].as_array().expect("issues array");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["shortId"], json!("PROJ-1"));
+    let wire_token = resp["result"]["nextToken"]
+        .as_str()
+        .expect("non-null nextToken on first page")
+        .to_string();
     let req = seen_request.lock().unwrap().clone().expect("captured");
     assert!(req.status.is_none(), "no status omits the field");
     assert!(req.project.is_none());
     assert!(req.query.is_none());
+    assert!(req.cursor.is_none(), "first page sends no cursor");
+
+    // (b2) echoing the opaque token back decodes onto the raw engine cursor;
+    // the stub reports no further page → explicit `nextToken: null`.
+    let resp = send(
+        &socket,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"sentry.listIssues","params":{{"nextToken":"{wire_token}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["result"]["issues"][0]["shortId"], json!("PROJ-1"));
+    assert!(resp["result"]["nextToken"].is_null(), "last page is null");
+    let req = seen_request.lock().unwrap().clone().expect("captured");
+    assert_eq!(req.cursor.as_deref(), Some("0:100:0"));
 
     // (c) explicit typed status + project + query + limit map through server-side.
     let resp = send(
@@ -261,7 +298,7 @@ async fn uds_sentry_read_surface_round_trip() {
         r#"{"jsonrpc":"2.0","id":3,"method":"sentry.listIssues","params":{"status":"resolved","project":"web","query":"login","limit":5}}"#,
     )
     .await;
-    assert!(resp["result"].is_array());
+    assert!(resp["result"]["issues"].is_array());
     let req = seen_request.lock().unwrap().clone().expect("captured");
     assert_eq!(req.status, Some(intent_sentry::IssueStatusFilter::Resolved));
     assert_eq!(req.project.as_deref(), Some("web"));
@@ -276,19 +313,31 @@ async fn uds_sentry_read_surface_round_trip() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 
-    // (e) searchIssues forwards the query + optional project, returns a bare array.
+    // (e) searchIssues forwards the query + optional project, returns the
+    // paginated envelope; echoing the token back reaches the last page.
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":5,"method":"sentry.searchIssues","params":{"query":"login bug","project":"web"}}"#,
     )
     .await;
-    let arr = resp["result"].as_array().expect("bare array");
-    assert_eq!(arr[0]["shortId"], json!("PROJ-2"));
+    assert_eq!(resp["result"]["issues"][0]["shortId"], json!("PROJ-2"));
+    let wire_token = resp["result"]["nextToken"]
+        .as_str()
+        .expect("non-null nextToken on first page")
+        .to_string();
     assert_eq!(*seen_query.lock().unwrap(), Some("login bug".to_string()));
     assert_eq!(
         *seen_search_project.lock().unwrap(),
         Some("web".to_string())
     );
+    let resp = send(
+        &socket,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":52,"method":"sentry.searchIssues","params":{{"query":"login bug","nextToken":"{wire_token}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(resp["result"]["nextToken"].is_null(), "last page is null");
 
     // (f) a missing required `query` is -32602.
     let resp = send(

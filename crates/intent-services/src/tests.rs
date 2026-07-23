@@ -12466,8 +12466,9 @@ mod linear {
 }
 
 /// `sentry.*` P0 read handlers over an injected stub engine: not-configured
-/// failures map to `Internal` (→ `-32603`) and successes serialize as a bare
-/// array / a bare object (no `{ items, nextToken }` envelope).
+/// failures map to `Internal` (→ `-32603`), non-paginated successes serialize
+/// as a bare array / a bare object, and the issue reads return the paginated
+/// `{ issues, nextToken? }` envelope.
 mod sentry {
     use std::sync::Arc;
 
@@ -12475,7 +12476,8 @@ mod sentry {
     use intent_core::WorkspaceApi;
     use intent_sentry::{
         Error as SentryError, FetchIssuesRequest, Result as SentryResult, SentryAuthState,
-        SentryEngine, SentryIssueLevel, SentryIssueResult, SentryIssueStatus, SentryProject,
+        SentryEngine, SentryIssueLevel, SentryIssuePage, SentryIssueResult, SentryIssueStatus,
+        SentryProject,
     };
 
     use super::*;
@@ -12527,14 +12529,19 @@ mod sentry {
             })
         }
 
-        async fn list_issues(
-            &self,
-            _request: FetchIssuesRequest,
-        ) -> SentryResult<Vec<SentryIssueResult>> {
+        async fn list_issues(&self, request: FetchIssuesRequest) -> SentryResult<SentryIssuePage> {
             if self.fail {
                 return Self::not_configured();
             }
-            Ok(vec![Self::issue()])
+            // Report a next page only on the first page (no cursor) so the
+            // wire token round-trips exactly once.
+            Ok(SentryIssuePage {
+                issues: vec![Self::issue()],
+                next_token: match request.cursor {
+                    None => Some("0:100:0".into()),
+                    Some(_) => None,
+                },
+            })
         }
 
         async fn search_issues(
@@ -12542,11 +12549,18 @@ mod sentry {
             _query: &str,
             _project: Option<&str>,
             _limit: Option<u32>,
-        ) -> SentryResult<Vec<SentryIssueResult>> {
+            cursor: Option<&str>,
+        ) -> SentryResult<SentryIssuePage> {
             if self.fail {
                 return Self::not_configured();
             }
-            Ok(vec![Self::issue()])
+            Ok(SentryIssuePage {
+                issues: vec![Self::issue()],
+                next_token: match cursor {
+                    None => Some("0:100:0".into()),
+                    Some(_) => None,
+                },
+            })
         }
 
         async fn list_projects(&self, _limit: Option<u32>) -> SentryResult<Vec<SentryProject>> {
@@ -12610,11 +12624,12 @@ mod sentry {
             Err(Error::Internal(_))
         ));
         assert!(matches!(
-            s.sentry_list_issues(None, None, None, None).await,
+            s.sentry_list_issues(None, None, None, None, None).await,
             Err(Error::Internal(_))
         ));
         assert!(matches!(
-            s.sentry_search_issues("boom".into(), None, None).await,
+            s.sentry_search_issues("boom".into(), None, None, None)
+                .await,
             Err(Error::Internal(_))
         ));
         assert!(matches!(
@@ -12643,7 +12658,7 @@ mod sentry {
     async fn invalid_status_is_invalid_params() {
         let (_tmp, s) = svc(false).await;
         assert!(matches!(
-            s.sentry_list_issues(None, Some("bogus".into()), None, None)
+            s.sentry_list_issues(None, Some("bogus".into()), None, None, None)
                 .await,
             Err(Error::InvalidParams(_))
         ));
@@ -12657,17 +12672,52 @@ mod sentry {
         assert!(status.is_object());
         assert_eq!(status["authenticated"], true);
         assert_eq!(status["organization"], "acme");
+    }
 
-        for arr in [
-            s.sentry_list_issues(None, None, None, None).await.unwrap(),
-            s.sentry_search_issues("boom".into(), None, None)
-                .await
-                .unwrap(),
-        ] {
-            assert!(arr.is_array(), "expected bare array, got {arr}");
-            assert!(arr.get("items").is_none(), "no envelope");
-            assert_eq!(arr[0]["shortId"], "PROJ-1");
-        }
+    #[tokio::test]
+    async fn list_and_search_serialize_paginated_envelope() {
+        use crate::github_ops::encode_next_token;
+
+        let (_tmp, s) = svc(false).await;
+        let wire_token = encode_next_token("0:100:0");
+
+        // First page (no cursor): `{ issues, nextToken }` with the engine
+        // cursor wrapped into the opaque base64 wire token (§5.5).
+        let page = s
+            .sentry_list_issues(None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page["issues"][0]["shortId"], "PROJ-1");
+        assert_eq!(page["nextToken"], wire_token);
+
+        // Passing the wire token decodes onto the engine cursor; the stub
+        // reports no further page → explicit `nextToken: null`.
+        let page = s
+            .sentry_list_issues(None, None, None, None, Some(wire_token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(page["issues"][0]["shortId"], "PROJ-1");
+        assert_eq!(page["nextToken"], serde_json::Value::Null);
+
+        // A malformed token degrades to the first page (github parity).
+        let page = s
+            .sentry_list_issues(None, None, None, None, Some("!!not-base64!!".into()))
+            .await
+            .unwrap();
+        assert_eq!(page["nextToken"], wire_token);
+
+        let page = s
+            .sentry_search_issues("boom".into(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page["issues"][0]["shortId"], "PROJ-1");
+        assert_eq!(page["nextToken"], wire_token);
+
+        let page = s
+            .sentry_search_issues("boom".into(), None, None, Some(wire_token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(page["nextToken"], serde_json::Value::Null);
     }
 
     #[tokio::test]

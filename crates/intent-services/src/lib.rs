@@ -14706,23 +14706,30 @@ impl WorkspaceApi for Services {
         status: Option<String>,
         query: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
             let status = sentry_ops::parse_status(status)?;
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
             let request = intent_sentry::FetchIssuesRequest {
                 project,
                 status,
                 query,
                 limit: sentry_ops::wire_limit(limit),
+                cursor,
             };
-            let issues = engine
+            let page = engine
                 .list_issues(request)
                 .await
                 .map_err(sentry_ops::map_sentry_err)?;
-            serde_json::to_value(issues)
-                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+            let issues = serde_json::to_value(page.issues)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
+            Ok(serde_json::json!({
+                "issues": issues,
+                "nextToken": github_ops::next_token_value(page.next_token.as_deref()),
+            }))
         })
     }
 
@@ -14731,16 +14738,27 @@ impl WorkspaceApi for Services {
         query: String,
         project: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.sentry_engine.clone();
         Box::pin(async move {
+            let cursor = github_ops::decode_next_token(next_token.as_deref());
             let engine = sentry_ops::resolve_engine(injected).await?;
-            let issues = engine
-                .search_issues(&query, project.as_deref(), sentry_ops::wire_limit(limit))
+            let page = engine
+                .search_issues(
+                    &query,
+                    project.as_deref(),
+                    sentry_ops::wire_limit(limit),
+                    cursor.as_deref(),
+                )
                 .await
                 .map_err(sentry_ops::map_sentry_err)?;
-            serde_json::to_value(issues)
-                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
+            let issues = serde_json::to_value(page.issues)
+                .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))?;
+            Ok(serde_json::json!({
+                "issues": issues,
+                "nextToken": github_ops::next_token_value(page.next_token.as_deref()),
+            }))
         })
     }
 
