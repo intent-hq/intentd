@@ -40,8 +40,16 @@ impl Drop for TempDb {
     }
 }
 
+/// Generous deadline for every bounded await in this file (frame reads,
+/// connect retries, subscriber-count polls). Under full-suite parallel load a
+/// scheduling/fsync stall can exceed several seconds (monorepo#601: the old
+/// fixed 2s windows tripped exactly there), so the deadline only bounds how
+/// long a genuinely broken run takes to fail — it never delays a passing run.
+const DEADLINE: Duration = Duration::from_secs(60);
+
 async fn connect_retry(socket: &PathBuf) -> UnixStream {
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         if let Ok(s) = UnixStream::connect(socket).await {
             return s;
         }
@@ -58,7 +66,7 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
+    let n = timeout(DEADLINE, reader.read_line(&mut line))
         .await
         .expect("timed out waiting for a frame")
         .expect("read failed");
@@ -67,7 +75,8 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
 }
 
 async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while tokio::time::Instant::now() < deadline {
         if bus.subscriber_count() == target {
             return;
         }
