@@ -188,10 +188,11 @@ pub enum PrInvolvement {
 
 /// Filter for listing pull requests.
 ///
-/// When `involvement` is set, listing routes through `GET /search/issues`
-/// (`is:pr repo:o/r is:<state> <filter>:@me`) so callers can express
-/// author/assignee/review-requested/involves @me; otherwise the plain
-/// `GET /repos/{o}/{r}/pulls` path is used with client-side `author` filtering.
+/// When `involvement` or `search` is set, listing routes through
+/// `GET /search/issues` (`is:pr repo:o/r is:<state> [<filter>:@me] [<text>]`)
+/// so callers can express author/assignee/review-requested/involves @me and
+/// free text; otherwise the plain `GET /repos/{o}/{r}/pulls` path is used with
+/// client-side `author` filtering.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrQuery {
@@ -200,6 +201,10 @@ pub struct PrQuery {
     pub head: Option<String>,
     pub author: Option<String>,
     pub involvement: Option<PrInvolvement>,
+    /// Free-text search term appended to the `/search/issues` query; a
+    /// non-blank value routes the listing through `/search/issues` even
+    /// without `involvement`. Blank/absent leaves listing behavior unchanged.
+    pub search: Option<String>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.
@@ -323,11 +328,18 @@ pub struct Issue {
 }
 
 /// Filter for listing issues.
+///
+/// When `search` is set, listing routes through `GET /search/issues`
+/// (`is:issue repo:o/r [state:<state>] <text>`) so callers can express free
+/// text; otherwise the plain `GET /repos/{o}/{r}/issues` listing is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueQuery {
     pub state: Option<String>,
     pub labels: Option<String>,
+    /// Free-text search term; a non-blank value routes the listing through
+    /// `/search/issues`. Blank/absent leaves listing behavior unchanged.
+    pub search: Option<String>,
     pub limit: Option<u8>,
     /// Engine-native continuation cursor (a REST page number); `None` is the
     /// first page. The opaque wire `nextToken` is owned by the services layer.

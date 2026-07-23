@@ -88,6 +88,14 @@ pub(crate) fn parse_pr_involvement(filter: Option<&str>) -> Result<Option<PrInvo
     }
 }
 
+/// Normalize the optional free-text search `query`: trim and drop blanks so an
+/// absent or whitespace-only query preserves the listing behavior exactly.
+pub(crate) fn normalize_search_query(query: Option<String>) -> Option<String> {
+    query
+        .map(|q| q.trim().to_string())
+        .filter(|q| !q.is_empty())
+}
+
 /// Validate/normalize an issue `state` (`open`/`closed`/`all`, default `open`);
 /// an invalid value throws → `-32603`.
 pub(crate) fn parse_issue_state(state: Option<&str>) -> Result<String> {
@@ -327,6 +335,17 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(9000)), 200);
         assert_eq!(clamp_limit(Some(30)), 30);
+    }
+
+    #[test]
+    fn normalizes_free_text_search_query() {
+        assert_eq!(normalize_search_query(None), None);
+        assert_eq!(normalize_search_query(Some(String::new())), None);
+        assert_eq!(normalize_search_query(Some("   ".into())), None);
+        assert_eq!(
+            normalize_search_query(Some("  login bug  ".into())),
+            Some("login bug".to_string())
+        );
     }
 
     #[test]

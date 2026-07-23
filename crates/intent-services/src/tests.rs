@@ -6832,6 +6832,7 @@ mod pr {
                 "r".into(),
                 Some("created".into()),
                 Some("open".into()),
+                None,
                 Some(10),
                 None,
             )
@@ -6844,6 +6845,7 @@ mod pr {
                 "o".into(),
                 "r".into(),
                 Some("nope".into()),
+                None,
                 None,
                 None,
                 None
@@ -6902,6 +6904,7 @@ mod pr {
                 "r".into(),
                 Some("assigned".into()),
                 Some("open".into()),
+                None,
                 None,
                 None,
             )

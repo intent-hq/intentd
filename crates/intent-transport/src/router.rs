@@ -2044,10 +2044,11 @@ async fn dispatch(
             let repo = require_str_param(params, "repo")?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
+            let query = opt_str(params, "query");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_search(owner, repo, filter, state, limit, next_token)
+                .github_pulls_search(owner, repo, filter, state, query, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2101,10 +2102,11 @@ async fn dispatch(
             let repo = require_str_param(params, "repo")?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
+            let query = opt_str(params, "query");
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_search(owner, repo, filter, state, limit, next_token)
+                .github_issues_search(owner, repo, filter, state, query, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

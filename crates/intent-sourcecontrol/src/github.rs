@@ -223,6 +223,55 @@ pub(crate) fn map_user_identity(value: Value) -> Result<UserIdentity> {
     })
 }
 
+/// Blank-stripped free-text search term: `None` when absent or whitespace-only
+/// so a blank `search` never changes the listing route.
+fn search_term(search: Option<&str>) -> Option<&str> {
+    search.map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Build the `GET /search/issues` query for a PR search: `is:pr repo:{o}/{r}
+/// is:{state}` plus the optional `@me` involvement clause (parity with the FE
+/// `searchGitHubPullRequests`) and the optional free-text term.
+pub(crate) fn build_pr_search_query(
+    repo: &RepoRef,
+    state: &str,
+    involvement: Option<PrInvolvement>,
+    search: Option<&str>,
+) -> String {
+    let mut q = format!("is:pr repo:{}/{} is:{state}", repo.owner, repo.name);
+    if let Some(involvement) = involvement {
+        let involve = match involvement {
+            PrInvolvement::Created => "author:@me",
+            PrInvolvement::Assigned => "assignee:@me",
+            PrInvolvement::ReviewRequested => "review-requested:@me",
+            PrInvolvement::Involves => "involves:@me",
+        };
+        q.push(' ');
+        q.push_str(involve);
+    }
+    if let Some(text) = search_term(search) {
+        q.push(' ');
+        q.push_str(text);
+    }
+    q
+}
+
+/// Build the `GET /search/issues` query for an issue search: `is:issue
+/// repo:{o}/{r}` plus a `state:` clause (`all` adds none) and the free-text
+/// term.
+pub(crate) fn build_issue_search_query(repo: &RepoRef, state: &str, search: &str) -> String {
+    let mut q = format!("is:issue repo:{}/{}", repo.owner, repo.name);
+    if matches!(state, "open" | "closed") {
+        q.push_str(&format!(" state:{state}"));
+    }
+    let text = search.trim();
+    if !text.is_empty() {
+        q.push(' ');
+        q.push_str(text);
+    }
+    q
+}
+
 /// Rewrite raw repo-search input into GitHub `/search/repositories` syntax
 /// (parity with the FE `buildRepoSearchQuery`): `owner/name` → `name
 /// user:owner`, `owner/` → `user:owner`, `/name` → `name`, bare → unchanged.
@@ -661,25 +710,18 @@ impl SourceControl for GitHubSourceControl {
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>> {
         let per_page = rest_per_page(query.limit.unwrap_or(30));
         let page_no = rest_page(query.cursor.as_deref());
-        if let Some(involvement) = query.involvement {
+        let search = search_term(query.search.as_deref());
+        if query.involvement.is_some() || search.is_some() {
             // GitHub's `/pulls` listing cannot express assignee/review-requested/
-            // involves @me, so route involvement queries through `/search/issues`
-            // (parity with the FE `searchGitHubPullRequests`).
+            // involves @me or free text, so route involvement/free-text queries
+            // through `/search/issues` (parity with the FE
+            // `searchGitHubPullRequests`).
             let state = match query.state {
                 Some(PrState::Closed) => "closed",
                 Some(PrState::Merged) => "merged",
                 _ => "open",
             };
-            let involve = match involvement {
-                PrInvolvement::Created => "author:@me",
-                PrInvolvement::Assigned => "assignee:@me",
-                PrInvolvement::ReviewRequested => "review-requested:@me",
-                PrInvolvement::Involves => "involves:@me",
-            };
-            let q = format!(
-                "is:pr repo:{}/{} is:{state} {involve}",
-                repo.owner, repo.name
-            );
+            let q = build_pr_search_query(repo, state, query.involvement, search);
             let params: Vec<(&str, String)> = vec![
                 ("q", q),
                 ("sort", "updated".to_string()),
@@ -1002,6 +1044,39 @@ impl SourceControl for GitHubSourceControl {
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
         let per_page = rest_per_page(query.limit.unwrap_or(30));
         let page_no = rest_page(query.cursor.as_deref());
+        if let Some(search) = search_term(query.search.as_deref()) {
+            // The `/issues` listing cannot express free text, so route search
+            // queries through `/search/issues` (mirror of the `list_prs`
+            // involvement branch).
+            let state = query.state.as_deref().unwrap_or("open");
+            let q = build_issue_search_query(repo, state, search);
+            let params: Vec<(&str, String)> = vec![
+                ("q", q),
+                ("sort", "updated".to_string()),
+                ("order", "desc".to_string()),
+                ("per_page", per_page.to_string()),
+                ("page", page_no.to_string()),
+            ];
+            let v: Value = self.client.get("/search/issues", Some(&params)).await?;
+            let items: Vec<Value> = serde_json::from_value(
+                v.get("items")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new())),
+            )?;
+            let fetched = items.len();
+            // `is:issue` already excludes PRs server-side; the `pull_request`
+            // filter stays as defense-in-depth (paging is measured on the raw
+            // page, parity with the listing path below).
+            let issues = items
+                .into_iter()
+                .filter(|i| i.get("pull_request").is_none())
+                .map(map_issue)
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Page {
+                items: issues,
+                next_cursor: rest_next_cursor(page_no, fetched, per_page),
+            });
+        }
         let mut params: Vec<(&str, String)> = vec![(
             "state",
             query.state.clone().unwrap_or_else(|| "open".into()),
@@ -1420,6 +1495,62 @@ mod tests {
         );
         assert_eq!(build_repo_search_query("   "), "");
         assert_eq!(build_repo_search_query(""), "");
+    }
+
+    #[test]
+    fn builds_pr_search_query() {
+        let repo = RepoRef::new("o", "r");
+        // Involvement-only (the pre-existing branch shape).
+        assert_eq!(
+            build_pr_search_query(&repo, "open", Some(PrInvolvement::Created), None),
+            "is:pr repo:o/r is:open author:@me"
+        );
+        // Free text combines with involvement and state.
+        assert_eq!(
+            build_pr_search_query(
+                &repo,
+                "closed",
+                Some(PrInvolvement::ReviewRequested),
+                Some("panic on save")
+            ),
+            "is:pr repo:o/r is:closed review-requested:@me panic on save"
+        );
+        // Free text without involvement still searches; text is trimmed.
+        assert_eq!(
+            build_pr_search_query(&repo, "merged", None, Some("  flaky test  ")),
+            "is:pr repo:o/r is:merged flaky test"
+        );
+        // Blank text adds no clause.
+        assert_eq!(
+            build_pr_search_query(&repo, "open", Some(PrInvolvement::Involves), Some("   ")),
+            "is:pr repo:o/r is:open involves:@me"
+        );
+    }
+
+    #[test]
+    fn builds_issue_search_query() {
+        let repo = RepoRef::new("o", "r");
+        assert_eq!(
+            build_issue_search_query(&repo, "open", "login bug"),
+            "is:issue repo:o/r state:open login bug"
+        );
+        assert_eq!(
+            build_issue_search_query(&repo, "closed", "crash"),
+            "is:issue repo:o/r state:closed crash"
+        );
+        // `all` carries no state clause; text is trimmed.
+        assert_eq!(
+            build_issue_search_query(&repo, "all", "  crash  "),
+            "is:issue repo:o/r crash"
+        );
+    }
+
+    #[test]
+    fn search_term_strips_blank_input() {
+        assert_eq!(search_term(None), None);
+        assert_eq!(search_term(Some("")), None);
+        assert_eq!(search_term(Some("   ")), None);
+        assert_eq!(search_term(Some("  x  ")), Some("x"));
     }
 
     #[test]
