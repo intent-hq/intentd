@@ -2009,6 +2009,162 @@ async fn set_model_rejects_unknown_provider() {
     );
 }
 
+/// Regression for monorepo#607: `agent.create` rejects (-32602 InvalidParams)
+/// a bare model id that provably belongs to a different provider's static
+/// tiers — the incident payload was an explicit `provider: "grok"` with a
+/// bare auggie-tier model.
+#[tokio::test]
+async fn create_rejects_bare_model_owned_by_other_provider() {
+    let (_t, svc, ws) = setup().await;
+    // Incident shape: explicit grok provider + bare auggie static-tier model.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("bare auggie model + grok provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.create: model sonnet4.5 does not belong to provider grok"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "owning provider must be named: {msg}"
+    );
+    // Default-provider path (no provider param): a bare model owned
+    // exclusively by another provider is validated against the default
+    // provider (auggie) the same way.
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad2".into()),
+            Some("claude-sonnet-4-5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect_err("bare cortex model with defaulted provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string().contains("cortex"),
+        "owning provider must be named: {err}"
+    );
+    // No rejection persisted a session row.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+}
+
+/// Bare model ids pass `agent.create` when the provider matches the static
+/// tier owner, or when no static tier claims the id at all (dynamic-only
+/// model lists — ownership cannot be proven).
+#[tokio::test]
+async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
+    let (_t, svc, ws) = setup().await;
+    // Matching provider passes.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK".into()),
+        Some("sonnet4.5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("matching provider + bare model");
+    // Bare id unknown to every static tier passes for any provider (grok's
+    // model list is dynamic-only).
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK2".into()),
+        Some("grok-4-fast".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("bare id unknown to every static tier");
+    // Unknown-to-all bare id with a defaulted provider passes too.
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK3".into()),
+        Some("some-dynamic-model".into()),
+        None,
+        None,
+        None,
+        false,
+        Default::default(),
+    )
+    .await
+    .expect("unknown bare id with defaulted provider");
+}
+
+/// `agent.setModel` applies the same bare-model ownership guard against the
+/// session's effective provider and leaves session.model / session.provider
+/// untouched on rejection (monorepo#607).
+#[tokio::test]
+async fn set_model_rejects_bare_model_owned_by_other_provider() {
+    let (_t, svc, ws) = setup().await;
+    // create_agent yields an auggie session (provider derived from the
+    // compound model prefix).
+    let id = create_agent(&svc, &ws, "BareGuard").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "haiku".into())
+        .await
+        .expect_err("bare claude-code model on an auggie session must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.setModel: model haiku does not belong to provider auggie"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("claude-code"),
+        "owning provider must be named: {msg}"
+    );
+    let after = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+    // Bare id unknown to every static tier still passes.
+    svc.agent_set_model_op(id, "some-dynamic-model".into())
+        .await
+        .expect("bare id unknown to every static tier");
+}
+
 #[tokio::test]
 async fn rename_missing_agent_is_internal() {
     let (_t, svc, _ws) = setup().await;

@@ -668,6 +668,21 @@ fn compound_model_id_round_trip() {
 }
 
 #[test]
+fn providers_claiming_model_matches_static_tiers_exactly() {
+    assert_eq!(providers_claiming_model("opus4.7"), vec!["auggie"]);
+    assert_eq!(providers_claiming_model("haiku"), vec!["claude-code"]);
+    assert_eq!(
+        providers_claiming_model("claude-sonnet-4-5"),
+        vec!["cortex"]
+    );
+    // Exact match only — no fuzzy/prefix matching.
+    assert!(providers_claiming_model("opus").is_empty());
+    // Unknown / dynamic-only ids claim no provider.
+    assert!(providers_claiming_model("grok-4-fast").is_empty());
+    assert!(providers_claiming_model("").is_empty());
+}
+
+#[test]
 fn tier_table_and_resolution() {
     assert_eq!(tiers_for("auggie").unwrap().smart, "opus4.7");
     // Dynamic-model providers are intentionally absent.
