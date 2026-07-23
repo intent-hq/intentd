@@ -12117,16 +12117,17 @@ mod primitive_ops_service {
 }
 
 /// `linear.*` P1 read handlers over an injected stub engine: not-configured
-/// failures map to `Internal` (→ `-32603`) and successes serialize as bare
-/// arrays / a bare object (no `{ items, nextToken }` envelope).
+/// failures map to `Internal` (→ `-32603`); the catalog reads serialize as bare
+/// arrays / a bare object while `listIssues` / `searchIssues` serialize as the
+/// paginated `{ issues, nextToken? }` envelope.
 mod linear {
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use intent_core::WorkspaceApi;
     use intent_linear::{
-        CreateIssueRequest, Error as LinearError, IssueFilter, LinearEngine, LinearIssueResult,
-        LinearLabel, LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
+        CreateIssueRequest, Error as LinearError, IssueFilter, LinearEngine, LinearIssuePage,
+        LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
         Result as LinearResult, UpdateIssueRequest,
     };
 
@@ -12174,16 +12175,38 @@ mod linear {
             &self,
             _filter: IssueFilter,
             _limit: Option<u32>,
-        ) -> LinearResult<Vec<LinearIssueResult>> {
-            Self::not_configured()
+            next_token: Option<&str>,
+        ) -> LinearResult<LinearIssuePage> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            // Echo the cursor so tests can assert it threaded through, and
+            // report a next page only when this was the first page.
+            Ok(LinearIssuePage {
+                issues: vec![Self::issue()],
+                next_token: match next_token {
+                    None => Some("cursor-2".into()),
+                    Some(_) => None,
+                },
+            })
         }
 
         async fn search_issues(
             &self,
             _query: &str,
             _limit: Option<u32>,
-        ) -> LinearResult<Vec<LinearIssueResult>> {
-            Self::not_configured()
+            next_token: Option<&str>,
+        ) -> LinearResult<LinearIssuePage> {
+            if self.fail {
+                return Self::not_configured();
+            }
+            Ok(LinearIssuePage {
+                issues: vec![Self::issue()],
+                next_token: match next_token {
+                    None => Some("cursor-2".into()),
+                    Some(_) => None,
+                },
+            })
         }
 
         async fn get_issue(&self, _id_or_identifier: &str) -> LinearResult<LinearIssueResult> {
@@ -12285,6 +12308,14 @@ mod linear {
     async fn not_configured_maps_to_internal() {
         let (_tmp, s) = svc(true).await;
         assert!(matches!(
+            s.linear_list_issues(None, None, None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
+            s.linear_search_issues("t".into(), None, None).await,
+            Err(Error::Internal(_))
+        ));
+        assert!(matches!(
             s.linear_get_issue("ENG-1".into()).await,
             Err(Error::Internal(_))
         ));
@@ -12354,6 +12385,49 @@ mod linear {
         assert!(updated.is_object());
         assert_eq!(updated["identifier"], "ENG-1");
         assert!(updated.get("items").is_none(), "no envelope");
+    }
+
+    #[tokio::test]
+    async fn list_and_search_serialize_paginated_envelope() {
+        use crate::github_ops::encode_next_token;
+
+        let (_tmp, s) = svc(false).await;
+        let wire_token = encode_next_token("cursor-2");
+
+        // First page (no cursor): `{ issues, nextToken }` with the engine
+        // cursor wrapped into the opaque base64 wire token (§5.5).
+        let page = s.linear_list_issues(None, None, None).await.unwrap();
+        assert_eq!(page["issues"][0]["identifier"], "ENG-1");
+        assert_eq!(page["nextToken"], wire_token);
+
+        // Passing the wire token decodes onto the engine cursor; the stub
+        // reports no further page → explicit `nextToken: null`.
+        let page = s
+            .linear_list_issues(None, None, Some(wire_token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(page["issues"][0]["identifier"], "ENG-1");
+        assert_eq!(page["nextToken"], serde_json::Value::Null);
+
+        // A malformed token degrades to the first page (github parity).
+        let page = s
+            .linear_list_issues(None, None, Some("!!not-base64!!".into()))
+            .await
+            .unwrap();
+        assert_eq!(page["nextToken"], wire_token);
+
+        let page = s
+            .linear_search_issues("t".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page["issues"][0]["identifier"], "ENG-1");
+        assert_eq!(page["nextToken"], wire_token);
+
+        let page = s
+            .linear_search_issues("t".into(), None, Some(wire_token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(page["nextToken"], serde_json::Value::Null);
     }
 
     #[tokio::test]

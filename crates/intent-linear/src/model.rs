@@ -78,6 +78,20 @@ pub struct LinearIssueResult {
     pub updated_at: Option<String>,
 }
 
+/// One engine-level page of issues backing `linear.listIssues` /
+/// `linear.searchIssues`.
+///
+/// `next_token` carries the **raw** Linear GraphQL `pageInfo.endCursor` and is
+/// present only when `pageInfo.hasNextPage` is true. The services layer wraps
+/// it into the opaque base64 wire `nextToken` (and emits explicit `null` on
+/// the last page) per the §5.5 uniform-pagination conventions — this struct
+/// never crosses the wire directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearIssuePage {
+    pub issues: Vec<LinearIssueResult>,
+    pub next_token: Option<String>,
+}
+
 /// A Linear user (`linear.viewer`).
 ///
 /// Mirrors the FE `LinearUser` (`linear-auth/types.ts`) field-for-field.
