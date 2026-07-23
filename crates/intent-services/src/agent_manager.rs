@@ -5342,10 +5342,16 @@ mod turn_failure_tests {
 
     #[test]
     fn cancelled_rpc_error_with_data_detail_is_benign() {
-        // `JsonRpcError` Display now appends the `data` payload; the richer
-        // message must not break the -32800 benign-cancel classification.
+        // `JsonRpcError` Display now appends the `data` payload (strings raw,
+        // objects as compact JSON); the richer message must not break the
+        // -32800 benign-cancel classification.
         let err = Error::Internal(
             "session/prompt failed: JSON-RPC error -32800: Request cancelled: turn aborted"
+                .to_string(),
+        );
+        assert!(is_benign_turn_error(&err));
+        let err = Error::Internal(
+            r#"session/prompt failed: JSON-RPC error -32800: Request cancelled: {"reason":"turn aborted"}"#
                 .to_string(),
         );
         assert!(is_benign_turn_error(&err));

@@ -224,12 +224,21 @@ async function handlePrompt(id, params) {
   // The exit closes stdout, so the daemon's pending session/prompt fails with
   // "agent stdout closed" — the mid-turn crash the STAB terminal-failure path
   // must surface (agent:failed + requeue for agent.retry).
-  if (typeof behavior.exitDuringPromptAttempts === 'number' && behavior.exitDuringPromptAttempts > 0) {
-    const attempt = getAndIncrementAttempt();
-    if (attempt <= behavior.exitDuringPromptAttempts) {
-      log(`exiting during prompt (attempt ${attempt}/${behavior.exitDuringPromptAttempts})`);
-      process.exit(1);
-    }
+  // The attempt counter is read at most once per prompt and shared by every
+  // attempt-gated behavior below, so enabling several of them never
+  // double-increments the counter and shifts a gating window.
+  const exitGate =
+    typeof behavior.exitDuringPromptAttempts === 'number' && behavior.exitDuringPromptAttempts > 0
+      ? behavior.exitDuringPromptAttempts
+      : 0;
+  const rpcGate =
+    typeof behavior.promptRpcErrorAttempts === 'number' && behavior.promptRpcErrorAttempts > 0
+      ? behavior.promptRpcErrorAttempts
+      : 0;
+  const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
+  if (exitGate > 0 && attempt <= exitGate) {
+    log(`exiting during prompt (attempt ${attempt}/${exitGate})`);
+    process.exit(1);
   }
   // Provider prompt failure (monorepo#479): optionally stream one
   // agent_message_chunk (the provider's pre-failure warning) and then answer
@@ -240,9 +249,7 @@ async function handlePrompt(id, params) {
   // failure is attempt-gated (counter in MOCK_AGENT_ATTEMPT_FILE) so a retry
   // redrive can succeed; otherwise every prompt fails.
   if (behavior.promptRpcError) {
-    const gate = behavior.promptRpcErrorAttempts;
-    const failing =
-      typeof gate === 'number' && gate > 0 ? getAndIncrementAttempt() <= gate : true;
+    const failing = rpcGate > 0 ? attempt <= rpcGate : true;
     if (failing) {
       if (typeof behavior.streamBeforeErrorText === 'string' && behavior.streamBeforeErrorText.length > 0) {
         note('session/update', {
