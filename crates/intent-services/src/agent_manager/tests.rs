@@ -4273,7 +4273,7 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
-    let resolved = resolve_spawn(&session, None, &settings).expect("default resolves");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("default resolves");
     assert_eq!(
         resolved.provider.id,
         intent_providers::default_provider_id()
@@ -4297,7 +4297,7 @@ async fn resolve_spawn_parses_compound_model_id() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.model = Some("claude-code:sonnet".to_string());
-    let resolved = resolve_spawn(&session, None, &settings).expect("compound resolves");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("compound resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     assert_eq!(
@@ -4360,7 +4360,7 @@ async fn resolve_spawn_compound_prefix_wins_over_session_provider() {
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
     session.model = Some("opencode:opencode-go/kimi-k3".to_string());
-    let resolved = resolve_spawn(&session, None, &settings).expect("compound prefix wins");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("compound prefix wins");
     // The compound prefix (opencode) should win over session.provider (auggie).
     assert_eq!(resolved.provider.id, "opencode");
     // The model string is the bare half.
@@ -4374,7 +4374,8 @@ async fn resolve_spawn_session_provider_fallback_for_bare_model() {
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
     session.model = Some("gpt-5.3-codex/high".to_string());
-    let resolved = resolve_spawn(&session, None, &settings).expect("session provider fallback");
+    let resolved =
+        resolve_spawn(&session, None, &settings, None).expect("session provider fallback");
     // Bare model → session.provider is used.
     assert_eq!(resolved.provider.id, "codex");
     // The bare model is passed through as-is.
@@ -4426,7 +4427,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         token_usage: None,
         cow_supported: None,
     };
-    let resolved = resolve_spawn(&session, Some(&workspace), &settings)
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
     assert_eq!(resolved.cwd, ws_dir);
 
@@ -4438,10 +4439,45 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
             .to_string(),
     );
     let resolved =
-        resolve_spawn(&session, Some(&workspace), &settings).expect("falls back to temp");
+        resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
 
     let _ = std::fs::remove_dir_all(&ws_dir);
+}
+
+/// The chief workspace (no worktree on disk) spawns in the dedicated
+/// `<data_dir>/chief-cwd` directory (STAB-50), created on demand — never
+/// `/tmp`. Without a configured chief cwd root, chief falls back to the
+/// temp dir.
+#[tokio::test]
+async fn resolve_spawn_chief_uses_dedicated_cwd() {
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let session = session_with_specialist(None);
+    let chief = intent_core::chief_workspace();
+
+    // Fresh (not-yet-created) chief cwd root → created on demand and used.
+    let data_dir = std::env::temp_dir().join(format!("intentd-chief-{}", uuid::Uuid::new_v4()));
+    let chief_root = intent_core::chief_cwd_root(&data_dir);
+    assert!(!chief_root.exists(), "fresh data dir: root must not exist");
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
+        .expect("chief resolves");
+    assert_eq!(resolved.cwd, chief_root);
+    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp");
+    assert!(chief_root.is_dir(), "chief cwd created on demand");
+    let entries = std::fs::read_dir(&chief_root).unwrap().count();
+    assert_eq!(entries, 0, "dedicated chief cwd is empty");
+
+    // Idempotent: resolving again with the dir already present still works.
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
+        .expect("chief resolves again");
+    assert_eq!(resolved.cwd, chief_root);
+
+    // No chief cwd root configured (bare wiring) → temp-dir catch-all.
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, None)
+        .expect("chief without root resolves");
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 // --- Prompt block shape helpers ----------------------------------------------

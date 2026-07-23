@@ -394,7 +394,12 @@ async function handlePrompt(id, params) {
   const base = active.response || behavior.response || 'Mock agent completed.';
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
-  const text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  // With echoCwd, stamp the child's working directory so e2e tests can assert
+  // the daemon's spawn cwd (e.g. the dedicated chief-cwd dir, STAB-50).
+  let text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  if (behavior.echoCwd) {
+    text = `${text} cwd=${process.cwd()}`;
+  }
   // Optional per-turn delay (MS) so a test can set up queue state during the
   // first turn before it resolves. Only applied to the FIRST turn so subsequent
   // queue-drained turns proceed at full speed.

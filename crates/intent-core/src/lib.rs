@@ -6,6 +6,7 @@
 //! layers implement and consume.
 
 pub mod agent_logs;
+pub mod chief_cwd;
 pub mod clock;
 pub mod config;
 pub mod error;
@@ -23,6 +24,7 @@ pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOGS_DIR_NAME, AGENT_LOG_RETENTION_DAYS,
 };
+pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, CHIEF_CWD_DIR_NAME};
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
 pub use error::{Error, Result};

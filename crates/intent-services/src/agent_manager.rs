@@ -13,7 +13,7 @@
 //! reaping is M5, exposed here as the [`AgentManager::reap_idle`] hook.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -695,6 +695,10 @@ pub struct AgentManager {
     /// as `<root>/<agent-id>/<YYYY-MM-DD>.log`. The composition root wires
     /// `<data_dir>/agent-logs`; `None` (tests / bare wiring) disables capture.
     agent_log_root: Option<PathBuf>,
+    /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
+    /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
+    /// (tests / bare wiring) falls back to the temp dir.
+    chief_cwd_root: Option<PathBuf>,
     /// Agents with an in-flight turn loop (a worker is draining their stream).
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
@@ -807,6 +811,7 @@ impl AgentManager {
             policy: PermissionPolicy::AllowAll,
             mcp_bridge_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("intentd")),
             agent_log_root: None,
+            chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -841,6 +846,14 @@ impl AgentManager {
     /// root passes `intent_core::agent_logs_root(&config.data_dir)`.
     pub fn with_agent_log_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.agent_log_root = Some(root.into());
+        self
+    }
+
+    /// Set the dedicated spawn cwd for chief provider children (STAB-50).
+    /// The composition root passes `intent_core::chief_cwd_root(&config.data_dir)`;
+    /// the directory is created on demand right before a chief spawn resolves.
+    pub fn with_chief_cwd_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.chief_cwd_root = Some(root.into());
         self
     }
 
@@ -3147,6 +3160,7 @@ impl AgentManager {
             &session,
             workspace.as_ref(),
             &self.services.effective_settings(),
+            self.chief_cwd_root.as_deref(),
         )?;
 
         // Check if the agent's model/provider has changed (via agent.setModel).
@@ -3783,6 +3797,7 @@ fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
     settings: &intent_core::settings_file::SettingsFile,
+    chief_cwd_root: Option<&Path>,
 ) -> Result<ResolvedSpawn> {
     let provider_id = session_provider_id(session);
     let model = session
@@ -3790,11 +3805,13 @@ fn resolve_spawn(
         .as_ref()
         .map(|m| intent_providers::parse_compound_model_id(m).1)
         .filter(|m| !m.is_empty());
-    // Chief has no worktree/repo on disk; the TS `agent-factory` fallback
-    // (`workspace.id === CHIEF_WORKSPACE_ID ? '/tmp' : undefined`) pins its
-    // spawn `cwd` to `/tmp` so provider processes have a stable, existing
-    // working directory instead of `std::env::temp_dir()`'s longer
-    // `/var/folders/…/T/` path.
+    // Chief has no worktree/repo on disk, so its children spawn in the
+    // dedicated, daemon-owned, empty `<data_dir>/chief-cwd` directory
+    // (STAB-50): providers that index their cwd (auggie with
+    // `--allow-indexing`) previously ingested an arbitrarily large shared
+    // `/tmp` and blew past their V8 heap cap. Created on demand so a fresh
+    // data dir spawns fine; a creation failure falls through to the temp-dir
+    // catch-all rather than blocking the spawn.
     //
     // Task 3: If the session has a sandbox_path (CoW isolation), use it as the cwd.
     let cwd = session
@@ -3811,7 +3828,17 @@ fn resolve_spawn(
         .or_else(|| {
             workspace
                 .filter(|w| w.id.is_chief())
-                .map(|_| PathBuf::from("/tmp"))
+                .and(chief_cwd_root)
+                .map(|root| {
+                    if let Err(e) = intent_core::chief_cwd::create_chief_cwd_dir(root) {
+                        tracing::warn!(
+                            error = %e,
+                            path = %root.display(),
+                            "failed to create chief spawn cwd; falling back to temp dir"
+                        );
+                    }
+                    root.to_path_buf()
+                })
                 .filter(|p| p.is_dir())
         })
         .unwrap_or_else(std::env::temp_dir);

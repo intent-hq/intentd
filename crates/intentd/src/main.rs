@@ -698,7 +698,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .with_policy(permission_policy)
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
-        .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir)),
+        .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
+        // STAB-50: chief provider children spawn in the dedicated, empty
+        // `<data_dir>/chief-cwd` directory instead of `/tmp`.
+        .with_chief_cwd_root(intent_core::chief_cwd_root(&config.data_dir)),
     );
     // Attach the manager to the services surface so the `agent.*` RPC handlers
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
