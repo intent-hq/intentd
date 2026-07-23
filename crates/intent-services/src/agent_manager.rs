@@ -29,8 +29,8 @@ use intent_acp::{
 };
 use intent_core::events::AGENT_STATUS_CHANGED;
 use intent_core::{
-    now_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus, BoxFuture,
-    Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    now_iso, parse_iso, slug::is_workspace_slug, ActorType, AgentId, AgentSession, AgentStatus,
+    BoxFuture, Error, EventActor, Result, WorkspaceApi, WorkspaceAttention, WorkspaceId,
 };
 use intent_providers::{InjectionMechanism, ProviderConfig};
 use intent_store::{NewEvent, NewTrackedChange};
@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::agent_ops::{new_message_id, user_message_blocks, MAX_MESSAGE_ID_LEN};
+use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
 use crate::agent_session::agent_actor;
 use crate::events::EventBus;
 use crate::Services;
@@ -62,6 +62,22 @@ fn title_case_ascii(s: &str) -> String {
     out.push_str(chars.as_str());
     out
 }
+
+/// Deterministic system note appended to a STALE queued-message redrive (#576)
+/// so a delegated child that already delivered its completion report does not
+/// blindly re-report the same content (duplicate parent wake).
+fn stale_redrive_note(report_timestamp: &str) -> String {
+    format!(
+        "[SYSTEM NOTE] This message was queued before you completed; your completion report \
+         was already delivered to your parent at {report_timestamp}. Only call reportToParent \
+         again if this message materially changes the outcome — do not re-send the same report."
+    )
+}
+
+/// Stable prefix of [`stale_redrive_note`], used to keep the annotation
+/// idempotent when a stale entry is requeued and redriven again.
+const STALE_REDRIVE_NOTE_PREFIX: &str =
+    "[SYSTEM NOTE] This message was queued before you completed";
 
 const GB: u64 = 1024 * 1024 * 1024;
 
@@ -108,6 +124,14 @@ pub struct TurnOptions {
     /// the entry's captured metadata so both the drain-time persist and a
     /// later terminal-failure requeue keep the tag.
     pub message_metadata: Option<serde_json::Value>,
+    /// `true` when this turn delivers a STALE queued-message redrive (#576):
+    /// the message was enqueued before the delegated agent's current
+    /// completion report was persisted, so the parent has already been woken
+    /// with that report. The worker skips the turn-begin
+    /// `clear_completion_report_if_present` for such turns, keeping the
+    /// delivered report queryable via `agent.get`. Fresh turns leave this
+    /// `false` and clear as today.
+    pub suppress_report_clear: bool,
 }
 
 /// Conservative cap used when total system memory cannot be determined.
@@ -2273,6 +2297,50 @@ impl AgentManager {
         }
     }
 
+    /// Stale queued-message redrive detection (#576). A dequeued message is
+    /// STALE for a delegated agent (`parent_agent_id` set) when its
+    /// `queued_at` predates the session's `completion_report_timestamp` —
+    /// i.e. it was enqueued before the current completion report was
+    /// persisted, so the parent has already been woken with that report.
+    ///
+    /// For stale messages this appends the [`stale_redrive_note`] annotation
+    /// to the content (skipped for already-persisted requeues, whose
+    /// transcript row is fixed, and for content already carrying the note so
+    /// a requeued stale entry is not double-annotated) and returns `true` so
+    /// the caller sets [`TurnOptions::suppress_report_clear`], keeping the
+    /// delivered report queryable. Fail open: session-lookup or timestamp
+    /// parse failures treat the message as fresh (today's behavior).
+    async fn annotate_stale_redrive(&self, agent_id: &AgentId, msg: &mut QueuedMessage) -> bool {
+        let session = match self.services.store.get_agent_session(agent_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "stale-redrive check skipped: session lookup failed"
+                );
+                return false;
+            }
+        };
+        if session.parent_agent_id.is_none() {
+            return false;
+        }
+        let Some(report_ts) = session.completion_report_timestamp else {
+            return false;
+        };
+        let (Some(queued), Some(reported)) = (parse_iso(&msg.queued_at), parse_iso(&report_ts))
+        else {
+            return false;
+        };
+        if queued >= reported {
+            return false;
+        }
+        if !msg.persisted && !msg.content.contains(STALE_REDRIVE_NOTE_PREFIX) {
+            msg.content = format!("{}\n\n{}", msg.content, stale_redrive_note(&report_ts));
+        }
+        true
+    }
+
     /// Persist `agent_session.status` + `is_active` and publish the
     /// `agent:status-changed` self-sufficient event (PROTOCOL §6.5/§6.7). All
     /// failures are logged and swallowed: the runtime turn is the source of
@@ -2588,7 +2656,7 @@ impl AgentManager {
         if !self.try_begin(&agent_id, &workspace_id).await {
             return;
         }
-        let next = match self.services.dequeue_message(&agent_id) {
+        let mut next = match self.services.dequeue_message(&agent_id) {
             Some(msg) => msg,
             None => {
                 // Raced with another mutation (e.g. remove) that emptied the
@@ -2604,6 +2672,10 @@ impl AgentManager {
                 self.services.queue_snapshot(&agent_id),
             )
             .await;
+        // Stale-redrive check (#576) BEFORE the transcript append so the
+        // annotated content reaches both the persisted user row and the
+        // provider prompt.
+        let stale = self.annotate_stale_redrive(&agent_id, &mut next).await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
         // began; otherwise persist now (with `persist_user`'s bounded retry).
@@ -2634,6 +2706,7 @@ impl AgentManager {
             image_blocks: next.image_blocks.clone(),
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
+            suppress_report_clear: stale,
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -4040,8 +4113,13 @@ async fn run_message_worker(
                 // report is set; the `agent:idle` wake for a prior turn that set a
                 // report still includes it because the clear runs at the NEXT turn's
                 // begin (after the `agent:idle` emit at the prior turn's end).
-                mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
-                    .await;
+                // Stale redrives (#576) suppress the clear entirely so the
+                // already-delivered report stays queryable via `agent.get` — a
+                // genuine re-report still overwrites it through `reportToParent`.
+                if !options.suppress_report_clear {
+                    mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
+                        .await;
+                }
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
@@ -4115,7 +4193,7 @@ async fn run_message_worker(
             }
         }
         // Drain the next queued message while still holding the in-flight slot.
-        if let Some(next) = mgr.services.dequeue_message(&agent_id) {
+        if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
             mgr.services
                 .publish_queue_updated_for(
                     &agent_id,
@@ -4123,6 +4201,11 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
+            // Stale-redrive check (#576) BEFORE the transcript append so the
+            // annotated content reaches both the persisted user row and the
+            // provider prompt. Runs before the next iteration's report clear,
+            // so `completion_report_timestamp` is still visible here.
+            let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             // A terminal-failure requeue whose user row already reached the
@@ -4147,6 +4230,7 @@ async fn run_message_worker(
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
+                suppress_report_clear: stale,
                 ..TurnOptions::default()
             };
             // Fail closed (#547): a persist failure that survived the bounded
@@ -4165,7 +4249,7 @@ async fn run_message_worker(
         // goes idle while ready-to-send messages remain — each re-claim of the
         // slot continues `'outer` and re-enters the drain at the top.
         mgr.end_turn(&agent_id).await;
-        let Some(next) = mgr.services.dequeue_message(&agent_id) else {
+        let Some(mut next) = mgr.services.dequeue_message(&agent_id) else {
             break 'outer;
         };
         if mgr.try_begin(&agent_id, &workspace_id).await {
@@ -4176,6 +4260,10 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
+            // Stale-redrive check (#576): same contract as the pre-release
+            // drain arm. Runs only after the slot is re-claimed so a message
+            // handed back via `requeue_front` below is never annotated here.
+            let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             user_persisted = if next.persisted {
@@ -4197,6 +4285,7 @@ async fn run_message_worker(
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
+                suppress_report_clear: stale,
                 ..TurnOptions::default()
             };
             // Fail closed (#547): same contract as the pre-release drain arm.
