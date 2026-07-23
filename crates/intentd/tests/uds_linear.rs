@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use intent_core::{Config, WorkspaceApi};
 use intent_linear::{
     AuthStatus, CreateIssueRequest, Error as LinearError, IssueFilter, LinearEngine,
-    LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser, LinearWorkflowState,
-    UpdateIssueRequest,
+    LinearIssuePage, LinearIssueResult, LinearLabel, LinearProject, LinearTeam, LinearUser,
+    LinearWorkflowState, UpdateIssueRequest,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -54,6 +54,8 @@ struct StubEngine {
     fail: bool,
     seen_filter: Arc<Mutex<Option<IssueFilter>>>,
     seen_query: Arc<Mutex<Option<String>>>,
+    seen_list_token: Arc<Mutex<Option<Option<String>>>>,
+    seen_search_token: Arc<Mutex<Option<Option<String>>>>,
     seen_id: Arc<Mutex<Option<String>>>,
     seen_create: Arc<Mutex<Option<CreateIssueRequest>>>,
     seen_update: Arc<Mutex<Option<UpdateIssueRequest>>>,
@@ -76,24 +78,41 @@ impl LinearEngine for StubEngine {
         &self,
         filter: IssueFilter,
         _limit: Option<u32>,
-    ) -> intent_linear::Result<Vec<LinearIssueResult>> {
+        next_token: Option<&str>,
+    ) -> intent_linear::Result<LinearIssuePage> {
         if self.fail {
             return Err(LinearError::NotConfigured("no key".into()));
         }
         *self.seen_filter.lock().unwrap() = Some(filter);
-        Ok(vec![issue("ENG-1")])
+        *self.seen_list_token.lock().unwrap() = Some(next_token.map(str::to_string));
+        // Report a next page only on the first page (no cursor).
+        Ok(LinearIssuePage {
+            issues: vec![issue("ENG-1")],
+            next_token: match next_token {
+                None => Some("cursor-2".into()),
+                Some(_) => None,
+            },
+        })
     }
 
     async fn search_issues(
         &self,
         query: &str,
         _limit: Option<u32>,
-    ) -> intent_linear::Result<Vec<LinearIssueResult>> {
+        next_token: Option<&str>,
+    ) -> intent_linear::Result<LinearIssuePage> {
         if self.fail {
             return Err(LinearError::NotConfigured("no key".into()));
         }
         *self.seen_query.lock().unwrap() = Some(query.to_string());
-        Ok(vec![issue("ENG-2")])
+        *self.seen_search_token.lock().unwrap() = Some(next_token.map(str::to_string));
+        Ok(LinearIssuePage {
+            issues: vec![issue("ENG-2")],
+            next_token: match next_token {
+                None => Some("cursor-2".into()),
+                Some(_) => None,
+            },
+        })
     }
 
     async fn get_issue(&self, id_or_identifier: &str) -> intent_linear::Result<LinearIssueResult> {
@@ -253,6 +272,8 @@ async fn start(
 async fn uds_linear_read_surface_round_trip() {
     let seen_filter = Arc::new(Mutex::new(None));
     let seen_query = Arc::new(Mutex::new(None));
+    let seen_list_token = Arc::new(Mutex::new(None));
+    let seen_search_token = Arc::new(Mutex::new(None));
     let seen_id = Arc::new(Mutex::new(None));
     let seen_create = Arc::new(Mutex::new(None));
     let seen_update = Arc::new(Mutex::new(None));
@@ -260,6 +281,8 @@ async fn uds_linear_read_surface_round_trip() {
         fail: false,
         seen_filter: seen_filter.clone(),
         seen_query: seen_query.clone(),
+        seen_list_token: seen_list_token.clone(),
+        seen_search_token: seen_search_token.clone(),
         seen_id: seen_id.clone(),
         seen_create: seen_create.clone(),
         seen_update: seen_update.clone(),
@@ -276,25 +299,37 @@ async fn uds_linear_read_surface_round_trip() {
     assert_eq!(resp["result"]["login"], json!("Ada Lovelace"));
     assert_eq!(resp["result"]["scopes"], json!([]));
 
-    // (b) listIssues with no filter → bare array; engine sees the `assigned` default.
+    // (b) listIssues with no filter → `{ issues, nextToken }` envelope; engine
+    // sees the `assigned` default and no cursor, and reports a next page.
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":2,"method":"linear.listIssues","params":{}}"#,
     )
     .await;
-    let arr = resp["result"].as_array().expect("bare array");
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["identifier"], json!("ENG-1"));
+    let issues = resp["result"]["issues"].as_array().expect("issues array");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["identifier"], json!("ENG-1"));
+    assert_eq!(resp["result"]["nextToken"], json!("cursor-2"));
     assert_eq!(*seen_filter.lock().unwrap(), Some(IssueFilter::Assigned));
+    assert_eq!(*seen_list_token.lock().unwrap(), Some(None));
 
-    // (c) an explicit typed filter maps through server-side.
+    // (c) an explicit typed filter maps through server-side, and a `nextToken`
+    // param round-trips to the engine cursor; the last page omits the token.
     let resp = send(
         &socket,
-        r#"{"jsonrpc":"2.0","id":3,"method":"linear.listIssues","params":{"filter":"created","limit":5}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"linear.listIssues","params":{"filter":"created","limit":5,"nextToken":"cursor-2"}}"#,
     )
     .await;
-    assert!(resp["result"].is_array());
+    assert!(resp["result"]["issues"].is_array());
+    assert!(
+        resp["result"].get("nextToken").is_none(),
+        "last page omits nextToken"
+    );
     assert_eq!(*seen_filter.lock().unwrap(), Some(IssueFilter::Created));
+    assert_eq!(
+        *seen_list_token.lock().unwrap(),
+        Some(Some("cursor-2".to_string()))
+    );
 
     // (d) an invalid filter is rejected with -32602 before the engine is touched.
     let resp = send(
@@ -304,15 +339,32 @@ async fn uds_linear_read_surface_round_trip() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 
-    // (e) searchIssues forwards the query and returns a bare array.
+    // (e) searchIssues forwards the query and returns the paginated envelope;
+    // a follow-up call threads the `nextToken` param through to the engine.
     let resp = send(
         &socket,
         r#"{"jsonrpc":"2.0","id":5,"method":"linear.searchIssues","params":{"query":"login bug"}}"#,
     )
     .await;
-    let arr = resp["result"].as_array().expect("bare array");
-    assert_eq!(arr[0]["identifier"], json!("ENG-2"));
+    let issues = resp["result"]["issues"].as_array().expect("issues array");
+    assert_eq!(issues[0]["identifier"], json!("ENG-2"));
+    assert_eq!(resp["result"]["nextToken"], json!("cursor-2"));
     assert_eq!(*seen_query.lock().unwrap(), Some("login bug".to_string()));
+    assert_eq!(*seen_search_token.lock().unwrap(), Some(None));
+
+    let resp = send(
+        &socket,
+        r#"{"jsonrpc":"2.0","id":15,"method":"linear.searchIssues","params":{"query":"login bug","nextToken":"cursor-2"}}"#,
+    )
+    .await;
+    assert!(
+        resp["result"].get("nextToken").is_none(),
+        "last page omits nextToken"
+    );
+    assert_eq!(
+        *seen_search_token.lock().unwrap(),
+        Some(Some("cursor-2".to_string()))
+    );
 
     // (f) a missing required `query` is -32602.
     let resp = send(
@@ -435,6 +487,8 @@ async fn uds_linear_not_configured_is_internal() {
         fail: true,
         seen_filter: Arc::new(Mutex::new(None)),
         seen_query: Arc::new(Mutex::new(None)),
+        seen_list_token: Arc::new(Mutex::new(None)),
+        seen_search_token: Arc::new(Mutex::new(None)),
         seen_id: Arc::new(Mutex::new(None)),
         seen_create: Arc::new(Mutex::new(None)),
         seen_update: Arc::new(Mutex::new(None)),

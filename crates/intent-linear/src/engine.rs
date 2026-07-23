@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use crate::client::LinearClient;
 use crate::error::{Error, Result};
 use crate::model::{
-    AuthStatus, CreateIssueRequest, IssueFilter, LinearIssueResult, LinearLabel, LinearProject,
-    LinearTeam, LinearUser, LinearWorkflowState, UpdateIssueRequest,
+    AuthStatus, CreateIssueRequest, IssueFilter, LinearIssuePage, LinearIssueResult, LinearLabel,
+    LinearProject, LinearTeam, LinearUser, LinearWorkflowState, UpdateIssueRequest,
 };
 
 /// Default page size when the caller does not specify one.
@@ -43,19 +43,24 @@ pub trait LinearEngine: Send + Sync {
     /// Auth / connectivity probe via `viewer { id name email }`.
     async fn auth_status(&self) -> Result<AuthStatus>;
 
-    /// List issues matching `filter` (typed server-side filters).
+    /// List issues matching `filter` (typed server-side filters). `next_token`
+    /// is the opaque cursor from a previous page (threaded as the GraphQL
+    /// `after` cursor); absent → first page.
     async fn list_issues(
         &self,
         filter: IssueFilter,
         limit: Option<u32>,
-    ) -> Result<Vec<LinearIssueResult>>;
+        next_token: Option<&str>,
+    ) -> Result<LinearIssuePage>;
 
-    /// Full-text search issues by `query`.
+    /// Full-text search issues by `query`. `next_token` paginates like
+    /// [`Self::list_issues`].
     async fn search_issues(
         &self,
         query: &str,
         limit: Option<u32>,
-    ) -> Result<Vec<LinearIssueResult>>;
+        next_token: Option<&str>,
+    ) -> Result<LinearIssuePage>;
 
     /// Fetch a single issue by UUID `id` or `ENG-123` `identifier`.
     async fn get_issue(&self, id_or_identifier: &str) -> Result<LinearIssueResult>;
@@ -116,33 +121,34 @@ impl LinearEngine for LinearEngineImpl {
         &self,
         filter: IssueFilter,
         limit: Option<u32>,
-    ) -> Result<Vec<LinearIssueResult>> {
+        next_token: Option<&str>,
+    ) -> Result<LinearIssuePage> {
         let query = format!(
-            "query Issues($first: Int, $filter: IssueFilter) {{ \
-                issues(first: $first, filter: $filter) {{ nodes {{ {ISSUE_FIELDS} }} }} \
+            "query Issues($first: Int, $after: String, $filter: IssueFilter) {{ \
+                issues(first: $first, after: $after, filter: $filter) \
+                {{ nodes {{ {ISSUE_FIELDS} }} pageInfo {{ endCursor hasNextPage }} }} \
             }}"
         );
-        let variables = json!({
-            "first": clamp_limit(limit),
-            "filter": build_issue_filter(filter),
-        });
+        let variables = list_issues_variables(filter, limit, next_token);
         let data = self.client.graphql(&query, variables).await?;
-        Ok(map_issue_nodes(data.pointer("/issues/nodes")))
+        Ok(map_issue_page(data.get("issues")))
     }
 
     async fn search_issues(
         &self,
         query: &str,
         limit: Option<u32>,
-    ) -> Result<Vec<LinearIssueResult>> {
+        next_token: Option<&str>,
+    ) -> Result<LinearIssuePage> {
         let gql = format!(
-            "query Search($term: String!, $first: Int) {{ \
-                searchIssues(term: $term, first: $first) {{ nodes {{ {ISSUE_FIELDS} }} }} \
+            "query Search($term: String!, $first: Int, $after: String) {{ \
+                searchIssues(term: $term, first: $first, after: $after) \
+                {{ nodes {{ {ISSUE_FIELDS} }} pageInfo {{ endCursor hasNextPage }} }} \
             }}"
         );
-        let variables = json!({ "term": query, "first": clamp_limit(limit) });
+        let variables = search_issues_variables(query, limit, next_token);
         let data = self.client.graphql(&gql, variables).await?;
-        Ok(map_issue_nodes(data.pointer("/searchIssues/nodes")))
+        Ok(map_issue_page(data.get("searchIssues")))
     }
 
     async fn get_issue(&self, id_or_identifier: &str) -> Result<LinearIssueResult> {
@@ -260,6 +266,30 @@ fn clamp_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
+/// Variables for the `issues` list query: the clamped `first`, the typed
+/// `filter`, and the `after` cursor (`null` on the first page).
+pub(crate) fn list_issues_variables(
+    filter: IssueFilter,
+    limit: Option<u32>,
+    after: Option<&str>,
+) -> Value {
+    json!({
+        "first": clamp_limit(limit),
+        "after": after,
+        "filter": build_issue_filter(filter),
+    })
+}
+
+/// Variables for the `searchIssues` query: `term`, the clamped `first`, and
+/// the `after` cursor (`null` on the first page).
+pub(crate) fn search_issues_variables(
+    term: &str,
+    limit: Option<u32>,
+    after: Option<&str>,
+) -> Value {
+    json!({ "term": term, "first": clamp_limit(limit), "after": after })
+}
+
 /// Build the GraphQL `IssueCreateInput` from [`CreateIssueRequest`]. Optional
 /// fields are only included when present so they don't overwrite defaults.
 pub(crate) fn build_create_input(req: &CreateIssueRequest) -> Value {
@@ -338,6 +368,17 @@ pub(crate) fn map_issue_nodes(nodes: Option<&Value>) -> Vec<LinearIssueResult> {
         .and_then(Value::as_array)
         .map(|arr| arr.iter().map(map_issue).collect())
         .unwrap_or_default()
+}
+
+/// Map an issue connection (`{ nodes, pageInfo }`) into a [`LinearIssuePage`]:
+/// `next_token` carries `pageInfo.endCursor` only when `hasNextPage` is true.
+pub(crate) fn map_issue_page(connection: Option<&Value>) -> LinearIssuePage {
+    let issues = map_issue_nodes(connection.and_then(|c| c.get("nodes")));
+    let next_token = connection
+        .and_then(|c| c.get("pageInfo"))
+        .filter(|p| p.get("hasNextPage").and_then(Value::as_bool) == Some(true))
+        .and_then(|p| str_field(p, "endCursor"));
+    LinearIssuePage { issues, next_token }
 }
 
 /// Flatten a single Linear issue node into [`LinearIssueResult`].
@@ -530,6 +571,83 @@ mod tests {
         assert_eq!(r.creator.as_deref(), Some("Grace"));
         assert_eq!(r.project.as_deref(), Some("Apollo"));
         assert_eq!(r.labels, Some(vec!["bug".to_string(), "p1".to_string()]));
+    }
+
+    #[test]
+    fn list_variables_thread_after_cursor() {
+        let v = list_issues_variables(IssueFilter::Assigned, Some(10), Some("cursor-1"));
+        assert_eq!(v["first"], json!(10));
+        assert_eq!(v["after"], json!("cursor-1"));
+        assert_eq!(
+            v["filter"],
+            json!({ "assignee": { "isMe": { "eq": true } } })
+        );
+
+        // First page: no cursor → `after` is null (limit still clamps/defaults).
+        let v = list_issues_variables(IssueFilter::All, None, None);
+        assert_eq!(v["first"], json!(DEFAULT_LIMIT));
+        assert_eq!(v["after"], json!(null));
+    }
+
+    #[test]
+    fn search_variables_thread_after_cursor() {
+        let v = search_issues_variables("widget", Some(20), Some("cursor-2"));
+        assert_eq!(v["term"], json!("widget"));
+        assert_eq!(v["first"], json!(20));
+        assert_eq!(v["after"], json!("cursor-2"));
+
+        let v = search_issues_variables("widget", None, None);
+        assert_eq!(v["first"], json!(DEFAULT_LIMIT));
+        assert_eq!(v["after"], json!(null));
+    }
+
+    #[test]
+    fn maps_issue_page_with_next_token_only_when_has_next_page() {
+        let page = map_issue_page(Some(&json!({
+            "nodes": [{ "id": "x", "identifier": "A-1", "title": "t" }],
+            "pageInfo": { "endCursor": "cursor-9", "hasNextPage": true }
+        })));
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.next_token.as_deref(), Some("cursor-9"));
+
+        // Last page: hasNextPage false → no token even with an endCursor.
+        let page = map_issue_page(Some(&json!({
+            "nodes": [],
+            "pageInfo": { "endCursor": "cursor-9", "hasNextPage": false }
+        })));
+        assert!(page.next_token.is_none());
+
+        // Defensive: missing pageInfo / null endCursor / absent connection.
+        let page = map_issue_page(Some(&json!({ "nodes": [] })));
+        assert!(page.next_token.is_none());
+        let page = map_issue_page(Some(&json!({
+            "nodes": [],
+            "pageInfo": { "endCursor": null, "hasNextPage": true }
+        })));
+        assert!(page.next_token.is_none());
+        let page = map_issue_page(None);
+        assert!(page.issues.is_empty());
+        assert!(page.next_token.is_none());
+    }
+
+    #[test]
+    fn issue_page_serializes_envelope_and_omits_absent_token() {
+        let page = LinearIssuePage {
+            issues: vec![],
+            next_token: Some("cursor-3".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&page).unwrap(),
+            json!({ "issues": [], "nextToken": "cursor-3" })
+        );
+        let page = LinearIssuePage {
+            issues: vec![],
+            next_token: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&page).unwrap(),
+            json!({ "issues": [] })
+        );
     }
 
     #[test]

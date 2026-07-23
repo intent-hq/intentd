@@ -3317,13 +3317,16 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `linear.listIssues`: the viewer's issues for the typed `filter`
     /// (`assigned`|`created`|`subscribed`|`team`|`all`, default `assigned`),
-    /// returned as a bare `LinearIssueResult[]` (PROTOCOL §5.28).
+    /// returned as `{ issues: LinearIssueResult[], nextToken? }`. `next_token`
+    /// is the opaque cursor from a previous page; the result's `nextToken` is
+    /// present only when another page exists (PROTOCOL §5.28).
     fn linear_list_issues(
         &self,
         filter: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (filter, limit);
+        let _ = (filter, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::linear_list_issues not implemented".to_string(),
@@ -3331,14 +3334,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `linear.searchIssues`: full-text issue search by `query`, returned as a
-    /// bare `LinearIssueResult[]` (PROTOCOL §5.28).
+    /// `linear.searchIssues`: full-text issue search by `query`, returned as
+    /// `{ issues: LinearIssueResult[], nextToken? }` with the same cursor
+    /// semantics as `linear.listIssues` (PROTOCOL §5.28).
     fn linear_search_issues(
         &self,
         query: String,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (query, limit);
+        let _ = (query, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::linear_search_issues not implemented".to_string(),

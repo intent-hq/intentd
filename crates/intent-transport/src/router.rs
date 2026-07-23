@@ -2194,8 +2194,9 @@ async fn dispatch(
         "linear.listIssues" => {
             let filter = opt_str(params, "filter");
             let limit = opt_int(params, "limit");
-            match api.linear_list_issues(filter, limit).await {
-                Ok(issues) => Ok(issues),
+            let next_token = opt_str(params, "nextToken");
+            match api.linear_list_issues(filter, limit, next_token).await {
+                Ok(page) => Ok(page),
                 Err(Error::InvalidParams(m)) => Err(rpc(INVALID_PARAMS, m)),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -2203,8 +2204,9 @@ async fn dispatch(
         "linear.searchIssues" => {
             let query = require_str_param(params, "query")?;
             let limit = opt_int(params, "limit");
+            let next_token = opt_str(params, "nextToken");
             let r = api
-                .linear_search_issues(query, limit)
+                .linear_search_issues(query, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

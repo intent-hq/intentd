@@ -78,6 +78,20 @@ pub struct LinearIssueResult {
     pub updated_at: Option<String>,
 }
 
+/// One page of issues returned by `linear.listIssues` / `linear.searchIssues`:
+/// `{ issues, nextToken? }`.
+///
+/// `next_token` carries the Linear GraphQL `pageInfo.endCursor` and is present
+/// only when `pageInfo.hasNextPage` is true; pass it back as the `nextToken`
+/// param (threaded as the GraphQL `after` cursor) to fetch the next page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinearIssuePage {
+    pub issues: Vec<LinearIssueResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
 /// A Linear user (`linear.viewer`).
 ///
 /// Mirrors the FE `LinearUser` (`linear-auth/types.ts`) field-for-field.

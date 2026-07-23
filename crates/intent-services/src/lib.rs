@@ -14520,16 +14520,17 @@ impl WorkspaceApi for Services {
         &self,
         filter: Option<String>,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             let filter = linear_ops::parse_filter(filter)?;
             let engine = linear_ops::resolve_engine(injected).await?;
-            let issues = engine
-                .list_issues(filter, linear_ops::wire_limit(limit))
+            let page = engine
+                .list_issues(filter, linear_ops::wire_limit(limit), next_token.as_deref())
                 .await
                 .map_err(linear_ops::map_linear_err)?;
-            serde_json::to_value(issues)
+            serde_json::to_value(page)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
     }
@@ -14538,15 +14539,16 @@ impl WorkspaceApi for Services {
         &self,
         query: String,
         limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.linear_engine.clone();
         Box::pin(async move {
             let engine = linear_ops::resolve_engine(injected).await?;
-            let issues = engine
-                .search_issues(&query, linear_ops::wire_limit(limit))
+            let page = engine
+                .search_issues(&query, linear_ops::wire_limit(limit), next_token.as_deref())
                 .await
                 .map_err(linear_ops::map_linear_err)?;
-            serde_json::to_value(issues)
+            serde_json::to_value(page)
                 .map_err(|e| Error::Internal(format!("serialize result failed: {e}")))
         })
     }
