@@ -815,11 +815,17 @@ fn note_from_legacy_file(workspace: &Workspace, stem: &str, text: &str, path: &P
             }
         }
     });
-    let created_at = fm.created.unwrap_or_else(now_iso);
+    let created_at = fm
+        .created
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(now_iso);
     Note {
         id: NoteId::from(id.clone()),
         workspace_id: workspace.id.clone(),
-        title: fm.title.unwrap_or_else(|| stem.to_string()),
+        title: fm
+            .title
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| stem.to_string()),
         content: body.to_string(),
         content_type: ContentType::Markdown,
         tags: fm.tags,
@@ -2208,10 +2214,17 @@ mod tests {
             "bad-task.md",
             "---\nid: bad-task\ntitle: Bad task\ntask: \"not a mapping\"\n---\n\nBody here\n",
         );
+        // Empty `title:` / `created:` degrade to filename-derived title and
+        // a fresh timestamp rather than importing empty strings.
+        write_legacy_note(
+            &ws_dir,
+            "empties.md",
+            "---\nid: empties\ntitle: \"\"\ncreated: \"\"\n---\n\nEmpty meta body\n",
+        );
         let store = open_store().await;
 
         let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
-        assert_eq!(report.entries[0].notes.imported, 2, "{report}");
+        assert_eq!(report.entries[0].notes.imported, 3, "{report}");
         assert_eq!(report.entries[0].notes.failed, 0, "{report}");
 
         let ws_id = WorkspaceId::from("ws-bad-notes");
@@ -2229,6 +2242,14 @@ mod tests {
         assert_eq!(bad_task.title, "Bad task");
         assert_eq!(bad_task.content, "Body here\n");
         assert!(bad_task.metadata.task.is_none());
+
+        let empties = store
+            .get_note(&ws_id, &NoteId::from("empties"))
+            .await
+            .unwrap();
+        assert_eq!(empties.title, "empties");
+        assert!(!empties.created_at.is_empty());
+        assert_eq!(empties.created_at, empties.updated_at);
 
         std::fs::remove_dir_all(&root).ok();
     }

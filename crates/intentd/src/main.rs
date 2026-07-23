@@ -337,7 +337,8 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
 /// explicit `--root` or a store-open failure exits non-zero. A dry-run
 /// against a not-yet-created DB removes the freshly created DB file
 /// afterwards, so a later `serve` still sees a fresh DB and the first-boot
-/// auto-import still fires.
+/// auto-import still fires. Empty resolved roots (legacy import disabled)
+/// exit early without opening the store or writing the marker.
 async fn cmd_import_legacy(
     roots: Vec<PathBuf>,
     app_dir: Option<PathBuf>,
@@ -356,6 +357,14 @@ async fn cmd_import_legacy(
         }
         roots
     };
+    // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
+    // hermetic test harness) mean "legacy import disabled": return before
+    // touching the store so no app-level blobs land and no completion marker
+    // is written — consistent with `maybe_import_on_first_boot`.
+    if roots.is_empty() {
+        println!("legacy import disabled: no legacy roots to scan");
+        return Ok(());
+    }
     let app_dir = app_dir.or_else(legacy_import::default_app_dir);
     let db_existed = config.db_path.exists();
     let store = Store::open(&config.db_path)
