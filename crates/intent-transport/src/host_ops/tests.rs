@@ -387,16 +387,33 @@ fn tool_availability_op_honours_explicit_tool_list() {
 
 #[test]
 fn enhanced_path_dedups_and_appends_canonical_tool_dirs() {
-    let sep = path_separator();
-    let custom = "/opt/tools";
-    let input = format!("{custom}{sep}{custom}");
+    let custom = if cfg!(target_os = "windows") {
+        r"C:\intent-test-tools"
+    } else {
+        "/opt/tools"
+    };
+    let input = std::env::join_paths([custom, custom])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let enhanced = enhanced_path_from(&input);
-    let parts: Vec<&str> = enhanced.split(sep).collect();
+    let parts: Vec<PathBuf> = std::env::split_paths(&enhanced).collect();
     // The caller's entry comes first and appears exactly once (de-duplicated).
-    assert_eq!(parts[0], custom);
-    assert_eq!(parts.iter().filter(|p| **p == custom).count(), 1);
-    // A canonical system tool directory is merged in.
-    assert!(parts.contains(&"/usr/bin"));
+    assert_eq!(parts[0], PathBuf::from(custom));
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|p| **p == PathBuf::from(custom))
+            .count(),
+        1
+    );
+    // Every platform-specific essential system path is merged in.
+    for essential in essential_system_paths() {
+        assert!(
+            parts.contains(&PathBuf::from(&essential)),
+            "missing essential {essential}"
+        );
+    }
 }
 
 #[test]
