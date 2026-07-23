@@ -3896,8 +3896,17 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
                 continue;
             }
         };
-        if !ws_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
+        match ws_entry.file_type() {
+            Ok(t) if t.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %ws_entry.path().display(),
+                    "orphaned trash sweep: failed to read workspaces-root entry file type"
+                );
+                continue;
+            }
         }
         let ws_dir = ws_entry.path();
         let children = match std::fs::read_dir(&ws_dir) {
@@ -3931,8 +3940,17 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
             if !child.file_name().to_string_lossy().contains(".deleting-") {
                 continue;
             }
-            if !child.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
+            match child.file_type() {
+                Ok(t) if t.is_dir() => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %child.path().display(),
+                        "orphaned trash sweep: failed to read trash candidate file type"
+                    );
+                    continue;
+                }
             }
             let trash = child.path();
             match std::fs::remove_dir_all(&trash) {
@@ -3956,8 +3974,20 @@ fn sweep_orphaned_worktree_trash(root: &Path) -> usize {
         }
         // Only a workspace dir we actually swept trash from is a deletion
         // leftover; the empty-only `remove_dir` never touches live content.
+        // A non-empty dir (live sibling) or already-gone dir is expected.
         if swept_any {
-            let _ = std::fs::remove_dir(&ws_dir);
+            if let Err(e) = std::fs::remove_dir(&ws_dir) {
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %ws_dir.display(),
+                        "orphaned trash sweep: failed to remove emptied workspace dir"
+                    );
+                }
+            }
         }
     }
     removed
