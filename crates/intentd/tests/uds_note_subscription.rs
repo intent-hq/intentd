@@ -40,14 +40,28 @@ impl Drop for TempDb {
     }
 }
 
+/// Generous per-await deadline for every bounded wait in this file (each
+/// frame read, connect retry, subscriber-count poll gets its own window; it is
+/// not a whole-test cap). Under full-suite parallel load a scheduling/fsync
+/// stall can exceed several seconds (monorepo#601: the old fixed 2s windows
+/// tripped exactly there), so the deadline only bounds how long a genuinely
+/// broken run takes to fail — it never delays a passing run.
+const DEADLINE: Duration = Duration::from_secs(60);
+
 async fn connect_retry(socket: &PathBuf) -> UnixStream {
-    for _ in 0..100 {
-        if let Ok(s) = UnixStream::connect(socket).await {
-            return s;
+    // The whole retry loop (including any single hung connect attempt) is
+    // bounded by one `timeout`; `Timeout` polls the inner future before the
+    // deadline check, so a stall spanning a sleep still gets a final attempt.
+    timeout(DEADLINE, async {
+        loop {
+            if let Ok(s) = UnixStream::connect(socket).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("could not connect to {}", socket.display());
+    })
+    .await
+    .unwrap_or_else(|_| panic!("could not connect to {}", socket.display()))
 }
 
 async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
@@ -58,7 +72,7 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
+    let n = timeout(DEADLINE, reader.read_line(&mut line))
         .await
         .expect("timed out waiting for a frame")
         .expect("read failed");
@@ -67,16 +81,18 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
 }
 
 async fn wait_for_subscriber_count(bus: &EventBus, target: usize) {
-    for _ in 0..100 {
-        if bus.subscriber_count() == target {
-            return;
+    timeout(DEADLINE, async {
+        while bus.subscriber_count() != target {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "subscriber_count never reached {target} (last={})",
-        bus.subscriber_count()
-    );
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "subscriber_count never reached {target} (last={})",
+            bus.subscriber_count()
+        )
+    });
 }
 
 /// Issue one JSON-RPC request on a dedicated (non-subscribed) connection and
