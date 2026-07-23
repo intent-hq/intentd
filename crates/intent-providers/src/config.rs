@@ -34,7 +34,7 @@ pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 /// Pinned npx package spec for the codex ACP fallback. Matches the
 /// cloudlands-fe managed runtime pin (`MANAGED_CODEX_ACP_VERSION` in
 /// `codex-acp-manager.ts`); bumping the version is a deliberate code change.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@zed-industries/codex-acp@0.16.0";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@1.1.7";
 
 /// Pinned npx package spec the pi provider is ALWAYS spawned with (via
 /// `npx -y`). Mirrors the FE pin (`PI_ACP_NPX_PACKAGE` in `pi-resolver.ts`);
