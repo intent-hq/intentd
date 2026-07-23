@@ -267,8 +267,9 @@ async fn runtime_ws_listener_toggle_over_wss() {
         "settings.update port should succeed: {set_port}"
     );
 
-    // Verify initial system.status shows the WSS listener (started at boot)
-    let status = common::await_wss_status(&socket).await;
+    // Verify initial system.status shows the WSS listener (started at boot);
+    // single-shot on purpose — the readiness poll above already gated on the port
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
     let initial_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set at boot") as u16;
