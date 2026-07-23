@@ -1523,6 +1523,27 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
+    // Echo the parsed create params so the router tests can assert the
+    // optional `nameExplicitlySet` flag threads into
+    // `AgentCreateExtra.name_explicitly_set` (absent → null).
+    fn agent_create(
+        &self,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        _model: Option<String>,
+        _specialist_id: Option<String>,
+        _parent_agent_id: Option<AgentId>,
+        _idempotency_key: Option<String>,
+        extra: intent_core::AgentCreateExtra,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "agent": { "id": "agent-fake", "name": name, "workspaceId": workspace_id.as_str() },
+                "nameExplicitlySet": extra.name_explicitly_set,
+            }))
+        })
+    }
+
     // Echo the parsed rename params so the router tests can assert the
     // optional `skipIfExplicitlySet` flag is forwarded (P3-1.2b).
     fn agent_rename(
@@ -2024,6 +2045,71 @@ async fn agent_create_rejects_client_supplied_agent_id() {
             .contains("server-assigned"),
         "error message should say agent IDs are server-assigned: {v}"
     );
+}
+
+/// `agent.create` threads the optional `nameExplicitlySet` boolean into
+/// `AgentCreateExtra.name_explicitly_set`: omitted/null stays `None` (the
+/// service default `name.is_some()` holds) and a supplied bool is forwarded
+/// verbatim, so a placeholder name (`false`) stays self-renameable.
+#[tokio::test]
+async fn agent_create_forwards_name_explicitly_set() {
+    // Omitted → None (serialized as null by the echoing fake).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"agent.create","params":{"workspaceId":"ws-1","name":"A"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"]["nameExplicitlySet"].is_null(), "omitted: {v}");
+
+    // Explicit null → None as well.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{"workspaceId":"ws-1","name":"A","nameExplicitlySet":null}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v["result"]["nameExplicitlySet"].is_null(), "null: {v}");
+
+    // Supplied booleans forwarded verbatim.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{"workspaceId":"ws-1","name":"A","nameExplicitlySet":false}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["nameExplicitlySet"], serde_json::json!(false));
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{"workspaceId":"ws-1","name":"A","nameExplicitlySet":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["nameExplicitlySet"], serde_json::json!(true));
+}
+
+/// Non-boolean `nameExplicitlySet` values are rejected with `-32602` instead
+/// of being silently dropped (a drop would flip the persisted flag back to
+/// its `name.is_some()` default).
+#[tokio::test]
+async fn agent_create_rejects_non_boolean_name_explicitly_set() {
+    for (id, params) in [
+        (
+            1,
+            r#"{"workspaceId":"ws-1","name":"A","nameExplicitlySet":"false"}"#,
+        ),
+        (
+            2,
+            r#"{"workspaceId":"ws-1","name":"A","nameExplicitlySet":0}"#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.create","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "non-bool rejected: {v}");
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!("nameExplicitlySet must be a boolean")
+        );
+    }
 }
 
 /// Same guard for `workspace.create`: `initialAgent.agentId` is no longer
