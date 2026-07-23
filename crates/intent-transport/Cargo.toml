@@ -7,8 +7,8 @@ repository.workspace = true
 description = "UDS/TCP/TLS listeners, JSON-RPC router, auth, heartbeat, lifecycle (§16)"
 
 [dependencies]
-intent-core = { path = "../intent-core" }
-intent-services = { path = "../intent-services" }
+intent-core = { path = "../intent-core", version = "0.1.0" }
+intent-services = { path = "../intent-services", version = "0.1.0" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

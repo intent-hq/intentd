@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Git wrappers: status/stage/commit/branches and worktree create + lock"
 
 [dependencies]
-intent-core = { path = "../intent-core" }
+intent-core = { path = "../intent-core", version = "0.1.0" }
 git2 = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

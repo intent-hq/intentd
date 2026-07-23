@@ -7,7 +7,7 @@ repository.workspace = true
 description = "LinearEngine + DTOs for the linear.* surface (typed GraphQL over reqwest)"
 
 [dependencies]
-intent-core = { path = "../intent-core" }
+intent-core = { path = "../intent-core", version = "0.1.0" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -229,6 +229,13 @@ Because PRs are squash-merged, only the PR title survives as the commit title on
 `feat!: drop the legacy memories RPC`); a `BREAKING CHANGE:` footer buried in the
 squashed body is not a reliable signal.
 
+**One-time bootstrap**: release-plz replays `cargo package` against the latest tag to
+diff released contents, so it requires that tag's manifests to carry version specs on
+internal path dependencies. The existing `v0.2.0` tag predates those specs, so the first
+run on `main` fails until a release is cut manually once: bump `version` in
+`crates/intentd/Cargo.toml` (plus `Cargo.lock`), merge, and push the matching `vX.Y.Z`
+tag. Every subsequent release is fully automated.
+
 The workflow authenticates with the `RELEASE_PLZ_TOKEN` repository secret — a PAT with
 `contents` and `pull-requests` write access. It must be a PAT (not the default
 `GITHUB_TOKEN`) because tags pushed with `GITHUB_TOKEN` do not trigger other workflows,

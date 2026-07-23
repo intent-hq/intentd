@@ -7,17 +7,17 @@ repository.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core" }
-intent-store = { path = "../intent-store" }
-intent-git = { path = "../intent-git" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol" }
-intent-linear = { path = "../intent-linear" }
-intent-sentry = { path = "../intent-sentry" }
-intent-acp = { path = "../intent-acp" }
-intent-context = { path = "../intent-context" }
-intent-providers = { path = "../intent-providers" }
-intent-pty = { path = "../intent-pty" }
-intent-search = { path = "../intent-search" }
+intent-core = { path = "../intent-core", version = "0.1.0" }
+intent-store = { path = "../intent-store", version = "0.1.0" }
+intent-git = { path = "../intent-git", version = "0.1.0" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.1.0" }
+intent-linear = { path = "../intent-linear", version = "0.1.0" }
+intent-sentry = { path = "../intent-sentry", version = "0.1.0" }
+intent-acp = { path = "../intent-acp", version = "0.1.0" }
+intent-context = { path = "../intent-context", version = "0.1.0" }
+intent-providers = { path = "../intent-providers", version = "0.1.0" }
+intent-pty = { path = "../intent-pty", version = "0.1.0" }
+intent-search = { path = "../intent-search", version = "0.1.0" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 serde_json = { workspace = true }
