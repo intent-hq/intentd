@@ -629,6 +629,23 @@ fn chat_tool_delta_proposal_output_emits_standalone_resource_block() {
 }
 
 #[test]
+fn chat_tool_delta_errored_tool_with_proposal_output_emits_no_extra_block() {
+    // An errored tool must not surface an actionable ProposalCard, even when
+    // its output still carries a proposal-MIME resource item.
+    let mut s = ChatDeltaState::new(&agent());
+    let d = s
+        .tool_delta(&tool_event(
+            "msg-e",
+            "msg-e:0",
+            "tc-e",
+            "error",
+            Some(json!([proposal_output_item()])),
+        ))
+        .expect("tool errored delta");
+    assert_eq!(d["added"].as_array().unwrap().len(), 2, "use + result only");
+}
+
+#[test]
 fn chat_tool_delta_no_proposal_in_output_emits_no_extra_block() {
     let mut s = ChatDeltaState::new(&agent());
     let d = s

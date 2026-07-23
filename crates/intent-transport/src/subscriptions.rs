@@ -602,8 +602,9 @@ impl ChatDeltaState {
 
     /// Map an `agent:tool:call`: synthesize a `tool_use` block (and, once the call
     /// completes WITH output, a `tool_result` block — plus a standalone
-    /// proposal-resource block when the output carries a proposal-MIME resource
-    /// item, §7.1) matching the persisted `record_tool` shape (D6). The
+    /// proposal-resource block when a `completed` (not `error`) output carries
+    /// a proposal-MIME resource item, §7.1) matching the persisted
+    /// `record_tool` shape (D6). The
     /// `tool_result` block id is the `tool_use` index + 1 (it is appended right
     /// after) and the proposal block follows at + 2; a mispredicted id
     /// self-heals at the terminal reconcile via `removedIds`.
@@ -655,20 +656,25 @@ impl ChatDeltaState {
                 );
                 // §7.1: the same standalone proposal-resource block the
                 // persisted transcript appends right after the `tool_result`.
-                if let Some(item) = intent_services::tool_block::find_proposal_resource(output) {
-                    if let Some(proposal_id) = next_block_id(&result_id) {
-                        let proposal_block =
-                            intent_services::tool_block::build_proposal_resource_block(
-                                &proposal_id,
-                                item,
+                // Gated on `completed` only (matching `record_tool`) — an
+                // errored tool must not surface an actionable ProposalCard.
+                if status == "completed" {
+                    if let Some(item) = intent_services::tool_block::find_proposal_resource(output)
+                    {
+                        if let Some(proposal_id) = next_block_id(&result_id) {
+                            let proposal_block =
+                                intent_services::tool_block::build_proposal_resource_block(
+                                    &proposal_id,
+                                    item,
+                                );
+                            let prop_added = self.note_block(&proposal_id);
+                            push_entity(
+                                &mut added,
+                                &mut updated,
+                                prop_added,
+                                self.entity(&message_id, proposal_block, None, None, false),
                             );
-                        let prop_added = self.note_block(&proposal_id);
-                        push_entity(
-                            &mut added,
-                            &mut updated,
-                            prop_added,
-                            self.entity(&message_id, proposal_block, None, None, false),
-                        );
+                        }
                     }
                 }
             }
