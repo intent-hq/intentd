@@ -447,9 +447,12 @@ pub async fn run(store: &Store, opts: &Options) -> anyhow::Result<Report> {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
+        // `DirEntry::file_type()` does not follow symlinks, so a symlinked
+        // directory pointing outside the legacy root is never a candidate.
         let mut dirs: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_dir())
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
             .collect();
         dirs.sort();
         for dir in dirs {
@@ -2809,6 +2812,18 @@ mod tests {
             evil_ws.join("workspace.json"),
         )
         .unwrap();
+        // A symlinked workspace DIRECTORY pointing outside the root is never
+        // a discovery candidate either.
+        let outside_ws = temp_root("symlink-outside-ws");
+        let outside_ws_dir = outside_ws.join("ws-evil-dir");
+        let outside_meta = outside_ws_dir.join(".workspace");
+        std::fs::create_dir_all(&outside_meta).unwrap();
+        std::fs::write(
+            outside_meta.join("workspace.json"),
+            serde_json::to_string(&json!({ "id": "ws-evil-dir", "title": "Evil dir" })).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside_ws_dir, root.join("ws-evil-dir")).unwrap();
         let assets_root = temp_root("symlink-dest");
         let store = open_store().await;
 
@@ -2822,9 +2837,13 @@ mod tests {
         )
         .await
         .unwrap();
-        // The symlinked manifest never becomes a candidate: no report entry
-        // and no workspace row for it.
+        // The symlinked manifest/directory never become candidates: no report
+        // entries and no workspace rows for them.
         assert_eq!(report.entries.len(), 1, "{report}");
+        assert!(store
+            .get_workspace(&WorkspaceId::from("ws-evil-dir"))
+            .await
+            .is_err());
         let entry = &report.entries[0];
         assert_eq!(entry.id, "ws-symlink", "{report}");
         assert_eq!(entry.assets.imported, 1, "{report}");
@@ -2839,6 +2858,7 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+        std::fs::remove_dir_all(&outside_ws).ok();
         std::fs::remove_dir_all(&assets_root).ok();
     }
 
