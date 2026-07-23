@@ -2495,6 +2495,19 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
     // Claim the in-flight slot so the send preempts a busy (mid-turn) agent.
     assert!(mgr.try_begin(&id, &ws).await);
 
+    // Prime intent-core's process-wide login-shell PATH capture (OnceLock;
+    // on Unix the first use spawns `$SHELL -ilc`, up to 5s — a no-op
+    // elsewhere) so the requeued turn's `resolve_spawn` →
+    // `find_provider_binary` doesn't stall the 300ms event-collection gap
+    // window below. Called directly (not via `find_provider_binary`) so the
+    // priming can't short-circuit at an earlier resolution tier (e.g. an
+    // installed `~/.augment/bin/auggie`), and via `spawn_blocking` so the
+    // capture's blocking poll loop doesn't stall the test runtime's worker
+    // thread.
+    tokio::task::spawn_blocking(intent_core::path_utils::enhanced_path_dirs)
+        .await
+        .expect("prime enhanced PATH dirs");
+
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let result = mgr
         .interrupt_send_message(

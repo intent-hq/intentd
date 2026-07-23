@@ -107,10 +107,11 @@ fn gated_reason(provider: &ProviderConfig) -> Option<String> {
 /// order. Gated providers report `gated_off` and are not probed on `PATH`.
 /// npx-only providers (claude-code) are probed for `npx` availability instead
 /// of a local provider binary — there is no local-binary path for them.
-/// Providers with native installers (grok: `~/.grok/bin/grok`, opencode:
-/// `~/.opencode/bin/opencode`) prefer that location over the `PATH` scan
-/// because npm-global wrappers can emit update banners before real stdout
-/// (parity with `grok-resolver.ts` / `opencode-resolver.ts`).
+/// All other providers resolve through [`find_provider_binary`] so this
+/// aggregate surface and `host.providerAuthStatus` share one resolution
+/// precedence: native installer locations (grok `~/.grok/bin`, opencode
+/// `~/.opencode/bin`), then `~/.augment/bin`, then the enhanced PATH scan
+/// (inherited PATH + enriched tool dirs + login-shell capture).
 pub fn discover_providers() -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
@@ -121,8 +122,7 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             } else if provider.npx_only_package.is_some() {
                 find_npx()
             } else {
-                find_provider_native_binary(provider.id, provider.command)
-                    .or_else(|| resolve_on_path(provider.command))
+                find_provider_binary(provider.id, provider.command, None)
             };
             ProviderAvailability {
                 id: provider.id,
@@ -155,11 +155,11 @@ pub fn probe_npx() -> NpxStatus {
 /// 1. Explicit path from `providers.paths` map (keyed by provider ID)
 /// 2. Native installer location (grok: `~/.grok/bin`, opencode: `~/.opencode/bin`)
 /// 3. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
-/// 4. Scan enhanced PATH directories
+/// 4. Scan enhanced PATH directories (`intent_core::path_utils`: inherited
+///    PATH + enriched tool dirs + login-shell PATH capture)
 ///
-/// Returns `None` when the binary cannot be resolved. Reuses the discovery
-/// logic from `intent_context::discovery` but generalized for all providers.
-/// The `provider_id` is used for logging when an explicit path is invalid.
+/// Returns `None` when the binary cannot be resolved. The `provider_id` is
+/// used for logging when an explicit path is invalid.
 pub fn find_provider_binary(
     provider_id: &str,
     command: &str,
@@ -240,13 +240,6 @@ fn native_install_candidates(home: &std::path::Path, dot_dir: &str, command: &st
     candidates
 }
 
-/// Resolve a provider's native installer binary (e.g. `~/.grok/bin/grok`,
-/// `~/.opencode/bin/opencode`), or `None` when the provider has no native
-/// tier or the binary is absent.
-fn find_provider_native_binary(provider_id: &str, command: &str) -> Option<PathBuf> {
-    find_provider_native_binary_in(provider_id, command, &home_dir()?)
-}
-
 /// Resolve a provider's native installer binary under an explicit `home`
 /// (test seam — avoids mutating the process-global `HOME` in parallel tests).
 fn find_provider_native_binary_in(
@@ -298,13 +291,23 @@ fn is_executable_file(p: &std::path::Path) -> bool {
     }
 }
 
-/// Find the first executable for `command` by scanning enhanced PATH directories.
-/// Enhanced PATH includes inherited PATH plus common node/npm/nvm locations
-/// (same discovery dirs as `intent_context::discovery::enhanced_path_dirs`).
+/// Find the first executable for `command` by scanning enhanced PATH directories
+/// from `intent_core::path_utils::enhanced_path_dirs()`: inherited PATH plus
+/// enriched tool dirs (node/npm/nvm/homebrew/volta/asdf, …) plus the cached
+/// login-shell PATH capture.
+///
+/// Blocking: this scans the filesystem, and on Unix the *first* per-process
+/// call can spawn `$SHELL -ilc` (up to 5s, then cached). Latency-sensitive
+/// async callers should prewarm or wrap in `spawn_blocking`.
 fn find_in_enhanced_dirs(command: &str) -> Option<PathBuf> {
-    let dirs = enhanced_path_dirs();
+    find_in_dirs(&intent_core::path_utils::enhanced_path_dirs(), command)
+}
+
+/// Find the first executable for `command` in `dirs`, in order (test seam —
+/// lets tests scan a controlled dir list without spawning a login shell).
+fn find_in_dirs(dirs: &[PathBuf], command: &str) -> Option<PathBuf> {
     let candidates = name_candidates(command);
-    for dir in &dirs {
+    for dir in dirs {
         for candidate in &candidates {
             let full = dir.join(candidate);
             if is_executable_file(&full) {
@@ -313,73 +316,6 @@ fn find_in_enhanced_dirs(command: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Build the ordered, de-duplicated list of directories to search (port of
-/// `getEnhancedPath` from `intent_context::discovery`).
-fn enhanced_path_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-    let push =
-        |d: PathBuf, dirs: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>| {
-            if !d.as_os_str().is_empty() && seen.insert(d.clone()) {
-                dirs.push(d);
-            }
-        };
-
-    // Inherited PATH first
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            push(dir, &mut dirs, &mut seen);
-        }
-    }
-
-    let home = home_dir();
-
-    if cfg!(windows) {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            push(PathBuf::from(&appdata).join("npm"), &mut dirs, &mut seen);
-        }
-        if let Some(h) = &home {
-            push(h.join(".npm-global"), &mut dirs, &mut seen);
-        }
-    } else {
-        for p in [
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-            "/usr/sbin",
-            "/sbin",
-            "/opt/homebrew/bin",
-            "/opt/homebrew/sbin",
-            "/usr/local/opt/node/bin",
-        ] {
-            push(PathBuf::from(p), &mut dirs, &mut seen);
-        }
-        if let Some(h) = &home {
-            for sub in [
-                [".npm-global", "bin"],
-                [".npm-packages", "bin"],
-                [".local", "bin"],
-                [".volta", "bin"],
-            ] {
-                push(h.join(sub[0]).join(sub[1]), &mut dirs, &mut seen);
-            }
-            push(h.join(".asdf").join("shims"), &mut dirs, &mut seen);
-        }
-    }
-
-    if let Some(h) = &home {
-        let nvm_dir = h.join(".nvm").join("versions").join("node");
-        if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
-            for entry in entries.flatten() {
-                push(entry.path().join("bin"), &mut dirs, &mut seen);
-            }
-        }
-    }
-
-    dirs
 }
 
 /// Resolve `npx` to an absolute path using the same enhanced PATH scanning that
@@ -664,6 +600,22 @@ mod find_provider_binary_tests {
             Some(native),
             "native tier must resolve without an explicit setting"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_dirs_scans_login_shell_style_dirs() {
+        // The enhanced scan must find binaries in dirs that only appear via
+        // the login-shell PATH capture (injected here as a controlled dir
+        // list — no real login shell is spawned, same seam pattern as
+        // `intent_core::path_utils` tests).
+        let login_dir = unique_temp_dir("login-shell-bin");
+        let bin = login_dir.join("opencode");
+        make_executable(&bin);
+
+        let dirs = vec![PathBuf::from("/nonexistent/first"), login_dir];
+        assert_eq!(find_in_dirs(&dirs, "opencode"), Some(bin));
+        assert_eq!(find_in_dirs(&dirs, "intent-test-absent-cmd"), None);
     }
 
     #[test]
