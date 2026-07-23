@@ -227,6 +227,25 @@ fn sha256_mismatch_is_rejected_and_nothing_installed() {
 }
 
 #[test]
+fn invalid_manifest_version_is_rejected_and_nothing_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    // Fresh install (no current version): a non-semver manifest version must
+    // be rejected before it becomes a `versions/` directory name.
+    let base_url = serve_release("../not-semver", b"evil bytes", false);
+
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    assert!(
+        matches!(err, UpdateError::InvalidManifestVersion { .. }),
+        "expected InvalidManifestVersion, got {err:?}"
+    );
+
+    assert!(installed_versions(&paths).is_empty());
+    assert_eq!(state::load(&paths.state_path).current_version, None);
+}
+
+#[test]
 fn network_down_is_a_soft_failure() {
     let dir = tempfile::tempdir().unwrap();
     let paths = paths_in(dir.path());

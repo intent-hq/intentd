@@ -123,6 +123,16 @@ impl Updater {
         let url = manifest::manifest_url(&self.base_url, channel);
         let bytes = self.fetch(&url, MANIFEST_TIMEOUT)?;
         let manifest = manifest::parse(&bytes)?;
+        // The manifest version becomes a directory name under `versions/` and
+        // the persisted `current_version`; reject anything that is not valid
+        // semver before it touches the filesystem (also covers the fresh
+        // install path, where `manifest_is_newer` below never runs).
+        semver::Version::parse(&manifest.version).map_err(|source| {
+            UpdateError::InvalidManifestVersion {
+                version: manifest.version.clone(),
+                source,
+            }
+        })?;
 
         let state = state::load(&self.paths.state_path);
         if let Some(current) = state.current_version.as_deref() {
