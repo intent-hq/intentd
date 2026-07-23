@@ -208,6 +208,13 @@ mod tests {
         assert_eq!(mode, 0o600, "log file must be owner-only");
         // Re-opening an existing file appends rather than failing.
         open_agent_log_file(&path).unwrap();
+        // A pre-existing file keeps its mode (no retroactive chmod).
+        let pre = dir.join("2026-07-15.log");
+        std::fs::write(&pre, "x").unwrap();
+        std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_agent_log_file(&pre).unwrap();
+        let pre_mode = std::fs::metadata(&pre).unwrap().permissions().mode() & 0o777;
+        assert_eq!(pre_mode, 0o644, "pre-existing file mode is untouched");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
