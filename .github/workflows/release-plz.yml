@@ -54,6 +54,11 @@ jobs:
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
+    # Run after the release job: on a Release-PR merge commit the tag must be
+    # pushed before release-pr computes the next version, or it races on tag
+    # visibility and can open a spurious Release PR. On ordinary commits the
+    # release job no-ops quickly, so the ordering costs nothing.
+    needs: release-plz-release
     if: ${{ github.repository_owner == 'intent-hq' }}
     concurrency:
       group: release-plz-pr-${{ github.ref }}
