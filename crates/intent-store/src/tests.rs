@@ -910,6 +910,58 @@ async fn comment_round_trip_update_delete_and_thread() {
     );
 }
 
+/// `update_comment` must not drop legacy/unknown `extra_json` keys preserved
+/// by `insert_comment_with_extras` (legacy importer): the update rebuilds the
+/// known fields but carries unknown keys over from the existing row.
+#[tokio::test]
+async fn comment_update_preserves_legacy_extra_keys() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+
+    let c1 = sample_comment(&note.id, "thread-1", "c1");
+    let mut legacy = serde_json::Map::new();
+    legacy.insert("legacyMarkId".to_string(), json!("mark-7"));
+    legacy.insert("legacyRev".to_string(), json!(3));
+    // Wrong-typed legacy isOrphaned preserved verbatim by the importer.
+    legacy.insert("isOrphaned".to_string(), json!("yes"));
+    store
+        .insert_comment_with_extras(&ws_id, &c1, &legacy)
+        .await
+        .expect("insert with extras");
+
+    let mut updated = c1.clone();
+    updated.status = CommentStatus::Resolved;
+    store
+        .update_comment(&ws_id, &updated)
+        .await
+        .expect("update c1");
+
+    // Known fields round-trip through the wire-facing Comment...
+    let reread = store.get_comment("c1").await.expect("reget c1");
+    assert_eq!(reread.status, CommentStatus::Resolved);
+    assert_eq!(reread.anchor_before, c1.anchor_before);
+    // ...and the raw extra_json blob still carries the legacy keys.
+    let row = sqlx::query("SELECT extra_json FROM comment WHERE id = 'c1'")
+        .fetch_one(store.read_pool())
+        .await
+        .expect("raw extra_json");
+    let raw: Option<String> = sqlx::Row::get(&row, "extra_json");
+    let blob: serde_json::Value =
+        serde_json::from_str(&raw.expect("extra_json present")).expect("valid json");
+    assert_eq!(blob["legacyMarkId"], json!("mark-7"));
+    assert_eq!(blob["legacyRev"], json!(3));
+    // The non-bool isOrphaned survives updates too, even though the key is
+    // otherwise store-owned.
+    assert_eq!(blob["isOrphaned"], json!("yes"));
+}
+
 /// Store-layer defense-in-depth for comment mutations: UPDATE/DELETE and
 /// `set_thread_status` all scope by `(id, workspace_id)`, so a caller
 /// declaring workspace B cannot mutate a comment row that belongs to
@@ -1558,6 +1610,66 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
+}
+
+/// `insert_agent_session_with_messages` persists the session and its whole
+/// transcript in one transaction: on success everything lands with 0-based
+/// monotonic seq, and on failure (duplicate session id) NOTHING lands — no
+/// session row and no message rows (the legacy importer's retry-safety
+/// contract).
+#[tokio::test]
+async fn agent_session_with_messages_is_atomic() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let agent_id = AgentId::from("agent-cccccccc-1111-2222-3333-444444444444");
+    let metadata = json!({ "source": "legacy" });
+    let contents = [
+        json!([{ "type": "text", "text": "hi" }]),
+        json!([{ "type": "text", "text": "yo" }]),
+    ];
+    let rows = vec![
+        crate::ReplaceMessage {
+            role: "user",
+            content: &contents[0],
+            metadata: Some(&metadata),
+            created_at: "t0",
+        },
+        crate::ReplaceMessage {
+            role: "assistant",
+            content: &contents[1],
+            metadata: None,
+            created_at: "t1",
+        },
+    ];
+    store
+        .insert_agent_session_with_messages(&sample_agent_session(&agent_id, &ws), &rows)
+        .await
+        .expect("insert with messages");
+
+    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[0].seq, 0);
+    assert_eq!(loaded.messages[0].role, "user");
+    assert_eq!(loaded.messages[0].metadata.as_ref(), Some(&metadata));
+    assert_eq!(loaded.messages[1].seq, 1);
+    assert!(loaded.messages[1].metadata.is_none());
+
+    // Re-inserting the same id fails wholesale: the original transcript is
+    // untouched and no extra rows landed.
+    let err = store
+        .insert_agent_session_with_messages(&sample_agent_session(&agent_id, &ws), &rows)
+        .await;
+    assert!(err.is_err());
+    assert_eq!(
+        store.count_agent_messages(&agent_id).await.expect("count"),
+        2
+    );
 }
 
 /// `get_agent_session_status` is the lightweight status-only accessor backing

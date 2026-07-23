@@ -27,6 +27,7 @@ use sqlx::Row;
 
 mod client;
 mod import;
+mod legacy_import;
 use client::rpc_call;
 
 /// Global guard for the file log writer thread. Must be kept alive for the
@@ -99,6 +100,28 @@ enum Command {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Import legacy per-directory Intent workspaces
+    /// (`<root>/<id>/.workspace/workspace.json`) into the SQLite store. Scans
+    /// `~/intent/workspaces`, `~/intent`, and `~/.workspaces` by default;
+    /// idempotent (ids already in the DB are skipped) and read-only toward the
+    /// source. The same module backs the automatic first-boot import in `serve`.
+    ImportLegacy {
+        /// Scan only these directories instead of the default legacy roots
+        /// (repeatable: `--root a --root b`; each must exist).
+        #[arg(long)]
+        root: Vec<PathBuf>,
+        /// Legacy Electron app-level dir holding `config.json` /
+        /// `repo-registry.json`; defaults to the platform userData dir.
+        #[arg(long)]
+        app_dir: Option<PathBuf>,
+        /// Print the per-workspace plan without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-run even when the completion marker is already set, and update
+        /// rows whose workspace id already exists instead of skipping.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print WSS pairing credentials (bearer token + TLS fingerprint); --rotate
     /// regenerates the token.
     Token {
@@ -149,6 +172,12 @@ async fn main() -> ExitCode {
         Command::Doctor => cmd_doctor().await,
         Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
         Command::Import { from } => to_exit(cmd_import(&from).await),
+        Command::ImportLegacy {
+            root,
+            app_dir,
+            dry_run,
+            force,
+        } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
         Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
         #[cfg(feature = "js-engine")]
@@ -294,6 +323,112 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let summary = import::run(&store, from).await?;
     println!("{summary}");
+    Ok(())
+}
+
+/// Import legacy per-directory Intent workspaces into the configured SQLite
+/// store. `--root` (repeatable) narrows the scan to explicit directories
+/// (each must exist); otherwise the default legacy roots are scanned. When
+/// the completion marker is already set, the run is skipped unless `--force`
+/// or `--dry-run` is passed. A non-dry-run run always ends by rewriting the
+/// marker — even when every workspace was skipped or failed softly (the run
+/// itself "completed"; `--force` re-runs to retry problem workspaces).
+/// Per-workspace problems are soft (reported, exit 0); only an unusable
+/// explicit `--root` or a store-open failure exits non-zero. A dry-run
+/// against a not-yet-created DB removes the freshly created DB file
+/// afterwards, so a later `serve` still sees a fresh DB and the first-boot
+/// auto-import still fires. Empty resolved roots (legacy import disabled)
+/// exit early without opening the store or writing the marker.
+async fn cmd_import_legacy(
+    roots: Vec<PathBuf>,
+    app_dir: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    std::fs::create_dir_all(&config.data_dir)?;
+    let roots = if roots.is_empty() {
+        legacy_import::default_roots()
+    } else {
+        for dir in &roots {
+            if !dir.is_dir() {
+                anyhow::bail!("--root is not a directory: {}", dir.display());
+            }
+        }
+        roots
+    };
+    // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
+    // hermetic test harness) mean "legacy import disabled": return before
+    // touching the store so no app-level blobs land and no completion marker
+    // is written — consistent with `maybe_import_on_first_boot`.
+    if roots.is_empty() {
+        println!("legacy import disabled: no legacy roots to scan");
+        return Ok(());
+    }
+    let app_dir = app_dir.or_else(legacy_import::default_app_dir);
+    let db_existed = config.db_path.exists();
+    let store = Store::open(&config.db_path)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Marker gate: a completed import is not repeated unless forced. Dry-run
+    // stays allowed (it writes nothing, so previewing is always safe).
+    if !dry_run && !force {
+        if let Some(at) = store
+            .get_setting(legacy_import::LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        {
+            println!(
+                "legacy import already completed at {at}; use --force to re-run \
+                 or --dry-run to preview"
+            );
+            return Ok(());
+        }
+    }
+    let report = legacy_import::run(
+        &store,
+        &legacy_import::Options {
+            roots,
+            dry_run,
+            force,
+            assets_root: Some(config.data_dir.join("assets")),
+            app_dir,
+        },
+    )
+    .await?;
+    println!("{report}");
+    if !dry_run {
+        // Marker write failure is a warning, not a command failure — the
+        // import itself completed (mirrors the first-boot hook in `serve`).
+        // Without the marker a later run/first-boot may re-import, which is
+        // safe: the import is idempotent.
+        if let Err(e) = legacy_import::write_completion_marker(&store).await {
+            eprintln!(
+                "warning: import completed but the completion marker could not \
+                 be written ({e}); a later run or first boot may re-import \
+                 (idempotent, existing rows are skipped)"
+            );
+        }
+    } else if !db_existed {
+        // Dry-run on a fresh install: don't leave behind the DB file that
+        // `Store::open` just created, or the first-boot auto-import in
+        // `serve` (gated on DB-file existence) would silently never fire.
+        store.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = config.db_path.as_os_str().to_owned();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: could not remove {} ({e}); delete it manually or the \
+                         first-boot auto-import in `serve` will not fire",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -458,9 +593,26 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
     let _pidfile = acquire_single_instance(&config).await?;
+    // Snapshot DB-file existence before `Store::open` creates it: the one-time
+    // legacy workspace import below fires only on a truly fresh database.
+    let db_existed = config.db_path.exists();
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // First-boot legacy workspace import: on a fresh DB with no completion
+    // marker, scan the legacy roots and import `.workspace/workspace.json`
+    // workspaces. Runs to completion inline after migrations (inside
+    // `Store::open`) and before any transport serves RPCs; it never fails
+    // startup, but a large legacy tree does delay this first boot (accepted
+    // one-time tradeoff — see `maybe_import_on_first_boot`).
+    legacy_import::maybe_import_on_first_boot(
+        &store,
+        db_existed,
+        legacy_import::default_roots(),
+        Some(config.data_dir.join("assets")),
+        legacy_import::default_app_dir(),
+    )
+    .await;
     // Spawn the periodic WAL checkpoint task (every 60s) to prevent unbounded
     // WAL growth when continuous readers hold long-lived transactions. Aborted
     // during shutdown before Store::close().

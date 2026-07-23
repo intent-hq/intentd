@@ -54,6 +54,46 @@ fn json_col_from_db(raw: Option<String>, name: &str) -> Result<Option<serde_json
     .transpose()
 }
 
+/// Bind the full 29-column `agent_session` insert value list onto `query`, in
+/// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
+/// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
+/// lives in one place.
+fn bind_session_insert<'q>(
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    s: &'q AgentSession,
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+    Ok(query
+        .bind(&s.id.0)
+        .bind(&s.workspace_id.0)
+        .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
+        .bind(&s.acp_session_id)
+        .bind(&s.name)
+        .bind(s.name_explicitly_set as i64)
+        .bind(&s.model)
+        .bind(&s.provider)
+        .bind(enum_to_db(&s.status)?)
+        .bind(s.is_active as i64)
+        .bind(&s.system_prompt)
+        .bind(&s.created_at)
+        .bind(&s.updated_at)
+        .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
+        .bind(&s.specialist)
+        .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
+        .bind(s.skip_auto_commit as i64)
+        .bind(&s.completion_report)
+        .bind(&s.completion_report_timestamp)
+        .bind(s.delegation_depth)
+        .bind(&s.initial_message)
+        .bind(json_col_to_db(&s.context_references)?)
+        .bind(json_col_to_db(&s.image_blocks)?)
+        .bind(s.is_background as i64)
+        .bind(encode_metadata(s.metadata.as_ref())?)
+        .bind(&s.sandbox_id)
+        .bind(&s.sandbox_path)
+        .bind(&s.sandbox_branch)
+        .bind(&s.stop_reason))
+}
+
 impl Store {
     /// Insert an agent-session row. `messages`/`stats` are not persisted here;
     /// append messages via [`Store::append_agent_message`].
@@ -68,36 +108,7 @@ impl Store {
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
              (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        sqlx::query(&sql)
-            .bind(&s.id.0)
-            .bind(&s.workspace_id.0)
-            .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
-            .bind(&s.acp_session_id)
-            .bind(&s.name)
-            .bind(s.name_explicitly_set as i64)
-            .bind(&s.model)
-            .bind(&s.provider)
-            .bind(enum_to_db(&s.status)?)
-            .bind(s.is_active as i64)
-            .bind(&s.system_prompt)
-            .bind(&s.created_at)
-            .bind(&s.updated_at)
-            .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
-            .bind(&s.specialist)
-            .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-            .bind(s.skip_auto_commit as i64)
-            .bind(&s.completion_report)
-            .bind(&s.completion_report_timestamp)
-            .bind(s.delegation_depth)
-            .bind(&s.initial_message)
-            .bind(json_col_to_db(&s.context_references)?)
-            .bind(json_col_to_db(&s.image_blocks)?)
-            .bind(s.is_background as i64)
-            .bind(encode_metadata(s.metadata.as_ref())?)
-            .bind(&s.sandbox_id)
-            .bind(&s.sandbox_path)
-            .bind(&s.sandbox_branch)
-            .bind(&s.stop_reason)
+        bind_session_insert(sqlx::query(&sql), s)?
             .execute(self.write_pool())
             .await
             .map_err(|e| {
@@ -116,6 +127,77 @@ impl Store {
                 }
             })?;
         Ok(())
+    }
+
+    /// Insert an agent-session row together with its full message log in ONE
+    /// write transaction: either the session and every message commit, or
+    /// nothing does. Messages get minted UUIDv7 ids and 0-based monotonic
+    /// `seq` values in slice order. Built for the legacy-transcript importer,
+    /// whose idempotency check is session-id presence — a partially-persisted
+    /// transcript would otherwise be skipped forever on re-runs. Uses
+    /// whole-transaction retry to absorb SQLITE_BUSY (code 5) during lock
+    /// upgrade (STAB-7).
+    pub async fn insert_agent_session_with_messages(
+        &self,
+        s: &AgentSession,
+        messages: &[ReplaceMessage<'_>],
+    ) -> Result<()> {
+        let pool = self.write_pool();
+        // Clone messages into owned data for the retry closure.
+        let owned_messages: Vec<(String, serde_json::Value, Option<serde_json::Value>, String)> =
+            messages
+                .iter()
+                .map(|m| {
+                    (
+                        m.role.to_string(),
+                        m.content.clone(),
+                        m.metadata.cloned(),
+                        m.created_at.to_string(),
+                    )
+                })
+                .collect();
+
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool.begin().await.map_err(|e| {
+                Error::Internal(format!("insert session with messages begin failed: {e}"))
+            })?;
+            let session_sql = format!(
+                "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            );
+            bind_session_insert(sqlx::query(&session_sql), s)?
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
+            let insert_sql =
+                format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
+            for (idx, (role, content, metadata, created_at)) in owned_messages.iter().enumerate() {
+                let content_json = serde_json::to_string(content)
+                    .map_err(|e| Error::Internal(format!("encode message content failed: {e}")))?;
+                let metadata_json = match metadata {
+                    Some(md) => Some(serde_json::to_string(md).map_err(|e| {
+                        Error::Internal(format!("encode message metadata failed: {e}"))
+                    })?),
+                    None => None,
+                };
+                sqlx::query(&insert_sql)
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(&s.id.0)
+                    .bind(idx as i64)
+                    .bind(role)
+                    .bind(&content_json)
+                    .bind(metadata_json.as_deref())
+                    .bind(created_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
+            }
+            tx.commit().await.map_err(|e| {
+                Error::Internal(format!("insert session with messages commit failed: {e}"))
+            })?;
+            Ok(())
+        })
+        .await
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
