@@ -398,7 +398,16 @@ async fn cmd_import_legacy(
         for suffix in ["", "-wal", "-shm"] {
             let mut path = config.db_path.as_os_str().to_owned();
             path.push(suffix);
-            let _ = std::fs::remove_file(PathBuf::from(path));
+            let path = PathBuf::from(path);
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: could not remove {} ({e}); delete it manually or the \
+                         first-boot auto-import in `serve` will not fire",
+                        path.display()
+                    );
+                }
+            }
         }
     }
     Ok(())
