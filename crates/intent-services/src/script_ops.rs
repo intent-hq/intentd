@@ -34,7 +34,10 @@ const AUTO_RESTART_DELAY: Duration = Duration::from_millis(1000);
 /// Max consecutive auto-restarts for a service (mirrors `AUTO_RESTART_MAX_RETRIES`).
 const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 /// A run shorter than this is treated as a config error — do not auto-restart.
-const TOO_FAST_MS: u128 = 2000;
+/// The production floor; tests can raise it via
+/// [`Services::with_script_too_fast_ms`](crate::Services) so the decision is
+/// load-independent (monorepo#514).
+pub(crate) const TOO_FAST_MS: u128 = 2000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
@@ -97,6 +100,9 @@ pub(crate) struct ScriptManager {
     store: Store,
     scripts: ScriptRegistry,
     bootstrap_locks: WorkspaceScriptLocks,
+    /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
+    /// tests inject a larger floor so the decision is load-independent).
+    too_fast_ms: u128,
 }
 
 impl ScriptManager {
@@ -107,6 +113,7 @@ impl ScriptManager {
         store: Store,
         scripts: ScriptRegistry,
         bootstrap_locks: WorkspaceScriptLocks,
+        too_fast_ms: u128,
     ) -> Self {
         Self {
             pty,
@@ -114,6 +121,7 @@ impl ScriptManager {
             store,
             scripts,
             bootstrap_locks,
+            too_fast_ms,
         }
     }
 
@@ -596,7 +604,7 @@ impl ScriptManager {
             if stopped_by_user || def.mode != ScriptMode::Service {
                 break;
             }
-            if started.elapsed().as_millis() < TOO_FAST_MS {
+            if started.elapsed().as_millis() < self.too_fast_ms {
                 let ms = started.elapsed().as_millis();
                 self.emit_separator(
                     &ws,

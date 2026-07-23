@@ -260,6 +260,11 @@ pub struct Services {
     /// Shared across clones so all `ScriptManager` instances serialize bootstrap
     /// per workspace (modeled after `intent-git::WorktreeLocks`).
     script_bootstrap_locks: script_ops::WorkspaceScriptLocks,
+    /// The `script.*` too-fast-exit floor in milliseconds
+    /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via
+    /// [`with_script_too_fast_ms`](Self::with_script_too_fast_ms) so the
+    /// no-restart decision cannot flip under scheduler load (monorepo#514).
+    script_too_fast_ms: u128,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -419,6 +424,7 @@ impl Services {
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
+            script_too_fast_ms: script_ops::TOO_FAST_MS,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -624,7 +630,17 @@ impl Services {
             self.store.clone(),
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
+            self.script_too_fast_ms,
         )
+    }
+
+    /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
+    /// decision is independent of scheduler load (monorepo#514). Production
+    /// wiring keeps the [`script_ops::TOO_FAST_MS`] default.
+    #[cfg(test)]
+    pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
+        self.script_too_fast_ms = ms;
+        self
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
