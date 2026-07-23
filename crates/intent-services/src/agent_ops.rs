@@ -186,9 +186,12 @@ pub(crate) struct QueuedMessage {
     #[serde(default)]
     pub editing: bool,
     /// `true` when the user-message row already reached the transcript before
-    /// this entry was (re)queued — set by both the terminal-failure requeue
-    /// (STAB-112) and the interrupt zero-output requeue (STAB-114). Drain paths
-    /// skip `persist_user` for such entries so a retry does not duplicate the
+    /// this entry was (re)queued. The terminal-failure requeue (STAB-112)
+    /// carries the CONFIRMED durability of the pre-turn `persist_user` append
+    /// (STAB-51) — `false` when that append failed, so the retry drain
+    /// re-attempts it; the interrupt zero-output requeue (STAB-114) always
+    /// sets it (the row is read from the transcript). Drain paths skip
+    /// `persist_user` for such entries so a retry does not duplicate the
     /// user message in chat history.
     #[serde(default)]
     pub persisted: bool,

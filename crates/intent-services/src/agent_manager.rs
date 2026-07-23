@@ -2507,7 +2507,7 @@ impl AgentManager {
                 crate::agent_ops::agent_message_event_payload(&agent_id, &message),
             )
             .await;
-        self.spawn_worker(agent_id, workspace_id, content, options);
+        self.spawn_worker(agent_id, workspace_id, content, options, true);
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
     }
 
@@ -2582,9 +2582,13 @@ impl AgentManager {
                 self.services.queue_snapshot(&agent_id),
             )
             .await;
-        // Skip the transcript append for a terminal-failure requeue — its
-        // user row was already persisted before the failed turn began.
-        if !next.persisted {
+        // Skip the transcript append for a terminal-failure requeue whose
+        // user row already reached the transcript before the failed turn
+        // began; otherwise persist now and carry the durability outcome to
+        // the worker so a terminal failure requeues with the true state.
+        let user_persisted = if next.persisted {
+            true
+        } else {
             persist_user(
                 &self,
                 &agent_id,
@@ -2594,8 +2598,8 @@ impl AgentManager {
                 next.file_blocks.as_ref(),
                 next.message_metadata.as_ref(),
             )
-            .await;
-        }
+            .await
+        };
         // Queue-drained turns carry no per-turn prompt hints of their own,
         // but the FE-supplied attachments and `messageMetadata` captured at
         // enqueue time do ride along so the drained turn receives the same
@@ -2606,7 +2610,13 @@ impl AgentManager {
             message_metadata: next.message_metadata.clone(),
             ..TurnOptions::default()
         };
-        self.spawn_worker(agent_id, workspace_id, next.content, options);
+        self.spawn_worker(
+            agent_id,
+            workspace_id,
+            next.content,
+            options,
+            user_persisted,
+        );
     }
 
     /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
@@ -2645,7 +2655,7 @@ impl AgentManager {
             )
             .await?;
         self.try_begin(&agent_id, &workspace_id).await;
-        self.spawn_worker(agent_id, workspace_id, content, options);
+        self.spawn_worker(agent_id, workspace_id, content, options, true);
         Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
     }
 
@@ -2928,18 +2938,21 @@ impl AgentManager {
     }
 
     /// Spawn (and track) the background turn worker for an agent. The caller must
-    /// already hold the in-flight slot (`try_begin`).
+    /// already hold the in-flight slot (`try_begin`). `user_persisted` reports
+    /// whether the initial turn's user row durably reached the transcript, so a
+    /// terminal-failure requeue carries the true durability state (STAB-51).
     fn spawn_worker(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         content: String,
         options: TurnOptions,
+        user_persisted: bool,
     ) {
         let mgr = self.clone();
         let id = agent_id.clone();
         let handle = tokio::spawn(async move {
-            run_message_worker(mgr, id, workspace_id, content, options).await;
+            run_message_worker(mgr, id, workspace_id, content, options, user_persisted).await;
         });
         self.workers.lock().unwrap().insert(agent_id, handle);
     }
@@ -3069,7 +3082,7 @@ impl AgentManager {
         content: String,
         options: TurnOptions,
     ) {
-        self.spawn_worker(agent_id, workspace_id, content, options);
+        self.spawn_worker(agent_id, workspace_id, content, options, true);
     }
 
     /// Release an in-flight slot claimed via [`AgentManager::try_begin_turn`]
@@ -3969,6 +3982,7 @@ async fn run_message_worker(
     workspace_id: WorkspaceId,
     initial_content: String,
     initial_options: TurnOptions,
+    initial_persisted: bool,
 ) {
     let mut content = initial_content;
     // Only the first turn carries the caller's per-turn prompt-assembly hints
@@ -3977,6 +3991,10 @@ async fn run_message_worker(
     // at enqueue time and DO ride along on drain, so a queued turn reaches the
     // agent with the same ACP content blocks as if it had run inline.
     let mut options = initial_options;
+    // Whether the CURRENT turn's user row durably reached the transcript
+    // (STAB-51). Terminal spawn/turn failures thread it into the requeue so
+    // a failed pre-turn persist is re-attempted by the `agent.retry` drain.
+    let mut user_persisted = initial_persisted;
     'outer: loop {
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -4018,6 +4036,7 @@ async fn run_message_worker(
                             &workspace_id,
                             &content,
                             &options,
+                            user_persisted,
                             &e,
                         )
                         .await;
@@ -4047,6 +4066,7 @@ async fn run_message_worker(
                     &workspace_id,
                     &content,
                     &options,
+                    user_persisted,
                     &e,
                 )
                 .await;
@@ -4068,9 +4088,12 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            // A terminal-failure requeue was already persisted before its
-            // failed turn began — don't duplicate the user row on retry.
-            if !next.persisted {
+            // A terminal-failure requeue whose user row already reached the
+            // transcript before its failed turn began must not duplicate the
+            // row on retry; otherwise persist now and remember the outcome.
+            user_persisted = if next.persisted {
+                true
+            } else {
                 persist_user(
                     &mgr,
                     &agent_id,
@@ -4080,8 +4103,8 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                 )
-                .await;
-            }
+                .await
+            };
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -4110,7 +4133,9 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            if !next.persisted {
+            user_persisted = if next.persisted {
+                true
+            } else {
                 persist_user(
                     &mgr,
                     &agent_id,
@@ -4120,8 +4145,8 @@ async fn run_message_worker(
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
                 )
-                .await;
-            }
+                .await
+            };
             content = next.content;
             options = TurnOptions {
                 image_blocks: next_image_blocks,
@@ -4164,6 +4189,11 @@ async fn run_message_worker(
 /// content block should not diverge from its direct-send counterpart just
 /// because a dedup id rode along. Best-effort; a store or publish error is
 /// logged and the turn still proceeds.
+///
+/// Returns `true` when the user row was durably appended to the transcript,
+/// `false` when the store append failed (STAB-51). Callers thread the outcome
+/// into the terminal-failure requeue so `QueuedMessage.persisted` reflects
+/// confirmed durability and a failed append is re-attempted on `agent.retry`.
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -4172,7 +4202,7 @@ async fn persist_user(
     image_blocks: Option<&Value>,
     file_blocks: Option<&Value>,
     message_metadata: Option<&Value>,
-) {
+) -> bool {
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
     let block_md = message_metadata.and_then(|md| match md {
@@ -4223,9 +4253,11 @@ async fn persist_user(
                     crate::agent_ops::agent_message_event_payload(agent_id, &message),
                 )
                 .await;
+            true
         }
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "failed to persist queued user message");
+            false
         }
     }
 }
@@ -4401,13 +4433,15 @@ async fn publish_terminal_failure_events(
 /// `agent.sendMessage` — can redrive it. Shared by the terminal spawn- and
 /// turn-failure paths. The `error_text` argument is persisted into
 /// `agent_session.stop_reason` and included in the `agent:status-changed` event's
-/// `stopReason` field (durable-before-observable).
+/// `stopReason` field (durable-before-observable). `persisted` reports whether
+/// the failed turn's user row durably reached the transcript (STAB-51).
 async fn persist_error_and_requeue(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     content: &str,
     options: &TurnOptions,
+    persisted: bool,
     error_text: &str,
 ) {
     // Persist agent status as Error WITH stop_reason and emit agent:status-changed.
@@ -4449,11 +4483,12 @@ async fn persist_error_and_requeue(
         crate::publish_event(&mgr.services.event_bus, event).await;
     }
 
-    // Requeue the failed message to the front of the queue. `persisted` is
-    // set: the user row already reached the transcript before the failed
-    // turn began (send_message / drain persist before spawn_worker), so the
-    // retry drain must not append a duplicate. `requeued_after_failure` is
-    // set so the wire emits `requeuedAfterFailure: true` (STAB-112).
+    // Requeue the failed message to the front of the queue. `persisted`
+    // carries the CONFIRMED durability of the user row (STAB-51): `true` only
+    // when the pre-turn transcript append succeeded, so the retry drain skips
+    // the duplicate append; `false` when it failed, so the retry drain
+    // re-attempts it. `requeued_after_failure` is set so the wire emits
+    // `requeuedAfterFailure: true` (STAB-112).
     let queued = crate::agent_ops::QueuedMessage {
         id: new_message_id(),
         content: content.to_string(),
@@ -4461,7 +4496,7 @@ async fn persist_error_and_requeue(
         file_blocks: options.file_blocks.clone(),
         queued_at: now_iso(),
         editing: false,
-        persisted: true,
+        persisted,
         requeued_after_failure: true,
         message_metadata: options.message_metadata.clone(),
     };
@@ -4487,11 +4522,21 @@ async fn handle_terminal_spawn_failure(
     workspace_id: &WorkspaceId,
     content: &str,
     options: &TurnOptions,
+    persisted: bool,
     error: &Error,
 ) {
     let error_text = error.to_string();
     publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
-    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options, &error_text).await;
+    persist_error_and_requeue(
+        mgr,
+        agent_id,
+        workspace_id,
+        content,
+        options,
+        persisted,
+        &error_text,
+    )
+    .await;
 }
 
 /// Prefix `run_prompt_turn` wraps every post-prompt failure with (see
@@ -4580,6 +4625,7 @@ async fn handle_terminal_turn_failure(
     workspace_id: &WorkspaceId,
     content: &str,
     options: &TurnOptions,
+    persisted: bool,
     error: &Error,
 ) {
     // Tear down the (likely dead) child so the retry path spawns fresh. Safe
@@ -4590,7 +4636,16 @@ async fn handle_terminal_turn_failure(
     if !turn_failure_events_already_emitted(error) {
         publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
     }
-    persist_error_and_requeue(mgr, agent_id, workspace_id, content, options, &error_text).await;
+    persist_error_and_requeue(
+        mgr,
+        agent_id,
+        workspace_id,
+        content,
+        options,
+        persisted,
+        &error_text,
+    )
+    .await;
 }
 
 #[cfg(test)]

@@ -3440,6 +3440,193 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
     assert!(!session.is_active);
 }
 
+/// STAB-51 regression (intent-hq/monorepo#454): when the pre-turn
+/// `persist_user` append fails for a drained message, the terminal-failure
+/// requeue must carry `persisted: false` so the `agent.retry` drain
+/// re-attempts the append and the message lands in the transcript. Before the
+/// fix the requeue hard-coded `persisted: true`, so the retry skipped the
+/// persist and the user message never reached the transcript.
+#[tokio::test]
+async fn failed_drain_persist_is_reattempted_by_retry_drain() {
+    // Unset (and restore on drop) so every spawn fails terminally.
+    let _env = EnvGuard::unset("MOCK_AGENT_SCRIPT_PATH");
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-p51"), AgentId::from("a-p51"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    // Queue an unpersisted message, then hide the transcript table so the
+    // drain's pre-turn `persist_user` append fails.
+    mgr.services
+        .enqueue_message(&id, "boom".to_string(), None, None, None);
+    sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("hide agent_message table");
+
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    // Wait for the worker to hit the terminal spawn failure and exit. Poll
+    // the status-only read: the full session read joins the (hidden)
+    // transcript table.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let status = mgr
+                .services
+                .store
+                .get_agent_session_status(&id)
+                .await
+                .unwrap();
+            if status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker parks the session in error and exits");
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "failed message requeued for agent.retry"
+    );
+
+    // Restore the store, then retry: the drain must re-attempt the persist.
+    sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("restore agent_message table");
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+
+    // The retry turn fails terminally again (spawn still broken) and parks.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn parks the session in error and exits");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("boom"))
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "the drained message lands in the transcript exactly once: {messages:?}"
+    );
+}
+
+/// STAB-51 no-regression companion: when the pre-turn persist SUCCEEDED
+/// (direct `send_message` path), the terminal-failure requeue keeps
+/// `persisted: true` and the `agent.retry` drain must NOT append a duplicate
+/// user row.
+#[tokio::test]
+async fn successful_persist_is_not_duplicated_by_retry_drain() {
+    let _env = EnvGuard::unset("MOCK_AGENT_SCRIPT_PATH");
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-p51-ok"), AgentId::from("a-p51-ok"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "boom".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker parks the session in error and exits");
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn parks the session in error and exits");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("boom"))
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "retry must not duplicate an already-persisted user row: {messages:?}"
+    );
+}
+
 #[tokio::test]
 async fn send_message_queues_when_already_busy() {
     let (_tmp, mgr) = manager().await;
