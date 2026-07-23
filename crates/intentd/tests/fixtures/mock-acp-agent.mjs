@@ -9,9 +9,10 @@
 // state changes — NOT an in-process shortcut. Behavior is driven by the JSON in
 // MOCK_AGENT_BEHAVIOR: { toolCall: { name, arguments }, response }. An optional
 // `rules` array of prompt-matched variants ({ ifPromptContains, toolCall?,
-// toolCalls?, response?, delayMs? }) lets ONE behavior drive a delegating
-// parent and several distinct children (first matching rule wins; falls back
-// to the top-level behavior).
+// toolCalls?, response?, delayMs?, rawUpdates? }) lets ONE behavior drive a
+// delegating parent and several distinct children (first matching rule wins;
+// falls back to the top-level behavior). `rawUpdates` is an array of
+// session/update `update` objects echoed verbatim before the text response.
 import readline from 'node:readline';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -367,6 +368,16 @@ async function handlePrompt(id, params) {
   const delayMs = Number.isFinite(behavior.firstTurnDelayMs) ? behavior.firstTurnDelayMs : 0;
   if (delayMs > 0 && promptCount === 1) {
     await new Promise((r) => setTimeout(r, delayMs));
+  }
+
+  // Canned session/update sequence: each entry in active.rawUpdates is an
+  // `update` object echoed verbatim as a session/update notification. Lets a
+  // test drive exact tool_call / tool_call_update shapes (e.g. a completed
+  // tool whose rawOutput carries a proposal-MIME resource item) without a
+  // real MCP round-trip.
+  const rawUpdates = Array.isArray(active.rawUpdates) ? active.rawUpdates : [];
+  for (const update of rawUpdates) {
+    note('session/update', { sessionId: SESSION_ID, update });
   }
 
   // Emit text response

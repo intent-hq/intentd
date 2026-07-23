@@ -380,6 +380,24 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
         serde_json::to_string_pretty(&conversation).unwrap()
     );
 
+    // §7.1: the proposal resource is ALSO lifted into its own standalone
+    // top-level block right after the tool_result, so the FE can render a
+    // ProposalCard without digging through tool output.
+    let has_standalone_proposal_block = messages.iter().any(|msg| {
+        msg["contentBlocks"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "resource"
+                    && block["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+                    && block["id"].is_string()
+            })
+        })
+    });
+    assert!(
+        has_standalone_proposal_block,
+        "Standalone proposal resource block not found in persisted transcript: {}",
+        serde_json::to_string_pretty(&conversation).unwrap()
+    );
+
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
