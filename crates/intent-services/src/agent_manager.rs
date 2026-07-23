@@ -3027,9 +3027,14 @@ impl AgentManager {
                                 // `requeued_after_failure: false` so the FE does not show
                                 // "failed — will retry" (interrupt ≠ failure, STAB-114).
                                 // `queued_at` carries the interrupted user row's
-                                // ORIGINAL timestamp so the #576 staleness verdict
-                                // stays sticky across the requeue (an interrupted
-                                // stale redrive is still stale on redelivery).
+                                // `created_at` (best effort, #576): a direct send
+                                // interrupted after a mid-turn `reportToParent`
+                                // correctly classifies stale on redelivery. A drained
+                                // stale redrive's row was stamped at DRAIN time (after
+                                // `report_ts`), so its redelivery classifies fresh —
+                                // but the persisted `[SYSTEM NOTE]` annotation survives
+                                // in the row, so the duplicate-wake protection holds
+                                // either way.
                                 let queued = crate::agent_ops::QueuedMessage {
                                     id: crate::agent_ops::new_message_id(),
                                     content: text_content,
