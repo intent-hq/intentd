@@ -46,9 +46,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, AuthorType, Comment, CommentAnchor,
-    CommentAnchorType, CommentStatus, CommentType, ContentType, Error, Note, NoteId, NoteMetadata,
-    NoteVisibility, TaskMetadata, Workspace,
+    now_epoch_ms, now_iso, parse_iso, AgentId, AgentSession, AgentStatus, AuthorType, Comment,
+    CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType, Error, Note, NoteId,
+    NoteMetadata, NoteVisibility, TaskMetadata, Workspace,
 };
 use intent_store::Store;
 use serde::Deserialize;
@@ -229,6 +229,19 @@ impl Report {
 
     pub fn skipped(&self) -> usize {
         self.count(|o| matches!(o, Outcome::Skipped(_)))
+    }
+
+    /// Whether any workspace manifest could not be decoded into a workspace.
+    pub fn has_compatibility_failures(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                &entry.outcome,
+                Outcome::Skipped(reason)
+                    if reason.starts_with("workspace.json parse failed:")
+                        || reason.starts_with("invalid JSON in workspace.json:")
+                        || reason == "workspace.json is not a JSON object"
+            )
+        })
     }
 
     /// Total note rows inserted across all workspaces.
@@ -1525,6 +1538,23 @@ fn workspace_from_legacy_json(mut obj: Map<String, Value>) -> Result<Workspace, 
     ] {
         obj.entry(key).or_insert(default);
     }
+    if let Some(Value::String(script)) = obj.get("setupScript").cloned() {
+        let updated_at = obj
+            .get("updatedAt")
+            .and_then(|value| match value {
+                Value::Number(n) => n.as_u64(),
+                Value::String(s) => s.parse().ok().or_else(|| {
+                    parse_iso(s)
+                        .and_then(|dt| u64::try_from(dt.unix_timestamp_nanos() / 1_000_000).ok())
+                }),
+                _ => None,
+            })
+            .unwrap_or_else(now_epoch_ms);
+        obj.insert(
+            "setupScript".to_string(),
+            json!({ "script": script, "updatedAt": updated_at }),
+        );
+    }
     let mut ws: Workspace = serde_json::from_value(Value::Object(obj))
         .map_err(|e| format!("workspace.json parse failed: {e}"))?;
     if let Some(path) = &ws.worktree_path {
@@ -1697,7 +1727,8 @@ pub async fn write_completion_marker(store: &Store) -> anyhow::Result<()> {
 /// did not exist before `Store::open` AND no completion marker is set. Runs
 /// after migrations (inside `Store::open`) and before any transport serves
 /// RPCs. Never fails startup — every failure is logged and swallowed; the
-/// marker is written only when the run completes.
+/// marker is written only when the run completes without manifest compatibility
+/// failures.
 ///
 /// Empty `roots` (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the hermetic test
 /// harness) disables the hook entirely: it returns before reading the marker
@@ -1748,7 +1779,11 @@ pub async fn maybe_import_on_first_boot(
             for entry in &report.entries {
                 tracing::info!(id = %entry.id, outcome = ?entry.outcome, "legacy workspace");
             }
-            if let Err(e) = write_completion_marker(store).await {
+            if report.has_compatibility_failures() {
+                tracing::warn!(
+                    "first-boot legacy workspace import had compatibility failures; completion marker not written"
+                );
+            } else if let Err(e) = write_completion_marker(store).await {
                 tracing::warn!(error = %e, "legacy import marker write failed");
             }
         }
@@ -1856,6 +1891,39 @@ mod tests {
             .await
             .unwrap();
         assert!(b.archived);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn imports_legacy_string_setup_script_and_child_note() {
+        let root = temp_root("setup-script");
+        let ws_dir = write_legacy_workspace(
+            &root,
+            "ws-setup-script",
+            json!({"setupScript": "#!/bin/bash\nset -e\nnpm install\n"}),
+        );
+        write_legacy_note(
+            &ws_dir,
+            "extra.md",
+            "---\nid: extra\ntitle: Imported extra\n---\n\nChild note body\n",
+        );
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        assert_eq!(report.imported(), 1, "{report}");
+        assert_eq!(report.notes_imported(), 1, "{report}");
+
+        let ws_id = WorkspaceId::from("ws-setup-script");
+        let ws = store.get_workspace(&ws_id).await.unwrap();
+        let setup = ws.setup_script.expect("normalized setup script");
+        assert_eq!(setup.script, "#!/bin/bash\nset -e\nnpm install\n");
+        assert_eq!(setup.updated_at, 1_746_144_000_000);
+        let note = store
+            .get_note(&ws_id, &NoteId::from("extra"))
+            .await
+            .unwrap();
+        assert_eq!(note.content, "Child note body\n");
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2070,6 +2138,56 @@ mod tests {
         write_legacy_workspace(&root, "ws-later", json!({}));
         maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn first_boot_hook_does_not_write_marker_after_parse_failure() {
+        let root = temp_root("boot-parse-failure");
+        write_legacy_workspace(&root, "ws-good", json!({}));
+        write_legacy_workspace(&root, "ws-bad", json!({"setupScript": 42}));
+        let store = open_store().await;
+
+        maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
+
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 1);
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn second_run_recovers_parse_failure_and_skips_existing_workspace() {
+        let root = temp_root("parse-recovery");
+        write_legacy_workspace(&root, "ws-existing", json!({}));
+        write_legacy_workspace(&root, "ws-recovered", json!({"setupScript": 42}));
+        let store = open_store().await;
+
+        let first = run(&store, &opts(vec![root.clone()])).await.unwrap();
+        assert_eq!(first.imported(), 1, "{first}");
+        assert!(first.has_compatibility_failures(), "{first}");
+        write_completion_marker(&store).await.unwrap();
+
+        write_legacy_workspace(&root, "ws-recovered", json!({}));
+        let second = run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        assert_eq!(second.imported(), 1, "{second}");
+        assert_eq!(second.skipped(), 1, "{second}");
+        assert!(!second.has_compatibility_failures(), "{second}");
+        assert!(second.entries.iter().any(|entry| {
+            entry.id == "ws-existing"
+                && matches!(&entry.outcome, Outcome::Skipped(reason) if reason == "already in DB")
+        }));
+        assert!(second
+            .entries
+            .iter()
+            .any(|entry| entry.id == "ws-recovered" && entry.outcome == Outcome::Imported));
+        assert_eq!(store.list_workspaces(true).await.unwrap().len(), 2);
 
         std::fs::remove_dir_all(&root).ok();
     }

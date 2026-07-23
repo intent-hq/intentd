@@ -292,7 +292,7 @@ pub const METHOD_ALIASES: &[(&str, &str)] =
 
 /// Fast-path methods (intercepted before `router::dispatch`).
 ///
-/// These 30 methods are handled by dedicated fast-path modules (`events.rs`,
+/// These 31 methods are handled by dedicated fast-path modules (`events.rs`,
 /// `client.rs`, `drafts.rs`, `browser.rs`, `forward.rs`, `host.rs`, `control.rs`,
 /// `pairing.rs`) before reaching the main router. They share the same JSON-RPC
 /// envelope validation but are dispatched earlier in the connection task for
@@ -327,6 +327,7 @@ pub const FASTPATH_METHODS: &[&str] = &[
     "host.status",
     "host.toolAvailability",
     "pairing.getInfo",
+    "system.importLegacy",
     "system.shutdown",
     "system.status",
 ];
