@@ -384,3 +384,41 @@ async fn system_import_legacy_over_wss_rejects() {
         .contains("UDS only"));
     daemon.child.kill().ok();
 }
+
+#[tokio::test]
+async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
+    let data_dir = temp_data_dir();
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir).await;
+    let cfg = client_config(&fp);
+
+    // system.shutdown over WSS (TCP) is rejected with -32001 and must NOT
+    // tear the daemon down.
+    let frame =
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "system.shutdown", "params": {} }).to_string();
+    let response = wss_call(port, cfg.clone(), &frame).await;
+
+    assert_eq!(response["jsonrpc"], "2.0", "{response}");
+    assert_eq!(response["id"], 1, "{response}");
+    assert_eq!(response["error"]["code"], -32001, "{response}");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("UDS only"));
+
+    // A shutdown notification (no id) over WSS must be ignored too.
+    let notification = json!({ "jsonrpc": "2.0", "method": "system.shutdown" }).to_string();
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    ws.send(Message::Text(notification)).await.expect("send");
+
+    // The daemon is still alive: system.status over WSS still answers.
+    let status_frame =
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "system.status", "params": {} }).to_string();
+    let status = wss_call(port, cfg, &status_frame).await;
+    assert_eq!(status["result"]["running"], true, "{status}");
+
+    daemon.child.kill().ok();
+}

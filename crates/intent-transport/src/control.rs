@@ -165,7 +165,9 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
 
 /// Handle a classified `system.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `system.shutdown` triggers the
-/// graceful teardown before acknowledging.
+/// graceful teardown before acknowledging; like `system.importLegacy` it is
+/// UDS-only, so remote (TCP/WSS) callers get -32001 and remote shutdown
+/// notifications are ignored.
 pub(crate) async fn handle(
     req: SystemRequest,
     control: &dyn SystemControl,
@@ -174,6 +176,10 @@ pub(crate) async fn handle(
 ) -> Option<String> {
     let result: Result<Value, (i32, String)> = match req.method {
         SystemMethod::Status => Ok(status_json(&control.status(), is_local)),
+        SystemMethod::Shutdown if !is_uds => Err((
+            -32001,
+            "system.shutdown is available over UDS only".to_string(),
+        )),
         SystemMethod::Shutdown => {
             control.request_shutdown();
             Ok(json!({ "ok": true, "stopping": true }))
