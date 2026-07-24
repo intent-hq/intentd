@@ -10607,7 +10607,7 @@ impl WorkspaceApi for Services {
                 Some(s) => match parse_iso(s) {
                     Some(dt) => Some(dt),
                     None => {
-                        return Err(Error::Internal(format!(
+                        return Err(Error::InvalidParams(format!(
                             "Invalid 'since' timestamp: {s}. Must be ISO 8601 format."
                         )))
                     }
@@ -10616,14 +10616,14 @@ impl WorkspaceApi for Services {
             };
             if let Some(at) = author_type.as_deref() {
                 if at != "user" && at != "agent" {
-                    return Err(Error::Internal(format!(
+                    return Err(Error::InvalidParams(format!(
                         "Invalid 'authorType': {at}. Must be 'user' or 'agent'."
                     )));
                 }
             }
             if let Some(st) = status.as_deref() {
                 if !["open", "resolved", "pending"].contains(&st) {
-                    return Err(Error::Internal(format!(
+                    return Err(Error::InvalidParams(format!(
                         "Invalid 'status': {st}. Must be 'open', 'resolved', or 'pending'."
                     )));
                 }
@@ -10723,7 +10723,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
                 ));
             }
@@ -10939,7 +10939,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
                 ));
             }

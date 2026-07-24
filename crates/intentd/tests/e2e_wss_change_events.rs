@@ -1828,4 +1828,35 @@ async fn comment_respond_author_type_round_trips_over_wss() {
     )
     .await;
     assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    // The sibling caller-input validations on `comment.getThread` /
+    // `comment.resolveThread` (missing threadId AND commentId) and the
+    // `comment.list` filter checks also reject with -32602, not -32603
+    // (monorepo#649).
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        9,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        10,
+        "comment.resolveThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "resolved": true }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "authorType": "robot" }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
 }
