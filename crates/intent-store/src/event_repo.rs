@@ -8,7 +8,7 @@
 
 use intent_core::{ActorType, Error, Event, EventActor, Result, WorkspaceId};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{QueryBuilder, Row, Sqlite};
+use sqlx::{Connection, QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
 use crate::{enum_to_db, Store};
@@ -163,10 +163,18 @@ impl Store {
 
         match result {
             Ok(_) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("commit failed: {e}")))?;
+                if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                    // A failed COMMIT can leave the transaction open on the
+                    // pooled connection; roll back so it is not returned to
+                    // the pool still holding the write lock (monorepo#670).
+                    // If the ROLLBACK fails too, detach the connection from
+                    // the pool and close it so the poisoned handle is never
+                    // reused (the pool opens a fresh replacement on demand).
+                    if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
+                        let _ = conn.detach().close().await;
+                    }
+                    return Err(Error::Internal(format!("commit failed: {e}")));
+                }
             }
             Err(e) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
