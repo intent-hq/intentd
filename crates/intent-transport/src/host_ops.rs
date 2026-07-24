@@ -80,6 +80,33 @@ pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
 /// verbatim, like the FE `commonPaths` option) → OS-common directories.
 /// Returns the first existing absolute path, or `None`.
 pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option<PathBuf> {
+    resolve_binary_path_with_tool_dirs(name, common_paths, &path_utils::enriched_tool_dirs())
+}
+
+/// Test seam for [`resolve_binary_path`]: derives the enriched tool
+/// directories from an injected `home` (via
+/// [`path_utils::enriched_tool_dirs_with_home`]) instead of the real
+/// environment, so tests never mutate process-global `HOME`.
+#[cfg(test)]
+fn resolve_binary_path_with_home(
+    name: &str,
+    common_paths: &[String],
+    home: &Path,
+) -> Option<PathBuf> {
+    resolve_binary_path_with_tool_dirs(
+        name,
+        common_paths,
+        &path_utils::enriched_tool_dirs_with_home(Some(home)),
+    )
+}
+
+/// Core of [`resolve_binary_path`] with the enriched tool directories
+/// injected by the caller.
+fn resolve_binary_path_with_tool_dirs(
+    name: &str,
+    common_paths: &[String],
+    enriched_tool_dirs: &[PathBuf],
+) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }
@@ -97,7 +124,7 @@ pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option
         }
     }
     // 3. Enriched tool directories (hardcoded + login-shell PATH)
-    for dir in path_utils::enriched_tool_dirs() {
+    for dir in enriched_tool_dirs {
         let candidate = dir.join(binary_filename(name));
         if candidate.is_file() || candidate.is_symlink() {
             return Some(candidate);
