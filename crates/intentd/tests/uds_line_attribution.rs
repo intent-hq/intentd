@@ -56,7 +56,7 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(5), reader.read_line(&mut line))
+    let n = timeout(common::rpc_read_timeout(), reader.read_line(&mut line))
         .await
         .expect("timed out waiting for a frame")
         .expect("read failed");

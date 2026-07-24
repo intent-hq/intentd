@@ -126,7 +126,10 @@ async fn await_uds(socket: &PathBuf) -> bool {
     .is_ok()
 }
 
-/// One UDS JSON-RPC round-trip (one connection per call); returns the full frame.
+/// One UDS JSON-RPC round-trip (one connection per call); returns the full
+/// frame. The read is bounded by [`common::rpc_read_timeout`] — generous but
+/// bounded — so CPU contention from the parallel suite can't trip the wait
+/// while a hung daemon still fails deterministically (intent-hq/monorepo#615).
 async fn uds_rpc(socket: &PathBuf, id: i64, method: &str, params: Value) -> Value {
     let stream = UnixStream::connect(socket).await.expect("connect uds");
     let (read_half, mut write_half) = stream.into_split();
@@ -137,9 +140,10 @@ async fn uds_rpc(socket: &PathBuf, id: i64, method: &str, params: Value) -> Valu
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+    let budget = common::rpc_read_timeout();
+    timeout(budget, reader.read_line(&mut buf))
         .await
-        .expect("uds rpc timed out")
+        .unwrap_or_else(|_| panic!("uds rpc timed out after {budget:?}"))
         .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
@@ -448,12 +452,15 @@ async fn send_frame(write_half: &mut (impl AsyncWriteExt + Unpin), frame: Value)
     write_half.flush().await.unwrap();
 }
 
-/// Read one newline-delimited JSON frame (bounded by `secs`).
+/// Read one newline-delimited JSON frame, bounded by `secs` scaled through
+/// [`common::test_timeout`] so caller-supplied deadlines honor the
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER` budget.
 async fn read_frame(reader: &mut (impl AsyncBufReadExt + Unpin), secs: u64) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(secs), reader.read_line(&mut line))
+    let budget = common::test_timeout(Duration::from_secs(secs));
+    let n = timeout(budget, reader.read_line(&mut line))
         .await
-        .expect("timed out waiting for a frame")
+        .unwrap_or_else(|_| panic!("timed out waiting for a frame after {budget:?}"))
         .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")

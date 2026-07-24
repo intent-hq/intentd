@@ -47,6 +47,16 @@ pub fn daemon_startup_timeout() -> Duration {
     test_timeout(Duration::from_secs(60))
 }
 
+/// Shared budget for one RPC/frame read against a live daemon — UDS
+/// `read_line` responses, WSS `ws.next()` responses/events. Delegates to
+/// [`daemon_startup_timeout`] (60s base, scaled by
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`): the bound only guards against hangs —
+/// a healthy daemon answers in milliseconds — while absorbing CPU contention
+/// when the parallel suite saturates the machine (intent-hq/monorepo#615).
+pub fn rpc_read_timeout() -> Duration {
+    daemon_startup_timeout()
+}
+
 /// Return a unique, hermetic workspaces root under the OS temp dir.
 ///
 /// In-process integration tests must chain `.with_workspaces_root(...)` onto

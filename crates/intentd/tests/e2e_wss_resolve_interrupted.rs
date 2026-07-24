@@ -559,7 +559,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "resume": "not-an-array" }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
@@ -590,7 +590,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "abandon": 123 }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
@@ -621,7 +621,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "resume": ["valid-id", 123, "another-id"] }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
@@ -652,7 +652,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "resume": ["agent-1", "agent-2"], "abandon": ["agent-3"] }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
