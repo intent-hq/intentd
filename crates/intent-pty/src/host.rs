@@ -356,6 +356,12 @@ impl PtyHost {
 
     /// Wait until the PTY's child exits and return its status (ACP
     /// `terminal/wait_for_exit`). Polls the child rather than blocking a thread.
+    ///
+    /// Note: exit becomes observable as soon as the child is reaped, which can
+    /// be slightly before the reader has drained the last of its output into
+    /// scrollback (monorepo#587 makes that output eventually-complete rather
+    /// than lost). Callers reading scrollback right after `wait()` should poll
+    /// briefly rather than assume it is final.
     pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
         let session = self.get(id)?;
         loop {
@@ -486,7 +492,7 @@ impl PtyHost {
     }
 
     /// Whether the PTY's reader thread has finished (leak inspection).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reader_finished(&self, id: PtyId) -> bool {
         self.sessions.lock().unwrap().get(&id).map_or(true, |s| {
             s.reader
@@ -498,7 +504,7 @@ impl PtyHost {
     }
 
     /// Whether the parent-side slave fd is still held (leak inspection).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn slave_held(&self, id: PtyId) -> bool {
         self.sessions
             .lock()
@@ -510,7 +516,10 @@ impl PtyHost {
 
 /// Whether the PTY master has unread output pending in the kernel queue
 /// (POLLIN with a zero timeout). `false` once the reader has drained
-/// everything, or when the master is already torn down.
+/// everything, or when the master is already torn down. A poll error is
+/// reported as *pending*: prematurely declaring "drained" would close the
+/// held slave and could discard queued output (the exact loss this guards
+/// against), while over-reporting only costs up to `DRAIN_GRACE`.
 #[cfg(unix)]
 fn master_pending(session: &PtySession) -> bool {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
@@ -527,7 +536,7 @@ fn master_pending(session: &PtySession) -> bool {
         Ok(_) => fds[0]
             .revents()
             .is_some_and(|r| r.contains(PollFlags::POLLIN)),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
