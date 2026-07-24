@@ -264,10 +264,15 @@ impl Store {
 
         match result {
             Ok(rev) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("commit note+comment tx failed: {e}")))?;
+                if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                    // A failed COMMIT can leave the transaction open on the
+                    // pooled connection; roll back so it is not returned to
+                    // the pool still holding the write lock.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(Error::Internal(format!(
+                        "commit note+comment tx failed: {e}"
+                    )));
+                }
                 Ok(rev)
             }
             Err(e) => {
