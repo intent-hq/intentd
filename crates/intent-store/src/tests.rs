@@ -1572,10 +1572,10 @@ async fn insert_events_rolls_back_on_body_error() {
 }
 
 /// Finding F4: extended ephemeral-event retention sweep deletes high-volume
-/// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`) older
-/// than the cutoff while preserving lifecycle/tool/note/task/workspace events
-/// regardless of age. The sweep is idempotent and the legacy
-/// `delete_stream_events_before` alias still works.
+/// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
+/// `script:output`) older than the cutoff while preserving lifecycle/tool/
+/// note/task/workspace events regardless of age. The sweep is idempotent and
+/// the legacy `delete_stream_events_before` alias still works.
 #[tokio::test]
 async fn ephemeral_event_retention_sweep_extended_families() {
     let tmp = TempDb::new();
@@ -1602,11 +1602,13 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         typed_event(&ws, old, events::HOST_EXEC_STDOUT, agent.clone()),
         typed_event(&ws, old, events::HOST_EXEC_STDERR, agent.clone()),
         typed_event(&ws, old, events::HOST_EXEC_EXIT, agent.clone()),
+        typed_event(&ws, old, events::SCRIPT_OUTPUT, agent.clone()),
         // New ephemeral events (within TTL — must survive).
         typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
         typed_event(&ws, new, events::FILE_CHANGED, agent.clone()),
         typed_event(&ws, new, events::TERMINAL_DATA, agent.clone()),
         typed_event(&ws, new, events::HOST_EXEC_STDOUT, agent.clone()),
+        typed_event(&ws, new, events::SCRIPT_OUTPUT, agent.clone()),
         // Old non-ephemeral families (must NEVER be deleted regardless of age).
         typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
         typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
@@ -1614,6 +1616,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         typed_event(&ws, old, events::TASK_STATUS_CHANGED, agent.clone()),
         typed_event(&ws, old, events::TERMINAL_EXIT, agent.clone()), // not terminal:data
         typed_event(&ws, old, events::GIT_COMMIT, agent.clone()),
+        typed_event(&ws, old, events::SCRIPT_STATE, agent.clone()), // not script:output
     ];
     for ev in &seed {
         store.insert_event(ev).await.expect("insert seed event");
@@ -1626,8 +1629,8 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         .await
         .expect("sweep");
     assert_eq!(
-        removed, 10,
-        "10 old ephemeral events removed (3 stream + 3 file + 1 terminal + 3 host:exec)"
+        removed, 11,
+        "11 old ephemeral events removed (3 stream + 3 file + 1 terminal + 3 host:exec + 1 script:output)"
     );
 
     let remaining = store
@@ -1636,8 +1639,8 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         .expect("remaining");
     assert_eq!(
         remaining.len(),
-        10,
-        "4 new ephemeral + 6 preserved families"
+        12,
+        "5 new ephemeral + 7 preserved families"
     );
 
     // New ephemeral events survive.
@@ -1646,6 +1649,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         events::FILE_CHANGED,
         events::TERMINAL_DATA,
         events::HOST_EXEC_STDOUT,
+        events::SCRIPT_OUTPUT,
     ] {
         assert!(
             remaining
@@ -1663,12 +1667,36 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         events::TASK_STATUS_CHANGED,
         events::TERMINAL_EXIT,
         events::GIT_COMMIT,
+        events::SCRIPT_STATE,
     ] {
         assert!(
             remaining.iter().any(|e| e.event_type == t),
             "preserved family {t} missing"
         );
     }
+
+    // Explicit script:* assertions (monorepo#620): script:output is exact,
+    // not a prefix, so its lifecycle sibling script:state must be preserved.
+    // Stated directly rather than left to the count-based checks above so a
+    // future regression on either side is unambiguous.
+    assert!(
+        remaining
+            .iter()
+            .any(|e| e.event_type == events::SCRIPT_STATE && e.timestamp == old),
+        "script:state (old) must survive the ephemeral sweep"
+    );
+    assert!(
+        !remaining
+            .iter()
+            .any(|e| e.event_type == events::SCRIPT_OUTPUT && e.timestamp == old),
+        "old script:output must be pruned by the ephemeral sweep"
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|e| e.event_type == events::SCRIPT_OUTPUT && e.timestamp == new),
+        "new script:output (within TTL) must survive the ephemeral sweep"
+    );
 
     // Idempotent: a re-run with the same cutoff removes nothing more.
     let removed_again = store

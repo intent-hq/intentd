@@ -259,13 +259,14 @@ impl Store {
 
     /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
     /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
-    /// `host:exec:*`) whose `timestamp` is strictly older than `cutoff` (an
-    /// RFC-3339 string), and return the number of rows removed. Lifecycle/note/
-    /// task/workspace events are preserved regardless of age (`agent:tool:call`
-    /// has its own TTL via [`Store::delete_tool_call_events_before`]). This is
-    /// deliberately scoped to high-volume families that can be safely trimmed
-    /// so the log stays the source of truth for everything else. Each family is
-    /// deleted separately in index-driven chunks (see
+    /// `host:exec:*`, `script:output`) whose `timestamp` is strictly older
+    /// than `cutoff` (an RFC-3339 string), and return the number of rows
+    /// removed. Lifecycle/note/task/workspace events are preserved regardless
+    /// of age (`agent:tool:call` has its own TTL via
+    /// [`Store::delete_tool_call_events_before`]). This is deliberately scoped
+    /// to high-volume families that can be safely trimmed so the log stays the
+    /// source of truth for everything else. Each family is deleted separately
+    /// in index-driven chunks (see
     /// [`Store::delete_events_by_type_range_before`]) so no single write
     /// transaction holds the pool for long. Idempotent — a re-run with the same
     /// cutoff removes nothing more.
@@ -275,6 +276,10 @@ impl Store {
         // - file:* — file watcher events (finding F4: 87% of event table)
         // - terminal:data — live PTY output
         // - host:exec:* — streaming command output
+        // - script:output — script PTY output chunks (monorepo#620: same
+        //   live-output shape as terminal:data; was leaking pre-fix and
+        //   dominated the event table on long-lived daemons). Exact type,
+        //   not a `script:` prefix, so `script:state` (lifecycle) survives.
         let mut removed = 0;
         removed += self
             .delete_type_prefix_before(intent_core::events::AGENT_STREAM_PREFIX, cutoff)
@@ -284,6 +289,9 @@ impl Store {
             .delete_exact_type_before(intent_core::events::TERMINAL_DATA, cutoff)
             .await?;
         removed += self.delete_type_prefix_before("host:exec:", cutoff).await?;
+        removed += self
+            .delete_exact_type_before(intent_core::events::SCRIPT_OUTPUT, cutoff)
+            .await?;
         Ok(removed)
     }
 
