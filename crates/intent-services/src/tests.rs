@@ -8890,7 +8890,12 @@ mod script {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let batch = tokio::time::timeout(remaining, sub.recv())
                 .await
-                .expect("script event delivered")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "script event not delivered within {timeout:?}; output so far: {:?}",
+                        String::from_utf8_lossy(&data)
+                    )
+                })
                 .expect("subscription open");
             for ev in &batch {
                 let v = serde_json::to_value(ev).expect("serialize");
@@ -8995,25 +9000,28 @@ mod script {
     /// A service that exits faster than the too-fast floor is treated as a
     /// config error and is NOT auto-restarted (the ported backoff guard).
     ///
-    /// Load-independent (monorepo#514): the floor is raised far above any
-    /// plausible scheduling stall so the supervisor's wall-clock measurement of
-    /// the `echo` run can never legitimately cross it, and the test awaits the
-    /// supervisor's *positive* "Exited too quickly" separator (emitted right
-    /// before it stops supervising) instead of watching a fixed window for the
-    /// absence of a restart. A spurious restart still fails fast: the restart
+    /// Load-independent (monorepo#514, monorepo#623): the floor is injected as
+    /// `u128::MAX` so the supervisor's wall-clock measurement of the `echo` run
+    /// can never cross it — the no-restart decision is time-independent by
+    /// construction — and the test awaits the supervisor's *positive* "Exited
+    /// too quickly" separator (emitted right before it stops supervising)
+    /// instead of watching a fixed window for the absence of a restart. The
+    /// await deadline is purely liveness (real login-shell spawn + exit-poll +
+    /// bus delivery) and is kept far above any plausible multi-suite machine
+    /// stall (monorepo#623). A spurious restart still fails fast: the restart
     /// separator or a `running` state with `restartCount` >= 1 would arrive
     /// before the too-fast separator ever could.
     #[tokio::test]
     async fn service_too_fast_exit_does_not_restart() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(10 * 60 * 1000);
+        h.services = h.services.with_script_too_fast_ms(u128::MAX);
         let mut sub = subscribe(&h);
         let id = create(&h, "boom", "echo boom", ScriptMode::Service).await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(60), |v| {
+        drain_until(&mut sub, Duration::from_secs(300), |v| {
             if v["type"] == "script:state"
                 && v["data"]["status"] == "running"
                 && v["data"]["restartCount"].as_i64().unwrap_or(0) >= 1
