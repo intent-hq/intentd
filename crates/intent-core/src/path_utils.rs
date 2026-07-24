@@ -27,16 +27,14 @@ const PATH_START_SENTINEL: &str = "__INTENT_PATH_S__";
 const PATH_END_SENTINEL: &str = "__INTENT_PATH_E__";
 
 /// Capture PATH from the user's login shell (unix only, cached, short timeout).
-/// On failure (timeout, spawn error, no $SHELL, non-unix), returns an empty vec.
+/// On failure (timeout, spawn error, no shell, non-unix), returns an empty vec.
 /// Exposed for testing via an injectable shell path.
 #[cfg(unix)]
 fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
-    let shell = match shell {
-        Some(s) => s.to_string(),
-        None => match std::env::var("SHELL") {
-            Ok(s) if !s.is_empty() => s,
-            _ => return Vec::new(),
-        },
+    let inherited_shell = std::env::var_os("SHELL");
+    let shell = match resolve_login_shell(shell, inherited_shell.as_deref()) {
+        Some(shell) => shell,
+        None => return Vec::new(),
     };
 
     // Try interactive login shell first (-ilc), fall back to login shell (-lc)
@@ -47,6 +45,25 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
 
     // Fallback to non-interactive login shell
     try_capture_with_flags(&shell, &["-lc"]).unwrap_or_default()
+}
+
+/// Finder/launchd may omit `SHELL`, so macOS falls back to its standard login
+/// shell rather than silently discarding the user's shell-configured PATH.
+#[cfg(unix)]
+fn resolve_login_shell(
+    explicit: Option<&str>,
+    inherited: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    if let Some(shell) = explicit {
+        return (!shell.is_empty()).then(|| shell.to_string());
+    }
+    if let Some(shell) = inherited.filter(|shell| !shell.is_empty()) {
+        return Some(shell.to_string_lossy().into_owned());
+    }
+    if cfg!(target_os = "macos") {
+        return Some("/bin/zsh".to_string());
+    }
+    None
 }
 
 /// Helper to attempt PATH capture with specific shell flags.
@@ -365,6 +382,12 @@ mod tests {
     fn capture_login_shell_path_with_empty_shell_string_degrades_silently() {
         let dirs = capture_login_shell_path_with(Some(""));
         assert!(dirs.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn missing_shell_falls_back_to_macos_login_shell() {
+        assert_eq!(resolve_login_shell(None, None).as_deref(), Some("/bin/zsh"));
     }
 
     #[test]

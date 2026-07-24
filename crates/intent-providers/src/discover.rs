@@ -429,11 +429,16 @@ mod find_provider_binary_tests {
             Some(crate::config::CLAUDE_AGENT_ACP_NPX_PACKAGE),
             "claude-code availability must carry the pinned npx package"
         );
-        // Installed reflects npx availability, never a local claude-agent-acp
-        // binary; the resolved path (when present) is npx itself.
-        let npx = find_npx();
-        assert_eq!(cc.installed, npx.is_some());
-        assert_eq!(cc.resolved_path, npx);
+        // Assert against the single discovery snapshot: other tests temporarily
+        // rewrite process-global PATH, so resolving npx again here would race.
+        assert_eq!(cc.installed, cc.resolved_path.is_some());
+        if let Some(path) = &cc.resolved_path {
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("npx"));
+        }
     }
 
     #[test]
@@ -445,11 +450,16 @@ mod find_provider_binary_tests {
             Some(crate::config::PI_ACP_NPX_PACKAGE),
             "pi availability must carry the pinned npx package"
         );
-        // Installed reflects npx availability, never a local pi-acp binary;
-        // the resolved path (when present) is npx itself.
-        let npx = find_npx();
-        assert_eq!(pi.installed, npx.is_some());
-        assert_eq!(pi.resolved_path, npx);
+        // Assert against the same discovery snapshot to avoid racing tests that
+        // temporarily rewrite process-global PATH.
+        assert_eq!(pi.installed, pi.resolved_path.is_some());
+        if let Some(path) = &pi.resolved_path {
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("npx"));
+        }
     }
 
     #[test]

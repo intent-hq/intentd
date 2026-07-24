@@ -435,24 +435,25 @@ fn essential_system_paths() -> Vec<String> {
     }
 }
 
-/// Compute the "enhanced" PATH (mirrors the FE `getEnhancedPath`): the host
-/// PATH with the essential system directories merged in, de-duplicated and
-/// order-preserving (existing entries first, then any missing essentials).
+/// Compute the daemon's canonical enhanced PATH: inherited entries first, then
+/// common tool locations, the login-shell PATH, and platform essentials,
+/// de-duplicated in order.
 pub(crate) fn enhanced_path_from(current_path: &str) -> String {
-    let sep = path_separator();
-    let mut seen = std::collections::HashSet::new();
-    let mut ordered: Vec<String> = Vec::new();
-    for entry in current_path.split(sep).filter(|s| !s.is_empty()) {
-        if seen.insert(entry.to_string()) {
-            ordered.push(entry.to_string());
-        }
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in std::env::split_paths(current_path) {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
-    for entry in essential_system_paths() {
-        if seen.insert(entry.clone()) {
-            ordered.push(entry);
-        }
+    for dir in path_utils::enriched_tool_dirs() {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
-    ordered.join(&sep.to_string())
+    for dir in essential_system_paths() {
+        path_utils::push_dir(&mut dirs, &mut seen, PathBuf::from(dir));
+    }
+    std::env::join_paths(dirs)
+        .unwrap_or_else(|_| OsString::from(current_path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Resolve the host login shell (mirrors the FE `getLoginShellPath`): the
