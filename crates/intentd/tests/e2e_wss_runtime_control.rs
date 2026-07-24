@@ -131,16 +131,19 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
 /// Poll until new TCP connections to `port` are refused — the listener socket
 /// closes asynchronously after a `settings.update` disable clears the status
 /// port, so a single-shot connect can still succeed under load (monorepo#515).
+/// Only a connect *error* counts as refusal; an elapsed connect timeout is
+/// inconclusive (a stalled-but-live listener) and keeps polling.
 async fn await_tcp_refused(port: u16) {
     let budget = common::daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
+    let connect_budget = common::test_timeout(Duration::from_secs(2));
     loop {
         let connect = timeout(
-            Duration::from_secs(2),
+            connect_budget,
             TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
         )
         .await;
-        if connect.is_err() || connect.unwrap().is_err() {
+        if matches!(connect, Ok(Err(_))) {
             return;
         }
         assert!(

@@ -1086,8 +1086,11 @@ mod tests {
     const LIVENESS: Duration = Duration::from_secs(300);
     /// Service command lifetime long enough that a service under test cannot
     /// exit (and auto-restart, killing its PTY) mid-assertion under load
-    /// (monorepo#515). Every test that starts one stops or removes it.
-    const SERVICE_CMD: &str = "sleep 300";
+    /// (monorepo#515). Strictly outlives `LIVENESS` so negative checks bounded
+    /// by it (e.g. the upsert orphan `kill -0` poll) can still hard-fail on a
+    /// leaked process instead of the command exiting first. Every test that
+    /// starts one stops or removes it.
+    const SERVICE_CMD: &str = "sleep 3600";
 
     // ---- pure-helper tests (no PTY, no event bus) --------------------------
 

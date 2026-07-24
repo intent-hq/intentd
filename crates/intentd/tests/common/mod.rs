@@ -193,7 +193,10 @@ pub async fn await_wss_stopped(socket: &Path) {
         .await
         {
             Ok(resp) => {
-                if resp["result"]["port"].is_null() {
+                // Require a real success envelope: an error response also has
+                // a null `result.port` under serde_json indexing, but proves
+                // nothing about the listener.
+                if resp["result"].is_object() && resp["result"]["port"].is_null() {
                     return;
                 }
                 last = resp.to_string();

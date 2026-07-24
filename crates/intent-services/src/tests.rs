@@ -8914,8 +8914,10 @@ mod script {
     const LIVENESS: Duration = Duration::from_secs(300);
     /// Service lifetime long enough that a service under test cannot exit
     /// (and auto-restart, killing its PTY) before the post-wait assertions
-    /// run under load (monorepo#515). Every test that starts one stops it.
-    const KEEPALIVE: &str = "sleep 300";
+    /// run under load (monorepo#515). Strictly outlives `LIVENESS` so waits
+    /// bounded by it can never be outlived by the command exiting first.
+    /// Every test that starts one stops it.
+    const KEEPALIVE: &str = "sleep 3600";
 
     struct Harness {
         _tmp: TempDb,
