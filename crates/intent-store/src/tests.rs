@@ -10,6 +10,7 @@ use intent_core::{
     Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
+use sqlx::Row;
 
 use crate::{AgentQueueRow, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
@@ -1682,6 +1683,98 @@ async fn retention_delete_query_plan_uses_index() {
             "{name} plan must not full-scan the event table: {details:?}"
         );
     }
+}
+
+/// Disk-space reclamation: a freshly created database is in
+/// `auto_vacuum = INCREMENTAL` mode, pages emptied by retention deletes land
+/// on the freelist, and bounded `Store::incremental_vacuum` calls actually
+/// release them (freelist shrinks, logical page_count drops).
+#[tokio::test]
+async fn incremental_vacuum_releases_freelist_pages() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // New databases must be created in incremental auto-vacuum mode (2).
+    let auto_vacuum: i64 = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("query auto_vacuum")
+        .get(0);
+    assert_eq!(auto_vacuum, 2, "new DB should have auto_vacuum=INCREMENTAL");
+
+    // Seed enough bulky ephemeral events to allocate a meaningful number of
+    // pages (~4KB payload each, several hundred rows).
+    let payload = "x".repeat(4096);
+    let seed: Vec<NewEvent> = (0..300)
+        .map(|_| NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: events::TERMINAL_DATA.to_string(),
+            actor: agent.clone(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({ "chunk": payload }),
+        })
+        .collect();
+    for batch in seed.chunks(100) {
+        store.insert_events(batch).await.expect("insert batch");
+    }
+
+    let pages_before: i64 = sqlx::query("PRAGMA page_count")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("page_count before")
+        .get(0);
+
+    // Retention sweep deletes every seeded row; the emptied pages go to the
+    // freelist instead of being returned to the filesystem.
+    let removed = store
+        .delete_ephemeral_events_before("2027-01-01T00:00:00Z")
+        .await
+        .expect("sweep");
+    assert_eq!(removed, 300);
+    let freelist_after_delete = store.freelist_count().await.expect("freelist");
+    assert!(
+        freelist_after_delete > 0,
+        "deletes should leave pages on the freelist (got {freelist_after_delete})"
+    );
+
+    // A bounded call frees at most `max_pages` per invocation.
+    let freed_bounded = store.incremental_vacuum(8).await.expect("bounded vacuum");
+    assert!(
+        freed_bounded > 0 && freed_bounded <= 8,
+        "bounded incremental_vacuum should free 1..=8 pages (got {freed_bounded})"
+    );
+
+    // Draining the rest empties the freelist and shrinks the logical DB size.
+    let freed_rest = store
+        .incremental_vacuum(1_000_000)
+        .await
+        .expect("drain vacuum");
+    assert_eq!(
+        freed_bounded + freed_rest,
+        freelist_after_delete as u64,
+        "all freelist pages should be released"
+    );
+    assert_eq!(store.freelist_count().await.expect("freelist"), 0);
+
+    let pages_after: i64 = sqlx::query("PRAGMA page_count")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("page_count after")
+        .get(0);
+    assert!(
+        pages_after < pages_before,
+        "page_count should shrink after vacuum ({pages_before} -> {pages_after})"
+    );
 }
 
 fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {

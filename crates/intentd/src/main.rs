@@ -1925,12 +1925,24 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
 /// the in-memory bus — so 24h is comfortably conservative.
 const TOOL_CALL_RETENTION_HOURS: u32 = 24;
 
+/// Upper bound on pages released per `PRAGMA incremental_vacuum(N)` call in
+/// the retention loop. 2000 pages ≈ 8 MiB at the 4 KiB default page size —
+/// enough to keep up with sweep-driven churn while keeping each call short on
+/// the single-connection write pool. A large backlog (e.g. the dev seat's
+/// ~54k free pages) drains over successive ticks instead of one long stall.
+const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
+
 /// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
 /// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
 /// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
 /// `host:exec:*`) older than the TTL, plus `agent:tool:call` events older than
 /// [`TOOL_CALL_RETENTION_HOURS`], while preserving lifecycle/note/task/
-/// workspace events. The sweep interval is derived from the TTL (≈4×/TTL),
+/// workspace events. After the sweeps each tick runs a bounded
+/// `PRAGMA incremental_vacuum` ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to release
+/// freelist pages back to the filesystem (effective on incremental-auto-vacuum
+/// databases; a no-op otherwise — see `intent_store::connect_write` for the
+/// activation story) and `PRAGMA optimize` to keep planner statistics current.
+/// The sweep interval is derived from the TTL (≈4×/TTL),
 /// clamped so long TTLs still sweep periodically and short ones do not busy-loop.
 /// A failed sweep is logged and retried on the next tick (never aborts the loop).
 fn spawn_stream_retention_loop(
@@ -1977,6 +1989,19 @@ fn spawn_stream_retention_loop(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
+            }
+            match store.incremental_vacuum(INCREMENTAL_VACUUM_MAX_PAGES).await {
+                Ok(freed) if freed > 0 => {
+                    tracing::info!(
+                        pages_freed = freed,
+                        "incremental vacuum released freelist pages"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "incremental vacuum failed"),
+            }
+            if let Err(e) = store.optimize().await {
+                tracing::warn!(error = %e, "PRAGMA optimize failed");
             }
         }
     }))
@@ -2728,6 +2753,37 @@ async fn report_db_health(store: &Store) {
         Err(e) => {
             println!("  [WARN] wal_checkpoint failed: {}", e);
         }
+    }
+
+    // auto_vacuum / freelist: new databases are created with
+    // auto_vacuum=INCREMENTAL so the retention loop's bounded
+    // incremental_vacuum can release deleted pages. Existing databases stay
+    // in NONE mode until a one-time offline VACUUM — deliberately never run
+    // automatically (it blocks all writes) — so print the activation step.
+    let auto_vacuum = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.read_pool())
+        .await
+        .ok()
+        .and_then(|row| row.try_get::<i64, _>(0).ok());
+    let freelist = store.freelist_count().await;
+    match (auto_vacuum, &freelist) {
+        (Some(2), Ok(freelist)) => println!(
+            "  [ok] auto_vacuum: INCREMENTAL (freelist_count={} pages)",
+            freelist
+        ),
+        (Some(mode), Ok(freelist)) => {
+            let label = if mode == 1 { "FULL" } else { "NONE" };
+            println!(
+                "  [WARN] auto_vacuum: {} (freelist_count={} pages; deleted pages are not returned to the filesystem)",
+                label, freelist
+            );
+            if mode == 0 {
+                println!(
+                    "         one-time activation (daemon must be STOPPED): sqlite3 <db_path> \"PRAGMA auto_vacuum=INCREMENTAL; VACUUM;\""
+                );
+            }
+        }
+        _ => println!("  [WARN] auto_vacuum/freelist_count: failed to query"),
     }
 
     // Connection pool stats: report size and idle connections for both pools
