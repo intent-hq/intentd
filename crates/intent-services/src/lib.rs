@@ -14248,13 +14248,14 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            // Validate `filter` against the FE value set. The host-agnostic
-            // engine cannot express `@me` involvement for issues (v1
-            // limitation — that needs an involvement clause on `IssueQuery`);
-            // a free-text `query` routes through the engine's
-            // `GET /search/issues` path, and without one the search degrades
-            // to the repo-issue listing filtered by state.
-            let _ = github_ops::parse_pr_involvement(filter.as_deref())?;
+            // Validate `filter` against the issues value set from PROTOCOL §5
+            // (no PR-only `review-requested`). The host-agnostic engine
+            // cannot express `@me` involvement for issues (v1 limitation —
+            // that needs an involvement clause on `IssueQuery`); a free-text
+            // `query` routes through the engine's `GET /search/issues` path,
+            // and without one the search degrades to the repo-issue listing
+            // filtered by state.
+            github_ops::parse_issue_filter(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             let state = match state {
                 Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,
