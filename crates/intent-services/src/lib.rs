@@ -1601,12 +1601,11 @@ impl Services {
                     .get_pr(&repo_ref, number)
                     .await
                     .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive branch mismatch that
-                // is not rescued by a baseRef match (review workspaces link
-                // PRs whose head equals the workspace's `baseRef`, §7.6).
-                if pr_ops::pr_branch_mismatch(&pr, &ws.branch)
-                    && !pr_ops::matches_base_ref(&pr.source_branch, ws.base_ref.as_deref())
-                {
+                // Clear a stale link only on a positive mismatch against BOTH
+                // the workspace's branch and its baseRef (review workspaces
+                // link PRs whose head equals the workspace's `baseRef`, §7.6);
+                // unknown inputs never unlink.
+                if pr_ops::pr_workspace_mismatch(&pr, &ws.branch, ws.base_ref.as_deref()) {
                     ws.pr_number = None;
                     ws.pr_url = None;
                     ws.pr_status = None;

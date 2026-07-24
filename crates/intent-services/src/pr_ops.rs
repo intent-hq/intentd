@@ -168,14 +168,6 @@ pub(crate) fn pr_matches_branch(pr: &PullRequest, branch: &str) -> bool {
     !pr.source_branch.is_empty() && !branch.is_empty() && pr.source_branch == branch
 }
 
-/// True only on a POSITIVE mismatch: both branches are known (non-empty) and
-/// differ. An empty `source_branch` (e.g. a forge that omits it) is treated as
-/// "cannot determine" and never clears a link, mirroring the TS guard that only
-/// clears a stale link when the source branch is present and differs.
-pub(crate) fn pr_branch_mismatch(pr: &PullRequest, branch: &str) -> bool {
-    !pr.source_branch.is_empty() && !branch.is_empty() && pr.source_branch != branch
-}
-
 /// Port of the FE `baseref-matching.ts::matchesBaseRef` (§7.6): true when a
 /// PR's `source_branch` matches the workspace's `baseRef`. Raw equality always
 /// wins (covers plain branches and slashed local branches alike); when
@@ -204,6 +196,29 @@ pub(crate) fn matches_base_ref(pr_source_branch: &str, base_ref: Option<&str>) -
 /// matters (see [`discover_matching_open_pr`]).
 pub(crate) fn pr_matches_workspace(pr: &PullRequest, branch: &str, base_ref: Option<&str>) -> bool {
     pr_matches_branch(pr, branch) || matches_base_ref(&pr.source_branch, base_ref)
+}
+
+/// The §7.6 stale-unlink rule: true only on a POSITIVE mismatch against the
+/// whole workspace — the PR's `source_branch` is known, at least one of the
+/// workspace's `branch` / `baseRef` is known, and NEITHER matches. Unknown
+/// inputs (empty `source_branch`, or both `branch` and `baseRef` empty) are
+/// "cannot determine" and never clear a link, mirroring the TS guard that only
+/// clears a stale link when the source branch is present and differs; a
+/// branch-less workspace with a mismatching `baseRef` still unlinks.
+pub(crate) fn pr_workspace_mismatch(
+    pr: &PullRequest,
+    branch: &str,
+    base_ref: Option<&str>,
+) -> bool {
+    if pr.source_branch.is_empty() {
+        return false;
+    }
+    let branch_known = !branch.is_empty();
+    let base_ref_known = base_ref.is_some_and(|s| !s.is_empty());
+    if !branch_known && !base_ref_known {
+        return false;
+    }
+    !pr_matches_workspace(pr, branch, base_ref)
 }
 
 /// Port of the FE `getBaseRefMatchCandidates`: the head-query candidates for a
@@ -983,21 +998,6 @@ mod tests {
     }
 
     #[test]
-    fn branch_mismatch_only_on_positive_difference() {
-        let p = pr(PrState::Open, false, Some(true), Some("clean"));
-        // Same branch: no mismatch.
-        assert!(!pr_branch_mismatch(&p, "feat"));
-        // Different, both non-empty: positive mismatch.
-        assert!(pr_branch_mismatch(&p, "other"));
-        // Empty source branch: cannot determine → never a mismatch.
-        let mut empty = p.clone();
-        empty.source_branch = String::new();
-        assert!(!pr_branch_mismatch(&empty, "feat"));
-        // Empty workspace branch: cannot determine → never a mismatch.
-        assert!(!pr_branch_mismatch(&p, ""));
-    }
-
-    #[test]
     fn base_ref_matches_on_raw_equality() {
         // Mirrors `baseref-matching.test.ts`: plain and slashed local
         // branches match raw-equal, without any stripping.
@@ -1074,21 +1074,27 @@ mod tests {
     }
 
     #[test]
-    fn base_ref_match_prevents_stale_unlink() {
-        // The unlink rule is `pr_branch_mismatch && !matches_base_ref`: a PR
-        // whose head equals the workspace's `baseRef` (review workspace)
-        // stays linked despite a positive branch mismatch.
+    fn workspace_mismatch_unlinks_only_on_positive_dual_mismatch() {
+        // The unlink rule is `pr_workspace_mismatch`: a PR whose head equals
+        // the workspace's `baseRef` (review workspace) stays linked despite a
+        // positive branch mismatch.
         let p = pr(PrState::Open, false, Some(true), Some("clean"));
-        assert!(pr_branch_mismatch(&p, "review-ws"));
         assert!(matches_base_ref(&p.source_branch, Some("feat")));
-        let unlinks = pr_branch_mismatch(&p, "review-ws")
-            && !matches_base_ref(&p.source_branch, Some("feat"));
-        assert!(!unlinks);
+        assert!(!pr_workspace_mismatch(&p, "review-ws", Some("feat")));
         // A positive mismatch against BOTH still unlinks.
-        assert!(
-            pr_branch_mismatch(&p, "review-ws")
-                && !matches_base_ref(&p.source_branch, Some("main"))
-        );
+        assert!(pr_workspace_mismatch(&p, "review-ws", Some("main")));
+        // Branch-only workspaces keep the old branch-mismatch semantics.
+        assert!(pr_workspace_mismatch(&p, "review-ws", None));
+        assert!(!pr_workspace_mismatch(&p, "feat", None));
+        // A branch-less workspace with a mismatching baseRef still unlinks…
+        assert!(pr_workspace_mismatch(&p, "", Some("main")));
+        assert!(!pr_workspace_mismatch(&p, "", Some("feat")));
+        // …but fully-unknown inputs never do (cannot determine).
+        assert!(!pr_workspace_mismatch(&p, "", None));
+        assert!(!pr_workspace_mismatch(&p, "", Some("")));
+        let mut empty = p.clone();
+        empty.source_branch = String::new();
+        assert!(!pr_workspace_mismatch(&empty, "review-ws", Some("main")));
     }
 
     #[test]
