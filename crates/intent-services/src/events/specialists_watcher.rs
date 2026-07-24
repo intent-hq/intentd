@@ -106,7 +106,7 @@ fn watch_directory(
             // Only care about `<id>.md` files under the specialists root (the
             // watch may sit on an ancestor when the root does not exist yet).
             if event.paths.iter().any(|p| {
-                p.starts_with(&root) && p.extension().and_then(|e| e.to_str()) == Some("md")
+                p.extension().and_then(|e| e.to_str()) == Some("md") && path_within_root(p, &root)
             }) {
                 let _ = tx.send(SpecialistsEvent {
                     workspace_id: workspace_id.clone(),
@@ -143,6 +143,19 @@ fn canonical_root(root: &Path, ancestor: &Path) -> PathBuf {
         Ok(rest) => canonical_ancestor.join(rest),
         Err(_) => root.to_path_buf(),
     }
+}
+
+/// Whether an event path falls under the canonical specialists root. `notify`
+/// does not guarantee canonical paths across backends, so a raw prefix check
+/// is tried first and a best-effort canonicalization of the event path covers
+/// symlinked forms. Deleted paths cannot be canonicalized directly; they are
+/// rebased onto their nearest existing ancestor instead.
+fn path_within_root(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    let ancestor = find_existing_ancestor(path);
+    canonical_root(path, &ancestor).starts_with(root)
 }
 
 /// Default user-tier specialists directory (`~/.intent/specialists/`).
@@ -397,6 +410,37 @@ mod tests {
 
     fn specialist_md(name: &str, body: &str) -> String {
         format!("---\nname: \"{name}\"\ndescription: \"d\"\n---\n\n{body}")
+    }
+
+    #[test]
+    fn path_within_root_matches_canonical_and_foreign_paths() {
+        let dir = TempDir::new("pwr");
+        let root = dir.path.canonicalize().expect("canonicalize temp dir");
+        std::fs::write(root.join("a.md"), "x").expect("write file");
+
+        assert!(path_within_root(&root.join("a.md"), &root));
+        // Deleted files cannot be canonicalized; the ancestor-rebase fallback
+        // must still resolve them under the root.
+        assert!(path_within_root(&root.join("gone.md"), &root));
+        assert!(!path_within_root(Path::new("/elsewhere/a.md"), &root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_within_root_resolves_symlinked_event_paths() {
+        let dir = TempDir::new("pwr-sym");
+        let real = dir.path.join("real");
+        std::fs::create_dir_all(&real).expect("mk real dir");
+        let root = real.canonicalize().expect("canonicalize real dir");
+        std::fs::write(root.join("a.md"), "x").expect("write file");
+        let link = dir.path.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        // Non-canonical (symlink) event paths must match the canonical root,
+        // whether the file still exists (canonicalize) or was deleted
+        // (ancestor rebase).
+        assert!(path_within_root(&link.join("a.md"), &root));
+        assert!(path_within_root(&link.join("deleted.md"), &root));
     }
 
     #[tokio::test]
