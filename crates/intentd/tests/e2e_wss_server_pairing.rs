@@ -384,3 +384,66 @@ async fn system_import_legacy_over_wss_rejects() {
         .contains("UDS only"));
     daemon.child.kill().ok();
 }
+
+#[tokio::test]
+async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
+    let data_dir = temp_data_dir();
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    let (port, fp) = boot(&data_dir).await;
+    let cfg = client_config(&fp);
+
+    // system.shutdown over WSS (TCP) is rejected with -32001 and must NOT
+    // tear the daemon down.
+    let frame =
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "system.shutdown", "params": {} }).to_string();
+    let response = wss_call(port, cfg.clone(), &frame).await;
+
+    assert_eq!(response["jsonrpc"], "2.0", "{response}");
+    assert_eq!(response["id"], 1, "{response}");
+    assert_eq!(response["error"]["code"], -32001, "{response}");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("UDS only"));
+
+    // A shutdown notification (no id) over WSS must be ignored too: no
+    // response frame within a bounded window (non-text frames tolerated).
+    let notification = json!({ "jsonrpc": "2.0", "method": "system.shutdown" }).to_string();
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    ws.send(Message::Text(notification)).await.expect("send");
+    let unexpected = timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => return Some(text),
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await;
+    assert!(
+        !matches!(&unexpected, Ok(Some(_))),
+        "notification must get no response frame: {unexpected:?}"
+    );
+
+    // The daemon is still alive: system.status on the SAME connection still
+    // answers. Frames are processed in order, so the first text frame back
+    // (id 2) also proves the notification produced no earlier response.
+    let status_frame =
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "system.status", "params": {} }).to_string();
+    ws.send(Message::Text(status_frame)).await.expect("send");
+    let status: Value = loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => break serde_json::from_str(&text).expect("json"),
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    };
+    assert_eq!(status["id"], 2, "{status}");
+    assert_eq!(status["result"]["running"], true, "{status}");
+
+    daemon.child.kill().ok();
+}

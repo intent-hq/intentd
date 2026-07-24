@@ -164,6 +164,33 @@ async fn handle_notification_gets_no_response() {
 }
 
 #[tokio::test]
+async fn handle_shutdown_remote_rejects_with_uds_only_error() {
+    let control = FakeControl::new();
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 11, "method": "system.shutdown" })).unwrap();
+    let frame = handle(req, &control, false, false)
+        .await
+        .expect("remote shutdown gets an error response");
+    let parsed: Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(parsed["id"], 11);
+    assert_eq!(parsed["error"]["code"], -32001);
+    assert_eq!(
+        parsed["error"]["message"],
+        "system.shutdown is available over UDS only"
+    );
+    assert!(!control.shutdown_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn handle_shutdown_remote_notification_is_ignored() {
+    let control = FakeControl::new();
+    // A remote notification gets no frame back AND must not trigger shutdown.
+    let req = classify(&json!({ "jsonrpc": "2.0", "method": "system.shutdown" })).unwrap();
+    assert!(handle(req, &control, false, false).await.is_none());
+    assert!(!control.shutdown_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn import_legacy_defaults_force_and_returns_counts() {
     let control = FakeControl::new();
     let req = classify(&json!({
