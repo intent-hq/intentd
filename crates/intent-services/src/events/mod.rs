@@ -6,6 +6,7 @@
 pub mod bus;
 pub mod filter;
 pub mod skills_watcher;
+pub mod specialists_watcher;
 pub mod watcher;
 
 pub use bus::{EventBus, Subscription};
@@ -14,6 +15,7 @@ pub use filter::{
     DEFAULT_BATCH_WINDOW, VALID_EVENT_CATEGORY_WILDCARDS,
 };
 pub use skills_watcher::SkillsWatcher;
+pub use specialists_watcher::SpecialistsWatcher;
 pub use watcher::FileWatcher;
 
 #[cfg(test)]

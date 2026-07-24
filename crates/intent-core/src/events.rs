@@ -296,6 +296,13 @@ pub const APP_WORKSPACE_OPEN: &str = "app:workspace-open";
 // Payload: `{ workspaceId }`.
 pub const SKILLS_CHANGED: &str = "skills:changed";
 
+// Specialists events (new in intentd; PROTOCOL §5.11/§6.5). Emitted when the
+// resolved specialist set changes for a workspace (file-watch on the user
+// `~/.intent/specialists/` and project `<workspace>/.intent/specialists/`
+// tiers); user-tier changes fan out to one event per workspace. Payload:
+// `{ workspaceId }`.
+pub const SPECIALISTS_CHANGED: &str = "specialists:changed";
+
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -405,6 +412,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
     SKILLS_CHANGED,
+    SPECIALISTS_CHANGED,
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.

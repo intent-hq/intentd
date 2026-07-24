@@ -14,7 +14,7 @@ use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
     default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus, FileWatcher,
-    PermissionPolicy, Services, SkillsWatcher,
+    PermissionPolicy, Services, SkillsWatcher, SpecialistsWatcher,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -861,6 +861,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Start skills directory watchers (user-tier + project-tier per workspace).
     // Publishes debounced `skills:changed` events when SKILL.md files are modified.
     let _skills_watcher = start_skills_watcher(&bus, api.as_ref()).await;
+
+    // Start specialist directory watchers (user-tier + project-tier per workspace).
+    // Publishes debounced `specialists:changed` events when the resolved
+    // specialist set actually changes on disk.
+    let _specialists_watcher = start_specialists_watcher(&bus, api.as_ref()).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -2026,6 +2031,38 @@ async fn start_skills_watcher(
 
     let watcher = SkillsWatcher::start(bus.clone(), workspace_pairs);
     tracing::info!("skills watcher started");
+    Some(watcher)
+}
+
+/// Start a [`SpecialistsWatcher`] covering the specialist directories (user-tier +
+/// project-tier per workspace). Returns the live handle; dropping it stops the watcher.
+async fn start_specialists_watcher(
+    bus: &EventBus,
+    services: &dyn WorkspaceApi,
+) -> Option<SpecialistsWatcher> {
+    let workspaces = match services.list_workspaces(false).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list workspaces for specialists watching");
+            return None;
+        }
+    };
+
+    let workspace_pairs: Vec<_> = workspaces
+        .into_iter()
+        .filter_map(|ws| {
+            let root = ws.path.clone().or_else(|| ws.worktree_path.clone())?;
+            let path = std::path::PathBuf::from(&root);
+            if path.is_dir() {
+                Some((ws.id, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let watcher = SpecialistsWatcher::start(bus.clone(), workspace_pairs);
+    tracing::info!("specialists watcher started");
     Some(watcher)
 }
 
