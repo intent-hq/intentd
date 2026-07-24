@@ -5,6 +5,7 @@
 
 pub mod bus;
 pub mod filter;
+mod root_watch;
 pub mod skills_watcher;
 pub mod specialists_watcher;
 pub mod watcher;
