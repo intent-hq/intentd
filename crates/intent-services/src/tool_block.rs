@@ -139,12 +139,19 @@ fn collapsed_output_text(output: &Value) -> Option<&str> {
 /// `ok: true`, and a proposal that passes the bindings' canonical
 /// `is_valid_proposal` (the SAME function `ws.app.proposal.show` validated
 /// with before emitting it).
+///
+/// When the initial parse fails, a wrap-repair pass strips raw newlines from
+/// inside JSON string literals and re-parses: auggie hard-wraps the collapsed
+/// echo at a 1000-char column, injecting raw `\n` mid-string (even mid-word),
+/// which strict JSON rejects. See [`repair_wrapped_json`].
 fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
     let text = collapsed_output_text(output)?;
     if text.len() > COLLAPSED_PROPOSAL_MAX_BYTES || !text.trim_start().starts_with('{') {
         return None;
     }
-    let parsed: Value = serde_json::from_str(text).ok()?;
+    let parsed: Value = serde_json::from_str(text)
+        .ok()
+        .or_else(|| serde_json::from_str(&repair_wrapped_json(text)?).ok())?;
     let obj = parsed.as_object()?;
     if obj.get("ok") != Some(&Value::Bool(true)) {
         return None;
@@ -154,6 +161,37 @@ fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
         return None;
     }
     Some(build_proposal_resource_item(proposal))
+}
+
+/// Repair a provider-column-wrapped JSON text by removing raw `\n` / `\r`
+/// occurring **inside string literals**, tracking in/out-of-string state and
+/// honoring backslash escapes. Raw control characters are never valid inside
+/// JSON strings (RFC 8259 §7) — real newlines in content arrive escaped as
+/// `\n` — so the removal is unambiguous. A wrap that splits an escape
+/// sequence (`\` + raw newline + `n`) is reassembled by the same removal.
+/// Characters outside string literals are left untouched (whitespace there is
+/// legal, and structural corruption should still fail the re-parse). Returns
+/// `None` when nothing was removed, so the caller skips the pointless
+/// re-parse.
+fn repair_wrapped_json(text: &str) -> Option<String> {
+    let mut repaired = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut removed = false;
+    for c in text.chars() {
+        if in_string && (c == '\n' || c == '\r') {
+            removed = true;
+            continue;
+        }
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+        repaired.push(c);
+    }
+    removed.then_some(repaired)
 }
 
 /// Rebuild the MCP proposal resource item exactly as the `ws.app.*` bindings
@@ -396,5 +434,114 @@ mod tests {
         let mut proposal = valid_proposal();
         proposal["payload"]["filler"] = json!("x".repeat(COLLAPSED_PROPOSAL_MAX_BYTES));
         assert!(lift_proposal_resource(&collapsed_output(&proposal)).is_none());
+    }
+
+    /// Hard-wrap every line of `text` at `col` characters by inserting raw
+    /// newlines, reproducing auggie's column-wrapped echo of collapsed tool
+    /// output (wraps land mid-word, inside JSON string literals).
+    fn column_wrap(text: &str, col: usize) -> String {
+        text.lines()
+            .flat_map(|line| {
+                line.as_bytes()
+                    .chunks(col)
+                    .map(|c| std::str::from_utf8(c).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A proposal whose pretty-printed lines exceed the provider's 1000-char
+    /// wrap column, mirroring the observed corrupt payload
+    /// (`workspace-create` with a long `initialPrompt`).
+    fn long_proposal() -> Value {
+        let prompt = "Fix these 4 open bugs in parallel. ".repeat(40) + "End of the long prompt.";
+        json!({
+            "kind": "workspace-create",
+            "preview": { "title": "Create workspace: Parallel bug batch" },
+            "payload": {
+                "operation": "workspace.create",
+                "params": { "initialPrompt": prompt },
+            },
+        })
+    }
+
+    /// The provider-wrapped shape observed in the wild: the daemon's
+    /// `{ok, proposal}` text-item payload pretty-printed, then hard-wrapped at
+    /// a 1000-char column with raw newlines injected inside string literals.
+    fn wrapped_collapsed_text(proposal: &Value) -> String {
+        let pretty = serde_json::to_string_pretty(&json!({ "ok": true, "proposal": proposal }))
+            .expect("serialize");
+        let wrapped = column_wrap(&pretty, 1000);
+        // The wrap must actually corrupt the payload for the test to mean
+        // anything: raw newlines inside string literals break strict JSON.
+        assert!(serde_json::from_str::<Value>(&wrapped).is_err());
+        wrapped
+    }
+
+    #[test]
+    fn lift_proposal_resource_repairs_provider_wrapped_object_output() {
+        let proposal = long_proposal();
+        let output = json!({ "output": wrapped_collapsed_text(&proposal) });
+        let item = lift_proposal_resource(&output).expect("wrapped fallback lifted");
+        assert_eq!(item["resource"]["mimeType"], PROPOSAL_RESOURCE_MIME);
+        assert_eq!(
+            item["resource"]["uri"],
+            "intent-proposal://workspace-create/Create%20workspace%3A%20Parallel%20bug%20batch"
+        );
+        // The repaired `text` round-trips to the original proposal — the raw
+        // wrap newlines are gone, the content is otherwise untouched.
+        let text = item["resource"]["text"].as_str().expect("text is a string");
+        let parsed: Value = serde_json::from_str(text).expect("text parses");
+        assert_eq!(parsed, proposal);
+    }
+
+    #[test]
+    fn lift_proposal_resource_repairs_provider_wrapped_string_output() {
+        let proposal = long_proposal();
+        let item = lift_proposal_resource(&json!(wrapped_collapsed_text(&proposal)))
+            .expect("wrapped bare-string fallback lifted");
+        let text = item["resource"]["text"].as_str().expect("text is a string");
+        let parsed: Value = serde_json::from_str(text).expect("text parses");
+        assert_eq!(parsed, proposal);
+    }
+
+    #[test]
+    fn lift_repair_preserves_escaped_newlines_in_content() {
+        // Real newlines in proposal content arrive escaped (`\n` in the JSON
+        // text); only the RAW wrap newlines are removed by the repair.
+        let mut proposal = long_proposal();
+        proposal["payload"]["params"]["initialPrompt"] =
+            json!("line one\nline two\n".repeat(60) + "tail");
+        let output = json!({ "output": wrapped_collapsed_text(&proposal) });
+        let item = lift_proposal_resource(&output).expect("wrapped fallback lifted");
+        let text = item["resource"]["text"].as_str().expect("text is a string");
+        let parsed: Value = serde_json::from_str(text).expect("text parses");
+        assert_eq!(parsed, proposal);
+    }
+
+    #[test]
+    fn lift_repair_handles_wrap_splitting_an_escape_sequence() {
+        // A wrap column can land between the backslash and the letter of an
+        // escape sequence (`\` + raw newline + `n`); removing the raw newline
+        // must reassemble the escape.
+        let text = "{\"ok\": true, \"proposal\": {\"kind\": \"settings-change\", \"preview\": {\"title\": \"T\\\nnT\"}, \"payload\": {}}}";
+        assert!(serde_json::from_str::<Value>(text).is_err());
+        let item = lift_proposal_resource(&json!({ "output": text })).expect("lifted");
+        let lifted: Value =
+            serde_json::from_str(item["resource"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(lifted["preview"]["title"], "T\nT");
+    }
+
+    #[test]
+    fn lift_repair_does_not_rescue_genuinely_invalid_json() {
+        // Truncated payload: no amount of control-char stripping makes this
+        // parse; the lift must still decline.
+        let proposal = long_proposal();
+        let wrapped = wrapped_collapsed_text(&proposal);
+        let truncated = &wrapped[..wrapped.len() - 40];
+        assert!(lift_proposal_resource(&json!({ "output": truncated })).is_none());
+        // Structural corruption outside strings (unquoted garbage) as well.
+        let garbage = "{\"ok\": true, \"proposal\": not json at\nall}";
+        assert!(lift_proposal_resource(&json!({ "output": garbage })).is_none());
     }
 }
