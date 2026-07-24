@@ -4479,38 +4479,117 @@ async fn persist_user(
 
 /// Max number of spawn attempts (includes the initial attempt).
 const MAX_SPAWN_ATTEMPTS: u32 = 3;
-/// Default backoff delays between retry attempts (in milliseconds).
-const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+/// Default backoff delays between retry attempts (in milliseconds). Long
+/// enough that retries escape the host load spike that killed the first
+/// attempt (monorepo#616); jitter is applied on top (see [`jitter_delay_ms`]).
+const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[5000, 15000];
 /// Default backoff delays between pre-turn persist retry attempts (#547).
 /// Short: the append is a local SQLite write, so a transient failure (busy
 /// database, lock contention) clears quickly or not at all.
 const DEFAULT_PERSIST_RETRY_BACKOFF_MS: &[u64] = &[250, 1000];
 
+/// Parse comma-separated millisecond delays; `None` when empty or malformed.
+fn parse_backoff_list(val: &str) -> Option<Vec<u64>> {
+    let mut delays = Vec::new();
+    for part in val.split(',') {
+        delays.push(part.trim().parse::<u64>().ok()?);
+    }
+    (!delays.is_empty()).then_some(delays)
+}
+
 /// Parse comma-separated millisecond delays from `var`, falling back to
 /// `default` when unset, empty, or malformed. Primarily for tests/CI.
 fn env_backoff_ms(var: &str, default: &[u64]) -> Vec<u64> {
-    if let Ok(val) = std::env::var(var) {
-        let mut delays = Vec::new();
-        for part in val.split(',') {
-            if let Ok(ms) = part.trim().parse::<u64>() {
-                delays.push(ms);
-            } else {
-                // Invalid format, fall back to default
-                return default.to_vec();
-            }
-        }
-        if !delays.is_empty() {
-            return delays;
-        }
-    }
-    default.to_vec()
+    std::env::var(var)
+        .ok()
+        .and_then(|val| parse_backoff_list(&val))
+        .unwrap_or_else(|| default.to_vec())
 }
 
-/// Get spawn retry backoff delays, overridable via
-/// INTENTD_SPAWN_RETRY_BACKOFF_MS (comma-separated milliseconds, e.g.
-/// "100,200"). Primarily for tests/CI.
-fn retry_backoff_ms() -> Vec<u64> {
-    env_backoff_ms("INTENTD_SPAWN_RETRY_BACKOFF_MS", DEFAULT_RETRY_BACKOFF_MS)
+/// Get spawn retry backoff delays plus whether jitter applies, overridable
+/// via INTENTD_SPAWN_RETRY_BACKOFF_MS (comma-separated milliseconds, e.g.
+/// "100,200"). Env-overridden delays are applied verbatim — no jitter — so
+/// tests stay deterministic; the defaults are jittered (monorepo#616).
+fn retry_backoff_ms() -> (Vec<u64>, bool) {
+    spawn_backoff_from(
+        std::env::var("INTENTD_SPAWN_RETRY_BACKOFF_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`retry_backoff_ms`]: `(delays, apply_jitter)` from an
+/// optional env-override value. Split out so unit tests avoid mutating
+/// process-global env vars.
+fn spawn_backoff_from(env_val: Option<&str>) -> (Vec<u64>, bool) {
+    match env_val.and_then(parse_backoff_list) {
+        Some(delays) => (delays, false),
+        None => (DEFAULT_RETRY_BACKOFF_MS.to_vec(), true),
+    }
+}
+
+/// Apply uniform jitter in [0.5x, 1.5x) to a backoff delay so concurrent
+/// spawn retries desynchronize instead of landing inside the same host load
+/// spike (monorepo#616). Entropy comes from a v4 UUID's random low bits
+/// rather than pulling in a `rand` dependency.
+fn jitter_delay_ms(delay_ms: u64) -> u64 {
+    const MANTISSA_BITS: u32 = 53;
+    let r = (Uuid::new_v4().as_u128() as u64) & ((1u64 << MANTISSA_BITS) - 1);
+    let factor = 0.5 + (r as f64) / ((1u64 << MANTISSA_BITS) as f64);
+    (delay_ms as f64 * factor) as u64
+}
+
+#[cfg(test)]
+mod spawn_backoff_tests {
+    //! Spawn retry backoff schedule + jitter (monorepo#616): lengthened
+    //! defaults are jittered so concurrent retries desynchronize, while an
+    //! explicit `INTENTD_SPAWN_RETRY_BACKOFF_MS` override stays verbatim.
+
+    use super::*;
+
+    #[test]
+    fn defaults_are_lengthened_and_jittered() {
+        let (delays, jitter) = spawn_backoff_from(None);
+        assert_eq!(delays, vec![5000, 15000]);
+        assert!(jitter, "defaults must be jittered");
+    }
+
+    #[test]
+    fn env_override_is_verbatim_no_jitter() {
+        let (delays, jitter) = spawn_backoff_from(Some("100,200"));
+        assert_eq!(delays, vec![100, 200]);
+        assert!(!jitter, "env-overridden delays must be applied verbatim");
+    }
+
+    #[test]
+    fn malformed_or_empty_env_falls_back_to_jittered_defaults() {
+        for bad in ["abc", "100,abc", ""] {
+            let (delays, jitter) = spawn_backoff_from(Some(bad));
+            assert_eq!(delays, DEFAULT_RETRY_BACKOFF_MS.to_vec(), "input: {bad:?}");
+            assert!(
+                jitter,
+                "fallback defaults must be jittered (input: {bad:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_stays_within_half_to_one_and_a_half_x() {
+        let delay = 10_000u64;
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let jittered = jitter_delay_ms(delay);
+            assert!(
+                (5_000..=15_000).contains(&jittered),
+                "jittered delay {jittered} outside [0.5x, 1.5x] of {delay}"
+            );
+            distinct.insert(jittered);
+        }
+        assert!(
+            distinct.len() > 1,
+            "jitter must vary across draws (concurrent retries desynchronize)"
+        );
+    }
 }
 
 /// Get persist retry backoff delays (#547), overridable via
@@ -4557,7 +4636,7 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
     false
 }
 
-/// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with exponential
+/// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with jittered
 /// backoff. On each retry (after the first failure), tear down the failed
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
 /// process. Returns the `acpSessionId` on success, or the final error after
@@ -4620,9 +4699,15 @@ async fn retry_spawn(
                     )
                     .await;
 
-                // Backoff before retry
-                let backoff = retry_backoff_ms();
+                // Backoff before retry — jittered unless the env override
+                // pinned exact delays.
+                let (backoff, jitter) = retry_backoff_ms();
                 if let Some(&delay_ms) = backoff.get((attempt - 1) as usize) {
+                    let delay_ms = if jitter {
+                        jitter_delay_ms(delay_ms)
+                    } else {
+                        delay_ms
+                    };
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
             }
