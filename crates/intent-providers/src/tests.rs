@@ -104,6 +104,17 @@ fn registry_field_parity() {
         pi.login_docs_url,
         Some("https://pi.dev/docs/latest/quickstart")
     );
+    // MCP rides the bundled pi extension (wrapper + PI_ACP_PI_COMMAND) — pi
+    // has no MCP CLI flag and ignores the ACP session field.
+    assert!(pi.mcp_via_pi_extension);
+    assert!(!pi.supports_mcp_config && !pi.supports_session_mcp_servers);
+    for p in ACP_PROVIDERS.iter().filter(|p| p.id != "pi") {
+        assert!(
+            !p.mcp_via_pi_extension,
+            "{} must not use the pi-extension MCP delivery",
+            p.id
+        );
+    }
 
     let droid = find_provider("droid").unwrap();
     assert_eq!(droid.base_args, &["exec", "--output-format", "acp"]);

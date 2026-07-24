@@ -676,6 +676,115 @@ impl Drop for TempConfigFile {
     }
 }
 
+/// Env var pi-acp (0.0.31) reads to override the `pi` binary it spawns
+/// (`PiRpcProcess.spawn({ piCommand: process.env.PI_ACP_PI_COMMAND })`).
+/// `create_agent` points it at the generated wrapper script.
+const PI_ACP_PI_COMMAND_ENV: &str = "PI_ACP_PI_COMMAND";
+
+/// Env var the bundled pi extension reads for the per-agent MCP bridge's
+/// loopback TCP address (`host:port`, see [`McpBridge::connect_addr`]).
+const INTENTD_MCP_BRIDGE_ADDR_ENV: &str = "INTENTD_MCP_BRIDGE_ADDR";
+
+/// Bundled pi extension source (MCP bridge client + tool registration),
+/// embedded at build time and written to a per-agent temp file at spawn.
+const PI_MCP_EXTENSION_SOURCE: &str = include_str!("pi_mcp_extension.ts");
+
+/// Per-agent pi-extension MCP delivery files: the bundled extension plus a
+/// wrapper script that execs the real pi binary with `-e <extension>`. Both
+/// live in the temp dir for the lifetime of the owning agent handle (same
+/// pattern as the generated `--mcp-config`).
+struct PiExtensionDelivery {
+    /// Held for its temp-file lifetime only — the wrapper script carries the
+    /// path, so nothing reads this field after construction.
+    _extension: TempConfigFile,
+    wrapper: TempConfigFile,
+}
+
+impl PiExtensionDelivery {
+    /// Write the extension + wrapper (0755) temp files. The wrapper only
+    /// appends our `-e` flag — user-installed pi extensions stay enabled.
+    #[cfg(unix)]
+    fn write(real_pi_command: &str) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let extension_path =
+            std::env::temp_dir().join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
+        std::fs::write(&extension_path, PI_MCP_EXTENSION_SOURCE)
+            .map_err(|e| Error::Internal(format!("write pi extension failed: {e}")))?;
+        let extension = TempConfigFile {
+            path: extension_path,
+        };
+
+        let wrapper_path =
+            std::env::temp_dir().join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
+        let script = format!(
+            "#!/bin/sh\nexec {} -e {} \"$@\"\n",
+            sh_squote(real_pi_command),
+            sh_squote(&extension.path.to_string_lossy())
+        );
+        std::fs::write(&wrapper_path, script)
+            .map_err(|e| Error::Internal(format!("write pi wrapper failed: {e}")))?;
+        let wrapper = TempConfigFile { path: wrapper_path };
+        std::fs::set_permissions(&wrapper.path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| Error::Internal(format!("chmod pi wrapper failed: {e}")))?;
+        Ok(Self {
+            _extension: extension,
+            wrapper,
+        })
+    }
+
+    /// The delivery relies on an executable `#!/bin/sh` wrapper; there is no
+    /// non-unix equivalent, so fail with a clear error instead of spawning pi
+    /// with a script it cannot execute.
+    #[cfg(not(unix))]
+    fn write(_real_pi_command: &str) -> Result<Self> {
+        Err(Error::Internal(
+            "pi extension MCP delivery requires a unix host (sh wrapper script)".to_string(),
+        ))
+    }
+
+    /// Insert the two spawn env vars: route pi-acp's pi spawn through the
+    /// wrapper, and hand the extension the bridge's TCP address.
+    fn apply_spawn_env(
+        &self,
+        extra_env: &mut BTreeMap<String, String>,
+        bridge_connect_addr: String,
+    ) {
+        extra_env.insert(
+            PI_ACP_PI_COMMAND_ENV.to_string(),
+            self.wrapper.path.to_string_lossy().into_owned(),
+        );
+        extra_env.insert(INTENTD_MCP_BRIDGE_ADDR_ENV.to_string(), bridge_connect_addr);
+    }
+}
+
+/// Write the pi-extension delivery files for providers flagged
+/// `mcp_via_pi_extension`; `None` for every other provider.
+fn pi_extension_delivery(provider: &ProviderConfig) -> Result<Option<PiExtensionDelivery>> {
+    if !provider.mcp_via_pi_extension {
+        return Ok(None);
+    }
+    Ok(Some(
+        PiExtensionDelivery::write(&resolve_real_pi_command())?,
+    ))
+}
+
+/// Single-quote a string for inert interpolation into a `sh` script: quotes
+/// suppress all expansion, and embedded `'` uses the standard `'\''` escape.
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The pi binary the wrapper execs: a pre-existing `PI_ACP_PI_COMMAND` in the
+/// daemon env (the value pi-acp itself would have used, which the wrapper
+/// override shadows) or `pi` from the child's PATH — pi-acp's own fallback.
+fn resolve_real_pi_command() -> String {
+    std::env::var(PI_ACP_PI_COMMAND_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "pi".to_string())
+}
+
 /// One live agent: its ACP [`Connection`] (own id space + pending map), the
 /// streaming-notification receiver consumed during a turn, the client-served
 /// request loop, the owned child (its process group is killed on teardown via
@@ -693,6 +802,9 @@ struct AgentHandle {
     _mcp_bridge: Option<McpBridge>,
     _mcp_config: Option<TempConfigFile>,
     _rules_config: Option<TempConfigFile>,
+    /// Bundled pi-extension MCP delivery files (extension + wrapper script),
+    /// removed when the handle drops (pi only).
+    _pi_extension: Option<PiExtensionDelivery>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
     /// consume them there (claude-code, codex, droid, grok). Empty for providers
@@ -987,6 +1099,13 @@ impl AgentManager {
             env_mcp_config = Some(self.opencode_env_mcp_config(bridge.connect_addr()).await?);
         }
 
+        // For pi, MCP delivery rides a bundled pi extension: pi-acp has no
+        // MCP CLI flag and does not wire `session/new` `mcpServers` into the
+        // pi process, so the spawn env routes pi-acp's pi spawn through a
+        // wrapper script adding `-e <extension>` (PI_ACP_PI_COMMAND) and the
+        // extension dials the same bridge endpoint (INTENTD_MCP_BRIDGE_ADDR).
+        let pi_extension = pi_extension_delivery(opts.provider)?;
+
         // For providers that consume MCP servers from the ACP session setup
         // (claude-code, codex, droid, grok), the same normalized server set is
         // carried as the typed `session/new` / `session/load` `mcpServers`
@@ -1064,12 +1183,15 @@ impl AgentManager {
         }
 
         // Reconstruct the spawn options with the generated config path injected.
-        let spawn_opts = rebuild_spawn_opts(
+        let mut spawn_opts = rebuild_spawn_opts(
             opts,
             rules_file_path.as_deref(),
             mcp_config_path.as_deref(),
             env_mcp_config.as_deref(),
         );
+        if let Some(delivery) = &pi_extension {
+            delivery.apply_spawn_env(&mut spawn_opts.extra_env, bridge.connect_addr());
+        }
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
@@ -1141,6 +1263,7 @@ impl AgentManager {
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
             _rules_config: rules_config,
+            _pi_extension: pi_extension,
             session_mcp_servers,
             spawned_model: opts.model.map(|s| s.to_string()),
             spawned_provider: opts.provider.command.to_string(),
@@ -4479,38 +4602,117 @@ async fn persist_user(
 
 /// Max number of spawn attempts (includes the initial attempt).
 const MAX_SPAWN_ATTEMPTS: u32 = 3;
-/// Default backoff delays between retry attempts (in milliseconds).
-const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[2000, 5000];
+/// Default backoff delays between retry attempts (in milliseconds). Long
+/// enough that retries escape the host load spike that killed the first
+/// attempt (monorepo#616); jitter is applied on top (see [`jitter_delay_ms`]).
+const DEFAULT_RETRY_BACKOFF_MS: &[u64] = &[5000, 15000];
 /// Default backoff delays between pre-turn persist retry attempts (#547).
 /// Short: the append is a local SQLite write, so a transient failure (busy
 /// database, lock contention) clears quickly or not at all.
 const DEFAULT_PERSIST_RETRY_BACKOFF_MS: &[u64] = &[250, 1000];
 
+/// Parse comma-separated millisecond delays; `None` when empty or malformed.
+fn parse_backoff_list(val: &str) -> Option<Vec<u64>> {
+    let mut delays = Vec::new();
+    for part in val.split(',') {
+        delays.push(part.trim().parse::<u64>().ok()?);
+    }
+    (!delays.is_empty()).then_some(delays)
+}
+
 /// Parse comma-separated millisecond delays from `var`, falling back to
 /// `default` when unset, empty, or malformed. Primarily for tests/CI.
 fn env_backoff_ms(var: &str, default: &[u64]) -> Vec<u64> {
-    if let Ok(val) = std::env::var(var) {
-        let mut delays = Vec::new();
-        for part in val.split(',') {
-            if let Ok(ms) = part.trim().parse::<u64>() {
-                delays.push(ms);
-            } else {
-                // Invalid format, fall back to default
-                return default.to_vec();
-            }
-        }
-        if !delays.is_empty() {
-            return delays;
-        }
-    }
-    default.to_vec()
+    std::env::var(var)
+        .ok()
+        .and_then(|val| parse_backoff_list(&val))
+        .unwrap_or_else(|| default.to_vec())
 }
 
-/// Get spawn retry backoff delays, overridable via
-/// INTENTD_SPAWN_RETRY_BACKOFF_MS (comma-separated milliseconds, e.g.
-/// "100,200"). Primarily for tests/CI.
-fn retry_backoff_ms() -> Vec<u64> {
-    env_backoff_ms("INTENTD_SPAWN_RETRY_BACKOFF_MS", DEFAULT_RETRY_BACKOFF_MS)
+/// Get spawn retry backoff delays plus whether jitter applies, overridable
+/// via INTENTD_SPAWN_RETRY_BACKOFF_MS (comma-separated milliseconds, e.g.
+/// "100,200"). Env-overridden delays are applied verbatim — no jitter — so
+/// tests stay deterministic; the defaults are jittered (monorepo#616).
+fn retry_backoff_ms() -> (Vec<u64>, bool) {
+    spawn_backoff_from(
+        std::env::var("INTENTD_SPAWN_RETRY_BACKOFF_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`retry_backoff_ms`]: `(delays, apply_jitter)` from an
+/// optional env-override value. Split out so unit tests avoid mutating
+/// process-global env vars.
+fn spawn_backoff_from(env_val: Option<&str>) -> (Vec<u64>, bool) {
+    match env_val.and_then(parse_backoff_list) {
+        Some(delays) => (delays, false),
+        None => (DEFAULT_RETRY_BACKOFF_MS.to_vec(), true),
+    }
+}
+
+/// Apply uniform jitter in [0.5x, 1.5x) to a backoff delay so concurrent
+/// spawn retries desynchronize instead of landing inside the same host load
+/// spike (monorepo#616). Entropy comes from a v4 UUID's random low bits
+/// rather than pulling in a `rand` dependency.
+fn jitter_delay_ms(delay_ms: u64) -> u64 {
+    const MANTISSA_BITS: u32 = 53;
+    let r = (Uuid::new_v4().as_u128() as u64) & ((1u64 << MANTISSA_BITS) - 1);
+    let factor = 0.5 + (r as f64) / ((1u64 << MANTISSA_BITS) as f64);
+    (delay_ms as f64 * factor) as u64
+}
+
+#[cfg(test)]
+mod spawn_backoff_tests {
+    //! Spawn retry backoff schedule + jitter (monorepo#616): lengthened
+    //! defaults are jittered so concurrent retries desynchronize, while an
+    //! explicit `INTENTD_SPAWN_RETRY_BACKOFF_MS` override stays verbatim.
+
+    use super::*;
+
+    #[test]
+    fn defaults_are_lengthened_and_jittered() {
+        let (delays, jitter) = spawn_backoff_from(None);
+        assert_eq!(delays, vec![5000, 15000]);
+        assert!(jitter, "defaults must be jittered");
+    }
+
+    #[test]
+    fn env_override_is_verbatim_no_jitter() {
+        let (delays, jitter) = spawn_backoff_from(Some("100,200"));
+        assert_eq!(delays, vec![100, 200]);
+        assert!(!jitter, "env-overridden delays must be applied verbatim");
+    }
+
+    #[test]
+    fn malformed_or_empty_env_falls_back_to_jittered_defaults() {
+        for bad in ["abc", "100,abc", ""] {
+            let (delays, jitter) = spawn_backoff_from(Some(bad));
+            assert_eq!(delays, DEFAULT_RETRY_BACKOFF_MS.to_vec(), "input: {bad:?}");
+            assert!(
+                jitter,
+                "fallback defaults must be jittered (input: {bad:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_stays_within_half_to_one_and_a_half_x() {
+        let delay = 10_000u64;
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let jittered = jitter_delay_ms(delay);
+            assert!(
+                (5_000..=15_000).contains(&jittered),
+                "jittered delay {jittered} outside [0.5x, 1.5x] of {delay}"
+            );
+            distinct.insert(jittered);
+        }
+        assert!(
+            distinct.len() > 1,
+            "jitter must vary across draws (concurrent retries desynchronize)"
+        );
+    }
 }
 
 /// Get persist retry backoff delays (#547), overridable via
@@ -4557,7 +4759,7 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
     false
 }
 
-/// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with exponential
+/// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with jittered
 /// backoff. On each retry (after the first failure), tear down the failed
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
 /// process. Returns the `acpSessionId` on success, or the final error after
@@ -4620,9 +4822,15 @@ async fn retry_spawn(
                     )
                     .await;
 
-                // Backoff before retry
-                let backoff = retry_backoff_ms();
+                // Backoff before retry — jittered unless the env override
+                // pinned exact delays.
+                let (backoff, jitter) = retry_backoff_ms();
                 if let Some(&delay_ms) = backoff.get((attempt - 1) as usize) {
+                    let delay_ms = if jitter {
+                        jitter_delay_ms(delay_ms)
+                    } else {
+                        delay_ms
+                    };
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
             }
@@ -5579,6 +5787,99 @@ mod rebuild_spawn_opts_tests {
         opts.rules_file = Some("/caller/rules.md");
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/generated.md"), None, None);
         assert_eq!(rebuilt.rules_file, Some("/caller/rules.md"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pi_extension_delivery_tests {
+    //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
+    //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn
+    //! env vars, and the capability gate that leaves non-pi providers alone.
+    //! Unix-only, matching the delivery itself (sh wrapper + chmod).
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn write_creates_extension_and_executable_wrapper() {
+        let delivery = PiExtensionDelivery::write("pi").unwrap();
+
+        let ext = std::fs::read_to_string(&delivery._extension.path).unwrap();
+        assert_eq!(ext, PI_MCP_EXTENSION_SOURCE);
+        assert!(
+            !ext.trim().is_empty(),
+            "embedded extension must not be empty"
+        );
+
+        let mode = std::fs::metadata(&delivery.wrapper.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "wrapper must be executable (0755)");
+        let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
+        assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(
+            script.contains(&format!(
+                "exec 'pi' -e '{}' \"$@\"",
+                delivery._extension.path.display()
+            )),
+            "wrapper must exec the real pi with -e <extension>: {script:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_single_quotes_special_characters() {
+        let delivery = PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi").unwrap();
+        let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
+        assert!(
+            script.contains("exec '/opt/pi'\\''s \"odd$\" bin/pi' -e '"),
+            "wrapper must single-quote the pi command with the '\\'' escape: {script:?}"
+        );
+    }
+
+    #[test]
+    fn temp_files_removed_when_delivery_drops() {
+        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let ext = delivery._extension.path.clone();
+        let wrapper = delivery.wrapper.path.clone();
+        drop(delivery);
+        assert!(!ext.exists());
+        assert!(!wrapper.exists());
+    }
+
+    #[test]
+    fn apply_spawn_env_sets_wrapper_and_bridge_addr() {
+        let delivery = PiExtensionDelivery::write("pi").unwrap();
+        let mut extra_env = BTreeMap::new();
+        delivery.apply_spawn_env(&mut extra_env, "127.0.0.1:9999".to_string());
+        assert_eq!(
+            extra_env.get(PI_ACP_PI_COMMAND_ENV),
+            Some(&delivery.wrapper.path.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            extra_env
+                .get(INTENTD_MCP_BRIDGE_ADDR_ENV)
+                .map(String::as_str),
+            Some("127.0.0.1:9999")
+        );
+    }
+
+    #[test]
+    fn delivery_gated_on_capability_flag() {
+        let pi = intent_providers::find_provider("pi").unwrap();
+        let delivery = pi_extension_delivery(pi).unwrap();
+        assert!(delivery.is_some(), "pi must get the extension delivery");
+
+        for provider in intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter(|p| p.id != "pi")
+        {
+            assert!(
+                pi_extension_delivery(provider).unwrap().is_none(),
+                "{} must not get a wrapper or extension",
+                provider.id
+            );
+        }
     }
 }
 

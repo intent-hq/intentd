@@ -1,0 +1,39 @@
+# cargo-deny configuration for intentd — license policy.
+#
+# Entry point: `cargo deny check licenses`
+# Docs: https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+#
+# Only the [licenses] section is configured; other cargo-deny checks
+# (advisories, bans, sources) intentionally use defaults.
+
+[licenses]
+version = 2
+# Every crate's SPDX license expression must be satisfiable using only the
+# identifiers below. Anything else — GPL/LGPL/AGPL/SSPL, unknown, or
+# unlicensed — fails the check. Crates dual-licensed via OR expressions
+# (e.g. `Unlicense OR MIT`, `MIT OR Apache-2.0 OR LGPL-2.1-or-later`) pass
+# as long as one allowed alternative exists, so weak/strong copyleft
+# identifiers never need to be listed here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # Public-domain-equivalent; sole license of `notify`.
+    "CC0-1.0",
+    # Permissive data license; sole license of `webpki-roots` (Mozilla CA
+    # certificate data).
+    "CDLA-Permissive-2.0",
+]
+
+# Per-crate exceptions for licenses we accept only case-by-case.
+exceptions = [
+    # MPL-2.0 is file-level weak copyleft and Apache-2.0 compatible when the
+    # crate is consumed unmodified as a dependency. `option-ext` is pulled in
+    # by `dirs-sys` (via `directories`).
+    { name = "option-ext", allow = ["MPL-2.0"] },
+]

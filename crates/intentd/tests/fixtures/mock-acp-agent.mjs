@@ -500,6 +500,13 @@ async function dispatch(msg) {
 
   switch (msg.method) {
     case 'initialize':
+      // Slow cold-start simulation (monorepo#616): delay the initialize reply
+      // by `initializeDelayMs` so tests can prove the daemon's handshake
+      // timeout tolerates a slow-to-start agent (or trips when pinned lower).
+      if (Number.isFinite(behavior.initializeDelayMs) && behavior.initializeDelayMs > 0) {
+        log(`delaying initialize reply by ${behavior.initializeDelayMs}ms`);
+        await new Promise((r) => setTimeout(r, behavior.initializeDelayMs));
+      }
       return result(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: false } });
     case 'authenticate':
       return result(msg.id, {});

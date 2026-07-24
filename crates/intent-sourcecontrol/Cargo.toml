@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "SourceControl trait + GitHubSourceControl (PR/issue/review/check-run/mergeability)"
 
 [dependencies]
