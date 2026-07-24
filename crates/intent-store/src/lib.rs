@@ -92,6 +92,31 @@ where
     Err(last_error.unwrap_or_else(|| Error::Internal("retry exhausted".to_string())))
 }
 
+/// COMMIT the transaction open on `conn`, guarding against a failed COMMIT
+/// (monorepo#638 / #657 / #670): a failed COMMIT can leave the transaction
+/// open on the pooled connection, so roll back explicitly so the connection
+/// is not returned to the pool still holding the write lock. If the ROLLBACK
+/// fails too, detach the connection from the pool and close it so the
+/// poisoned handle is never reused (the pool opens a fresh replacement on
+/// demand). On failure returns `Error::Internal` with the message
+/// `"{context}: {commit error}"`.
+///
+/// Takes the connection by value: COMMIT must be the last statement of the
+/// raw `BEGIN IMMEDIATE` transaction, and the detach path consumes it.
+pub(crate) async fn commit_with_rollback_guard(
+    mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    context: &str,
+) -> Result<()> {
+    use sqlx::Connection;
+    if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+        if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
+            let _ = conn.detach().close().await;
+        }
+        return Err(Error::Internal(format!("{context}: {e}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;
 
