@@ -8,7 +8,7 @@ use intent_core::{
     Error, Note, NoteId, NoteVersion, NoteVersionAuthor, NoteVersionSummary, Result, WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
+use sqlx::{Connection, Row};
 
 use crate::Store;
 
@@ -87,10 +87,20 @@ impl Store {
 
         match result {
             Ok(v) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("commit note_version tx failed: {e}")))?;
+                if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                    // A failed COMMIT can leave the transaction open on the
+                    // pooled connection; roll back so it is not returned to
+                    // the pool still holding the write lock (monorepo#657).
+                    // If the ROLLBACK fails too, detach the connection from
+                    // the pool and close it so the poisoned handle is never
+                    // reused (the pool opens a fresh replacement on demand).
+                    if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
+                        let _ = conn.detach().close().await;
+                    }
+                    return Err(Error::Internal(format!(
+                        "commit note_version tx failed: {e}"
+                    )));
+                }
                 Ok(v)
             }
             Err(e) => {
