@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7] - 2026-07-24
+
+### 🐛 Bug Fixes
+
+- Comment.getThread/resolveThread/list caller-input errors return -32602 (intent-hq/monorepo#649)
+- *(test)* Scale fixed 5s daemon-read timeouts by the shared test budget (intent-hq/monorepo#615) ([#457](https://github.com/intent-hq/intentd/pull/457))
+
+### 🧪 Testing
+
+- Deflake queue-drain event-order race in e2e_wss_agent_lifecycle (monorepo#456) ([#459](https://github.com/intent-hq/intentd/pull/459))
+
+
 ## [0.2.6] - 2026-07-24
 
 ### 🚀 Features
