@@ -429,8 +429,9 @@ mod find_provider_binary_tests {
             Some(crate::config::CLAUDE_AGENT_ACP_NPX_PACKAGE),
             "claude-code availability must carry the pinned npx package"
         );
-        // Assert against the single discovery snapshot: other tests temporarily
-        // rewrite process-global PATH, so resolving npx again here would race.
+        // Assert against the single discovery snapshot rather than re-resolving
+        // npx (no test mutates process-global PATH anymore — monorepo#628 —
+        // but the snapshot assertion stays robust regardless).
         assert_eq!(cc.installed, cc.resolved_path.is_some());
         if let Some(path) = &cc.resolved_path {
             assert!(path
@@ -450,8 +451,8 @@ mod find_provider_binary_tests {
             Some(crate::config::PI_ACP_NPX_PACKAGE),
             "pi availability must carry the pinned npx package"
         );
-        // Assert against the same discovery snapshot to avoid racing tests that
-        // temporarily rewrite process-global PATH.
+        // Assert against the same discovery snapshot rather than re-resolving
+        // npx (see the claude-code test above; monorepo#628).
         assert_eq!(pi.installed, pi.resolved_path.is_some());
         if let Some(path) = &pi.resolved_path {
             assert!(path
