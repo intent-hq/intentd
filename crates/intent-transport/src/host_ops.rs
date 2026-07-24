@@ -456,23 +456,6 @@ pub(crate) fn enhanced_path_from(current_path: &str) -> String {
         .into_owned()
 }
 
-/// Resolve the host login shell (mirrors the FE `getLoginShellPath`): the
-/// `SHELL` env var, else the platform default (empty on Windows).
-fn login_shell() -> String {
-    if let Ok(shell) = std::env::var("SHELL") {
-        if !shell.is_empty() {
-            return shell;
-        }
-    }
-    if cfg!(target_os = "macos") {
-        "/bin/zsh".to_string()
-    } else if cfg!(windows) {
-        String::new()
-    } else {
-        "/bin/bash".to_string()
-    }
-}
-
 /// Build the `host.env` result. Returns the host PATH (raw + split `entries`),
 /// the "enhanced" PATH the daemon uses for binary resolution, the login shell,
 /// the home directory, and the SORTED NAMES of every environment variable.
@@ -499,9 +482,14 @@ pub(crate) fn build_env_json(
 
 /// Production `host.env` — reads the daemon's actual environment. See
 /// [`build_env_json`] for the secret-safety contract (names only, no values).
+/// The login shell comes from the shared [`path_utils::login_shell`] resolver
+/// (`SHELL` env → user database → `/bin/zsh` on macOS), so the reported shell
+/// always matches the one login-shell PATH enrichment uses; when no shell can
+/// be resolved (Windows, or non-macOS unix without a user-db entry) the field
+/// is empty and enrichment is skipped.
 pub(crate) fn env_probe() -> Value {
     let raw_path = std::env::var("PATH").unwrap_or_default();
-    let shell = login_shell();
+    let shell = path_utils::login_shell().unwrap_or_default();
     let home = home_dir();
     let mut var_names: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())

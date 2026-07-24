@@ -31,10 +31,15 @@ const PATH_END_SENTINEL: &str = "__INTENT_PATH_E__";
 /// Exposed for testing via an injectable shell path.
 #[cfg(unix)]
 fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
-    let inherited_shell = std::env::var_os("SHELL");
-    let shell = match resolve_login_shell(shell, inherited_shell.as_deref()) {
-        Some(shell) => shell,
-        None => return Vec::new(),
+    let shell = match shell {
+        Some(explicit) => match (!explicit.is_empty()).then(|| explicit.to_string()) {
+            Some(shell) => shell,
+            None => return Vec::new(),
+        },
+        None => match login_shell() {
+            Some(shell) => shell,
+            None => return Vec::new(),
+        },
     };
 
     // Try interactive login shell first (-ilc), fall back to login shell (-lc)
@@ -47,22 +52,77 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
     try_capture_with_flags(&shell, &["-lc"]).unwrap_or_default()
 }
 
-/// Finder/launchd may omit `SHELL`, so macOS falls back to its standard login
-/// shell rather than silently discarding the user's shell-configured PATH.
-#[cfg(unix)]
+/// Resolve the user's login shell: the `SHELL` env var, else the user
+/// database (`getpwuid`, unix only), else `/bin/zsh` on macOS (Finder/launchd
+/// omit `SHELL`, and the user-db lookup can still fail), else `None`.
+///
+/// This is the single source of truth for login-shell resolution: both the
+/// login-shell PATH capture in this module and the `host.env` probe consume
+/// it, so the reported shell and the enrichment shell always agree.
+pub fn login_shell() -> Option<String> {
+    resolve_login_shell(
+        std::env::var_os("SHELL").as_deref(),
+        user_db_shell().as_deref(),
+    )
+}
+
+/// Pure resolution core for [`login_shell`], injectable for tests.
 fn resolve_login_shell(
-    explicit: Option<&str>,
-    inherited: Option<&std::ffi::OsStr>,
+    env_shell: Option<&std::ffi::OsStr>,
+    user_db_shell: Option<&str>,
 ) -> Option<String> {
-    if let Some(shell) = explicit {
-        return (!shell.is_empty()).then(|| shell.to_string());
-    }
-    if let Some(shell) = inherited.filter(|shell| !shell.is_empty()) {
+    if let Some(shell) = env_shell.filter(|shell| !shell.is_empty()) {
         return Some(shell.to_string_lossy().into_owned());
     }
-    if cfg!(target_os = "macos") {
-        return Some("/bin/zsh".to_string());
+    if let Some(shell) = user_db_shell.filter(|shell| !shell.is_empty()) {
+        return Some(shell.to_string());
     }
+    cfg!(target_os = "macos").then(|| "/bin/zsh".to_string())
+}
+
+/// Look up the current user's login shell in the user database via
+/// `getpwuid_r`. Returns `None` on lookup failure or a null, empty, or
+/// non-UTF-8 `pw_shell`.
+#[cfg(unix)]
+fn user_db_shell() -> Option<String> {
+    use std::ffi::CStr;
+
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 1024];
+    loop {
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < (1 << 20) {
+            let doubled = buf.len() * 2;
+            buf.resize(doubled, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let pw_shell = unsafe { (*result).pw_shell };
+        if pw_shell.is_null() {
+            return None;
+        }
+        let shell = unsafe { CStr::from_ptr(pw_shell) };
+        return shell
+            .to_str()
+            .ok()
+            .filter(|shell| !shell.is_empty())
+            .map(str::to_string);
+    }
+}
+
+#[cfg(not(unix))]
+fn user_db_shell() -> Option<String> {
     None
 }
 
@@ -385,9 +445,60 @@ mod tests {
     }
 
     #[test]
+    fn resolve_login_shell_prefers_env_shell() {
+        assert_eq!(
+            resolve_login_shell(Some(std::ffi::OsStr::new("/bin/fish")), Some("/bin/bash"))
+                .as_deref(),
+            Some("/bin/fish")
+        );
+    }
+
+    #[test]
+    fn resolve_login_shell_uses_user_db_when_env_missing() {
+        assert_eq!(
+            resolve_login_shell(None, Some("/usr/local/bin/fish")).as_deref(),
+            Some("/usr/local/bin/fish")
+        );
+    }
+
+    #[test]
+    fn resolve_login_shell_skips_empty_env_shell() {
+        assert_eq!(
+            resolve_login_shell(Some(std::ffi::OsStr::new("")), Some("/bin/bash")).as_deref(),
+            Some("/bin/bash")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn resolve_login_shell_empty_user_db_falls_back_to_zsh_on_macos() {
+        assert_eq!(
+            resolve_login_shell(None, Some("")).as_deref(),
+            Some("/bin/zsh")
+        );
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn missing_shell_falls_back_to_macos_login_shell() {
         assert_eq!(resolve_login_shell(None, None).as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn missing_shell_fails_open_on_non_macos() {
+        assert_eq!(resolve_login_shell(None, None), None);
+        assert_eq!(resolve_login_shell(None, Some("")), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn user_db_shell_never_returns_empty() {
+        // The lookup itself may legitimately fail (e.g. minimal containers),
+        // but a successful lookup must never yield an empty shell.
+        if let Some(shell) = user_db_shell() {
+            assert!(!shell.is_empty());
+        }
     }
 
     #[test]
