@@ -657,6 +657,7 @@ fn mock_handle() -> AgentHandle {
         _mcp_bridge: None,
         _mcp_config: None,
         _rules_config: None,
+        _pi_extension: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
@@ -1209,6 +1210,7 @@ fn track_mock_agent_inner(
             _mcp_bridge: None,
             _mcp_config: None,
             _rules_config: None,
+            _pi_extension: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
@@ -4273,7 +4275,7 @@ async fn build_turn_body_clears_flag_when_only_current_message_exists() {
 async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let session = session_with_specialist(None);
-    let resolved = resolve_spawn(&session, None, &settings).expect("default resolves");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("default resolves");
     assert_eq!(
         resolved.provider.id,
         intent_providers::default_provider_id()
@@ -4297,7 +4299,7 @@ async fn resolve_spawn_parses_compound_model_id() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.model = Some("claude-code:sonnet".to_string());
-    let resolved = resolve_spawn(&session, None, &settings).expect("compound resolves");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("compound resolves");
     assert_eq!(resolved.provider.id, "claude-code");
     assert_eq!(resolved.model.as_deref(), Some("sonnet"));
     assert_eq!(
@@ -4360,7 +4362,7 @@ async fn resolve_spawn_compound_prefix_wins_over_session_provider() {
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
     session.model = Some("opencode:opencode-go/kimi-k3".to_string());
-    let resolved = resolve_spawn(&session, None, &settings).expect("compound prefix wins");
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("compound prefix wins");
     // The compound prefix (opencode) should win over session.provider (auggie).
     assert_eq!(resolved.provider.id, "opencode");
     // The model string is the bare half.
@@ -4374,7 +4376,8 @@ async fn resolve_spawn_session_provider_fallback_for_bare_model() {
     let mut session = session_with_specialist(None);
     session.provider = Some("codex".to_string());
     session.model = Some("gpt-5.3-codex/high".to_string());
-    let resolved = resolve_spawn(&session, None, &settings).expect("session provider fallback");
+    let resolved =
+        resolve_spawn(&session, None, &settings, None).expect("session provider fallback");
     // Bare model → session.provider is used.
     assert_eq!(resolved.provider.id, "codex");
     // The bare model is passed through as-is.
@@ -4426,7 +4429,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         token_usage: None,
         cow_supported: None,
     };
-    let resolved = resolve_spawn(&session, Some(&workspace), &settings)
+    let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
     assert_eq!(resolved.cwd, ws_dir);
 
@@ -4438,10 +4441,54 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
             .to_string(),
     );
     let resolved =
-        resolve_spawn(&session, Some(&workspace), &settings).expect("falls back to temp");
+        resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
 
     let _ = std::fs::remove_dir_all(&ws_dir);
+}
+
+/// The chief workspace (no worktree on disk) spawns in the dedicated
+/// `<data_dir>/chief-cwd` directory (STAB-50), created on demand — never
+/// `/tmp`. Without a configured chief cwd root, chief falls back to the
+/// temp dir.
+#[tokio::test]
+async fn resolve_spawn_chief_uses_dedicated_cwd() {
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let session = session_with_specialist(None);
+    let chief = intent_core::chief_workspace();
+
+    // Fresh (not-yet-created) chief cwd root → created on demand and used.
+    let data_dir = std::env::temp_dir().join(format!("intentd-chief-{}", uuid::Uuid::new_v4()));
+    let chief_root = intent_core::chief_cwd_root(&data_dir);
+    assert!(!chief_root.exists(), "fresh data dir: root must not exist");
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
+        .expect("chief resolves");
+    assert_eq!(resolved.cwd, chief_root);
+    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp");
+    assert!(chief_root.is_dir(), "chief cwd created on demand");
+    let entries = std::fs::read_dir(&chief_root).unwrap().count();
+    assert_eq!(entries, 0, "dedicated chief cwd is empty");
+
+    // Idempotent: resolving again with the dir already present still works.
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
+        .expect("chief resolves again");
+    assert_eq!(resolved.cwd, chief_root);
+
+    // No chief cwd root configured (bare wiring) → temp-dir catch-all.
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, None)
+        .expect("chief without root resolves");
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+
+    // Creation failure (a regular FILE squats on the chief cwd path) →
+    // the root is not a dir, so the spawn falls through to the temp-dir
+    // catch-all instead of failing.
+    let blocked_root = data_dir.join("blocked-chief-cwd");
+    std::fs::write(&blocked_root, b"not a dir").unwrap();
+    let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&blocked_root))
+        .expect("chief resolves despite blocked root");
+    assert_eq!(resolved.cwd, std::env::temp_dir());
+
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 // --- Prompt block shape helpers ----------------------------------------------
@@ -5115,5 +5162,399 @@ mod session_cancel_log_classifier_tests {
         assert!(!is_cancel_transport_closed(&AcpError::Serde(
             "bad payload".to_string()
         )));
+    }
+}
+
+/// Stale queued-message redrive detection (#576):
+/// [`AgentManager::annotate_stale_redrive`] must flag (and annotate) a
+/// delegated agent's queued message whose `queued_at` predates the session's
+/// `completion_report_timestamp`, and must treat everything else as fresh.
+mod stale_redrive_tests {
+    use super::*;
+    use crate::agent_ops::QueuedMessage;
+
+    fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
+        QueuedMessage {
+            id: "qm-stale-test".to_string(),
+            content: content.to_string(),
+            image_blocks: None,
+            file_blocks: None,
+            queued_at: queued_at.to_string(),
+            editing: false,
+            persisted,
+            requeued_after_failure: false,
+            message_metadata: None,
+        }
+    }
+
+    /// Mark the seeded session as a delegated child that already delivered a
+    /// completion report at `report_ts`.
+    async fn set_delegated_report(
+        mgr: &AgentManager,
+        ws: &WorkspaceId,
+        id: &AgentId,
+        report_ts: &str,
+    ) {
+        let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+        session.parent_agent_id = Some(AgentId::from("agent-parent"));
+        session.completion_report = Some("work done".to_string());
+        session.completion_report_timestamp = Some(report_ts.to_string());
+        mgr.services
+            .store
+            .update_agent_session(ws, &session)
+            .await
+            .expect("set delegated report");
+    }
+
+    #[tokio::test]
+    async fn stale_message_is_annotated_and_flagged() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-a"), AgentId::from("a-576-a"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+
+        let mut msg = queued_msg("please continue", &queued_at, false);
+        let stale = mgr.annotate_stale_redrive(&id, &mut msg).await;
+        assert!(stale, "queued_at < completion_report_timestamp is stale");
+        assert!(
+            msg.content.starts_with("please continue"),
+            "original content is preserved: {}",
+            msg.content
+        );
+        assert!(
+            msg.content
+                .contains(super::super::STALE_REDRIVE_NOTE_PREFIX),
+            "stale content carries the system note: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(&report_ts),
+            "the note names the delivered report timestamp: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_message_after_report_is_not_stale() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-b"), AgentId::from("a-576-b"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut msg = queued_msg("new work", &now_iso(), false);
+        let stale = mgr.annotate_stale_redrive(&id, &mut msg).await;
+        assert!(!stale, "queued_at >= completion_report_timestamp is fresh");
+        assert_eq!(msg.content, "new work", "fresh content is untouched");
+    }
+
+    #[tokio::test]
+    async fn non_delegated_agent_is_never_stale() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-c"), AgentId::from("a-576-c"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        // Report set but NO parent_agent_id: user-created agents keep today's
+        // behavior even with a (vestigial) report on the session.
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.completion_report = Some("work done".to_string());
+        session.completion_report_timestamp = Some(now_iso());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set report without parent");
+
+        let mut msg = queued_msg("hello", &queued_at, false);
+        let stale = mgr.annotate_stale_redrive(&id, &mut msg).await;
+        assert!(!stale, "non-delegated agents are never stale");
+        assert_eq!(msg.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn no_report_means_fresh() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-d"), AgentId::from("a-576-d"));
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.parent_agent_id = Some(AgentId::from("agent-parent"));
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set parent without report");
+
+        let mut msg = queued_msg("hi", &now_iso(), false);
+        assert!(!mgr.annotate_stale_redrive(&id, &mut msg).await);
+        assert_eq!(msg.content, "hi");
+    }
+
+    #[tokio::test]
+    async fn persisted_requeue_is_flagged_but_not_annotated() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-e"), AgentId::from("a-576-e"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
+
+        // A terminal-failure requeue whose transcript row is already durable:
+        // the content must stay byte-identical to the persisted row, but the
+        // clear-suppression flag still applies.
+        let mut msg = queued_msg("already persisted", &queued_at, true);
+        let stale = mgr.annotate_stale_redrive(&id, &mut msg).await;
+        assert!(stale, "persisted stale requeue still suppresses the clear");
+        assert_eq!(
+            msg.content, "already persisted",
+            "persisted rows are never rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_annotation_is_idempotent_across_requeues() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-f"), AgentId::from("a-576-f"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
+
+        let mut msg = queued_msg("loop", &queued_at, false);
+        assert!(mgr.annotate_stale_redrive(&id, &mut msg).await);
+        let once = msg.content.clone();
+        assert!(mgr.annotate_stale_redrive(&id, &mut msg).await);
+        assert_eq!(
+            msg.content, once,
+            "a requeued stale entry is not double-annotated"
+        );
+    }
+
+    /// Fail open: an unparseable `queued_at` (or report timestamp) disables
+    /// the staleness verdict for that message — treated as fresh, content
+    /// untouched (the `else` arm logs a warn for diagnosability).
+    #[tokio::test]
+    async fn unparseable_timestamps_fail_open_as_fresh() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-g"), AgentId::from("a-576-g"));
+        seed_agent(&mgr, &ws, &id).await;
+        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
+
+        // Garbage queued_at.
+        let mut msg = queued_msg("hello", "not-a-timestamp", false);
+        assert!(!mgr.annotate_stale_redrive(&id, &mut msg).await);
+        assert_eq!(msg.content, "hello");
+
+        // Garbage report timestamp.
+        set_delegated_report(&mgr, &ws, &id, "garbage-ts").await;
+        let mut msg = queued_msg("hello", &now_iso(), false);
+        assert!(!mgr.annotate_stale_redrive(&id, &mut msg).await);
+        assert_eq!(msg.content, "hello");
+    }
+
+    /// STAB-112 requeue keeps staleness sticky (#576): a drained stale entry
+    /// whose turn fails terminally is requeued with its ORIGINAL `queued_at`
+    /// (threaded via [`TurnOptions::queued_at`]), so the retry drain still
+    /// classifies it stale and keeps suppressing the report clear. Direct
+    /// sends (`queued_at: None`) stamp a fresh timestamp as before.
+    #[tokio::test]
+    async fn terminal_failure_requeue_preserves_staleness() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-576-h"), AgentId::from("a-576-h"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        let queued_at = now_iso();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report_ts = now_iso();
+        set_delegated_report(&mgr, &ws, &id, &report_ts).await;
+
+        // Simulate the terminal-failure requeue of a drained stale entry.
+        let options = super::super::TurnOptions {
+            queued_at: Some(queued_at.clone()),
+            ..super::super::TurnOptions::default()
+        };
+        super::super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            "stale work",
+            &options,
+            true,
+            "boom",
+        )
+        .await;
+
+        let mut requeued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("requeued entry present");
+        assert_eq!(
+            requeued.queued_at, queued_at,
+            "requeue carries the original queued_at, not now_iso()"
+        );
+        assert!(requeued.requeued_after_failure);
+        assert!(
+            mgr.annotate_stale_redrive(&id, &mut requeued).await,
+            "the retry drain still classifies the requeued entry as stale"
+        );
+        assert_eq!(
+            requeued.content, "stale work",
+            "persisted requeues are never rewritten"
+        );
+
+        // Direct sends have no drained timestamp: the requeue stamps fresh.
+        let options = super::super::TurnOptions::default();
+        super::super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            "direct send",
+            &options,
+            true,
+            "boom",
+        )
+        .await;
+        let mut requeued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("requeued entry present");
+        assert!(
+            !mgr.annotate_stale_redrive(&id, &mut requeued).await,
+            "a direct-send requeue is stamped fresh (queued_at >= report_ts)"
+        );
+    }
+
+    /// Full drain-path flow (#576): a delegated agent with a delivered
+    /// completion report drains a STALE queued message through a real mock-ACP
+    /// turn — the persisted user row carries the annotation and the report
+    /// survives the turn (the start-of-turn clear is suppressed).
+    #[tokio::test]
+    async fn stale_drain_keeps_report_and_annotates_transcript() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-576-g"), AgentId::from("a-576-g"));
+        seed_agent(&mgr, &ws, &id).await;
+        set_session_provider(&mgr, &ws, &id, "mock").await;
+
+        // Enqueue FIRST, then persist the report: queued_at < report_ts, the
+        // exact incident ordering (message queued while the reporting turn
+        // was still in flight).
+        mgr.services
+            .enqueue_message(&id, "stale wake".to_string(), None, None, None);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stale drained turn completes");
+
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(
+            session.completion_report.as_deref(),
+            Some("work done"),
+            "the delivered report survives a stale redrive"
+        );
+        assert!(
+            session.completion_report_timestamp.is_some(),
+            "report timestamp survives too"
+        );
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let user_row = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("drained user row persisted");
+        let text = user_row.content[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("stale wake"),
+            "original content first: {text}"
+        );
+        assert!(
+            text.contains(super::super::STALE_REDRIVE_NOTE_PREFIX),
+            "persisted row carries the annotation: {text}"
+        );
+    }
+
+    /// Full drain-path flow (#576) counterpart: a FRESH queued message
+    /// (enqueued after the report was delivered) keeps today's behavior — no
+    /// annotation and the start-of-turn clear wipes the stale report.
+    #[tokio::test]
+    async fn fresh_drain_clears_report_without_annotation() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+        let (_tmp, mgr) = manager().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-576-h"), AgentId::from("a-576-h"));
+        seed_agent(&mgr, &ws, &id).await;
+        set_session_provider(&mgr, &ws, &id, "mock").await;
+
+        set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        mgr.services
+            .enqueue_message(&id, "fresh work".to_string(), None, None, None);
+
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh drained turn completes");
+
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(
+            session.completion_report, None,
+            "a fresh turn clears the prior report as today"
+        );
+        assert_eq!(session.completion_report_timestamp, None);
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .expect("messages");
+        let user_row = messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("drained user row persisted");
+        let text = user_row.content[0]["text"].as_str().unwrap();
+        assert_eq!(text, "fresh work", "fresh content is not annotated");
     }
 }

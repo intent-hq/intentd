@@ -6,6 +6,11 @@
 # rebuild stable.json from that release's assets and upload it to the fixed
 # `channel-stable` release. Consumers (e.g. cloudlands-fe pin-bump automation,
 # installer scripts) discover the latest stable release from that manifest.
+#
+# As a best-effort extra, promotion also rewrites the `channel-stable` release
+# body with aggregated release notes covering every version since the previous
+# stable (aggregate-stable-notes.sh). Notes steps are fail-soft: they never
+# block the promotion or change manifest publishing.
 name: Promote stable
 
 on:
@@ -58,6 +63,29 @@ jobs:
             exit 1
           fi
           echo "Release v${VERSION} exists and is a published non-prerelease"
+      # Read the outgoing stable.json before it is rebuilt so the aggregated
+      # notes can span (previous stable, promoted]. Fail-soft: a missing
+      # asset/release (first promotion) or any error just leaves the previous
+      # version empty.
+      - name: Read previous stable version
+        id: prev-stable
+        continue-on-error: true
+        shell: bash
+        run: |
+          prev=""
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          if gh release download channel-stable --repo "$GITHUB_REPOSITORY" \
+            --pattern stable.json --dir "$tmpdir"; then
+            prev=$(jq -r '.version // empty' "$tmpdir/stable.json" || true)
+          else
+            echo "No existing stable.json on channel-stable (first promotion?)"
+          fi
+          if [[ ! "$prev" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            prev=""
+          fi
+          echo "version=$prev" >> "$GITHUB_OUTPUT"
+          echo "Previous stable version: ${prev:-<none>}"
       - name: Build stable manifest
         shell: bash
         run: |
@@ -66,14 +94,35 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh stable stable.json
+      # Fail-soft: aggregated notes are a nice-to-have; a failure here must
+      # never fail the promotion (the manifest is already published).
+      - name: Aggregate stable release notes
+        id: notes
+        continue-on-error: true
+        shell: bash
+        env:
+          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
+        run: |
+          ./scripts/aggregate-stable-notes.sh "$VERSION" "$PREV_STABLE"
       - name: Post summary
         shell: bash
+        env:
+          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
+          NOTES_OUTCOME: ${{ steps.notes.outcome }}
         run: |
           {
             echo "## Stable promotion"
             echo ""
             echo "**Promoted version:** v$VERSION"
             echo ""
-            echo "- [channel-stable release](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-stable)"
+            echo "**Previous stable:** ${PREV_STABLE:-unknown (first promotion?)}"
+            echo ""
+            if [[ "$NOTES_OUTCOME" == "success" ]]; then
+              echo "**Aggregated notes:** updated on channel-stable"
+            else
+              echo "**Aggregated notes:** skipped (non-blocking failure; manifest unaffected)"
+            fi
+            echo ""
+            echo "- [channel-stable release (aggregated notes)](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-stable)"
             echo "- [stable.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-stable/stable.json)"
           } >> "$GITHUB_STEP_SUMMARY"

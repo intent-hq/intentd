@@ -504,6 +504,7 @@ impl WorkspaceApi for FakeApi {
                 // `params.idempotencyKey` instead of silently dropping it.
                 comment_id: idempotency_key.unwrap_or_else(|| "c1".to_string()),
                 anchored: true,
+                note_rev: 1,
                 location: CommentLocation {
                     line: 1,
                     anchored_text: comment_target,
@@ -522,6 +523,7 @@ impl WorkspaceApi for FakeApi {
         _comment: String,
         _kind: Option<String>,
         _author: Option<String>,
+        _author_type: Option<String>,
         suggestion_original: Option<String>,
         suggestion_proposed: Option<String>,
     ) -> BoxFuture<'_, Result<CommentRespondResult>> {

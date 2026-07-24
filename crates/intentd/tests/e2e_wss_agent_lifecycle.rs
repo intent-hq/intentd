@@ -3801,44 +3801,51 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second message should be queued");
 
-    // Collect events and look for the agent:message event for the dequeued message.
-    let mut saw_dequeued_user_message = false;
+    // Collect events under one shared deadline (30s, STAB-128 precedent).
+    // The daemon does NOT guarantee the relative order of the empty-queue
+    // `agent:queue:updated`, the dequeued user `agent:message`, and the
+    // `agent:stream:end` frames — the end-of-turn drain and the stream:end
+    // publication run on independent async paths — so track each signal
+    // independently, filtered by agent id, with no cross-signal ordering
+    // gates (STAB-34/36 pattern).
     let mut saw_queue_drain = false;
+    let mut user_message_event_ids: Vec<String> = Vec::new();
     let mut stream_end_count = 0;
 
-    for i in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
+    // Fast-path exit note: `user_message_event_ids.len() >= 2` relies on the
+    // direct-send branch of `agent.sendMessage` also emitting `agent:message`
+    // for "first message" (PROTOCOL §5.5 step 6). If that emit ever went away
+    // the loop would still be correct — it would just run to the deadline and
+    // let the id-match assertion below decide.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_queue_drain && stream_end_count >= 2 && user_message_event_ids.len() >= 2) {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            break;
+        };
         let evt = &frame["params"]["event"];
+        if evt["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
         match evt["type"].as_str() {
             Some("agent:queue:updated") => {
-                // After the first turn completes, the queue drains to empty
-                if stream_end_count >= 1
-                    && evt["data"]["queue"]
-                        .as_array()
-                        .map(|q| q.is_empty())
-                        .unwrap_or(false)
+                // The queue drains to empty once the first turn completes.
+                if evt["data"]["queue"]
+                    .as_array()
+                    .map(|q| q.is_empty())
+                    .unwrap_or(false)
                 {
                     saw_queue_drain = true;
                 }
             }
             Some("agent:message") => {
-                assert_eq!(evt["data"]["agentId"].as_str(), Some(agent_id.as_str()));
-                let role = evt["data"]["role"].as_str();
-                // The dequeued message event should arrive after the queue drain
-                if role == Some("user") && saw_queue_drain {
-                    saw_dequeued_user_message = true;
+                if evt["data"]["role"].as_str() == Some("user") {
+                    if let Some(mid) = evt["data"]["messageId"].as_str() {
+                        user_message_event_ids.push(mid.to_string());
+                    }
                 }
             }
             Some("agent:stream:end") => {
                 stream_end_count += 1;
-                // After two turns complete and we've seen the dequeued message event, we're done
-                if stream_end_count >= 2 && saw_dequeued_user_message {
-                    break;
-                }
-                // Give up after seeing both stream ends + some extra iterations
-                if stream_end_count >= 2 && i >= 10 {
-                    break;
-                }
             }
             _ => {}
         }
@@ -3849,8 +3856,33 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         "queue should have drained after first turn"
     );
     assert!(
-        saw_dequeued_user_message,
-        "agent:message event for dequeued user message — STAB-4 fix"
+        stream_end_count >= 2,
+        "both turns reached terminal agent:stream:end (saw {stream_end_count})"
+    );
+
+    // The `agent:message` payload carries `{ agentId, messageId, role }` (no
+    // content, PROTOCOL §6.5) — resolve the persisted row for the dequeued
+    // "queued message" content and match the collected event ids against it,
+    // instead of relying on event arrival order.
+    let convo = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let dequeued_row_id = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued message")
+        .and_then(|m| m["id"].as_str())
+        .expect("dequeued user message row present in transcript")
+        .to_string();
+    assert!(
+        user_message_event_ids.contains(&dequeued_row_id),
+        "agent:message event for dequeued user message — STAB-4 fix \
+         (row id {dequeued_row_id}, event ids {user_message_event_ids:?})"
     );
 }
 
@@ -5971,6 +6003,310 @@ async fn completion_report_cleared_when_new_turn_begins_over_wss() {
     assert!(
         get_after["agent"]["metadata"]["completionReportTimestamp"].is_null(),
         "completion report timestamp cleared after new turn begins"
+    );
+}
+
+/// Stale queued-message redrive over WSS (#576). A message queued to a
+/// delegated child while it is mid-turn — BEFORE the child persists its
+/// completion report — drains only after that report was already delivered
+/// to the parent (`queued_at < completion_report_timestamp`). The redrive
+/// must NOT look like fresh work:
+/// - (a) the redriven user message carries the deterministic `[SYSTEM NOTE]`
+///   annotation telling the child its report was already delivered;
+/// - (b) NO `agent:updated` with `completionReportCleared: true` fires for
+///   the stale turn — the delivered report stays queryable via `agent.get`;
+/// - (c) the parent receives exactly ONE wake for the report (the child
+///   never re-reports, so no duplicate wake).
+/// Fresh messages keep today's clear-on-new-turn behavior (covered by
+/// `completion_report_cleared_when_new_turn_begins_over_wss` above).
+#[tokio::test]
+async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
+    let Some(script) = gate("WSS stale queued-message redrive (#576)") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    const CHILD_TAG: &str = "STALE576_CHILD";
+    const REPORT: &str = "STALE576_REPORT shipped the thing";
+    const STALE_MSG: &str = "STALE576_QUEUED follow-up sent while the child was mid-turn";
+    const PARENT_GO: &str = "STALE576_PARENT_GO";
+    // Stable prefix of the daemon's stale-redrive annotation (#576) — see
+    // `STALE_REDRIVE_NOTE_PREFIX` in `intent-services`'s agent_manager.
+    const NOTE_PREFIX: &str = "[SYSTEM NOTE] This message was queued before you completed";
+    let report_js = format!("return await ws.agent.reportToParent({});", json!(REPORT));
+    let delegate_js = format!(
+        "return await ws.agent.delegate({{ agentInstructions: {}, model: 'mock:default' }});",
+        json!(CHILD_TAG),
+    );
+    // Prompt-matched rules; the STALE_MSG rule comes FIRST so the redriven
+    // turn matches it (and never re-reports). The child's report turn delays
+    // 8s BEFORE its reportToParent tool call so the test can queue STALE_MSG
+    // mid-turn, strictly before the report timestamp is persisted.
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": STALE_MSG,
+                "response": "child acknowledged the stale message without re-reporting",
+            },
+            {
+                "ifPromptContains": CHILD_TAG,
+                "delayMs": 8000,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": report_js, "summary": "child reportToParent" }
+                },
+                "response": "child finished after reportToParent",
+            },
+            {
+                "ifPromptContains": "[WORKSPACE EVENTS]",
+                "response": "parent acknowledged the wake",
+            },
+            {
+                "ifPromptContains": PARENT_GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": delegate_js, "summary": "delegate stale-redrive child" }
+                },
+                "response": "parent delegated one immediate child",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child: child_proc,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no events.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let parent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Stale Parent", "model": "mock:default" }),
+    )
+    .await;
+    let parent_id = parent["agent"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent_id, "content": PARENT_GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Phase 1 — learn the child id and wait until its report turn is
+    // verifiably in flight (busy slot claimed), so the follow-up send below
+    // QUEUES instead of delivering. The child id is any non-parent agent id
+    // on the wire (only one child exists); mid-turn evidence is its active
+    // `agent:status-changed` or a turn-startup `agent:stream:status` frame —
+    // both fire well inside the child rule's 8s pre-report delay.
+    let mut child_id: Option<String> = None;
+    let mut child_mid_turn = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !child_mid_turn {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out waiting for the child's report turn to begin: child_id={child_id:?}"
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        if ev_agent.is_empty() || ev_agent == parent_id {
+            continue;
+        }
+        if child_id.is_none() {
+            child_id = Some(ev_agent.to_string());
+        }
+        if (ev_type == "agent:status-changed" && ev["data"]["isActive"] == json!(true))
+            || ev_type == "agent:stream:status"
+        {
+            child_mid_turn = true;
+        }
+    }
+    let child_id = child_id.expect("child agent id observed on the wire");
+
+    // Queue the follow-up while the child is mid-turn and its report is NOT
+    // yet persisted (the mock delays 8s before reportToParent): `queued_at`
+    // therefore predates `completion_report_timestamp` — the exact #576
+    // staleness condition. `queued: true` is the deterministic proof the
+    // message parked behind the in-flight turn instead of starting a fresh
+    // one; the NORMAL (non-requeue) stale path is the one under test, so the
+    // redriven row gets the annotation (a persisted terminal-failure requeue
+    // would suppress the clear WITHOUT annotating).
+    let queued = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": child_id, "content": STALE_MSG }),
+    )
+    .await;
+    assert_eq!(queued["success"], true, "queued send ok: {queued}");
+    assert_eq!(
+        queued["queued"], true,
+        "message must QUEUE behind the child's in-flight turn: {queued}"
+    );
+
+    // Phase 2 — drive to completion ORDER-INSENSITIVELY (the report-time
+    // wake races the child's own turn end on the wire, see SUB-2 above):
+    // the child ends its report turn AND its redriven stale turn (two
+    // stream:ends) then idles; the parent idles after delegating, runs
+    // exactly ONE wake turn, and idles again. Meanwhile count every
+    // `agent:updated` carrying `completionReportCleared: true` for the
+    // child — the stale redrive must NOT clear the delivered report, and
+    // the subscription's ordered delivery guarantees any turn-begin clear
+    // event would land before the stale turn's stream:end.
+    let mut parent_idle_count = 0u32;
+    let mut parent_wake_ends = 0u32;
+    let mut child_stream_ends = 0u32;
+    let mut child_idle = false;
+    let mut child_cleared_events = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_stream_ends >= 2 && child_idle)
+    {
+        let frame = match wss_event_opt_until(&mut sub, deadline).await {
+            Some(frame) => frame,
+            None => panic!(
+                "timed out waiting for redrive milestones: parent_idle_count={parent_idle_count} \
+                 parent_wake_ends={parent_wake_ends} child_stream_ends={child_stream_ends} \
+                 child_idle={child_idle}"
+            ),
+        };
+        let ev = &frame["params"]["event"];
+        let ev_agent = ev["data"]["agentId"].as_str().unwrap_or_default();
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        if ev_agent == parent_id {
+            if ev_type == "agent:idle" {
+                parent_idle_count += 1;
+            }
+            // Any parent stream:end after the first parent idle belongs to a
+            // wake turn (the delegating turn's stream:end precedes that idle).
+            if ev_type == "agent:stream:end" && parent_idle_count >= 1 {
+                parent_wake_ends += 1;
+            }
+        } else if ev_agent == child_id {
+            match ev_type {
+                "agent:stream:end" => child_stream_ends += 1,
+                "agent:idle" => child_idle = true,
+                "agent:updated" if ev["data"]["completionReportCleared"] == json!(true) => {
+                    child_cleared_events += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    // (b) the stale redrive suppressed the turn-begin report clear.
+    assert_eq!(
+        child_cleared_events, 0,
+        "NO agent:updated with completionReportCleared:true may fire for the stale turn"
+    );
+    assert_eq!(
+        parent_wake_ends, 1,
+        "exactly one wake-turn stream:end on the parent"
+    );
+
+    // (a) the redriven user message carries the [SYSTEM NOTE] annotation —
+    // and ONLY that message (the delegated-instructions row is untouched).
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": child_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("child messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    let stale_rows: Vec<&String> = texts.iter().filter(|t| t.contains(STALE_MSG)).collect();
+    assert_eq!(
+        stale_rows.len(),
+        1,
+        "the queued message persisted exactly once in the child transcript: {conv}"
+    );
+    assert!(
+        stale_rows[0].contains(NOTE_PREFIX),
+        "the redriven stale message carries the [SYSTEM NOTE] annotation: {}",
+        stale_rows[0]
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(NOTE_PREFIX)).count(),
+        1,
+        "only the stale redrive is annotated: {conv}"
+    );
+
+    // The delivered report stays queryable after the stale turn (the clear
+    // was suppressed, not deferred).
+    let child_got = wss_rpc(&mut rpc, 14, "agent.get", json!({ "agentId": child_id })).await;
+    assert_eq!(
+        child_got["agent"]["metadata"]["completionReport"],
+        json!(REPORT),
+        "completion report still queryable after the stale redrive: {child_got}"
+    );
+
+    // (c) the parent received exactly ONE wake for the report: one
+    // [WORKSPACE EVENTS] message, and the report text appears nowhere else.
+    let conv = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({ "agentId": parent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("parent messages array");
+    let texts: Vec<String> = messages
+        .iter()
+        .map(|m| serde_json::to_string(&m["contentBlocks"]).unwrap_or_default())
+        .collect();
+    assert_eq!(
+        texts
+            .iter()
+            .filter(|t| t.contains("[WORKSPACE EVENTS]"))
+            .count(),
+        1,
+        "exactly one wake message in the parent transcript: {conv}"
+    );
+    assert_eq!(
+        texts.iter().filter(|t| t.contains(REPORT)).count(),
+        1,
+        "the report reached the parent exactly once (inside the single wake): {conv}"
     );
 }
 
@@ -8145,5 +8481,203 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
             .flatten()
             .any(|item| item["resource"]["mimeType"] == "application/vnd.intent.proposal+json"),
         "tool_result.output keeps the resource item: {tool_result}"
+    );
+}
+
+/// §7.1 fallback (intent-hq/monorepo#511 regression class): a provider that
+/// collapses the MCP content items into `{ output: "<stringified {ok,
+/// proposal}>" }` — dropping the resource item entirely, as auggie does —
+/// still surfaces the standalone proposal `resource` block over the live
+/// `chat.subscribe` channel, and the terminal reconcile keeps it (its id
+/// matches the persisted transcript).
+#[tokio::test]
+async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
+    let Some(script) = gate("WSS collapsed-proposal chat.subscribe E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // The canned tool_call_update carries the auggie-collapsed rawOutput: the
+    // daemon's own {ok, proposal} text-item payload stringified under
+    // `output`, with the resource item dropped.
+    let proposal = json!({
+        "kind": "settings-change",
+        "preview": { "title": "Update" },
+        "payload": { "key": "test.setting" },
+    });
+    let collapsed_text = serde_json::to_string_pretty(&json!({ "ok": true, "proposal": proposal }))
+        .expect("serialize collapsed payload");
+    let behavior = json!({
+        "response": "proposal shown",
+        "rawUpdates": [
+            { "sessionUpdate": "tool_call", "toolCallId": "tc_prop",
+              "title": "workspace_api", "kind": "other", "status": "in_progress",
+              "rawInput": { "code": "ws.app.proposal.show(p)" } },
+            { "sessionUpdate": "tool_call_update", "toolCallId": "tc_prop",
+              "status": "completed",
+              "rawOutput": { "output": collapsed_text } }
+        ]
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // RPC conn — create the agent.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Collapser", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // CHAT conn — subscribe BEFORE the turn so every stream delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "show proposal" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The live channel delivers the REBUILT standalone proposal block even
+    // though the rawOutput carried no resource item.
+    let proposal_block_id = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = &frame["params"]["delta"];
+            if let Some(entity) = delta["added"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(delta["updated"].as_array().into_iter().flatten())
+                .find(|e| {
+                    e["block"]["type"] == "resource"
+                        && e["block"]["resource"]["mimeType"]
+                            == "application/vnd.intent.proposal+json"
+                })
+            {
+                assert_eq!(
+                    entity["block"]["resource"]["uri"],
+                    json!("intent-proposal://settings-change/Update"),
+                    "uri rebuilt from the collapsed payload: {entity}"
+                );
+                return entity["block"]["id"].as_str().map(String::from);
+            }
+        }
+    })
+    .await
+    .expect("standalone proposal block reached chat channel in time")
+    .expect("standalone proposal block carries an id");
+
+    // Terminal reconcile keeps the rebuilt block (live and persisted agree).
+    let terminal = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = frame["params"]["delta"].clone();
+            let is_terminal = ["added", "updated"].iter().any(|key| {
+                delta[*key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+            });
+            if is_terminal {
+                return delta;
+            }
+        }
+    })
+    .await
+    .expect("terminal (streamingComplete) delta arrived");
+    assert!(
+        !terminal["removedIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|id| id.as_str() == Some(proposal_block_id.as_str())),
+        "the proposal block {proposal_block_id} survives the reconcile: {terminal}"
+    );
+
+    // The persisted transcript holds the same rebuilt block under the SAME id,
+    // and the tool_result keeps the collapsed output object unchanged.
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let persisted_proposal = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| {
+            b["type"] == "resource"
+                && b["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+        })
+        .expect("standalone proposal block persisted");
+    assert_eq!(
+        persisted_proposal["id"].as_str(),
+        Some(proposal_block_id.as_str()),
+        "live and persisted block ids agree: {persisted_proposal}"
+    );
+    let persisted_text = persisted_proposal["resource"]["text"]
+        .as_str()
+        .expect("proposal text");
+    let parsed: Value = serde_json::from_str(persisted_text).expect("proposal text parses");
+    assert_eq!(parsed, proposal, "proposal round-trips byte-for-byte");
+    let tool_result = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_result")
+        .expect("tool_result persisted");
+    assert_eq!(
+        tool_result["output"]["output"],
+        json!(collapsed_text),
+        "tool_result.output keeps the collapsed object unchanged: {tool_result}"
     );
 }

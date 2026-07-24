@@ -5,7 +5,10 @@
 
 pub mod bus;
 pub mod filter;
+pub mod registry;
+mod root_watch;
 pub mod skills_watcher;
+pub mod specialists_watcher;
 pub mod watcher;
 
 pub use bus::{EventBus, Subscription};
@@ -13,7 +16,9 @@ pub use filter::{
     event_matches, event_type_matches, resolve_event_types, SubscriptionFilter,
     DEFAULT_BATCH_WINDOW, VALID_EVENT_CATEGORY_WILDCARDS,
 };
+pub use registry::WatcherRegistry;
 pub use skills_watcher::SkillsWatcher;
+pub use specialists_watcher::SpecialistsWatcher;
 pub use watcher::FileWatcher;
 
 #[cfg(test)]

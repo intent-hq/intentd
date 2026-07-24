@@ -1920,6 +1920,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "directories",
+ "libc",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -2112,7 +2113,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.2.3"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "async-trait",

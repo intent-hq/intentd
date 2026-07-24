@@ -659,13 +659,13 @@ impl ChatDeltaState {
                 // Gated on `completed` only (matching `record_tool`) — an
                 // errored tool must not surface an actionable ProposalCard.
                 if status == "completed" {
-                    if let Some(item) = intent_services::tool_block::find_proposal_resource(output)
+                    if let Some(item) = intent_services::tool_block::lift_proposal_resource(output)
                     {
                         if let Some(proposal_id) = next_block_id(&result_id) {
                             let proposal_block =
                                 intent_services::tool_block::build_proposal_resource_block(
                                     &proposal_id,
-                                    item,
+                                    &item,
                                 );
                             let prop_added = self.note_block(&proposal_id);
                             push_entity(

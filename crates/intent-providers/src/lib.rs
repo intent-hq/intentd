@@ -36,8 +36,8 @@ pub use models::{
     is_model_valid_for_provider, model_tier_from_model, normalize_model_override,
     parse_codex_reasoning_effort, parse_compound_model_id, parse_grok_initialize_models,
     parse_grok_initialize_response_from_stdout, parse_grok_models_command_output,
-    resolve_preferred_model, tiers_for, GrokModel, GrokModelsCommandOutput, GrokParsedModels,
-    ModelTier, ModelTiers, PROVIDER_MODEL_TIERS,
+    providers_claiming_model, resolve_preferred_model, tiers_for, GrokModel,
+    GrokModelsCommandOutput, GrokParsedModels, ModelTier, ModelTiers, PROVIDER_MODEL_TIERS,
 };
 
 #[cfg(test)]

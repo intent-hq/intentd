@@ -1,4 +1,5 @@
-//! Server pairing fast-path: `server.pairingInfo` + `server.rotateToken` (§5.2).
+//! Server pairing fast-path: `server.pairingInfo` + `server.rotateToken`
+//! (PROTOCOL.md §5 fast-path catalog).
 //!
 //! These two methods expose pairing credentials (token + fingerprint + port + local IPs + hostname)
 //! and rotate the bearer token. They are LOCAL-ONLY: gated on the real connection origin (UDS vs TCP)

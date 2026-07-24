@@ -18,10 +18,10 @@ pub(crate) const PRELUDE: &str = r#"
 "#;
 
 /// MCP resource MIME type for proposals (parity with FE `proposal-resource.ts`).
-const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+json";
+pub const PROPOSAL_RESOURCE_MIME_TYPE: &str = "application/vnd.intent.proposal+json";
 
 /// Valid proposal kinds (parity with TS `PROPOSAL_KINDS`).
-const PROPOSAL_KINDS: &[&str] = &[
+pub const PROPOSAL_KINDS: &[&str] = &[
     "workspace-create",
     "settings-change",
     "specialist-edit",
@@ -46,7 +46,11 @@ pub(crate) async fn dispatch(
 }
 
 /// Port of TS `isProposal` validation from `proposal.ts`.
-fn is_valid_proposal(value: &Value) -> bool {
+///
+/// Public (re-exported at `intent_acp::mcp_server`) so the §7.1
+/// collapsed-output proposal lift in `intent-services::tool_block` validates
+/// against the SAME canonical rules — one source, no drift.
+pub fn is_valid_proposal(value: &Value) -> bool {
     if let Some(obj) = value.as_object() {
         // Check kind
         let kind_valid = obj
@@ -74,7 +78,10 @@ fn is_valid_proposal(value: &Value) -> bool {
 }
 
 /// Build proposal resource URI (parity with TS `proposalResourceId` + `createProposalResource`).
-fn proposal_resource_uri(proposal: &Value) -> String {
+///
+/// Public (re-exported at `intent_acp::mcp_server`) so the §7.1
+/// collapsed-output lift rebuilds the identical URI.
+pub fn proposal_resource_uri(proposal: &Value) -> String {
     let kind = proposal
         .get("kind")
         .and_then(Value::as_str)

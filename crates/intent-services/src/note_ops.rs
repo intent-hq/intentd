@@ -594,10 +594,14 @@ struct PlaintextProjection {
 
 /// Characters dropped from BOTH the markdown projection and the search
 /// needles: whitespace (block joins and newline/space differences become
-/// flexible) plus inline emphasis/code delimiters and link brackets. Dropping
-/// them symmetrically keeps literal `*`/`_`/brackets in prose matching.
+/// flexible) plus inline emphasis/code delimiters, link brackets, and `@`.
+/// Dropping them symmetrically keeps literal `*`/`_`/brackets in prose
+/// matching. `@` is included because editor clients render bare filenames
+/// (e.g. `KNOWN_ISSUES.md`) as mention chips whose canonical text carries a
+/// leading `@` the markdown source never had; dropping it on both sides keeps
+/// literal `@` in prose matching too.
 fn is_normalized_away(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '*' | '_' | '`' | '~' | '[' | ']')
+    c.is_whitespace() || matches!(c, '*' | '_' | '`' | '~' | '[' | ']' | '@')
 }
 
 /// Normalize a client-supplied needle (searchContext / commentTarget) for the
@@ -1690,6 +1694,53 @@ mod tests {
             matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times in the document")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_mention_at_prefix() {
+        // Real-world repro (2026-07-23, round 4): editor clients render bare
+        // filenames as mention chips whose canonical text carries a leading
+        // `@` the markdown source never had (`KNOWN_ISSUES.md` in the source,
+        // `@KNOWN_ISSUES.md` in the extracted needle). `@` is normalized away
+        // on both sides so the needle still matches.
+        let content =
+            "issue filed+closed; KNOWN_ISSUES.md was retired on main in favor of GitHub issues.";
+        let (from, to, _line) = find_and_anchor_text(
+            content,
+            "issue filed+closed; @KNOWN_ISSUES.md was retired on main",
+            "@KNOWN_ISSUES.md was retired",
+        )
+        .unwrap();
+        assert_eq!(&content[from..to], "KNOWN_ISSUES.md was retired");
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_at_ambiguity_fails_closed() {
+        // With `@` normalized away, a fallback needle that used to match only
+        // the literal `@alice` occurrence now also matches the bare `alice`
+        // one — the ambiguity guard fails closed (error, never a wrong
+        // anchor). Emphasis in the source keeps the exact-match path from
+        // short-circuiting so the plaintext fallback is exercised.
+        let content = "Ping **@alice** for details.\n\nPing **alice** for details.";
+        let err = find_and_anchor_text(content, "Ping @alice for details", "@alice").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(ref m) if m.contains("appears multiple times")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_literal_at_still_matches() {
+        // A literal `@` present in BOTH the markdown and the needle keeps
+        // matching after the symmetric drop.
+        let content = "Contact user@example.com for access to the beta.";
+        let (from, to, _line) = find_and_anchor_text(
+            content,
+            "Contact user@example.com for access",
+            "user@example.com",
+        )
+        .unwrap();
+        assert_eq!(&content[from..to], "user@example.com");
     }
 
     // Real-world dogfood repro (2026-07-22): the note gained a new paragraph

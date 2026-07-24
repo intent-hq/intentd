@@ -21,7 +21,7 @@ mod common;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::WorkspaceApi;
@@ -96,7 +96,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
     ws.send(Message::Text(frame.to_string()))
         .await
         .expect("send");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + common::rpc_read_timeout();
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -124,7 +124,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 /// Read the next `events.event` notification frame from `ws`, echoing pings
 /// and skipping unrelated `id`-carrying response frames.
 async fn next_event(ws: &mut PlainWs) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + common::rpc_read_timeout();
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())

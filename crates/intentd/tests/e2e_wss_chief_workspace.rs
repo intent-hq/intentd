@@ -118,7 +118,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
         .expect("uds rpc timed out")
         .expect("read uds response");
@@ -491,6 +491,125 @@ async fn chief_workspace_over_wss() {
     assert_eq!(after["archived"], json!(false));
     assert_eq!(after["status"], json!("Active"));
     assert_eq!(after["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+}
+
+/// Chief provider children spawn in the dedicated, daemon-owned, EMPTY
+/// `<data_dir>/chief-cwd` directory — never `/tmp` (STAB-50: auggie's
+/// `--allow-indexing` over a large shared `/tmp` blew the child's V8 heap
+/// cap). Drives a real chief agent turn over WSS with the mock ACP provider
+/// echoing its `process.cwd()` into the response text, then asserts the
+/// child's actual working directory resolves to `<data_dir>/chief-cwd`,
+/// which was auto-created (fresh data dir) and left empty.
+#[tokio::test]
+async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
+    let Some(script) = gate("WSS chief dedicated cwd E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    // Fresh data dir: the chief cwd must not pre-exist — the spawn path
+    // creates it on demand.
+    let chief_cwd = intent_core::chief_cwd_root(&data_dir);
+    assert!(
+        !chief_cwd.exists(),
+        "fresh data dir must not carry {}",
+        chief_cwd.display()
+    );
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Cwd Probe",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "agent.create errored: {resp}");
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": agent_id,
+            "content": "where do you live?",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    // The mock child stamps `cwd=<process.cwd()>` into its response text.
+    let echoed = poll_conversation(&mut rpc, 100, &agent_id, "echoed cwd", |m| {
+        let text = serde_json::to_string(m).unwrap_or_default();
+        text.split("cwd=")
+            .nth(1)
+            .and_then(|rest| rest.split(['"', ' ']).next())
+            .map(str::to_string)
+    })
+    .await;
+
+    // The kernel resolves symlinks in the spawn cwd (`/tmp` →
+    // `/private/tmp` on macOS), so compare canonicalized paths.
+    let expected = std::fs::canonicalize(&chief_cwd).expect("chief cwd created on demand");
+    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
+    assert_eq!(
+        actual, expected,
+        "chief child must spawn in the dedicated chief-cwd dir, got {echoed}"
+    );
+    assert_ne!(
+        actual,
+        Path::new("/tmp"),
+        "chief child must never spawn in /tmp"
+    );
+    if let Ok(shared_tmp) = std::fs::canonicalize("/tmp") {
+        assert_ne!(
+            shared_tmp, actual,
+            "chief child must never spawn in the shared temp dir"
+        );
+    }
+
+    // The dedicated cwd stays empty: nothing to index.
+    let entries = std::fs::read_dir(&chief_cwd)
+        .expect("read chief cwd")
+        .count();
+    assert_eq!(entries, 0, "dedicated chief cwd must be empty");
+
+    let _ = wss_rpc_envelope(&mut rpc, 200, "agent.stop", json!({ "agentId": agent_id })).await;
 }
 
 /// WSS e2e coverage for chief workspace contract. Verifies:
