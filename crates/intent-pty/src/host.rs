@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use portable_pty::{
     native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize as PortablePtySize,
+    SlavePty,
 };
 use tokio::sync::broadcast;
 
@@ -26,6 +27,13 @@ const READ_CHUNK: usize = 8192;
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a signalled child to exit.
 const REAP_POLL: Duration = Duration::from_millis(20);
+/// Poll interval while the exit watcher waits for the reader to drain the
+/// master queue after the child has been reaped (monorepo#587).
+const DRAIN_POLL: Duration = Duration::from_millis(5);
+/// Upper bound on that drain wait: the child is already dead, so the queue is
+/// finite and normally empties within a few reads — the bound only guards
+/// against a wedged reader keeping the held slave fd open forever.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// Opaque identifier for a spawned PTY, unique within a [`PtyHost`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -180,11 +188,21 @@ struct PtySession {
     cwd: Option<String>,
     pid: Option<u32>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    /// Parent-side slave end, held open until the child is reaped and the
+    /// reader has drained the master queue (monorepo#587): if the child's exit
+    /// closed the *last* slave fd, macOS would discard any PTY output the
+    /// reader had not yet read — a fast-exiting child's entire output could be
+    /// lost. The exit watcher (or teardown) takes it so the reader still
+    /// observes EOF and its thread exits.
+    slave: Mutex<Option<Box<dyn SlavePty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     fanout: Arc<Mutex<Fanout>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Exit watcher thread: reaps the child, then releases `slave` once the
+    /// reader has drained the queue (see `exit_watch_loop`).
+    watcher: Mutex<Option<JoinHandle<()>>>,
     /// Cached exit status, latched the first time the child is observed exited so
     /// it survives later teardown/removal (the `portable-pty` child only yields
     /// its status once).
@@ -247,9 +265,13 @@ impl PtyHost {
         }
 
         let child = pair.slave.spawn_command(cmd).map_err(internal)?;
-        // Drop the slave so the master reader observes EOF once the child exits;
-        // otherwise our retained slave fd keeps the stream open forever.
-        drop(pair.slave);
+        // Keep the parent-side slave open (monorepo#587): if we dropped it
+        // here, a fast-exiting child would close the *last* slave fd before
+        // the reader thread's first read(), and macOS discards buffered PTY
+        // output on last-slave close — the child's output would be lost
+        // entirely. The exit watcher releases it once the child is reaped and
+        // the reader has drained the queue, so the reader still observes EOF
+        // and its thread exits (no fd or thread leak).
 
         let pid = child.process_id();
         let killer = child.clone_killer();
@@ -281,13 +303,19 @@ impl PtyHost {
             cwd,
             pid,
             master: Mutex::new(Some(pair.master)),
+            slave: Mutex::new(Some(pair.slave)),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             fanout,
             reader: Mutex::new(Some(handle)),
+            watcher: Mutex::new(None),
             exit: Mutex::new(None),
         });
+
+        let watcher_session = Arc::clone(&session);
+        let watcher = std::thread::spawn(move || exit_watch_loop(&watcher_session));
+        *session.watcher.lock().unwrap() = Some(watcher);
 
         let id = PtyId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.sessions.lock().unwrap().insert(id, session);
@@ -456,6 +484,84 @@ impl PtyHost {
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("{id}")))
     }
+
+    /// Whether the PTY's reader thread has finished (leak inspection).
+    #[cfg(test)]
+    fn reader_finished(&self, id: PtyId) -> bool {
+        self.sessions.lock().unwrap().get(&id).map_or(true, |s| {
+            s.reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(true, |h| h.is_finished())
+        })
+    }
+
+    /// Whether the parent-side slave fd is still held (leak inspection).
+    #[cfg(test)]
+    fn slave_held(&self, id: PtyId) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|s| s.slave.lock().unwrap().is_some())
+    }
+}
+
+/// Whether the PTY master has unread output pending in the kernel queue
+/// (POLLIN with a zero timeout). `false` once the reader has drained
+/// everything, or when the master is already torn down.
+#[cfg(unix)]
+fn master_pending(session: &PtySession) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::BorrowedFd;
+
+    let guard = session.master.lock().unwrap();
+    let Some(fd) = guard.as_ref().and_then(|m| m.as_raw_fd()) else {
+        return false;
+    };
+    // SAFETY: `guard` keeps the master (and thus `fd`) alive for the borrow.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::ZERO) {
+        Ok(_) => fds[0]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLIN)),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn master_pending(_session: &PtySession) -> bool {
+    false
+}
+
+/// Per-PTY exit watcher (own thread): poll until the child is reaped (latching
+/// its exit status), then wait — bounded — for the reader to drain any output
+/// still queued on the master, and release the held slave fd so the reader
+/// observes EOF and its thread exits (monorepo#587). Returns early when
+/// teardown has already released the slave.
+fn exit_watch_loop(session: &PtySession) {
+    loop {
+        if session.slave.lock().unwrap().is_none() {
+            return; // torn down; teardown joins the reader itself
+        }
+        if observe_exit(session).is_some() {
+            break;
+        }
+        std::thread::sleep(REAP_POLL);
+    }
+    // The child is reaped, so no further output arrives from it — only unread
+    // bytes can remain queued. Closing the held slave while bytes are queued
+    // would discard them on macOS (the very loss this fd guards against), so
+    // wait for the reader to drain the queue first. The bound only protects
+    // against a wedged reader; a grandchild that inherited the slave keeps
+    // the stream open regardless of when we release ours.
+    let deadline = std::time::Instant::now() + DRAIN_GRACE;
+    while master_pending(session) && std::time::Instant::now() < deadline {
+        std::thread::sleep(DRAIN_POLL);
+    }
+    session.slave.lock().unwrap().take();
 }
 
 /// Blocking reader loop (own thread): append each chunk to scrollback and
@@ -505,9 +611,15 @@ async fn teardown(session: &PtySession) {
     {
         let _ = session.killer.lock().unwrap().kill();
     }
-    // Drop the master fd so the reader observes EOF, then join its thread.
+    // Release the held slave and the master fd so the reader observes EOF,
+    // then join the reader and exit-watcher threads (the watcher exits on its
+    // own once it sees the slave released).
+    session.slave.lock().unwrap().take();
     session.master.lock().unwrap().take();
     if let Some(handle) = session.reader.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+    if let Some(handle) = session.watcher.lock().unwrap().take() {
         let _ = handle.join();
     }
 }
@@ -792,6 +904,63 @@ mod tests {
                 t.await.unwrap();
             }
         }
+        assert_eq!(host.count(), 0);
+    }
+
+    /// After a fast-exiting child is reaped and its output drained, the host
+    /// releases the held slave fd on its own and the reader thread exits — no
+    /// fd or reader-thread leak for naturally-exiting children (monorepo#587).
+    #[tokio::test]
+    async fn fast_exit_releases_slave_and_reader_without_kill() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("s", "echo");
+        spec.args = vec!["pty587-leak-check".into()];
+        let id = host.spawn(spec).unwrap();
+
+        let exit = host.wait(id).await.unwrap();
+        assert_eq!(exit.exit_code, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.slave_held(id) || !host.reader_finished(id) {
+            assert!(
+                Instant::now() < deadline,
+                "held slave fd or reader thread leaked after natural exit \
+                 (slave_held={}, reader_finished={})",
+                host.slave_held(id),
+                host.reader_finished(id)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The drained output must have reached scrollback before the release.
+        assert!(contains(
+            &host.scrollback(id).unwrap(),
+            b"pty587-leak-check"
+        ));
+        host.kill(id).await;
+        assert_eq!(host.count(), 0);
+    }
+
+    /// A long-running child keeps the held slave and its reader thread until
+    /// teardown; `kill()` releases both and joins the reader and watcher
+    /// threads promptly (no leak on the kill path either).
+    #[tokio::test]
+    async fn long_running_child_holds_slave_until_kill() {
+        let host = PtyHost::new();
+        let id = host.spawn(cat_spec("s")).unwrap();
+        let mut rx = host.attach(id).unwrap().live;
+
+        host.write(id, b"still-alive\n").unwrap();
+        let out = collect_until(&mut rx, b"still-alive", Duration::from_secs(5)).await;
+        assert!(contains(&out, b"still-alive"));
+
+        assert!(host.slave_held(id), "slave must stay held while running");
+        assert!(
+            !host.reader_finished(id),
+            "reader must keep tailing a live child"
+        );
+
+        assert!(host.kill(id).await);
         assert_eq!(host.count(), 0);
     }
 
