@@ -2191,6 +2191,92 @@ async fn comment_respond_author_type_persists_and_validates() {
     assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
 }
 
+/// `comment.respond`'s pre-existing caller-input validations — missing
+/// `threadId`/`commentId`, empty `comment`, and a missing
+/// `suggestionOriginal`/`suggestionProposed` pair — return `InvalidParams`
+/// (-32602) like `comment.add`, not `Internal` (-32603) (monorepo#632).
+#[tokio::test]
+async fn comment_respond_caller_input_errors_are_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("alpha reply-target omega").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha reply-target omega".into(),
+            "reply-target".into(),
+            "root".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+
+    // Missing threadId AND commentId.
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            None,
+            "hi".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing threadId/commentId must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Either threadId or commentId")),
+        "got: {err:?}"
+    );
+
+    // Empty (whitespace-only) comment.
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "   ".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("empty comment must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("non-empty")),
+        "got: {err:?}"
+    );
+
+    // type='suggestion' without the suggestionOriginal/suggestionProposed pair.
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id),
+            "try this".into(),
+            Some("suggestion".into()),
+            None,
+            None,
+            Some("only original".into()),
+            None,
+        )
+        .await
+        .expect_err("suggestion without both fields must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("suggestionOriginal and suggestionProposed")),
+        "got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn comment_resolve_thread_marks_and_reopens() {
     let (_tmp, svc, ws, id) = setup("alpha resolve-target omega").await;

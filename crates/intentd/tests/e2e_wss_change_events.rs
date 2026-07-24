@@ -1682,4 +1682,50 @@ async fn comment_respond_author_type_round_trips_over_wss() {
     )
     .await;
     assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    // The pre-existing caller-input validations also reject with -32602, not
+    // -32603 (monorepo#632): missing threadId/commentId, empty comment, and a
+    // suggestion without the suggestionOriginal/suggestionProposed pair.
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "comment": "no target",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        7,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "   ",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        8,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "try this",
+            "type": "suggestion",
+            "suggestionOriginal": "only original",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
 }

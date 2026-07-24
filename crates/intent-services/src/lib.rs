@@ -10772,12 +10772,12 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
                 ));
             }
             if comment.trim().is_empty() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Comment text is required and must be non-empty".to_string(),
                 ));
             }
@@ -10797,7 +10797,7 @@ impl WorkspaceApi for Services {
             if kind_parsed == CommentType::Suggestion
                 && (suggestion_original.is_none() || suggestion_proposed.is_none())
             {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "For type='suggestion', both suggestionOriginal and suggestionProposed are required"
                         .to_string(),
                 ));
