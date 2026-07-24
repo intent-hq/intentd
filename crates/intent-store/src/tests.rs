@@ -910,6 +910,55 @@ async fn comment_round_trip_update_delete_and_thread() {
     );
 }
 
+/// `update_note_with_comment` commits the note rewrite + comment INSERT in
+/// one transaction (monorepo#638): success returns the post-rewrite `rev`
+/// and persists both; a failed INSERT rolls the note rewrite back (no
+/// anchor markers without a comment row); an absent note is `NotFound`.
+#[tokio::test]
+async fn update_note_with_comment_is_atomic_and_returns_rev() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+
+    // Success: both persist, returned rev is the post-rewrite value (0 → 1).
+    note.content = "with <!--anchor:c1:start-->markers<!--anchor:c1:end-->".to_string();
+    let c1 = sample_comment(&note.id, "c1", "c1");
+    let rev = store
+        .update_note_with_comment(&note, &c1)
+        .await
+        .expect("atomic update+insert");
+    assert_eq!(rev, 1);
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(stored.content, note.content);
+    assert_eq!(store.get_comment("c1").await.expect("get c1"), c1);
+
+    // Failure (duplicate comment id → INSERT fails): the note rewrite must
+    // roll back — content and rev stay at the committed state above.
+    note.content = "rewrite-that-must-roll-back".to_string();
+    let dup = sample_comment(&note.id, "c1", "c1");
+    assert!(store.update_note_with_comment(&note, &dup).await.is_err());
+    let after_fail = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!(after_fail.rev, 1);
+    assert_eq!(after_fail.content, stored.content);
+
+    // Absent note row → NotFound, and the comment must not persist.
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    let c2 = sample_comment(&ghost.id, "c2", "c2");
+    match store.update_note_with_comment(&ghost, &c2).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound for absent note, got {other:?}"),
+    }
+    assert!(store.get_comment("c2").await.is_err());
+}
+
 /// `update_comment` must not drop legacy/unknown `extra_json` keys preserved
 /// by `insert_comment_with_extras` (legacy importer): the update rebuilds the
 /// known fields but carries unknown keys over from the existing row.

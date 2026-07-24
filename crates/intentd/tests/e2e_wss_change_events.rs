@@ -894,6 +894,106 @@ async fn comment_add_idempotency_key_dedupes_over_wss() {
     );
 }
 
+/// End-to-end (monorepo#638): `comment.add` rewrites the note markdown
+/// (anchor markers), so over WSS the result must echo the authoritative
+/// post-rewrite `noteRev` AND publish exactly one `note:updated` alongside
+/// `comment:added` — otherwise subscribed clients hold a stale rev and hit
+/// spurious conflicts on their next versioned write. An idempotent replay
+/// returns the cached `noteRev` without a second `note:updated`.
+#[tokio::test]
+async fn comment_add_echoes_note_rev_and_emits_note_updated_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap workspace + note off UDS so the WSS side drives only the add.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Comments", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "anchor target text" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let rev_before = n["result"]["note"]["rev"].as_i64().expect("note rev");
+
+    // Subscribe over WSS before the add, scoped to note:updated.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["note:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let params = json!({
+        "workspaceId": ws_id,
+        "noteId": note_id,
+        "searchContext": "anchor target text",
+        "commentTarget": "target",
+        "comment": "root",
+        "idempotencyKey": "wss-comment-rev-1",
+    });
+    let add = wss_rpc(&mut rpc, 2, "comment.add", params.clone()).await;
+    assert_eq!(add["success"], json!(true));
+    // The result echoes the post-rewrite rev: exactly one bump over create.
+    let note_rev = add["noteRev"].as_i64().expect("noteRev in result");
+    assert_eq!(note_rev, rev_before + 1, "result: {add}");
+
+    // The echoed rev is the authoritative stored value.
+    let read = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(read["note"]["rev"].as_i64(), Some(note_rev));
+
+    // Exactly one note:updated for the rewrite, with the §6.5 payload shape.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+    );
+    let extra = drain_extra(&mut sub, "note:updated", 500).await;
+    assert!(
+        extra.is_none(),
+        "comment.add must publish exactly one note:updated, got extra: {extra:?}"
+    );
+
+    // Idempotent replay: cached result carries the SAME noteRev, no rewrite,
+    // no second note:updated.
+    let replay = wss_rpc(&mut rpc, 4, "comment.add", params).await;
+    assert_eq!(
+        replay["noteRev"].as_i64(),
+        Some(note_rev),
+        "replay: {replay}"
+    );
+    let extra = drain_extra(&mut sub, "note:updated", 500).await;
+    assert!(
+        extra.is_none(),
+        "idempotent replay must not publish a second note:updated, got extra: {extra:?}"
+    );
+}
+
 /// End-to-end (Audit D C3): `workspace.archive` over WSS publishes
 /// `workspace:updated` with `changes: { archived: true }`. §6.5 has no
 /// `workspace:archived` event; the reference emitter dispatches

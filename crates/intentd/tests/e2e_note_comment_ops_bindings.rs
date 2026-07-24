@@ -281,6 +281,14 @@ async fn comment_add_anchors_to_text() {
     assert_eq!(result.location.anchored_text, "unique paragraph");
     assert!(result.location.line > 0);
     assert!(!result.message.is_empty());
+    // The add rewrites the note markdown (anchor markers), so the result
+    // echoes the authoritative post-rewrite rev (monorepo#638): create=0 → 1.
+    assert_eq!(result.note_rev, 1);
+    let note_after = services
+        .get_note(ws.clone(), note.id.clone())
+        .await
+        .expect("get note after add");
+    assert_eq!(note_after.rev, result.note_rev);
 
     drop(services);
     cleanup_db(&db);

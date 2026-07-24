@@ -168,6 +168,53 @@ pub async fn await_wss_status(socket: &Path) -> serde_json::Value {
     }
 }
 
+/// Poll `system.status` over the daemon's UDS control socket until the WSS
+/// listener is stopped — i.e. the response carries a null `result.port` —
+/// the counterpart of [`await_wss_status`] for runtime-disable paths
+/// (monorepo#515). Listener teardown after a `settings.update` disable is
+/// asynchronous, so a fixed post-disable sleep plus a single-shot status
+/// lookup flakes under parallel load. Same budget/backoff discipline;
+/// readiness poll ONLY — callers must not use this to retry assertions.
+#[cfg(unix)]
+pub async fn await_wss_stopped(socket: &Path) {
+    let budget = daemon_startup_timeout();
+    let deadline = tokio::time::Instant::now() + budget;
+    let rpc_budget = test_timeout(Duration::from_secs(5));
+    let mut backoff = Duration::from_millis(25);
+    let mut attempts: u32 = 0;
+    let mut last: String;
+    loop {
+        attempts += 1;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match try_status_rpc(
+            socket,
+            rpc_budget.min(remaining.max(Duration::from_millis(1))),
+        )
+        .await
+        {
+            Ok(resp) => {
+                // Require a real success envelope: an error response also has
+                // a null `result.port` under serde_json indexing, but proves
+                // nothing about the listener.
+                if resp["result"].is_object() && resp["result"]["port"].is_null() {
+                    return;
+                }
+                last = resp.to_string();
+            }
+            Err(e) => last = e,
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "WSS listener not stopped: system.status still reports result.port on {} within \
+             {budget:?} ({attempts} attempts); last: {last}",
+            socket.display()
+        );
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = (backoff * 2).min(Duration::from_millis(500));
+    }
+}
+
 /// Enable the WSS/TCP listener for a daemon booted from `data_dir` by seeding
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`

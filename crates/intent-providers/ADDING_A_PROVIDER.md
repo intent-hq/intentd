@@ -122,6 +122,13 @@ per provider — pick exactly one delivery path:
   post-handshake against the agent's advertised `mcpCapabilities` from `initialize` —
   an agent that didn't advertise them may reject the whole `session/new`; stdio (the
   workspace bridge) always passes.
+- **(d) bundled pi extension** (pi): `mcp_via_pi_extension: true`. `create_agent`
+  writes the embedded extension (`pi_mcp_extension.ts`, via `include_str!`) plus a
+  wrapper script that execs the real `pi` binary with `-e <extension>`, then sets
+  `PI_ACP_PI_COMMAND=<wrapper>` and `INTENTD_MCP_BRIDGE_ADDR=<bridge host:port>` in
+  the spawn env; the extension dials the bridge over TCP and registers the tools
+  with pi. Only the reserved workspace bridge is delivered this way (no user
+  `mcp.servers` translation).
 
 **Verify tools actually reach the agent** — adapters differ in which session-setup fields
 they honor; do not assume wiring works because the spawn succeeded. Unit-test the

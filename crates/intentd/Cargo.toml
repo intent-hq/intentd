@@ -4,6 +4,7 @@ version = "0.2.5"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
 

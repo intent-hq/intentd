@@ -499,6 +499,11 @@ async fn uds_slice_end_to_end() {
         resp["result"]["location"].get("anchored_text").is_none(),
         "comment.add must not leak snake_case keys"
     );
+    assert!(
+        resp["result"]["noteRev"].is_i64(),
+        "comment.add must echo the post-rewrite noteRev (monorepo#638): {}",
+        resp["result"]
+    );
 
     // (k) comment.list with includeComments → camelCase thread summary + nested
     //     CommentWire (`type`, `authorType`, `createdAt`).
