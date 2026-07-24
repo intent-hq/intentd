@@ -3812,6 +3812,11 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     let mut user_message_event_ids: Vec<String> = Vec::new();
     let mut stream_end_count = 0;
 
+    // Fast-path exit note: `user_message_event_ids.len() >= 2` relies on the
+    // direct-send branch of `agent.sendMessage` also emitting `agent:message`
+    // for "first message" (PROTOCOL §5.5 step 6). If that emit ever went away
+    // the loop would still be correct — it would just run to the deadline and
+    // let the id-match assertion below decide.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(saw_queue_drain && stream_end_count >= 2 && user_message_event_ids.len() >= 2) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
