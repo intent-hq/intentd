@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 homepage.workspace = true
 description = "Self-updating supervisor shim for the intentd daemon (packaged and renamed to `intentd` at release time)"
 
