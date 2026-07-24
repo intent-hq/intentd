@@ -14,7 +14,6 @@ mod common;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -381,7 +380,7 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string())).await.unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
                 Message::Text(text) => {
