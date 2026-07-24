@@ -296,7 +296,7 @@ fn thousands_separated(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -536,7 +536,7 @@ fn is_grok_header_or_status_line(line: &str) -> bool {
         let boundary = |s: &str| {
             s.chars()
                 .next()
-                .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'))
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
         };
         if boundary(rest) || rest.strip_prefix("id").is_some_and(boundary) {
             return true;

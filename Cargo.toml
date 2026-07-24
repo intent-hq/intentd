@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.79"
+rust-version = "1.88"
 repository = "https://github.com/intent-hq/intentd"
 homepage = "https://github.com/intent-hq/intentd"
 license = "Apache-2.0"

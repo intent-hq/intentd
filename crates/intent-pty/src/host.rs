@@ -534,12 +534,12 @@ impl PtyHost {
     /// Whether the PTY's reader thread has finished (leak inspection).
     #[cfg(all(test, unix))]
     fn reader_finished(&self, id: PtyId) -> bool {
-        self.sessions.lock().unwrap().get(&id).map_or(true, |s| {
+        self.sessions.lock().unwrap().get(&id).is_none_or(|s| {
             s.reader
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map_or(true, |h| h.is_finished())
+                .is_none_or(|h| h.is_finished())
         })
     }
 
