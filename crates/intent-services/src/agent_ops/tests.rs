@@ -2011,12 +2011,10 @@ async fn set_model_rejects_unknown_provider() {
 
 /// Regression for monorepo#607: `agent.create` rejects (-32602 InvalidParams)
 /// an incident-shaped payload — an explicit `provider` plus a bare model id
-/// provably owned by another provider's *static* tiers. Note the dynamic-model
-/// gap: the actual incident model (`fable-5`) is an auggie **dynamic** model
-/// absent from `PROVIDER_MODEL_TIERS`, so `providers_claiming_model` cannot
-/// prove ownership and that exact payload still passes this guard today (the
-/// gap is asserted explicitly in
-/// [`create_accepts_bare_model_for_matching_or_unknown_owner`]).
+/// provably owned by another provider's *static* tiers. Dynamic-only models
+/// absent from `PROVIDER_MODEL_TIERS` (the actual incident model `fable-5`)
+/// are covered by cached-catalog evidence instead — see
+/// [`create_rejects_bare_dynamic_model_via_cached_catalog`].
 #[tokio::test]
 async fn create_rejects_bare_model_owned_by_other_provider() {
     let (_t, svc, ws) = setup().await;
@@ -2115,11 +2113,11 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
     )
     .await
     .expect("bare id unknown to every static tier");
-    // Known dynamic-model gap (monorepo#607): the exact incident payload —
-    // grok + bare `fable-5`, an auggie *dynamic* model absent from
-    // `PROVIDER_MODEL_TIERS` — still passes because static-tier ownership
-    // cannot be proven. Closing this needs a dynamic-catalog check tracked
-    // in the follow-up on monorepo#607.
+    // Cold start (monorepo#607): grok + bare `fable-5`, an auggie *dynamic*
+    // model absent from `PROVIDER_MODEL_TIERS`, passes while no cached
+    // catalog provides ownership evidence — absence of evidence is not a
+    // mismatch. With a warm auggie cache the same payload is rejected — see
+    // `create_rejects_bare_dynamic_model_via_cached_catalog`.
     let extra = intent_core::AgentCreateExtra {
         provider: Some("grok".into()),
         ..Default::default()
@@ -2135,7 +2133,7 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
         extra,
     )
     .await
-    .expect("dynamic-model gap: bare fable-5 + grok passes today");
+    .expect("cold start: bare fable-5 + grok passes without cache evidence");
     // The literal "default" id is claude-code's smart-tier *sentinel* ("use
     // the CLI default"), not an ownership claim — it must pass for every
     // provider.
@@ -2168,6 +2166,194 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
     )
     .await
     .expect("unknown bare id with defaulted provider");
+}
+
+/// Regression for monorepo#607 (dynamic gap): with a warm auggie catalog
+/// cached, the exact incident payload — `provider: "grok"` + bare `fable-5`,
+/// an auggie dynamic-only model — is rejected -32602 naming auggie, because
+/// grok's own cached catalog affirmatively disproves ownership.
+#[tokio::test]
+async fn create_rejects_bare_dynamic_model_via_cached_catalog() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad".into()),
+            Some("fable-5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("cached-catalog evidence must reject the incident payload");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.create: model fable-5 does not belong to provider grok"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "owning provider must be named: {msg}"
+    );
+    // No rejection persisted a session row.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+}
+
+/// Cached-catalog evidence must not produce false rejects (monorepo#607):
+/// the bare id passes when the requested provider has no cached catalog
+/// (absence of evidence), when its own catalog claims the id (shared id),
+/// or when the only claiming entry sits under a stale version key.
+#[tokio::test]
+async fn create_accepts_bare_dynamic_model_without_disproof() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let auggie_rows = vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })];
+    // Auggie claims fable-5, but grok has no cached catalog: ownership by
+    // grok is not disproven, so the id passes.
+    svc.models_catalog
+        .test_store("auggie", "", auggie_rows.clone(), now);
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK-a".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("no grok cache: absence of evidence is not a mismatch");
+    // Grok's catalog also claims the id (shared id): passes.
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "grok" })],
+        now,
+    );
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK-b".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("shared id claimed by the requested provider's own catalog");
+    // Fresh services: auggie's claiming entry sits under a stale version key
+    // (auggie's current key is "" — no version pin), so it is not evidence
+    // even though grok's own catalog disproves ownership.
+    let (_t2, svc2, ws2) = setup().await;
+    svc2.models_catalog
+        .test_store("auggie", "stale-pin", auggie_rows, now);
+    svc2.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc2.agent_create_op(
+        ws2.clone(),
+        Some("OK-c".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("version-key-mismatched entries are not ownership evidence");
+}
+
+/// `agent.setModel` applies the cached-catalog evidence too (monorepo#607):
+/// a bare dynamic-only model owned by another provider's cached catalog is
+/// rejected against the session's effective provider when that provider's
+/// own catalog disproves ownership.
+#[tokio::test]
+async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    // Pin the session's provider to grok so the guard compares against it.
+    let id = create_agent(&svc, &ws, "CacheGuard").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = Some("grok".into());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist grok provider");
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "fable-5".into())
+        .await
+        .expect_err("cached auggie model on a grok session must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.setModel: model fable-5 does not belong to provider grok"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "owning provider must be named: {msg}"
+    );
+    let after = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
 }
 
 /// `agent.setModel` applies the same bare-model ownership guard against the

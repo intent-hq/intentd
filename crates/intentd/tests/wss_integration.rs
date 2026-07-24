@@ -955,6 +955,118 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#607 (dynamic gap) over the real WSS wire: with a
+/// warm auggie catalog cached (seeded through the persisted models-cache
+/// file) that claims the dynamic-only `fable-5` and a grok catalog without
+/// it, the exact incident payload — `agent.create` with `provider: "grok"` +
+/// bare `model: "fable-5"` — is rejected -32602 naming auggie, and no
+/// session row persists. The same id passes when grok has no cached catalog
+/// entry (absence of evidence is not a mismatch).
+#[tokio::test]
+async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Path::new("/tmp").join(format!("intentd-wss-bare-cache-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = DirGuard(dir.clone());
+    // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
+    // version key must match each provider's current one ("" — no pin).
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "fable-5", "name": "Fable 5", "provider": "auggie" } ]
+            },
+            "grok": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv =
+        start_with_auggie_and_models_cache(WsOptions::default(), None, Some(dir.clone())).await;
+
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Cached Catalog Guard"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // The exact incident payload: grok + bare auggie dynamic model.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","provider":"grok","model":"fable-5"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "cached-catalog mismatch must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.create: model fable-5 does not belong to provider grok"),
+        "error must name the model and provider: {rejected}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "error must name the owning provider: {rejected}"
+    );
+
+    // No session row persisted by the rejection.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row may persist after the rejection: {listed}"
+    );
+
+    srv.ws.stop().await;
+
+    // Cold-start counterpart: without any cached catalogs the same payload
+    // passes — absence of evidence is not a mismatch (Phase 2 behavior).
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{"title":"WSS Cold Cache"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Cold","provider":"grok","model":"fable-5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("fable-5"),
+        "cold start must pass without cache evidence: {created}"
+    );
+    srv.ws.stop().await;
+}
+
 /// `agent.create` accepts the widened P2-12a wire shape (optional `provider`,
 /// `agentType`, `metadata`, `workspacePath`, `workspaceContext`) and returns
 /// the full `AgentLite` projection instead of the pre-widening `{id, name}`

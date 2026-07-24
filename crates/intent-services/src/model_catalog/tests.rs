@@ -421,3 +421,85 @@ async fn negative_entry_is_version_key_scoped() {
     let r = resolve_with_cache(&cache, "p", "v2", false, 1_001, ok_fetch("bumped")).await;
     assert_eq!(r.models, Some(rows("bumped")));
 }
+
+// --- cached-catalog ownership evidence (monorepo#607) ---
+// These use real registry provider ids (`source_for` gates the lookup):
+// auggie and grok are both version-pin-free (`no_version` → "").
+
+#[test]
+fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
+    let cache = ModelCatalogCache::new(None);
+    cache.store(
+        "auggie",
+        "",
+        vec![
+            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
+            json!({ "id": "auggie:fable-6", "name": "Fable 6", "provider": "auggie" }),
+            json!({ "id": "grok:foreign-model", "name": "Foreign", "provider": "grok" }),
+        ],
+        1_000,
+    );
+    // Exact bare id and the bare part of a self-prefixed compound row id
+    // both claim.
+    assert_eq!(cache.cached_catalog_claims("auggie", "fable-5"), Some(true));
+    assert_eq!(cache.cached_catalog_claims("auggie", "fable-6"), Some(true));
+    // A foreign-prefixed row id is not an ownership claim.
+    assert_eq!(
+        cache.cached_catalog_claims("auggie", "foreign-model"),
+        Some(false)
+    );
+    // Present catalog without the id is affirmative disproof.
+    assert_eq!(
+        cache.cached_catalog_claims("auggie", "grok-4-fast"),
+        Some(false)
+    );
+    // Prefix/substring must not match.
+    assert_eq!(cache.cached_catalog_claims("auggie", "fable"), Some(false));
+}
+
+#[test]
+fn cached_catalog_claims_none_without_usable_entry() {
+    let cache = ModelCatalogCache::new(None);
+    // No entry at all → no evidence.
+    assert_eq!(cache.cached_catalog_claims("grok", "fable-5"), None);
+    // Unregistered provider id → no evidence.
+    cache.store("not-a-provider", "", rows("fable-5"), 1_000);
+    assert_eq!(
+        cache.cached_catalog_claims("not-a-provider", "fable-5"),
+        None
+    );
+    // Version-key mismatch (stale pin) → the entry is not evidence.
+    cache.store(
+        "codex",
+        "stale-pin",
+        vec![json!({ "id": "fable-5", "name": "x", "provider": "codex" })],
+        1_000,
+    );
+    assert_eq!(cache.cached_catalog_claims("codex", "fable-5"), None);
+}
+
+#[test]
+fn providers_claiming_model_cached_walks_registry() {
+    let cache = ModelCatalogCache::new(None);
+    assert!(cache.providers_claiming_model_cached("fable-5").is_empty());
+    cache.store(
+        "auggie",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
+        1_000,
+    );
+    cache.store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok", "provider": "grok" })],
+        1_000,
+    );
+    assert_eq!(
+        cache.providers_claiming_model_cached("fable-5"),
+        vec!["auggie".to_string()]
+    );
+    assert_eq!(
+        cache.providers_claiming_model_cached("grok-4-fast"),
+        vec!["grok".to_string()]
+    );
+}
