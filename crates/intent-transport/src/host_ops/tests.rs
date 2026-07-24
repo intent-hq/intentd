@@ -311,50 +311,25 @@ fn resolve_binary_path_finds_caller_common_path() {
 #[test]
 fn resolve_binary_path_searches_enriched_tool_dirs() {
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
 
-    // Serialize env mutation to avoid thread-safety issues in parallel test execution
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-    let _guard = ENV_MUTEX.lock().unwrap();
-
-    // Smoke test: verify that resolve_binary_path searches enriched_tool_dirs
-    // when PATH doesn't find the binary. Use a temp directory to avoid writing
-    // into the real $HOME (which can fail on CI or leave artifacts).
-    let temp_dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let test_dir = temp_dir.join(format!("enriched_test_{pid}_{nanos}"));
+    // Smoke test: verify that binary resolution searches enriched_tool_dirs
+    // (which include ~/.local/bin) when PATH doesn't find the binary. The
+    // scratch home is injected via resolve_binary_path_with_home instead of
+    // mutating process-global HOME, which would race parallel tests.
+    let test_dir = unique_temp_dir("enriched-home");
     let local_bin = test_dir.join(".local").join("bin");
-
     std::fs::create_dir_all(&local_bin).unwrap();
 
-    let test_bin_name = format!("test-enriched-binary-{pid}-{nanos}");
+    let test_bin_name = format!(
+        "test-enriched-binary-{}",
+        test_dir.file_name().unwrap().to_string_lossy()
+    );
     let bin = local_bin.join(&test_bin_name);
     std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    // RAII guard for panic-safe HOME restoration
-    struct HomeGuard(Option<String>);
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            if let Some(h) = &self.0 {
-                std::env::set_var("HOME", h);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
+    let resolved = resolve_binary_path_with_home(&test_bin_name, &[], &test_dir);
 
-    let _home_guard = HomeGuard(std::env::var("HOME").ok());
-    std::env::set_var("HOME", &test_dir);
-
-    // Verify the binary is found via enriched_tool_dirs (which includes ~/.local/bin)
-    let resolved = resolve_binary_path(&test_bin_name, &[]);
-
-    // HOME is restored by drop guard, even on panic
     std::fs::remove_dir_all(&test_dir).ok();
 
     assert_eq!(resolved.as_deref(), Some(bin.as_path()));
@@ -403,7 +378,7 @@ fn enhanced_path_dedups_and_appends_canonical_tool_dirs() {
     assert_eq!(
         parts
             .iter()
-            .filter(|p| **p == PathBuf::from(custom))
+            .filter(|p| p.as_path() == Path::new(custom))
             .count(),
         1
     );

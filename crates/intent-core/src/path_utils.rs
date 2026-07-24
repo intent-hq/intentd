@@ -283,19 +283,25 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
 /// provider-binary dir and ~/.augment/bin for auggie, then these enriched dirs,
 /// then inherited PATH last).
 pub fn enriched_tool_dirs() -> Vec<PathBuf> {
-    enriched_tool_dirs_with(login_shell_dirs)
+    enriched_tool_dirs_with_home(home_dir())
 }
 
-/// Injectable variant for testing - accepts a function that returns login-shell dirs.
-/// This allows tests to avoid spawning the real shell.
-fn enriched_tool_dirs_with<F>(login_dirs_fn: F) -> Vec<PathBuf>
+/// Variant of [`enriched_tool_dirs`] with the home directory injected instead
+/// of resolved from the environment. Lets tests point the user-local tool
+/// directories (`~/.local/bin`, `~/.nvm`, …) at a scratch home without
+/// mutating process-global `HOME`, which races parallel tests.
+pub fn enriched_tool_dirs_with_home(home: Option<PathBuf>) -> Vec<PathBuf> {
+    enriched_tool_dirs_impl(home, login_shell_dirs)
+}
+
+/// Injectable core - accepts the home directory and a function that returns
+/// login-shell dirs, so tests can avoid spawning the real shell.
+fn enriched_tool_dirs_impl<F>(home: Option<PathBuf>, login_dirs_fn: F) -> Vec<PathBuf>
 where
     F: FnOnce() -> &'static [PathBuf],
 {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-
-    let home = home_dir();
 
     if cfg!(windows) {
         if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -521,7 +527,7 @@ mod tests {
             ]
         });
 
-        let dirs = enriched_tool_dirs_with(|| &FAKE_LOGIN_DIRS);
+        let dirs = enriched_tool_dirs_impl(home_dir(), || &FAKE_LOGIN_DIRS);
 
         // Verify the fake login-shell dirs actually appear in the result
         assert!(
