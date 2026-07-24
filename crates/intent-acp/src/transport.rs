@@ -24,7 +24,8 @@ use tokio::task::JoinHandle;
 
 use crate::error::{AcpError, AcpResult, JsonRpcError};
 
-/// Default per-request timeout (mirrors the TS initialize timeout, §6.4).
+/// Default per-request timeout (§6.4). `initialize` uses its own, more
+/// generous timeout — see `handshake::initialize_timeout` (monorepo#616).
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of recent stderr entries retained (parity:
