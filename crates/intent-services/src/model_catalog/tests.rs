@@ -435,12 +435,19 @@ fn cached_catalog_claims_matches_bare_and_compound_row_ids() {
         vec![
             json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
             json!({ "id": "auggie:fable-6", "name": "Fable 6", "provider": "auggie" }),
+            json!({ "id": "grok:foreign-model", "name": "Foreign", "provider": "grok" }),
         ],
         1_000,
     );
-    // Exact bare id and the bare part of a compound row id both claim.
+    // Exact bare id and the bare part of a self-prefixed compound row id
+    // both claim.
     assert_eq!(cache.cached_catalog_claims("auggie", "fable-5"), Some(true));
     assert_eq!(cache.cached_catalog_claims("auggie", "fable-6"), Some(true));
+    // A foreign-prefixed row id is not an ownership claim.
+    assert_eq!(
+        cache.cached_catalog_claims("auggie", "foreign-model"),
+        Some(false)
+    );
     // Present catalog without the id is affirmative disproof.
     assert_eq!(
         cache.cached_catalog_claims("auggie", "grok-4-fast"),

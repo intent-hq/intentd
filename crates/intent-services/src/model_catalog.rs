@@ -356,13 +356,18 @@ impl ModelCatalogCache {
     /// version-key mismatch — stale-pin entries are not evidence).
     /// Synchronous and read-only: no probe, no TTL check, no negative-cache
     /// interaction — the bare-model ownership guard must never block on or
-    /// trigger a fetch.
+    /// trigger a fetch. Trade-off of skipping the TTL check: a `Some(false)`
+    /// disproof can outlive the provider's real catalog (e.g. a model added
+    /// upstream after the last fetch keeps being rejected until any
+    /// `models.list` refresh replaces the entry); a compound `provider:model`
+    /// id always bypasses the bare-model guard, so callers are never wedged.
     pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
         let source = source_for(provider_id)?;
         let version_key = (source.version_key)();
         let entries = self.entries.lock().expect("model catalog cache poisoned");
         let entry = entries.get(provider_id)?;
-        (entry.version_key == version_key).then(|| rows_claim_model(&entry.models, bare_id))
+        (entry.version_key == version_key)
+            .then(|| rows_claim_model(provider_id, &entry.models, bare_id))
     }
 
     /// Provider ids whose cached catalog claims `bare_id` (see
@@ -615,13 +620,21 @@ fn failure_fallback(
     }
 }
 
-/// Whether any cached wire row (`{ id, name, provider }`, §5.30) names
-/// `bare_id`. Row ids are matched exactly, tolerating a compound
-/// `provider:model` id by comparing its bare part (monorepo#607).
-fn rows_claim_model(rows: &[Value], bare_id: &str) -> bool {
+/// Whether any cached wire row (`{ id, name, provider }`, §5.30) in
+/// `provider_id`'s catalog names `bare_id`. Row ids are matched exactly,
+/// tolerating a compound `provider:model` id by comparing its bare part —
+/// but only when the prefix names the owning provider itself: a foreign-
+/// prefixed row (`other:foo` in this provider's catalog) is not an ownership
+/// claim (monorepo#607).
+fn rows_claim_model(provider_id: &str, rows: &[Value], bare_id: &str) -> bool {
     rows.iter()
         .filter_map(|row| row.get("id").and_then(Value::as_str))
-        .any(|id| id == bare_id || id.split_once(':').is_some_and(|(_, bare)| bare == bare_id))
+        .any(|id| {
+            id == bare_id
+                || id
+                    .split_once(':')
+                    .is_some_and(|(prefix, bare)| prefix == provider_id && bare == bare_id)
+        })
 }
 
 #[cfg(test)]
