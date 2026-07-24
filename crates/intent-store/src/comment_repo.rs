@@ -7,15 +7,15 @@
 //! wire-facing [`Comment`].
 
 use intent_core::{
-    AgentId, Comment, CommentAnchor, CommentStatus, CommentThread, CommentType, Error, NoteId,
-    Result, WorkspaceId,
+    AgentId, Comment, CommentAnchor, CommentStatus, CommentThread, CommentType, Error, Note,
+    NoteId, Result, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, enum_to_db, Store};
+use crate::{enum_from_db, enum_to_db, tags_to_db, Store};
 
 const COMMENT_COLUMNS: &str = "id, thread_id, note_id, kind, content, author, author_type, \
     status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at";
@@ -90,6 +90,30 @@ fn extra_map_to_json(merged: Map<String, Value>) -> Result<Option<String>> {
     }
 }
 
+/// Encode a comment's `anchor_json` + `extra_json` column values, merging
+/// `legacy_extra` (comment's own fields win on key collision).
+fn encode_comment_json(
+    c: &Comment,
+    legacy_extra: &Map<String, Value>,
+) -> Result<(String, Option<String>)> {
+    let anchor_json = serde_json::to_string(&c.anchor)
+        .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
+    let extra = ExtraFields {
+        anchor_before: c.anchor_before.clone(),
+        anchor_after: c.anchor_after.clone(),
+        suggestion_original: c.suggestion_original.clone(),
+        suggestion_proposed: c.suggestion_proposed.clone(),
+        agent_id: c.agent_id.clone(),
+        is_orphaned: c.is_orphaned,
+    };
+    let mut merged = extra.to_map()?;
+    for (k, v) in legacy_extra {
+        merged.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let extra_json = extra_map_to_json(merged)?;
+    Ok((anchor_json, extra_json))
+}
+
 impl Store {
     /// Insert a comment row, scoping it to `workspace_id` (0022 added the
     /// per-workspace column plus the composite FK to `note(id, workspace_id)`).
@@ -111,21 +135,7 @@ impl Store {
         c: &Comment,
         legacy_extra: &Map<String, Value>,
     ) -> Result<()> {
-        let anchor_json = serde_json::to_string(&c.anchor)
-            .map_err(|e| Error::Internal(format!("encode anchor failed: {e}")))?;
-        let extra = ExtraFields {
-            anchor_before: c.anchor_before.clone(),
-            anchor_after: c.anchor_after.clone(),
-            suggestion_original: c.suggestion_original.clone(),
-            suggestion_proposed: c.suggestion_proposed.clone(),
-            agent_id: c.agent_id.clone(),
-            is_orphaned: c.is_orphaned,
-        };
-        let mut merged = extra.to_map()?;
-        for (k, v) in legacy_extra {
-            merged.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-        let extra_json = extra_map_to_json(merged)?;
+        let (anchor_json, extra_json) = encode_comment_json(c, legacy_extra)?;
         let sql = format!(
             "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
@@ -150,6 +160,127 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
         Ok(())
+    }
+
+    /// Atomically persist a `comment.add`: the anchor-marker note rewrite
+    /// (the same full-row UPDATE + unconditional `rev` bump as
+    /// [`Store::update_note`]) and the comment INSERT run in ONE transaction,
+    /// so a failure between the two can never leave anchor markers embedded
+    /// in the note with no comment row (monorepo#638). Returns the
+    /// post-rewrite note `rev` so the caller can echo the authoritative
+    /// value. `NotFound` if the note row is absent; nothing persists on any
+    /// error.
+    pub async fn update_note_with_comment(&self, note: &Note, c: &Comment) -> Result<i64> {
+        let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
+        let task_json = match &note.metadata.task {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| Error::Internal(format!("encode task_json failed: {e}")))?,
+            ),
+            None => None,
+        };
+        let (anchor_json, extra_json) = encode_comment_json(c, &Map::new())?;
+
+        // IMMEDIATE mode: acquires the write lock upfront, avoiding the
+        // DEFERRED-mode transaction-upgrade race that surfaces SQLITE_BUSY
+        // when concurrent connections hold read locks (STAB-1).
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("begin IMMEDIATE failed: {e}")))?;
+
+        // Execute the transaction body; rollback explicitly on error.
+        let result = async {
+            // Same statement as `update_note_versioned` (no expected_version
+            // gate): full-row replace scoped by (id, workspace_id) with the
+            // store-owned `rev = rev + 1` bump.
+            let res = sqlx::query(
+                "UPDATE note SET title=?, content=?, content_type=?, tags=?, \
+                 is_pinned=?, is_archived=?, is_default=?, parent_id=?, visibility=?, task_json=?, \
+                 created_at=?, updated_at=?, rev = rev + 1 WHERE id=? AND workspace_id=?",
+            )
+            .bind(&note.title)
+            .bind(&note.content)
+            .bind(enum_to_db(&note.content_type)?)
+            .bind(tags_to_db(&note.tags)?)
+            .bind(note.is_pinned as i64)
+            .bind(note.is_archived as i64)
+            .bind(note.is_default as i64)
+            .bind(parent_id)
+            .bind(enum_to_db(&note.visibility)?)
+            .bind(task_json)
+            .bind(&note.created_at)
+            .bind(&note.updated_at)
+            .bind(&note.id.0)
+            .bind(&note.workspace_id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("note {}", note.id)));
+            }
+
+            let new_rev: i64 = sqlx::query("SELECT rev FROM note WHERE id=? AND workspace_id=?")
+                .bind(&note.id.0)
+                .bind(&note.workspace_id.0)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("read back note rev failed: {e}")))?
+                .try_get("rev")
+                .map_err(|e| Error::Internal(format!("column rev: {e}")))?;
+
+            let sql = format!(
+                "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            );
+            sqlx::query(&sql)
+                .bind(&c.id)
+                .bind(&c.thread_id)
+                .bind(c.note_id.as_ref().map(|n| n.0.clone()))
+                .bind(enum_to_db(&c.kind)?)
+                .bind(&c.content)
+                .bind(&c.author)
+                .bind(enum_to_db(&c.author_type)?)
+                .bind(enum_to_db(&c.status)?)
+                .bind(&c.parent_id)
+                .bind(&anchor_json)
+                .bind(&c.anchor_text)
+                .bind(&extra_json)
+                .bind(&c.created_at)
+                .bind(&c.updated_at)
+                .bind(&note.workspace_id.0)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
+
+            Ok(new_rev)
+        }
+        .await;
+
+        match result {
+            Ok(rev) => {
+                if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                    // A failed COMMIT can leave the transaction open on the
+                    // pooled connection; roll back so it is not returned to
+                    // the pool still holding the write lock.
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(Error::Internal(format!(
+                        "commit note+comment tx failed: {e}"
+                    )));
+                }
+                Ok(rev)
+            }
+            Err(e) => {
+                // Best-effort rollback to avoid leaving connection with open transaction.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
     }
 
     /// Fetch a single comment by id, or `NotFound`.

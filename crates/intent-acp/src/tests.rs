@@ -4546,6 +4546,7 @@ mod wsapi3_bindings_tests {
                     message: format!("Comment anchored to \"{comment_target}\""),
                     comment_id: "c-1".to_string(),
                     anchored: true,
+                    note_rev: 1,
                     location: CommentLocation {
                         line: 1,
                         anchored_text: comment_target,
