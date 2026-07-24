@@ -74,6 +74,7 @@ jobs:
         run: |
           prev=""
           tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
           if gh release download channel-stable --repo "$GITHUB_REPOSITORY" \
             --pattern stable.json --dir "$tmpdir"; then
             prev=$(jq -r '.version // empty' "$tmpdir/stable.json" || true)

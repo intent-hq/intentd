@@ -83,7 +83,7 @@ trap 'rm -f "$notes_file"' EXIT
     echo "## v$v"
     echo
     if [[ -n "$body" ]]; then
-      echo "$body"
+      printf '%s\n' "$body"
     else
       echo "_No release notes._"
     fi
