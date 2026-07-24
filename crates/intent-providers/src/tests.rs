@@ -680,6 +680,10 @@ fn providers_claiming_model_matches_static_tiers_exactly() {
     // Unknown / dynamic-only ids claim no provider.
     assert!(providers_claiming_model("grok-4-fast").is_empty());
     assert!(providers_claiming_model("").is_empty());
+    // Documented caveat: claude-code's smart tier is the literal "default"
+    // sentinel, so it *is* claimed here — callers using claims as ownership
+    // proofs must special-case it.
+    assert_eq!(providers_claiming_model("default"), vec!["claude-code"]);
 }
 
 #[test]

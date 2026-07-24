@@ -94,6 +94,11 @@ pub fn tiers_for(provider_id: &str) -> Option<&'static ModelTiers> {
 /// Provider ids whose static tier table ([`PROVIDER_MODEL_TIERS`]) lists
 /// `model_id` exactly (any tier). Empty when no static tier claims the id —
 /// unknown or dynamic-only models — in which case ownership cannot be proven.
+///
+/// Caveat: claude-code's smart tier is the literal `"default"` *sentinel*
+/// ("use the CLI default"), so `providers_claiming_model("default")` returns
+/// `["claude-code"]`. Callers treating a claim as an ownership proof (e.g.
+/// the bare-model/provider mismatch guard) must special-case `"default"`.
 pub fn providers_claiming_model(model_id: &str) -> Vec<&'static str> {
     PROVIDER_MODEL_TIERS
         .iter()

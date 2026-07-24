@@ -733,6 +733,119 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#607 over the real WSS wire: a bare model id
+/// provably owned by another provider's static tiers is rejected with the
+/// exact `-32602` JSON-RPC error envelope on both `agent.create` (explicit
+/// mismatched `provider`) and `agent.setModel` (session's effective
+/// provider), no session row / model mutation persists, and a bare id
+/// unknown to every static tier still passes (dynamic-model lists).
+#[tokio::test]
+async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Bare Model Mismatch"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Incident-shaped create: explicit `provider: "grok"` + a bare auggie
+    // static-tier model → -32602 naming model, provider, and owner.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","provider":"grok","model":"sonnet4.5"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["jsonrpc"],
+        Value::from("2.0"),
+        "envelope: {rejected}"
+    );
+    assert_eq!(rejected["id"], Value::from(2), "envelope: {rejected}");
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "bare-model/provider mismatch must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.create: model sonnet4.5 does not belong to provider grok"),
+        "error must name the model and provider: {rejected}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "error must name the owning provider: {rejected}"
+    );
+
+    // No session row persisted by the rejection.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row may persist after the rejection: {listed}"
+    );
+
+    // A bare id unknown to every static tier passes for the same provider
+    // (grok's model list is dynamic-only; ownership cannot be proven).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Good","provider":"grok","model":"grok-4-fast"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("grok-4-fast"),
+        "unknown-to-all bare id must pass: {created}"
+    );
+
+    // An auggie session (compound-prefix derived provider) rejects a bare
+    // claude-code model via agent.setModel with the same envelope shape…
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Auggie","model":"auggie:sonnet4.5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let set_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"haiku"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &set_frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "setModel bare-model mismatch must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.setModel: model haiku does not belong to provider auggie"),
+        "error must name the model and provider: {rejected}"
+    );
+    assert!(
+        msg.contains("claude-code"),
+        "error must name the owning provider: {rejected}"
+    );
+
+    // …and the rejected setModel left the session's model untouched.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("auggie:sonnet4.5"),
+        "model must be unchanged after the rejected setModel: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `agent.create` accepts the widened P2-12a wire shape (optional `provider`,
 /// `agentType`, `metadata`, `workspacePath`, `workspaceContext`) and returns
 /// the full `AgentLite` projection instead of the pre-widening `{id, name}`

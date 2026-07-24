@@ -2010,9 +2010,13 @@ async fn set_model_rejects_unknown_provider() {
 }
 
 /// Regression for monorepo#607: `agent.create` rejects (-32602 InvalidParams)
-/// a bare model id that provably belongs to a different provider's static
-/// tiers — the incident payload was an explicit `provider: "grok"` with a
-/// bare auggie-tier model.
+/// an incident-shaped payload — an explicit `provider` plus a bare model id
+/// provably owned by another provider's *static* tiers. Note the dynamic-model
+/// gap: the actual incident model (`fable-5`) is an auggie **dynamic** model
+/// absent from `PROVIDER_MODEL_TIERS`, so `providers_claiming_model` cannot
+/// prove ownership and that exact payload still passes this guard today (the
+/// gap is asserted explicitly in
+/// [`create_accepts_bare_model_for_matching_or_unknown_owner`]).
 #[tokio::test]
 async fn create_rejects_bare_model_owned_by_other_provider() {
     let (_t, svc, ws) = setup().await;
@@ -2111,6 +2115,46 @@ async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
     )
     .await
     .expect("bare id unknown to every static tier");
+    // Known dynamic-model gap (monorepo#607): the exact incident payload —
+    // grok + bare `fable-5`, an auggie *dynamic* model absent from
+    // `PROVIDER_MODEL_TIERS` — still passes because static-tier ownership
+    // cannot be proven. Closing this needs a dynamic-catalog check tracked
+    // in the follow-up on monorepo#607.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK2b".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("dynamic-model gap: bare fable-5 + grok passes today");
+    // The literal "default" id is claude-code's smart-tier *sentinel* ("use
+    // the CLI default"), not an ownership claim — it must pass for every
+    // provider.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK2c".into()),
+        Some("default".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("bare \"default\" sentinel passes for any provider");
     // Unknown-to-all bare id with a defaulted provider passes too.
     svc.agent_create_op(
         ws.clone(),
@@ -2163,6 +2207,40 @@ async fn set_model_rejects_bare_model_owned_by_other_provider() {
     svc.agent_set_model_op(id, "some-dynamic-model".into())
         .await
         .expect("bare id unknown to every static tier");
+}
+
+/// `agent.setModel` normalizes legacy default-provider aliases persisted on
+/// old sessions (`default`/`acp`/`augment` — `DEFAULT_PROVIDER_ALIASES`)
+/// before the bare-model ownership comparison: a session whose raw
+/// `session.provider` is `"acp"` spawns the default provider (auggie), so a
+/// bare auggie model must pass, and a bare model owned by a *different*
+/// provider is still rejected naming the normalized provider.
+#[tokio::test]
+async fn set_model_normalizes_legacy_provider_aliases() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Alias").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = Some("acp".into());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist legacy alias");
+    // Bare auggie model on an "acp" session passes (spawn runs auggie).
+    svc.agent_set_model_op(id.clone(), "sonnet4.5".into())
+        .await
+        .expect("bare default-provider model on a legacy-alias session");
+    // A bare claude-code model is still rejected — naming the normalized
+    // provider, not the raw alias.
+    let err = svc
+        .agent_set_model_op(id, "haiku".into())
+        .await
+        .expect_err("bare claude-code model on a legacy-alias auggie session");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("model haiku does not belong to provider auggie"),
+        "normalized provider must be named: {err}"
+    );
 }
 
 #[tokio::test]

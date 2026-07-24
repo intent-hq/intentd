@@ -171,15 +171,28 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 /// only (deterministic, no probe dependency): bare ids unknown to every
 /// static tier pass unchanged. `method` names the rejecting RPC in the
 /// message.
+///
+/// Two spawn-parity carve-outs:
+/// - the literal `"default"` id is claude-code's smart-tier *sentinel*
+///   ("use the CLI default"), not an ownership claim — it passes for every
+///   provider;
+/// - `provider_id` is normalized through `provider_config` first, so legacy
+///   default-provider aliases persisted on old sessions (`default`/`acp`/
+///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
+///   spawn would actually run, not as the raw alias string.
 fn ensure_bare_model_matches_provider(
     method: &str,
     provider_id: &str,
     model_id: &str,
 ) -> Result<()> {
+    if model_id == "default" {
+        return Ok(());
+    }
     let owners = intent_providers::providers_claiming_model(model_id);
-    if !owners.is_empty() && !owners.contains(&provider_id) {
+    let effective = intent_providers::provider_config(provider_id).id;
+    if !owners.is_empty() && !owners.contains(&effective) {
         return Err(Error::InvalidParams(format!(
-            "{method}: model {model_id} does not belong to provider {provider_id} \
+            "{method}: model {model_id} does not belong to provider {effective} \
              (providers with this model: {})",
             owners.join(", ")
         )));
@@ -1374,7 +1387,8 @@ impl Services {
         // afterwards; existing agents change model only via explicit agent.setModel.
         //
         // Precedence: explicit model > specialist frontmatter model > settings chain
-        let resolved_model = match model {
+        let model_explicit = model.is_some();
+        let mut resolved_model = match model {
             Some(m) => Some(m),
             None => {
                 // Try specialist frontmatter model first (3-tier: project > user > bundled)
@@ -1457,10 +1471,31 @@ impl Services {
                 // `resolve_provider_id` for a bare model: provider field →
                 // default. Bare ids unknown to every static tier pass —
                 // ownership cannot be proven for dynamic-only model lists.
+                //
+                // Only a *client-supplied* mismatch hard-fails. A mismatch in
+                // a derived default (specialist frontmatter / settings chain
+                // — e.g. a global `model.default` naming an auggie model
+                // while the caller asked for `provider: "grok"` with no model
+                // param) would reject a model the caller never sent and make
+                // the provider uncreatable until settings change; drop it to
+                // the CLI default instead (session.model stays None).
                 let effective = provider
                     .as_deref()
                     .unwrap_or(intent_providers::default_provider_id());
-                ensure_bare_model_matches_provider("agent.create", effective, m)?;
+                match ensure_bare_model_matches_provider("agent.create", effective, m) {
+                    Ok(()) => {}
+                    Err(e) if model_explicit => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            model = m,
+                            provider = effective,
+                            error = %e,
+                            "configured default model belongs to another provider; \
+                             falling back to the CLI default"
+                        );
+                        resolved_model = None;
+                    }
+                }
             }
         }
         let session = AgentSession {
