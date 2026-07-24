@@ -63,9 +63,10 @@ pub fn build_tool_use_block(
     })
 }
 
-/// MIME type identifying a proposal resource content item (§7.1). Parity with
-/// the FE contract in `cloudlands-fe/src/shared/types/proposal-resource.ts`.
-pub const PROPOSAL_RESOURCE_MIME: &str = "application/vnd.intent.proposal+json";
+/// MIME type identifying a proposal resource content item (§7.1). Aliases the
+/// bindings' canonical constant (parity with the FE contract in
+/// `cloudlands-fe/src/shared/types/proposal-resource.ts`).
+pub const PROPOSAL_RESOURCE_MIME: &str = intent_acp::mcp_server::PROPOSAL_RESOURCE_MIME_TYPE;
 
 /// Find the first well-formed proposal resource item in a `tool_result` output
 /// array: `{ type: "resource", resource: { mimeType: <proposal MIME>, text } }`
@@ -99,16 +100,6 @@ pub fn build_proposal_resource_block(block_id: &str, item: &Value) -> Value {
 /// (proposals are preview+payload sized), so skip the parse entirely.
 const COLLAPSED_PROPOSAL_MAX_BYTES: usize = 256 * 1024;
 
-/// Valid proposal kinds. Parity with the `ws.app.*` bindings
-/// (`intent-acp/src/mcp_server/bindings/app/proposal.rs::PROPOSAL_KINDS`) and
-/// the FE contract (`proposal.ts::PROPOSAL_KINDS`).
-const PROPOSAL_KINDS: &[&str] = &[
-    "workspace-create",
-    "settings-change",
-    "specialist-edit",
-    "bulk-op",
-];
-
 /// Find or reconstruct the proposal resource item for a completed tool's
 /// output (§7.1). Tries [`find_proposal_resource`] first (the provider echoed
 /// the MCP content-item array intact); when the output is not an array,
@@ -118,9 +109,12 @@ const PROPOSAL_KINDS: &[&str] = &[
 /// proposal}>" }`, dropping the resource item entirely
 /// (intent-hq/monorepo#511 regression class). The fallback is guarded: the
 /// candidate string is size-capped, must parse as JSON carrying `ok: true`
-/// plus a structurally valid proposal, and the resource item is rebuilt
-/// exactly as the `ws.app.*` bindings build it, so downstream rendering is
-/// identical to the array path.
+/// plus a proposal passing the bindings' own canonical validation
+/// (`intent_acp::mcp_server::is_valid_proposal`), and the resource item is
+/// rebuilt with the bindings' own URI builder, so downstream rendering is
+/// identical to the array path. Note the guards verify *shape*, not
+/// *provenance*: a collapsed output byte-identical to a `ws.app.proposal.show`
+/// echo is indistinguishable from one and will be lifted.
 pub fn lift_proposal_resource(output: &Value) -> Option<Value> {
     if let Some(item) = find_proposal_resource(output) {
         return Some(item.clone());
@@ -142,8 +136,9 @@ fn collapsed_output_text(output: &Value) -> Option<&str> {
 /// daemon's own `ws.app.*` bindings emitted as their MCP text item, and
 /// rebuild the proposal resource item from it. `None` unless every guard
 /// passes: string present, within the size cap, valid JSON object with
-/// `ok: true`, and a proposal that passes the same structural validation the
-/// bindings applied before emitting it.
+/// `ok: true`, and a proposal that passes the bindings' canonical
+/// `is_valid_proposal` (the SAME function `ws.app.proposal.show` validated
+/// with before emitting it).
 fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
     let text = collapsed_output_text(output)?;
     if text.len() > COLLAPSED_PROPOSAL_MAX_BYTES || !text.trim_start().starts_with('{') {
@@ -155,37 +150,15 @@ fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
         return None;
     }
     let proposal = obj.get("proposal")?;
-    if !is_valid_proposal(proposal) {
+    if !intent_acp::mcp_server::is_valid_proposal(proposal) {
         return None;
     }
     Some(build_proposal_resource_item(proposal))
 }
 
-/// Structural proposal validation. Parity with the `ws.app.*` bindings
-/// (`proposal.rs::is_valid_proposal`): known `kind`, non-empty
-/// `preview.title`, object `payload`.
-fn is_valid_proposal(value: &Value) -> bool {
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    let kind_valid = obj
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(|k| PROPOSAL_KINDS.contains(&k))
-        .unwrap_or(false);
-    let preview_valid = obj
-        .get("preview")
-        .and_then(Value::as_object)
-        .and_then(|p| p.get("title"))
-        .and_then(Value::as_str)
-        .map(|t| !t.is_empty())
-        .unwrap_or(false);
-    let payload_valid = obj.get("payload").and_then(Value::as_object).is_some();
-    kind_valid && preview_valid && payload_valid
-}
-
 /// Rebuild the MCP proposal resource item exactly as the `ws.app.*` bindings
-/// construct it (`proposal.rs::show`): uri from kind + applyToolCallId (or
+/// construct it (`proposal.rs::show`), reusing the bindings' own
+/// `proposal_resource_uri`: uri from kind + applyToolCallId (or
 /// preview.title), name from preview.title, compact proposal JSON as `text`.
 fn build_proposal_resource_item(proposal: &Value) -> Value {
     let name = proposal
@@ -196,51 +169,12 @@ fn build_proposal_resource_item(proposal: &Value) -> Value {
     json!({
         "type": "resource",
         "resource": {
-            "uri": proposal_resource_uri(proposal),
+            "uri": intent_acp::mcp_server::proposal_resource_uri(proposal),
             "name": name,
             "mimeType": PROPOSAL_RESOURCE_MIME,
             "text": serde_json::to_string(proposal).unwrap_or_else(|_| "{}".to_string()),
         }
     })
-}
-
-/// Build the proposal resource URI (parity with the bindings'
-/// `proposal_resource_uri`): `intent-proposal://{kind}/{encoded id}` where id
-/// is `applyToolCallId` when present, else `preview.title`.
-fn proposal_resource_uri(proposal: &Value) -> String {
-    let kind = proposal
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let id = proposal
-        .get("applyToolCallId")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            proposal
-                .get("preview")
-                .and_then(|p| p.get("title"))
-                .and_then(Value::as_str)
-        })
-        .unwrap_or("untitled");
-    format!(
-        "intent-proposal://{kind}/{}",
-        percent_encode_path_segment(id)
-    )
-}
-
-/// RFC3986 percent-encoding for URI path segments: everything but unreserved
-/// (A-Z a-z 0-9 - _ . ~) is encoded. Parity with the bindings'
-/// `percent_encode_path_segment`.
-fn percent_encode_path_segment(s: &str) -> String {
-    s.as_bytes()
-        .iter()
-        .flat_map(|&b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                vec![b as char]
-            }
-            _ => format!("%{b:02X}").chars().collect(),
-        })
-        .collect()
 }
 
 #[cfg(test)]
