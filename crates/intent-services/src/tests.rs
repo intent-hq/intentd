@@ -6673,6 +6673,107 @@ mod pr {
         assert!(evs.is_empty());
     }
 
+    /// Like [`refresh_setup`], but also seeds the workspace's `baseRef` —
+    /// written directly to the store so tests can exercise legacy
+    /// remote-qualified rows that predate write-side canonicalisation.
+    async fn refresh_setup_with_base_ref(
+        forge: StubForge,
+        branch: &str,
+        base_ref: &str,
+        pr_number: Option<u64>,
+    ) -> (TempDb, Services, WorkspaceId) {
+        let (tmp, svc, ws_id) = refresh_setup(forge, branch, pr_number, false).await;
+        let mut ws = svc.store().get_workspace(&ws_id).await.expect("ws");
+        ws.base_ref = Some(base_ref.to_string());
+        svc.store().update_workspace(&ws).await.expect("update ws");
+        (tmp, svc, ws_id)
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_link_on_branch_mismatch_with_baseref_match() {
+        // Review workspace: branch "main" mismatches the PR head "feature",
+        // but `baseRef == "feature"` rescues the link (§7.6, FE
+        // `matchesBaseRef` parity) — the refresh updates instead of unlinking.
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(StubForge::default(), "main", "feature", Some(42)).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:unlinked", 10)
+            .await
+            .unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_unlinks_when_neither_branch_nor_baseref_match() {
+        // Both the branch ("main") and the baseRef ("dev") positively
+        // mismatch the PR head ("feature"): the stale link is cleared.
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(StubForge::default(), "main", "dev", Some(42)).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, None);
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:unlinked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_links_via_baseref_discovery() {
+        // Unlinked review workspace on its own branch; discovery's branch
+        // query yields no head-ref match, and the baseRef fallback links the
+        // PR whose head equals the workspace `baseRef`.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(forge, "review-ws", "feature", None).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
+    }
+
+    #[tokio::test]
+    async fn refresh_links_via_legacy_remote_qualified_baseref() {
+        // Legacy row persisted before write-side canonicalisation:
+        // `baseRef == "origin/feature"` still matches the PR head "feature"
+        // via the allowlist-stripped candidate.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(forge, "review-ws", "origin/feature", None).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+    }
+
     // ------------------------------------------------------------------------
     // `pr.refresh` (PROTOCOL §5.7 extension): the on-demand RPC wraps
     // `refresh_workspace_pr` and reports the post-refresh linkage state; the

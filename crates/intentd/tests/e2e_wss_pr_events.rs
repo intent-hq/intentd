@@ -333,6 +333,17 @@ struct Fixture {
 /// Boot a TLS + bearer-auth WSS listener whose services carry the stub forge
 /// and a seeded workspace linked to PR #42 on branch `feature`.
 async fn boot(forge: StubForge) -> Fixture {
+    boot_seeded(forge, "feature", None, Some(42)).await
+}
+
+/// Like [`boot`], but with explicit workspace `branch`, `baseRef`, and PR
+/// linkage so tests can seed unlinked/review workspaces.
+async fn boot_seeded(
+    forge: StubForge,
+    branch: &str,
+    base_ref: Option<&str>,
+    pr_number: Option<u64>,
+) -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
     let dir = std::env::temp_dir().join(format!("intentd-pr-events-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
@@ -346,8 +357,8 @@ async fn boot(forge: StubForge) -> Fixture {
     let ws = Workspace {
         id: ws_id.clone(),
         title: "PR events".into(),
-        branch: "feature".into(),
-        base_ref: None,
+        branch: branch.into(),
+        base_ref: base_ref.map(Into::into),
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: None,
@@ -367,7 +378,7 @@ async fn boot(forge: StubForge) -> Fixture {
         setup_script: None,
         is_remote: false,
         default_model: None,
-        pr_number: Some(42),
+        pr_number,
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
@@ -511,6 +522,51 @@ async fn pr_linked_event_carries_pull_requests_list_over_wss() {
     assert_eq!(merged["status"], "Merged");
     let open = list.iter().find(|p| p["number"] == 300).expect("open #300");
     assert_eq!(open["status"], "Open");
+}
+
+/// baseRef discovery over the wire (§7.6, FE `matchesBaseRef` parity): an
+/// unlinked review workspace on its own branch (`review-ws`) whose `baseRef`
+/// equals an open PR's head ref (`feature`) links that PR — the refresh
+/// emits `pr:linked` with the discovered PR in the payload.
+#[tokio::test]
+async fn pr_linked_via_baseref_discovery_over_wss() {
+    let fx = boot_seeded(
+        StubForge {
+            open_pr_number: Some(300),
+            ..Default::default()
+        },
+        "review-ws",
+        Some("feature"),
+        None,
+    )
+    .await;
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["pr:linked"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Drive the same per-workspace refresh the 60s background sweep runs:
+    // no head-ref match on "review-ws", so the baseRef fallback links #300.
+    let outcome = fx
+        .services
+        .refresh_workspace_pr(&fx.ws_id)
+        .await
+        .expect("refresh");
+    assert_eq!(outcome, intent_services::PrRefreshOutcome::Linked);
+
+    let evt = next_event(&mut sub, "pr:linked").await;
+    assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
+    let data = &evt["data"];
+    assert_eq!(data["prNumber"], 300);
+    assert_eq!(data["prUrl"], "https://github.com/o/r/pull/300");
+    assert_eq!(data["prStatus"], "Open");
+    assert_eq!(data["activePullRequest"]["number"], 300);
 }
 
 /// Merged-without-successor over the wire: the linked PR (#42) is fetched as
