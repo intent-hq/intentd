@@ -1415,6 +1415,89 @@ async fn event_metadata_round_trips_through_store() {
     );
 }
 
+/// Regression for monorepo#670: a failed COMMIT in `insert_events` must roll
+/// the transaction back so the sole write-pool connection (max_connections=1)
+/// is not returned to the pool still holding an open transaction + write
+/// lock. The `event` table has no FK on `workspace_id`, so unlike the
+/// note_version variant this test plants a trap: a trigger on `event`
+/// inserts into a table whose FK is `DEFERRABLE INITIALLY DEFERRED`, so the
+/// violation only surfaces at COMMIT time, forcing the COMMIT itself to
+/// fail. Pre-fix code propagated the error without ROLLBACK, poisoning the
+/// connection so every later `BEGIN IMMEDIATE` failed.
+#[tokio::test]
+async fn insert_events_rolls_back_on_failed_commit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Plant the COMMIT trap: every event insert also inserts a row whose
+    // deferred FK points at a nonexistent workspace, so the violation is
+    // only detected when `insert_events` issues its COMMIT.
+    sqlx::query(
+        "CREATE TABLE commit_trap (
+             event_id TEXT PRIMARY KEY,
+             ws_ref   TEXT NOT NULL REFERENCES workspace(id)
+                      DEFERRABLE INITIALLY DEFERRED
+         )",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap table");
+    sqlx::query(
+        "CREATE TRIGGER commit_trap_trigger AFTER INSERT ON event BEGIN
+             INSERT INTO commit_trap (event_id, ws_ref)
+             VALUES (NEW.id, 'ghost-workspace');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let trapped = typed_event(
+        &ws,
+        "2026-01-01T00:00:01Z",
+        events::AGENT_MESSAGE,
+        actor.clone(),
+    );
+    let err = store
+        .insert_events(std::slice::from_ref(&trapped))
+        .await
+        .expect_err("COMMIT must fail on the deferred FK violation");
+    assert!(
+        err.to_string().contains("commit"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing persisted for the trapped insert...
+    assert!(store
+        .events_by_workspace(&ws, 10)
+        .await
+        .expect("query events")
+        .is_empty());
+    // ...and the failed COMMIT was rolled back, not left open: with the
+    // trap disarmed, the next insert reuses the same pooled connection and
+    // commits normally.
+    sqlx::query("DROP TRIGGER commit_trap_trigger")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let ok_event = typed_event(&ws, "2026-01-01T00:00:02Z", events::AGENT_MESSAGE, actor);
+    let inserted = store
+        .insert_events(std::slice::from_ref(&ok_event))
+        .await
+        .expect("insert after failed COMMIT");
+    assert_eq!(inserted.len(), 1);
+}
+
 /// Finding F4: extended ephemeral-event retention sweep deletes high-volume
 /// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`) older
 /// than the cutoff while preserving lifecycle/tool/note/task/workspace events
