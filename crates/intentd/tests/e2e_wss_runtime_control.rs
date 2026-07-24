@@ -118,11 +118,37 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
+    timeout(
+        common::test_timeout(Duration::from_secs(30)),
+        reader.read_line(&mut buf),
+    )
+    .await
+    .expect("uds rpc timed out")
+    .expect("read uds response");
     serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+}
+
+/// Poll until new TCP connections to `port` are refused — the listener socket
+/// closes asynchronously after a `settings.update` disable clears the status
+/// port, so a single-shot connect can still succeed under load (monorepo#515).
+async fn await_tcp_refused(port: u16) {
+    let budget = common::daemon_startup_timeout();
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let connect = timeout(
+            Duration::from_secs(2),
+            TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+        )
+        .await;
+        if connect.is_err() || connect.unwrap().is_err() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "TCP port {port} still accepting connections {budget:?} after listener disable"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[derive(Debug)]
@@ -215,7 +241,7 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
+        let next = timeout(common::test_timeout(Duration::from_secs(30)), ws.next())
             .await
             .expect("wss rpc timed out");
         match next {
@@ -310,26 +336,11 @@ async fn runtime_ws_listener_toggle_over_wss() {
         "settings.update disable should succeed: {disable}"
     );
 
-    // Give the listener a moment to stop
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify system.status shows no listener
-    let status = uds_rpc(&socket, 4, "system.status", json!({})).await;
-    assert!(
-        status["result"]["port"].is_null(),
-        "port should be null after disable"
-    );
+    // Verify system.status shows no listener (poll — teardown is async)
+    common::await_wss_stopped(&socket).await;
 
     // Verify new WSS connections are refused (TCP listener should be closed)
-    let connect_result = timeout(
-        Duration::from_secs(2),
-        TcpStream::connect((Ipv4Addr::LOCALHOST, initial_port)),
-    )
-    .await;
-    assert!(
-        connect_result.is_err() || connect_result.unwrap().is_err(),
-        "TCP connection should fail after listener is stopped"
-    );
+    await_tcp_refused(initial_port).await;
 
     // Re-enable the WSS listener via settings.update over UDS
     let enable = uds_rpc(
@@ -344,11 +355,8 @@ async fn runtime_ws_listener_toggle_over_wss() {
         "settings.update enable should succeed: {enable}"
     );
 
-    // Give the listener a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify system.status shows the WSS listener again
-    let status = uds_rpc(&socket, 6, "system.status", json!({})).await;
+    // Verify system.status shows the WSS listener again (poll — start is async)
+    let status = common::await_wss_status(&socket).await;
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
@@ -451,11 +459,8 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
         "settings.update enable should succeed: {enable}"
     );
 
-    // Give the listener a moment to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify system.status shows the WSS listener is running
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    // Verify system.status shows the WSS listener is running (poll — start is async)
+    let status = common::await_wss_status(&socket).await;
     let first_boot_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after enable") as u16;
@@ -500,9 +505,12 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
         shutdown.get("result").is_some(),
         "system.shutdown should succeed: {shutdown}"
     );
-    // Wait for the daemon to exit gracefully (up to 3 seconds)
+    // Wait for the daemon to exit gracefully (liveness bound: WAL flush under
+    // parallel-suite load can exceed a fixed few-second window, monorepo#515)
+    let exit_budget = common::daemon_startup_timeout();
+    let exit_deadline = tokio::time::Instant::now() + exit_budget;
     let mut exited = false;
-    for _ in 0..30 {
+    while tokio::time::Instant::now() < exit_deadline {
         if matches!(_daemon.child.try_wait(), Ok(Some(_))) {
             exited = true;
             break;
@@ -511,7 +519,7 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     }
     assert!(
         exited,
-        "daemon did not exit within 3 seconds after system.shutdown"
+        "daemon did not exit within {exit_budget:?} after system.shutdown"
     );
     // Drop the first daemon without cleanup; process already exited
     drop(_daemon);
@@ -525,12 +533,10 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
     };
     assert!(await_uds(&socket).await, "daemon did not start on reboot");
 
-    // Give the listener a moment to auto-start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // REGRESSION TEST: Verify system.status shows the WSS listener is running
-    // (before the fix, port would be null because persisted setting was ignored)
-    let status2 = uds_rpc(&socket, 4, "system.status", json!({})).await;
+    // (before the fix, port would be null because persisted setting was
+    // ignored). Poll — the boot auto-start is async relative to UDS readiness.
+    let status2 = common::await_wss_status(&socket).await;
     let reboot_port = status2["result"]["port"]
         .as_u64()
         .expect("port should be set at reboot with persisted enabled=true")
@@ -597,7 +603,7 @@ async fn batch_hook_ordering_port_before_enable() {
         disable.get("error").is_none(),
         "disable should succeed: {disable}"
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::await_wss_stopped(&socket).await;
 
     // Batch update: provide changes in REVERSE dependency order (wsApi.enabled
     // before wsApi.port in the input array). The hook ordering ensures the port
@@ -622,10 +628,9 @@ async fn batch_hook_ordering_port_before_enable() {
         "batch reverse order should succeed: {batch_reverse}"
     );
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify system.status shows the listener bound to the NEW port
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    // Verify system.status shows the listener bound to the NEW port (poll —
+    // the runtime listener start is async)
+    let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after batch enable") as u16;
@@ -739,11 +744,8 @@ async fn runtime_toggled_wss_serves_system_status() {
         "settings.update should succeed: {enable_resp}"
     );
 
-    // Wait a moment for the listener to start
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // Verify WSS is now running
-    let status_after = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    // Verify WSS is now running (poll — the runtime listener start is async)
+    let status_after = common::await_wss_status(&socket).await;
     let runtime_port = status_after["result"]["port"]
         .as_u64()
         .expect("port after toggle") as u16;

@@ -8907,6 +8907,16 @@ mod script {
     use crate::events::{EventBus, Subscription, SubscriptionFilter};
     use crate::Services;
 
+    /// Pure-liveness deadline for the event-driven waits below (monorepo#515):
+    /// `drain_until` returns as soon as the awaited event arrives, so this
+    /// bound only has to outlast a worst-case multi-suite machine stall
+    /// (login-shell spawn + exit-poll + bus delivery), never a passing run.
+    const LIVENESS: Duration = Duration::from_secs(300);
+    /// Service lifetime long enough that a service under test cannot exit
+    /// (and auto-restart, killing its PTY) before the post-wait assertions
+    /// run under load (monorepo#515). Every test that starts one stops it.
+    const KEEPALIVE: &str = "sleep 300";
+
     struct Harness {
         _tmp: TempDb,
         services: Services,
@@ -9002,9 +9012,11 @@ mod script {
     async fn command_runs_once_and_captures_output() {
         let h = harness().await;
         let id = create(&h, "echo", "echo run-once-output", ScriptMode::Command).await;
+        // The timeout is a liveness bound only — the run ends when `echo`
+        // exits — so keep it far above any plausible machine stall.
         let out = h
             .services
-            .script_run(h.ws.clone(), id, None, Some(10))
+            .script_run(h.ws.clone(), id, None, Some(300))
             .await
             .expect("run");
         assert_eq!(out["timedOut"], false);
@@ -9028,7 +9040,7 @@ mod script {
         let id = create(
             &h,
             "svc",
-            "echo OUTPUT-PARITY-MARK ; sleep 5",
+            &format!("echo OUTPUT-PARITY-MARK ; {KEEPALIVE}"),
             ScriptMode::Service,
         )
         .await;
@@ -9036,7 +9048,7 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(5), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:output" {
                 let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
                 contains(&bytes, b"OUTPUT-PARITY-MARK").then_some(())
@@ -9107,7 +9119,7 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(300), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:state"
                 && v["data"]["status"] == "running"
                 && v["data"]["restartCount"].as_i64().unwrap_or(0) >= 1
@@ -9146,19 +9158,25 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(12), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             (v["type"] == "script:state"
                 && v["data"]["status"] == "running"
                 && v["data"]["restartCount"] == 1)
                 .then_some(())
         })
         .await;
+        // The `restartCount: 1` event above proves the single auto-restart;
+        // a stalled scheduler can let the short-lived second run exit (and
+        // restart again) before this status call, so only assert the floor.
         let st = h
             .services
             .script_status(h.ws.clone(), id.clone())
             .await
             .expect("status");
-        assert_eq!(st["restartCount"], 1);
+        assert!(
+            st["restartCount"].as_i64().unwrap_or(0) >= 1,
+            "restartCount reflects at least the observed restart: {st}"
+        );
         h.services
             .script_stop(h.ws.clone(), id)
             .await
@@ -9174,7 +9192,7 @@ mod script {
         let id = create(
             &h,
             "dev",
-            "echo listening on http://localhost:3000/ ; sleep 5",
+            &format!("echo listening on http://localhost:3000/ ; {KEEPALIVE}"),
             ScriptMode::Service,
         )
         .await;
@@ -9182,7 +9200,7 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        let (url, _) = drain_until(&mut sub, Duration::from_secs(5), |v| {
+        let (url, _) = drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:state" {
                 v["data"]["detectedUrl"].as_str().map(str::to_string)
             } else {
@@ -9207,7 +9225,7 @@ mod script {
         let id = create(
             &h,
             "svc",
-            "echo SCRIPT-PTY-MARK ; sleep 5",
+            &format!("echo SCRIPT-PTY-MARK ; {KEEPALIVE}"),
             ScriptMode::Service,
         )
         .await;
@@ -9216,7 +9234,7 @@ mod script {
             .await
             .expect("start");
         // Wait until the marker has streamed (so it is in the PTY scrollback).
-        drain_until(&mut sub, Duration::from_secs(5), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:output" {
                 let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
                 contains(&bytes, b"SCRIPT-PTY-MARK").then_some(())
