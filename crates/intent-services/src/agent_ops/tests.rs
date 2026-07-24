@@ -9049,6 +9049,55 @@ async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
     assert!(svc.all_watches(&ws).is_empty());
 }
 
+/// The backstop sweep in `workspace.delete` emits a refreshed
+/// `agent:subscriptions-changed` for each affected cross-workspace parent, so
+/// clients converge on the shrunken watch set without polling — the swept
+/// grouped watch would otherwise leave stale waiting flags until the group
+/// settles.
+#[tokio::test]
+async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&chief_ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &chief_ws,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        false,
+        Some(gid.clone()),
+    )
+    .expect("chief grouped watch");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The grouped watch survived the direct delivery (group settlement owns
+    // its lifecycle) and was removed by the backstop sweep, which publishes
+    // the parent's refreshed (now empty) waiting flags.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after backstop sweep")
+        .expect("batch");
+    let last = batch.last().expect("event");
+    assert_eq!(last.event_type, AGENT_SUBSCRIPTIONS_CHANGED);
+    assert_eq!(last.data["agentId"], json!(parent.0));
+    assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
+    assert_eq!(last.data["waitingForAgentIds"], json!([]));
+}
+
 /// The workspace-delete sweep stays scoped: watches parented in the deleted
 /// workspace and groups anchored there are still dropped, while watches and
 /// groups that live entirely in another workspace are untouched.

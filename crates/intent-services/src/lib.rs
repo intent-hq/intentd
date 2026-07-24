@@ -8080,15 +8080,22 @@ impl WorkspaceApi for Services {
             // settlement owns their lifecycle) and a racing registration can
             // land behind the loop above — after this point no watch may
             // reference the deleted workspace as its child side. In-memory
-            // retain + best-effort delete of the persisted rows.
-            let leaked: Vec<String> = {
+            // retain + best-effort delete of the persisted rows. Each
+            // affected parent then gets a refreshed
+            // `agent:subscriptions-changed` so clients converge on the
+            // shrunken watch set without polling (PROTOCOL §6.5).
+            let leaked: Vec<(String, WorkspaceId, AgentId)> = {
                 let mut registry = agent_subscriptions
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let mut leaked = Vec::new();
                 registry.subscriptions.retain(|s| {
                     if s.child_workspace_id == id {
-                        leaked.push(s.id.clone());
+                        leaked.push((
+                            s.id.clone(),
+                            s.parent_workspace_id.clone(),
+                            s.parent_agent_id.clone(),
+                        ));
                         false
                     } else {
                         true
@@ -8096,9 +8103,18 @@ impl WorkspaceApi for Services {
                 });
                 leaked
             };
-            for watch_id in &leaked {
+            for (watch_id, _, _) in &leaked {
                 if let Err(e) = store.delete_completion_watch(watch_id).await {
                     tracing::warn!("completion_watch delete failed {watch_id}: {e}");
+                }
+            }
+            let mut notified: Vec<(&WorkspaceId, &AgentId)> = Vec::new();
+            for (_, parent_ws, parent_id) in &leaked {
+                if !notified.contains(&(parent_ws, parent_id)) {
+                    notified.push((parent_ws, parent_id));
+                    services
+                        .publish_subscriptions_changed(parent_ws, parent_id)
+                        .await;
                 }
             }
             // Capture workspace state for the async cleanup below (before the
