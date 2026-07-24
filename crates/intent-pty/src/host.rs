@@ -739,6 +739,62 @@ mod tests {
         host.kill(id).await;
     }
 
+    /// Regression test for monorepo#587: a fast-exiting child's PTY output must
+    /// not be lost. Pre-fix, `PtyHost::spawn` dropped the parent-side slave fd
+    /// immediately, so when the child wrote and exited before the reader
+    /// thread's first `read()` drained it, closing the last slave fd (the
+    /// child's, at exit) discarded the buffered PTY output on macOS — the
+    /// scrollback stayed empty forever even though `wait()` returned exit 0
+    /// (see intentd#411 / monorepo#587). Concurrent spawn bursts of a bare
+    /// `echo` (no shell startup) on a multi-threaded runtime amplify the repro
+    /// odds under parallel host load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fast_exiting_child_output_is_captured() {
+        let host = Arc::new(PtyHost::new());
+        for round in 0..4 {
+            let mut tasks = Vec::new();
+            for i in 0..32 {
+                let host = Arc::clone(&host);
+                tasks.push(tokio::spawn(async move {
+                    let marker = format!("pty587-fast-exit-{round}-{i}");
+                    let mut spec = SpawnSpec::new("s", "echo");
+                    spec.args = vec![marker.clone()];
+                    let id = host.spawn(spec).unwrap();
+
+                    // Exit codes must be unaffected by the race (or the fix).
+                    let exit = host.wait(id).await.unwrap();
+                    assert_eq!(exit.exit_code, 0, "{marker}: child must exit 0");
+                    assert!(exit.success);
+
+                    // Poll scrollback for the marker. Pre-fix the output is
+                    // *lost*, not late — the deadline only bounds how long a
+                    // failing run takes to report.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let out = host.scrollback(id).unwrap();
+                        if contains(&out, marker.as_bytes()) {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            panic!(
+                                "{marker}: fast-exiting child's output was lost; \
+                                 exit 0 but scrollback stayed {:?}",
+                                String::from_utf8_lossy(&out)
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+
+                    host.kill(id).await;
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        assert_eq!(host.count(), 0);
+    }
+
     /// Killing a scope reaps the whole process group: a backgrounded grandchild
     /// is terminated too, leaving no orphan (mirrors the M5 reaping test).
     #[tokio::test]
