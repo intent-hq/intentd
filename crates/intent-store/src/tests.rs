@@ -557,6 +557,115 @@ async fn note_version_append_list_get_and_prune() {
     assert!(after.is_empty(), "note delete cascades to note_version");
 }
 
+/// A failed statement inside `append_note_version`'s transaction rolls the
+/// whole write back and leaves the pooled write connection usable: appending
+/// for an absent note trips the composite `(note_id, workspace_id)` FK at
+/// INSERT time (`foreign_keys = ON`), nothing persists, and a subsequent
+/// append for a real note succeeds.
+#[tokio::test]
+async fn append_note_version_rolls_back_on_body_error() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    let ts = now_iso();
+
+    // Ghost note row → the version INSERT violates the FK immediately.
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    assert!(store
+        .append_note_version(&ghost, &author, &ts)
+        .await
+        .is_err());
+    assert!(store
+        .list_note_versions(&ws_id, &ghost.id)
+        .await
+        .expect("list ghost versions")
+        .is_empty());
+
+    // The write connection is clean: a normal append still works.
+    let v = store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect("append after body error");
+    assert_eq!(v, 1);
+}
+
+/// Regression for monorepo#657: a failed COMMIT in `append_note_version`
+/// must roll the transaction back so the sole write-pool connection
+/// (max_connections=1) is not returned to the pool still holding an open
+/// transaction + write lock. `defer_foreign_keys = ON` postpones a
+/// ghost-note FK violation to COMMIT time, forcing the COMMIT itself to
+/// fail; pre-fix code propagated the error without ROLLBACK, poisoning the
+/// connection so every later `BEGIN IMMEDIATE` failed.
+#[tokio::test]
+async fn append_note_version_rolls_back_on_failed_commit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    let ts = now_iso();
+
+    // Arm the deferred-FK trap on the single write-pool connection; the
+    // pragma stays in effect until the next transaction concludes, so the
+    // append below passes its INSERT and fails at COMMIT instead.
+    {
+        let mut conn = store
+            .write_pool()
+            .acquire()
+            .await
+            .expect("acquire write conn");
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .expect("defer FKs");
+    }
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    let err = store
+        .append_note_version(&ghost, &author, &ts)
+        .await
+        .expect_err("COMMIT must fail on the deferred FK violation");
+    assert!(
+        err.to_string().contains("commit"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing persisted for the ghost note...
+    assert!(store
+        .list_note_versions(&ws_id, &ghost.id)
+        .await
+        .expect("list ghost versions")
+        .is_empty());
+    // ...and the failed COMMIT was rolled back, not left open: the next
+    // append reuses the same pooled connection and commits normally.
+    let v = store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect("append after failed COMMIT");
+    assert_eq!(v, 1);
+}
+
 #[tokio::test]
 async fn note_rev_increments_on_update() {
     let tmp = TempDb::new();
