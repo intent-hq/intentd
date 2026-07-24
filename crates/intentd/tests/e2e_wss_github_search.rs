@@ -22,9 +22,9 @@ use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
-    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
-    PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewThread,
-    ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
+    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
+    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review,
+    ReviewComment, ReviewThread, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -378,7 +378,9 @@ async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     common::wss_connect_with_retry(port, cfg, &url).await
 }
 
-async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+/// Send a JSON-RPC request and return the full response envelope (success or
+/// error) so tests can assert either arm.
+async fn wss_rpc_envelope(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string())).await.unwrap();
     timeout(Duration::from_secs(5), async {
@@ -387,8 +389,7 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
                 Message::Text(text) => {
                     let v: Value = serde_json::from_str(&text).unwrap();
                     if v.get("id") == Some(&json!(id)) {
-                        assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-                        return v["result"].clone();
+                        return v;
                     }
                 }
                 Message::Ping(p) => {
@@ -401,6 +402,12 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
     })
     .await
     .expect("response timeout")
+}
+
+async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
+    let v = wss_rpc_envelope(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
 }
 
 /// The opaque wire `nextToken` for an engine page cursor: no-pad base64 of
@@ -512,4 +519,61 @@ async fn search_without_query_leaves_listing_unchanged() {
     assert_eq!(pr_queries.len(), 1);
     assert_eq!(pr_queries[0].search, None);
     assert_eq!(pr_queries[0].involvement, None);
+}
+
+/// `github.issues.search` rejects the PR-only `review-requested` filter with
+/// the wire `-32603 "Internal error"` envelope whose `data` lists the issues
+/// filter set from PROTOCOL §5 (`all, assigned, created, involves`) and never
+/// reaches the engine, while `github.pulls.search` continues to accept
+/// `review-requested` (monorepo#551).
+#[tokio::test]
+async fn issues_search_rejects_pr_only_review_requested_filter() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+
+    let env = wss_rpc_envelope(
+        &mut ws,
+        1,
+        "github.issues.search",
+        json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
+    )
+    .await;
+    assert!(
+        env.get("result").is_none(),
+        "expected error envelope: {env}"
+    );
+    assert_eq!(env["error"]["code"], json!(-32603));
+    assert_eq!(env["error"]["message"], json!("Internal error"));
+    let data = env["error"]["data"].as_str().unwrap();
+    assert!(
+        data.contains("all, assigned, created, involves"),
+        "error data must list the issues filter set: {data}"
+    );
+    assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
+
+    // Valid issue filters still pass through unchanged.
+    let r = wss_rpc(
+        &mut ws,
+        2,
+        "github.issues.search",
+        json!({ "owner": "o", "repo": "r", "filter": "involves" }),
+    )
+    .await;
+    assert_eq!(r["issues"][0]["number"], 11);
+
+    // The PR search keeps its wider filter set.
+    let r2 = wss_rpc(
+        &mut ws,
+        3,
+        "github.pulls.search",
+        json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
+    )
+    .await;
+    assert_eq!(r2["pulls"][0]["number"], 42);
+    let pr_queries = fx.forge.pr_queries.lock().unwrap();
+    assert_eq!(pr_queries.len(), 1);
+    assert_eq!(
+        pr_queries[0].involvement,
+        Some(PrInvolvement::ReviewRequested)
+    );
 }

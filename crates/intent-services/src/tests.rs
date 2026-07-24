@@ -7242,6 +7242,25 @@ mod pr {
             .await
             .unwrap();
         assert_eq!(s["issues"][0]["number"], 11);
+
+        // PR-only `review-requested` is rejected for issues (monorepo#551):
+        // the error lists the issues filter set from PROTOCOL §5.
+        let err = svc
+            .github_issues_search(
+                "o".into(),
+                "r".into(),
+                Some("review-requested".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("all, assigned, created, involves"),
+            "error must list the issues filter set: {err}"
+        );
     }
 
     #[tokio::test]
