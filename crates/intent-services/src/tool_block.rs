@@ -140,10 +140,11 @@ fn collapsed_output_text(output: &Value) -> Option<&str> {
 /// `is_valid_proposal` (the SAME function `ws.app.proposal.show` validated
 /// with before emitting it).
 ///
-/// When the initial parse fails, a wrap-repair pass strips raw newlines from
-/// inside JSON string literals and re-parses: auggie hard-wraps the collapsed
-/// echo at a 1000-char column, injecting raw `\n` mid-string (even mid-word),
-/// which strict JSON rejects. See [`repair_wrapped_json`].
+/// When the initial parse fails, a wrap-repair pass strips raw control
+/// characters from inside JSON string literals and re-parses: auggie
+/// hard-wraps the collapsed echo at a 1000-char column, injecting raw `\n`
+/// mid-string (even mid-word), which strict JSON rejects. See
+/// [`repair_wrapped_json`].
 fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
     let text = collapsed_output_text(output)?;
     if text.len() > COLLAPSED_PROPOSAL_MAX_BYTES || !text.trim_start().starts_with('{') {
@@ -163,23 +164,25 @@ fn rebuild_collapsed_proposal_resource(output: &Value) -> Option<Value> {
     Some(build_proposal_resource_item(proposal))
 }
 
-/// Repair a provider-column-wrapped JSON text by removing raw `\n` / `\r`
-/// occurring **inside string literals**, tracking in/out-of-string state and
-/// honoring backslash escapes. Raw control characters are never valid inside
-/// JSON strings (RFC 8259 §7) — real newlines in content arrive escaped as
-/// `\n` — so the removal is unambiguous. A wrap that splits an escape
-/// sequence (`\` + raw newline + `n`) is reassembled by the same removal.
-/// Characters outside string literals are left untouched (whitespace there is
-/// legal, and structural corruption should still fail the re-parse). Returns
-/// `None` when nothing was removed, so the caller skips the pointless
-/// re-parse.
+/// Repair a provider-column-wrapped JSON text by removing raw C0 control
+/// characters (`< U+0020`; DEL U+007F is kept) occurring **inside string
+/// literals**, tracking in/out-of-string state and honoring backslash
+/// escapes. Raw control characters in that range are never valid inside JSON
+/// strings (RFC 8259 §7) — real newlines in content arrive escaped as `\n` —
+/// so the removal is unambiguous. A wrap that splits an escape sequence
+/// (`\` + raw newline + `n`) is reassembled by the same removal. Characters
+/// outside string literals are left untouched (whitespace there is legal, and
+/// structural corruption should still fail the re-parse). Returns `None` when
+/// nothing was removed, so the caller skips the pointless re-parse. Parity
+/// with the FE mirror's `charCodeAt < 0x20` check
+/// (`daemon-events-bridge.client.ts`, cloudlands-fe PR #347).
 fn repair_wrapped_json(text: &str) -> Option<String> {
     let mut repaired = String::with_capacity(text.len());
     let mut in_string = false;
     let mut escaped = false;
     let mut removed = false;
     for c in text.chars() {
-        if in_string && (c == '\n' || c == '\r') {
+        if in_string && c < '\u{20}' {
             removed = true;
             continue;
         }
@@ -533,6 +536,19 @@ mod tests {
         let lifted: Value =
             serde_json::from_str(item["resource"]["text"].as_str().unwrap()).unwrap();
         assert_eq!(lifted["preview"]["title"], "T\nT");
+    }
+
+    #[test]
+    fn lift_repair_strips_raw_tab_inside_string_literal() {
+        // The repair covers the full C0 control range (< U+0020), not just
+        // newlines: a raw TAB inside a string literal is equally invalid JSON
+        // and is stripped (parity with the FE mirror's `charCodeAt < 0x20`).
+        let text = "{\"ok\": true, \"proposal\": {\"kind\": \"settings-change\", \"preview\": {\"title\": \"Ta\tb\"}, \"payload\": {}}}";
+        assert!(serde_json::from_str::<Value>(text).is_err());
+        let item = lift_proposal_resource(&json!({ "output": text })).expect("lifted");
+        let lifted: Value =
+            serde_json::from_str(item["resource"]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(lifted["preview"]["title"], "Tab");
     }
 
     #[test]
