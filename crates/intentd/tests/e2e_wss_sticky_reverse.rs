@@ -94,13 +94,14 @@ async fn connect(port: u16) -> PlainWs {
 
 /// One bounded JSON-RPC round-trip on `ws`: send `method`/`params` with the
 /// caller-supplied `id`, then wait for the matching response frame under a
-/// single 5s overall deadline, echoing pings inline. Used as a lightweight
-/// barrier — a successful reply proves the server-side `connection_loop` is
-/// running past the point where it registered its reverse channel with
-/// `PrimaryReverseRegistry`, so pairing two sequential `client.hello` calls
-/// yields a deterministic arrival order. The 5s is a *total* budget across
-/// all frames (ping / unrelated notification loops included), matching the
-/// `try_read_text` pattern below so pings can't extend the wait indefinitely.
+/// single overall deadline of [`common::rpc_read_timeout`], echoing pings
+/// inline. Used as a lightweight barrier — a successful reply proves the
+/// server-side `connection_loop` is running past the point where it
+/// registered its reverse channel with `PrimaryReverseRegistry`, so pairing
+/// two sequential `client.hello` calls yields a deterministic arrival order.
+/// The read budget is a *total* budget across all frames (ping / unrelated
+/// notification loops included), matching the `try_read_text` pattern below
+/// so pings can't extend the wait indefinitely.
 async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({
         "jsonrpc": "2.0",
