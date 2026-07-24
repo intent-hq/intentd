@@ -2443,7 +2443,8 @@ async fn comment_get_thread_and_resolve_caller_input_errors_are_invalid_params()
         "got: {err:?}"
     );
 
-    // Lookup failures stay Internal: unknown commentId on getThread/resolveThread.
+    // Lookup failures stay Internal: unknown commentId / threadId on
+    // getThread/resolveThread.
     let err = svc
         .comment_get_thread(ws.clone(), id.clone(), None, Some("comment-missing".into()))
         .await
@@ -2453,11 +2454,33 @@ async fn comment_get_thread_and_resolve_caller_input_errors_are_invalid_params()
         "got: {err:?}"
     );
     let err = svc
-        .comment_resolve_thread(ws, id, None, Some("comment-missing".into()), true)
+        .comment_resolve_thread(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some("comment-missing".into()),
+            true,
+        )
         .await
         .expect_err("unknown commentId must fail");
     assert!(
         matches!(err, Error::Internal(ref m) if m.contains("Comment not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), Some("thread-missing".into()), None)
+        .await
+        .expect_err("unknown threadId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Thread not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_resolve_thread(ws, id, Some("thread-missing".into()), None, true)
+        .await
+        .expect_err("unknown threadId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Thread not found")),
         "got: {err:?}"
     );
 }
