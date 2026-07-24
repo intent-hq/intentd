@@ -37,7 +37,7 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate for PRs. Running it
       # plainly here as well would double the critical path. The exception is
