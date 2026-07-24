@@ -10488,12 +10488,6 @@ impl WorkspaceApi for Services {
                         anchored = anchored_text,
                     );
                     note.updated_at = now_iso();
-                    store.update_note(&note).await?;
-                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
-                    services.schedule_line_attribution_recompute(
-                        note.workspace_id.clone(),
-                        note.id.clone(),
-                    );
                     let now = now_iso();
                     let new_comment = Comment {
                         id: comment_id.clone(),
@@ -10535,7 +10529,30 @@ impl WorkspaceApi for Services {
                         created_at: now.clone(),
                         updated_at: now,
                     };
-                    store.insert_comment(&workspace_id, &new_comment).await?;
+                    // The anchor-marker note rewrite + comment INSERT commit
+                    // atomically: a failure can never leave markers embedded
+                    // with no comment row (monorepo#638). The returned rev is
+                    // the authoritative post-rewrite value echoed to clients.
+                    let note_rev = store.update_note_with_comment(&note, &new_comment).await?;
+                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
+                    services.schedule_line_attribution_recompute(
+                        note.workspace_id.clone(),
+                        note.id.clone(),
+                    );
+                    // `note:updated` fires because the add rewrote the note
+                    // markdown; without it clients hold a stale rev and hit
+                    // spurious conflicts on their next versioned write.
+                    publish_event(
+                        &bus,
+                        note_change_event(
+                            &workspace_id,
+                            &note_id,
+                            &note.title,
+                            NOTE_UPDATED,
+                            "update",
+                        ),
+                    )
+                    .await;
                     publish_event(
                         &bus,
                         comment_added_event(&workspace_id, &note_id, &comment_id),
@@ -10546,6 +10563,7 @@ impl WorkspaceApi for Services {
                         message: format!("Comment successfully anchored to \"{anchored_text}\""),
                         comment_id,
                         anchored: true,
+                        note_rev,
                         location: CommentLocation {
                             line,
                             anchored_text,

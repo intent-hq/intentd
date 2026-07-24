@@ -3248,6 +3248,16 @@ mod change_event_parity {
             )
             .await
             .expect("comment");
+        // The add rewrites the note markdown (anchor markers), so a
+        // `note:updated` precedes the `comment:added` (monorepo#638) and the
+        // result echoes the post-rewrite rev (insert=0 → 1).
+        assert_eq!(added.note_rev, 1);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "noteId": "n-1", "title": "Title", "action": "update" })
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "comment:added");
         assert_eq!(
@@ -3282,6 +3292,8 @@ mod change_event_parity {
             )
             .await
             .expect("first add");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "comment:added");
 
