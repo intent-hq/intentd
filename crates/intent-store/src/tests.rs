@@ -90,7 +90,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50
+            47, 48, 49, 50, 51
         ]
     );
     assert_eq!(
@@ -98,7 +98,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50
+            47, 48, 49, 50, 51
         ]
     );
 }
@@ -1504,6 +1504,184 @@ async fn stream_retention_sweep_disabled_is_noop_in_practice() {
         .expect("sweep");
     assert_eq!(removed, 0);
     assert_eq!(store.events_by_workspace(&ws, 10).await.unwrap().len(), 1);
+}
+
+/// `agent:tool:call` has its own TTL sweep (`delete_tool_call_events_before`):
+/// tool calls older than the cutoff are removed, newer ones are retained, and
+/// no other family is touched. The ephemeral sweep continues to leave tool
+/// calls alone regardless of age.
+#[tokio::test]
+async fn tool_call_retention_sweep_trims_only_old_tool_calls() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let seed = vec![
+        // Old tool calls (eligible for the tool-call TTL sweep).
+        typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
+        typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
+        // New tool call (within TTL — must survive).
+        typed_event(&ws, new, events::AGENT_TOOL_CALL, agent.clone()),
+        // Other old families — the tool-call sweep must not touch them.
+        typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
+        typed_event(&ws, old, events::NOTE_UPDATED, agent.clone()),
+        typed_event(&ws, old, events::FILE_CHANGED, agent.clone()),
+    ];
+    for ev in &seed {
+        store.insert_event(ev).await.expect("insert seed event");
+    }
+
+    let cutoff = "2026-03-01T00:00:00Z";
+    let removed = store
+        .delete_tool_call_events_before(cutoff)
+        .await
+        .expect("tool-call sweep");
+    assert_eq!(removed, 2, "only the 2 old tool calls are removed");
+
+    let remaining = store
+        .events_by_workspace(&ws, 100)
+        .await
+        .expect("remaining");
+    assert_eq!(remaining.len(), 4);
+    assert!(
+        remaining
+            .iter()
+            .any(|e| e.event_type == events::AGENT_TOOL_CALL && e.timestamp == new),
+        "new tool call must survive"
+    );
+    for t in [
+        events::AGENT_STARTED,
+        events::NOTE_UPDATED,
+        events::FILE_CHANGED,
+    ] {
+        assert!(
+            remaining.iter().any(|e| e.event_type == t),
+            "other family {t} must be untouched"
+        );
+    }
+
+    // Idempotent: a re-run with the same cutoff removes nothing more.
+    let removed_again = store
+        .delete_tool_call_events_before(cutoff)
+        .await
+        .expect("re-run");
+    assert_eq!(removed_again, 0);
+
+    // The ephemeral sweep still never touches tool calls, even with a cutoff
+    // newer than every row (it removes only the old FILE_CHANGED here).
+    let ephemeral_removed = store
+        .delete_ephemeral_events_before("2027-01-01T00:00:00Z")
+        .await
+        .expect("ephemeral sweep");
+    assert_eq!(ephemeral_removed, 1, "only FILE_CHANGED is ephemeral here");
+    let after = store.events_by_workspace(&ws, 100).await.expect("after");
+    assert!(
+        after
+            .iter()
+            .any(|e| e.event_type == events::AGENT_TOOL_CALL && e.timestamp == new),
+        "tool call survives the ephemeral sweep"
+    );
+}
+
+/// Chunked deletion completes: seeding more old tool-call rows than
+/// `RETENTION_DELETE_CHUNK` still sweeps them all in a single call (the
+/// chunk loop keeps going until a short chunk), and newer rows survive.
+#[tokio::test]
+async fn retention_sweep_chunked_deletion_completes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let total_old = crate::event_repo::RETENTION_DELETE_CHUNK as usize * 2 + 50;
+    let mut seed: Vec<NewEvent> = (0..total_old)
+        .map(|_| typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()))
+        .collect();
+    seed.push(typed_event(
+        &ws,
+        new,
+        events::AGENT_TOOL_CALL,
+        agent.clone(),
+    ));
+    for batch in seed.chunks(500) {
+        store.insert_events(batch).await.expect("insert batch");
+    }
+
+    let removed = store
+        .delete_tool_call_events_before("2026-03-01T00:00:00Z")
+        .await
+        .expect("chunked sweep");
+    assert_eq!(removed, total_old as u64, "all old chunks swept");
+
+    let remaining = store
+        .events_by_type(&ws, events::AGENT_TOOL_CALL, 10)
+        .await
+        .expect("remaining");
+    assert_eq!(remaining.len(), 1, "only the new tool call survives");
+    assert_eq!(remaining[0].timestamp, new);
+}
+
+/// The retention DELETEs must be index-driven (no full table scan): the inner
+/// row-selection of both the prefix-family and exact-type shapes uses the
+/// composite `idx_event_type_time` index (migration 0051).
+#[tokio::test]
+async fn retention_delete_query_plan_uses_index() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let prefix_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN DELETE FROM event WHERE rowid IN (
+            SELECT rowid FROM event
+            WHERE event_type >= ? AND event_type < ? AND timestamp < ?
+            LIMIT ?
+        )",
+    )
+    .bind("agent:stream:")
+    .bind("agent:stream;")
+    .bind("2026-01-01T00:00:00Z")
+    .bind(1000_i64)
+    .fetch_all(store.read_pool())
+    .await
+    .expect("explain prefix delete");
+
+    let exact_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN DELETE FROM event WHERE rowid IN (
+            SELECT rowid FROM event
+            WHERE event_type = ? AND timestamp < ?
+            LIMIT ?
+        )",
+    )
+    .bind("agent:tool:call")
+    .bind("2026-01-01T00:00:00Z")
+    .bind(1000_i64)
+    .fetch_all(store.read_pool())
+    .await
+    .expect("explain exact delete");
+
+    for (name, plan) in [("prefix", &prefix_plan), ("exact", &exact_plan)] {
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            details.iter().any(|d| d.contains("idx_event_type_time")),
+            "{name} plan should use idx_event_type_time: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.trim() == "SCAN event"),
+            "{name} plan must not full-scan the event table: {details:?}"
+        );
+    }
 }
 
 fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {

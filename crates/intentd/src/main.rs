@@ -1918,10 +1918,18 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
+/// Fixed TTL for persisted `agent:tool:call` events, swept on the same tick as
+/// the ephemeral families. Tool calls are the dominant share of the event
+/// table (87% of live data on the dev seat) and no consumer reads them beyond
+/// bounded recent windows — replay uses `agent_message`, live streaming uses
+/// the in-memory bus — so 24h is comfortably conservative.
+const TOOL_CALL_RETENTION_HOURS: u32 = 24;
+
 /// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
 /// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
 /// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-/// `host:exec:*`) older than the TTL while preserving lifecycle/tool/note/task/
+/// `host:exec:*`) older than the TTL, plus `agent:tool:call` events older than
+/// [`TOOL_CALL_RETENTION_HOURS`], while preserving lifecycle/note/task/
 /// workspace events. The sweep interval is derived from the TTL (≈4×/TTL),
 /// clamped so long TTLs still sweep periodically and short ones do not busy-loop.
 /// A failed sweep is logged and retried on the next tick (never aborts the loop).
@@ -1937,8 +1945,9 @@ fn spawn_stream_retention_loop(
     let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
     tracing::info!(
         ttl_hours = stream_retention_hours,
+        tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
         interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*)"
+        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, agent:tool:call)"
     );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -1956,6 +1965,18 @@ fn spawn_stream_retention_loop(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
+            }
+            let tool_cutoff = intent_core::iso_minutes_ago(TOOL_CALL_RETENTION_HOURS as i64 * 60);
+            match store.delete_tool_call_events_before(&tool_cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(
+                        removed,
+                        cutoff = tool_cutoff,
+                        "event retention sweep trimmed agent:tool:call events"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
             }
         }
     }))
