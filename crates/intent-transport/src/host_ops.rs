@@ -96,7 +96,7 @@ fn resolve_binary_path_with_home(
     resolve_binary_path_with_tool_dirs(
         name,
         common_paths,
-        &path_utils::enriched_tool_dirs_with_home(Some(home.to_path_buf())),
+        &path_utils::enriched_tool_dirs_with_home(Some(home)),
     )
 }
 

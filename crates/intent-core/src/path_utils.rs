@@ -283,20 +283,20 @@ pub fn enhanced_path_dirs() -> Vec<PathBuf> {
 /// provider-binary dir and ~/.augment/bin for auggie, then these enriched dirs,
 /// then inherited PATH last).
 pub fn enriched_tool_dirs() -> Vec<PathBuf> {
-    enriched_tool_dirs_with_home(home_dir())
+    enriched_tool_dirs_with_home(home_dir().as_deref())
 }
 
 /// Variant of [`enriched_tool_dirs`] with the home directory injected instead
 /// of resolved from the environment. Lets tests point the user-local tool
 /// directories (`~/.local/bin`, `~/.nvm`, …) at a scratch home without
 /// mutating process-global `HOME`, which races parallel tests.
-pub fn enriched_tool_dirs_with_home(home: Option<PathBuf>) -> Vec<PathBuf> {
+pub fn enriched_tool_dirs_with_home(home: Option<&std::path::Path>) -> Vec<PathBuf> {
     enriched_tool_dirs_impl(home, login_shell_dirs)
 }
 
 /// Injectable core - accepts the home directory and a function that returns
 /// login-shell dirs, so tests can avoid spawning the real shell.
-fn enriched_tool_dirs_impl<F>(home: Option<PathBuf>, login_dirs_fn: F) -> Vec<PathBuf>
+fn enriched_tool_dirs_impl<F>(home: Option<&std::path::Path>, login_dirs_fn: F) -> Vec<PathBuf>
 where
     F: FnOnce() -> &'static [PathBuf],
 {
@@ -307,7 +307,7 @@ where
         if let Some(appdata) = std::env::var_os("APPDATA") {
             push_dir(&mut dirs, &mut seen, PathBuf::from(&appdata).join("npm"));
         }
-        if let Some(home) = &home {
+        if let Some(home) = home {
             push_dir(&mut dirs, &mut seen, home.join(".npm-global"));
         }
     } else {
@@ -326,7 +326,7 @@ where
         }
 
         // Add user-local tool directories
-        if let Some(home) = &home {
+        if let Some(home) = home {
             for sub in [
                 [".npm-global", "bin"],
                 [".npm-packages", "bin"],
@@ -340,7 +340,7 @@ where
     }
 
     // Add all nvm-managed node versions
-    if let Some(home) = &home {
+    if let Some(home) = home {
         let nvm_dir = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
             for entry in entries.flatten() {
@@ -527,7 +527,7 @@ mod tests {
             ]
         });
 
-        let dirs = enriched_tool_dirs_impl(home_dir(), || &FAKE_LOGIN_DIRS);
+        let dirs = enriched_tool_dirs_impl(home_dir().as_deref(), || &FAKE_LOGIN_DIRS);
 
         // Verify the fake login-shell dirs actually appear in the result
         assert!(
