@@ -117,8 +117,7 @@ enum Command {
         /// Print the per-workspace plan without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Re-run even when the completion marker is already set, and update
-        /// rows whose workspace id already exists instead of skipping.
+        /// Update rows whose workspace id already exists instead of skipping.
         #[arg(long)]
         force: bool,
     },
@@ -328,11 +327,10 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
 
 /// Import legacy per-directory Intent workspaces into the configured SQLite
 /// store. `--root` (repeatable) narrows the scan to explicit directories
-/// (each must exist); otherwise the default legacy roots are scanned. When
-/// the completion marker is already set, the run is skipped unless `--force`
-/// or `--dry-run` is passed. A non-dry-run run always ends by rewriting the
-/// marker — even when every workspace was skipped or failed softly (the run
-/// itself "completed"; `--force` re-runs to retry problem workspaces).
+/// (each must exist); otherwise the default legacy roots are scanned. The
+/// first-boot completion marker does not gate explicit CLI runs. A
+/// non-dry-run run without manifest compatibility failures rewrites the marker;
+/// `--force` only controls whether existing workspace rows are updated.
 /// Per-workspace problems are soft (reported, exit 0); only an unusable
 /// explicit `--root` or a store-open failure exits non-zero. A dry-run
 /// against a not-yet-created DB removes the freshly created DB file
@@ -370,21 +368,6 @@ async fn cmd_import_legacy(
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // Marker gate: a completed import is not repeated unless forced. Dry-run
-    // stays allowed (it writes nothing, so previewing is always safe).
-    if !dry_run && !force {
-        if let Some(at) = store
-            .get_setting(legacy_import::LEGACY_IMPORT_MARKER_KEY)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        {
-            println!(
-                "legacy import already completed at {at}; use --force to re-run \
-                 or --dry-run to preview"
-            );
-            return Ok(());
-        }
-    }
     let report = legacy_import::run(
         &store,
         &legacy_import::Options {
@@ -398,16 +381,18 @@ async fn cmd_import_legacy(
     .await?;
     println!("{report}");
     if !dry_run {
-        // Marker write failure is a warning, not a command failure — the
-        // import itself completed (mirrors the first-boot hook in `serve`).
-        // Without the marker a later run/first-boot may re-import, which is
-        // safe: the import is idempotent.
-        if let Err(e) = legacy_import::write_completion_marker(&store).await {
-            eprintln!(
-                "warning: import completed but the completion marker could not \
-                 be written ({e}); a later run or first boot may re-import \
-                 (idempotent, existing rows are skipped)"
-            );
+        if !report.has_compatibility_failures() {
+            // Marker write failure is a warning, not a command failure — the
+            // import itself completed (mirrors the first-boot hook in `serve`).
+            // Without the marker a later run/first-boot may re-import, which is
+            // safe: the import is idempotent.
+            if let Err(e) = legacy_import::write_completion_marker(&store).await {
+                eprintln!(
+                    "warning: import completed but the completion marker could not \
+                     be written ({e}); a later run or first boot may re-import \
+                     (idempotent, existing rows are skipped)"
+                );
+            }
         }
     } else if !db_existed {
         // Dry-run on a fresh install: don't leave behind the DB file that
@@ -666,8 +651,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
+    let legacy_import_store = store.clone();
+    let assets_root = config.data_dir.join("assets");
     let services = Services::new(store)
-        .with_assets_root(config.data_dir.join("assets"))
+        .with_assets_root(assets_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(config.data_dir.clone())
         .with_event_bus(bus.clone())
@@ -928,6 +915,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
         proc_usage,
+        legacy_import_store,
+        legacy_import_assets_root: assets_root,
+        legacy_import_lock: tokio::sync::Mutex::new(()),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -1146,8 +1136,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     Ok(())
 }
 
-/// Live daemon control surface backing `system.status` / `system.shutdown`
-/// (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
+/// Live daemon control surface backing `system.status`, `system.shutdown`, and
+/// `system.importLegacy` (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
 /// resolved WSS `port`/`fingerprint` are real (not guessed); `client_count`/agent
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
@@ -1163,6 +1153,11 @@ struct DaemonControl {
     start_time: std::time::Instant,
     /// Latest own-process CPU/memory sample from the background sampler.
     proc_usage: Arc<ProcUsage>,
+    /// Live store and asset destination shared with Services for legacy import.
+    legacy_import_store: Store,
+    legacy_import_assets_root: PathBuf,
+    /// Prevent overlapping import runs from racing workspace inserts/copies.
+    legacy_import_lock: tokio::sync::Mutex<()>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -1342,6 +1337,64 @@ impl SystemControl for DaemonControl {
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
+    }
+
+    fn import_legacy(
+        &self,
+        force: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let _guard = self.legacy_import_lock.lock().await;
+            let report = legacy_import::run(
+                &self.legacy_import_store,
+                &legacy_import::Options {
+                    roots: legacy_import::default_roots(),
+                    dry_run: false,
+                    force,
+                    assets_root: Some(self.legacy_import_assets_root.clone()),
+                    app_dir: legacy_import::default_app_dir(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let compatibility_failures = report.has_compatibility_failures();
+            let marker_written = if compatibility_failures {
+                false
+            } else {
+                match legacy_import::write_completion_marker(&self.legacy_import_store).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "legacy import RPC marker write failed");
+                        false
+                    }
+                }
+            };
+            let skip_summary: Vec<Value> = report
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.outcome {
+                    legacy_import::Outcome::Skipped(reason) => {
+                        Some(json!({ "id": &entry.id, "reason": reason }))
+                    }
+                    _ => None,
+                })
+                .take(20)
+                .collect();
+            Ok(json!({
+                "imported": report.imported(),
+                "updated": report.updated(),
+                "skipped": report.skipped(),
+                "notes": report.notes_imported(),
+                "comments": report.comments_imported(),
+                "agents": report.agent_sessions_imported(),
+                "assets": report.assets_imported(),
+                "skipSummary": skip_summary,
+                "compatibilityFailures": compatibility_failures,
+                "markerWritten": marker_written,
+            }))
+        })
     }
 }
 

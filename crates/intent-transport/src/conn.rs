@@ -142,9 +142,13 @@ pub(crate) async fn process_frame(
         let (rpc_id, method) = panic_guard::request_identity(value);
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
-                let frame = panic_guard::guard_frame_sync(&method, rpc_id.clone(), || {
-                    control::handle(req, control.as_ref(), is_local)
-                });
+                let is_uds = !crate::context::is_tcp_connection();
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    control::handle(req, control.as_ref(), is_local, is_uds),
+                )
+                .await;
                 return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,
