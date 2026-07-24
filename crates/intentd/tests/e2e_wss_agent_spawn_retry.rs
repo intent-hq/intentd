@@ -317,14 +317,15 @@ async fn agent_spawn_retry_session_new_stall_over_wss() {
         "response": "retry succeeded",
     })
     .to_string();
-    // Fast retry: 500ms timeout + 100ms,200ms backoff for fast e2e
-    let env: [(&str, &str); 7] = [
+    // Fast retry: 500ms timeouts + 100ms,200ms backoff for fast e2e
+    let env: [(&str, &str); 8] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
         ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -438,13 +439,14 @@ async fn agent_spawn_retry_stdout_closed_over_wss() {
         "response": "retry succeeded after exit",
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 8] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
         ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -551,13 +553,14 @@ async fn agent_spawn_exhaustion_terminal_failure_over_wss() {
         "ignoreSessionNewAttempts": 999,
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 8] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
         ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -675,13 +678,14 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         "response": "retry recovery succeeded",
     })
     .to_string();
-    let env: [(&str, &str); 7] = [
+    let env: [(&str, &str); 8] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
         ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "500"),
+        ("INTENTD_ACP_INITIALIZE_TIMEOUT_MS", "500"),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -877,4 +881,116 @@ async fn agent_retry_rpc_recovery_path_over_wss() {
         retry_again["ok"], false,
         "agent.retry on non-error agent returns ok:false"
     );
+}
+
+/// INIT-TIMEOUT (monorepo#616): a slow-to-initialize agent succeeds on the
+/// FIRST attempt under the default 30s `initialize` timeout. The mock delays
+/// its `initialize` reply by 6s — longer than the old hard-coded 5s
+/// per-request timeout that made cold starts fail spuriously under host load —
+/// and the turn must complete without any spawn retry.
+#[tokio::test]
+async fn agent_spawn_slow_initialize_succeeds_over_wss() {
+    let Some(script) = gate("WSS slow initialize E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "initializeDelayMs": 6000,
+        "response": "slow initialize succeeded",
+    })
+    .to_string();
+    // No INTENTD_ACP_INITIALIZE_TIMEOUT_MS: exercise the 30s default, which
+    // must tolerate the 6s initialize delay without a handshake timeout.
+    let env: [(&str, &str); 5] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-SLOW-INIT", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "trigger slow initialize" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The turn completes (chunk + end) with NO retry hints and NO failure —
+    // the single spawn attempt rode out the 6s initialize delay.
+    let mut retry_hints = Vec::new();
+    let mut chunks = 0u32;
+    let mut ends = 0u32;
+    for _ in 0..100 {
+        let frame = wss_event(&mut sub, 30).await;
+        match frame["params"]["event"]["type"].as_str() {
+            Some("agent:stream:status") => {
+                let msg = frame["params"]["event"]["data"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                if msg.contains("retry") || msg.contains("attempt") {
+                    retry_hints.push(msg);
+                }
+            }
+            Some("agent:failed") => {
+                panic!("agent:failed on slow initialize — handshake timeout regressed: {frame}");
+            }
+            Some("agent:stream:chunk") => chunks += 1,
+            Some("agent:stream:end") => {
+                ends += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        retry_hints.is_empty(),
+        "slow initialize must succeed on the first attempt, saw retry hints: {retry_hints:?}"
+    );
+    assert!(chunks >= 1, "at least one agent:stream:chunk over WSS");
+    assert_eq!(ends, 1, "exactly one terminal agent:stream:end over WSS");
 }
