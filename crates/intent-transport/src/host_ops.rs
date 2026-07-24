@@ -484,9 +484,11 @@ pub(crate) fn build_env_json(
 /// [`build_env_json`] for the secret-safety contract (names only, no values).
 /// The login shell comes from the shared [`path_utils::login_shell`] resolver
 /// (`SHELL` env → user database → `/bin/zsh` on macOS), so the reported shell
-/// always matches the one login-shell PATH enrichment uses; when no shell can
-/// be resolved (Windows, or non-macOS unix without a user-db entry) the field
-/// is empty and enrichment is skipped.
+/// always matches the one login-shell PATH enrichment uses. A set `SHELL` env
+/// var is honoured on every platform, including Windows (e.g. MSYS/Git Bash),
+/// as it was before the resolvers were unified; when no shell can be resolved
+/// (Windows without `SHELL`, or non-macOS unix without a user-db entry) the
+/// field is empty and enrichment is skipped.
 pub(crate) fn env_probe() -> Value {
     let raw_path = std::env::var("PATH").unwrap_or_default();
     let shell = path_utils::login_shell().unwrap_or_default();

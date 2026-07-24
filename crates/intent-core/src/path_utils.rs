@@ -60,10 +60,16 @@ fn capture_login_shell_path_with(shell: Option<&str>) -> Vec<PathBuf> {
 /// login-shell PATH capture in this module and the `host.env` probe consume
 /// it, so the reported shell and the enrichment shell always agree.
 pub fn login_shell() -> Option<String> {
-    resolve_login_shell(
-        std::env::var_os("SHELL").as_deref(),
-        user_db_shell().as_deref(),
-    )
+    let env_shell = std::env::var_os("SHELL");
+    let env_shell = env_shell.as_deref().filter(|shell| !shell.is_empty());
+    // Only pay for the user-db lookup (a potential NSS/LDAP round-trip) when
+    // the env var is missing or empty.
+    let user_db = if env_shell.is_some() {
+        None
+    } else {
+        user_db_shell()
+    };
+    resolve_login_shell(env_shell, user_db.as_deref())
 }
 
 /// Pure resolution core for [`login_shell`], injectable for tests.
@@ -108,11 +114,12 @@ fn user_db_shell() -> Option<String> {
         if rc != 0 || result.is_null() {
             return None;
         }
-        let pw_shell = unsafe { (*result).pw_shell };
-        if pw_shell.is_null() {
+        // On success `result` points at `pwd`, which getpwuid_r filled in, so
+        // read the field from `pwd` rather than dereferencing the raw pointer.
+        if pwd.pw_shell.is_null() {
             return None;
         }
-        let shell = unsafe { CStr::from_ptr(pw_shell) };
+        let shell = unsafe { CStr::from_ptr(pwd.pw_shell) };
         return shell
             .to_str()
             .ok()
