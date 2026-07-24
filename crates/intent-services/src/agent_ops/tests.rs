@@ -8931,6 +8931,188 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     assert_eq!(deleted_ids, expected, "one agent:deleted per session");
 }
 
+/// monorepo#463 regression: a chief parent's oneShot watch on a child in the
+/// deleted workspace must be consumed by `workspace.delete` itself — the
+/// `agent:deleted` bus publish is best-effort (a `None` bus is a quiet no-op),
+/// so with no bus wired the delete path must deliver the deleted-completion
+/// directly. Exactly one wake reaches the chief parent, the watch is gone from
+/// the registry (memory + persisted row), and a later bus-loop reprocessing of
+/// the same event delivers nothing (no duplicate wake).
+#[tokio::test]
+async fn delete_workspace_consumes_chief_oneshot_watch_without_bus() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    // Durable registration: the row is committed before the delete below, so
+    // the persisted-row assertion cannot race the spawned best-effort upsert.
+    svc.register_completion_watch_durable(
+        &chief_ws,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        true,
+        None,
+    )
+    .await
+    .expect("chief cross-workspace watch is allowed");
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The watch is consumed synchronously — no bus is wired, so nothing else
+    // could have delivered it.
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+
+    // Exactly one deleted-completion wake reached the chief parent.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session survives the delete");
+    assert_eq!(parent_session.messages.len(), 1);
+
+    // The persisted completion_watch row is swept (delete is spawned; poll).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("list watches");
+        if rows.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "persisted completion_watch rows not swept: {rows:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A bus-loop reprocessing of the same `agent:deleted` (when a bus IS
+    // wired) finds no watch and delivers no second wake.
+    let event = completion_event(&ws, AGENT_DELETED, &child, json!({ "agentId": child.0 }));
+    svc.handle_completion_event(&event).await;
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1, "duplicate wake delivered");
+}
+
+/// monorepo#463 regression: a chief-anchored after_all group expecting a child
+/// in the deleted workspace records that child in `deleted_agent_ids` at
+/// delete time (no bus wired, no restart needed), and the grouped watch no
+/// longer references the deleted workspace as its child side.
+#[tokio::test]
+async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&chief_ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &chief_ws,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        false,
+        Some(gid.clone()),
+    )
+    .expect("chief grouped watch");
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The group survives (anchored at chief, still unsealed) and the child is
+    // already recorded as deleted — the fan-in can settle once sealed.
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("chief-anchored group survives the delete");
+    assert_eq!(group.deleted_agent_ids, vec![child.clone()]);
+
+    // Backstop: no surviving watch references the deleted workspace as child.
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(svc.all_watches(&ws).is_empty());
+}
+
+/// The workspace-delete sweep stays scoped: watches parented in the deleted
+/// workspace and groups anchored there are still dropped, while watches and
+/// groups that live entirely in another workspace are untouched.
+#[tokio::test]
+async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
+    let (_t, svc, ws_a) = setup().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+
+    // Doomed: watch parented in A on a child in A, group anchored in A.
+    let parent_a = create_agent(&svc, &ws_a, "ParentA").await;
+    let child_a = create_agent(&svc, &ws_a, "ChildA").await;
+    svc.register_completion_watch(
+        &ws_a,
+        &ws_a,
+        parent_a.clone(),
+        "ParentA".into(),
+        child_a.clone(),
+        true,
+        None,
+    )
+    .expect("ws-a watch");
+    let gid_a = svc.get_or_create_delegation_group(&ws_a, &parent_a);
+    svc.enroll_child_in_group(&gid_a, &child_a);
+
+    // Unrelated: watch parented in B on a child in B, group anchored in B.
+    let parent_b = create_agent(&svc, &ws_b, "ParentB").await;
+    let child_b = create_agent(&svc, &ws_b, "ChildB").await;
+    svc.register_completion_watch(
+        &ws_b,
+        &ws_b,
+        parent_b.clone(),
+        "ParentB".into(),
+        child_b.clone(),
+        true,
+        None,
+    )
+    .expect("ws-b watch");
+    let gid_b = svc.get_or_create_delegation_group(&ws_b, &parent_b);
+    svc.enroll_child_in_group(&gid_b, &child_b);
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws_a.clone())
+        .await
+        .expect("delete workspace A");
+
+    // A's entries are gone; the A parent got no wake destination so no
+    // residual watch survives under either anchor.
+    assert!(svc.all_watches(&ws_a).is_empty());
+    assert!(svc.list_watches_for_parent(&parent_a).is_empty());
+    assert!(svc.delegation_group_for_parent(&parent_a).is_none());
+
+    // B's entries are untouched.
+    assert_eq!(svc.find_watches_for_child(&child_b).len(), 1);
+    let group_b = svc
+        .delegation_group_for_parent(&parent_b)
+        .expect("ws-b group untouched");
+    assert_eq!(group_b.group_id, gid_b);
+    assert!(group_b.deleted_agent_ids.is_empty());
+}
+
 /// When a delegated agent starts a new turn after persisting a completion
 /// report, the store clears `completion_report` + `completion_report_timestamp`
 /// and returns `true`. A subsequent `agent.get` shows no report in metadata.

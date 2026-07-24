@@ -7963,6 +7963,9 @@ impl WorkspaceApi for Services {
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
+        // Full handle for the direct completion delivery below (Services is
+        // Clone — the same capture pattern the spawn helpers use).
+        let services = self.clone();
         Box::pin(async move {
             // Chief is virtual and never appears in `workspace.list`; delete is
             // a no-op success (TS `workspace.repository.delete` / virtual-guard
@@ -8043,6 +8046,60 @@ impl WorkspaceApi for Services {
                     },
                 )
                 .await;
+            }
+            // Deterministic cross-workspace consumption (monorepo#463): the
+            // publishes above are best-effort (`None` bus, logged-and-skipped
+            // delivery failures), so a chief parent's watch on a child here
+            // could otherwise leak forever (no cleanup deadline on oneShot
+            // watches) and a chief-anchored after_all group would stay
+            // incomplete until restart. Deliver the same synthetic
+            // `agent:deleted` directly, BEFORE the store cascade drops the
+            // session rows (grouped delivery still resolves the child's
+            // completion report). The remove-before-deliver guard in
+            // `deliver_completion_to_watches` makes the bus loop's later
+            // processing of the published event a no-op — no duplicate wake —
+            // and `record_group_child_completion` is idempotent.
+            for session in &sessions {
+                let event = Event {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    workspace_id: id.clone(),
+                    timestamp: now_iso(),
+                    event_type: AGENT_DELETED.to_string(),
+                    actor: system_actor(),
+                    session_id: Some(session.id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: serde_json::json!({ "agentId": session.id.0 }),
+                };
+                services
+                    .deliver_completion_to_watches(&session.id, &event)
+                    .await;
+            }
+            // Backstop sweep: grouped watches survive delivery (group
+            // settlement owns their lifecycle) and a racing registration can
+            // land behind the loop above — after this point no watch may
+            // reference the deleted workspace as its child side. In-memory
+            // retain + best-effort delete of the persisted rows.
+            let leaked: Vec<String> = {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut leaked = Vec::new();
+                registry.subscriptions.retain(|s| {
+                    if s.child_workspace_id == id {
+                        leaked.push(s.id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                leaked
+            };
+            for watch_id in &leaked {
+                if let Err(e) = store.delete_completion_watch(watch_id).await {
+                    tracing::warn!("completion_watch delete failed {watch_id}: {e}");
+                }
             }
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
