@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5] - 2026-07-24
+
+### 🐛 Bug Fixes
+
+- Reject bare-model/provider mismatch at agent creation and setModel ([#425](https://github.com/intent-hq/intentd/pull/425))
+- Lift proposals when the provider collapses raw_output ([#427](https://github.com/intent-hq/intentd/pull/427))
+
+### 🧪 Testing
+
+- Deflake graceful_shutdown_allows_immediate_restart port contention (monorepo#466) ([#429](https://github.com/intent-hq/intentd/pull/429))
+
+
 ## [0.2.4] - 2026-07-24
 
 ### 🚀 Features
