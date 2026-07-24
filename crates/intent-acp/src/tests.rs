@@ -4629,6 +4629,7 @@ mod wsapi3_bindings_tests {
             comment: String,
             _kind: Option<String>,
             _author: Option<String>,
+            _author_type: Option<String>,
             _suggestion_original: Option<String>,
             _suggestion_proposed: Option<String>,
         ) -> BoxFuture<'_, Result<CommentRespondResult>> {

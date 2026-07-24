@@ -10763,6 +10763,7 @@ impl WorkspaceApi for Services {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        author_type: Option<String>,
         suggestion_original: Option<String>,
         suggestion_proposed: Option<String>,
     ) -> BoxFuture<'_, Result<CommentRespondResult>> {
@@ -10779,6 +10780,18 @@ impl WorkspaceApi for Services {
                     "Comment text is required and must be non-empty".to_string(),
                 ));
             }
+            // Default `agent` keeps backward compatibility with
+            // agent/MCP callers that predate the param (parity with
+            // `comment.add`'s authorType validation).
+            let author_type = match author_type.as_deref() {
+                None | Some("agent") => AuthorType::Agent,
+                Some("user") => AuthorType::User,
+                Some(other) => {
+                    return Err(Error::InvalidParams(format!(
+                        "Invalid 'authorType': {other}. Must be 'user' or 'agent'."
+                    )))
+                }
+            };
             let kind_parsed = parse_comment_type(kind.as_deref());
             if kind_parsed == CommentType::Suggestion
                 && (suggestion_original.is_none() || suggestion_proposed.is_none())
@@ -10824,8 +10837,14 @@ impl WorkspaceApi for Services {
                 note_id: Some(note_id.clone()),
                 kind: kind_parsed,
                 content: comment,
-                author: author.unwrap_or_else(|| "Agent".to_string()),
-                author_type: AuthorType::Agent,
+                author: author.unwrap_or_else(|| {
+                    match author_type {
+                        AuthorType::User => "User",
+                        AuthorType::Agent => "Agent",
+                    }
+                    .to_string()
+                }),
+                author_type,
                 status: CommentStatus::Open,
                 parent_id: Some(parent.id.clone()),
                 anchor: parent.anchor.clone(),

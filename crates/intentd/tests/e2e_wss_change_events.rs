@@ -1564,3 +1564,122 @@ async fn comment_add_author_type_round_trips_over_wss() {
     .await;
     assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
 }
+
+/// End-to-end: `comment.respond` with `authorType: "user"` persists the
+/// author type and round-trips it through `comment.getThread`; omitting the
+/// param keeps the backward-compatible `agent` default.
+#[tokio::test]
+async fn comment_respond_author_type_round_trips_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "RespondAuthorType", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "alpha reply-target omega" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "alpha reply-target omega",
+            "commentTarget": "reply-target",
+            "comment": "root",
+        }),
+    )
+    .await;
+    let root_id = add["commentId"].as_str().expect("id").to_string();
+
+    let user_reply = wss_rpc(
+        &mut rpc,
+        2,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "hi from the user",
+            "authorType": "user",
+        }),
+    )
+    .await;
+    let user_reply_id = user_reply["comment"]["id"]
+        .as_str()
+        .expect("reply id")
+        .to_string();
+
+    let agent_reply = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "hi from an agent",
+        }),
+    )
+    .await;
+    let agent_reply_id = agent_reply["comment"]["id"]
+        .as_str()
+        .expect("reply id")
+        .to_string();
+
+    let thread = wss_rpc(
+        &mut rpc,
+        4,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "commentId": root_id }),
+    )
+    .await;
+    let replies = thread["replies"].as_array().expect("replies");
+    let by_id = |id: &str| {
+        replies
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap_or_else(|| panic!("reply {id} missing: {thread}"))
+    };
+    let user = by_id(&user_reply_id);
+    assert_eq!(user["authorType"], json!("user"), "{user}");
+    assert_eq!(user["author"], json!("User"), "{user}");
+    let agent = by_id(&agent_reply_id);
+    assert_eq!(agent["authorType"], json!("agent"), "{agent}");
+    assert_eq!(agent["author"], json!("Agent"), "{agent}");
+
+    // Invalid authorType is rejected with -32602.
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "c",
+            "authorType": "robot",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+}

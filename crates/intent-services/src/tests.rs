@@ -2069,6 +2069,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "please change".into(),
             Some("suggestion".into()),
             None,
+            None,
             Some("only-original".into()),
             None,
         )
@@ -2084,6 +2085,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "please change".into(),
             Some("suggestion".into()),
             Some("Bob".into()),
+            None,
             Some("old text".into()),
             Some("new text".into()),
         )
@@ -2112,6 +2114,83 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
     assert!(del.success);
 }
 
+/// `comment.respond` persists the optional `authorType` (defaulting `author`
+/// to `"User"` / `"Agent"` when absent) and rejects invalid values with
+/// `InvalidParams`, mirroring `comment.add`'s validation.
+#[tokio::test]
+async fn comment_respond_author_type_persists_and_validates() {
+    use intent_core::AuthorType;
+
+    let (_tmp, svc, ws, id) = setup("alpha reply-target omega").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha reply-target omega".into(),
+            "reply-target".into(),
+            "root".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+
+    let user_reply = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "hi".into(),
+            None,
+            None,
+            Some("user".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("user respond");
+    assert_eq!(user_reply.comment.author_type, AuthorType::User);
+    assert_eq!(user_reply.comment.author, "User");
+
+    let agent_reply = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "on it".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("agent respond");
+    assert_eq!(agent_reply.comment.author_type, AuthorType::Agent);
+    assert_eq!(agent_reply.comment.author, "Agent");
+
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id),
+            "bad".into(),
+            None,
+            None,
+            Some("robot".into()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("invalid authorType must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+}
+
 #[tokio::test]
 async fn comment_resolve_thread_marks_and_reopens() {
     let (_tmp, svc, ws, id) = setup("alpha resolve-target omega").await;
@@ -2136,6 +2215,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
         Some(added.comment_id.clone()),
         None,
         "a reply".into(),
+        None,
         None,
         None,
         None,
@@ -2372,6 +2452,7 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
             None,
             Some(seeded_a.id.clone()),
             "leaked reply".into(),
+            None,
             None,
             None,
             None,
@@ -3180,6 +3261,7 @@ mod change_event_parity {
                 None,
                 Some(added.comment_id.clone()),
                 "reply body".to_string(),
+                None,
                 None,
                 None,
                 None,

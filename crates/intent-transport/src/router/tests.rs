@@ -522,6 +522,7 @@ impl WorkspaceApi for FakeApi {
         _comment: String,
         _kind: Option<String>,
         _author: Option<String>,
+        _author_type: Option<String>,
         suggestion_original: Option<String>,
         suggestion_proposed: Option<String>,
     ) -> BoxFuture<'_, Result<CommentRespondResult>> {
