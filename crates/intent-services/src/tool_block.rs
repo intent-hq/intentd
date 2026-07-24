@@ -438,13 +438,16 @@ mod tests {
 
     /// Hard-wrap every line of `text` at `col` characters by inserting raw
     /// newlines, reproducing auggie's column-wrapped echo of collapsed tool
-    /// output (wraps land mid-word, inside JSON string literals).
+    /// output (wraps land mid-word, inside JSON string literals). Chunks by
+    /// chars so non-ASCII fixture data can't split a multi-byte sequence.
     fn column_wrap(text: &str, col: usize) -> String {
         text.lines()
             .flat_map(|line| {
-                line.as_bytes()
+                line.chars()
+                    .collect::<Vec<_>>()
                     .chunks(col)
-                    .map(|c| std::str::from_utf8(c).unwrap())
+                    .map(|c| c.iter().collect::<String>())
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -538,7 +541,8 @@ mod tests {
         // parse; the lift must still decline.
         let proposal = long_proposal();
         let wrapped = wrapped_collapsed_text(&proposal);
-        let truncated = &wrapped[..wrapped.len() - 40];
+        let cut = wrapped.char_indices().rev().nth(39).map_or(0, |(i, _)| i);
+        let truncated = &wrapped[..cut];
         assert!(lift_proposal_resource(&json!({ "output": truncated })).is_none());
         // Structural corruption outside strings (unquoted garbage) as well.
         let garbage = "{\"ok\": true, \"proposal\": not json at\nall}";
