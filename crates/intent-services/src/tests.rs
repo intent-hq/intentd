@@ -2370,7 +2370,119 @@ async fn comment_resolve_thread_requires_thread_or_comment_id() {
         .comment_resolve_thread(ws, id, None, None, true)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Internal(ref m) if m.contains("Either threadId or commentId")));
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Either threadId or commentId")),
+        "got: {err:?}"
+    );
+}
+
+/// `comment.getThread` / `comment.resolveThread`'s missing
+/// `threadId`/`commentId` validation and `comment.list`'s filter validations
+/// (`since`, `authorType`, `status`) are caller-input errors and return
+/// `InvalidParams` (-32602) like `comment.add`/`comment.respond`, not
+/// `Internal` (-32603) (monorepo#649). Lookup failures (unknown
+/// commentId/threadId) keep their existing `Internal` semantics.
+#[tokio::test]
+async fn comment_get_thread_and_resolve_caller_input_errors_are_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("alpha lookup-target omega").await;
+
+    // getThread: missing threadId AND commentId.
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), None, None)
+        .await
+        .expect_err("getThread without threadId/commentId must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Either threadId or commentId")),
+        "got: {err:?}"
+    );
+
+    // list: invalid `since` / `authorType` / `status` filters.
+    let err = svc
+        .comment_list(
+            ws.clone(),
+            id.clone(),
+            Some("not-a-timestamp".into()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("invalid since must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Invalid 'since'")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_list(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some("robot".into()),
+            None,
+            false,
+        )
+        .await
+        .expect_err("invalid authorType must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Invalid 'authorType'")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_list(
+            ws.clone(),
+            id.clone(),
+            None,
+            None,
+            Some("closed".into()),
+            false,
+        )
+        .await
+        .expect_err("invalid status must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Invalid 'status'")),
+        "got: {err:?}"
+    );
+
+    // Lookup failures stay Internal: unknown commentId / threadId on
+    // getThread/resolveThread.
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), None, Some("comment-missing".into()))
+        .await
+        .expect_err("unknown commentId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Comment not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_resolve_thread(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some("comment-missing".into()),
+            true,
+        )
+        .await
+        .expect_err("unknown commentId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Comment not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), Some("thread-missing".into()), None)
+        .await
+        .expect_err("unknown threadId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Thread not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_resolve_thread(ws, id, Some("thread-missing".into()), None, true)
+        .await
+        .expect_err("unknown threadId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Thread not found")),
+        "got: {err:?}"
+    );
 }
 
 /// Cross-workspace bare-id probes must not delete a comment that lives in a
