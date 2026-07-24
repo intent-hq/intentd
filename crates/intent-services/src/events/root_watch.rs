@@ -119,9 +119,15 @@ async fn promote_loop(
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
     loop {
         if root.exists() {
-            if let Ok(watcher) = recursive_watcher(&root, filename_matches, Arc::clone(&on_change))
-            {
-                store(&inner, watcher, root.clone(), true);
+            match recursive_watcher(&root, filename_matches, Arc::clone(&on_change)) {
+                Ok(watcher) => store(&inner, watcher, root.clone(), true),
+                Err(e) => {
+                    tracing::warn!(
+                        root = %root.display(),
+                        error = %e,
+                        "recursive watch on newly created root failed; leaving stale ancestor watch"
+                    );
+                }
             }
             // Files may have landed inside the root before the recursive
             // watch was established (mkdir -p + immediate writes, or a whole
@@ -138,11 +144,24 @@ async fn promote_loop(
                 let _ = tx.send(());
             }
         });
-        let Ok(mut watcher) = watcher else { return };
-        if watcher
-            .watch(&ancestor, RecursiveMode::NonRecursive)
-            .is_err()
-        {
+        let mut watcher = match watcher {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "ancestor watcher creation failed; root creation will not be detected"
+                );
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(&ancestor, RecursiveMode::NonRecursive) {
+            tracing::warn!(
+                root = %root.display(),
+                ancestor = %ancestor.display(),
+                error = %e,
+                "ancestor watch failed; root creation will not be detected"
+            );
             return;
         }
         store(&inner, watcher, ancestor.clone(), false);

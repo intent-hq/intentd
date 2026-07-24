@@ -2,9 +2,10 @@
 //!
 //! [`WatcherRegistry`] is the single registration path for all three watcher
 //! families: per-workspace [`FileWatcher`]s, the [`SkillsWatcher`], and the
-//! [`SpecialistsWatcher`]. At start it seeds them from the current workspace
-//! set (boot-time behavior unchanged), then subscribes to the event bus and
-//! follows the live set: `workspace:created`/`workspace:opened` register the
+//! [`SpecialistsWatcher`]. At start it subscribes to the event bus first,
+//! then seeds the watchers from the current workspace snapshot (boot-time
+//! behavior unchanged) and follows the live set from the subscription:
+//! `workspace:created`/`workspace:opened` register the
 //! workspace's watch roots at runtime, `workspace:deleted`/`workspace:closed`
 //! tear them down. Each watcher keeps its own debounce/fingerprint semantics;
 //! the registry only routes lifecycle transitions.
@@ -44,6 +45,21 @@ impl WatcherRegistry {
     /// `services` resolves paths for lifecycle events whose payload does not
     /// carry the workspace row (e.g. `workspace:opened`).
     pub async fn start(bus: EventBus, services: Arc<dyn WorkspaceApi>) -> Self {
+        // Subscribe BEFORE taking the workspace snapshot: subscription
+        // delivery is live-only, so a lifecycle event published between the
+        // snapshot and the subscribe would never be observed. A workspace
+        // seen by both the snapshot and a buffered `workspace:created` is
+        // fine — insert/add_workspace are idempotent replacements.
+        let sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![
+                WORKSPACE_CREATED.to_string(),
+                WORKSPACE_OPENED.to_string(),
+                WORKSPACE_DELETED.to_string(),
+                WORKSPACE_CLOSED.to_string(),
+            ],
+            ..SubscriptionFilter::default()
+        });
+
         let initial = match services.list_workspaces(false).await {
             Ok(ws) => ws
                 .into_iter()
@@ -58,18 +74,6 @@ impl WatcherRegistry {
                 Vec::new()
             }
         };
-
-        // Subscribe BEFORE starting watchers so no lifecycle event published
-        // between seeding and the loop is missed.
-        let sub = bus.subscribe(SubscriptionFilter {
-            event_types: vec![
-                WORKSPACE_CREATED.to_string(),
-                WORKSPACE_OPENED.to_string(),
-                WORKSPACE_DELETED.to_string(),
-                WORKSPACE_CLOSED.to_string(),
-            ],
-            ..SubscriptionFilter::default()
-        });
 
         let mut file_watchers: HashMap<WorkspaceId, FileWatcher> = HashMap::new();
         for (ws_id, path) in &initial {
