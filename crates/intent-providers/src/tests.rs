@@ -634,17 +634,22 @@ fn v8_runtime_node_options_heap_cap() {
 
 #[test]
 fn enhanced_path_prepends_bin_and_augment() {
-    std::env::set_var("HOME", "/home/tester");
-    std::env::set_var("USERPROFILE", "/home/tester");
-    std::env::set_var("PATH", "/usr/bin:/bin");
+    // Injected home / inherited PATH (never mutates process-global env — the
+    // env vars are shared with parallel PATH-dependent tests, monorepo#628).
+    let home = std::path::Path::new("/home/tester");
+    let inherited = std::ffi::OsStr::new("/usr/bin:/bin");
     let bin = std::path::PathBuf::from("/opt/tools/auggie");
-    let path = enhanced_path(Some(&bin));
+    let path = args::enhanced_path_with(Some(&bin), Some(home), Some(inherited));
     let parts: Vec<&str> = path.split([':', ';']).collect();
     assert_eq!(parts[0], "/opt/tools");
     assert!(path.contains(".augment"));
     assert!(parts.contains(&"/usr/bin") && parts.contains(&"/bin"));
     // Relative provider paths contribute no parent dir.
-    let rel = enhanced_path(Some(std::path::Path::new("auggie")));
+    let rel = args::enhanced_path_with(
+        Some(std::path::Path::new("auggie")),
+        Some(home),
+        Some(inherited),
+    );
     assert!(!rel.starts_with("auggie"));
 }
 
