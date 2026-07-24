@@ -283,6 +283,12 @@ impl PtyHost {
     }
 
     /// Spawn a process attached to a fresh PTY and start fanning out its output.
+    ///
+    /// This is a blocking call (`openpty`/fork are blocking syscalls); on
+    /// transient `openpty` failure it additionally sleeps between bounded
+    /// retries (monorepo#653), up to ~0.8s worst-case before giving up. Async
+    /// callers that cannot tolerate that on a runtime thread should wrap the
+    /// call in `spawn_blocking`.
     pub fn spawn(&self, spec: SpawnSpec) -> Result<PtyId> {
         let pair = openpty_with_retry(spec.size.to_portable())?;
 
@@ -690,11 +696,13 @@ mod tests {
     }
 
     /// Deadline scale factor for slow environments (coverage runs export
-    /// INTENTD_TEST_TIMEOUT_MULTIPLIER); never below 1.0.
+    /// INTENTD_TEST_TIMEOUT_MULTIPLIER); never below 1.0, and non-finite
+    /// values (`inf`/`NaN`) are ignored so `Duration::mul_f64` cannot panic.
     fn timeout_multiplier() -> f64 {
         std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
+            .filter(|m| m.is_finite())
             .unwrap_or(1.0)
             .max(1.0)
     }
