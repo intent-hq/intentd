@@ -113,6 +113,12 @@ pub struct ProviderConfig {
     /// `session/load` request's `mcpServers` field (claude-code, codex,
     /// droid, grok).
     pub supports_session_mcp_servers: bool,
+    /// Whether MCP delivery rides a bundled pi extension: `create_agent`
+    /// writes the embedded extension plus a wrapper script that execs the
+    /// real `pi` binary with `-e <extension>`, points pi-acp at the wrapper
+    /// via `PI_ACP_PI_COMMAND`, and hands the extension the per-agent bridge
+    /// TCP address via `INTENTD_MCP_BRIDGE_ADDR` (pi only).
+    pub mcp_via_pi_extension: bool,
     /// Whether the provider supports rules files via CLI args.
     pub supports_rules_file: bool,
     /// Flag for the rules file (e.g., `--rules`).
@@ -177,6 +183,7 @@ impl ProviderConfig {
             supports_config_option_model: false,
             supports_mcp_config: false,
             supports_session_mcp_servers: false,
+            mcp_via_pi_extension: false,
             supports_rules_file: false,
             rules_flag: None,
             injection_mechanism: InjectionMechanism::None,
@@ -297,6 +304,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // false }` and does not wire `session/new` `mcpServers` into the pi
         // process), so the assembled prompt is prepended on the first turn.
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // MCP delivery instead rides a bundled pi extension: the spawn env
+        // routes pi-acp's pi spawn through a wrapper script adding
+        // `-e <extension>` (PI_ACP_PI_COMMAND), and the extension dials the
+        // per-agent workspace bridge over TCP (INTENTD_MCP_BRIDGE_ADDR).
+        mcp_via_pi_extension: true,
         // The adapter's `session/new` result advertises the model as a
         // `configOptions[id="model"]` select; the stored model is applied
         // post-session via `session/set_config_option` (verified against
