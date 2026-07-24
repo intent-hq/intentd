@@ -409,10 +409,25 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
         .unwrap()
         .contains("UDS only"));
 
-    // A shutdown notification (no id) over WSS must be ignored too.
+    // A shutdown notification (no id) over WSS must be ignored too: no
+    // response frame within a bounded window (non-text frames tolerated).
     let notification = json!({ "jsonrpc": "2.0", "method": "system.shutdown" }).to_string();
     let mut ws = connect_ws(port, cfg.clone()).await;
     ws.send(Message::Text(notification)).await.expect("send");
+    let unexpected = timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => return Some(text),
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await;
+    assert!(
+        !matches!(&unexpected, Ok(Some(_))),
+        "notification must get no response frame: {unexpected:?}"
+    );
 
     // The daemon is still alive: system.status over WSS still answers.
     let status_frame =
