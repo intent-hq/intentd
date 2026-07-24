@@ -3,26 +3,30 @@
 //! Watches the writable specialist tiers — user (`~/.intent/specialists/`) and
 //! project (`<workspace>/.intent/specialists/` per workspace) — and emits
 //! `specialists:changed` events when `<id>.md` files are created, modified, or
-//! deleted. User-tier changes affect all workspaces; project-tier changes are
+//! deleted — or when a tier directory itself appears or disappears (#612).
+//! User-tier changes affect all workspaces; project-tier changes are
 //! scoped to their workspace. Debounce is 500ms per workspace to coalesce rapid
 //! edits, and an event is emitted only when the resolved specialist set
 //! actually changed (fingerprint check, analogous to `check_skills_changed`).
 //! The bundled/embedded tiers are static at runtime and are not watched.
+//! Workspaces can be registered/deregistered at runtime (#611) via
+//! [`SpecialistsWatcher::add_workspace`] / [`SpecialistsWatcher::remove_workspace`].
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use intent_core::{events::SPECIALISTS_CHANGED, now_iso, ActorType, EventActor, WorkspaceId};
 use intent_store::NewEvent;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
+use super::root_watch::{watch_root, RootWatch};
 use crate::specialists::SpecialistsService;
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
@@ -30,8 +34,9 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Holds watchers for all specialist directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
 pub struct SpecialistsWatcher {
-    _user_watchers: Vec<RecommendedWatcher>,
-    _workspace_watchers: Vec<RecommendedWatcher>,
+    _user_watchers: Vec<RootWatch>,
+    workspace_watchers: Mutex<HashMap<WorkspaceId, Vec<RootWatch>>>,
+    raw_tx: mpsc::UnboundedSender<SpecialistsMsg>,
     task: JoinHandle<()>,
 }
 
@@ -55,7 +60,7 @@ impl SpecialistsWatcher {
         workspaces: Vec<(WorkspaceId, PathBuf)>,
         user_dir: Option<PathBuf>,
     ) -> Self {
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SpecialistsEvent>();
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SpecialistsMsg>();
 
         // Start the user-tier watcher (affects all workspaces)
         let mut user_watchers = Vec::new();
@@ -66,96 +71,92 @@ impl SpecialistsWatcher {
         }
 
         // Start project-tier watchers (per-workspace)
-        let mut workspace_watchers = Vec::new();
+        let mut workspace_watchers: HashMap<WorkspaceId, Vec<RootWatch>> = HashMap::new();
         for (ws_id, ws_path) in &workspaces {
-            let root = project_dir(ws_path);
-            if let Ok(watcher) = watch_directory(root, Some(ws_id.clone()), raw_tx.clone()) {
-                workspace_watchers.push(watcher);
-            }
+            workspace_watchers.insert(
+                ws_id.clone(),
+                start_project_watchers(ws_id, ws_path, &raw_tx),
+            );
         }
 
         let task = tokio::spawn(debounce_loop(bus, workspaces, user_dir, raw_rx));
 
         Self {
             _user_watchers: user_watchers,
-            _workspace_watchers: workspace_watchers,
+            workspace_watchers: Mutex::new(workspace_watchers),
+            raw_tx,
             task,
         }
     }
+
+    /// Register a workspace at runtime (#611). The debounce loop learns the
+    /// path first (and primes the fingerprint so pre-existing specialists do
+    /// not emit a spurious event), then the project tier is watched.
+    /// Re-registering replaces the watch.
+    pub fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+        let _ = self.raw_tx.send(SpecialistsMsg::Add(
+            workspace_id.clone(),
+            workspace_path.clone(),
+        ));
+        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.insert(workspace_id, watchers);
+        }
+    }
+
+    /// Deregister a workspace at runtime (#611): tear down its project-tier
+    /// watch and drop any pending flush so it stops emitting.
+    pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.remove(workspace_id);
+        }
+        let _ = self
+            .raw_tx
+            .send(SpecialistsMsg::Remove(workspace_id.clone()));
+    }
 }
 
+/// Watch the project-tier specialists root of one workspace.
+fn start_project_watchers(
+    workspace_id: &WorkspaceId,
+    workspace_path: &Path,
+    raw_tx: &mpsc::UnboundedSender<SpecialistsMsg>,
+) -> Vec<RootWatch> {
+    let root = project_dir(workspace_path);
+    match watch_directory(root, Some(workspace_id.clone()), raw_tx.clone()) {
+        Ok(watcher) => vec![watcher],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Message into the debounce loop: a raw filesystem change, or a runtime
+/// (de)registration of a workspace (#611).
 #[derive(Debug, Clone)]
-struct SpecialistsEvent {
-    workspace_id: Option<WorkspaceId>, // None = affects all workspaces
+enum SpecialistsMsg {
+    /// Raw change from a root watch; `None` = user tier (all workspaces).
+    Change(Option<WorkspaceId>),
+    /// Workspace registered after start.
+    Add(WorkspaceId, PathBuf),
+    /// Workspace deregistered; its pending flush is dropped.
+    Remove(WorkspaceId),
 }
 
-/// Watch a single directory (or its nearest existing ancestor).
+/// Watch a single root, forwarding `*.md` and directory-level events.
+/// Missing roots are handled by [`watch_root`]: a non-recursive watch on the
+/// nearest existing ancestor is promoted to a recursive watch on the root
+/// once it appears.
 fn watch_directory(
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
-    tx: mpsc::UnboundedSender<SpecialistsEvent>,
-) -> notify::Result<RecommendedWatcher> {
-    let watch_path = find_existing_ancestor(&root);
-    // Filter against the canonical root: OS watchers (FSEvents in particular)
-    // report canonicalized paths, so a symlinked root (e.g. `/var` →
-    // `/private/var` on macOS) would otherwise never match.
-    let root = canonical_root(&root, &watch_path);
-
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            // Only care about `<id>.md` files under the specialists root (the
-            // watch may sit on an ancestor when the root does not exist yet).
-            if event.paths.iter().any(|p| {
-                p.extension().and_then(|e| e.to_str()) == Some("md") && path_within_root(p, &root)
-            }) {
-                let _ = tx.send(SpecialistsEvent {
-                    workspace_id: workspace_id.clone(),
-                });
-            }
-        }
-    })?;
-
-    watcher.watch(&watch_path, RecursiveMode::Recursive)?;
-    Ok(watcher)
+    tx: mpsc::UnboundedSender<SpecialistsMsg>,
+) -> notify::Result<RootWatch> {
+    watch_root(root, is_md, move || {
+        let _ = tx.send(SpecialistsMsg::Change(workspace_id.clone()));
+    })
 }
 
-/// Find the nearest existing ancestor of a path (for non-existent roots).
-fn find_existing_ancestor(path: &Path) -> PathBuf {
-    let mut current = path.to_path_buf();
-    while !current.exists() && current.parent().is_some() {
-        current = current.parent().unwrap().to_path_buf();
-    }
-    if current.exists() {
-        current
-    } else {
-        path.to_path_buf()
-    }
-}
-
-/// Rebase `root` onto the canonicalized form of its nearest existing
-/// `ancestor`, so it can be compared against the canonical paths OS watchers
-/// report.
-fn canonical_root(root: &Path, ancestor: &Path) -> PathBuf {
-    let canonical_ancestor = ancestor
-        .canonicalize()
-        .unwrap_or_else(|_| ancestor.to_path_buf());
-    match root.strip_prefix(ancestor) {
-        Ok(rest) => canonical_ancestor.join(rest),
-        Err(_) => root.to_path_buf(),
-    }
-}
-
-/// Whether an event path falls under the canonical specialists root. `notify`
-/// does not guarantee canonical paths across backends, so a raw prefix check
-/// is tried first and a best-effort canonicalization of the event path covers
-/// symlinked forms. Deleted paths cannot be canonicalized directly; they are
-/// rebased onto their nearest existing ancestor instead.
-fn path_within_root(path: &Path, root: &Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
-    let ancestor = find_existing_ancestor(path);
-    canonical_root(path, &ancestor).starts_with(root)
+fn is_md(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("md")
 }
 
 /// Default user-tier specialists directory (`~/.intent/specialists/`).
@@ -190,15 +191,16 @@ fn specialists_fingerprint(user_dir: &Option<PathBuf>, workspace_path: &Path) ->
 }
 
 /// Debounce loop that coalesces rapid specialist file changes per workspace.
+/// `Add`/`Remove` messages keep the workspace map and fingerprints in step
+/// with runtime (de)registrations (#611).
 async fn debounce_loop(
     bus: EventBus,
     workspaces: Vec<(WorkspaceId, PathBuf)>,
     user_dir: Option<PathBuf>,
-    mut raw_rx: mpsc::UnboundedReceiver<SpecialistsEvent>,
+    mut raw_rx: mpsc::UnboundedReceiver<SpecialistsMsg>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
-    let workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
-    let all_workspace_ids: Vec<WorkspaceId> = workspace_paths.keys().cloned().collect();
+    let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
 
     // Prime the per-workspace fingerprints so the first flush compares against
     // the set as it stood at watcher start (no spurious first event).
@@ -212,12 +214,12 @@ async fn debounce_loop(
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
-                Some(event) => {
+                Some(SpecialistsMsg::Change(workspace_id)) => {
                     let deadline = tokio::time::Instant::now() + DEBOUNCE;
-                    match event.workspace_id {
+                    match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
-                            for ws_id in &all_workspace_ids {
+                            for ws_id in workspace_paths.keys() {
                                 pending.insert(ws_id.clone(), deadline);
                             }
                         }
@@ -226,6 +228,16 @@ async fn debounce_loop(
                             pending.insert(ws_id, deadline);
                         }
                     }
+                }
+                Some(SpecialistsMsg::Add(ws_id, path)) => {
+                    // Prime the fingerprint like the start-time priming above.
+                    fingerprints.insert(ws_id.clone(), specialists_fingerprint(&user_dir, &path));
+                    workspace_paths.insert(ws_id, path);
+                }
+                Some(SpecialistsMsg::Remove(ws_id)) => {
+                    workspace_paths.remove(&ws_id);
+                    fingerprints.remove(&ws_id);
+                    pending.remove(&ws_id);
                 }
                 None => {
                     // All senders dropped: flush and exit
@@ -412,35 +424,80 @@ mod tests {
         format!("---\nname: \"{name}\"\ndescription: \"d\"\n---\n\n{body}")
     }
 
-    #[test]
-    fn path_within_root_matches_canonical_and_foreign_paths() {
-        let dir = TempDir::new("pwr");
-        let root = dir.path.canonicalize().expect("canonicalize temp dir");
-        std::fs::write(root.join("a.md"), "x").expect("write file");
+    #[tokio::test]
+    async fn tier_directory_deletion_emits_event() {
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let user = TempDir::new("rmdir-user");
+        let ws = TempDir::new("rmdir-ws");
+        let ws_id = WorkspaceId::from("ws-rmdir");
+        let proj = project_dir(&ws.path);
+        std::fs::create_dir_all(&proj).expect("mk project tier");
+        // Seed BEFORE the watcher starts so the primed fingerprint includes
+        // this specialist.
+        std::fs::write(proj.join("doomed.md"), specialist_md("Doomed", "body"))
+            .expect("seed specialist");
 
-        assert!(path_within_root(&root.join("a.md"), &root));
-        // Deleted files cannot be canonicalized; the ancestor-rebase fallback
-        // must still resolve them under the root.
-        assert!(path_within_root(&root.join("gone.md"), &root));
-        assert!(!path_within_root(Path::new("/elsewhere/a.md"), &root));
+        let _watcher = SpecialistsWatcher::start_with_user_dir(
+            bus.clone(),
+            vec![(ws_id.clone(), ws.path.clone())],
+            Some(user.path.clone()),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // `rm -rf` of the whole tier directory: possibly only directory-level
+        // events surface, which the filter must still forward (#612).
+        std::fs::remove_dir_all(&proj).expect("remove tier dir");
+
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
+        assert_eq!(
+            events.len(),
+            1,
+            "tier-directory deletion must emit one event, got {events:?}"
+        );
+        assert_eq!(events[0].workspace_id, ws_id);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn path_within_root_resolves_symlinked_event_paths() {
-        let dir = TempDir::new("pwr-sym");
-        let real = dir.path.join("real");
-        std::fs::create_dir_all(&real).expect("mk real dir");
-        let root = real.canonicalize().expect("canonicalize real dir");
-        std::fs::write(root.join("a.md"), "x").expect("write file");
-        let link = dir.path.join("link");
-        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    #[tokio::test]
+    async fn missing_root_promotes_on_creation_and_detects_changes() {
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let user = TempDir::new("late-user");
+        let ws = TempDir::new("late-ws");
+        let ws_id = WorkspaceId::from("ws-late");
+        let proj = project_dir(&ws.path);
+        // The project tier does NOT exist when the watcher starts.
 
-        // Non-canonical (symlink) event paths must match the canonical root,
-        // whether the file still exists (canonicalize) or was deleted
-        // (ancestor rebase).
-        assert!(path_within_root(&link.join("a.md"), &root));
-        assert!(path_within_root(&link.join("deleted.md"), &root));
+        let _watcher = SpecialistsWatcher::start_with_user_dir(
+            bus.clone(),
+            vec![(ws_id.clone(), ws.path.clone())],
+            Some(user.path.clone()),
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        std::fs::create_dir_all(&proj).expect("create tier dir");
+        std::fs::write(proj.join("late.md"), specialist_md("Late", "body"))
+            .expect("write specialist");
+
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(15))
+                .await;
+        assert!(
+            !events.is_empty(),
+            "root created after start must emit, got {events:?}"
+        );
+        assert!(events.iter().all(|e| e.workspace_id == ws_id));
+
+        // Subsequent changes under the promoted root are detected.
+        std::fs::write(proj.join("late.md"), specialist_md("Late", "new body"))
+            .expect("modify specialist");
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
+        assert!(
+            !events.is_empty(),
+            "changes under the promoted root must emit, got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -568,5 +625,69 @@ mod tests {
             "real change after a no-op must emit exactly one event, got {events:?}"
         );
         assert_eq!(events[0].workspace_id, ws_id);
+    }
+
+    #[tokio::test]
+    async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let user = TempDir::new("dyn-user");
+        let ws = TempDir::new("dyn-ws");
+        let ws_id = WorkspaceId::from("ws-dyn");
+        let proj = project_dir(&ws.path);
+        std::fs::create_dir_all(&proj).expect("mk project tier");
+        // Seed BEFORE registration: the primed fingerprint must include this
+        // specialist so registration itself does not emit.
+        std::fs::write(proj.join("seed.md"), specialist_md("Seed", "body"))
+            .expect("seed specialist");
+
+        // Start with NO workspaces; register at runtime (#611).
+        let watcher =
+            SpecialistsWatcher::start_with_user_dir(bus.clone(), vec![], Some(user.path.clone()));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Registration alone must not emit (fingerprint primed at add time).
+        let events = drain_specialists_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "runtime registration must not emit for the pre-existing set, got {events:?}"
+        );
+
+        // A project-tier change after registration emits for the new workspace.
+        std::fs::write(proj.join("added.md"), specialist_md("Added", "body"))
+            .expect("write specialist");
+        let events =
+            drain_specialists_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10))
+                .await;
+        assert_eq!(
+            events.len(),
+            1,
+            "change after runtime registration must emit one event, got {events:?}"
+        );
+        assert_eq!(events[0].workspace_id, ws_id);
+
+        // Deregister: further project-tier changes no longer emit.
+        watcher.remove_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        std::fs::write(proj.join("late.md"), specialist_md("Late", "body"))
+            .expect("write specialist after removal");
+        let events = drain_specialists_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "deregistered workspace must stop emitting, got {events:?}"
+        );
     }
 }
