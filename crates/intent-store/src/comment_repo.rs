@@ -264,15 +264,10 @@ impl Store {
 
         match result {
             Ok(rev) => {
-                if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
-                    // A failed COMMIT can leave the transaction open on the
-                    // pooled connection; roll back so it is not returned to
-                    // the pool still holding the write lock.
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    return Err(Error::Internal(format!(
-                        "commit note+comment tx failed: {e}"
-                    )));
-                }
+                // Rollback (and detach+close on double failure) if the COMMIT
+                // itself fails, so the sole write-pool connection is never
+                // returned holding an open transaction (monorepo#638).
+                crate::commit_with_rollback_guard(conn, "commit note+comment tx failed").await?;
                 Ok(rev)
             }
             Err(e) => {

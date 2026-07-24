@@ -1498,6 +1498,79 @@ async fn insert_events_rolls_back_on_failed_commit() {
     assert_eq!(inserted.len(), 1);
 }
 
+/// A failed statement inside `insert_events`' transaction rolls the whole
+/// batch back and leaves the pooled write connection usable (monorepo#669,
+/// style of #453's `append_note_version_rolls_back_on_body_error`): an
+/// `AFTER INSERT` trigger raising ABORT fails the multi-row INSERT at
+/// statement time (not COMMIT time), nothing persists, and a subsequent
+/// batch on the same pooled connection succeeds.
+#[tokio::test]
+async fn insert_events_rolls_back_on_body_error() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Arm the body trap: any event insert aborts its own statement.
+    sqlx::query(
+        "CREATE TRIGGER body_trap AFTER INSERT ON event BEGIN
+             SELECT RAISE(ABORT, 'body trap');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let events = vec![
+        typed_event(
+            &ws,
+            "2026-01-01T00:00:01Z",
+            events::AGENT_MESSAGE,
+            actor.clone(),
+        ),
+        typed_event(
+            &ws,
+            "2026-01-01T00:00:02Z",
+            events::AGENT_MESSAGE,
+            actor.clone(),
+        ),
+    ];
+    let err = store
+        .insert_events(&events)
+        .await
+        .expect_err("INSERT must fail on the abort trigger");
+    assert!(
+        err.to_string().contains("insert events failed"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing persisted from the failed batch...
+    assert!(store
+        .events_by_workspace(&ws, 10)
+        .await
+        .expect("query events")
+        .is_empty());
+    // ...and the write connection is clean: with the trap disarmed, the same
+    // batch succeeds on the same pooled connection.
+    sqlx::query("DROP TRIGGER body_trap")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let inserted = store
+        .insert_events(&events)
+        .await
+        .expect("insert after body error");
+    assert_eq!(inserted.len(), 2);
+}
+
 /// Finding F4: extended ephemeral-event retention sweep deletes high-volume
 /// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`) older
 /// than the cutoff while preserving lifecycle/tool/note/task/workspace events
