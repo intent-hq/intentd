@@ -124,6 +124,7 @@ pub use agent_manager::{
 // and the transport router (`agent.respondPermission` outcome parsing) need.
 pub use events::{
     EventBus, FileWatcher, SkillsWatcher, SpecialistsWatcher, Subscription, SubscriptionFilter,
+    WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
