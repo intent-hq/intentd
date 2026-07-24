@@ -10,8 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use portable_pty::{
-    native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize as PortablePtySize,
-    SlavePty,
+    native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtyPair,
+    PtySize as PortablePtySize, SlavePty,
 };
 use tokio::sync::broadcast;
 
@@ -34,6 +34,17 @@ const DRAIN_POLL: Duration = Duration::from_millis(5);
 /// finite and normally empties within a few reads — the bound only guards
 /// against a wedged reader keeping the held slave fd open forever.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Attempt budget for `openpty`: transient pty/fd-pool exhaustion (e.g.
+/// EMFILE/ENFILE-class errors under heavy parallel load — monorepo#653)
+/// usually clears within milliseconds as other PTYs close, so a short
+/// backed-off retry rides it out. A persistent failure still surfaces as the
+/// same `Internal` error after the last attempt.
+const OPENPTY_ATTEMPTS: u32 = 8;
+/// Initial backoff between `openpty` attempts; doubles per retry up to
+/// [`OPENPTY_BACKOFF_CAP`] (~0.8s worst-case total across all attempts).
+const OPENPTY_BACKOFF: Duration = Duration::from_millis(10);
+/// Ceiling for the per-attempt `openpty` backoff.
+const OPENPTY_BACKOFF_CAP: Duration = Duration::from_millis(250);
 
 /// Opaque identifier for a spawned PTY, unique within a [`PtyHost`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -233,6 +244,31 @@ fn internal(e: impl std::fmt::Display) -> Error {
     Error::Internal(e.to_string())
 }
 
+/// Open a fresh PTY pair, retrying transient failures with bounded backoff
+/// (monorepo#653). `openpty` has no non-transient failure mode for a valid
+/// size — an error means pty/fd pressure — so every failure is retried until
+/// the attempt budget runs out, then the last error is returned unchanged.
+fn openpty_with_retry(size: PortablePtySize) -> Result<PtyPair> {
+    retry_transient(|| native_pty_system().openpty(size))
+}
+
+/// Run `op` up to [`OPENPTY_ATTEMPTS`] times, sleeping an exponentially
+/// growing backoff between attempts; the final attempt's error is mapped to
+/// [`Error::Internal`].
+fn retry_transient<T, E: std::fmt::Display>(
+    mut op: impl FnMut() -> std::result::Result<T, E>,
+) -> Result<T> {
+    let mut backoff = OPENPTY_BACKOFF;
+    for _ in 1..OPENPTY_ATTEMPTS {
+        if let Ok(value) = op() {
+            return Ok(value);
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(OPENPTY_BACKOFF_CAP);
+    }
+    op().map_err(internal)
+}
+
 /// The unified host owning every spawned PTY (terminals and scripts).
 #[derive(Default)]
 pub struct PtyHost {
@@ -248,9 +284,7 @@ impl PtyHost {
 
     /// Spawn a process attached to a fresh PTY and start fanning out its output.
     pub fn spawn(&self, spec: SpawnSpec) -> Result<PtyId> {
-        let pair = native_pty_system()
-            .openpty(spec.size.to_portable())
-            .map_err(internal)?;
+        let pair = openpty_with_retry(spec.size.to_portable())?;
 
         let mut cmd = CommandBuilder::new(&spec.command);
         cmd.args(&spec.args);
@@ -655,6 +689,16 @@ mod tests {
         needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// Deadline scale factor for slow environments (coverage runs export
+    /// INTENTD_TEST_TIMEOUT_MULTIPLIER); never below 1.0.
+    fn timeout_multiplier() -> f64 {
+        std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(1.0)
+            .max(1.0)
+    }
+
     /// Drain a live receiver until `needle` is seen or the deadline passes.
     async fn collect_until(
         rx: &mut broadcast::Receiver<Arc<Vec<u8>>>,
@@ -715,6 +759,38 @@ mod tests {
     /// Spec for `cat`, which echoes its stdin back through the PTY.
     fn cat_spec(scope: &str) -> SpawnSpec {
         SpawnSpec::new(scope, "cat")
+    }
+
+    /// Transient failures inside the attempt budget are retried to success and
+    /// never surface to the caller (monorepo#653).
+    #[test]
+    fn retry_transient_rides_out_transient_failures() {
+        let mut attempts = 0u32;
+        let out = retry_transient(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err("pty pool exhausted")
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+    }
+
+    /// A persistent failure exhausts the whole attempt budget, then surfaces
+    /// the last error as `Internal` — the same shape as before the retry.
+    #[test]
+    fn retry_transient_surfaces_persistent_failure_after_budget() {
+        let mut attempts = 0u32;
+        let out: Result<()> = retry_transient(|| {
+            attempts += 1;
+            Err::<(), _>("failed to openpty")
+        });
+        assert_eq!(attempts, OPENPTY_ATTEMPTS);
+        match out {
+            Err(Error::Internal(msg)) => assert!(msg.contains("failed to openpty")),
+            other => panic!("expected Internal error, got {other:?}"),
+        }
     }
 
     /// `SpawnSpec::name` is surfaced through `info()`; unnamed PTYs stay `None`.
@@ -887,19 +963,32 @@ mod tests {
                     assert_eq!(exit.exit_code, 0, "{marker}: child must exit 0");
                     assert!(exit.success);
 
-                    // Poll scrollback for the marker. Pre-fix the output is
-                    // *lost*, not late — the deadline only bounds how long a
-                    // failing run takes to report.
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                    // Poll scrollback for the marker, event-driven rather than
+                    // on a fixed clock (monorepo#648): the drain is provably
+                    // over once the reader thread has exited (it only exits at
+                    // EOF, after pushing everything it read into scrollback),
+                    // so a missing marker at that point is genuine *loss*, not
+                    // lateness. The generous deadline only guards against a
+                    // drain that never completes on a badly overloaded host.
+                    let deadline =
+                        Instant::now() + Duration::from_secs(60).mul_f64(timeout_multiplier());
                     loop {
+                        let drained = host.reader_finished(id);
                         let out = host.scrollback(id).unwrap();
                         if contains(&out, marker.as_bytes()) {
                             break;
                         }
-                        if Instant::now() >= deadline {
+                        if drained {
                             panic!(
                                 "{marker}: fast-exiting child's output was lost; \
-                                 exit 0 but scrollback stayed {:?}",
+                                 exit 0 and reader drained to EOF but scrollback stayed {:?}",
+                                String::from_utf8_lossy(&out)
+                            );
+                        }
+                        if Instant::now() >= deadline {
+                            panic!(
+                                "{marker}: output drain never completed within deadline; \
+                                 scrollback so far {:?}",
                                 String::from_utf8_lossy(&out)
                             );
                         }
@@ -987,12 +1076,7 @@ mod tests {
         // line before `attach()` subscribes, in which case the PID only ever
         // exists in scrollback and a live tail would wait out the whole
         // deadline. Honor INTENTD_TEST_TIMEOUT_MULTIPLIER for coverage runs.
-        let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .max(1.0);
-        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(multiplier);
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
 
         let grandchild: u32 = loop {
             let out = host.scrollback(id).unwrap();
