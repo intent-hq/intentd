@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2026-07-24
+
+### 🚀 Features
+
+- Emit specialists:changed on specialist file changes ([#426](https://github.com/intent-hq/intentd/pull/426))
+
+### 🐛 Bug Fixes
+
+- Fail closed on nonexistent agent in agent.queueMessage and agent.watchCompletion (monorepo#568) ([#408](https://github.com/intent-hq/intentd/pull/408))
+- Deliver workspace MCP servers to grok sessions ([#412](https://github.com/intent-hq/intentd/pull/412))
+- Annotate stale queued-message redrives and keep delivered completion report ([#576](https://github.com/intent-hq/intentd/pull/576)) ([#413](https://github.com/intent-hq/intentd/pull/413))
+- Drop the draft workspace FK so opaque draft keys work (PROTOCOL 5.16) ([#420](https://github.com/intent-hq/intentd/pull/420))
+- Spawn chief agents in dedicated empty chief-cwd dir instead of /tmp ([#419](https://github.com/intent-hq/intentd/pull/419))
+
+### 🧪 Testing
+
+- Poll system.status for WSS port with bounded backoff ([#409](https://github.com/intent-hq/intentd/pull/409))
+- Deflake uds_note_subscription frame/state awaits (monorepo#601)
+
+
 ## [0.2.3] - 2026-07-23
 
 ### 🐛 Bug Fixes
