@@ -3801,44 +3801,51 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     assert_eq!(send2["success"], true);
     assert_eq!(send2["queued"], true, "second message should be queued");
 
-    // Collect events and look for the agent:message event for the dequeued message.
-    let mut saw_dequeued_user_message = false;
+    // Collect events under one shared deadline (30s, STAB-128 precedent).
+    // The daemon does NOT guarantee the relative order of the empty-queue
+    // `agent:queue:updated`, the dequeued user `agent:message`, and the
+    // `agent:stream:end` frames — the end-of-turn drain and the stream:end
+    // publication run on independent async paths — so track each signal
+    // independently, filtered by agent id, with no cross-signal ordering
+    // gates (STAB-34/36 pattern).
     let mut saw_queue_drain = false;
+    let mut user_message_event_ids: Vec<String> = Vec::new();
     let mut stream_end_count = 0;
 
-    for i in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
+    // Fast-path exit note: `user_message_event_ids.len() >= 2` relies on the
+    // direct-send branch of `agent.sendMessage` also emitting `agent:message`
+    // for "first message" (PROTOCOL §5.5 step 6). If that emit ever went away
+    // the loop would still be correct — it would just run to the deadline and
+    // let the id-match assertion below decide.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_queue_drain && stream_end_count >= 2 && user_message_event_ids.len() >= 2) {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            break;
+        };
         let evt = &frame["params"]["event"];
+        if evt["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
         match evt["type"].as_str() {
             Some("agent:queue:updated") => {
-                // After the first turn completes, the queue drains to empty
-                if stream_end_count >= 1
-                    && evt["data"]["queue"]
-                        .as_array()
-                        .map(|q| q.is_empty())
-                        .unwrap_or(false)
+                // The queue drains to empty once the first turn completes.
+                if evt["data"]["queue"]
+                    .as_array()
+                    .map(|q| q.is_empty())
+                    .unwrap_or(false)
                 {
                     saw_queue_drain = true;
                 }
             }
             Some("agent:message") => {
-                assert_eq!(evt["data"]["agentId"].as_str(), Some(agent_id.as_str()));
-                let role = evt["data"]["role"].as_str();
-                // The dequeued message event should arrive after the queue drain
-                if role == Some("user") && saw_queue_drain {
-                    saw_dequeued_user_message = true;
+                if evt["data"]["role"].as_str() == Some("user") {
+                    if let Some(mid) = evt["data"]["messageId"].as_str() {
+                        user_message_event_ids.push(mid.to_string());
+                    }
                 }
             }
             Some("agent:stream:end") => {
                 stream_end_count += 1;
-                // After two turns complete and we've seen the dequeued message event, we're done
-                if stream_end_count >= 2 && saw_dequeued_user_message {
-                    break;
-                }
-                // Give up after seeing both stream ends + some extra iterations
-                if stream_end_count >= 2 && i >= 10 {
-                    break;
-                }
             }
             _ => {}
         }
@@ -3849,8 +3856,33 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
         "queue should have drained after first turn"
     );
     assert!(
-        saw_dequeued_user_message,
-        "agent:message event for dequeued user message — STAB-4 fix"
+        stream_end_count >= 2,
+        "both turns reached terminal agent:stream:end (saw {stream_end_count})"
+    );
+
+    // The `agent:message` payload carries `{ agentId, messageId, role }` (no
+    // content, PROTOCOL §6.5) — resolve the persisted row for the dequeued
+    // "queued message" content and match the collected event ids against it,
+    // instead of relying on event arrival order.
+    let convo = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let dequeued_row_id = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "user" && m["contentBlocks"][0]["text"] == "queued message")
+        .and_then(|m| m["id"].as_str())
+        .expect("dequeued user message row present in transcript")
+        .to_string();
+    assert!(
+        user_message_event_ids.contains(&dequeued_row_id),
+        "agent:message event for dequeued user message — STAB-4 fix \
+         (row id {dequeued_row_id}, event ids {user_message_event_ids:?})"
     );
 }
 
