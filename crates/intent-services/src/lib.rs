@@ -10552,7 +10552,12 @@ impl WorkspaceApi for Services {
             )
             .await;
             if let Err(e) = &result {
+                // `workspace_id` is essential: note ids are per-workspace (every
+                // workspace has a `spec` note), so a context-not-found here can
+                // mean the caller targeted the wrong workspace's same-id note
+                // (the round-5 dogfood failure was exactly that).
                 tracing::warn!(
+                    workspace_id = %ws_scope,
                     note_id = %warn_note_id.as_str(),
                     error = %e,
                     search_context_len = diag_ctx_len,
