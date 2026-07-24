@@ -2008,6 +2008,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `comment.respond`: add a reply to a thread (PROTOCOL §5.3).
+    ///
+    /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);
+    /// it defaults to `agent` for backward compatibility with agent/MCP callers.
     #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
@@ -2018,6 +2021,7 @@ pub trait WorkspaceApi: Send + Sync {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        author_type: Option<String>,
         suggestion_original: Option<String>,
         suggestion_proposed: Option<String>,
     ) -> BoxFuture<'_, Result<CommentRespondResult>> {
@@ -2029,6 +2033,7 @@ pub trait WorkspaceApi: Send + Sync {
             comment,
             kind,
             author,
+            author_type,
             suggestion_original,
             suggestion_proposed,
         );

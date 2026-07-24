@@ -382,6 +382,7 @@ async fn comment_respond_adds_reply_to_thread() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("respond to comment");
