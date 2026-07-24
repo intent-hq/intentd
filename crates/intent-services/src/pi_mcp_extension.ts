@@ -261,7 +261,12 @@ export default async function piMcpExtension(pi) {
     if (!clientPromise) {
       clientPromise = (async () => {
         const client = await connectMcpTcp(addr);
-        await client.initialize({ name: "intentd-pi-mcp-extension", version: "0.1.0" });
+        try {
+          await client.initialize({ name: "intentd-pi-mcp-extension", version: "0.1.0" });
+        } catch (err) {
+          client.close();
+          throw err;
+        }
         return client;
       })().catch((err) => {
         clientPromise = null;
@@ -299,21 +304,29 @@ export default async function piMcpExtension(pi) {
     }
   };
 
+  // Registration failures (e.g. a name collision with a tool from a
+  // user-installed extension) skip that tool only — never break pi.
+  let registered = 0;
   for (const tool of tools) {
-    pi.registerTool({
-      name: tool.name,
-      label: tool.name,
-      description: tool.description ?? "",
-      // MCP `inputSchema` is already JSON Schema, which is what pi feeds the
-      // model; no typebox needed.
-      parameters: tool.inputSchema ?? { type: "object", properties: {} },
-      async execute(_toolCallId, params, signal) {
-        const result = await forwardCall(tool.name, params ?? {}, signal);
-        return mapToolResult(result);
-      },
-    });
+    try {
+      pi.registerTool({
+        name: tool.name,
+        label: tool.name,
+        description: tool.description ?? "",
+        // MCP `inputSchema` is already JSON Schema, which is what pi feeds the
+        // model; no typebox needed.
+        parameters: tool.inputSchema ?? { type: "object", properties: {} },
+        async execute(_toolCallId, params, signal) {
+          const result = await forwardCall(tool.name, params ?? {}, signal);
+          return mapToolResult(result);
+        },
+      });
+      registered += 1;
+    } catch (err) {
+      log(`failed to register tool ${tool.name} (${err.message}); skipping it`);
+    }
   }
-  log(`registered ${tools.length} workspace tool(s) from ${addr}`);
+  log(`registered ${registered} of ${tools.length} workspace tool(s) from ${addr}`);
 
   if (typeof pi.on === "function") {
     pi.on("session_shutdown", async () => {

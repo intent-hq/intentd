@@ -703,7 +703,10 @@ struct PiExtensionDelivery {
 impl PiExtensionDelivery {
     /// Write the extension + wrapper (0755) temp files. The wrapper only
     /// appends our `-e` flag — user-installed pi extensions stay enabled.
+    #[cfg(unix)]
     fn write(real_pi_command: &str) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+
         let extension_path =
             std::env::temp_dir().join(format!("intentd-pi-ext-{}.ts", Uuid::new_v4()));
         std::fs::write(&extension_path, PI_MCP_EXTENSION_SOURCE)
@@ -715,23 +718,29 @@ impl PiExtensionDelivery {
         let wrapper_path =
             std::env::temp_dir().join(format!("intentd-pi-wrapper-{}.sh", Uuid::new_v4()));
         let script = format!(
-            "#!/bin/sh\nexec \"{}\" -e \"{}\" \"$@\"\n",
-            real_pi_command,
-            extension.path.display()
+            "#!/bin/sh\nexec {} -e {} \"$@\"\n",
+            sh_squote(real_pi_command),
+            sh_squote(&extension.path.to_string_lossy())
         );
         std::fs::write(&wrapper_path, script)
             .map_err(|e| Error::Internal(format!("write pi wrapper failed: {e}")))?;
         let wrapper = TempConfigFile { path: wrapper_path };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper.path, std::fs::Permissions::from_mode(0o755))
-                .map_err(|e| Error::Internal(format!("chmod pi wrapper failed: {e}")))?;
-        }
+        std::fs::set_permissions(&wrapper.path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| Error::Internal(format!("chmod pi wrapper failed: {e}")))?;
         Ok(Self {
             _extension: extension,
             wrapper,
         })
+    }
+
+    /// The delivery relies on an executable `#!/bin/sh` wrapper; there is no
+    /// non-unix equivalent, so fail with a clear error instead of spawning pi
+    /// with a script it cannot execute.
+    #[cfg(not(unix))]
+    fn write(_real_pi_command: &str) -> Result<Self> {
+        Err(Error::Internal(
+            "pi extension MCP delivery requires a unix host (sh wrapper script)".to_string(),
+        ))
     }
 
     /// Insert the two spawn env vars: route pi-acp's pi spawn through the
@@ -758,6 +767,12 @@ fn pi_extension_delivery(provider: &ProviderConfig) -> Result<Option<PiExtension
     Ok(Some(
         PiExtensionDelivery::write(&resolve_real_pi_command())?,
     ))
+}
+
+/// Single-quote a string for inert interpolation into a `sh` script: quotes
+/// suppress all expansion, and embedded `'` uses the standard `'\''` escape.
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// The pi binary the wrapper execs: a pre-existing `PI_ACP_PI_COMMAND` in the
@@ -5690,11 +5705,12 @@ mod rebuild_spawn_opts_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn
     //! env vars, and the capability gate that leaves non-pi providers alone.
+    //! Unix-only, matching the delivery itself (sh wrapper + chmod).
 
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -5719,10 +5735,20 @@ mod pi_extension_delivery_tests {
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(
             script.contains(&format!(
-                "exec \"pi\" -e \"{}\" \"$@\"",
+                "exec 'pi' -e '{}' \"$@\"",
                 delivery._extension.path.display()
             )),
             "wrapper must exec the real pi with -e <extension>: {script:?}"
+        );
+    }
+
+    #[test]
+    fn wrapper_single_quotes_special_characters() {
+        let delivery = PiExtensionDelivery::write("/opt/pi's \"odd$\" bin/pi").unwrap();
+        let script = std::fs::read_to_string(&delivery.wrapper.path).unwrap();
+        assert!(
+            script.contains("exec '/opt/pi'\\''s \"odd$\" bin/pi' -e '"),
+            "wrapper must single-quote the pi command with the '\\'' escape: {script:?}"
         );
     }
 

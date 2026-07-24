@@ -148,6 +148,23 @@ function fakePi() {
 
 // --- 5. Graceful degradation ----------------------------------------------
 {
+  // A throwing registerTool (e.g. name collision with a user-installed
+  // extension's tool) skips that tool only; the rest still register.
+  process.env.INTENTD_MCP_BRIDGE_ADDR = addr;
+  const pi = fakePi();
+  const realRegister = pi.registerTool.bind(pi);
+  pi.registerTool = (def) => {
+    if (def.name === "echo") throw new Error("name collision");
+    realRegister(def);
+  };
+  await ext.default(pi);
+  assert.deepEqual(
+    pi.tools.map((t) => t.name),
+    ["reverse"],
+    "a throwing registerTool skips that tool only",
+  );
+}
+{
   delete process.env.INTENTD_MCP_BRIDGE_ADDR;
   const pi = fakePi();
   await ext.default(pi);
