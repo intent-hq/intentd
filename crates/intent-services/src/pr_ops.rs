@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
-    CheckRun, CheckState, MergeMethod, Page, PageParams, PrState, PullRequest, Review,
-    ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, SourceControl,
+    CheckRun, CheckState, MergeMethod, Page, PageParams, PrQuery, PrState, PullRequest, RepoRef,
+    Review, ReviewComment, ReviewThread, ReviewThreadComment, ReviewVerdict, SourceControl,
     SourceControlRegistry, SourceControlSettings,
 };
 use serde_json::{json, Value};
@@ -120,13 +120,14 @@ pub(crate) fn active_pr_number(ws: &Workspace) -> Result<u64> {
 }
 
 // ===========================================================================
-// Workspace ↔ PR linkage (§7.6). The matching rule ports from the TS
-// `Workspace` type: a PR belongs to a workspace when its head ref equals the
-// workspace's OWN branch (`pr.head.ref === workspace.branch`), NOT `baseRef`.
-//
-// PARITY NOTE: the TS `performBackgroundEnrichment` additionally accepts a
-// `baseRef` match (`matchesBaseRef`); this port intentionally does branch-only
-// matching (the workspace's own branch, NOT `baseRef`) and ignores `baseRef`.
+// Workspace ↔ PR linkage (§7.6). The matching rule ports from the TS side:
+// a PR belongs to a workspace when its head ref equals the workspace's OWN
+// branch (`pr.head.ref === workspace.branch`) OR its source branch matches
+// the workspace's `baseRef` (`matchesBaseRef` in the FE `baseref-matching.ts`
+// — review workspaces created *for* a PR store that PR's head as `baseRef`).
+// Branch match takes precedence where ordering matters. The baseRef arm only
+// strips a conservative remote-name allowlist (`origin/`, `upstream/`,
+// `fork/`) so slashed local branches are never over-stripped.
 // ===========================================================================
 
 /// Outcome of a single workspace PR refresh (§7.6). Drives which `pr:*` event
@@ -142,7 +143,8 @@ pub enum PrRefreshOutcome {
     Linked,
     /// A linked PR's persisted snapshot changed (`pr:updated`).
     Updated,
-    /// A stale link was cleared after a positive branch mismatch (`pr:unlinked`).
+    /// A stale link was cleared after a positive mismatch against both the
+    /// workspace's branch and its `baseRef` (`pr:unlinked`).
     Unlinked,
 }
 
@@ -172,6 +174,110 @@ pub(crate) fn pr_matches_branch(pr: &PullRequest, branch: &str) -> bool {
 /// clears a stale link when the source branch is present and differs.
 pub(crate) fn pr_branch_mismatch(pr: &PullRequest, branch: &str) -> bool {
     !pr.source_branch.is_empty() && !branch.is_empty() && pr.source_branch != branch
+}
+
+/// Port of the FE `baseref-matching.ts::matchesBaseRef` (§7.6): true when a
+/// PR's `source_branch` matches the workspace's `baseRef`. Raw equality always
+/// wins (covers plain branches and slashed local branches alike); when
+/// `base_ref` starts with a known remote from [`crate::CANONICAL_BASE_REF_REMOTES`]
+/// the stripped remainder is also compared — defensive, covering legacy rows
+/// persisted before write-side canonicalisation. First path segments outside
+/// the allowlist are NOT stripped (`feature/foo` never matches `foo`);
+/// empty/absent inputs never match.
+pub(crate) fn matches_base_ref(pr_source_branch: &str, base_ref: Option<&str>) -> bool {
+    let Some(base_ref) = base_ref.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if pr_source_branch.is_empty() {
+        return false;
+    }
+    if pr_source_branch == base_ref {
+        return true;
+    }
+    let stripped = crate::canonicalise_base_ref(base_ref);
+    stripped != base_ref && stripped == pr_source_branch
+}
+
+/// Combined §7.6 link predicate: a PR matches a workspace when its head ref
+/// equals the workspace's own `branch` OR its source branch matches the
+/// workspace's `baseRef`. Branch match takes precedence where ordering
+/// matters (see [`discover_matching_open_pr`]).
+pub(crate) fn pr_matches_workspace(pr: &PullRequest, branch: &str, base_ref: Option<&str>) -> bool {
+    pr_matches_branch(pr, branch) || matches_base_ref(&pr.source_branch, base_ref)
+}
+
+/// Port of the FE `getBaseRefMatchCandidates`: the head-query candidates for a
+/// workspace `baseRef` — the raw value plus the allowlist-stripped remainder
+/// when it differs (legacy remote-qualified rows). Empty/absent `baseRef`
+/// yields no candidates.
+pub(crate) fn base_ref_match_candidates(base_ref: Option<&str>) -> Vec<String> {
+    let Some(base_ref) = base_ref.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let mut candidates = vec![base_ref.to_string()];
+    let stripped = crate::canonicalise_base_ref(base_ref);
+    if stripped != base_ref {
+        candidates.push(stripped);
+    }
+    candidates
+}
+
+/// Discover the open PR a workspace should link (§7.6): query head = the
+/// workspace's own `branch` first (branch match takes precedence); when that
+/// yields no match, fall back to one open-PR query per `baseRef` candidate
+/// (skipping candidates equal to `branch` — already covered) and accept PRs
+/// matching the combined branch-OR-baseRef predicate. `exclude` drops a
+/// just-merged/closed PR number so relink never loops back onto it. When
+/// several PRs match, the highest number wins so selection is deterministic
+/// regardless of forge sort order.
+pub(crate) async fn discover_matching_open_pr(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    branch: &str,
+    base_ref: Option<&str>,
+    exclude: Option<u64>,
+) -> std::result::Result<Option<PullRequest>, intent_sourcecontrol::Error> {
+    if !branch.is_empty() {
+        let query = PrQuery {
+            state: Some(PrState::Open),
+            head: Some(branch.to_string()),
+            ..Default::default()
+        };
+        if let Some(pr) = sc
+            .list_prs(repo_ref, query)
+            .await?
+            .items
+            .into_iter()
+            .filter(|p| Some(p.number) != exclude && pr_matches_branch(p, branch))
+            .max_by_key(|p| p.number)
+        {
+            return Ok(Some(pr));
+        }
+    }
+    let mut best: Option<PullRequest> = None;
+    for candidate in base_ref_match_candidates(base_ref) {
+        if candidate == branch {
+            continue;
+        }
+        let query = PrQuery {
+            state: Some(PrState::Open),
+            head: Some(candidate),
+            ..Default::default()
+        };
+        let matched = sc
+            .list_prs(repo_ref, query)
+            .await?
+            .items
+            .into_iter()
+            .filter(|p| Some(p.number) != exclude && pr_matches_workspace(p, branch, base_ref))
+            .max_by_key(|p| p.number);
+        if let Some(p) = matched {
+            if best.as_ref().map_or(true, |b| p.number > b.number) {
+                best = Some(p);
+            }
+        }
+    }
+    Ok(best)
 }
 
 /// Upsert a PR snapshot into the daemon-owned `workspace.pull_requests` list
@@ -864,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_on_head_ref_not_baseref() {
+    fn branch_predicate_matches_on_head_ref() {
         // The sample PR's `source_branch` (head.ref) is "feat".
         let p = pr(PrState::Open, false, Some(true), Some("clean"));
         assert!(pr_matches_branch(&p, "feat"));
@@ -889,6 +995,100 @@ mod tests {
         assert!(!pr_branch_mismatch(&empty, "feat"));
         // Empty workspace branch: cannot determine → never a mismatch.
         assert!(!pr_branch_mismatch(&p, ""));
+    }
+
+    #[test]
+    fn base_ref_matches_on_raw_equality() {
+        // Mirrors `baseref-matching.test.ts`: plain and slashed local
+        // branches match raw-equal, without any stripping.
+        assert!(matches_base_ref("main", Some("main")));
+        assert!(matches_base_ref("feature/foo", Some("feature/foo")));
+        assert!(!matches_base_ref("dev", Some("main")));
+    }
+
+    #[test]
+    fn base_ref_strips_only_known_remote_prefixes() {
+        // Allowlisted remotes are stripped for the comparison…
+        assert!(matches_base_ref("main", Some("origin/main")));
+        assert!(matches_base_ref(
+            "release/1.0",
+            Some("upstream/release/1.0")
+        ));
+        assert!(matches_base_ref("foo", Some("fork/foo")));
+        // …but slashed local branches / unknown remotes are NOT stripped.
+        assert!(!matches_base_ref("foo", Some("feature/foo")));
+        assert!(!matches_base_ref("main", Some("myremote/main")));
+        assert!(!matches_base_ref("dev", Some("origin/main")));
+    }
+
+    #[test]
+    fn base_ref_empty_inputs_never_match() {
+        assert!(!matches_base_ref("", Some("main")));
+        assert!(!matches_base_ref("main", None));
+        assert!(!matches_base_ref("main", Some("")));
+        assert!(!matches_base_ref("", None));
+    }
+
+    #[test]
+    fn base_ref_candidates_follow_allowlist_rule() {
+        // Mirrors the FE `getBaseRefMatchCandidates` cases.
+        assert_eq!(
+            base_ref_match_candidates(Some("origin/foo")),
+            vec!["origin/foo".to_string(), "foo".to_string()]
+        );
+        assert_eq!(
+            base_ref_match_candidates(Some("upstream/release/1.0")),
+            vec![
+                "upstream/release/1.0".to_string(),
+                "release/1.0".to_string()
+            ]
+        );
+        assert_eq!(
+            base_ref_match_candidates(Some("feature/foo")),
+            vec!["feature/foo".to_string()]
+        );
+        assert_eq!(
+            base_ref_match_candidates(Some("main")),
+            vec!["main".to_string()]
+        );
+        assert!(base_ref_match_candidates(None).is_empty());
+        assert!(base_ref_match_candidates(Some("")).is_empty());
+    }
+
+    #[test]
+    fn combined_predicate_matches_branch_or_base_ref() {
+        // The sample PR's `source_branch` is "feat".
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        // Branch match alone.
+        assert!(pr_matches_workspace(&p, "feat", None));
+        // baseRef match alone (plain and legacy remote-qualified).
+        assert!(pr_matches_workspace(&p, "other", Some("feat")));
+        assert!(pr_matches_workspace(&p, "other", Some("origin/feat")));
+        // Neither matches.
+        assert!(!pr_matches_workspace(&p, "other", Some("main")));
+        assert!(!pr_matches_workspace(&p, "other", None));
+        // Empty source branch matches nothing.
+        let mut empty = p.clone();
+        empty.source_branch = String::new();
+        assert!(!pr_matches_workspace(&empty, "feat", Some("feat")));
+    }
+
+    #[test]
+    fn base_ref_match_prevents_stale_unlink() {
+        // The unlink rule is `pr_branch_mismatch && !matches_base_ref`: a PR
+        // whose head equals the workspace's `baseRef` (review workspace)
+        // stays linked despite a positive branch mismatch.
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        assert!(pr_branch_mismatch(&p, "review-ws"));
+        assert!(matches_base_ref(&p.source_branch, Some("feat")));
+        let unlinks = pr_branch_mismatch(&p, "review-ws")
+            && !matches_base_ref(&p.source_branch, Some("feat"));
+        assert!(!unlinks);
+        // A positive mismatch against BOTH still unlinks.
+        assert!(
+            pr_branch_mismatch(&p, "review-ws")
+                && !matches_base_ref(&p.source_branch, Some("main"))
+        );
     }
 
     #[test]

@@ -1541,15 +1541,17 @@ impl Services {
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
     /// any change and emitting the matching `pr:*` event. Used both on demand
     /// and by the background loop. The matching rule is `pr.head.ref ==
-    /// workspace.branch` (NOT baseRef). When the workspace is already linked the
-    /// PR is re-fetched and its snapshot diffed (clearing a stale link on a
-    /// positive branch mismatch); a linked PR fetched as merged/closed stays
-    /// recorded in `pull_requests` and triggers discovery of a newer open PR on
-    /// the same branch (relinking + `pr:linked` when found); when unlinked, an
-    /// open PR whose head ref equals the branch is discovered and linked. Every
-    /// refreshed/discovered PR snapshot is upserted into the daemon-owned
-    /// `pull_requests` list. Remote/archived workspaces, and those lacking
-    /// repo/branch info, are skipped. A missing forge token (no
+    /// workspace.branch` OR a `baseRef` match ([`pr_ops::matches_base_ref`],
+    /// TS `performBackgroundEnrichment` parity). When the workspace is already
+    /// linked the PR is re-fetched and its snapshot diffed (clearing a stale
+    /// link only on a positive mismatch against BOTH branch and baseRef); a
+    /// linked PR fetched as merged/closed stays recorded in `pull_requests`
+    /// and triggers discovery of a newer open PR under the same rule
+    /// (relinking + `pr:linked` when found); when unlinked, an open PR
+    /// matching the branch — or, failing that, the baseRef — is discovered and
+    /// linked. Every refreshed/discovered PR snapshot is upserted into the
+    /// daemon-owned `pull_requests` list. Remote/archived workspaces, and
+    /// those lacking repo/branch info, are skipped. A missing forge token (no
     /// injected/registry provider) surfaces as `Internal`.
     pub async fn refresh_workspace_pr(
         &self,
@@ -1599,8 +1601,12 @@ impl Services {
                     .get_pr(&repo_ref, number)
                     .await
                     .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive branch mismatch.
-                if pr_ops::pr_branch_mismatch(&pr, &ws.branch) {
+                // Clear a stale link only on a positive branch mismatch that
+                // is not rescued by a baseRef match (review workspaces link
+                // PRs whose head equals the workspace's `baseRef`, §7.6).
+                if pr_ops::pr_branch_mismatch(&pr, &ws.branch)
+                    && !pr_ops::matches_base_ref(&pr.source_branch, ws.base_ref.as_deref())
+                {
                     ws.pr_number = None;
                     ws.pr_url = None;
                     ws.pr_status = None;
@@ -1615,39 +1621,37 @@ impl Services {
                 let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                 // A merged/closed linked PR stays recorded in `pull_requests`
                 // but no longer blocks discovery: relink to a newer open PR
-                // whose head ref equals the branch, so the workspace follows
-                // the latest PR without waiting for an unlink. A discovery
-                // failure degrades to the plain update path below so the
-                // merged/closed status delta is never lost to a transient
-                // `list_prs` error (the next sweep retries discovery).
+                // matching the branch (or, failing that, the baseRef), so the
+                // workspace follows the latest PR without waiting for an
+                // unlink. A discovery failure degrades to the plain update
+                // path below so the merged/closed status delta is never lost
+                // to a transient `list_prs` error (the next sweep retries
+                // discovery).
                 if matches!(
                     info.status,
                     intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-                ) && !ws.branch.is_empty()
+                ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
                 {
-                    let query = intent_sourcecontrol::PrQuery {
-                        state: Some(intent_sourcecontrol::PrState::Open),
-                        head: Some(ws.branch.clone()),
-                        ..Default::default()
-                    };
-                    let prs = match sc.list_prs(&repo_ref, query).await {
-                        Ok(page) => page.items,
+                    let discovered = match pr_ops::discover_matching_open_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &ws.branch,
+                        ws.base_ref.as_deref(),
+                        Some(number),
+                    )
+                    .await
+                    {
+                        Ok(found) => found,
                         Err(e) => {
                             tracing::warn!(
                                 workspace_id = %workspace_id.as_str(),
                                 error = %e,
                                 "pr refresh: relink discovery failed, persisting status only"
                             );
-                            Vec::new()
+                            None
                         }
                     };
-                    // Highest PR number wins so successor selection is
-                    // deterministic regardless of forge sort order.
-                    if let Some(open_pr) = prs
-                        .into_iter()
-                        .filter(|p| p.number != number && pr_ops::pr_matches_branch(p, &ws.branch))
-                        .max_by_key(|p| p.number)
-                    {
+                    if let Some(open_pr) = discovered {
                         let open_info = pr_ops::build_pr_info(&open_pr);
                         pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
                         ws.pr_number = Some(open_pr.number);
@@ -1676,24 +1680,21 @@ impl Services {
                 Ok(PrRefreshOutcome::Updated)
             }
             None => {
-                // Discovery: link an open PR whose head ref equals the branch.
-                if ws.branch.is_empty() {
+                // Discovery: link an open PR matching the branch, or —
+                // failing that — the workspace's baseRef (§7.6).
+                if ws.branch.is_empty() && ws.base_ref.is_none() {
                     return Ok(PrRefreshOutcome::Skipped);
                 }
-                let query = intent_sourcecontrol::PrQuery {
-                    state: Some(intent_sourcecontrol::PrState::Open),
-                    head: Some(ws.branch.clone()),
-                    ..Default::default()
-                };
-                let prs = sc
-                    .list_prs(&repo_ref, query)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?
-                    .items;
-                match prs
-                    .into_iter()
-                    .find(|p| pr_ops::pr_matches_branch(p, &ws.branch))
-                {
+                let found = pr_ops::discover_matching_open_pr(
+                    sc.as_ref(),
+                    &repo_ref,
+                    &ws.branch,
+                    ws.base_ref.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+                match found {
                     Some(pr) => {
                         let info = pr_ops::build_pr_info(&pr);
                         pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
@@ -1714,8 +1715,9 @@ impl Services {
 
     /// Refresh active workspaces' PR linkage: existing links are re-fetched
     /// (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and unlinked
-    /// workspaces discover a matching open PR by head ref (branch-only
-    /// matching per §7.6 — `pr.head.ref == workspace.branch`), persisting the
+    /// workspaces discover a matching open PR by head ref or baseRef
+    /// (per §7.6 — `pr.head.ref == workspace.branch` OR
+    /// [`pr_ops::matches_base_ref`]), persisting the
     /// link + emitting `pr:linked` on first match. Remote/archived workspaces and
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
@@ -1767,8 +1769,8 @@ impl Services {
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` it sweeps
-    /// active workspaces — discovering open PRs by head-ref match for
-    /// unlinked workspaces (emitting `pr:linked`) and updating linked PRs
+    /// active workspaces — discovering open PRs by head-ref or baseRef match
+    /// for unlinked workspaces (emitting `pr:linked`) and updating linked PRs
     /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
     /// `interval` and refreshes every workspace (tick 0); thereafter the sweep
     /// is tiered by recency (see [`Services::refresh_all_workspace_prs`]) so
