@@ -353,7 +353,8 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["data"]["triggeredBy"]["newStatus"], "in_progress");
     assert!(e["data"]["computedAt"].is_string());
 
-    // comment.add → comment:added { noteId, commentId }.
+    // comment.add → note:updated (the add rewrites the note markdown with
+    // anchor markers, monorepo#638) followed by comment:added.
     let added = rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -369,6 +370,13 @@ async fn crud_mutations_emit_change_events_over_uds() {
     )
     .await;
     let comment_id = added["commentId"].as_str().unwrap().to_string();
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "note:updated");
+    assert_eq!(
+        e["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+    );
     let ev = read_json(&mut sub_reader).await;
     let e = &ev["params"]["event"];
     assert_eq!(e["type"], "comment:added");
