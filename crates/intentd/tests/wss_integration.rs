@@ -2105,24 +2105,64 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
-    // NOTE: This test verifies fixed-port restart semantics (same port reclaimed
-    // after stop). Pick a dynamically-available port to avoid hard-coded collisions.
-    let fixed_port = free_port();
-    let srv = start(WsOptions {
-        base_port: fixed_port,
-        ..WsOptions::default()
-    })
-    .await;
-    let port = srv.port;
-    srv.ws.stop().await;
-    // Re-start the SAME listener immediately; the freed port must rebind.
-    let again = srv
-        .ws
-        .start()
-        .await
-        .expect("restart binds with no EADDRINUSE");
-    assert_eq!(again, port, "restart should reclaim the same port");
-    srv.ws.stop().await;
+    // Verifies fixed-port restart semantics: a graceful `stop()` fully releases
+    // the listen port (it awaits the accept loop) so the SAME listener can
+    // immediately rebind it. `free_port()` hands back a port from the kernel's
+    // ephemeral range, so under parallel test load another process's
+    // `base_port: 0` bind can be assigned that port inside either
+    // release->bind window (before the first start, or between stop and
+    // restart); the listener is single-bind fail-fast by design (§5.6, no port
+    // walking), so that exogenous contention surfaces as `AddrInUse`. Retry the
+    // whole scenario on a fresh port within a bounded number of attempts
+    // (monorepo#466); any non-`AddrInUse` error still fails immediately.
+    let (api, bus, _store, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    const MAX_ATTEMPTS: u32 = 10;
+    for _ in 0..MAX_ATTEMPTS {
+        let fixed_port = free_port();
+        let opts = WsOptions {
+            base_port: fixed_port,
+            bind_address: Ipv4Addr::LOCALHOST.into(),
+            ..WsOptions::default()
+        };
+        let ws = WsApiServer::new(
+            api.clone(),
+            bus.clone(),
+            &tls,
+            token_store.clone(),
+            opts,
+            None,
+        )
+        .expect("server");
+        let port = match ws.start().await {
+            Ok(port) => port,
+            // A concurrent ephemeral bind stole the port before our first
+            // bind; the scenario never started, so retry on a fresh port.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("first start failed with non-contention error: {e}"),
+        };
+        assert_eq!(port, fixed_port, "fixed-port bind honours base_port");
+        ws.stop().await;
+        // Re-start the SAME listener immediately; the freed port must rebind.
+        match ws.start().await {
+            Ok(again) => {
+                assert_eq!(again, port, "restart should reclaim the same port");
+                ws.stop().await;
+                return;
+            }
+            // stop() released the port but an exogenous bind grabbed it in
+            // the stop->restart gap; retry on a fresh port.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("restart failed with non-contention error: {e}"),
+        }
+    }
+    panic!(
+        "gave up after {MAX_ATTEMPTS} attempts: every scenario lost its port to \
+         concurrent ephemeral binds"
+    );
 }
 
 #[tokio::test]
