@@ -164,13 +164,24 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reject a bare model id that provably belongs to a different provider's
-/// static tiers with `-32602` (InvalidParams). Persisting the mismatch would
-/// make the spawn path feed another provider's model id to `provider_id`'s
-/// binary (monorepo#607). Ownership is decided by `PROVIDER_MODEL_TIERS`
-/// only (deterministic, no probe dependency): bare ids unknown to every
-/// static tier pass unchanged. `method` names the rejecting RPC in the
-/// message.
+/// Reject a bare model id that provably belongs to a different provider with
+/// `-32602` (InvalidParams). Persisting the mismatch would make the spawn
+/// path feed another provider's model id to `provider_id`'s binary
+/// (monorepo#607). Ownership evidence is deterministic and probe-free:
+/// `PROVIDER_MODEL_TIERS` (static tiers) unioned with the in-memory
+/// last-good `ModelCatalogCache` entries under each provider's current
+/// registry version key — never a live fetch, so create/setModel cannot
+/// block on a catalog probe.
+///
+/// Evidence is asymmetric by strength:
+/// - a **static-tier** claim by another provider rejects outright (the
+///   original #425 rule, unchanged) unless the requested provider itself
+///   claims the id (static or cached);
+/// - a **cached-catalog** claim by another provider rejects only when the
+///   requested provider's ownership is affirmatively *disproven* — no static
+///   claim AND its own cached catalog exists but lacks the id. With no cache
+///   entry for the requested provider (cold start, expired pin), the bare id
+///   passes — absence of evidence is not a mismatch.
 ///
 /// Two spawn-parity carve-outs:
 /// - the literal `"default"` id is claude-code's smart-tier *sentinel*
@@ -182,15 +193,32 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
 ///   spawn would actually run, not as the raw alias string.
 fn ensure_bare_model_matches_provider(
     method: &str,
+    cache: &crate::model_catalog::ModelCatalogCache,
     provider_id: &str,
     model_id: &str,
 ) -> Result<()> {
     if model_id == "default" {
         return Ok(());
     }
-    let owners = intent_providers::providers_claiming_model(model_id);
     let effective = intent_providers::provider_config(provider_id).id;
-    if !owners.is_empty() && !owners.contains(&effective) {
+    let static_owners = intent_providers::providers_claiming_model(model_id);
+    // The requested provider provably owns the id — static tier or its own
+    // current cached catalog — so any other claim is a shared id, not a
+    // mismatch.
+    let requested_cache = cache.cached_catalog_claims(effective, model_id);
+    if static_owners.contains(&effective) || requested_cache == Some(true) {
+        return Ok(());
+    }
+    let cached_owners = cache.providers_claiming_model_cached(model_id);
+    let reject =
+        !static_owners.is_empty() || (!cached_owners.is_empty() && requested_cache == Some(false));
+    if reject {
+        let mut owners: Vec<String> = static_owners.iter().map(|s| s.to_string()).collect();
+        for owner in cached_owners {
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
         return Err(Error::InvalidParams(format!(
             "{method}: model {model_id} does not belong to provider {effective} \
              (providers with this model: {})",
@@ -1464,13 +1492,14 @@ impl Services {
                 let (model_provider, _) = intent_providers::parse_compound_model_id(m);
                 ensure_known_provider("agent.create", &model_provider)?;
             } else {
-                // A bare model that provably belongs to a different provider's
-                // static tiers must not be persisted either: the spawn would
-                // feed the effective provider another provider's model id
-                // (monorepo#607). The effective provider mirrors
-                // `resolve_provider_id` for a bare model: provider field →
-                // default. Bare ids unknown to every static tier pass —
-                // ownership cannot be proven for dynamic-only model lists.
+                // A bare model that provably belongs to a different provider
+                // — static tiers or cached dynamic catalogs — must not be
+                // persisted either: the spawn would feed the effective
+                // provider another provider's model id (monorepo#607). The
+                // effective provider mirrors `resolve_provider_id` for a bare
+                // model: provider field → default. Bare ids with no ownership
+                // evidence pass — ownership cannot be proven for dynamic-only
+                // model lists that were never fetched.
                 //
                 // Only a *client-supplied* mismatch hard-fails. A mismatch in
                 // a derived default (specialist frontmatter / settings chain
@@ -1482,7 +1511,12 @@ impl Services {
                 let effective = provider
                     .as_deref()
                     .unwrap_or(intent_providers::default_provider_id());
-                match ensure_bare_model_matches_provider("agent.create", effective, m) {
+                match ensure_bare_model_matches_provider(
+                    "agent.create",
+                    &self.models_catalog,
+                    effective,
+                    m,
+                ) {
                     Ok(()) => {}
                     Err(e) if model_explicit => return Err(e),
                     Err(e) => {
@@ -1625,14 +1659,19 @@ impl Services {
             // A bare model is validated against the session's effective
             // provider (same precedence as `resolve_provider_id` when the
             // model has no prefix: session.provider → default): a bare id
-            // provably owned by another provider's static tiers is the same
-            // misroute vector (monorepo#607).
+            // provably owned by another provider — static tiers or cached
+            // dynamic catalogs — is the same misroute vector (monorepo#607).
             let effective = session
                 .provider
                 .as_deref()
                 .filter(|p| !p.is_empty())
                 .unwrap_or(intent_providers::default_provider_id());
-            ensure_bare_model_matches_provider("agent.setModel", effective, &model_id)?;
+            ensure_bare_model_matches_provider(
+                "agent.setModel",
+                &self.models_catalog,
+                effective,
+                &model_id,
+            )?;
             None
         };
         session.model = Some(model_id.clone());

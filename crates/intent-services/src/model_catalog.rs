@@ -349,6 +349,32 @@ impl ModelCatalogCache {
         (entry.version_key == version_key).then(|| entry.models.clone())
     }
 
+    /// Cached-catalog ownership evidence for one provider (monorepo#607):
+    /// `Some(claims)` when `provider_id` holds an in-memory last-good entry
+    /// under its **current** registry version key ([`source_for`]), `None`
+    /// when there is no usable entry (unregistered provider, no entry, or a
+    /// version-key mismatch — stale-pin entries are not evidence).
+    /// Synchronous and read-only: no probe, no TTL check, no negative-cache
+    /// interaction — the bare-model ownership guard must never block on or
+    /// trigger a fetch.
+    pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
+        let source = source_for(provider_id)?;
+        let version_key = (source.version_key)();
+        let entries = self.entries.lock().expect("model catalog cache poisoned");
+        let entry = entries.get(provider_id)?;
+        (entry.version_key == version_key).then(|| rows_claim_model(&entry.models, bare_id))
+    }
+
+    /// Provider ids whose cached catalog claims `bare_id` (see
+    /// [`Self::cached_catalog_claims`]), in registry order.
+    pub(crate) fn providers_claiming_model_cached(&self, bare_id: &str) -> Vec<String> {
+        SOURCES
+            .iter()
+            .filter(|s| self.cached_catalog_claims(s.provider_id, bare_id) == Some(true))
+            .map(|s| s.provider_id.to_string())
+            .collect()
+    }
+
     /// Record a successful fetch and best-effort persist the snapshot. The
     /// write happens under the entries lock (the file is tiny — a handful of
     /// model rows) so concurrent stores for different providers cannot land
@@ -587,6 +613,15 @@ fn failure_fallback(
             warning: Some(reason),
         },
     }
+}
+
+/// Whether any cached wire row (`{ id, name, provider }`, §5.30) names
+/// `bare_id`. Row ids are matched exactly, tolerating a compound
+/// `provider:model` id by comparing its bare part (monorepo#607).
+fn rows_claim_model(rows: &[Value], bare_id: &str) -> bool {
+    rows.iter()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+        .any(|id| id == bare_id || id.split_once(':').is_some_and(|(_, bare)| bare == bare_id))
 }
 
 #[cfg(test)]
