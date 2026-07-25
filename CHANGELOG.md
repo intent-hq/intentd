@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7] - 2026-07-25
+
+### 🚀 Features
+
+- BaseRef-aware PR-workspace matching (intent-hq/monorepo#459)
+- Add hidden flag to specialist definitions ([#471](https://github.com/intent-hq/intentd/pull/471))
+- Turn-attachment registry for deterministic resource-block attach ([#482](https://github.com/intent-hq/intentd/pull/482))
+
+### 🐛 Bug Fixes
+
+- Comment.getThread/resolveThread/list caller-input errors return -32602 (intent-hq/monorepo#649)
+- *(test)* Scale fixed 5s daemon-read timeouts by the shared test budget (intent-hq/monorepo#615) ([#457](https://github.com/intent-hq/intentd/pull/457))
+- Reject review-requested filter on github.issues.search (intent-hq/monorepo#551) ([#462](https://github.com/intent-hq/intentd/pull/462))
+- Include script:output in ephemeral event retention sweep (monorepo#620) ([#432](https://github.com/intent-hq/intentd/pull/432))
+- Inherit hidden flag across specialist tiers ([#480](https://github.com/intent-hq/intentd/pull/480))
+
+### ⚡ Performance
+
+- Relax sweep cadences and pause between workspaces (monorepo#703) ([#465](https://github.com/intent-hq/intentd/pull/465))
+
+### 🧪 Testing
+
+- Deflake queue-drain event-order race in e2e_wss_agent_lifecycle (monorepo#456) ([#459](https://github.com/intent-hq/intentd/pull/459))
+
+
 ## [0.2.6] - 2026-07-24
 
 ### 🚀 Features
