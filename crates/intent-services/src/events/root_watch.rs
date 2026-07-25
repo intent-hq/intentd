@@ -95,13 +95,21 @@ fn recursive_watcher(
     // report canonicalized paths, so a symlinked root (e.g. `/var` →
     // `/private/var` on macOS) would otherwise never match.
     let canonical = canonical_root(root, root);
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            if event_matches(&event, &canonical, filename_matches) {
-                on_change();
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(event) => {
+                if event_matches(&event, &canonical, filename_matches) {
+                    on_change();
+                }
             }
-        }
-    })?;
+            Err(e) => {
+                tracing::warn!(
+                    root = %canonical.display(),
+                    error = %e,
+                    "recursive watcher callback error; events may be missed"
+                );
+            }
+        })?;
     watcher.watch(root, RecursiveMode::Recursive)?;
     Ok(watcher)
 }
@@ -139,11 +147,18 @@ async fn promote_loop(
 
         let ancestor = find_existing_ancestor(&root);
         let tx = wake_tx.clone();
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                let _ = tx.send(());
-            }
-        });
+        let watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+                Ok(_) => {
+                    let _ = tx.send(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ancestor watcher callback error; root creation may go undetected"
+                    );
+                }
+            });
         let mut watcher = match watcher {
             Ok(w) => w,
             Err(e) => {
