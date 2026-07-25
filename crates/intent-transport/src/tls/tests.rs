@@ -143,3 +143,24 @@ fn ensure_caches_and_exposes_fingerprint() {
     // Clear cache after test to avoid polluting other tests.
     clear_cert_cache();
 }
+
+#[test]
+fn generated_pem_parses_with_rustls_pemfile() {
+    // Regression test for the WSS acceptor path (`ws.rs`): the rcgen-generated
+    // cert/key PEM must remain parseable by `rustls_pemfile`, otherwise the
+    // WSS listener cannot start in secure mode.
+    let dir = unique_dir("rustlsparse");
+    let generated = generate_new_cert(&dir).unwrap();
+
+    let mut cert_reader: &[u8] = generated.cert.as_bytes();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<_, _>>()
+        .expect("generated cert PEM must parse");
+    assert!(!certs.is_empty(), "cert PEM must contain a certificate");
+
+    let mut key_reader: &[u8] = generated.key.as_bytes();
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .expect("generated key PEM must parse")
+        .expect("key PEM must contain a private key");
+    assert!(matches!(key, rustls::pki_types::PrivateKeyDer::Pkcs8(_)));
+}
