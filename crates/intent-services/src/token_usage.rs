@@ -1,12 +1,19 @@
-//! Token-usage tallying for the daemon-internal periodic scan job (§5.23 / §19.1).
+//! Token-usage tallying for the workspace `TokenUsage` snapshot (§5.23 / §19.1),
+//! shared by the end-of-turn live update (primary) and the daemon-internal
+//! periodic reconciliation scan.
 //!
-//! The scan loop (in `lib.rs`, alongside the PR refresh loop) lists a workspace's
-//! agent sessions and rolls each session's per-turn token counters up into the
-//! durable `TokenUsage` workspace field surfaced by `workspace.getTokenUsage`.
-//! The aggregation here is pure and side-effect free so it is unit-testable
+//! **Live-primary / scan-reconciliation split**: the end-of-turn live update
+//! (`agent_session.rs`) persists each session's cumulative usage snapshot and
+//! re-aggregates immediately, so the workspace tally is fresh at every turn
+//! end. The 300 s scan loop (in `lib.rs`, alongside the PR refresh loop) is a
+//! reconciliation pass: per-session tallies prefer the stored snapshot when
+//! present ([`agent_token_tally`]) and fall back to legacy per-message usage
+//! summing only for sessions that never reported end-of-turn usage. The
+//! aggregation here is pure and side-effect free so it is unit-testable
 //! without a store or bus; only the read + `workspace:tokenUsage-changed` event
 //! cross the wire (the scan itself has no RPC, §6.8).
 
+use intent_acp::session::Usage;
 use intent_core::{AgentSession, TokenUsage, TokenUsageTotals};
 use serde_json::Value;
 
@@ -72,6 +79,51 @@ pub fn session_token_tally(session: &AgentSession) -> AgentTokenTally {
         agent_id: session.id.0.clone(),
         model: session.model.clone().unwrap_or_default(),
         totals,
+    }
+}
+
+/// Interpret one end-of-turn ACP `Usage` report as the session's cumulative
+/// [`TokenUsageTotals`] snapshot.
+///
+/// **Cumulative-replace interpretation** (isolated here on purpose): the ACP
+/// `unstable_end_turn_token_usage` extension documents its counters as totals
+/// "across all turns" of the ACP session, so each report REPLACES the
+/// session's previous snapshot — reports are never summed. The ACP RFD is
+/// still Draft; if the semantics flip to per-turn deltas later, this function
+/// (and its callers' replace-vs-add choice) is the single place to change.
+///
+/// Field mapping: `cachedReadTokens` → `cacheReadTokens` and
+/// `cachedWriteTokens` → `cacheCreationTokens`; absent optional counters map
+/// to zero. `thoughtTokens` has no slot in [`TokenUsageTotals`] and is
+/// intentionally dropped (as is `totalTokens`, which is derivable).
+pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
+    TokenUsageTotals {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cached_read_tokens.unwrap_or(0),
+        cache_creation_tokens: usage.cached_write_tokens.unwrap_or(0),
+    }
+}
+
+/// One agent's tally for the workspace roll-up, preferring the persisted
+/// end-of-turn snapshot when the session has one (§5.23): the snapshot is
+/// already cumulative for the session (see [`snapshot_from_turn_usage`]), so
+/// it is used as-is; sessions that never reported end-of-turn usage fall back
+/// to summing per-message usage metadata via
+/// [`agent_token_tally_from_contents`].
+pub fn agent_token_tally(
+    agent_id: &str,
+    model: Option<&str>,
+    snapshot: Option<&TokenUsageTotals>,
+    contents: &[serde_json::Value],
+) -> AgentTokenTally {
+    match snapshot {
+        Some(totals) => AgentTokenTally {
+            agent_id: agent_id.to_string(),
+            model: model.unwrap_or("").to_string(),
+            totals: totals.clone(),
+        },
+        None => agent_token_tally_from_contents(agent_id, model, contents),
     }
 }
 
@@ -163,6 +215,71 @@ mod tests {
             extract_message_usage(&serde_json::json!({ "content": "hi" })),
             None
         );
+    }
+
+    #[test]
+    fn snapshot_from_turn_usage_maps_cached_fields() {
+        // `Usage` is #[non_exhaustive]; construct via its camelCase wire form.
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 120,
+            "inputTokens": 70,
+            "outputTokens": 50,
+            "thoughtTokens": 8,
+            "cachedReadTokens": 30,
+            "cachedWriteTokens": 4
+        }))
+        .expect("usage deserializes");
+        assert_eq!(snapshot_from_turn_usage(&usage), totals(70, 50, 30, 4));
+
+        // Absent optional counters map to zero.
+        let sparse: Usage = serde_json::from_value(serde_json::json!({
+            "totalTokens": 3,
+            "inputTokens": 2,
+            "outputTokens": 1
+        }))
+        .expect("sparse usage deserializes");
+        assert_eq!(snapshot_from_turn_usage(&sparse), totals(2, 1, 0, 0));
+    }
+
+    #[test]
+    fn agent_token_tally_prefers_snapshot_over_contents() {
+        let contents = vec![serde_json::json!({ "usage": { "inputTokens": 999 } })];
+        let snapshot = totals(70, 50, 30, 4);
+        // Snapshot present → used as-is; message usage is NOT added on top.
+        let tally = agent_token_tally("agent-s", Some("opus-4.8"), Some(&snapshot), &contents);
+        assert_eq!(tally.totals, snapshot);
+        assert_eq!(tally.model, "opus-4.8");
+        // No snapshot → falls back to summing message usage.
+        let fallback = agent_token_tally("agent-s", None, None, &contents);
+        assert_eq!(fallback.totals, totals(999, 0, 0, 0));
+    }
+
+    #[test]
+    fn mixed_snapshot_and_fallback_sessions_aggregate_correctly() {
+        // One session with a persisted end-of-turn snapshot (its message
+        // usage must be ignored), one snapshot-less session that falls back
+        // to per-message summing.
+        let snap_contents = vec![serde_json::json!({ "usage": { "inputTokens": 500 } })];
+        let snapshot = totals(40, 30, 20, 10);
+        let legacy_contents = vec![
+            serde_json::json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } }),
+            serde_json::json!({ "_meta": { "usage": { "cacheReadTokens": 2 } } }),
+        ];
+        let tallies = vec![
+            agent_token_tally(
+                "agent-snap",
+                Some("opus-4.8"),
+                Some(&snapshot),
+                &snap_contents,
+            ),
+            agent_token_tally("agent-legacy", Some("sonnet-5"), None, &legacy_contents),
+        ];
+        let usage = aggregate_token_usage(&tallies);
+        assert_eq!(usage.by_agent_id["agent-snap"], totals(40, 30, 20, 10));
+        assert_eq!(usage.by_agent_id["agent-legacy"], totals(7, 3, 2, 0));
+        assert_eq!(usage.totals, totals(47, 33, 22, 10));
+        assert_eq!(usage.by_model["opus-4.8"], totals(40, 30, 20, 10));
+        assert_eq!(usage.by_model["sonnet-5"], totals(7, 3, 2, 0));
     }
 
     #[test]

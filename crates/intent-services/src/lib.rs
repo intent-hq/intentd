@@ -1866,14 +1866,19 @@ impl Services {
         })
     }
 
-    /// Recompute one workspace's durable `tokenUsage` by tallying its agent
-    /// sessions per agent and per model (§5.23 / §19.1), persisting the snapshot
-    /// and emitting `workspace:tokenUsage-changed` only when the materialized
-    /// tally (ignoring `lastScanAt`) actually changed. Daemon-internal — there is
+    /// **Reconciliation** pass for one workspace's durable `tokenUsage`
+    /// (§5.23 / §19.1). The end-of-turn live update in `agent_session.rs` is
+    /// the primary writer; this scan exists to catch up sessions the live
+    /// path cannot see (providers that never report end-of-turn usage and
+    /// legacy per-message usage metadata). Persists the snapshot and emits
+    /// `workspace:tokenUsage-changed` only when the materialized tally
+    /// (ignoring `lastScanAt`) actually changed. Daemon-internal — there is
     /// no scan RPC. Returns whether a change was written. `NotFound` if the
     /// workspace is absent. **Incremental** (finding F2): skips when the
     /// agent_message watermark is unchanged since the last scan, and hydrates
-    /// only usage metadata (not full message logs) when a scan does run.
+    /// only usage metadata (not full message logs) when a scan does run. As a
+    /// reconciler it never clobbers a fresher live snapshot with an all-zero
+    /// tally (see [`Services::recompute_workspace_token_usage`]).
     pub async fn scan_workspace_token_usage(&self, workspace_id: &WorkspaceId) -> Result<bool> {
         // Cheap change detection: skip when the watermark is unchanged (finding F2).
         let current_watermark = self
@@ -1893,21 +1898,80 @@ impl Services {
             }
         }
 
-        // Watermark changed or first scan: tally usage without hydrating full message logs.
+        // Watermark changed or first scan: recompute the tally. The
+        // zero-tally guard keeps a racing sweep from regressing a fresher
+        // live snapshot to zeros.
+        let changed = self
+            .recompute_workspace_token_usage(workspace_id, true)
+            .await?;
+        // Update watermark after successful scan (changed or not).
+        self.token_usage_watermarks
+            .lock()
+            .unwrap()
+            .insert(workspace_id.clone(), current_watermark);
+        Ok(changed)
+    }
+
+    /// Recompute one workspace's durable `tokenUsage` from its agent sessions
+    /// (§5.23): sessions with a persisted end-of-turn snapshot use it as-is;
+    /// others fall back to summing per-message usage metadata. Persists the
+    /// snapshot and emits `workspace:tokenUsage-changed` only when the
+    /// materialized tally (ignoring `lastScanAt`) actually changed; returns
+    /// whether a change was written. Shared by the periodic reconciliation
+    /// scan (above, which adds watermark-based change detection) and the
+    /// end-of-turn live update in `agent_session.rs` (which calls this
+    /// directly — a persisted snapshot changes no `agent_message` rows, so
+    /// the watermark cannot see it).
+    ///
+    /// `guard_zero_regression` (set by the scan, not the live path): when the
+    /// freshly computed tally is all zeros, the stored `TokenUsage` has
+    /// non-zero totals, AND session rows still exist, skip the write and
+    /// return `Ok(false)`. This keeps a sweep that raced a concurrent live
+    /// update (reading the session rows before the turn's snapshot landed)
+    /// from regressing the fresher live snapshot to zeros. The guard is
+    /// scoped to that race: with no session rows left (all sessions deleted)
+    /// there is nothing mid-turn to race, so a legitimate transition to zero
+    /// writes through; the live path stays unguarded so a legitimate recount
+    /// can still lower the tally.
+    pub(crate) async fn recompute_workspace_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+        guard_zero_regression: bool,
+    ) -> Result<bool> {
+        // Tally usage without hydrating full message logs (finding F2).
         let usage_data = self
             .store
             .get_workspace_agent_usage_data(workspace_id)
             .await?;
         let tallies: Vec<token_usage::AgentTokenTally> = usage_data
             .iter()
-            .map(|(agent_id, model, contents)| {
-                token_usage::agent_token_tally_from_contents(agent_id, model.as_deref(), contents)
+            .map(|(agent_id, model, snapshot, contents)| {
+                token_usage::agent_token_tally(
+                    agent_id,
+                    model.as_deref(),
+                    snapshot.as_ref(),
+                    contents,
+                )
             })
             .collect();
         let mut usage = token_usage::aggregate_token_usage(&tallies);
         usage.last_scan_at = Some(now_iso());
 
         let mut ws = self.store.get_workspace(workspace_id).await?;
+        if guard_zero_regression
+            && !usage_data.is_empty()
+            && usage.totals == intent_core::TokenUsageTotals::default()
+            && ws
+                .token_usage
+                .as_ref()
+                .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
+        {
+            // Reconciliation guard: never clobber a fresher live snapshot
+            // with an all-zero tally while session rows exist (the racing-
+            // sweep case). An empty workspace (all sessions deleted) has no
+            // turn to race, so the zero recount above writes through.
+            return Ok(false);
+        }
         let changed = match &ws.token_usage {
             Some(prev) => {
                 prev.by_agent_id != usage.by_agent_id
@@ -1917,11 +1981,6 @@ impl Services {
             None => true,
         };
         if !changed {
-            // Tally unchanged — update watermark and skip write.
-            self.token_usage_watermarks
-                .lock()
-                .unwrap()
-                .insert(workspace_id.clone(), current_watermark);
             return Ok(false);
         }
         ws.token_usage = Some(usage.clone());
@@ -1934,18 +1993,15 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
-        // Update watermark after successful scan.
-        self.token_usage_watermarks
-            .lock()
-            .unwrap()
-            .insert(workspace_id.clone(), current_watermark);
         Ok(true)
     }
 
-    /// Re-scan token usage for every non-archived workspace, pausing
-    /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so the sweep never
-    /// monopolizes SQLite pool slots (intent-hq/monorepo#703). Errors are
-    /// logged per workspace and never abort the sweep.
+    /// Reconcile token usage for every non-archived workspace (see
+    /// [`Services::scan_workspace_token_usage`] — the end-of-turn live update
+    /// is the primary writer; this sweep catches sessions it cannot see),
+    /// pausing [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so the
+    /// sweep never monopolizes SQLite pool slots (intent-hq/monorepo#703).
+    /// Errors are logged per workspace and never abort the sweep.
     async fn scan_all_token_usage(&self) {
         let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
@@ -1968,10 +2024,14 @@ impl Services {
         }
     }
 
-    /// Spawn the daemon-internal periodic token-usage scan loop (§5.23 / §19.1):
-    /// every `interval` (300 s at the composition root) it re-tallies each
-    /// workspace's usage, persisting deltas and pushing
-    /// `workspace:tokenUsage-changed`. Each sweep pauses
+    /// Spawn the daemon-internal periodic token-usage **reconciliation** loop
+    /// (§5.23 / §19.1): every `interval` (300 s at the composition root) it
+    /// re-tallies each workspace's usage, persisting deltas and pushing
+    /// `workspace:tokenUsage-changed`. The end-of-turn live update in
+    /// `agent_session.rs` is the primary source of `TokenUsage` freshness;
+    /// this loop only reconciles sessions the live path cannot see (providers
+    /// without end-of-turn usage reports / legacy per-message metadata) and
+    /// never regresses a live-updated tally to zeros. Each sweep pauses
     /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
     /// monopolizes SQLite pool slots. The first sweep runs after one
     /// `interval`; missed ticks are skipped (no pile-up). Returns the task

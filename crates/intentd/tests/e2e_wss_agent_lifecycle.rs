@@ -8881,3 +8881,157 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
         "tool_result.output keeps the collapsed object unchanged: {tool_result}"
     );
 }
+
+/// Live token-usage capture over the real WSS transport (§5.23 / §6.5): the
+/// mock agent reports an end-of-turn `usage` snapshot on its PromptResponse
+/// (the ACP `unstable_end_turn_token_usage` extension); the daemon persists it
+/// and emits `workspace:tokenUsage-changed` immediately (no periodic scan),
+/// with `cachedReadTokens`/`cachedWriteTokens` mapped to
+/// `cacheReadTokens`/`cacheCreationTokens`. A second turn's larger cumulative
+/// snapshot REPLACES the first (never summed), and `workspace.getTokenUsage`
+/// returns the same tally over the wire.
+#[tokio::test]
+async fn token_usage_captured_at_turn_end_over_wss() {
+    let Some(script) = gate("WSS token-usage E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Turn 1 (top-level behavior): cumulative snapshot 70/50 (+30/+4 cached).
+    // Turn 2 (rule, matched on the second prompt's marker): grows to 100/80
+    // (+45/+6) — cumulative per session, so it must REPLACE turn 1.
+    let behavior = json!({
+        "response": "turn one",
+        "usage": {
+            "totalTokens": 154,
+            "inputTokens": 70,
+            "outputTokens": 50,
+            "cachedReadTokens": 30,
+            "cachedWriteTokens": 4,
+        },
+        "rules": [{
+            "ifPromptContains": "SECOND_TURN",
+            "response": "turn two",
+            "usage": {
+                "totalTokens": 231,
+                "inputTokens": 100,
+                "outputTokens": 80,
+                "cachedReadTokens": 45,
+                "cachedWriteTokens": 6,
+            },
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:tokenUsage-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Usage", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Turn 1 — the tokenUsage-changed event carries the mapped snapshot
+    // (§6.5 self-sufficient payload: { workspaceId, tokenUsage }).
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage 1 ok: {sent}");
+    let ev1 = wss_event(&mut sub, 30).await;
+    let ev1 = &ev1["params"]["event"];
+    assert_eq!(ev1["type"], "workspace:tokenUsage-changed");
+    assert_eq!(ev1["data"]["workspaceId"], json!(ws_id));
+    let totals1 = &ev1["data"]["tokenUsage"]["totals"];
+    assert_eq!(totals1["inputTokens"], 70, "event totals: {ev1}");
+    assert_eq!(totals1["outputTokens"], 50);
+    assert_eq!(
+        totals1["cacheReadTokens"], 30,
+        "cachedReadTokens maps to cacheReadTokens: {ev1}"
+    );
+    assert_eq!(
+        totals1["cacheCreationTokens"], 4,
+        "cachedWriteTokens maps to cacheCreationTokens: {ev1}"
+    );
+
+    // Turn 2 — the larger cumulative snapshot REPLACES turn 1 (100/80,
+    // NOT 170/130).
+    let sent2 = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "SECOND_TURN please" }),
+    )
+    .await;
+    assert_eq!(sent2["success"], true, "sendMessage 2 ok: {sent2}");
+    let ev2 = wss_event(&mut sub, 30).await;
+    let totals2 = &ev2["params"]["event"]["data"]["tokenUsage"]["totals"];
+    assert_eq!(
+        totals2["inputTokens"], 100,
+        "cumulative snapshot replaces, never sums: {ev2}"
+    );
+    assert_eq!(totals2["outputTokens"], 80);
+    assert_eq!(totals2["cacheReadTokens"], 45);
+    assert_eq!(totals2["cacheCreationTokens"], 6);
+
+    // workspace.getTokenUsage over WSS returns the same durable tally, keyed
+    // by agent and model (§5.23 response shape).
+    let read = wss_rpc(
+        &mut rpc,
+        13,
+        "workspace.getTokenUsage",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let usage = &read["tokenUsage"];
+    assert_eq!(usage["totals"]["inputTokens"], 100, "getTokenUsage: {read}");
+    assert_eq!(usage["totals"]["outputTokens"], 80);
+    assert_eq!(usage["byAgentId"][&agent_id]["inputTokens"], 100);
+    assert!(
+        usage["lastScanAt"].is_string(),
+        "lastScanAt stamped by the live update: {read}"
+    );
+}
