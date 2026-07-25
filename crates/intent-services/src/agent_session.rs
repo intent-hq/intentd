@@ -506,13 +506,25 @@ impl Services {
     /// won; the stale slot, if any, is cleared). Errors are logged and
     /// swallowed: this must never block shutdown or the interrupted_agent row
     /// insert.
+    ///
+    /// Empty-blocks slots (turn started, nothing streamed yet) are a no-op
+    /// unless `allow_empty` is set — the STAB-114 zero-output requeue in
+    /// `interrupt_send_message` and the graceful-shutdown capture must never
+    /// see a phantom row. Only the plain `agent.stop` interrupt opts in, so a
+    /// pre-first-token stop durably records the interruption as an empty
+    /// assistant row the FE can key the Stopped indicator off.
+    ///
+    /// Returns the persisted interrupted row's message id (`Some` only when
+    /// this flush appended the row), so the interrupt path can carry
+    /// `messageId` on the terminal `agent:stream:end`.
     pub(crate) async fn flush_partial_turn_on_interruption(
         &self,
         agent_id: &AgentId,
         live: LiveTurn,
-    ) {
-        if live.blocks.is_empty() {
-            return;
+        allow_empty: bool,
+    ) -> Option<String> {
+        if live.blocks.is_empty() && !allow_empty {
+            return None;
         }
         let metadata = json!({
             "interrupted": true,
@@ -531,7 +543,10 @@ impl Services {
             )
             .await
         {
-            Ok(_) => self.clear_live_turn(agent_id),
+            Ok(_) => {
+                self.clear_live_turn(agent_id);
+                Some(live.message_id)
+            }
             // Only the `agent_message.id` violation means "the worker already
             // persisted the full turn under this minted id" — a `(agent_id,
             // seq)` collision is a different race and falls through to warn
@@ -547,12 +562,16 @@ impl Services {
                     error = %e,
                     "partial flush skipped: worker already persisted the full turn under this id"
                 );
+                None
             }
-            Err(e) => tracing::warn!(
-                agent = %agent_id,
-                error = %e,
-                "failed to flush partial in-flight assistant content at interruption capture"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id,
+                    error = %e,
+                    "failed to flush partial in-flight assistant content at interruption capture"
+                );
+                None
+            }
         }
     }
 

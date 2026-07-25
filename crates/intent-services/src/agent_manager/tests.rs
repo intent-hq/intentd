@@ -2187,6 +2187,23 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
         types.contains(&"agent:idle"),
         "STAB-28: interrupt NOW emits agent:idle when queue is empty (got {types:?})"
     );
+    // The interrupt terminal is distinguishable from a normal turn end: it
+    // carries `stopReason: "interrupted"`. No live-turn slot existed here, so
+    // no interrupted row was persisted and `messageId` is absent.
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("stream:end event");
+    assert_eq!(
+        end.data["stopReason"], "interrupted",
+        "interrupt stream:end carries stopReason (got {:?})",
+        end.data
+    );
+    assert!(
+        end.data.get("messageId").is_none(),
+        "no live-turn slot → no messageId on stream:end (got {:?})",
+        end.data
+    );
 }
 
 /// STAB-28 suppression case: interrupt must NOT emit agent:idle when the agent
@@ -2345,6 +2362,69 @@ async fn interrupt_flushes_partial_live_turn_as_interrupted_assistant_row() {
     assert!(
         mgr.services.live_turn(&id).is_none(),
         "live-turn slot cleared after the flush"
+    );
+}
+
+/// Pre-first-token stop: a plain `agent.stop` landing after the turn started
+/// (live-turn slot open) but before any block streamed persists an EMPTY
+/// interrupted assistant row (explicit `allow_empty` opt-in — contrast the
+/// STAB-114 `interrupt_send_message` zero-output path, which persists
+/// nothing), and the terminal `agent:stream:end` carries both
+/// `stopReason: "interrupted"` and the persisted row's `messageId`.
+#[tokio::test]
+async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-empty"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-int-empty")
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&id, &ws).await);
+    // The turn started (slot open, message id minted) but nothing streamed yet.
+    mgr.services.set_live_turn(&id, "msg-int-empty", Vec::new());
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(mgr.interrupt(&id).await, "interrupt finds the live agent");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the empty synthetic row persisted: {messages:?}"
+    );
+    let msg = &messages[0];
+    assert_eq!(msg.id, "msg-int-empty");
+    assert_eq!(msg.role, "assistant");
+    assert_eq!(msg.content, Value::Array(Vec::new()));
+    let metadata = msg.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["interrupted"], true);
+    assert_eq!(metadata["stopReason"], "interrupted");
+    assert!(
+        mgr.services.live_turn(&id).is_none(),
+        "live-turn slot cleared after the flush"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("stream:end event");
+    assert_eq!(end.data["stopReason"], "interrupted");
+    assert_eq!(
+        end.data["messageId"], "msg-int-empty",
+        "stream:end targets the persisted synthetic row (got {:?})",
+        end.data
     );
 }
 
