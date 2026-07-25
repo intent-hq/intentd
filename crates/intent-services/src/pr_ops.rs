@@ -86,7 +86,7 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<(String, String)> {
 /// [`SWEEP_IDLE_TICK_MULTIPLE`]-th tick, trimming steady forge load.
 pub(crate) const SWEEP_ACTIVE_WINDOW_MINUTES: i64 = 30;
 
-/// Idle workspaces refresh on every Nth sweep tick (~10 minutes at the 60s
+/// Idle workspaces refresh on every Nth sweep tick (~30 minutes at the 180s
 /// base interval wired in `intentd/src/main.rs`).
 pub(crate) const SWEEP_IDLE_TICK_MULTIPLE: u64 = 10;
 

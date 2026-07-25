@@ -788,15 +788,17 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
     // Tiered by workspace recency to trim forge load (§7.7): recently-active
-    // workspaces refresh every 60s tick, idle ones only on every 10th tick.
-    // Safe when source control is unconfigured (a sweep with due workspaces
-    // logs and swallows the missing-provider error). Aborted on clean shutdown.
-    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
-    // Daemon-internal token-usage scan (§5.23/§19.1): periodically re-tally each
+    // workspaces refresh every 180s tick, idle ones only on every 10th tick
+    // (~30 min). Safe when source control is unconfigured (a sweep with due
+    // workspaces logs and swallows the missing-provider error). Aborted on
+    // clean shutdown.
+    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
+    // Daemon-internal token-usage scan (§5.23/§19.1): every 300s, re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
     // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
     // There is no scan RPC. Aborted on clean shutdown.
-    let token_usage_scan = services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(60));
+    let token_usage_scan =
+        services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300));
     // Completion-delivery worker (AS-3): wake parents holding a oneShot
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
