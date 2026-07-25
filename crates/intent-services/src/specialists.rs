@@ -214,12 +214,12 @@ const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
 ];
 
 /// True when a frontmatter/spec value marks the specialist as hidden: the
-/// frontmatter parser yields the string `"true"`, while wire specs carry the
-/// JSON boolean.
+/// frontmatter parser yields a string (matched case-insensitively so YAML-style
+/// `true`/`True`/`TRUE` all count), while wire specs carry the JSON boolean.
 fn is_hidden(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Bool(b)) => *b,
-        Some(Value::String(s)) => s == "true",
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
         _ => false,
     }
 }
@@ -788,6 +788,10 @@ mod tests {
         let content = "---\nname: \"Ghost\"\ndescription: \"d\"\nhidden: true\n---\n\nbody";
         let def = build_def("ghost", content, "bundled", Path::new(""));
         assert_eq!(def["hidden"], true);
+        // YAML-style capitalized booleans also count.
+        let content = "---\nname: \"Ghost\"\ndescription: \"d\"\nhidden: True\n---\n\nbody";
+        let def = build_def("ghost", content, "bundled", Path::new(""));
+        assert_eq!(def["hidden"], true, "hidden: True (YAML casing) counts");
     }
 
     #[test]
