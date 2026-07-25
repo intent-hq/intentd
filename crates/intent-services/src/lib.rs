@@ -17255,6 +17255,7 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_stats;
 pub mod session_stats {}
 
 /// Worktree setup-script detection and template generation (PROTOCOL §5.25).

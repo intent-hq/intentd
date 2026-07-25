@@ -388,6 +388,43 @@ impl Store {
         Ok(())
     }
 
+    /// Read one session's `model` and its persisted cumulative end-of-turn
+    /// `token_usage` snapshot (§5.23) in a single row read. This is the
+    /// pre-turn state the global usage-stats recorder diffs the new snapshot
+    /// against, so it MUST be read BEFORE
+    /// [`set_agent_session_token_usage`](Store::set_agent_session_token_usage)
+    /// replaces the snapshot. The snapshot is scoped to the CURRENT ACP
+    /// session (a recreate folds it into `token_usage_baseline` and clears
+    /// it), which is exactly the baseline a per-turn delta needs. Scoped to
+    /// `workspace_id` (defense-in-depth). `NotFound` if the session row is
+    /// absent or the workspace does not match.
+    pub async fn get_agent_session_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<(Option<String>, Option<TokenUsageTotals>)> {
+        let row = sqlx::query(
+            "SELECT model, token_usage FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get agent session token usage failed: {e}")))?;
+        let Some(row) = row else {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        };
+        let model = row.get::<Option<String>, _>("model");
+        let snapshot = row
+            .get::<Option<String>, _>("token_usage")
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|e| Error::Internal(format!("decode session token_usage failed: {e}")))
+            })
+            .transpose()?;
+        Ok((model, snapshot))
+    }
+
     /// Get lightweight usage data for all agents in a workspace: for each agent,
     /// returns the agent_id, model, the persisted end-of-turn `token_usage`
     /// snapshot (if any), the persisted `token_usage_baseline` folded from
