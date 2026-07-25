@@ -2908,7 +2908,10 @@ fn canonicalise_base_ref(raw: &str) -> String {
 
 /// Build a `line-attribution:updated` change event with the FE-parity payload
 /// `{ workspaceId, noteId, attributions }` (`line-attribution.service.ts`
-/// `mainDispatch(lineAttributionUpdated(...))`).
+/// `mainDispatch(lineAttributionUpdated(...))`). Broadcast-only: the event is
+/// published via the transient path and never persisted to the `event` table —
+/// the durable snapshot lives in `note_line_attribution` and is served by
+/// `note.lineAttribution.load`.
 fn line_attribution_updated_event(data: &LineAttributionData) -> NewEvent {
     NewEvent {
         workspace_id: data.workspace_id.clone(),
@@ -2929,7 +2932,8 @@ fn line_attribution_updated_event(data: &LineAttributionData) -> NewEvent {
 
 impl Services {
     /// Run `attribute_lines` over the note's current content + full version
-    /// history, persist the result, and emit `line-attribution:updated`.
+    /// history, persist the result, and emit `line-attribution:updated` as a
+    /// broadcast-only (transient, never persisted) event to live subscribers.
     /// The write is idempotent (upsert), so a race between two computes leaves
     /// the store consistent with the *latest* one to complete.
     async fn compute_and_persist_line_attribution(
@@ -2977,7 +2981,7 @@ impl Services {
             attributions: map,
         };
         self.store.upsert_note_line_attribution(&data).await?;
-        publish_event(&self.event_bus, line_attribution_updated_event(&data)).await;
+        publish_event_transient(&self.event_bus, line_attribution_updated_event(&data));
         Ok(data)
     }
 

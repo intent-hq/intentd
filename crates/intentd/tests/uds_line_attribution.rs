@@ -219,6 +219,23 @@ async fn line_attribution_compute_now_persists_and_emits_event() {
         assert!(author["id"].is_string());
     }
 
+    // Regression for monorepo#720 (finding 2): the event is broadcast-only
+    // (transient publish path), so no `line-attribution:updated` row may land
+    // in the durable `event` table.
+    let persisted = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        15,
+        "event.query",
+        json!({ "workspaceId": ws_id, "eventType": "line-attribution:updated" }),
+    )
+    .await;
+    assert_eq!(
+        persisted,
+        json!([]),
+        "line-attribution:updated must not be persisted"
+    );
+
     // A follow-up load returns the persisted snapshot (FE-parity shape).
     let after = rpc(
         &mut rpc_write,
