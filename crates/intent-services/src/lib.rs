@@ -7149,10 +7149,9 @@ impl WorkspaceApi for Services {
                         None
                     };
                     // Apply derived owner when caller left it blank.
-                    if !input
+                    if input
                         .repository_owner
-                        .as_deref()
-                        .is_some_and(|o| !o.is_empty())
+                        .as_deref().is_none_or(|o| o.is_empty())
                     {
                         if let Some((owner, _)) = origin_derived.as_ref() {
                             input.repository_owner = Some(owner.clone());
@@ -7160,10 +7159,9 @@ impl WorkspaceApi for Services {
                     }
                     // Apply derived name when caller left it blank; fall back to
                     // basename when origin remote is missing/unparseable.
-                    if !input
+                    if input
                         .repository_name
-                        .as_deref()
-                        .is_some_and(|n| !n.is_empty())
+                        .as_deref().is_none_or(|n| n.is_empty())
                     {
                         if let Some((_, name)) = origin_derived {
                             input.repository_name = Some(name);
@@ -7184,7 +7182,7 @@ impl WorkspaceApi for Services {
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
                     let branch_auto_generated =
-                        !input.branch.as_deref().is_some_and(|b| !b.is_empty());
+                        input.branch.as_deref().is_none_or(|b| b.is_empty());
                     let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
                         Some(explicit) => explicit,
                         None => {
