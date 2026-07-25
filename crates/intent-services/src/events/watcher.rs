@@ -208,9 +208,15 @@ impl FileWatcher {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<notify::Event>();
         let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(event) = res {
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+                Ok(event) => {
                     let _ = raw_tx.send(event);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "file watcher callback error; file:changed events may be missed"
+                    );
                 }
             })?;
         watcher.watch(&root, RecursiveMode::Recursive)?;

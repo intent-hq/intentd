@@ -145,7 +145,16 @@ impl ConfigWatcher {
         // so it forwards ticks over an unbounded channel to the debounce loop.
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<()>();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
+            let event = match res {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "config.toml watcher callback error; settings changes may be missed"
+                    );
+                    return;
+                }
+            };
             // Access events carry no mutation; everything else (create,
             // modify, rename, remove) can affect the file's content.
             if matches!(event.kind, notify::EventKind::Access(_)) {
