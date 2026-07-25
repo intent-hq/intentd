@@ -467,8 +467,11 @@ where
 
 fn map_comment_row(row: &SqliteRow) -> Result<Comment> {
     let note_id: Option<String> = col(row, "note_id")?;
-    let anchor: CommentAnchor = serde_json::from_str(&col::<String>(row, "anchor_json")?)
-        .map_err(|e| Error::Internal(format!("decode anchor failed: {e}")))?;
+    // Replies store `null` (they anchor via their thread/parent, monorepo#729);
+    // legacy reply rows and all roots store the anchor object.
+    let anchor: Option<CommentAnchor> =
+        serde_json::from_str(&col::<String>(row, "anchor_json")?)
+            .map_err(|e| Error::Internal(format!("decode anchor failed: {e}")))?;
     let extra: ExtraFields = match col::<Option<String>>(row, "extra_json")? {
         Some(s) => serde_json::from_str(&s)
             .map_err(|e| Error::Internal(format!("decode extra failed: {e}")))?,

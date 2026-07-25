@@ -1009,12 +1009,12 @@ fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {
         author_type: AuthorType::User,
         status: CommentStatus::Open,
         parent_id: None,
-        anchor: CommentAnchor {
+        anchor: Some(CommentAnchor {
             kind: CommentAnchorType::Range,
             start_id: Some("a1".to_string()),
             end_id: Some("a2".to_string()),
             point_id: None,
-        },
+        }),
         anchor_text: Some("foo".to_string()),
         anchor_before: Some("the ".to_string()),
         anchor_after: Some(" bar".to_string()),
@@ -1043,11 +1043,11 @@ async fn comment_round_trip_update_delete_and_thread() {
     let mut c2 = sample_comment(&note.id, "thread-1", "c2");
     c2.parent_id = Some("c1".to_string());
     c2.kind = CommentType::Comment;
-    c2.anchor = CommentAnchor {
+    c2.anchor = Some(CommentAnchor {
         kind: CommentAnchorType::Point,
         point_id: Some("p1".to_string()),
         ..Default::default()
-    };
+    });
     c2.anchor_before = None;
     c2.anchor_after = None;
     c2.suggestion_original = None;
