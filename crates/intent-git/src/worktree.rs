@@ -235,6 +235,18 @@ pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
     }
 }
 
+/// CoW counterpart of [`detach_worktree`] for standalone checkouts
+/// (`checkoutMode == "cow"`): rename the checkout directory to a unique
+/// sibling trash path awaiting [`remove_detached_worktree`]. A CoW checkout
+/// is a full clone with no registration in the source repository, so there
+/// is nothing to prune — this is filesystem work only and never opens a
+/// repository. Same semantics as the detach phase: `Ok(None)` when the
+/// directory was already gone or had to be removed in place (rename
+/// fallback). Idempotent.
+pub fn detach_checkout_dir(checkout_path: &Path) -> Result<Option<PathBuf>> {
+    rename_worktree_to_trash(checkout_path)
+}
+
 /// Rename `worktree_path` to a unique sibling trash path, returning the path
 /// awaiting recursive removal. Race-tolerant: a source that vanished between
 /// the probe and the rename is idempotent success (`None`), a trash-candidate
@@ -557,6 +569,40 @@ mod tests {
     #[test]
     fn remove_detached_worktree_is_ok_for_missing_path() {
         remove_detached_worktree(Path::new("/nonexistent/intent-git-trash-probe")).unwrap();
+    }
+
+    // CoW-checkout detach: pure rename-to-trash with no registration prune —
+    // the directory need not even be a git repository.
+    #[test]
+    fn detach_checkout_dir_renames_to_trash_without_touching_git() {
+        let dir = std::env::temp_dir().join(format!("cow-detach-{}", uuid_ish()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested").join("f.txt"), "x\n").unwrap();
+
+        let trash = detach_checkout_dir(&dir)
+            .unwrap()
+            .expect("directory renamed to a trash path");
+        assert!(!dir.exists(), "original path vacated by the rename");
+        assert!(
+            trash.join("nested").join("f.txt").exists(),
+            "contents intact — no recursive removal in the detach phase"
+        );
+        assert!(
+            trash
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".deleting-"),
+            "trash path uses the sweep-recognized marker"
+        );
+        remove_detached_worktree(&trash).unwrap();
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn detach_checkout_dir_is_none_when_directory_already_gone() {
+        let missing = std::env::temp_dir().join(format!("cow-detach-gone-{}", uuid_ish()));
+        assert!(detach_checkout_dir(&missing).unwrap().is_none());
     }
 
     // Regression for the delete-cleanup lock starvation: the lock-holding

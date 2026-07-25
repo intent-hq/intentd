@@ -185,11 +185,30 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
-    /// Whether CoW agent isolation is supported for this workspace. Computed as:
-    /// direct mode AND git repo AND cow_probe(userDir, workspacesRoot) Supported.
-    /// Used by the FE to gate the "Use Copy-on-Write for Agent Isolation" toggle.
+    /// Whether CoW isolation is supported on this machine. Computed as:
+    /// cow_probe(workspacesRoot, workspacesRoot) Supported — a machine
+    /// capability of the workspaces root's filesystem, independent of the
+    /// workspace or checkout mode. Used by the FE to gate the Copy-on-Write
+    /// opt-in toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cow_supported: Option<bool>,
+    /// How the workspace checkout was provisioned by `workspace.create` (§5.1):
+    /// `worktree` (linked git worktree) or `cow` (standalone copy-on-write
+    /// clone). Omitted for rows without a daemon-provisioned checkout
+    /// (`skipWorktree`, remote, caller-supplied `worktreePath`, non-git repo
+    /// paths, pre-existing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_mode: Option<CheckoutMode>,
+}
+
+/// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckoutMode {
+    /// Linked git worktree of the source repository.
+    Worktree,
+    /// Standalone copy-on-write clone of the source repository directory.
+    Cow,
 }
 
 /// Fixed timestamp for the synthetic Chief workspace (TS
@@ -241,6 +260,7 @@ pub fn chief_workspace() -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 
@@ -528,7 +548,13 @@ pub struct WorkspaceCreate {
     pub repository_name: Option<String>,
     pub worktree_path: Option<String>,
     pub scope: Option<String>,
-    pub skip_worktree: Option<bool>,
+    /// Opt out of the isolated checkout (worktree or CoW clone) and work
+    /// directly in the repository folder. Canonical wire name is
+    /// `skipIsolation`; `skipWorktree` is the deprecated pre-CoW alias
+    /// (either set ⇒ direct mode). The persisted column keeps its historical
+    /// `skip_worktree` name (`Workspace.skipWorktree`) — no DB migration.
+    #[serde(alias = "skipWorktree")]
+    pub skip_isolation: Option<bool>,
     pub setup_script: Option<String>,
     pub is_remote: Option<bool>,
     pub default_model: Option<String>,
@@ -2785,6 +2811,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -3434,5 +3461,21 @@ mod tests {
         assert_eq!(bare.prompt.as_deref(), Some("p"));
         assert!(bare.specialist.is_none());
         assert!(bare.metadata.is_none());
+    }
+
+    #[test]
+    fn workspace_create_skip_isolation_accepts_both_wire_names() {
+        // PROTOCOL §5.1: `skipIsolation` is canonical; `skipWorktree` is the
+        // deprecated pre-CoW alias. Either set ⇒ direct mode.
+        let new_name: WorkspaceCreate =
+            serde_json::from_value(json!({ "skipIsolation": true })).unwrap();
+        assert_eq!(new_name.skip_isolation, Some(true));
+
+        let old_name: WorkspaceCreate =
+            serde_json::from_value(json!({ "skipWorktree": true })).unwrap();
+        assert_eq!(old_name.skip_isolation, Some(true));
+
+        let absent: WorkspaceCreate = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(absent.skip_isolation, None);
     }
 }
