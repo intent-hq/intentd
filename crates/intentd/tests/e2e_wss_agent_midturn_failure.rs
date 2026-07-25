@@ -301,10 +301,12 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 /// `agent.retry` redrives the queued message to a successful turn.
 ///
 /// The mock spawns and handshakes normally (so the spawn-retry path is NOT in
-/// play), then `process.exit(1)`s inside `session/prompt` on the first attempt
-/// only. The daemon's in-flight prompt fails ("agent stdout closed"), which the
-/// worker must classify as a terminal mid-turn failure — the exact "silent
-/// drop" scenario this test locks down.
+/// play), then `process.exit(1)`s inside `session/prompt` on the first TWO
+/// attempts. The daemon's in-flight prompt fails ("agent stdout closed")
+/// before any output, so the first failure is consumed by the one-shot silent
+/// redrive (monorepo#764); the second spends the budget and must be classified
+/// as a terminal mid-turn failure — the exact "silent drop" scenario this test
+/// locks down.
 #[tokio::test]
 async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     let Some(script) = gate("WSS mid-turn failure E2E") else {
@@ -315,7 +317,7 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
-        "exitDuringPromptAttempts": 1,
+        "exitDuringPromptAttempts": 2,
         "response": "recovered after mid-turn crash",
     })
     .to_string();
@@ -634,8 +636,10 @@ async fn agent_retry_with_empty_queue_clears_to_idle_over_wss() {
     let ws_id = seed_workspace_only(&data_dir).await;
     let attempt_file = data_dir.join("attempts.txt");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // Two pre-output deaths: the first is consumed by the one-shot silent
+    // redrive (monorepo#764), the second parks the agent in error.
     let behavior = json!({
-        "exitDuringPromptAttempts": 1,
+        "exitDuringPromptAttempts": 2,
         "response": "unused",
     })
     .to_string();

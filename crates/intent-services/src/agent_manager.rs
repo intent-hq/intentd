@@ -4449,6 +4449,13 @@ async fn run_message_worker(
     // (STAB-51). Terminal spawn/turn failures thread it into the requeue so
     // a failed pre-turn persist is re-attempted by the `agent.retry` drain.
     let mut user_persisted = initial_persisted;
+    // One-shot silent-redrive budget for the CURRENT message (monorepo#764):
+    // a transport-closed prompt failure BEFORE any streamed output redrives
+    // the same prompt once on a fresh child instead of surfacing the STAB-6
+    // Retry. Reset at each queue-drain handoff so every message gets its own
+    // budget; a second pre-output failure on the same message takes the
+    // terminal path.
+    let mut silent_redrive_used = false;
     'outer: loop {
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -4475,6 +4482,23 @@ async fn run_message_worker(
                         // Concurrent stop/cancel won the turn — not a failure.
                         // Keep draining: any queued message re-spawns lazily.
                         tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
+                    } else if !silent_redrive_used && pre_output_transport_failure(&e) {
+                        // Silent redrive (monorepo#764): the transport closed
+                        // before the turn streamed anything — the prompt
+                        // provably produced no output, so redrive it once on
+                        // a fresh child. `run_prompt_turn` suppressed the
+                        // terminal `agent:failed` + `agent:stream:end` pair
+                        // for this attempt, so nothing user-visible surfaced.
+                        // Tear down the dead child and loop back through
+                        // `retry_spawn` with the SAME content/options.
+                        silent_redrive_used = true;
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %e,
+                            "transport closed before output — redriving the prompt once on a fresh child"
+                        );
+                        mgr.kill_child_only(&agent_id).await;
+                        continue 'outer;
                     } else {
                         // STAB-53: on a child-death failure, point at the
                         // captured stderr file so the crash is diagnosable.
@@ -4578,6 +4602,8 @@ async fn run_message_worker(
                 queued_at: Some(next.queued_at.clone()),
                 ..TurnOptions::default()
             };
+            // New message → fresh silent-redrive budget (monorepo#764).
+            silent_redrive_used = false;
             // Fail closed (#547): a persist failure that survived the bounded
             // retry parks the agent in Error instead of running the turn.
             if !user_persisted {
@@ -4634,6 +4660,8 @@ async fn run_message_worker(
                 queued_at: Some(next.queued_at.clone()),
                 ..TurnOptions::default()
             };
+            // New message → fresh silent-redrive budget (monorepo#764).
+            silent_redrive_used = false;
             // Fail closed (#547): same contract as the pre-release drain arm.
             if !user_persisted {
                 handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
@@ -5261,12 +5289,30 @@ fn stderr_capture_hint(
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
 /// every prompt error as `Internal("session/prompt failed: …")` AFTER emitting
 /// both events; errors WITHOUT that prefix (e.g. the transcript-append store
-/// error, which propagates via `?` before the emits) still need the events.
-/// Prefix-anchored on the structured `Error::Internal` payload so an
+/// error, which propagates via `?` before the emits, or a pre-output
+/// transport failure — see [`pre_output_transport_failure`] — whose emits are
+/// deliberately suppressed for a possible silent redrive) still need the
+/// events. Prefix-anchored on the structured `Error::Internal` payload so an
 /// unrelated error that merely mentions the phrase mid-string cannot
 /// suppress the terminal events.
 fn turn_failure_events_already_emitted(err: &Error) -> bool {
     matches!(err, Error::Internal(msg) if msg.starts_with(PROMPT_FAILED_PREFIX))
+}
+
+/// Whether a `run_turn` error carries the pre-output transport marker from
+/// `run_prompt_turn` (monorepo#764): the transport to the child closed BEFORE
+/// the turn streamed any output, so the prompt provably produced nothing and
+/// the worker may redrive it once on a fresh child. `run_prompt_turn`
+/// suppressed the terminal `agent:failed` + `agent:stream:end` pair for these
+/// errors — when the one-retry budget is already spent, the terminal-failure
+/// path emits the pair itself (`turn_failure_events_already_emitted` is false
+/// for this prefix). Prefix-anchored for the same mid-string reason as above.
+fn pre_output_transport_failure(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+    )
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
@@ -6395,6 +6441,48 @@ mod turn_failure_tests {
         let err =
             Error::Internal("store: could not log that session/prompt failed earlier".to_string());
         assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn pre_output_marker_is_detected() {
+        // monorepo#764: the marker run_prompt_turn wraps a transport failure
+        // with when the turn provably streamed nothing.
+        let err = Error::Internal(
+            "session/prompt transport closed before output: transport closed: writer task closed"
+                .to_string(),
+        );
+        assert!(pre_output_transport_failure(&err));
+        let err = Error::Internal(
+            "session/prompt transport closed before output: JSON-RPC error 0: agent stdout closed"
+                .to_string(),
+        );
+        assert!(pre_output_transport_failure(&err));
+    }
+
+    #[test]
+    fn pre_output_marker_needs_events_emitted() {
+        // run_prompt_turn SUPPRESSED the terminal pair for the marker — when
+        // the one-retry budget is spent, handle_terminal_turn_failure must
+        // emit it (the marker is not the PROMPT_FAILED_PREFIX).
+        let err = Error::Internal(
+            "session/prompt transport closed before output: transport closed: writer task closed"
+                .to_string(),
+        );
+        assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_pre_output_marked() {
+        // Post-output / non-transport failures carry the ordinary wrapper and
+        // must not trigger the silent redrive; mid-string mentions are inert.
+        let err = Error::Internal(
+            "session/prompt failed: transport closed: writer task closed".to_string(),
+        );
+        assert!(!pre_output_transport_failure(&err));
+        let err = Error::Internal(
+            "store: session/prompt transport closed before output: logged".to_string(),
+        );
+        assert!(!pre_output_transport_failure(&err));
     }
 }
 

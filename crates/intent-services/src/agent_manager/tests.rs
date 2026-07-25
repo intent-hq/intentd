@@ -4179,6 +4179,199 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
     );
 }
 
+/// monorepo#764: a transport-closed prompt failure BEFORE any streamed output
+/// is silently redriven once on a fresh child — the turn completes with NO
+/// `agent:failed`, no Error status, and no requeue (no Retry surface). The
+/// mock child exits inside `session/prompt` on the first attempt only
+/// (attempt counter persists across spawns), so the redrive succeeds.
+#[tokio::test]
+async fn pre_output_transport_failure_redrives_silently_once() {
+    let script = mock_agent_script();
+    let attempt_file = std::env::temp_dir().join(format!("itd-764-once-{}", uuid::Uuid::new_v4()));
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let behavior = json!({
+        "exitDuringPromptAttempts": 1,
+        "response": "recovered after silent redrive",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-764-r"), AgentId::from("a-764-r"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "dies pre-output once".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    // The redriven turn completes: the agent settles idle, not Error.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("silently redriven turn completes and the agent goes idle");
+
+    // No user-visible failure surfaced for the redriven attempt.
+    let mut saw_failed = false;
+    let mut stream_ends = 0;
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        for ev in batch {
+            match ev.event_type.as_str() {
+                "agent:failed" => saw_failed = true,
+                "agent:stream:end" => stream_ends += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(!saw_failed, "no agent:failed for the silent redrive");
+    assert_eq!(
+        stream_ends, 1,
+        "exactly one terminal stream:end for the message (the redriven attempt's)"
+    );
+    // Nothing requeued (no Retry surface) and no stale Error/stop_reason.
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no requeue for a silently redriven message"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert!(session.stop_reason.is_none(), "no error stop_reason");
+    // The user row landed exactly once and the redriven turn produced output.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("dies pre-output once"))
+        .collect();
+    assert_eq!(user_rows.len(), 1, "no duplicate user row: {messages:?}");
+    assert!(
+        messages.iter().any(|m| m.role == "assistant"),
+        "the redriven turn completed with assistant output: {messages:?}"
+    );
+    let _ = std::fs::remove_file(&attempt_file);
+}
+
+/// monorepo#764 one-retry bound: a SECOND consecutive pre-output transport
+/// failure on the same message takes the existing terminal path — persisted
+/// Error status, the terminal `agent:failed` + `agent:stream:end` pair
+/// (emitted by the terminal-failure path, since `run_prompt_turn` suppressed
+/// it for the marker error), and the message requeued for `agent.retry`.
+#[tokio::test]
+async fn second_pre_output_transport_failure_takes_terminal_path() {
+    let script = mock_agent_script();
+    let attempt_file = std::env::temp_dir().join(format!("itd-764-twice-{}", uuid::Uuid::new_v4()));
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let behavior = json!({
+        "exitDuringPromptAttempts": 2,
+        "response": "unreached",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-764-t"), AgentId::from("a-764-t"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "dies pre-output twice".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    // The second failure parks the agent in Error (one-retry bound).
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second pre-output failure parks the session in error");
+
+    // The terminal pair reached the bus EXACTLY once (the second attempt's;
+    // the first attempt stayed silent) — the STAB-6 Retry surface intact.
+    let mut failed = 0;
+    let mut stream_ends = 0;
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        for ev in batch {
+            match ev.event_type.as_str() {
+                "agent:failed" => failed += 1,
+                "agent:stream:end" => stream_ends += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(failed, 1, "exactly one terminal agent:failed");
+    assert_eq!(stream_ends, 1, "exactly one terminal agent:stream:end");
+    // The message is requeued for agent.retry and the error is persisted.
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "failed message requeued for agent.retry"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stop_reason = session.stop_reason.expect("error stop_reason persisted");
+    assert!(
+        stop_reason.contains("transport closed before output"),
+        "stop_reason names the transport failure: {stop_reason}"
+    );
+    let _ = std::fs::remove_file(&attempt_file);
+}
+
 #[tokio::test]
 async fn send_message_queues_when_already_busy() {
     let (_tmp, mgr) = manager().await;
