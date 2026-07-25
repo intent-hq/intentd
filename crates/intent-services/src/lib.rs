@@ -13275,6 +13275,24 @@ impl WorkspaceApi for Services {
         Box::pin(async move { self.models_list_op(provider_id, force_refresh).await })
     }
 
+    fn stats_get_usage(
+        &self,
+        period: String,
+        key: Option<String>,
+        tz_offset_minutes: i64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let period = usage_stats_read::parse_period(&period, key.as_deref())?;
+            let rows = self.store.list_usage_stats_hourly().await?;
+            usage_stats_read::aggregate_usage(
+                &rows,
+                period,
+                tz_offset_minutes,
+                time::OffsetDateTime::now_utc(),
+            )
+        })
+    }
+
     fn agent_enhance_prompt(
         &self,
         prompt: String,
@@ -15389,6 +15407,7 @@ impl WorkspaceApi for Services {
                     .get(&fd.path)
                     .cloned()
                     .unwrap_or((None, None, None));
+                let attributed_agent = agent_id.clone();
                 let change = intent_store::NewTrackedChange {
                     workspace_id: workspace_id.clone(),
                     path: fd.path.clone(),
@@ -15403,7 +15422,19 @@ impl WorkspaceApi for Services {
                     additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
                     deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
                 };
-                crate::file_tracking::track_change(&store, change).await?;
+                let (lines_added, lines_deleted) =
+                    crate::file_tracking::track_change(&store, change).await?;
+                // Global usage-stats (D5): reconciliation catches edits the
+                // watcher missed; the row-level delta keeps this idempotent
+                // when it did not. Best-effort inside.
+                crate::usage_stats::record_lines_changed(
+                    &store,
+                    &workspace_id,
+                    attributed_agent.as_deref(),
+                    lines_added,
+                    lines_deleted,
+                )
+                .await;
             }
             Ok(synced)
         })
@@ -17449,6 +17480,8 @@ pub mod metrics;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
+pub mod usage_stats;
+pub mod usage_stats_read;
 pub mod session_stats {}
 
 /// Worktree setup-script detection and template generation (PROTOCOL §5.25).

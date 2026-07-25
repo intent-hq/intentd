@@ -19,9 +19,20 @@ use intent_store::{NewTrackedChange, Store};
 /// normalized to a repo-relative, forward-slash form before storage, mirroring
 /// the TS attribution engine's `normalizePath` so lookups stay consistent across
 /// the git/filesystem/tool path sources.
-pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result<()> {
+///
+/// Returns the `(lines_added, lines_deleted)` **delta** this recording
+/// represents: the row's new cumulative per-file counters minus the replaced
+/// row's (0 for a fresh row), clamped ≥ 0 per counter so a shrinking diff
+/// (e.g. an agent reverting its own lines) never yields a negative delta.
+/// Callers feed this growth into the global usage-stats recording (D5).
+pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result<(u64, u64)> {
     change.path = normalize_path(&change.path);
-    store.upsert_tracked_change(&change).await
+    let prev = store.upsert_tracked_change(&change).await?;
+    let (prev_additions, prev_deletions) = prev.unwrap_or((0, 0));
+    Ok((
+        (change.additions - prev_additions).max(0) as u64,
+        (change.deletions - prev_deletions).max(0) as u64,
+    ))
 }
 
 /// Normalize a file path for consistent attribution lookups (parity with

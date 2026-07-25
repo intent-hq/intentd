@@ -33,6 +33,7 @@ mod script_repo;
 mod settings_repo;
 mod task_agent_link_repo;
 mod tracked_changes_repo;
+mod usage_stats_repo;
 mod workspace_context_repo;
 mod workspace_repo;
 mod workspace_ui_context_repo;
@@ -47,6 +48,7 @@ pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
 pub use note_version_repo::MAX_NOTE_VERSIONS;
 pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
+pub use usage_stats_repo::{UsageStatsDelta, UsageStatsRow};
 
 /// Retry helper for write transactions that may hit SQLITE_BUSY during lock upgrade
 /// (STAB-7). Executes the given async transaction closure up to MAX_ATTEMPTS times,

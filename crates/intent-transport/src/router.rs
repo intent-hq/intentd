@@ -1216,6 +1216,26 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "stats.getUsage" => {
+            // Global usage-stats read behind the agentic usage-stats cards;
+            // no workspaceId. `period` is "24h" / "month" / "year"; `key`
+            // ("YYYY-MM" / "YYYY") is required for month/year and ignored for
+            // 24h; `tzOffsetMinutes` (minutes east of UTC, default 0) shifts
+            // buckets into the client's local time before grouping.
+            let period = require_str_param(params, "period")?;
+            let key = opt_str(params, "key");
+            let tz_offset_minutes = match params.get("tzOffsetMinutes") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v
+                    .as_i64()
+                    .ok_or_else(|| rpc(INVALID_PARAMS, "tzOffsetMinutes must be an integer"))?,
+            };
+            let result = api
+                .stats_get_usage(period, key, tz_offset_minutes)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.enhancePrompt" => {
             // One-shot prompt-enhance / AI-layout generation (PROTOCOL §5.31).
             let prompt = require_str_param(params, "prompt")?;
