@@ -427,8 +427,9 @@ async fn specialist_full_frontmatter_wire_parity() {
         "edit round-trips hidden"
     );
 
-    // edit — a spec that omits hidden unhides (omit ⇒ unhide: the written
-    // file is the source of truth, no merge with the previous def).
+    // edit — a spec that omits hidden writes a file without the key; the
+    // resolved value then inherits from lower tiers (none hide ralph2, so it
+    // resolves not-hidden).
     let edited = ok(
         &mut w,
         &mut r,
@@ -454,7 +455,76 @@ async fn specialist_full_frontmatter_wire_parity() {
     .await;
     assert!(
         got["specialist"].get("hidden").is_none(),
-        "subsequent get confirms omit ⇒ unhide"
+        "subsequent get confirms omit ⇒ inherit (no lower tier hides ralph2)"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn specialist_hidden_inherits_across_tiers_on_the_wire() {
+    let h = start().await;
+    // Regression: a user-tier chief-of-staff.md materialized before the hidden
+    // feature (no `hidden` key) must still resolve hidden: true, inherited
+    // from the embedded bundled floor (PROTOCOL §5.11).
+    write_specialist(
+        &h.user_dir,
+        "chief-of-staff",
+        "Chief of Staff",
+        "User override",
+        "You orchestrate.",
+    );
+
+    let (read, mut w) = connect_retry(&h.socket).await.into_split();
+    let mut r = BufReader::new(read);
+
+    let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().unwrap();
+    let chief = specs.iter().find(|s| s["id"] == "chief-of-staff").unwrap();
+    assert_eq!(chief["source"], "user", "user override wins the tier merge");
+    assert_eq!(
+        chief["hidden"], true,
+        "hidden inherited from the embedded floor in list"
+    );
+
+    let got = ok(
+        &mut w,
+        &mut r,
+        2,
+        "specialist.get",
+        json!({ "id": "chief-of-staff" }),
+    )
+    .await;
+    assert_eq!(got["specialist"]["source"], "user");
+    assert_eq!(
+        got["specialist"]["hidden"], true,
+        "hidden inherited from the embedded floor on get"
+    );
+
+    // Explicit hidden: false in the user file is the opt-out that unhides.
+    std::fs::write(
+        h.user_dir.join("chief-of-staff.md"),
+        "---\nname: \"Chief of Staff\"\ndescription: \"User override\"\nhidden: false\n---\n\nYou orchestrate.",
+    )
+    .unwrap();
+    let got = ok(
+        &mut w,
+        &mut r,
+        3,
+        "specialist.get",
+        json!({ "id": "chief-of-staff" }),
+    )
+    .await;
+    assert!(
+        got["specialist"].get("hidden").is_none(),
+        "explicit false unhides on get"
+    );
+    let list = ok(&mut w, &mut r, 4, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().unwrap();
+    let chief = specs.iter().find(|s| s["id"] == "chief-of-staff").unwrap();
+    assert!(
+        chief.get("hidden").is_none(),
+        "explicit false unhides in list"
     );
 
     h.shutdown().await;
