@@ -23,6 +23,80 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason";
 
+/// One agent session's usage inputs for the workspace token-usage tally
+/// (§5.23): `(agent_id, model, snapshot, baseline, message_contents)`.
+/// `message_contents` is non-empty only for sessions whose decoded snapshot
+/// AND baseline are both absent (the per-message fallback path — see
+/// [`Store::get_workspace_agent_usage_data`]).
+pub type AgentUsageRow = (
+    String,
+    Option<String>,
+    Option<TokenUsageTotals>,
+    Option<TokenUsageTotals>,
+    Vec<serde_json::Value>,
+);
+
+/// Read the per-session usage rows for one workspace over an explicit
+/// connection, so [`Store::get_workspace_agent_usage_data`] (read pool) and
+/// the transactional recompute in `workspace_repo.rs` (write transaction,
+/// monorepo#738) share one implementation. Message contents are hydrated only
+/// when both the decoded snapshot and baseline are absent; a malformed
+/// snapshot/baseline decodes to `None` and still hydrates.
+pub(crate) async fn fetch_agent_usage_rows(
+    conn: &mut sqlx::SqliteConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<Vec<AgentUsageRow>> {
+    let session_sql = "SELECT id, model, token_usage, token_usage_baseline \
+        FROM agent_session WHERE workspace_id = ?";
+    let session_rows = sqlx::query(session_sql)
+        .bind(&workspace_id.0)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("get agent sessions for usage failed: {e}")))?;
+
+    let mut result = Vec::new();
+    for session_row in session_rows {
+        let agent_id: String = session_row.get("id");
+        let model: Option<String> = session_row.get("model");
+        // Best-effort decode (mirrors the content parse below): a malformed
+        // snapshot degrades to None so the tally falls back to message sums.
+        let snapshot: Option<TokenUsageTotals> = session_row
+            .get::<Option<String>, _>("token_usage")
+            .and_then(|s| serde_json::from_str(&s).ok());
+        // Same best-effort decode for the recreate baseline (monorepo#737).
+        let baseline: Option<TokenUsageTotals> = session_row
+            .get::<Option<String>, _>("token_usage_baseline")
+            .and_then(|s| serde_json::from_str(&s).ok());
+
+        // Message contents feed the tally only when BOTH snapshot and
+        // baseline are absent (`agent_token_tally`'s fallback rule), so the
+        // per-session content fetch is skipped otherwise (monorepo#738).
+        let contents: Vec<serde_json::Value> = if snapshot.is_none() && baseline.is_none() {
+            let message_sql =
+                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
+            let message_rows = sqlx::query(message_sql)
+                .bind(&agent_id)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("get agent messages for usage failed: {e}"))
+                })?;
+            message_rows
+                .iter()
+                .map(|row| {
+                    let content_str: String = row.get("content");
+                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        result.push((agent_id, model, snapshot, baseline, contents));
+    }
+    Ok(result)
+}
+
 /// Interrupted agent record (INT-41). Returned by
 /// [`Store::list_interrupted_agents`], joined with agent_session and workspace.
 #[derive(Debug, Clone)]
@@ -428,68 +502,23 @@ impl Store {
     /// Get lightweight usage data for all agents in a workspace: for each agent,
     /// returns the agent_id, model, the persisted end-of-turn `token_usage`
     /// snapshot (if any), the persisted `token_usage_baseline` folded from
-    /// prior ACP sessions (if any, monorepo#737), and all message content JSON
-    /// (for tallying without full AgentSession hydration; finding F2). Used by
-    /// the token-usage scan to avoid reading full message logs when only the
-    /// usage metadata is needed.
-    #[allow(clippy::type_complexity)]
+    /// prior ACP sessions (if any, monorepo#737), and message content JSON
+    /// (for tallying without full AgentSession hydration; finding F2). Message
+    /// contents are hydrated ONLY for sessions where both the decoded snapshot
+    /// and baseline are absent — the tally falls back to message sums for those
+    /// alone (see `agent_token_tally`), so snapshot/baseline-backed sessions
+    /// return empty `contents` (monorepo#738). A malformed snapshot/baseline
+    /// decodes to `None` and therefore still hydrates.
     pub async fn get_workspace_agent_usage_data(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<
-        Vec<(
-            String,
-            Option<String>,
-            Option<TokenUsageTotals>,
-            Option<TokenUsageTotals>,
-            Vec<serde_json::Value>,
-        )>,
-    > {
-        // First get all sessions for this workspace with their models
-        let session_sql = "SELECT id, model, token_usage, token_usage_baseline \
-            FROM agent_session WHERE workspace_id = ?";
-        let session_rows = sqlx::query(session_sql)
-            .bind(&workspace_id.0)
-            .fetch_all(self.read_pool())
+    ) -> Result<Vec<AgentUsageRow>> {
+        let mut conn = self
+            .read_pool()
+            .acquire()
             .await
-            .map_err(|e| Error::Internal(format!("get agent sessions for usage failed: {e}")))?;
-
-        let mut result = Vec::new();
-        for session_row in session_rows {
-            let agent_id: String = session_row.get("id");
-            let model: Option<String> = session_row.get("model");
-            // Best-effort decode (mirrors the content parse below): a malformed
-            // snapshot degrades to None so the tally falls back to message sums.
-            let snapshot: Option<TokenUsageTotals> = session_row
-                .get::<Option<String>, _>("token_usage")
-                .and_then(|s| serde_json::from_str(&s).ok());
-            // Same best-effort decode for the recreate baseline (monorepo#737).
-            let baseline: Option<TokenUsageTotals> = session_row
-                .get::<Option<String>, _>("token_usage_baseline")
-                .and_then(|s| serde_json::from_str(&s).ok());
-
-            // Get all message content for this agent
-            let message_sql =
-                "SELECT content FROM agent_message WHERE agent_id = ? ORDER BY seq ASC";
-            let message_rows = sqlx::query(message_sql)
-                .bind(&agent_id)
-                .fetch_all(self.read_pool())
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("get agent messages for usage failed: {e}"))
-                })?;
-
-            let contents: Vec<serde_json::Value> = message_rows
-                .iter()
-                .map(|row| {
-                    let content_str: String = row.get("content");
-                    serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null)
-                })
-                .collect();
-
-            result.push((agent_id, model, snapshot, baseline, contents));
-        }
-        Ok(result)
+            .map_err(|e| Error::Internal(format!("acquire read connection failed: {e}")))?;
+        fetch_agent_usage_rows(&mut conn, workspace_id).await
     }
 
     /// List every persisted session across workspaces, oldest first. Backs the
@@ -2200,6 +2229,191 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot survives");
         assert!(rows[0].3.is_none(), "baseline NULL for pre-existing rows");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Hydration-skip matrix (monorepo#738): `get_workspace_agent_usage_data`
+    /// hydrates message contents ONLY when both the decoded snapshot and
+    /// baseline are absent — snapshot- and/or baseline-backed sessions return
+    /// empty `contents`; a malformed-JSON snapshot decodes to `None` and
+    /// still hydrates (per-message fallback preserved).
+    #[tokio::test]
+    async fn usage_data_skips_hydration_for_snapshot_backed_sessions() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-hydration".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let usage_msg = serde_json::json!({ "usage": { "inputTokens": 9, "outputTokens": 1 } });
+        let snap = TokenUsageTotals {
+            input_tokens: 70,
+            output_tokens: 50,
+            cache_read_tokens: 30,
+            cache_creation_tokens: 4,
+        };
+
+        // Each session gets one message with usage metadata; only the
+        // fallback-eligible sessions must surface it.
+        let with_snapshot = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let with_baseline = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let with_neither = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let with_malformed = AgentId(format!("agent-{}", Uuid::new_v4()));
+        for id in [
+            &with_snapshot,
+            &with_baseline,
+            &with_neither,
+            &with_malformed,
+        ] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert");
+            store
+                .append_agent_message(id, "assistant", &usage_msg, &ts)
+                .await
+                .expect("append message");
+        }
+        store
+            .set_agent_session_token_usage(&ws_id, &with_snapshot, &snap)
+            .await
+            .expect("set snapshot");
+        sqlx::query("UPDATE agent_session SET token_usage_baseline=? WHERE id=?")
+            .bind(serde_json::to_string(&snap).unwrap())
+            .bind(&with_baseline.0)
+            .execute(store.write_pool())
+            .await
+            .expect("inject baseline");
+        sqlx::query("UPDATE agent_session SET token_usage='not json' WHERE id=?")
+            .bind(&with_malformed.0)
+            .execute(store.write_pool())
+            .await
+            .expect("inject malformed snapshot");
+
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        let by_id = |id: &AgentId| rows.iter().find(|r| r.0 == id.0).expect("row");
+        let snap_row = by_id(&with_snapshot);
+        assert_eq!(snap_row.2.as_ref(), Some(&snap), "snapshot surfaced");
+        assert!(snap_row.4.is_empty(), "snapshot-backed: no hydration");
+        let base_row = by_id(&with_baseline);
+        assert_eq!(base_row.3.as_ref(), Some(&snap), "baseline surfaced");
+        assert!(base_row.4.is_empty(), "baseline-backed: no hydration");
+        let neither_row = by_id(&with_neither);
+        assert_eq!(
+            neither_row.4,
+            vec![usage_msg.clone()],
+            "both-absent session still hydrates message contents"
+        );
+        let malformed_row = by_id(&with_malformed);
+        assert!(malformed_row.2.is_none(), "malformed snapshot decodes None");
+        assert_eq!(
+            malformed_row.4,
+            vec![usage_msg],
+            "malformed snapshot still hydrates (fallback preserved)"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `update_workspace_token_usage` (monorepo#738): the closure sees the
+    /// in-transaction usage rows and stored usage; a `Some` return performs a
+    /// SCOPED `token_usage` + `updated_at` write (a title changed between
+    /// reads survives — no full-row replace); `None` skips the write; a
+    /// missing workspace maps to `NotFound`.
+    #[tokio::test]
+    async fn update_workspace_token_usage_scoped_write_and_decline() {
+        use intent_core::{now_iso, TokenUsage};
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-scoped".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert");
+        let snap = TokenUsageTotals {
+            input_tokens: 70,
+            output_tokens: 50,
+            cache_read_tokens: 30,
+            cache_creation_tokens: 4,
+        };
+        store
+            .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
+            .await
+            .expect("set snapshot");
+
+        // Simulate a title update landing after the recompute's decision
+        // point would have read the workspace under the OLD full-row-replace
+        // scheme: change the title first, then run the scoped recompute and
+        // assert the title survives.
+        sqlx::query("UPDATE workspace SET title='Renamed by user' WHERE id=?")
+            .bind(&ws_id.0)
+            .execute(store.write_pool())
+            .await
+            .expect("rename");
+
+        let written = store
+            .update_workspace_token_usage(&ws_id, |rows, current| {
+                assert_eq!(rows.len(), 1, "closure sees the session rows");
+                assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot visible");
+                assert!(current.is_none(), "no stored usage yet");
+                Some(TokenUsage {
+                    totals: snap.clone(),
+                    ..TokenUsage::default()
+                })
+            })
+            .await
+            .expect("recompute ok");
+        assert_eq!(
+            written.as_ref().map(|u| &u.totals),
+            Some(&snap),
+            "written usage returned"
+        );
+        let ws = store.get_workspace(&ws_id).await.expect("get");
+        assert_eq!(ws.title, "Renamed by user", "scoped write keeps the title");
+        assert_eq!(
+            ws.token_usage.as_ref().map(|u| &u.totals),
+            Some(&snap),
+            "token_usage persisted"
+        );
+
+        // Closure declines → nothing written, stored usage passed in.
+        let declined = store
+            .update_workspace_token_usage(&ws_id, |_, current| {
+                assert_eq!(
+                    current.map(|u| &u.totals),
+                    Some(&snap),
+                    "stored usage visible on the next recompute"
+                );
+                None
+            })
+            .await
+            .expect("decline ok");
+        assert!(declined.is_none(), "None return skips the write");
+
+        // Missing workspace → NotFound.
+        let missing = WorkspaceId("ws-missing".to_string());
+        let err = store
+            .update_workspace_token_usage(&missing, |_, _| Some(TokenUsage::default()))
+            .await
+            .expect_err("missing workspace rejected");
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 
         let _ = std::fs::remove_file(&tmp);
     }

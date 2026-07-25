@@ -43,8 +43,15 @@ impl Drop for TempDb {
 const ACP_SID: &str = "acp-session-1";
 
 /// Mock agent that answers the lifecycle methods; `session/prompt` streams the
-/// caller-supplied `session/update` burst, then resolves with `end_turn`.
-fn spawn_mock_agent_with<R, W>(read: R, write: W, updates: Vec<String>) -> JoinHandle<()>
+/// caller-supplied `session/update` burst, then resolves with the supplied
+/// result — e.g. `end_turn`, optionally carrying an end-of-turn `usage`
+/// snapshot (the ACP `unstable_end_turn_token_usage` extension).
+fn spawn_mock_agent_with_prompt_result<R, W>(
+    read: R,
+    write: W,
+    updates: Vec<String>,
+    prompt_result: Value,
+) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -76,7 +83,7 @@ where
                 }
                 "session/new" => json!({ "sessionId": ACP_SID }),
                 "session/load" => json!({}),
-                "session/prompt" => json!({ "stopReason": "end_turn" }),
+                "session/prompt" => prompt_result.clone(),
                 _ => json!({}),
             };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -276,9 +283,21 @@ fn connect_with(
     mpsc::UnboundedReceiver<IncomingNotification>,
     JoinHandle<()>,
 ) {
+    connect_with_prompt_result(updates, json!({ "stopReason": "end_turn" }))
+}
+
+/// [`connect_with`] with a caller-supplied `session/prompt` result.
+fn connect_with_prompt_result(
+    updates: Vec<String>,
+    prompt_result: Value,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
     let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
     let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
-    let agent = spawn_mock_agent_with(c2a_agent, a2c_agent, updates);
+    let agent = spawn_mock_agent_with_prompt_result(c2a_agent, a2c_agent, updates, prompt_result);
     let (note_tx, note_rx) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
         notifications: Some(note_tx),
@@ -1282,4 +1301,171 @@ async fn recreate_acp_session_emits_session_create_status() {
         .expect("status event on the wire");
     assert_eq!(status.data["phase"], json!("session-create"));
     assert_eq!(status.data["message"], json!("Creating session\u{2026}"));
+}
+
+/// Detached turn-end bookkeeping (monorepo#738): a prompt whose result carries
+/// an end-of-turn `usage` snapshot still lands the session snapshot and emits
+/// `workspace:tokenUsage-changed`, even though the bookkeeping now runs in a
+/// spawned task off the stream path. The turn's terminal `agent:stream:end`
+/// must NOT wait on it — `workspace:tokenUsage-changed` has no ordering
+/// guarantee relative to `agent:stream:end`, so the effects are awaited by
+/// polling after the turn resolves.
+#[tokio::test]
+async fn detached_turn_end_usage_bookkeeping_still_lands() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with_prompt_result(
+        prompt_updates(),
+        json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "totalTokens": 154,
+                "inputTokens": 70,
+                "outputTokens": 50,
+                "cachedReadTokens": 30,
+                "cachedWriteTokens": 4
+            }
+        }),
+    );
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["workspace:tokenUsage-changed".to_string()],
+        ..Default::default()
+    });
+
+    let stop = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect("turn completes");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    // The detached task persists the snapshot and emits the event; await it.
+    let batch = timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("tokenUsage-changed delivered")
+        .expect("subscription open");
+    let ev = batch
+        .iter()
+        .find(|e| e.event_type == "workspace:tokenUsage-changed")
+        .expect("usage event");
+    assert_eq!(ev.data["tokenUsage"]["totals"]["inputTokens"], json!(70));
+    assert_eq!(ev.data["tokenUsage"]["totals"]["outputTokens"], json!(50));
+    assert_eq!(
+        ev.data["tokenUsage"]["totals"]["cacheReadTokens"],
+        json!(30)
+    );
+    assert_eq!(
+        ev.data["tokenUsage"]["totals"]["cacheCreationTokens"],
+        json!(4)
+    );
+
+    // Durable effects: session snapshot + workspace tally both landed.
+    let rows = bus
+        .store()
+        .get_workspace_agent_usage_data(&workspace_id)
+        .await
+        .expect("usage rows");
+    let snapshot = rows[0].2.as_ref().expect("session snapshot persisted");
+    assert_eq!(snapshot.input_tokens, 70);
+    assert_eq!(snapshot.output_tokens, 50);
+    let ws = bus
+        .store()
+        .get_workspace(&workspace_id)
+        .await
+        .expect("reload workspace");
+    let usage = ws.token_usage.expect("workspace tally persisted");
+    assert_eq!(usage.totals.input_tokens, 70);
+    assert_eq!(usage.by_agent_id[&agent_id.0].input_tokens, 70);
+}
+
+/// Cross-turn bookkeeping ordering (monorepo#738): detached turn-end
+/// bookkeeping tasks for one agent are CHAINED — each awaits its predecessor
+/// — so a delayed task from turn N can neither skew turn N+1's usage-stats
+/// delta nor overwrite its newer cumulative snapshot. Seed the chain with a
+/// slow predecessor that lands the prior turn's snapshot (70 input tokens)
+/// late; the next turn (cumulative 100) must wait for it, record a stats
+/// delta of 30 (not a double-counting 100) into `usage_stats_hourly`, and
+/// leave its own newer snapshot in place.
+#[tokio::test]
+async fn detached_bookkeeping_chains_per_agent_across_turns() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with_prompt_result(
+        prompt_updates(),
+        json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "totalTokens": 100,
+                "inputTokens": 100,
+                "outputTokens": 0,
+                "cachedReadTokens": 0,
+                "cachedWriteTokens": 0
+            }
+        }),
+    );
+
+    // Seed the per-agent chain with a slow "previous turn" bookkeeping task
+    // that persists the earlier cumulative snapshot late.
+    let store = bus.store().clone();
+    let prev_agent = agent_id.clone();
+    let prev_ws = workspace_id.clone();
+    let prev = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = intent_core::TokenUsageTotals {
+            input_tokens: 70,
+            ..Default::default()
+        };
+        store
+            .set_agent_session_token_usage(&prev_ws, &prev_agent, &snapshot)
+            .await
+            .expect("late snapshot persists");
+    });
+    services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .insert(agent_id.clone(), prev);
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect("turn completes");
+
+    // Await the chained bookkeeping task the turn registered.
+    let handle = services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .remove(&agent_id)
+        .expect("turn registered a bookkeeping task");
+    handle.await.expect("bookkeeping task completes");
+
+    // The turn's newer snapshot survives — the late predecessor did not win.
+    let (_model, snapshot) = bus
+        .store()
+        .get_agent_session_token_usage(&workspace_id, &agent_id)
+        .await
+        .expect("read snapshot");
+    assert_eq!(snapshot.expect("snapshot persisted").input_tokens, 100);
+
+    // The stats delta was computed against the predecessor's snapshot
+    // (100 - 70 = 30), not the pre-chain state (a double-counting 100).
+    let rows = bus
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("stats rows");
+    let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+    assert_eq!(input, 30);
 }
