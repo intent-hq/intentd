@@ -1922,6 +1922,15 @@ impl Services {
     /// directly — a persisted snapshot changes no `agent_message` rows, so
     /// the watermark cannot see it).
     ///
+    /// The read→tally→compare→write cycle runs inside ONE write-pool
+    /// transaction ([`Store::update_workspace_token_usage`], monorepo#738):
+    /// the tally/change-detection/zero-guard logic below executes as a sync
+    /// closure over the in-transaction session rows and stored usage, and the
+    /// persist is a scoped `token_usage` + `updated_at` UPDATE — concurrent
+    /// recomputes fully serialize and a racing title/status update is never
+    /// clobbered. `workspace:tokenUsage-changed` is emitted only after the
+    /// store reports a committed write.
+    ///
     /// `guard_zero_regression` (set by the scan, not the live path): when the
     /// freshly computed tally is all zeros, the stored `TokenUsage` has
     /// non-zero totals, AND session rows still exist, skip the write and
@@ -1937,55 +1946,52 @@ impl Services {
         workspace_id: &WorkspaceId,
         guard_zero_regression: bool,
     ) -> Result<bool> {
-        // Tally usage without hydrating full message logs (finding F2).
-        let usage_data = self
+        let written = self
             .store
-            .get_workspace_agent_usage_data(workspace_id)
-            .await?;
-        let tallies: Vec<token_usage::AgentTokenTally> = usage_data
-            .iter()
-            .map(|(agent_id, model, snapshot, baseline, contents)| {
-                token_usage::agent_token_tally(
-                    agent_id,
-                    model.as_deref(),
-                    baseline.as_ref(),
-                    snapshot.as_ref(),
-                    contents,
-                )
-            })
-            .collect();
-        let mut usage = token_usage::aggregate_token_usage(&tallies);
-        usage.last_scan_at = Some(now_iso());
+            .update_workspace_token_usage(workspace_id, |usage_data, current| {
+                // Tally usage without hydrating full message logs (finding F2;
+                // snapshot/baseline-backed sessions arrive with empty contents).
+                let tallies: Vec<token_usage::AgentTokenTally> = usage_data
+                    .iter()
+                    .map(|(agent_id, model, snapshot, baseline, contents)| {
+                        token_usage::agent_token_tally(
+                            agent_id,
+                            model.as_deref(),
+                            baseline.as_ref(),
+                            snapshot.as_ref(),
+                            contents,
+                        )
+                    })
+                    .collect();
+                let mut usage = token_usage::aggregate_token_usage(&tallies);
+                usage.last_scan_at = Some(now_iso());
 
-        let mut ws = self.store.get_workspace(workspace_id).await?;
-        if guard_zero_regression
-            && !usage_data.is_empty()
-            && usage.totals == intent_core::TokenUsageTotals::default()
-            && ws
-                .token_usage
-                .as_ref()
-                .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
-        {
-            // Reconciliation guard: never clobber a fresher live snapshot
-            // with an all-zero tally while session rows exist (the racing-
-            // sweep case). An empty workspace (all sessions deleted) has no
-            // turn to race, so the zero recount above writes through.
+                if guard_zero_regression
+                    && !usage_data.is_empty()
+                    && usage.totals == intent_core::TokenUsageTotals::default()
+                    && current
+                        .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
+                {
+                    // Reconciliation guard: never clobber a fresher live snapshot
+                    // with an all-zero tally while session rows exist (the racing-
+                    // sweep case). An empty workspace (all sessions deleted) has no
+                    // turn to race, so the zero recount above writes through.
+                    return None;
+                }
+                let changed = match current {
+                    Some(prev) => {
+                        prev.by_agent_id != usage.by_agent_id
+                            || prev.by_model != usage.by_model
+                            || prev.totals != usage.totals
+                    }
+                    None => true,
+                };
+                changed.then_some(usage)
+            })
+            .await?;
+        let Some(usage) = written else {
             return Ok(false);
-        }
-        let changed = match &ws.token_usage {
-            Some(prev) => {
-                prev.by_agent_id != usage.by_agent_id
-                    || prev.by_model != usage.by_model
-                    || prev.totals != usage.totals
-            }
-            None => true,
         };
-        if !changed {
-            return Ok(false);
-        }
-        ws.token_usage = Some(usage.clone());
-        ws.updated_at = now_iso();
-        self.store.update_workspace(&ws).await?;
         publish_event(
             &self.event_bus,
             token_usage_changed_event(workspace_id, &usage),

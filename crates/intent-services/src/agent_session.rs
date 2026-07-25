@@ -866,10 +866,20 @@ impl Services {
         // counts are cumulative per session) and re-aggregate the workspace
         // tally immediately, persisting + emitting `workspace:tokenUsage-changed`
         // without waiting for the periodic scan. Best-effort: a failure is
-        // logged and never fails the turn.
-        if let Some(usage) = &turn_usage {
-            self.persist_turn_token_usage(agent_id, workspace_id, usage)
-                .await;
+        // logged and never fails the turn. Detached (monorepo#738): the
+        // bookkeeping runs in a spawned task so the terminal `agent:stream:end`
+        // below never waits on it — `workspace:tokenUsage-changed` therefore
+        // has NO ordering guarantee relative to `agent:stream:end` (the FE
+        // handles it independently and no contract depends on the order).
+        if let Some(usage) = turn_usage.take() {
+            let services = self.clone();
+            let agent_id = agent_id.clone();
+            let workspace_id = workspace_id.clone();
+            tokio::spawn(async move {
+                services
+                    .persist_turn_token_usage(&agent_id, &workspace_id, &usage)
+                    .await;
+            });
         }
         // Exactly ONE terminal stream:end — complete and error both map here (§7).
         self.publish_agent_event(
