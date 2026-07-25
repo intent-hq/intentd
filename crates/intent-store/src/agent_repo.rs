@@ -807,8 +807,9 @@ impl Store {
     /// branches (callers gate the overwrite policy before invoking this).
     ///
     /// In the same transaction as the id write it folds the session's current
-    /// `token_usage` snapshot into `token_usage_baseline` (component-wise sum,
-    /// NULL treated as zero) and clears the snapshot (monorepo#737). Malformed
+    /// `token_usage` snapshot into `token_usage_baseline` (component-wise
+    /// saturating sum, NULL treated as zero) and clears the snapshot
+    /// (monorepo#737). Malformed
     /// stored JSON decodes to `None` (mirroring
     /// [`Store::get_workspace_agent_usage_data`]) and is treated as zero. The
     /// write-once first set ([`Store::set_acp_session_id`]) does NOT share this
@@ -848,10 +849,12 @@ impl Store {
                 let b = b.clone().unwrap_or_default();
                 let s = s.clone().unwrap_or_default();
                 Some(TokenUsageTotals {
-                    input_tokens: b.input_tokens + s.input_tokens,
-                    output_tokens: b.output_tokens + s.output_tokens,
-                    cache_read_tokens: b.cache_read_tokens + s.cache_read_tokens,
-                    cache_creation_tokens: b.cache_creation_tokens + s.cache_creation_tokens,
+                    input_tokens: b.input_tokens.saturating_add(s.input_tokens),
+                    output_tokens: b.output_tokens.saturating_add(s.output_tokens),
+                    cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
+                    cache_creation_tokens: b
+                        .cache_creation_tokens
+                        .saturating_add(s.cache_creation_tokens),
                 })
             }
         };
