@@ -7,7 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{
+    new_attachment_id, AgentId, AttachmentPolicy, TurnAttachment, WorkspaceApi, WorkspaceId,
+    ATTACHMENT_ID_KEY,
+};
 use intent_js::{eval as js_eval, BoxFuture, EvalOptions, HostFn, JsError};
 use serde_json::{json, Value};
 
@@ -61,6 +64,13 @@ impl WorkspaceMcpServer {
                     if let Some(content_items) =
                         value.get("__mcpContentItems").and_then(Value::as_array)
                     {
+                        // §7.1 deterministic attach: register any resource
+                        // content item in the turn-attachment registry (nonce
+                        // stamped into the outgoing items) so the transcript
+                        // writer does not depend on the provider echoing this
+                        // result intact. No-op unless both the registry and a
+                        // caller agent are wired.
+                        let content_items = self.register_turn_attachments(content_items);
                         // Return MCP content items directly
                         return json!({
                             "content": content_items,
@@ -76,6 +86,104 @@ impl WorkspaceMcpServer {
             },
             Err(e) => workspace_api_error(&format_js_error(&e)),
         }
+    }
+
+    /// §7.1 deterministic attach — registration side. For every well-formed
+    /// resource content item (`{ type: "resource", resource: { uri, name,
+    /// mimeType, text } }`) in a `workspace_api` result: mint a nonce, stamp
+    /// it (as [`ATTACHMENT_ID_KEY`]) into the resource's JSON-object `text`,
+    /// and register the canonical payload in the turn-attachment registry
+    /// under `AtToolResult`. All resource items of one result register as ONE
+    /// batch, so the claim attaches every one of them together. The first
+    /// nonce is also stamped into every JSON-object text item so a provider
+    /// that collapses the content-item array to the first text item still
+    /// echoes it — that echo (or, failing that, the `workspace_api` FIFO
+    /// fallback) is what links the completed tool call back to the registered
+    /// batch. Registration happens strictly before the result returns to the
+    /// provider, so the entries always exist by the time the provider can
+    /// echo the tool's completion. Pass-through (no clone mutation, no
+    /// registration) when the registry or caller agent is unwired or no
+    /// resource item is present.
+    fn register_turn_attachments(&self, items: &[Value]) -> Vec<Value> {
+        let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id)
+        else {
+            return items.to_vec();
+        };
+        let mut out = items.to_vec();
+        let mut batch: Vec<TurnAttachment> = Vec::new();
+        let mut first_nonce: Option<String> = None;
+        for item in out.iter_mut() {
+            if item.get("type").and_then(Value::as_str) != Some("resource") {
+                continue;
+            }
+            let Some(resource) = item.get_mut("resource").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let (Some(mime_type), Some(text)) = (
+                resource.get("mimeType").and_then(Value::as_str),
+                resource.get("text").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let nonce = new_attachment_id();
+            let stamped = stamp_attachment_id(text, &nonce, false).unwrap_or_else(|| text.into());
+            batch.push(TurnAttachment {
+                id: nonce.clone(),
+                policy: AttachmentPolicy::AtToolResult,
+                mime_type: mime_type.to_string(),
+                uri: resource
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: resource
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                text: stamped.clone(),
+            });
+            resource.insert("text".to_string(), Value::String(stamped));
+            first_nonce.get_or_insert(nonce);
+        }
+        registry.register_all(agent_id, batch);
+        if let Some(nonce) = first_nonce {
+            for item in out.iter_mut() {
+                if item.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                let Some(obj) = item.as_object_mut() else {
+                    continue;
+                };
+                if let Some(stamped) = obj
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(|t| stamp_attachment_id(t, &nonce, true))
+                {
+                    obj.insert("text".to_string(), Value::String(stamped));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Stamp [`ATTACHMENT_ID_KEY`] into a serialized JSON **object** payload,
+/// returning the re-serialized text (`pretty` matches the pretty-printed text
+/// items the bindings emit; compact otherwise). `None` when the text is not a
+/// JSON object — non-object payloads pass through unstamped (their entry is
+/// still claimable via the `workspace_api` FIFO fallback).
+fn stamp_attachment_id(text: &str, nonce: &str, pretty: bool) -> Option<String> {
+    let mut parsed: Value = serde_json::from_str(text).ok()?;
+    let obj = parsed.as_object_mut()?;
+    obj.insert(
+        ATTACHMENT_ID_KEY.to_string(),
+        Value::String(nonce.to_string()),
+    );
+    if pretty {
+        serde_json::to_string_pretty(&parsed).ok()
+    } else {
+        serde_json::to_string(&parsed).ok()
     }
 }
 

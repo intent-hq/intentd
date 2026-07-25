@@ -5012,6 +5012,132 @@ mod mcp_callback {
         assert_eq!(last.author.name, "McpWriter");
         assert_eq!(last.author.author_type, "agent");
     }
+
+    /// §7.1 deterministic attach — registration side. A `ws.app.proposal.show`
+    /// call through a caller-bound MCP server wired with the services'
+    /// turn-attachment registry: (1) stamps a nonce (`attachmentId`) into both
+    /// the outgoing text and resource content items, and (2) registers the
+    /// canonical resource payload under `AtToolResult` so the transcript
+    /// writer can claim it by nonce (or `workspace_api` FIFO) regardless of
+    /// echo fidelity.
+    #[tokio::test]
+    async fn proposal_show_through_mcp_registers_turn_attachment_with_nonce() {
+        use intent_core::AgentId;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store);
+        let registry = services.turn_attachments();
+        let agent_id = AgentId::from_string("agent-proposer");
+        let chief = intent_core::WorkspaceId::chief();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server = WorkspaceMcpServer::new(api, chief)
+            .with_caller_agent_id(Some(agent_id.clone()))
+            .with_turn_attachments(Some(registry.clone()));
+
+        let code = r#"
+            const proposal = {
+                kind: "settings-change",
+                payload: { key: "test.setting", value: "new-value" },
+                preview: { title: "Update Test Setting" }
+            };
+            return await ws.app.proposal.show(proposal);
+        "#;
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "proposal.show registers" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        // Outgoing content items carry the stamped nonce in BOTH items.
+        let items = resp["result"]["content"].as_array().expect("content items");
+        assert_eq!(items.len(), 2);
+        let text_payload: serde_json::Value =
+            serde_json::from_str(items[0]["text"].as_str().expect("text item"))
+                .expect("text item parses");
+        let nonce = text_payload["attachmentId"]
+            .as_str()
+            .expect("nonce stamped into text item")
+            .to_string();
+        assert!(nonce.starts_with("tar-"));
+        let resource_text = items[1]["resource"]["text"]
+            .as_str()
+            .expect("resource text");
+        let resource_payload: serde_json::Value =
+            serde_json::from_str(resource_text).expect("resource text parses");
+        assert_eq!(resource_payload["attachmentId"], json!(nonce));
+
+        // The registry holds the canonical entry, claimable by nonce.
+        let echo = json!({ "output": format!("…\"attachmentId\": \"{nonce}\"…") });
+        let mut batch = registry.claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool");
+        assert_eq!(batch.len(), 1, "one registered entry claimable by nonce");
+        let claimed = batch.remove(0);
+        assert_eq!(claimed.id, nonce);
+        assert_eq!(claimed.mime_type, "application/vnd.intent.proposal+json");
+        assert_eq!(
+            claimed.uri,
+            "intent-proposal://settings-change/Update%20Test%20Setting"
+        );
+        assert_eq!(claimed.name, "Update Test Setting");
+        assert_eq!(claimed.text, resource_text);
+    }
+
+    /// Registration is a no-op without a caller agent (the FE/RPC front door):
+    /// the content items pass through unstamped and nothing is registered.
+    #[tokio::test]
+    async fn proposal_show_without_caller_does_not_register() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let services = Services::new(store);
+        let registry = services.turn_attachments();
+        let chief = intent_core::WorkspaceId::chief();
+
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+        let server =
+            WorkspaceMcpServer::new(api, chief).with_turn_attachments(Some(registry.clone()));
+
+        let code = r#"
+            return await ws.app.proposal.show({
+                kind: "settings-change",
+                payload: { key: "k" },
+                preview: { title: "T" }
+            });
+        "#;
+        let resp = server
+            .handle_message(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "workspace_api",
+                    "arguments": { "code": code, "summary": "no caller" }
+                }
+            }))
+            .await
+            .expect("tools/call returns a response");
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let items = resp["result"]["content"].as_array().expect("content items");
+        let text_payload: serde_json::Value =
+            serde_json::from_str(items[0]["text"].as_str().expect("text item"))
+                .expect("text item parses");
+        assert!(
+            text_payload.get("attachmentId").is_none(),
+            "no nonce stamped without a caller agent"
+        );
+        assert!(registry
+            .claim_at_tool_result(
+                &intent_core::AgentId::from_string("agent-any"),
+                None,
+                "workspace_api"
+            )
+            .is_empty());
+    }
 }
 
 // ============================================================================

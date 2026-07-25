@@ -397,6 +397,15 @@ pub struct Services {
     /// libgit2/FS work inline on the async runtime (§9.1). Shared across
     /// clones so concurrent list calls single-flight the same worktree.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Turn-attachment registry (§7.1 deterministic attach): canonical
+    /// MIME-typed resource payloads registered in-process by the per-agent
+    /// MCP dispatch (keyed by a nonce embedded in the model-facing output),
+    /// claimed by the transcript writer when the provider echoes the tool's
+    /// completion — so standalone blocks (e.g. ProposalCards) render even
+    /// when the provider garbles the echo. Shared across clones (and with
+    /// each agent's [`WorkspaceMcpServer`]) so registration and claim observe
+    /// the same state.
+    turn_attachments: Arc<intent_core::TurnAttachmentRegistry>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -458,7 +467,16 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
         }
+    }
+
+    /// The shared turn-attachment registry (§7.1 deterministic attach) — the
+    /// [`AgentManager`] hands this to each agent's `WorkspaceMcpServer` so
+    /// tool dispatch registers into the same registry the transcript writer
+    /// claims from.
+    pub fn turn_attachments(&self) -> Arc<intent_core::TurnAttachmentRegistry> {
+        self.turn_attachments.clone()
     }
 
     /// Override the GitHub login host the device flow talks to (§5.27 test
