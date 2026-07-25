@@ -205,6 +205,11 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// verbatim so parse→write→parse round-trips losslessly (port of
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
 /// `modelTier`, `roleReminder`, `agentType`).
+///
+/// NOTE: these scalars resolve winner-takes-all across tiers — the highest
+/// tier's file wins wholesale and an omitted key drops any lower-tier value.
+/// Only `hidden` has inherit-on-omit semantics (PROTOCOL §5.11). Whether the
+/// scalars should also inherit is tracked in intent-hq/monorepo#718.
 const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
     "codingAgent",
     "model",
@@ -483,6 +488,31 @@ impl SpecialistsService {
         resolved
     }
 
+    /// The effective `hidden` inherited from the tiers **below** `scope` — the
+    /// same fold [`Self::resolve`] applies, stopped before `scope` — so that
+    /// `specialist.create`/`edit` responses agree with an immediately-following
+    /// `specialist.get` when the written spec omits the key (PROTOCOL §5.11).
+    fn inherited_hidden_below(&self, id: &str, scope: &str, workspace_path: Option<&Path>) -> bool {
+        let mut resolved = load_embedded(id);
+        let project = workspace_path.map(project_dir);
+        let tiers = [
+            (self.bundled_dir.as_deref(), "bundled"),
+            (self.user_dir.as_deref(), "user"),
+            (project.as_deref(), "project"),
+        ];
+        for (dir, source) in tiers {
+            if source == scope {
+                break;
+            }
+            let Some(dir) = dir else { continue };
+            let inherited = resolved.as_ref().is_some_and(effective_hidden);
+            if let Some(def) = Self::load_from_dir(dir, id, source, inherited) {
+                resolved = Some(def);
+            }
+        }
+        resolved.as_ref().is_some_and(effective_hidden)
+    }
+
     /// Resolve a specialist's `agentType` frontmatter scalar through the 3-tier
     /// order (project > user > bundled), used at spawn time to derive a created
     /// agent's `agent_type` (SP-B / §18.2 → §18.4 denylist). Returns `None` when
@@ -668,7 +698,10 @@ impl SpecialistsService {
     }
 
     /// `specialist.create` → write a new user/project file (default scope
-    /// `user`); an existing id in that scope → `-32602` (PROTOCOL §5.11).
+    /// `user`); an existing id in that scope → `-32602` (PROTOCOL §5.11). The
+    /// returned def folds `hidden` from the tiers below `scope`
+    /// ([`Self::inherited_hidden_below`]) so it agrees with an
+    /// immediately-following `specialist.get` when the spec omits the key.
     pub(crate) fn create(
         &self,
         id: &str,
@@ -688,13 +721,20 @@ impl SpecialistsService {
                 "specialist already exists in {scope} scope: {id}"
             )));
         }
-        std::fs::write(&path, render_file(id, spec))
+        let rendered = render_file(id, spec);
+        std::fs::write(&path, &rendered)
             .map_err(|e| Error::Internal(format!("write specialist file failed: {e}")))?;
-        Ok(json!({ "specialist": build_def(id, &render_file(id, spec), scope, &path) }))
+        let inherited = self.inherited_hidden_below(id, scope, workspace_path);
+        Ok(json!({
+            "specialist": build_def_inheriting(id, &rendered, scope, &path, inherited)
+        }))
     }
 
     /// `specialist.edit` → overwrite an existing user/project file; a missing
-    /// file (e.g. a `bundled`-only id) → `-32602` (PROTOCOL §5.11).
+    /// file (e.g. a `bundled`-only id) → `-32602` (PROTOCOL §5.11). The
+    /// returned def folds `hidden` from the tiers below `scope`
+    /// ([`Self::inherited_hidden_below`]) so it agrees with an
+    /// immediately-following `specialist.get` when the spec omits the key.
     pub(crate) fn edit(
         &self,
         id: &str,
@@ -714,9 +754,13 @@ impl SpecialistsService {
                 "specialist not found in {scope} scope: {id}"
             )));
         }
-        std::fs::write(&path, render_file(id, spec))
+        let rendered = render_file(id, spec);
+        std::fs::write(&path, &rendered)
             .map_err(|e| Error::Internal(format!("write specialist file failed: {e}")))?;
-        Ok(json!({ "specialist": build_def(id, &render_file(id, spec), scope, &path) }))
+        let inherited = self.inherited_hidden_below(id, scope, workspace_path);
+        Ok(json!({
+            "specialist": build_def_inheriting(id, &rendered, scope, &path, inherited)
+        }))
     }
 
     /// `specialist.delete` → remove a user/project file; a missing file
@@ -1210,5 +1254,101 @@ mod tests {
         assert!(render_file("ghost", &spec).contains("hidden: false"));
         let spec = json!({ "name": "Ghost", "description": "d", "prompt": "body" });
         assert!(!render_file("ghost", &spec).contains("hidden"));
+    }
+
+    #[test]
+    fn bundled_dir_override_without_hidden_inherits_from_embedded() {
+        // The first step of the fold: an on-disk bundled_dir file that omits
+        // the key inherits `hidden` from the embedded floor (PROTOCOL §5.11).
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "chief-of-staff",
+            "---\nname: \"Chief of Staff\"\ndescription: \"Patched bundled\"\n---\n\nPatched body",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("chief-of-staff", None).unwrap();
+        assert_eq!(got["specialist"]["source"], "bundled");
+        assert_eq!(got["specialist"]["description"], "Patched bundled");
+        assert_eq!(
+            got["specialist"]["hidden"], true,
+            "bundled dir file without the key inherits from the embedded floor on get"
+        );
+        let list = svc.list(None).unwrap();
+        let specs = list["specialists"].as_array().unwrap();
+        let chief = specs.iter().find(|s| s["id"] == "chief-of-staff").unwrap();
+        assert_eq!(
+            chief["hidden"], true,
+            "bundled dir file without the key inherits from the embedded floor in list"
+        );
+    }
+
+    #[test]
+    fn unrecognized_hidden_values_inherit() {
+        // Only case-insensitive `true`/`false` are recognized; YAML 1.1 truthy
+        // spellings (`yes`, `on`, `1`) parse as `None` and inherit the lower
+        // tier's value instead of unhiding (or hiding) anything.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        // Over a hidden lower tier the unrecognized value keeps it hidden.
+        user.write(
+            "chief-of-staff",
+            "---\nname: \"Chief of Staff\"\ndescription: \"d\"\nhidden: yes\n---\n\nbody",
+        );
+        // Over a visible lower tier the unrecognized value does not hide.
+        user.write(
+            "implementor",
+            "---\nname: \"Implementor\"\ndescription: \"d\"\nhidden: on\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("chief-of-staff", None).unwrap();
+        assert_eq!(
+            got["specialist"]["hidden"], true,
+            "hidden: yes inherits the embedded floor's hidden: true"
+        );
+        let got = svc.get("implementor", None).unwrap();
+        assert!(
+            got["specialist"].get("hidden").is_none(),
+            "hidden: on inherits the embedded floor's not-hidden"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_responses_fold_hidden_from_lower_tiers() {
+        // The create/edit response must agree with an immediately-following
+        // get: a spec that omits `hidden` inherits from lower tiers, and an
+        // explicit false is the opt-out (PROTOCOL §5.11).
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let spec = json!({ "name": "Chief of Staff", "description": "d", "prompt": "body" });
+        let created = svc
+            .create("chief-of-staff", &spec, Some("user"), None)
+            .unwrap();
+        assert_eq!(
+            created["specialist"]["hidden"], true,
+            "create response inherits hidden from the embedded floor"
+        );
+        let got = svc.get("chief-of-staff", None).unwrap();
+        assert_eq!(
+            got["specialist"]["hidden"], created["specialist"]["hidden"],
+            "create response agrees with the following get"
+        );
+        let spec = json!({
+            "name": "Chief of Staff",
+            "description": "d",
+            "hidden": false,
+            "prompt": "body"
+        });
+        let edited = svc.edit("chief-of-staff", &spec, "user", None).unwrap();
+        assert!(
+            edited["specialist"].get("hidden").is_none(),
+            "edit response honors the explicit false opt-out"
+        );
+        let got = svc.get("chief-of-staff", None).unwrap();
+        assert!(
+            got["specialist"].get("hidden").is_none(),
+            "edit response agrees with the following get"
+        );
     }
 }
