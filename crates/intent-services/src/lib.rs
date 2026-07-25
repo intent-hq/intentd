@@ -1924,12 +1924,15 @@ impl Services {
     /// the watermark cannot see it).
     ///
     /// `guard_zero_regression` (set by the scan, not the live path): when the
-    /// freshly computed tally is all zeros but the stored `TokenUsage` has
-    /// non-zero totals, skip the write and return `Ok(false)`. This keeps a
-    /// sweep that raced a concurrent live update (reading the session rows
-    /// before the turn's snapshot landed) from regressing the fresher live
-    /// snapshot to zeros; the live path stays unguarded so a legitimate
-    /// recount can still lower the tally.
+    /// freshly computed tally is all zeros, the stored `TokenUsage` has
+    /// non-zero totals, AND session rows still exist, skip the write and
+    /// return `Ok(false)`. This keeps a sweep that raced a concurrent live
+    /// update (reading the session rows before the turn's snapshot landed)
+    /// from regressing the fresher live snapshot to zeros. The guard is
+    /// scoped to that race: with no session rows left (all sessions deleted)
+    /// there is nothing mid-turn to race, so a legitimate transition to zero
+    /// writes through; the live path stays unguarded so a legitimate recount
+    /// can still lower the tally.
     pub(crate) async fn recompute_workspace_token_usage(
         &self,
         workspace_id: &WorkspaceId,
@@ -1956,6 +1959,7 @@ impl Services {
 
         let mut ws = self.store.get_workspace(workspace_id).await?;
         if guard_zero_regression
+            && !usage_data.is_empty()
             && usage.totals == intent_core::TokenUsageTotals::default()
             && ws
                 .token_usage
@@ -1963,7 +1967,9 @@ impl Services {
                 .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
         {
             // Reconciliation guard: never clobber a fresher live snapshot
-            // with an all-zero tally.
+            // with an all-zero tally while session rows exist (the racing-
+            // sweep case). An empty workspace (all sessions deleted) has no
+            // turn to race, so the zero recount above writes through.
             return Ok(false);
         }
         let changed = match &ws.token_usage {

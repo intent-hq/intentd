@@ -361,20 +361,27 @@ impl Store {
     /// Upsert one session's cumulative end-of-turn token-usage snapshot
     /// (§5.23): the JSON-encoded [`TokenUsageTotals`] REPLACES any previous
     /// snapshot (ACP end-of-turn counts are cumulative per session, never
-    /// summed). `NotFound` if the session row is absent.
+    /// summed). Scoped to `workspace_id` (defense-in-depth — matches the
+    /// pattern of the other `agent_session` update helpers). `NotFound` if
+    /// the session row is absent or the workspace does not match.
     pub async fn set_agent_session_token_usage(
         &self,
+        workspace_id: &WorkspaceId,
         id: &AgentId,
         snapshot: &TokenUsageTotals,
     ) -> Result<()> {
         let json = serde_json::to_string(snapshot)
             .map_err(|e| Error::Internal(format!("encode session token_usage failed: {e}")))?;
-        let res = sqlx::query("UPDATE agent_session SET token_usage=? WHERE id=?")
-            .bind(json)
-            .bind(&id.0)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("set agent session token usage failed: {e}")))?;
+        let res =
+            sqlx::query("UPDATE agent_session SET token_usage=? WHERE id=? AND workspace_id=?")
+                .bind(json)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("set agent session token usage failed: {e}"))
+                })?;
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -1494,7 +1501,7 @@ mod tests {
             cache_creation_tokens: 4,
         };
         store
-            .set_agent_session_token_usage(&agent_id, &first)
+            .set_agent_session_token_usage(&ws_id, &agent_id, &first)
             .await
             .expect("set first");
         let second = TokenUsageTotals {
@@ -1504,7 +1511,7 @@ mod tests {
             cache_creation_tokens: 6,
         };
         store
-            .set_agent_session_token_usage(&agent_id, &second)
+            .set_agent_session_token_usage(&ws_id, &agent_id, &second)
             .await
             .expect("set second");
         let rows = store
@@ -1520,9 +1527,17 @@ mod tests {
         // Unknown session → NotFound.
         let missing = AgentId("agent-missing".to_string());
         let err = store
-            .set_agent_session_token_usage(&missing, &first)
+            .set_agent_session_token_usage(&ws_id, &missing, &first)
             .await
             .expect_err("unknown session rejected");
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+        // Workspace mismatch → NotFound (defense-in-depth scoping).
+        let other_ws = WorkspaceId("ws-other".to_string());
+        let err = store
+            .set_agent_session_token_usage(&other_ws, &agent_id, &first)
+            .await
+            .expect_err("cross-workspace write rejected");
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 
         let _ = std::fs::remove_file(&tmp);

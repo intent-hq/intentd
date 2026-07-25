@@ -15510,6 +15510,58 @@ mod turn_token_usage {
         assert_eq!(usage2.totals.output_tokens, 3);
     }
 
+    /// The zero-regression guard is scoped to the racing-sweep case: once ALL
+    /// session rows are gone (e.g. every agent deleted), a scan's all-zero
+    /// recount is legitimate and writes through — the stale non-zero tally
+    /// does not persist indefinitely.
+    #[tokio::test]
+    async fn scan_zeroes_tally_when_all_sessions_deleted() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        // A message makes the watermark non-zero so the delete below moves it.
+        h.store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 70, "outputTokens": 50 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append usage message");
+        let changed = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan ok");
+        assert!(changed, "initial scan tallies the session");
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.token_usage.as_ref().unwrap().totals.input_tokens, 70);
+
+        // All sessions deleted → the next recount is all-zero AND unguarded
+        // (no session rows left to race), so the tally transitions to zero.
+        h.store
+            .delete_agent_session(&h.ws, &agent)
+            .await
+            .expect("delete session");
+        let mut sub = subscribe_usage(&h);
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan 2 ok");
+        assert!(changed2, "legitimate transition to zero writes through");
+        let ev = recv_usage_event(&mut sub).await;
+        assert_eq!(ev["data"]["tokenUsage"]["totals"]["inputTokens"], 0);
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload 2");
+        let usage = reloaded.token_usage.as_ref().expect("tally kept");
+        assert_eq!(usage.totals, intent_core::TokenUsageTotals::default());
+        assert!(usage.by_agent_id.is_empty(), "deleted session dropped");
+    }
+
     /// A snapshot for a session that no longer exists is logged, not fatal:
     /// no panic, no workspace-tally write, no event.
     #[tokio::test]

@@ -478,7 +478,15 @@ async function handlePrompt(id, params) {
     }
   }
 
-  result(id, { stopReason: 'end_turn' });
+  // Optional end-of-turn token-usage snapshot (ACP `unstable_end_turn_token_usage`
+  // extension): when the active behavior/rule carries a `usage` object it is
+  // echoed verbatim on the PromptResponse, letting e2e tests drive the daemon's
+  // live token-usage capture path (§5.23). Counts are cumulative per session.
+  const payload = { stopReason: 'end_turn' };
+  if (active.usage && typeof active.usage === 'object') {
+    payload.usage = active.usage;
+  }
+  result(id, payload);
 }
 
 // Attempt-counting for deterministic failure modes. Reads/writes a counter file

@@ -926,7 +926,7 @@ impl Services {
         let snapshot = token_usage::snapshot_from_turn_usage(usage);
         if let Err(e) = self
             .store
-            .set_agent_session_token_usage(agent_id, &snapshot)
+            .set_agent_session_token_usage(workspace_id, agent_id, &snapshot)
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "persist turn token usage failed");
