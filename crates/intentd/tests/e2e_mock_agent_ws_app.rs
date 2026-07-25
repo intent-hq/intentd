@@ -562,6 +562,172 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     }
 }
 
+/// §7.1 deterministic attach: a provider whose tool echo is GARBLED beyond
+/// repair (collapsed, truncated, and corrupted — neither the resource item
+/// nor a parseable `{ok, proposal}` payload survives, so both the array path
+/// and the collapsed-output lift fail) still yields the standalone
+/// proposal-resource block in the persisted transcript, because
+/// `ws.app.proposal.show`'s dispatch registered the canonical payload in the
+/// turn-attachment registry in-process and the transcript writer claims it
+/// when the tool call completes.
+#[tokio::test]
+async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
+    let Some(script) = gate() else { return };
+
+    let db = std::env::temp_dir().join(format!(
+        "intentd-e2e-ws-app-garble-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_event_bus(bus.clone());
+
+    let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
+    let agent_val = services
+        .agent_create(
+            chief_ws.clone(),
+            Some("Chief Garble E2E".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create chief agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    // Call ws.app.proposal.show via MCP; the mock garbles the tool output.
+    let js = r#"
+        const proposal = {
+            kind: "settings-change",
+            payload: { key: "test.setting", value: "new-value" },
+            preview: {
+                title: "Update Test Setting",
+                description: "Change test setting to new value"
+            }
+        };
+        const result = await ws.app.proposal.show(proposal);
+        return result;
+    "#;
+
+    let behavior = json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "ws.app.proposal.show garbled e2e" }
+        },
+        "response": "show proposal",
+        "emitToolBlocks": true,
+        "garbleToolOutput": true,
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    let cwd = std::env::temp_dir();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            agent_id.clone(),
+            chief_ws.clone(),
+            "Chief Garble E2E",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(json!({ "type": "text", "text": "show proposal" })).unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block])
+        .await
+        .expect("run_turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let conversation = services
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .await
+        .expect("read conversation");
+    let messages = conversation["messages"].as_array().expect("messages array");
+
+    // The garbled tool_result is preserved as echoed — truncated/corrupted,
+    // NOT a parseable {ok, proposal} payload and NOT a content-item array.
+    let garbled_result_present = messages.iter().any(|msg| {
+        msg["contentBlocks"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "tool_result"
+                    && block["output"]["output"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("[tool ran]"))
+            })
+        })
+    });
+    assert!(
+        garbled_result_present,
+        "Expected the garbled tool_result shape in transcript: {}",
+        serde_json::to_string_pretty(&conversation).unwrap()
+    );
+
+    // Deterministic attach: the standalone proposal-resource block is still
+    // present, carrying the CANONICAL payload from the registry (not the
+    // garbled echo).
+    let standalone = messages.iter().find_map(|msg| {
+        msg["contentBlocks"].as_array().and_then(|blocks| {
+            blocks.iter().find(|block| {
+                block["type"] == "resource"
+                    && block["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+                    && block["id"].is_string()
+            })
+        })
+    });
+    let standalone = standalone.unwrap_or_else(|| {
+        panic!(
+            "Standalone proposal resource block not attached from garbled output: {}",
+            serde_json::to_string_pretty(&conversation).unwrap()
+        )
+    });
+    assert_eq!(standalone["resource"]["name"], "Update Test Setting");
+    assert_eq!(
+        standalone["resource"]["uri"],
+        "intent-proposal://settings-change/Update%20Test%20Setting"
+    );
+    let text = standalone["resource"]["text"].as_str().expect("text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("proposal text parses");
+    assert_eq!(parsed["kind"], "settings-change");
+    assert_eq!(parsed["payload"]["key"], "test.setting");
+    assert_eq!(parsed["payload"]["value"], "new-value");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+}
+
 /// Gap 3 (P3): Non-chief workspace agent calls ws.app.* and receives the
 /// gating error through the MCP tool result.
 #[tokio::test]

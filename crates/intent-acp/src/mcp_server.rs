@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::tool_restrictions::get_tool_denylist_for_agent_type;
@@ -51,6 +51,13 @@ pub struct WorkspaceMcpServer {
     /// the 30s default; tests compress it so timeout-path coverage completes
     /// in milliseconds.
     workspace_api_timeout: Duration,
+    /// Turn-attachment registry (§7.1 deterministic attach). When wired —
+    /// together with a `caller_agent_id` — a `workspace_api` result carrying
+    /// a resource content item registers the canonical payload in-process
+    /// (nonce stamped into the model-facing output) so the transcript writer
+    /// attaches it without depending on the provider's echo fidelity. `None`
+    /// keeps the legacy echo-parse-only behavior (FE front door, tests).
+    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
 }
 
 impl WorkspaceMcpServer {
@@ -66,6 +73,7 @@ impl WorkspaceMcpServer {
             caller_agent_id: None,
             is_chief,
             workspace_api_timeout: dispatch::WORKSPACE_API_TIMEOUT,
+            turn_attachments: None,
         }
     }
 
@@ -100,6 +108,14 @@ impl WorkspaceMcpServer {
     /// point). Caller-aware tools attribute their actions to this id.
     pub fn with_caller_agent_id(mut self, caller: Option<AgentId>) -> Self {
         self.caller_agent_id = caller;
+        self
+    }
+
+    /// Wire the daemon-wide turn-attachment registry (§7.1 deterministic
+    /// attach). Registration only activates when a `caller_agent_id` is also
+    /// set — the registry keys pending attachments by agent.
+    pub fn with_turn_attachments(mut self, registry: Option<Arc<TurnAttachmentRegistry>>) -> Self {
+        self.turn_attachments = registry;
         self
     }
 

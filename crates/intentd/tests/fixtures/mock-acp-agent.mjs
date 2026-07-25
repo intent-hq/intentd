@@ -450,11 +450,20 @@ async function handlePrompt(id, params) {
       // the MCP content items into `{ output: "<first text item's text>" }`,
       // dropping resource items entirely — the shape behind the proposal-lift
       // fallback (intent-hq/monorepo#511 regression class).
+      //
+      // With garbleToolOutput, emulate the worst-case provider echo: the
+      // collapsed text is truncated and corrupted so neither the resource
+      // item nor a parseable {ok, proposal} payload survives — only the
+      // turn-attachment registry (deterministic attach) can recover it.
       if (result && result.content && Array.isArray(result.content)) {
         let rawOutput = result.content;
-        if (active.collapseToolOutput) {
+        if (active.collapseToolOutput || active.garbleToolOutput) {
           const firstText = result.content.find((c) => c && c.type === 'text');
           rawOutput = { output: firstText ? firstText.text : '' };
+        }
+        if (active.garbleToolOutput) {
+          const text = String(rawOutput.output || '');
+          rawOutput = { output: `[tool ran] ${text.slice(0, 40)}…(truncated by provider)` };
         }
         note('session/update', {
           sessionId: SESSION_ID,

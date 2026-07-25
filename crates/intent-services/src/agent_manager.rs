@@ -1069,7 +1069,10 @@ impl AgentManager {
         let server = Arc::new(
             WorkspaceMcpServer::for_agent_type(api, workspace_id.clone(), agent_type)
                 // Caller-aware tools attribute back to this spawning agent.
-                .with_caller_agent_id(Some(agent_id.clone())),
+                .with_caller_agent_id(Some(agent_id.clone()))
+                // §7.1 deterministic attach: tool dispatch registers resource
+                // payloads into the same registry the transcript writer claims.
+                .with_turn_attachments(Some(self.services.turn_attachments())),
         );
         let bridge = serve_workspace_mcp_tcp(server)
             .await

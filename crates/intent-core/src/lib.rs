@@ -19,6 +19,7 @@ pub mod server_control;
 pub mod settings_file;
 pub mod slug;
 pub mod traits;
+pub mod turn_attachments;
 
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
@@ -69,4 +70,7 @@ pub use settings_file::{
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
+};
+pub use turn_attachments::{
+    new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };

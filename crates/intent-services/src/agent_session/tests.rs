@@ -903,6 +903,156 @@ async fn tool_output_with_collapsed_proposal_appends_standalone_block() {
     assert_eq!(parsed["preview"]["title"], "Update Setting");
 }
 
+/// A prompt turn whose `workspace_api` tool completes with a GARBLED echo —
+/// truncated/corrupted so neither the array path nor the collapsed-output
+/// lift can recover anything (§7.1 deterministic-attach scenario).
+fn prompt_updates_with_garbled_tool_output() -> Vec<String> {
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "workspace_api", "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "ws.app.proposal.show(p)" } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed",
+                "rawOutput": { "output": "[tool ran] {\"ok\": tru…(truncated)" } }
+        }
+    })
+    .to_string();
+    vec![tool_call, tool_done]
+}
+
+fn test_attachment(id: &str, policy: intent_core::AttachmentPolicy) -> intent_core::TurnAttachment {
+    intent_core::TurnAttachment {
+        id: id.to_string(),
+        policy,
+        mime_type: "application/vnd.intent.proposal+json".to_string(),
+        uri: "intent-proposal://settings-change/Registered".to_string(),
+        name: "Registered".to_string(),
+        text: format!("{{\"kind\":\"settings-change\",\"attachmentId\":\"{id}\"}}"),
+    }
+}
+
+/// §7.1 deterministic attach: an `AtToolResult` attachment registered before
+/// the tool's completion echo arrives is attached as the standalone resource
+/// block even when the echo is garbled beyond what the lift fallback can
+/// recover — the canonical registry payload wins, no echo parsing.
+#[tokio::test]
+async fn registered_attachment_survives_garbled_tool_echo() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_garbled_tool_output());
+    services.turn_attachments().register(
+        &agent_id,
+        test_attachment("tar-reg1", intent_core::AttachmentPolicy::AtToolResult),
+    );
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    let blocks = messages[0].content.as_array().expect("content is array");
+    assert_eq!(blocks.len(), 3, "tool_use + tool_result + registered block");
+    // tool_result echo preserved verbatim (garbled).
+    assert_eq!(blocks[1]["type"], "tool_result");
+    assert_eq!(
+        blocks[1]["output"]["output"],
+        "[tool ran] {\"ok\": tru…(truncated)"
+    );
+    // The standalone block carries the CANONICAL registry payload.
+    assert_eq!(
+        blocks[2],
+        json!({ "type": "resource", "id": format!("{mid}:2"), "resource": {
+            "uri": "intent-proposal://settings-change/Registered",
+            "name": "Registered",
+            "mimeType": "application/vnd.intent.proposal+json",
+            "text": "{\"kind\":\"settings-change\",\"attachmentId\":\"tar-reg1\"}" } })
+    );
+    // The claim consumed the entry — nothing drains at the next turn end.
+    assert!(services
+        .turn_attachments()
+        .finish_turn(&agent_id)
+        .is_empty());
+}
+
+/// §7.1 `AtTurnEnd` policy: attachments registered with the turn-end policy
+/// are appended as trailing resource blocks when the turn finalizes, and
+/// unclaimed `AtToolResult` leftovers are dropped (not attached, not leaked
+/// to a later turn).
+#[tokio::test]
+async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    let registry = services.turn_attachments();
+    registry.register(
+        &agent_id,
+        test_attachment("tar-end1", intent_core::AttachmentPolicy::AtTurnEnd),
+    );
+    // An orphaned AtToolResult entry (its tool echo never arrives this turn).
+    registry.register(
+        &agent_id,
+        test_attachment("tar-orphan", intent_core::AttachmentPolicy::AtToolResult),
+    );
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let blocks = messages[0].content.as_array().expect("content is array");
+    // The AtTurnEnd attachment is the trailing block; the orphan is nowhere.
+    let last = blocks.last().expect("blocks non-empty");
+    assert_eq!(last["type"], "resource");
+    assert!(last["resource"]["text"]
+        .as_str()
+        .is_some_and(|t| t.contains("tar-end1")));
+    assert!(
+        !blocks.iter().any(|b| b["resource"]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("tar-orphan"))),
+        "unclaimed AtToolResult leftover must be dropped at turn end"
+    );
+    // Registry fully drained — nothing leaks into a later turn.
+    assert!(registry.finish_turn(&agent_id).is_empty());
+}
+
 /// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn
 /// never saw (the abort echo a cancelled child emits after an interrupt: no
 /// title/rawInput → derived name "") must NOT fabricate an anonymous

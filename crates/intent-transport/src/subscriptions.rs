@@ -654,12 +654,19 @@ impl ChatDeltaState {
                     res_added,
                     self.entity(&message_id, result_block, None, None, false),
                 );
-                // §7.1: the same standalone proposal-resource block the
-                // persisted transcript appends right after the `tool_result`.
-                // Gated on `completed` only (matching `record_tool`) — an
-                // errored tool must not surface an actionable ProposalCard.
+                // §7.1: the same standalone resource block the persisted
+                // transcript appends right after the `tool_result`. The
+                // registry-claimed canonical item carried on the event
+                // (`registeredAttachment`, deterministic attach) wins;
+                // otherwise fall back to lifting a proposal-MIME resource
+                // item out of the echoed output. Gated on `completed` only
+                // (matching `record_tool`) — an errored tool must not surface
+                // an actionable ProposalCard.
                 if status == "completed" {
-                    if let Some(item) = intent_services::tool_block::lift_proposal_resource(output)
+                    if let Some(item) = d
+                        .get("registeredAttachment")
+                        .cloned()
+                        .or_else(|| intent_services::tool_block::lift_proposal_resource(output))
                     {
                         if let Some(proposal_id) = next_block_id(&result_id) {
                             let proposal_block =

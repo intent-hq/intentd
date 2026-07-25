@@ -141,7 +141,13 @@ impl Transcript {
     /// toolCallId the (fresh) transcript never saw. Fabricating a `tool_use`
     /// block from it persists an anonymous block (`name: ""`) that breaks FE
     /// conversation loading. Known-id patching is unaffected.
-    fn record_tool(&mut self, tc: &MappedToolCall) -> Option<usize> {
+    ///
+    /// `registered` is the canonical resource item claimed from the
+    /// turn-attachment registry (§7.1 deterministic attach) for this
+    /// completed call, if any. On a registry hit it is attached directly and
+    /// echo parsing is skipped; otherwise the legacy lift/wrap-repair
+    /// fallback inspects the echoed output.
+    fn record_tool(&mut self, tc: &MappedToolCall, registered: Option<Value>) -> Option<usize> {
         let use_index = match self.tool_use_index.get(&tc.tool_call_id) {
             Some(&i) => {
                 if let Some(meta) = self.blocks[i]
@@ -198,16 +204,21 @@ impl Transcript {
                             .insert(tc.tool_call_id.clone(), rindex);
                     }
                 }
-                // §7.1: lift a proposal-MIME resource item out of the output
-                // into its own standalone block so the FE can render it
-                // directly (the item also stays in `tool_result.output`).
+                // §7.1: attach the standalone resource block so the FE can
+                // render it directly (the item also stays in
+                // `tool_result.output` when the provider echoed it). The
+                // registry-claimed canonical item wins (deterministic attach —
+                // no echo parsing); otherwise fall back to lifting a
+                // proposal-MIME resource item out of the echoed output.
                 // Gated on `completed` only — an errored tool must not surface
                 // an actionable ProposalCard. Asymmetry: a re-completion whose
                 // output DROPS the item leaves a previously appended block in
                 // place (the transcript is append-only; index-derived ids
                 // preclude removal).
                 if tc.status == "completed" {
-                    if let Some(item) = crate::tool_block::lift_proposal_resource(output) {
+                    if let Some(item) =
+                        registered.or_else(|| crate::tool_block::lift_proposal_resource(output))
+                    {
                         match self.proposal_index.get(&tc.tool_call_id) {
                             Some(&pi) => {
                                 let id = self.block_id(pi);
@@ -230,6 +241,15 @@ impl Transcript {
             }
         }
         Some(use_index)
+    }
+
+    /// The recorded tool name for a known `toolCallId` (from its `tool_use`
+    /// block), or `None` when the id was never seen. ACP `tool_call_update`s
+    /// are name-less — the name only arrives on the first `tool_call` — so
+    /// the completion-side registry claim resolves the name here.
+    fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
+        let &i = self.tool_use_index.get(tool_call_id)?;
+        self.blocks[i].get("name").and_then(Value::as_str)
     }
 
     fn into_blocks(mut self) -> Vec<Value> {
@@ -753,6 +773,16 @@ impl Services {
             self.route_notification(&note, agent_id, workspace_id, &mut transcript)
                 .await;
         }
+        // §7.1 deterministic attach — turn-end drain: append the registered
+        // `AtTurnEnd` attachments as trailing resource blocks, and clear ALL
+        // remaining registry entries for this agent (unclaimed `AtToolResult`
+        // leftovers are dropped so they cannot attach to a later turn). Runs
+        // on the error path too — the registry must not leak; the interrupt/
+        // abort path (worker dropped) is covered by the next turn's drain +
+        // the registry TTL.
+        for attachment in self.turn_attachments.finish_turn(agent_id) {
+            transcript.push_block(attachment.resource_item());
+        }
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
@@ -897,10 +927,28 @@ impl Services {
                 .await;
             }
             MappedUpdate::ToolCall(tc) => {
+                // §7.1 deterministic attach: claim the pending `AtToolResult`
+                // registry entry for this completed call (nonce match against
+                // the echoed output, `workspace_api` FIFO fallback). A hit
+                // yields the canonical resource item to attach — no echo
+                // parsing; a miss falls back to the legacy lift inside
+                // `record_tool`. `tool_call_update`s are name-less, so the
+                // FIFO gate resolves the name recorded at first sight.
+                let registered = (tc.status == "completed")
+                    .then(|| {
+                        let name = transcript
+                            .tool_name_for(&tc.tool_call_id)
+                            .unwrap_or(&tc.tool_name)
+                            .to_string();
+                        self.turn_attachments
+                            .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
+                            .map(|a| a.resource_item())
+                    })
+                    .flatten();
                 // D6: accumulate tool_use/tool_result blocks into the transcript
                 // so they persist (and reach `agent.getConversation`). A dropped
                 // update (STAB-124: anonymous first sight) publishes no event.
-                let Some(block_index) = transcript.record_tool(&tc) else {
+                let Some(block_index) = transcript.record_tool(&tc, registered.clone()) else {
                     return;
                 };
                 // D4: enrich additively — keep the existing fields, add agentId,
@@ -919,6 +967,12 @@ impl Services {
                 });
                 if let Some(output) = tc.output {
                     data["output"] = output;
+                }
+                // Carry the claimed canonical item on the event so the live
+                // `chat.subscribe` delta path attaches the SAME block the
+                // persisted transcript does (byte-identical invariant).
+                if let Some(item) = registered {
+                    data["registeredAttachment"] = item;
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_TOOL_CALL, data)
                     .await;
