@@ -1606,6 +1606,158 @@ async fn comment_add_context_not_found_returns_invalid_params_over_wss() {
     );
 }
 
+/// End-to-end (Round 14 root cause A): a client-supplied `commentId` is used
+/// for the comment row, the thread id, and the embedded anchor markers, so
+/// the FE's optimistic anchors converge with the daemon's rewrite.
+#[tokio::test]
+async fn comment_add_supplied_comment_id_round_trips_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "ClientCommentId", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "anchor target text" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let supplied = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "anchor target text",
+            "commentTarget": "target",
+            "comment": "root",
+            "commentId": supplied,
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], json!(true), "add: {add}");
+    assert_eq!(add["commentId"], json!(supplied), "add: {add}");
+
+    // The rewrite embedded the SUPPLIED id in the markers.
+    let read = wss_rpc(
+        &mut rpc,
+        2,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = read["note"]["content"].as_str().expect("content");
+    assert!(
+        content.contains(&format!(
+            "<!--anchor:{supplied}:start-->target<!--anchor:{supplied}:end-->"
+        )),
+        "markers must embed the supplied id: {content}"
+    );
+
+    // The stored row + thread use the supplied id too.
+    let thread = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "commentId": supplied }),
+    )
+    .await;
+    assert_eq!(thread["threadId"], json!(supplied), "thread: {thread}");
+    assert_eq!(thread["rootComment"]["id"], json!(supplied));
+
+    // A duplicate supplied id (fresh idempotency scope) is rejected -32602.
+    let dup = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "anchor target text",
+            "commentTarget": "anchor",
+            "comment": "again",
+            "commentId": supplied,
+        }),
+    )
+    .await;
+    assert_eq!(dup["error"]["code"], json!(-32602), "envelope: {dup}");
+    assert!(
+        dup["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("commentId"),
+        "envelope: {dup}"
+    );
+}
+
+/// End-to-end: a malformed `commentId` returns `-32602` naming the param.
+#[tokio::test]
+async fn comment_add_invalid_comment_id_returns_invalid_params_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "BadCommentId", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "some note content" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let v = wss_rpc_envelope(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "some note content",
+            "commentTarget": "content",
+            "comment": "c",
+            "commentId": "not-a-uuid",
+        }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "envelope: {v}");
+    assert_eq!(
+        v["error"]["message"],
+        json!("invalid params: Invalid 'commentId': not-a-uuid. Must be a valid UUID."),
+        "envelope: {v}"
+    );
+}
+
 /// End-to-end: `comment.add` with `authorType: "user"` persists the author
 /// type and round-trips it through `comment.list`; omitting the param keeps
 /// the backward-compatible `agent` default.

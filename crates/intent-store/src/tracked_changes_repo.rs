@@ -58,10 +58,16 @@ impl Store {
     /// existing row in place (preserving its id + `created_at`) or insert a new
     /// one with a minted UUIDv7 id. There is no UNIQUE index on this triple (the
     /// audit trail keeps history across stages), so the upsert is done by hand.
-    pub async fn upsert_tracked_change(&self, c: &NewTrackedChange) -> Result<()> {
+    ///
+    /// Returns the replaced row's `(additions, deletions)` (`None` when the row
+    /// was created) so callers can derive the line-change **delta** this upsert
+    /// represents (the global usage-stats recording needs the growth, not the
+    /// replaced cumulative per-file counters).
+    pub async fn upsert_tracked_change(&self, c: &NewTrackedChange) -> Result<Option<(i64, i64)>> {
         let now = now_iso();
-        let existing: Option<String> = sqlx::query(
-            "SELECT id FROM tracked_changes WHERE workspace_id = ? AND path = ? AND stage = ?",
+        let existing: Option<(String, i64, i64)> = sqlx::query(
+            "SELECT id, additions, deletions FROM tracked_changes \
+             WHERE workspace_id = ? AND path = ? AND stage = ?",
         )
         .bind(&c.workspace_id.0)
         .bind(&c.path)
@@ -69,10 +75,16 @@ impl Store {
         .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("lookup tracked change failed: {e}")))?
-        .map(|r| r.get::<String, _>("id"));
+        .map(|r| {
+            (
+                r.get::<String, _>("id"),
+                r.get::<i64, _>("additions"),
+                r.get::<i64, _>("deletions"),
+            )
+        });
 
         match existing {
-            Some(id) => {
+            Some((id, prev_additions, prev_deletions)) => {
                 sqlx::query(
                     "UPDATE tracked_changes SET status = ?, agent_id = ?, session_id = ?, \
                      turn = ?, commit_hash = ?, old_blob_sha = ?, new_blob_sha = ?, \
@@ -92,6 +104,7 @@ impl Store {
                 .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("update tracked change failed: {e}")))?;
+                Ok(Some((prev_additions, prev_deletions)))
             }
             None => {
                 let id = Uuid::now_v7().to_string();
@@ -118,9 +131,9 @@ impl Store {
                     .execute(self.write_pool())
                     .await
                     .map_err(|e| Error::Internal(format!("insert tracked change failed: {e}")))?;
+                Ok(None)
             }
         }
-        Ok(())
     }
 
     /// Transition the `stage` of a workspace's tracked-change rows for `path`

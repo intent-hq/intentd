@@ -730,6 +730,7 @@ async fn dispatch(
             let author = opt_str(params, "author");
             let author_type = opt_str(params, "authorType");
             let idempotency_key = opt_nonempty_str(params, "idempotencyKey");
+            let comment_id = opt_str(params, "commentId");
             let result = api
                 .comment_add(
                     ws,
@@ -741,6 +742,7 @@ async fn dispatch(
                     author,
                     author_type,
                     idempotency_key,
+                    comment_id,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -1210,6 +1212,26 @@ async fn dispatch(
             let force_refresh = opt_bool(params, "forceRefresh").unwrap_or(false);
             let result = api
                 .models_list(provider_id, force_refresh)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
+        "stats.getUsage" => {
+            // Global usage-stats read behind the agentic usage-stats cards;
+            // no workspaceId. `period` is "24h" / "month" / "year"; `key`
+            // ("YYYY-MM" / "YYYY") is required for month/year and ignored for
+            // 24h; `tzOffsetMinutes` (minutes east of UTC, default 0) shifts
+            // buckets into the client's local time before grouping.
+            let period = require_str_param(params, "period")?;
+            let key = opt_str(params, "key");
+            let tz_offset_minutes = match params.get("tzOffsetMinutes") {
+                None | Some(Value::Null) => 0,
+                Some(v) => v
+                    .as_i64()
+                    .ok_or_else(|| rpc(INVALID_PARAMS, "tzOffsetMinutes must be an integer"))?,
+            };
+            let result = api
+                .stats_get_usage(period, key, tz_offset_minutes)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::{token_usage, Services};
+use crate::{token_usage, usage_stats, Services};
 
 #[cfg(test)]
 mod tests;
@@ -793,6 +793,8 @@ impl Services {
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone());
+        // Turn wall-clock start, for the global usage-stats longest-run MAX.
+        let turn_started = std::time::Instant::now();
         // Publish the in-flight turn so a `chat.subscribe` arriving mid-turn can
         // reconstruct the partial message (CS-0 D5). The guard clears the slot on
         // ANY exit — including the interrupt/abort path that drops this worker
@@ -887,6 +889,21 @@ impl Services {
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
         // remains as the abort-path fallback.
         self.clear_live_turn(agent_id);
+        // Global usage-stats recording: fold this turn into the current UTC
+        // hour bucket of `usage_stats_hourly` under the session's normalized
+        // model — the per-turn token delta plus, for completed turns, a `runs`
+        // increment and the wall-clock duration for the longest-run MAX. MUST
+        // run BEFORE `persist_turn_token_usage` below replaces the cumulative
+        // snapshot the delta is computed against. Best-effort: never fails
+        // the turn.
+        self.record_turn_usage_stats(
+            agent_id,
+            workspace_id,
+            turn_usage.as_ref(),
+            turn_started.elapsed(),
+            result.is_ok(),
+        )
+        .await;
         // Live token-usage update (§5.23): when the agent reported end-of-turn
         // usage, REPLACE the session's cumulative snapshot (never sum — ACP
         // counts are cumulative per session) and re-aggregate the workspace
@@ -1029,6 +1046,68 @@ impl Services {
                 error = %e,
                 "recompute workspace token usage after turn failed"
             );
+        }
+    }
+
+    /// Record one finished prompt turn into the global `usage_stats_hourly`
+    /// store (usage-stats cards): the per-turn token delta — the new
+    /// cumulative snapshot minus the previously persisted one, clamped ≥ 0
+    /// per counter — plus, for completed turns only (agent runs = completed
+    /// prompt turns), a `runs` increment and the turn's wall-clock duration
+    /// folded into the bucket's `longest_run_ms` MAX. Counters land in the
+    /// current UTC hour bucket keyed by the session's normalized model name
+    /// (`"unknown"` fallback), with no workspace dimension. MUST be called
+    /// BEFORE `persist_turn_token_usage` replaces the session snapshot the
+    /// delta is computed against. Best-effort: errors are logged, never
+    /// propagated — stats bookkeeping must not fail a turn.
+    pub(crate) async fn record_turn_usage_stats(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        usage: Option<&session::Usage>,
+        turn_duration: std::time::Duration,
+        run_completed: bool,
+    ) {
+        if usage.is_none() && !run_completed {
+            return; // failed turn without a usage report — nothing to record
+        }
+        let (model, prev, prev_readable) = match self
+            .store
+            .get_agent_session_token_usage(workspace_id, agent_id)
+            .await
+        {
+            Ok((model, prev)) => (model, prev, true),
+            Err(e) => {
+                // Without the previous snapshot the delta would re-count the
+                // session's full history — drop the token part, keep the run.
+                tracing::warn!(agent = %agent_id, error = %e, "read prev token usage for stats failed");
+                (None, None, false)
+            }
+        };
+        let tokens = match usage {
+            Some(u) if prev_readable => usage_stats::turn_token_delta(
+                prev.as_ref(),
+                &token_usage::snapshot_from_turn_usage(u),
+            ),
+            _ => Default::default(),
+        };
+        let delta = intent_store::UsageStatsDelta {
+            input_tokens: tokens.input_tokens,
+            output_tokens: tokens.output_tokens,
+            cache_read_tokens: tokens.cache_read_tokens,
+            cache_creation_tokens: tokens.cache_creation_tokens,
+            runs: run_completed as u64,
+            longest_run_ms: if run_completed {
+                turn_duration.as_millis() as u64
+            } else {
+                0
+            },
+            ..Default::default()
+        };
+        let bucket = usage_stats::hour_bucket_utc(time::OffsetDateTime::now_utc());
+        let model = usage_stats::normalize_model_name(model.as_deref().unwrap_or(""));
+        if let Err(e) = self.store.add_usage_stats(&bucket, &model, &delta).await {
+            tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
         }
     }
 

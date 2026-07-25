@@ -153,6 +153,32 @@ fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     }
 }
 
+/// Whether `base_ref` resolves in the repository at `repo_path`, using the
+/// exact 3-spec resolution [`provision_worktree`] applies at apply time
+/// (`refs/remotes/{remote}/{r}` → `refs/heads/{r}` → any rev-parsable spec),
+/// so propose-time and apply-time agree on what "resolvable" means. An empty
+/// `base_ref` is `Ok(true)`: [`provision_worktree`] treats it as "no baseRef"
+/// and falls back to HEAD, never an unresolvable ref. Read-only probe backing
+/// the best-effort base-ref validation of chief workspace-create proposals
+/// (monorepo#761).
+pub fn base_ref_resolves(repo_path: &Path, base_ref: &str, remote: &str) -> Result<bool> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    if base_ref.is_empty() {
+        return Ok(true);
+    }
+    let r = base_ref;
+    let resolves = [
+        format!("refs/remotes/{remote}/{r}"),
+        format!("refs/heads/{r}"),
+        r.to_string(),
+    ]
+    .iter()
+    .find_map(|spec| repo.revparse_single(spec).ok())
+    .and_then(|obj| obj.peel_to_commit().ok())
+    .is_some();
+    Ok(resolves)
+}
+
 /// The branch checked out in the worktree at `worktree_path` (ports the
 /// `git rev-parse --abbrev-ref HEAD` probe in `removeGitWorktree`). `None` on
 /// a detached HEAD or when the worktree cannot be opened (the TS flow treats
@@ -233,6 +259,18 @@ pub fn remove_detached_worktree(trash_path: &Path) -> Result<()> {
             "cannot remove detached worktree dir: {e}"
         ))),
     }
+}
+
+/// CoW counterpart of [`detach_worktree`] for standalone checkouts
+/// (`checkoutMode == "cow"`): rename the checkout directory to a unique
+/// sibling trash path awaiting [`remove_detached_worktree`]. A CoW checkout
+/// is a full clone with no registration in the source repository, so there
+/// is nothing to prune — this is filesystem work only and never opens a
+/// repository. Same semantics as the detach phase: `Ok(None)` when the
+/// directory was already gone or had to be removed in place (rename
+/// fallback). Idempotent.
+pub fn detach_checkout_dir(checkout_path: &Path) -> Result<Option<PathBuf>> {
+    rename_worktree_to_trash(checkout_path)
 }
 
 /// Rename `worktree_path` to a unique sibling trash path, returning the path
@@ -375,6 +413,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn base_ref_resolves_uses_provision_spec_order() {
+        let dir = init_repo("wt-resolves");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap();
+        let branch = head.shorthand().expect("branch name").to_string();
+        let sha = head.target().unwrap().to_string();
+
+        // Local branch, raw SHA, and a remote-tracking-only ref all resolve.
+        assert!(base_ref_resolves(dir.path(), &branch, "origin").unwrap());
+        assert!(base_ref_resolves(dir.path(), &sha, "origin").unwrap());
+        repo.reference(
+            "refs/remotes/origin/remote-only",
+            head.target().unwrap(),
+            false,
+            "test",
+        )
+        .unwrap();
+        assert!(base_ref_resolves(dir.path(), "remote-only", "origin").unwrap());
+
+        // Missing ref → Ok(false); unopenable repo path → Err.
+        assert!(!base_ref_resolves(dir.path(), "no-such-ref", "origin").unwrap());
+        assert!(base_ref_resolves(Path::new("/no/such/repo"), "main", "origin").is_err());
+
+        // Empty base_ref → Ok(true): provision_worktree treats it as "no
+        // baseRef" and uses HEAD, never an unresolvable ref.
+        assert!(base_ref_resolves(dir.path(), "", "origin").unwrap());
     }
 
     #[test]
@@ -557,6 +625,40 @@ mod tests {
     #[test]
     fn remove_detached_worktree_is_ok_for_missing_path() {
         remove_detached_worktree(Path::new("/nonexistent/intent-git-trash-probe")).unwrap();
+    }
+
+    // CoW-checkout detach: pure rename-to-trash with no registration prune —
+    // the directory need not even be a git repository.
+    #[test]
+    fn detach_checkout_dir_renames_to_trash_without_touching_git() {
+        let dir = std::env::temp_dir().join(format!("cow-detach-{}", uuid_ish()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested").join("f.txt"), "x\n").unwrap();
+
+        let trash = detach_checkout_dir(&dir)
+            .unwrap()
+            .expect("directory renamed to a trash path");
+        assert!(!dir.exists(), "original path vacated by the rename");
+        assert!(
+            trash.join("nested").join("f.txt").exists(),
+            "contents intact — no recursive removal in the detach phase"
+        );
+        assert!(
+            trash
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".deleting-"),
+            "trash path uses the sweep-recognized marker"
+        );
+        remove_detached_worktree(&trash).unwrap();
+        assert!(!trash.exists());
+    }
+
+    #[test]
+    fn detach_checkout_dir_is_none_when_directory_already_gone() {
+        let missing = std::env::temp_dir().join(format!("cow-detach-gone-{}", uuid_ish()));
+        assert!(detach_checkout_dir(&missing).unwrap().is_none());
     }
 
     // Regression for the delete-cleanup lock starvation: the lock-holding

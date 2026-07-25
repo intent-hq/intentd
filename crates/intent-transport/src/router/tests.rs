@@ -55,6 +55,7 @@ fn sample_ws() -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 
@@ -494,14 +495,18 @@ impl WorkspaceApi for FakeApi {
         _author: Option<String>,
         _author_type: Option<String>,
         idempotency_key: Option<String>,
+        comment_id: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         Box::pin(async move {
             Ok(CommentAddResult {
                 success: true,
                 message: format!("Comment successfully anchored to \"{comment_target}\""),
-                // Echo the key so router tests can pin that the arm forwards
-                // `params.idempotencyKey` instead of silently dropping it.
-                comment_id: idempotency_key.unwrap_or_else(|| "c1".to_string()),
+                // Echo the supplied `commentId` (then the idempotency key) so
+                // router tests can pin that the arm forwards both params
+                // instead of silently dropping them.
+                comment_id: comment_id
+                    .or(idempotency_key)
+                    .unwrap_or_else(|| "c1".to_string()),
                 anchored: true,
                 note_rev: 1,
                 location: CommentLocation {
@@ -2534,6 +2539,31 @@ async fn comment_add_forwards_idempotency_key() {
     // first cached result. The fake falls back to "c1" when the key is None.
     let v = call(
         r#"{"jsonrpc":"2.0","id":2,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice","idempotencyKey":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commentId"], serde_json::json!("c1"));
+}
+
+/// Round 14 root cause A: the `comment.add` arm forwards `params.commentId`
+/// to the service (the fake echoes it back as the comment id) so a
+/// client-supplied id survives the router boundary.
+#[tokio::test]
+async fn comment_add_forwards_comment_id() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice","commentId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["commentId"],
+        serde_json::json!("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+    );
+
+    // Absent commentId falls through to the fake's default, pinning that the
+    // arm passes None rather than fabricating a value.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice"}}"#,
     )
     .await
     .unwrap();
@@ -5120,5 +5150,136 @@ mod merge_user_app_message_id {
     fn non_object_metadata_with_id_is_invalid_params() {
         let p = params(json!({ "userAppMessageId": "app-msg-1" }));
         assert!(merge_user_app_message_id(&p, Some(json!("opaque"))).is_err());
+    }
+}
+
+/// `stats.getUsage`: routing, param validation, and verbatim forwarding of
+/// `period` / `key` / `tzOffsetMinutes` to the [`WorkspaceApi`] call.
+mod stats_get_usage {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+    use super::{call, err_code};
+
+    #[tokio::test]
+    async fn routes_past_dispatch_not_method_not_found() {
+        // The FakeApi default impl yields -32603, never -32601, proving the
+        // method is registered in the dispatch table.
+        let v = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"stats.getUsage","params":{"period":"month","key":"2026-07","tzOffsetMinutes":120}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32603);
+
+        // period alone is enough for 24h (key + tzOffsetMinutes optional).
+        let v =
+            call(r#"{"jsonrpc":"2.0","id":2,"method":"stats.getUsage","params":{"period":"24h"}}"#)
+                .await
+                .unwrap();
+        assert_eq!(err_code(&v), -32603);
+    }
+
+    #[tokio::test]
+    async fn malformed_params_are_minus_32602() {
+        for msg in [
+            // missing period entirely
+            r#"{"jsonrpc":"2.0","id":1,"method":"stats.getUsage","params":{}}"#,
+            // non-string period
+            r#"{"jsonrpc":"2.0","id":2,"method":"stats.getUsage","params":{"period":24}}"#,
+            // non-integer tzOffsetMinutes
+            r#"{"jsonrpc":"2.0","id":3,"method":"stats.getUsage","params":{"period":"24h","tzOffsetMinutes":"sixty"}}"#,
+        ] {
+            let v = call(msg).await.unwrap();
+            assert_eq!(err_code(&v), -32602, "msg={msg}");
+        }
+    }
+
+    /// The forwarded `(period, key, tz_offset_minutes)` triple.
+    type SeenParams = (String, Option<String>, i64);
+
+    /// Records the forwarded params of the last `stats_get_usage` call.
+    #[derive(Default)]
+    struct RecordingApi {
+        seen: Arc<Mutex<Option<SeenParams>>>,
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn stats_get_usage(
+            &self,
+            period: String,
+            key: Option<String>,
+            tz_offset_minutes: i64,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.seen.clone();
+            Box::pin(async move {
+                *slot.lock().unwrap() = Some((period, key, tz_offset_minutes));
+                Ok(json!({ "ok": true }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_period_key_and_tz_offset() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":1,"method":"stats.getUsage",
+            "params":{"period":"month","key":"2026-07","tzOffsetMinutes":-300}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(
+            api.seen.lock().unwrap().clone(),
+            Some(("month".to_string(), Some("2026-07".to_string()), -300))
+        );
+
+        // Omitted key/tzOffsetMinutes default to None / 0.
+        let msg = r#"{"jsonrpc":"2.0","id":2,"method":"stats.getUsage","params":{"period":"24h"}}"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["ok"], true);
+        assert_eq!(
+            api.seen.lock().unwrap().clone(),
+            Some(("24h".to_string(), None, 0))
+        );
+    }
+
+    /// Domain `InvalidParams` from the service (bad period/key/tz) surfaces as
+    /// `-32602` through `domain_to_rpc`.
+    struct RejectingApi;
+
+    impl WorkspaceApi for RejectingApi {
+        fn stats_get_usage(
+            &self,
+            period: String,
+            _key: Option<String>,
+            _tz_offset_minutes: i64,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Err(intent_core::Error::InvalidParams(format!(
+                    "period must be \"24h\", \"month\" or \"year\" (got {period:?})"
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn service_invalid_params_maps_to_minus_32602() {
+        let msg =
+            r#"{"jsonrpc":"2.0","id":3,"method":"stats.getUsage","params":{"period":"week"}}"#;
+        let out = handle_message(&RejectingApi, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(err_code(&v), -32602);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("period must be"),
+            "error message should surface the domain detail: {v}"
+        );
     }
 }

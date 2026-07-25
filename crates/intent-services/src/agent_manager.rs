@@ -399,15 +399,32 @@ impl BusEventSink {
             additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
             deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
         };
-        if let Err(e) = crate::file_tracking::track_change(store, change).await {
-            tracing::warn!(error = %e, "file-tracking: track_change failed");
-            return;
-        }
+        let attributed_agent = change.agent_id.clone();
+        let (lines_added, lines_deleted) =
+            match crate::file_tracking::track_change(store, change).await {
+                Ok(delta) => delta,
+                Err(e) => {
+                    tracing::warn!(error = %e, "file-tracking: track_change failed");
+                    return;
+                }
+            };
         // Recompute the durable line-change aggregates so the metrics.* reads
         // (§17.5) reflect this edit. Best-effort: attribution is already recorded.
         if let Err(e) = crate::metrics::recompute(store, &workspace_id).await {
             tracing::warn!(error = %e, "metrics: recompute failed");
         }
+        // Global usage-stats (D5): fold the attributed lines-changed delta into
+        // the current `usage_stats_hourly` bucket under the acting agent's
+        // normalized model. Independent of the clearable metrics aggregates
+        // above. Best-effort inside.
+        crate::usage_stats::record_lines_changed(
+            store,
+            &workspace_id,
+            attributed_agent.as_deref(),
+            lines_added,
+            lines_deleted,
+        )
+        .await;
     }
 }
 
@@ -5408,6 +5425,7 @@ mod role_reminder_tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         }
     }
 
@@ -6552,6 +6570,7 @@ mod agent_retry_tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
             task_stats: None,
         }
     }

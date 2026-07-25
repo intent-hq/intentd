@@ -847,10 +847,12 @@ async fn workspace_duplicate_provisions_worktree_over_wss() {
     drop(daemon);
 }
 
-/// `workspace.duplicate` off a workspace with `skipWorktree: true` does NOT
+/// `workspace.duplicate` off a workspace created with `skipIsolation: true`
+/// (the canonical name for the pre-CoW `skipWorktree` alias) does NOT
 /// provision a worktree for the duplicate — the source configuration flows
 /// through verbatim, so a metadata-only source stays metadata-only. Guards the
-/// skip-arm on the duplicate's provisioning gate.
+/// skip-arm on the duplicate's provisioning gate and exercises the new wire
+/// name end-to-end (other suites cover the deprecated `skipWorktree` alias).
 #[tokio::test]
 async fn workspace_duplicate_skips_worktree_when_source_skips() {
     if !gate() {
@@ -870,14 +872,14 @@ async fn workspace_duplicate_skips_worktree_when_source_skips() {
             "repositoryPath": repo.to_string_lossy(),
             "repositoryName": "source-repo",
             "baseRef": "main",
-            "skipWorktree": true,
+            "skipIsolation": true,
             "idempotencyKey": Uuid::new_v4().to_string(),
         }),
     )
     .await;
     assert!(
         created["workspace"]["worktreePath"].is_null(),
-        "source with skipWorktree has no worktree"
+        "source with skipIsolation has no worktree"
     );
     let source_id = created["workspace"]["id"].as_str().expect("id").to_string();
 
@@ -890,7 +892,7 @@ async fn workspace_duplicate_skips_worktree_when_source_skips() {
     .await;
     assert!(
         dup["workspace"]["worktreePath"].is_null(),
-        "duplicate inherits skipWorktree and stays worktree-less"
+        "duplicate inherits skip_worktree and stays worktree-less"
     );
     assert!(
         dup["workspace"]["baseCommitSha"].is_null(),

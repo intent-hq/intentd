@@ -1,8 +1,9 @@
-//! Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode workspaces).
+//! Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
+//! CoW-checkout workspaces).
 
 use std::path::PathBuf;
 
-use intent_core::{AgentId, Error, Result, Workspace, WorkspaceId};
+use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
 use intent_git::{cow_clone, cow_probe, CowSupport};
 use intent_store::{Sandbox, SandboxStatus, Store};
 
@@ -48,17 +49,18 @@ pub struct ProvisionConfig {
     pub workspaces_root: PathBuf,
 }
 
-/// Provision a sandbox for an agent in a direct-mode workspace.
+/// Provision a sandbox for an agent in a sandbox-eligible (direct-mode or
+/// CoW-checkout) workspace.
 ///
-/// 1. Probe CoW support between the user's repository directory and the sandbox parent.
+/// 1. Probe CoW support between the canonical repository directory and the sandbox parent.
 /// 2. If Unsupported, return `ProvisionOutcome::Unsupported` (fallback to shared mode; ZERO bytes copied).
-/// 3. If Supported: cow_clone the user's directory to `<workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>`.
+/// 3. If Supported: cow_clone the canonical directory to `<workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>`.
 /// 4. Create branch `sb/<agentId>` in the sandbox.
 /// 5. If the source had uncommitted changes, create a snapshot commit of the dirty state.
 /// 6. Persist the sandbox record.
 /// 7. Return `ProvisionOutcome::Supported` with the sandbox details.
 ///
-/// The user's directory is never modified by this operation.
+/// The canonical directory is never modified by this operation.
 pub async fn provision_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -68,7 +70,8 @@ pub async fn provision_sandbox(
     // Load workspace
     let workspace = store.get_workspace(workspace_id).await?;
 
-    // Only direct-mode workspaces (skip_worktree = true OR no worktree_path) are supported
+    // Resolve the canonical directory (direct mode: the user's repo folder;
+    // CoW checkout: the workspace checkout). Worktree mode is rejected.
     let user_dir = resolve_user_directory(&workspace)?;
 
     // Construct sandbox path: <workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>
@@ -448,15 +451,30 @@ pub async fn merge_sandbox(
     })
 }
 
-/// Resolve the user's repository directory from a workspace.
-/// Returns an error if the workspace is not direct-mode or doesn't have a repository path.
+/// Resolve the canonical repository directory for a workspace's sandboxes —
+/// the sandbox clone source and the merge-back target.
+///
+/// - CoW-checkout workspaces (`checkoutMode == "cow"`): the workspace
+///   checkout (`worktree_path`) is canonical.
+/// - Worktree workspaces share the checkout with the user (no sandboxes):
+///   returns an error.
+/// - Otherwise (direct mode: skip_worktree = true OR no worktree provisioned):
+///   the user's repository folder (`repository_path`).
 fn resolve_user_directory(workspace: &Workspace) -> Result<PathBuf> {
-    // Direct-mode means: skip_worktree = true OR (skip_worktree = false but no worktree provisioned)
-    // For now, we require repository_path to be set
-    let repo_path = workspace
-        .repository_path
-        .as_ref()
-        .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?;
+    let repo_path = match workspace.checkout_mode {
+        Some(CheckoutMode::Cow) => workspace.worktree_path.as_ref().ok_or_else(|| {
+            Error::InvalidParams("CoW workspace has no worktree_path".to_string())
+        })?,
+        Some(CheckoutMode::Worktree) => {
+            return Err(Error::InvalidParams(
+                "worktree-mode workspaces do not support agent sandboxes".to_string(),
+            ));
+        }
+        None => workspace
+            .repository_path
+            .as_ref()
+            .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?,
+    };
 
     let path = PathBuf::from(repo_path);
     if !path.exists() {
@@ -844,6 +862,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         }
     }
 
@@ -1941,6 +1960,227 @@ mod tests {
         assert_eq!(retry_count, 0, "Retry count should be 0 after clear");
 
         // Clean up
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    /// Build a CoW-checkout workspace: the source repo is `repository_path`,
+    /// the workspace checkout is `worktree_path`, `checkout_mode = cow`.
+    fn cow_workspace(source_repo: &Path, checkout: &Path) -> Workspace {
+        let mut ws = workspace_for_repo(source_repo);
+        ws.skip_worktree = false;
+        ws.worktree_path = Some(checkout.to_string_lossy().to_string());
+        ws.checkout_mode = Some(CheckoutMode::Cow);
+        ws
+    }
+
+    /// Stage and commit a single file in the repo at `repo_path`; returns the commit SHA.
+    fn commit_file(repo_path: &Path, file: &str, content: &str, message: &str) -> String {
+        let repo = git2::Repository::open(repo_path).unwrap();
+        fs::write(repo_path.join(file), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(file)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn cow_checkout_provision_sources_from_workspace_checkout() {
+        let (store, _db) = temp_store().await;
+        let (test_root, source_path) = temp_repo_in_target("cow-provision-src");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&source_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        // Simulate a Task-1 CoW checkout: clone the source, then diverge it.
+        let checkout_path = test_root.join("checkout");
+        cow_clone(&source_path, &checkout_path).unwrap();
+        let checkout_head = commit_file(
+            &checkout_path,
+            "checkout-only.txt",
+            "only in checkout",
+            "Checkout-only commit",
+        );
+
+        let ws = cow_workspace(&source_path, &checkout_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let source_head_before = {
+            let repo = git2::Repository::open(&source_path).unwrap();
+            let head_ref = repo.head().unwrap();
+            let oid = head_ref.target().unwrap();
+            oid.to_string()
+        };
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path,
+            base_commit_sha,
+            ..
+        } = outcome
+        else {
+            panic!("Expected Supported after probe confirmed CoW available");
+        };
+
+        // Sandbox is cloned from the workspace checkout, not the source repo.
+        assert_eq!(
+            base_commit_sha, checkout_head,
+            "sandbox base must be the checkout HEAD"
+        );
+        assert_ne!(
+            base_commit_sha, source_head_before,
+            "sandbox base must not be the source repo HEAD"
+        );
+        assert!(
+            path.join("checkout-only.txt").exists(),
+            "sandbox must contain the checkout-only file"
+        );
+
+        // Source repo untouched.
+        let source_head_after = {
+            let repo = git2::Repository::open(&source_path).unwrap();
+            let head_ref = repo.head().unwrap();
+            let oid = head_ref.target().unwrap();
+            oid.to_string()
+        };
+        assert_eq!(source_head_before, source_head_after);
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn cow_checkout_merge_targets_workspace_checkout() {
+        let (store, _db) = temp_store().await;
+        let (test_root, source_path) = temp_repo_in_target("cow-merge-src");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&source_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let checkout_path = test_root.join("checkout");
+        cow_clone(&source_path, &checkout_path).unwrap();
+
+        let ws = cow_workspace(&source_path, &checkout_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported after probe confirmed CoW available");
+        };
+
+        // Agent commits in the sandbox (distinct author for attribution check).
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            fs::write(sandbox_path.join("agent.txt"), "agent work").unwrap();
+            let mut index = sandbox_repo.index().unwrap();
+            index.add_path(Path::new("agent.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Agent Author", "agent@example.com").unwrap();
+            let parent = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .commit(Some("HEAD"), &sig, &sig, "Agent work", &tree, &[&parent])
+                .unwrap();
+        }
+
+        let source_head_before = {
+            let repo = git2::Repository::open(&source_path).unwrap();
+            let head_ref = repo.head().unwrap();
+            let oid = head_ref.target().unwrap();
+            oid.to_string()
+        };
+        let checkout_head_before = {
+            let repo = git2::Repository::open(&checkout_path).unwrap();
+            let head_ref = repo.head().unwrap();
+            let oid = head_ref.target().unwrap();
+            oid.to_string()
+        };
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id).await.unwrap();
+        let MergeOutcome::Merged { canonical_head, .. } = outcome else {
+            panic!("Expected Merged outcome, got {:?}", outcome);
+        };
+
+        // Merge landed in the workspace checkout with attribution preserved.
+        let checkout_repo = git2::Repository::open(&checkout_path).unwrap();
+        let checkout_head_after = checkout_repo.head().unwrap().target().unwrap().to_string();
+        assert_eq!(canonical_head, checkout_head_after);
+        assert_ne!(checkout_head_before, checkout_head_after);
+        assert!(checkout_path.join("agent.txt").exists());
+        let head_commit = checkout_repo.head().unwrap().peel_to_commit().unwrap();
+        let author = head_commit.author();
+        assert_eq!(author.name().unwrap(), "Agent Author");
+        assert_eq!(head_commit.message().unwrap(), "Agent work");
+
+        // Source repo untouched.
+        let source_repo = git2::Repository::open(&source_path).unwrap();
+        let source_head_after = source_repo.head().unwrap().target().unwrap().to_string();
+        assert_eq!(source_head_before, source_head_after);
+        assert!(!source_path.join("agent.txt").exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn worktree_checkout_mode_rejects_sandbox_provisioning() {
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("worktree-reject");
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        let mut ws = workspace_for_repo(&repo_path);
+        ws.skip_worktree = false;
+        ws.worktree_path = Some(repo_path.to_string_lossy().to_string());
+        ws.checkout_mode = Some(CheckoutMode::Worktree);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let err = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("worktree-mode"),
+            "expected worktree-mode rejection, got: {err}"
+        );
+
         let _ = fs::remove_dir_all(&test_root);
     }
 

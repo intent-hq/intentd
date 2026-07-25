@@ -1340,6 +1340,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         }
     }
 

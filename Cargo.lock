@@ -1885,7 +1885,9 @@ name = "intent-acp"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "git2",
  "intent-core",
+ "intent-git",
  "intent-js",
  "intent-providers",
  "intent-pty",
@@ -2110,7 +2112,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-trait",

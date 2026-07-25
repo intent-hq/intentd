@@ -1531,6 +1531,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `stats.getUsage`: the global usage-stats read behind the agentic
+    /// usage-stats cards, aggregated over the `usage_stats_hourly` store; no
+    /// `workspaceId`. `period` is `"24h"` / `"month"` / `"year"` (`key` —
+    /// `"YYYY-MM"` / `"YYYY"` — is required for month/year and ignored for
+    /// 24h); `tz_offset_minutes` is the client's offset east of UTC, applied
+    /// to the UTC hour buckets before period filtering and hour-of-day /
+    /// month grouping so results reflect the client's local time.
+    fn stats_get_usage(
+        &self,
+        period: String,
+        key: Option<String>,
+        tz_offset_minutes: i64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (period, key, tz_offset_minutes);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::stats_get_usage not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
     /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
     /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
@@ -1935,6 +1956,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
     /// §5): when present and previously recorded, the original result is returned
     /// without re-executing; soft-launch when absent (warn + execute).
+    ///
+    /// `comment_id` is the optional wire `commentId`: a client-supplied UUID used
+    /// for the comment row, thread id, anchor ids, and the embedded
+    /// `<!--anchor:{id}:start/end-->` markers, so a client that inserted
+    /// optimistic anchors under that id converges with the daemon's rewrite.
+    /// Absent → the daemon mints a fresh UUID (backward compatible).
     #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
@@ -1947,6 +1974,7 @@ pub trait WorkspaceApi: Send + Sync {
         author: Option<String>,
         author_type: Option<String>,
         idempotency_key: Option<String>,
+        comment_id: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let _ = (
             workspace_id,
@@ -1958,6 +1986,7 @@ pub trait WorkspaceApi: Send + Sync {
             author,
             author_type,
             idempotency_key,
+            comment_id,
         );
         Box::pin(async {
             Err(Error::Internal(

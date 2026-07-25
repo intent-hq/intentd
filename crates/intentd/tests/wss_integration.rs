@@ -1501,6 +1501,110 @@ async fn wss_models_list_returns_catalog_with_source() {
 }
 
 #[tokio::test]
+async fn wss_stats_get_usage_round_trip_with_seeded_store() {
+    // stats.getUsage: the global usage-stats read behind the agentic
+    // usage-stats cards. Seed two hourly buckets straight into the store,
+    // then drive both a "month" and a "24h" read over the real WSS path and
+    // assert the documented result shape.
+    let srv = start(WsOptions::default()).await;
+
+    // The current hour bucket is inside both the current month and the
+    // trailing-24h window; a bucket 48h back is outside the 24h window.
+    // Bucket keys are the store's RFC-3339 UTC hour floors.
+    use chrono::{Datelike, Timelike, Utc};
+    let now = Utc::now();
+    let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:00:00Z").to_string();
+    let bucket_now = bucket_key(now);
+    let bucket_old = bucket_key(now - chrono::Duration::hours(48));
+    let delta = intent_store::UsageStatsDelta {
+        input_tokens: 100,
+        output_tokens: 40,
+        cache_read_tokens: 20,
+        cache_creation_tokens: 10,
+        runs: 2,
+        sessions_started: 1,
+        longest_run_ms: 5_000,
+        lines_added: 12,
+        lines_deleted: 3,
+    };
+    srv.store
+        .add_usage_stats(&bucket_now, "Opus 4.8", &delta)
+        .await
+        .expect("seed current bucket");
+    srv.store
+        .add_usage_stats(
+            &bucket_old,
+            "Sonnet 5",
+            &intent_store::UsageStatsDelta {
+                input_tokens: 7,
+                runs: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed old bucket");
+
+    // 24h period: only the current bucket is inside the trailing window.
+    let frame = r#"{"jsonrpc":"2.0","id":10,"method":"stats.getUsage","params":{"period":"24h","tzOffsetMinutes":0}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 10);
+    assert!(resp.get("error").is_none(), "{resp}");
+    let r = &resp["result"];
+    assert_eq!(r["totals"]["inputTokens"], 100);
+    assert_eq!(r["totals"]["outputTokens"], 40);
+    assert_eq!(r["totals"]["cacheReadTokens"], 20);
+    assert_eq!(r["totals"]["cacheCreationTokens"], 10);
+    assert_eq!(r["runs"], 2);
+    assert_eq!(r["sessions"], 1);
+    assert_eq!(r["longestRunMs"], 5_000);
+    assert_eq!(r["linesAdded"], 12);
+    assert_eq!(r["linesDeleted"], 3);
+    let by_model = r["byModel"].as_array().expect("byModel");
+    assert_eq!(by_model.len(), 1, "{resp}");
+    assert_eq!(by_model[0]["model"], "Opus 4.8");
+    assert_eq!(by_model[0]["runs"], 2);
+    let by_hour = r["byHourOfDay"].as_array().expect("byHourOfDay");
+    assert_eq!(by_hour.len(), 24);
+    // The seeded bucket occupies exactly one trailing-window slot (the newest
+    // one, unless the wall-clock hour ticked mid-test), labelled with the
+    // bucket's UTC hour (tzOffsetMinutes is 0).
+    let seeded: Vec<&Value> = by_hour.iter().filter(|h| h["inputTokens"] == 100).collect();
+    assert_eq!(seeded.len(), 1, "{resp}");
+    assert_eq!(seeded[0]["hour"], u64::from(now.hour()));
+    assert_eq!(r["byMonth"].as_array().expect("byMonth").len(), 12);
+    // availablePeriods spans ALL rows, including the out-of-window one.
+    let months = r["availablePeriods"]["months"].as_array().expect("months");
+    assert!(!months.is_empty(), "{resp}");
+
+    // month period for the current UTC month: the current bucket counts;
+    // exact totals depend on whether the 48h-old bucket shares the month, so
+    // assert per-model rows instead.
+    let month_key = format!("{:04}-{:02}", now.year(), now.month());
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":11,"method":"stats.getUsage","params":{{"period":"month","key":"{month_key}","tzOffsetMinutes":0}}}}"#
+    );
+    let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(resp["id"], 11);
+    assert!(resp.get("error").is_none(), "{resp}");
+    let by_model = resp["result"]["byModel"].as_array().expect("byModel");
+    let opus = by_model
+        .iter()
+        .find(|m| m["model"] == "Opus 4.8")
+        .expect("Opus row in current month");
+    assert_eq!(opus["inputTokens"], 100);
+    assert_eq!(opus["runs"], 2);
+
+    // Malformed params surface as -32602 over the wire.
+    let frame =
+        r#"{"jsonrpc":"2.0","id":12,"method":"stats.getUsage","params":{"period":"month"}}"#;
+    let resp = wss_call(srv.port, srv.cfg.clone(), frame).await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
 async fn wss_models_list_with_provider_id_and_force_refresh() {
     // models.list { providerId, forceRefresh } (§5.30): per-provider catalog
     // through the generic cache. Unknown providers degrade to the static
@@ -2345,6 +2449,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 

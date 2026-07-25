@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.2.6"
+version = "0.2.7"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -78,7 +78,9 @@ ctor = "1.0.10"
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
 
-# Static musl release targets have no system OpenSSL; build it from source so the
-# libgit2/libssh2 chain (git2 https+ssh) links. No-op for gnu/mac/windows builds.
-[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+# Static musl release targets have no system OpenSSL; macOS has no system OpenSSL
+# headers/dylibs we can rely on either (Homebrew paths break on machines without it).
+# Build OpenSSL from source and link it statically so the libgit2/libssh2 chain
+# (git2 https+ssh) is self-contained. No-op for gnu/windows builds.
+[target.'cfg(any(all(target_os = "linux", target_env = "musl"), target_os = "macos"))'.dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"] }

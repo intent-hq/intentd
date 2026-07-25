@@ -1,0 +1,488 @@
+//! `stats.getUsage` read aggregation over `usage_stats_hourly` rows (the
+//! agentic usage-stats cards). Everything here is pure and unit-testable
+//! without a store; the recording side lives in `usage_stats.rs`.
+//!
+//! Buckets are stored as UTC hour floors. For month/year periods they are
+//! shifted by the client's `tzOffsetMinutes` (minutes east of UTC) before
+//! period filtering and hour-of-day / month grouping, so results reflect the
+//! client's local time (D8). The `24h` period (D11) is an absolute rolling
+//! window — the trailing 24 hourly UTC buckets ending at the current hour —
+//! with only the per-bucket hour labels rendered in local time.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use intent_core::{Error, Result};
+use intent_store::UsageStatsRow;
+use serde_json::{json, Value};
+use time::format_description::well_known::Rfc3339;
+use time::{Duration, OffsetDateTime};
+
+/// One validated `stats.getUsage` period (`period` + `key` wire params).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsagePeriod {
+    /// One local-time calendar month (`period: "month"`, `key: "YYYY-MM"`).
+    Month { year: i32, month: u8 },
+    /// One local-time calendar year (`period: "year"`, `key: "YYYY"`).
+    Year { year: i32 },
+    /// The trailing 24 hourly UTC buckets ending at the current hour (D11).
+    Last24h,
+}
+
+/// Parse the wire `period` / `key` pair into a [`UsagePeriod`]. `key` is
+/// required for `"month"` / `"year"` and ignored for `"24h"`; anything
+/// malformed is `InvalidParams` (router surfaces `-32602`).
+pub fn parse_period(period: &str, key: Option<&str>) -> Result<UsagePeriod> {
+    match period {
+        "24h" => Ok(UsagePeriod::Last24h),
+        "month" => {
+            let key = key.ok_or_else(|| {
+                Error::InvalidParams("key (\"YYYY-MM\") is required for period \"month\"".into())
+            })?;
+            key.split_once('-')
+                .and_then(|(y, m)| {
+                    let year = parse_digits(y, 4)? as i32;
+                    let month = parse_digits(m, 2)?;
+                    (1..=12).contains(&month).then_some(UsagePeriod::Month {
+                        year,
+                        month: month as u8,
+                    })
+                })
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!("invalid month key {key:?}: expected \"YYYY-MM\""))
+                })
+        }
+        "year" => {
+            let key = key.ok_or_else(|| {
+                Error::InvalidParams("key (\"YYYY\") is required for period \"year\"".into())
+            })?;
+            parse_digits(key, 4)
+                .map(|y| UsagePeriod::Year { year: y as i32 })
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!("invalid year key {key:?}: expected \"YYYY\""))
+                })
+        }
+        other => Err(Error::InvalidParams(format!(
+            "period must be \"24h\", \"month\" or \"year\" (got {other:?})"
+        ))),
+    }
+}
+
+/// Parse an exactly-`len`-digit decimal number (no signs, no spaces).
+fn parse_digits(s: &str, len: usize) -> Option<u32> {
+    (s.len() == len && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+/// The 4 separate token counters (D6) for one aggregation cell.
+#[derive(Debug, Default, Clone, Copy)]
+struct TokenCell {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+}
+
+impl TokenCell {
+    fn add(&mut self, r: &UsageStatsRow) {
+        self.input += r.input_tokens;
+        self.output += r.output_tokens;
+        self.cache_read += r.cache_read_tokens;
+        self.cache_creation += r.cache_creation_tokens;
+    }
+
+    fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_creation
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "inputTokens": self.input,
+            "outputTokens": self.output,
+            "cacheReadTokens": self.cache_read,
+            "cacheCreationTokens": self.cache_creation,
+        })
+    }
+}
+
+/// Floor a UTC datetime to its hour (the rolling 24h-window boundary).
+fn floor_to_hour(t: OffsetDateTime) -> OffsetDateTime {
+    t.replace_minute(0)
+        .and_then(|t| t.replace_second(0))
+        .and_then(|t| t.replace_nanosecond(0))
+        .expect("hour floor components are in range")
+}
+
+/// Aggregate `usage_stats_hourly` rows into the `stats.getUsage` result for
+/// one period. `tz_offset_minutes` is the client's offset east of UTC (must
+/// be a plausible UTC offset, ±14h); `now_utc` anchors the 24h rolling window
+/// (injected for testability). Rows with malformed bucket keys are skipped.
+///
+/// Result shape (all periods): `totals` (4 counters), `runs`, `sessions`,
+/// `longestRunMs`, `linesAdded`, `linesDeleted`, `byModel` (sorted desc by
+/// total tokens), `byHourOfDay` (24 entries), `byMonth` (12 entries, the
+/// period's local year; zeroed for 24h), and `availablePeriods` computed over
+/// ALL rows regardless of the requested period. Empty periods return zeroed
+/// shapes, never an error.
+pub fn aggregate_usage(
+    rows: &[UsageStatsRow],
+    period: UsagePeriod,
+    tz_offset_minutes: i64,
+    now_utc: OffsetDateTime,
+) -> Result<Value> {
+    if !(-14 * 60..=14 * 60).contains(&tz_offset_minutes) {
+        return Err(Error::InvalidParams(format!(
+            "tzOffsetMinutes must be within ±840 (got {tz_offset_minutes})"
+        )));
+    }
+    let tz = time::UtcOffset::from_whole_seconds(tz_offset_minutes as i32 * 60)
+        .expect("validated offset is in range");
+
+    // The 24h rolling window: the 24 hourly UTC buckets ending at now's hour.
+    let window_end = floor_to_hour(now_utc.to_offset(time::UtcOffset::UTC));
+    let window_start = window_end - Duration::hours(23);
+
+    let mut totals = TokenCell::default();
+    let mut runs = 0u64;
+    let mut sessions = 0u64;
+    let mut longest_run_ms = 0u64;
+    let mut lines_added = 0u64;
+    let mut lines_deleted = 0u64;
+    let mut by_model: BTreeMap<String, (TokenCell, u64)> = BTreeMap::new();
+    let mut by_hour = [TokenCell::default(); 24];
+    let mut by_month = [TokenCell::default(); 12];
+    let mut months: BTreeSet<String> = BTreeSet::new();
+    let mut years: BTreeSet<String> = BTreeSet::new();
+
+    for row in rows {
+        let Ok(utc) = OffsetDateTime::parse(&row.bucket_utc, &Rfc3339) else {
+            continue; // defensive: never fail the whole read on one bad key
+        };
+        let local = utc.to_offset(tz);
+        months.insert(format!(
+            "{:04}-{:02}",
+            local.year(),
+            u8::from(local.month())
+        ));
+        years.insert(format!("{:04}", local.year()));
+
+        // byMonth covers the period's whole local year, independent of the
+        // (possibly narrower) month filter; 24h has no month card.
+        match period {
+            UsagePeriod::Month { year, .. } | UsagePeriod::Year { year } => {
+                if local.year() == year {
+                    by_month[usize::from(u8::from(local.month())) - 1].add(row);
+                }
+            }
+            UsagePeriod::Last24h => {}
+        }
+
+        let (in_period, hour_slot) = match period {
+            UsagePeriod::Month { year, month } => (
+                local.year() == year && u8::from(local.month()) == month,
+                usize::from(local.hour()),
+            ),
+            UsagePeriod::Year { year } => (local.year() == year, usize::from(local.hour())),
+            UsagePeriod::Last24h => {
+                if utc < window_start || utc > window_end {
+                    (false, 0)
+                } else {
+                    (
+                        true,
+                        (utc - window_start).whole_hours().clamp(0, 23) as usize,
+                    )
+                }
+            }
+        };
+        if !in_period {
+            continue;
+        }
+
+        totals.add(row);
+        runs += row.runs;
+        sessions += row.sessions_started;
+        longest_run_ms = longest_run_ms.max(row.longest_run_ms);
+        lines_added += row.lines_added;
+        lines_deleted += row.lines_deleted;
+        by_hour[hour_slot].add(row);
+        let entry = by_model.entry(row.model.clone()).or_default();
+        entry.0.add(row);
+        entry.1 += row.runs;
+    }
+
+    // byModel sorted desc by total tokens; ties break on model name (asc, via
+    // the BTreeMap ordering surviving the stable sort).
+    let mut models: Vec<(String, (TokenCell, u64))> = by_model.into_iter().collect();
+    models.sort_by_key(|(_, (cell, _))| std::cmp::Reverse(cell.total()));
+    let by_model_json: Vec<Value> = models
+        .into_iter()
+        .map(|(model, (cell, runs))| {
+            let mut v = cell.json();
+            v["model"] = json!(model);
+            v["runs"] = json!(runs);
+            v
+        })
+        .collect();
+
+    // byHourOfDay: for month/year the 24 local hours of day (0..23); for 24h
+    // the 24 trailing hourly buckets in chronological order, each labelled
+    // with its local-time hour.
+    let by_hour_json: Vec<Value> = by_hour
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            let hour = match period {
+                UsagePeriod::Last24h => {
+                    let bucket = window_start + Duration::hours(i as i64);
+                    u64::from(bucket.to_offset(tz).hour())
+                }
+                _ => i as u64,
+            };
+            let mut v = cell.json();
+            v["hour"] = json!(hour);
+            v
+        })
+        .collect();
+
+    let by_month_json: Vec<Value> = by_month
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            let mut v = cell.json();
+            v["month"] = json!(i as u64 + 1);
+            v
+        })
+        .collect();
+
+    Ok(json!({
+        "totals": totals.json(),
+        "runs": runs,
+        "sessions": sessions,
+        "longestRunMs": longest_run_ms,
+        "linesAdded": lines_added,
+        "linesDeleted": lines_deleted,
+        "byModel": by_model_json,
+        "byHourOfDay": by_hour_json,
+        "byMonth": by_month_json,
+        "availablePeriods": {
+            "months": months.into_iter().collect::<Vec<_>>(),
+            "years": years.into_iter().collect::<Vec<_>>(),
+        },
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(s, &Rfc3339).expect("parse test timestamp")
+    }
+
+    fn row(bucket: &str, model: &str, input: u64, output: u64) -> UsageStatsRow {
+        UsageStatsRow {
+            bucket_utc: bucket.to_string(),
+            model: model.to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn period_parsing_accepts_valid_and_rejects_malformed() {
+        assert_eq!(parse_period("24h", None).unwrap(), UsagePeriod::Last24h);
+        assert_eq!(
+            parse_period("month", Some("2026-07")).unwrap(),
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7
+            }
+        );
+        assert_eq!(
+            parse_period("year", Some("2026")).unwrap(),
+            UsagePeriod::Year { year: 2026 }
+        );
+        for (period, key) in [
+            ("week", Some("2026-07")),
+            ("month", None),
+            ("month", Some("2026-13")),
+            ("month", Some("2026-7")),
+            ("month", Some("26-07")),
+            ("year", None),
+            ("year", Some("26")),
+            ("year", Some("20x6")),
+        ] {
+            assert!(
+                matches!(parse_period(period, key), Err(Error::InvalidParams(_))),
+                "period {period:?} key {key:?} must be invalid params"
+            );
+        }
+        // 24h ignores any stray key.
+        assert_eq!(
+            parse_period("24h", Some("2026-07")).unwrap(),
+            UsagePeriod::Last24h
+        );
+    }
+
+    #[test]
+    fn month_period_filters_and_rolls_up() {
+        let now = parse("2026-07-25T10:00:00Z");
+        let mut in_july = row("2026-07-25T14:00:00Z", "Opus 4.8", 100, 40);
+        in_july.runs = 2;
+        in_july.sessions_started = 1;
+        in_july.longest_run_ms = 5_000;
+        in_july.lines_added = 10;
+        in_july.lines_deleted = 3;
+        let mut also_july = row("2026-07-10T14:00:00Z", "Sonnet 5", 30, 5);
+        also_july.runs = 1;
+        also_july.longest_run_ms = 9_000;
+        let in_june = row("2026-06-30T12:00:00Z", "Opus 4.8", 999, 999);
+        let rows = vec![in_july.clone(), also_july, in_june];
+
+        let v = aggregate_usage(
+            &rows,
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 130);
+        assert_eq!(v["totals"]["outputTokens"], 45);
+        assert_eq!(v["runs"], 3);
+        assert_eq!(v["sessions"], 1);
+        assert_eq!(v["longestRunMs"], 9_000);
+        assert_eq!(v["linesAdded"], 10);
+        assert_eq!(v["linesDeleted"], 3);
+        // byModel is sorted desc by total tokens.
+        assert_eq!(v["byModel"][0]["model"], "Opus 4.8");
+        assert_eq!(v["byModel"][0]["inputTokens"], 100);
+        assert_eq!(v["byModel"][0]["runs"], 2);
+        assert_eq!(v["byModel"][1]["model"], "Sonnet 5");
+        // byMonth covers the local year, INCLUDING the June row.
+        assert_eq!(v["byMonth"][5]["inputTokens"], 999);
+        assert_eq!(v["byMonth"][6]["inputTokens"], 130);
+        // byHourOfDay groups by local hour (both July rows are at 14:00).
+        assert_eq!(v["byHourOfDay"][14]["inputTokens"], 130);
+        assert_eq!(v["byHourOfDay"][13]["inputTokens"], 0);
+        // availablePeriods spans ALL rows.
+        assert_eq!(
+            v["availablePeriods"]["months"],
+            json!(["2026-06", "2026-07"])
+        );
+        assert_eq!(v["availablePeriods"]["years"], json!(["2026"]));
+    }
+
+    #[test]
+    fn tz_shift_moves_buckets_across_period_boundaries() {
+        let now = parse("2026-07-25T10:00:00Z");
+        // 23:30 UTC June 30 bucket floor is 23:00Z; at +120 minutes it is
+        // 01:00 local July 1 — inside a July month period.
+        let rows = vec![row("2026-06-30T23:00:00Z", "Opus 4.8", 50, 5)];
+        let july = UsagePeriod::Month {
+            year: 2026,
+            month: 7,
+        };
+        let v = aggregate_usage(&rows, july, 120, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 50);
+        assert_eq!(v["byHourOfDay"][1]["inputTokens"], 50, "local hour is 01");
+        assert_eq!(v["availablePeriods"]["months"], json!(["2026-07"]));
+
+        // The same bucket at -60 minutes stays in June, so July is empty.
+        let v = aggregate_usage(&rows, july, -60, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 0);
+        assert_eq!(v["availablePeriods"]["months"], json!(["2026-06"]));
+
+        // Year boundary: Dec 31 23:00Z at +120 lands in the next local year.
+        let rows = vec![row("2026-12-31T23:00:00Z", "Opus 4.8", 7, 0)];
+        let v = aggregate_usage(&rows, UsagePeriod::Year { year: 2027 }, 120, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 7);
+        assert_eq!(v["byMonth"][0]["inputTokens"], 7);
+        assert_eq!(v["availablePeriods"]["years"], json!(["2027"]));
+    }
+
+    #[test]
+    fn last_24h_window_includes_trailing_buckets_in_order() {
+        // now 15:37 → window is 24 buckets from yesterday 16:00Z .. today
+        // 15:00Z inclusive.
+        let now = parse("2026-07-25T15:37:12Z");
+        let rows = vec![
+            row("2026-07-24T15:00:00Z", "Opus 4.8", 111, 0), // 1h too old
+            row("2026-07-24T16:00:00Z", "Opus 4.8", 1, 0),   // oldest slot 0
+            row("2026-07-25T03:00:00Z", "Sonnet 5", 2, 0),   // slot 11
+            row("2026-07-25T15:00:00Z", "Opus 4.8", 4, 0),   // newest slot 23
+            row("2026-07-25T16:00:00Z", "Opus 4.8", 222, 0), // future bucket
+        ];
+        let v = aggregate_usage(&rows, UsagePeriod::Last24h, 0, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 7);
+        assert_eq!(v["byHourOfDay"].as_array().unwrap().len(), 24);
+        assert_eq!(v["byHourOfDay"][0]["inputTokens"], 1);
+        assert_eq!(v["byHourOfDay"][0]["hour"], 16);
+        assert_eq!(v["byHourOfDay"][11]["inputTokens"], 2);
+        assert_eq!(v["byHourOfDay"][11]["hour"], 3);
+        assert_eq!(v["byHourOfDay"][23]["inputTokens"], 4);
+        assert_eq!(v["byHourOfDay"][23]["hour"], 15);
+        // byMonth is zeroed for 24h (FE hides the month card).
+        assert!(v["byMonth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["inputTokens"] == 0 && m["outputTokens"] == 0));
+        // Local hour labels follow the tz offset.
+        let v = aggregate_usage(&rows, UsagePeriod::Last24h, 60, now).unwrap();
+        assert_eq!(v["byHourOfDay"][0]["hour"], 17);
+        assert_eq!(v["byHourOfDay"][23]["hour"], 16);
+    }
+
+    #[test]
+    fn empty_period_returns_zeroed_shape() {
+        let now = parse("2026-07-25T10:00:00Z");
+        let v = aggregate_usage(
+            &[],
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 0);
+        assert_eq!(v["totals"]["cacheReadTokens"], 0);
+        assert_eq!(v["runs"], 0);
+        assert_eq!(v["sessions"], 0);
+        assert_eq!(v["longestRunMs"], 0);
+        assert_eq!(v["linesAdded"], 0);
+        assert_eq!(v["linesDeleted"], 0);
+        assert_eq!(v["byModel"], json!([]));
+        assert_eq!(v["byHourOfDay"].as_array().unwrap().len(), 24);
+        assert_eq!(v["byMonth"].as_array().unwrap().len(), 12);
+        assert_eq!(v["availablePeriods"]["months"], json!([]));
+        assert_eq!(v["availablePeriods"]["years"], json!([]));
+    }
+
+    #[test]
+    fn implausible_tz_offset_is_invalid_params() {
+        let now = parse("2026-07-25T10:00:00Z");
+        for tz in [-15 * 60, 15 * 60] {
+            assert!(matches!(
+                aggregate_usage(&[], UsagePeriod::Last24h, tz, now),
+                Err(Error::InvalidParams(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_bucket_keys_are_skipped() {
+        let now = parse("2026-07-25T10:00:00Z");
+        let rows = vec![
+            row("not-a-timestamp", "Opus 4.8", 999, 0),
+            row("2026-07-25T09:00:00Z", "Opus 4.8", 5, 0),
+        ];
+        let v = aggregate_usage(&rows, UsagePeriod::Last24h, 0, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 5);
+    }
+}

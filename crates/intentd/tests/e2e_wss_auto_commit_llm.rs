@@ -339,6 +339,7 @@ async fn seed_workspace_with_repo(data_dir: &Path, auggie_bin: Option<&Path>) ->
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     };
     store.insert_workspace(&ws).await.expect("insert workspace");
     // Seed context.auggiePath via config.toml (TOML-backed setting) so the
