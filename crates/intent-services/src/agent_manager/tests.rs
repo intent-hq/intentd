@@ -62,7 +62,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// guard: constructing a second before the first drops deadlocks the test
 /// thread. Mutate every var (sets AND unsets) through a single
 /// [`EnvGuard::apply`] call instead.
-struct EnvGuard {
+pub(super) struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -77,7 +77,7 @@ impl EnvGuard {
 
     /// Apply every `(key, value)` mutation under one guard: `Some(v)` sets
     /// the var, `None` unsets it. Prior values are restored on drop.
-    fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
+    pub(super) fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
         let lock = Self::acquire();
         let mut saved = Vec::new();
         for (key, value) in pairs {
@@ -655,6 +655,7 @@ fn mock_handle() -> AgentHandle {
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
         _child: None,
+        child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
         _rules_config: None,
@@ -839,6 +840,93 @@ async fn reap_idle_older_than_skips_in_flight_agents() {
     assert_eq!(mgr.registry().size(), 1);
 }
 
+/// Track a mock agent whose handle owns a REAL child process (a long sleep),
+/// the way `create_agent` installs one, and arm the child-exit watcher for it.
+/// Returns the child's pid and the watcher task.
+#[cfg(unix)]
+fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::JoinHandle<bool>) {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "sleep 300"]);
+    cmd.kill_on_drop(true);
+    cmd.process_group(0);
+    let child = cmd.spawn().expect("spawn sleeper child");
+    let pid = child.id().expect("live child has a pid");
+    let mut handle = mock_handle();
+    handle._child = Some(child);
+    handle.child_pid = Some(pid);
+    mgr.handles.lock().unwrap().insert(id.clone(), handle);
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    let watcher = mgr.arm_child_exit_watcher(id.clone(), Some(pid));
+    (pid, watcher)
+}
+
+/// Proactive dead-child detection (monorepo#764): an idle agent's child that
+/// is killed EXTERNALLY (SIGKILL) is reaped by the watcher within a bounded
+/// delay — handle removed, registry deregistered — and the watcher reports it
+/// fired the unexpected-exit cleanup.
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_watcher_reaps_idle_agent_on_external_kill() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-watched");
+    let (pid, watcher) = track_with_child(&mgr, &id);
+    assert!(mgr.contains(&id));
+    assert!(mgr.registry().is_registered(&id));
+
+    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("external SIGKILL");
+
+    let fired = timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher fires within a bounded delay")
+        .expect("watcher task completes");
+    assert!(fired, "watcher fired the unexpected-exit cleanup");
+    assert!(!mgr.contains(&id), "handle removed");
+    assert!(!mgr.registry().is_registered(&id), "registry deregistered");
+}
+
+/// Deliberate teardown must NOT fire the watcher: `stop()` removes the handle
+/// before killing the child, so the watcher observes the missing handle and
+/// stands down (returns `false`, no "unexpected exit" cleanup/log).
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_watcher_stands_down_on_deliberate_stop() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-stopped");
+    let (_pid, watcher) = track_with_child(&mgr, &id);
+
+    assert!(mgr.stop(&id).await, "stop removes the tracked handle");
+
+    let fired = timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher stands down within a bounded delay")
+        .expect("watcher task completes");
+    assert!(!fired, "deliberate stop must not fire the watcher");
+}
+
+/// `kill_child_only` (the retry/respawn teardown) likewise removes the handle
+/// before the kill, so the watcher stands down without firing.
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_watcher_stands_down_on_kill_child_only() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-killed-deliberately");
+    let (_pid, watcher) = track_with_child(&mgr, &id);
+
+    mgr.kill_child_only(&id).await;
+
+    let fired = timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher stands down within a bounded delay")
+        .expect("watcher task completes");
+    assert!(
+        !fired,
+        "deliberate kill_child_only must not fire the watcher"
+    );
+}
+
 /// Process-tree teardown (§5.6): a provider's whole process group is signalled,
 /// so a grandchild spawned by the direct child is terminated too — `kill_on_drop`
 /// alone would leave it orphaned.
@@ -868,7 +956,7 @@ async fn kill_child_tree_terminates_grandchild() {
     let grandchild: u32 = line.trim().parse().expect("grandchild pid");
     assert!(pid_alive(grandchild), "grandchild alive before teardown");
 
-    super::kill_child_tree(child).await;
+    super::kill_child_tree(child, None).await;
 
     let mut dead = false;
     for _ in 0..100 {
@@ -879,6 +967,65 @@ async fn kill_child_tree_terminates_grandchild() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(dead, "grandchild terminated with the process group");
+}
+
+/// Regression (monorepo#764): after a `try_wait` liveness probe reaps the
+/// direct child (`Child::id()` reads `None`), the pgid teardown must still
+/// sweep same-group descendants via the spawn-time pid — this is the
+/// child-exit-watcher path, where the leader is reaped before the kill.
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_child_tree_sweeps_group_after_leader_reaped() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg("sleep 300 & echo $!; sleep 300");
+    cmd.stdout(Stdio::piped());
+    cmd.kill_on_drop(true);
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("spawn sleep tree");
+    let spawn_pid = child.id().expect("live child has a pid");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("grandchild pid line in time")
+        .expect("read ok")
+        .expect("a pid line");
+    let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+    assert!(pid_alive(grandchild), "grandchild alive before teardown");
+
+    // Kill ONLY the leader, then reap it via `try_wait` — same-group
+    // grandchild survives and `Child::id()` reads `None` afterwards.
+    kill(Pid::from_raw(spawn_pid as i32), Signal::SIGKILL).expect("kill leader");
+    let mut reaped = false;
+    for _ in 0..100 {
+        if child.try_wait().expect("try_wait ok").is_some() {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reaped, "leader reaped by try_wait");
+    assert!(child.id().is_none(), "id() cleared after reap");
+    assert!(pid_alive(grandchild), "grandchild outlives the leader");
+
+    super::kill_child_tree(child, Some(spawn_pid)).await;
+
+    let mut dead = false;
+    for _ in 0..100 {
+        if !pid_alive(grandchild) {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
 /// Signal-0 liveness probe used by the process-group teardown test.
@@ -1209,6 +1356,7 @@ fn track_mock_agent_inner(
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             _child: None,
+            child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
             _rules_config: None,
@@ -4095,6 +4243,199 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         messages.iter().any(|m| m.role == "assistant"),
         "the turn proceeded to completion: {messages:?}"
     );
+}
+
+/// monorepo#764: a transport-closed prompt failure BEFORE any streamed output
+/// is silently redriven once on a fresh child — the turn completes with NO
+/// `agent:failed`, no Error status, and no requeue (no Retry surface). The
+/// mock child exits inside `session/prompt` on the first attempt only
+/// (attempt counter persists across spawns), so the redrive succeeds.
+#[tokio::test]
+async fn pre_output_transport_failure_redrives_silently_once() {
+    let script = mock_agent_script();
+    let attempt_file = std::env::temp_dir().join(format!("itd-764-once-{}", uuid::Uuid::new_v4()));
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let behavior = json!({
+        "exitDuringPromptAttempts": 1,
+        "response": "recovered after silent redrive",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-764-r"), AgentId::from("a-764-r"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "dies pre-output once".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    // The redriven turn completes: the agent settles idle, not Error.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("silently redriven turn completes and the agent goes idle");
+
+    // No user-visible failure surfaced for the redriven attempt.
+    let mut saw_failed = false;
+    let mut stream_ends = 0;
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        for ev in batch {
+            match ev.event_type.as_str() {
+                "agent:failed" => saw_failed = true,
+                "agent:stream:end" => stream_ends += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(!saw_failed, "no agent:failed for the silent redrive");
+    assert_eq!(
+        stream_ends, 1,
+        "exactly one terminal stream:end for the message (the redriven attempt's)"
+    );
+    // Nothing requeued (no Retry surface) and no stale Error/stop_reason.
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "no requeue for a silently redriven message"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert!(session.stop_reason.is_none(), "no error stop_reason");
+    // The user row landed exactly once and the redriven turn produced output.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("dies pre-output once"))
+        .collect();
+    assert_eq!(user_rows.len(), 1, "no duplicate user row: {messages:?}");
+    assert!(
+        messages.iter().any(|m| m.role == "assistant"),
+        "the redriven turn completed with assistant output: {messages:?}"
+    );
+    let _ = std::fs::remove_file(&attempt_file);
+}
+
+/// monorepo#764 one-retry bound: a SECOND consecutive pre-output transport
+/// failure on the same message takes the existing terminal path — persisted
+/// Error status, the terminal `agent:failed` + `agent:stream:end` pair
+/// (emitted by the terminal-failure path, since `run_prompt_turn` suppressed
+/// it for the marker error), and the message requeued for `agent.retry`.
+#[tokio::test]
+async fn second_pre_output_transport_failure_takes_terminal_path() {
+    let script = mock_agent_script();
+    let attempt_file = std::env::temp_dir().join(format!("itd-764-twice-{}", uuid::Uuid::new_v4()));
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let behavior = json!({
+        "exitDuringPromptAttempts": 2,
+        "response": "unreached",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+    ]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-764-t"), AgentId::from("a-764-t"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "dies pre-output twice".to_string(),
+        None,
+        super::TurnOptions::default(),
+    )
+    .await
+    .expect("send_message spawns the worker inline");
+
+    // The second failure parks the agent in Error (one-retry bound).
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::Error
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second pre-output failure parks the session in error");
+
+    // The terminal pair reached the bus EXACTLY once (the second attempt's;
+    // the first attempt stayed silent) — the STAB-6 Retry surface intact.
+    let mut failed = 0;
+    let mut stream_ends = 0;
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        for ev in batch {
+            match ev.event_type.as_str() {
+                "agent:failed" => failed += 1,
+                "agent:stream:end" => stream_ends += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(failed, 1, "exactly one terminal agent:failed");
+    assert_eq!(stream_ends, 1, "exactly one terminal agent:stream:end");
+    // The message is requeued for agent.retry and the error is persisted.
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "failed message requeued for agent.retry"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let stop_reason = session.stop_reason.expect("error stop_reason persisted");
+    assert!(
+        stop_reason.contains("transport closed before output"),
+        "stop_reason names the transport failure: {stop_reason}"
+    );
+    let _ = std::fs::remove_file(&attempt_file);
 }
 
 #[tokio::test]

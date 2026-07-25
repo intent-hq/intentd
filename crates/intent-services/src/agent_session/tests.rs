@@ -265,6 +265,38 @@ fn prompt_updates_stale_anonymous_tool() -> Vec<String> {
     vec![stale, chunk]
 }
 
+/// Mock agent that dies mid-`session/prompt`: it streams the caller-supplied
+/// `session/update` burst, then drops both pipe ends WITHOUT answering the
+/// prompt — the daemon's reader hits EOF and fails the pending request with
+/// the code-0 "agent stdout closed" JSON-RPC error (the monorepo#764
+/// transport-death shape).
+fn spawn_dying_mock_agent<R, W>(read: R, write: W, updates: Vec<String>) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            if value.get("method").and_then(Value::as_str) == Some("session/prompt") {
+                for note in &updates {
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                write.flush().await.unwrap();
+                return;
+            }
+        }
+    })
+}
+
 /// Wire a `Connection` to a fresh mock agent, returning the connection, its
 /// notification receiver, and the agent task handle.
 fn connect() -> (
@@ -273,6 +305,27 @@ fn connect() -> (
     JoinHandle<()>,
 ) {
     connect_with(prompt_updates())
+}
+
+/// [`connect`] against the dying mock: `session/prompt` streams `updates`,
+/// then the child's pipes close with the request still pending.
+fn connect_dying(
+    updates: Vec<String>,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_dying_mock_agent(c2a_agent, a2c_agent, updates);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
 }
 
 /// [`connect`] with a caller-supplied prompt-update burst.
@@ -1301,6 +1354,123 @@ async fn recreate_acp_session_emits_session_create_status() {
         .expect("status event on the wire");
     assert_eq!(status.data["phase"], json!("session-create"));
     assert_eq!(status.data["message"], json!("Creating session\u{2026}"));
+}
+
+/// monorepo#764: a transport death BEFORE any streamed output must resolve
+/// the turn with the pre-output marker error and SUPPRESS the terminal
+/// `agent:failed` + `agent:stream:end` pair — the worker either redrives the
+/// prompt silently or emits the pair via the terminal-failure path.
+#[tokio::test]
+async fn pre_output_transport_death_marks_error_and_suppresses_terminal_events() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // The dying mock streams NOTHING before dropping its pipes.
+    let (conn, mut note_rx, _agent) = connect_dying(Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect_err("transport death fails the turn");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg)
+                if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+        ),
+        "pre-output transport failure carries the redrive marker: {err}"
+    );
+
+    // Only the pre-first-token status hint reached the bus — no agent:failed,
+    // no agent:stream:end (the worker owns the terminal decision).
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec!["agent:stream:status"],
+        "terminal events suppressed for a pre-output transport failure"
+    );
+    // Nothing streamed → no assistant row persisted.
+    assert!(
+        bus.store()
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no transcript row for an output-free failed attempt"
+    );
+}
+
+/// monorepo#764 inverse: the SAME transport death AFTER a streamed chunk is
+/// NOT redrive-eligible — the ordinary `session/prompt failed:` wrapper and
+/// the terminal `agent:failed` + `agent:stream:end` pair are unchanged
+/// (STAB-6 semantics preserved, including event ordering).
+#[tokio::test]
+async fn post_output_transport_death_keeps_terminal_events() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "partial" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_dying(vec![chunk]);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect_err("transport death fails the turn");
+    assert!(
+        matches!(
+            &err,
+            intent_core::Error::Internal(msg) if msg.starts_with("session/prompt failed:")
+        ),
+        "post-output failure keeps the ordinary wrapper: {err}"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        vec![
+            "agent:stream:status",
+            "agent:stream:chunk",
+            "agent:stream:end",
+            "agent:failed",
+        ],
+        "post-output transport death keeps the terminal pair and ordering"
+    );
+    // The streamed partial persists as the turn's assistant row.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "partial output persisted");
 }
 
 /// Detached turn-end bookkeeping (monorepo#738): a prompt whose result carries

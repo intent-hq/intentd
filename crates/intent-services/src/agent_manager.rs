@@ -816,6 +816,11 @@ struct AgentHandle {
     notifications: Arc<TokioMutex<mpsc::UnboundedReceiver<IncomingNotification>>>,
     serve_task: JoinHandle<()>,
     _child: Option<Child>,
+    /// The child's pid captured at spawn: `Child::id()` reads `None` once a
+    /// `try_wait` liveness probe reaps the exit status, and the pgid-based
+    /// teardown (`kill_child_tree`) still needs it to sweep same-group
+    /// descendants that outlive the leader (monorepo#764).
+    child_pid: Option<u32>,
     _mcp_bridge: Option<McpBridge>,
     _mcp_config: Option<TempConfigFile>,
     _rules_config: Option<TempConfigFile>,
@@ -1248,6 +1253,10 @@ impl AgentManager {
         let spawned = spawn_provider(&spawn_opts, hooks)
             .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection) = spawned.into_parts();
+        // Pin the spawned child's pid for the exit watcher armed below: the
+        // watcher stands down when the handle's child no longer matches it
+        // (a respawn installed a newer child with its own watcher).
+        let child_pid = child.id();
         let connection = Arc::new(connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
@@ -1280,6 +1289,7 @@ impl AgentManager {
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task,
             _child: Some(child),
+            child_pid,
             _mcp_bridge: Some(bridge),
             _mcp_config: mcp_config,
             _rules_config: rules_config,
@@ -1298,11 +1308,21 @@ impl AgentManager {
         // respawn-time window. (Drop the lock before awaiting the kill.)
         let stale = self.handles.lock().unwrap().remove(&agent_id);
         if let Some(mut stale) = stale {
+            let stale_pid = stale.child_pid;
             if let Some(child) = stale._child.take() {
-                kill_child_tree(child).await;
+                kill_child_tree(child, stale_pid).await;
             }
         }
-        self.handles.lock().unwrap().insert(agent_id, handle);
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), handle);
+        // Proactive dead-child detection (monorepo#764): watch the installed
+        // child for an unexpected exit so an idle agent's death is reaped
+        // (handle + registry) as it happens, not just at the next prompt.
+        // Detached: the watcher stands down on its own when the handle goes
+        // away (deliberate teardown) or a respawn supersedes the child.
+        let _watcher = self.arm_child_exit_watcher(agent_id, child_pid);
         Ok(())
     }
 
@@ -2139,8 +2159,8 @@ impl AgentManager {
     /// `agent.stop` / hard-cancel cancel semantics.
     pub async fn stop(&self, agent_id: &AgentId) -> bool {
         let (removed, child) = self.detach(agent_id).await;
-        if let Some(child) = child {
-            kill_child_tree(child).await;
+        if let Some((child, spawn_pid)) = child {
+            kill_child_tree(child, spawn_pid).await;
         }
         removed
     }
@@ -2151,7 +2171,7 @@ impl AgentManager {
     /// `stop()` kills the single tree inline (SIGTERM→grace→SIGKILL);
     /// `shutdown()` collects every detached child and kills all process groups
     /// concurrently under ONE shared grace window.
-    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<Child>) {
+    async fn detach(&self, agent_id: &AgentId) -> (bool, Option<(Child, Option<u32>)>) {
         // Snapshot the live-turn slot BEFORE aborting the worker (the abort
         // drops LiveTurnGuard, clearing the slot), then flush the partial
         // in-flight assistant content AFTER the abort — same convention as
@@ -2178,7 +2198,10 @@ impl AgentManager {
         self.end_turn(agent_id).await;
         let handle = self.handles.lock().unwrap().remove(agent_id);
         let removed = handle.is_some();
-        let child = handle.and_then(|mut h| h._child.take());
+        let child = handle.and_then(|mut h| {
+            let spawn_pid = h.child_pid;
+            h._child.take().map(|c| (c, spawn_pid))
+        });
         self.registry.deregister(agent_id);
         (removed, child)
     }
@@ -3399,6 +3422,28 @@ impl AgentManager {
         self.end_turn(agent_id).await;
     }
 
+    /// Whether the cached handle's child process + transport still look live
+    /// (monorepo#764). The connection probe catches a writer task that
+    /// already died on a broken pipe, but it is lazy — the writer only
+    /// notices on its next write — so a child that died while the agent sat
+    /// idle is caught by `Child::try_wait` instead. A missing handle counts
+    /// as dead; a handle without an owned child trusts the connection probe
+    /// alone, and an errored `try_wait` probe is treated as live so a
+    /// transient wait failure never forces a spurious respawn.
+    fn handle_is_live(&self, agent_id: &AgentId) -> bool {
+        let mut handles = self.handles.lock().unwrap();
+        let Some(handle) = handles.get_mut(agent_id) else {
+            return false;
+        };
+        if !handle.connection.is_alive() {
+            return false;
+        }
+        match handle._child.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    }
+
     /// Ensure the agent's child process + ACP session exist, spawning lazily on
     /// first turn (the TS spawn-on-first-message semantics) and reusing the live
     /// session otherwise. When the session's model/provider has changed (via
@@ -3452,8 +3497,17 @@ impl AgentManager {
                 // worker/busy-flag touch, matching the retry-spawn teardown path.
                 self.kill_child_only(agent_id).await;
             } else if let Some(acp) = session.acp_session_id.clone() {
-                // Model unchanged and child is live — reuse the existing session.
-                return Ok(acp);
+                if self.handle_is_live(agent_id) {
+                    // Model unchanged and child is live — reuse the existing session.
+                    return Ok(acp);
+                }
+                // The child/transport died while the agent sat idle
+                // (monorepo#764): clear the stale handle + registry entry and
+                // fall through to the spawn path below, which respawns the
+                // child and resumes via `session/load` (or the recreate
+                // fallback in `start_session`).
+                tracing::warn!(agent_id = %agent_id, "cached agent child is dead; respawning before turn");
+                self.kill_child_only(agent_id).await;
             }
         }
         let mut opts = SpawnOptions::new(&resolved.provider);
@@ -3625,8 +3679,9 @@ impl AgentManager {
     async fn kill_child_only(&self, agent_id: &AgentId) {
         let handle = self.handles.lock().unwrap().remove(agent_id);
         if let Some(mut handle) = handle {
+            let spawn_pid = handle.child_pid;
             if let Some(child) = handle._child.take() {
-                kill_child_tree(child).await;
+                kill_child_tree(child, spawn_pid).await;
             }
         }
         self.registry.deregister(agent_id);
@@ -3645,14 +3700,139 @@ impl AgentManager {
                     .upgrade()
                     .and_then(|h| h.lock().unwrap().remove(&id));
                 if let Some(mut handle) = removed {
+                    let spawn_pid = handle.child_pid;
                     if let Some(child) = handle._child.take() {
-                        kill_child_tree(child).await;
+                        kill_child_tree(child, spawn_pid).await;
                     }
                 }
             })
         })
     }
+
+    /// Arm the proactive child-exit watcher for a freshly installed handle
+    /// (monorepo#764): a background task `try_wait`-polls the handle's owned
+    /// child and, when it exits UNEXPECTEDLY while the agent is idle, removes
+    /// the handle + deregisters the process slot and logs one WARN carrying
+    /// the exit status (plus the stderr-capture dir hint when capture is on).
+    ///
+    /// Every deliberate teardown path (`kill_child_only`, `detach`/`stop`,
+    /// the registry kill callback, `shutdown`, and `create_agent`'s stale
+    /// reap) removes the handle from the map BEFORE killing the child, so the
+    /// watcher observes the missing handle (or a respawn's pid mismatch) and
+    /// stands down without firing. A mid-turn death (agent in `busy`) is left
+    /// to the in-flight turn's terminal-failure teardown — the watcher keeps
+    /// polling and only fires when the exit is observed while idle. The
+    /// handle removal and registry deregistration happen atomically under the
+    /// handles lock, and the dead child's process group is swept afterwards
+    /// via the spawn-time pid (same-group descendants can outlive the
+    /// leader). Persisted agent status is deliberately untouched: the agent
+    /// stays resumable and the next message spawns a fresh child
+    /// (`ensure_started`).
+    ///
+    /// Returns the watcher task: resolves `true` when it fired the
+    /// unexpected-exit cleanup, `false` when it stood down.
+    fn arm_child_exit_watcher(
+        &self,
+        agent_id: AgentId,
+        child_pid: Option<u32>,
+    ) -> JoinHandle<bool> {
+        let handles = Arc::downgrade(&self.handles);
+        let registry = Arc::downgrade(&self.registry);
+        let busy = Arc::downgrade(&self.busy);
+        let stderr_dir = self.agent_stderr_log_dir(&agent_id);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+                let (Some(handles), Some(registry), Some(busy)) =
+                    (handles.upgrade(), registry.upgrade(), busy.upgrade())
+                else {
+                    return false; // manager torn down
+                };
+                // Snapshot busy membership BEFORE the handles lock (no nested
+                // locking). Losing the race to a just-starting turn is safe:
+                // the removal below only happens when the child is confirmed
+                // dead, and `ensure_started` spawns fresh over a dead child.
+                let is_busy = busy.lock().unwrap().contains(&agent_id);
+                let exited = {
+                    let mut map = handles.lock().unwrap();
+                    // Handle gone: a deliberate teardown (stop / kill /
+                    // shutdown / respawn reap) already cleaned up.
+                    let Some(handle) = map.get_mut(&agent_id) else {
+                        return false;
+                    };
+                    let Some(child) = handle._child.as_mut() else {
+                        return false;
+                    };
+                    // A respawn installed a NEWER child under this agent id
+                    // (which armed its own watcher) — stand down. A child
+                    // already reaped by a prior `try_wait` reports
+                    // `id() == None` and falls through: `try_wait` then
+                    // returns its cached exit status.
+                    if let Some(current) = child.id() {
+                        if Some(current) != child_pid {
+                            return false;
+                        }
+                    }
+                    match child.try_wait() {
+                        // Alive — keep polling. A transient probe error is
+                        // treated as alive so it never forces a teardown.
+                        Ok(None) | Err(_) => None,
+                        // Exited. Mid-turn (busy) the in-flight turn's
+                        // terminal-failure path owns the teardown: keep
+                        // polling until it removes the handle (or the agent
+                        // goes idle with the dead child still installed).
+                        // Idle deaths are reaped here, removing the handle
+                        // under the same lock the probe ran under so a
+                        // concurrent respawn's fresh handle is never removed.
+                        // The registry slot is deregistered inside the SAME
+                        // critical section: a concurrent respawn registers
+                        // its fresh slot only after observing the missing
+                        // handle (which requires this lock), so a deregister
+                        // outside the lock could land AFTER that fresh
+                        // `register` and clobber the new child's slot.
+                        Ok(Some(status)) => {
+                            if is_busy {
+                                None
+                            } else {
+                                let dead = map.remove(&agent_id);
+                                registry.deregister(&agent_id);
+                                Some((status, dead.and_then(|mut h| h._child.take())))
+                            }
+                        }
+                    }
+                };
+                if let Some((status, dead_child)) = exited {
+                    match &stderr_dir {
+                        Some(dir) => tracing::warn!(
+                            agent = %agent_id,
+                            exit_status = %status,
+                            "idle agent child exited unexpectedly; handle reaped (agent stderr captured at {})",
+                            dir.display()
+                        ),
+                        None => tracing::warn!(
+                            agent = %agent_id,
+                            exit_status = %status,
+                            "idle agent child exited unexpectedly; handle reaped"
+                        ),
+                    }
+                    // The direct child is already reaped (`try_wait` above),
+                    // but same-group descendants can survive it: sweep the
+                    // process group via the spawn-time pid.
+                    if let Some(dead_child) = dead_child {
+                        kill_child_tree(dead_child, child_pid).await;
+                    }
+                    return true;
+                }
+            }
+        })
+    }
 }
+
+/// Poll interval for the proactive child-exit watcher
+/// ([`AgentManager::arm_child_exit_watcher`], monorepo#764): how often an
+/// installed handle's child is `try_wait`-probed for an unexpected exit.
+/// Bounds the idle-death cleanup delay.
+const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Grace period between SIGTERM and SIGKILL when tearing down a provider's
 /// process group, giving the tree a chance to exit cleanly first.
@@ -3673,12 +3853,16 @@ const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 /// into their OWN process groups survive the `killpg`, so they are snapshotted
 /// before the kill and swept afterwards (`intent_acp::descendant_sweep`).
 #[cfg(unix)]
-async fn kill_child_tree(mut child: Child) {
+async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
     use intent_acp::{descendant_pids, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
-    let Some(pid) = child.id() else {
+    // `Child::id()` reads `None` once a `try_wait` liveness probe has reaped
+    // the exit status (`handle_is_live`, the child-exit watcher), so fall
+    // back to the spawn-time pid: the process GROUP can outlive its leader,
+    // and same-group descendants still need the killpg sweep.
+    let Some(pid) = child.id().or(spawn_pid) else {
         let _ = child.start_kill();
         return;
     };
@@ -3695,7 +3879,7 @@ async fn kill_child_tree(mut child: Child) {
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
-async fn kill_child_tree(mut child: Child) {
+async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
 
@@ -3709,7 +3893,7 @@ async fn kill_child_tree(mut child: Child) {
 /// post-kill escape sweep (one extra grace window when something escaped)
 /// add hard-bounded overhead on top of that shared window.
 #[cfg(unix)]
-async fn kill_child_trees(children: Vec<Child>) {
+async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
     use intent_acp::{descendant_pids_many, sweep_escaped_descendants};
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
@@ -3718,14 +3902,18 @@ async fn kill_child_trees(children: Vec<Child>) {
     // `ps` for the whole batch) so descendants that escaped into their own
     // process groups can be swept after the group kills — post-kill they
     // reparent to init and become invisible (`intent_acp::descendant_sweep`).
-    let roots: Vec<u32> = children.iter().filter_map(|c| c.id()).collect();
+    // The spawn-time pid stands in for children a `try_wait` probe reaped.
+    let roots: Vec<u32> = children
+        .iter()
+        .filter_map(|(c, spawn_pid)| c.id().or(*spawn_pid))
+        .collect();
     let descendants = descendant_pids_many(&roots).await;
 
     // Phase 1: SIGTERM every group up-front so all trees start exiting at once.
     let mut pgids = Vec::new();
     let mut waits = Vec::new();
-    for mut child in children {
-        match child.id() {
+    for (mut child, spawn_pid) in children {
+        match child.id().or(spawn_pid) {
             Some(pid) => {
                 let pgid = Pid::from_raw(pid as i32);
                 let _ = killpg(pgid, Signal::SIGTERM);
@@ -3736,7 +3924,7 @@ async fn kill_child_trees(children: Vec<Child>) {
                 }));
             }
             None => {
-                // Already reaped — nothing to signal.
+                // Already reaped with no spawn-time pid — nothing to signal.
                 let _ = child.start_kill();
             }
         }
@@ -3773,9 +3961,9 @@ async fn kill_child_trees(children: Vec<Child>) {
 /// Non-unix fallback: no process groups, so kill each direct child; the kills
 /// are signal-only (no grace waits), so the sweep is already time-bounded.
 #[cfg(not(unix))]
-async fn kill_child_trees(children: Vec<Child>) {
-    for child in children {
-        kill_child_tree(child).await;
+async fn kill_child_trees(children: Vec<(Child, Option<u32>)>) {
+    for (child, spawn_pid) in children {
+        kill_child_tree(child, spawn_pid).await;
     }
 }
 
@@ -3798,7 +3986,7 @@ mod kill_sweep_tests {
             cmd.args(["-c", "trap '' TERM; sleep 30"]);
             cmd.process_group(0);
             cmd.kill_on_drop(true);
-            children.push(cmd.spawn().expect("spawn slow child"));
+            children.push((cmd.spawn().expect("spawn slow child"), None));
         }
         // Let each sh install its trap before SIGTERM arrives.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -4314,6 +4502,13 @@ async fn run_message_worker(
     // (STAB-51). Terminal spawn/turn failures thread it into the requeue so
     // a failed pre-turn persist is re-attempted by the `agent.retry` drain.
     let mut user_persisted = initial_persisted;
+    // One-shot silent-redrive budget for the CURRENT message (monorepo#764):
+    // a transport-closed prompt failure BEFORE any streamed output redrives
+    // the same prompt once on a fresh child instead of surfacing the STAB-6
+    // Retry. Reset at each queue-drain handoff so every message gets its own
+    // budget; a second pre-output failure on the same message takes the
+    // terminal path.
+    let mut silent_redrive_used = false;
     'outer: loop {
         match retry_spawn(&mgr, &agent_id, &workspace_id).await {
             Ok(acp_session_id) => {
@@ -4340,6 +4535,23 @@ async fn run_message_worker(
                         // Concurrent stop/cancel won the turn — not a failure.
                         // Keep draining: any queued message re-spawns lazily.
                         tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
+                    } else if !silent_redrive_used && pre_output_transport_failure(&e) {
+                        // Silent redrive (monorepo#764): the transport closed
+                        // before the turn streamed anything — the prompt
+                        // provably produced no output, so redrive it once on
+                        // a fresh child. `run_prompt_turn` suppressed the
+                        // terminal `agent:failed` + `agent:stream:end` pair
+                        // for this attempt, so nothing user-visible surfaced.
+                        // Tear down the dead child and loop back through
+                        // `retry_spawn` with the SAME content/options.
+                        silent_redrive_used = true;
+                        tracing::warn!(
+                            agent = %agent_id,
+                            error = %e,
+                            "transport closed before output — redriving the prompt once on a fresh child"
+                        );
+                        mgr.kill_child_only(&agent_id).await;
+                        continue 'outer;
                     } else {
                         // STAB-53: on a child-death failure, point at the
                         // captured stderr file so the crash is diagnosable.
@@ -4443,6 +4655,8 @@ async fn run_message_worker(
                 queued_at: Some(next.queued_at.clone()),
                 ..TurnOptions::default()
             };
+            // New message → fresh silent-redrive budget (monorepo#764).
+            silent_redrive_used = false;
             // Fail closed (#547): a persist failure that survived the bounded
             // retry parks the agent in Error instead of running the turn.
             if !user_persisted {
@@ -4499,6 +4713,8 @@ async fn run_message_worker(
                 queued_at: Some(next.queued_at.clone()),
                 ..TurnOptions::default()
             };
+            // New message → fresh silent-redrive budget (monorepo#764).
+            silent_redrive_used = false;
             // Fail closed (#547): same contract as the pre-release drain arm.
             if !user_persisted {
                 handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
@@ -5126,12 +5342,30 @@ fn stderr_capture_hint(
 /// `agent:stream:end` pair for this error. Its post-prompt failure path wraps
 /// every prompt error as `Internal("session/prompt failed: …")` AFTER emitting
 /// both events; errors WITHOUT that prefix (e.g. the transcript-append store
-/// error, which propagates via `?` before the emits) still need the events.
-/// Prefix-anchored on the structured `Error::Internal` payload so an
+/// error, which propagates via `?` before the emits, or a pre-output
+/// transport failure — see [`pre_output_transport_failure`] — whose emits are
+/// deliberately suppressed for a possible silent redrive) still need the
+/// events. Prefix-anchored on the structured `Error::Internal` payload so an
 /// unrelated error that merely mentions the phrase mid-string cannot
 /// suppress the terminal events.
 fn turn_failure_events_already_emitted(err: &Error) -> bool {
     matches!(err, Error::Internal(msg) if msg.starts_with(PROMPT_FAILED_PREFIX))
+}
+
+/// Whether a `run_turn` error carries the pre-output transport marker from
+/// `run_prompt_turn` (monorepo#764): the transport to the child closed BEFORE
+/// the turn streamed any output, so the prompt provably produced nothing and
+/// the worker may redrive it once on a fresh child. `run_prompt_turn`
+/// suppressed the terminal `agent:failed` + `agent:stream:end` pair for these
+/// errors — when the one-retry budget is already spent, the terminal-failure
+/// path emits the pair itself (`turn_failure_events_already_emitted` is false
+/// for this prefix). Prefix-anchored for the same mid-string reason as above.
+fn pre_output_transport_failure(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Internal(msg)
+            if msg.starts_with(crate::agent_session::PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX)
+    )
 }
 
 /// Handle a terminal mid-turn failure (`run_turn` error that is not a benign
@@ -5231,7 +5465,7 @@ mod role_reminder_tests {
         }
     }
 
-    fn session(
+    pub(super) fn session(
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         specialist: Option<&str>,
@@ -5273,7 +5507,7 @@ mod role_reminder_tests {
     }
 
     /// Build a manager over a temp store seeded with a workspace + agent session.
-    async fn manager_with(
+    pub(super) async fn manager_with(
         specialist: Option<&str>,
         specialists_dir: Option<PathBuf>,
     ) -> (AgentManager, AgentId) {
@@ -5757,6 +5991,152 @@ mod role_reminder_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod dead_child_respawn_tests {
+    //! Regression tests for monorepo#764: `ensure_started` must not hand back
+    //! the cached ACP session when the provider child died while the agent
+    //! sat idle — it clears the stale handle and falls through to the
+    //! respawn + resume path. The companion transport probe
+    //! (`Connection::is_alive`) is unit-tested in `intent-acp`.
+
+    use super::role_reminder_tests::{manager_with, session};
+    use super::tests::EnvGuard;
+    use super::*;
+
+    /// Pin the mock provider's env for one test: set the fixture script path
+    /// and unset the behavior knobs so a spawned child can't inherit
+    /// exit-inducing behavior leaked by a concurrently guarded test (the
+    /// guard also holds `ENV_LOCK`, serializing all env-mutating tests).
+    fn mock_env(script: &str) -> EnvGuard {
+        EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(script)),
+            ("MOCK_AGENT_BEHAVIOR", None),
+            ("MOCK_AGENT_ATTEMPT_FILE", None),
+        ])
+    }
+
+    /// Path to the deterministic mock ACP agent fixture (the node E2E mock),
+    /// reused here so the respawn fall-through spawns a real child.
+    fn mock_agent_script() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
+            .canonicalize()
+            .expect("mock-acp-agent.mjs fixture exists")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Insert a fresh agent session on provider `mock` with a cached acp
+    /// session id (the provider is immutable once set, so it must be seeded
+    /// at insert time, not patched onto `manager_with`'s default agent).
+    async fn seed_mock_session(mgr: &AgentManager, agent_id: &AgentId, acp: &str) {
+        let mut s = session(agent_id, &WorkspaceId::from("ws-1"), None);
+        s.provider = Some("mock".to_string());
+        s.acp_session_id = Some(acp.to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+    }
+
+    /// Install a fake duplex-backed handle (live connection, no responder).
+    /// Returns the far ends, which must stay in scope for the connection's
+    /// writer to stay alive. `spawned_model`/`spawned_provider` match what
+    /// `resolve_spawn` yields for the mock provider so the model-change
+    /// respawn branch stays cold.
+    fn install_fake_handle(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let connection = Arc::new(Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks::default(),
+        ));
+        let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+        let child_pid = child.as_ref().and_then(|c| c.id());
+        let handle = AgentHandle {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: child,
+            child_pid,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "node".to_string(),
+        };
+        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
+        (c2a_agent, a2c_agent)
+    }
+
+    /// Live child + unchanged model → the cached session comes back with no
+    /// respawn and no extra RPC (the fake connection has no responder, so any
+    /// RPC would fail the turn).
+    #[tokio::test]
+    async fn reuses_cached_session_when_child_alive() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _seeded) = manager_with(None, None).await;
+        let agent_id = AgentId::from("agent-764-alive");
+        seed_mock_session(&mgr, &agent_id, "acp-cached").await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("live-child reuse path succeeds");
+        assert_eq!(acp, "acp-cached", "live child reuses the cached session");
+        // No respawn happened: the fake handle (no owned child) is untouched.
+        let handles = mgr.handles.lock().unwrap();
+        assert!(handles.get(&agent_id).unwrap()._child.is_none());
+    }
+
+    /// Handle present but the child already exited → `ensure_started` must
+    /// NOT return the stale cached session: it reaps the handle and falls
+    /// through to a fresh spawn (real mock child) whose session resumes /
+    /// recreates.
+    #[tokio::test]
+    async fn respawns_when_cached_child_is_dead() {
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
+        let (mgr, _seeded) = manager_with(None, None).await;
+        let agent_id = AgentId::from("agent-764-dead");
+        seed_mock_session(&mgr, &agent_id, "acp-stale").await;
+
+        // A real child that has already exited: `try_wait` reports it dead
+        // even though the (fake) transport writer never observed a write
+        // failure — the exact died-while-idle shape from monorepo#764.
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        child.wait().await.expect("child exits");
+        let _ends = install_fake_handle(&mgr, &agent_id, Some(child));
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("dead child falls through to a fresh spawn");
+        // The mock agent advertises `loadSession: false`, so the respawn path
+        // recreated the session — the stale cached id must NOT come back.
+        assert_ne!(acp, "acp-stale", "stale session must not be reused");
+        // The stale fake handle was replaced by a real spawned child.
+        {
+            let handles = mgr.handles.lock().unwrap();
+            assert!(
+                handles.get(&agent_id).unwrap()._child.is_some(),
+                "respawn installed a real child-owning handle"
+            );
+        }
+        mgr.stop(&agent_id).await;
+    }
+}
+
 #[cfg(test)]
 mod rebuild_spawn_opts_tests {
     //! Regression tests for the `create_agent` [`SpawnOptions`] reconstruction:
@@ -6132,6 +6512,48 @@ mod turn_failure_tests {
         let err =
             Error::Internal("store: could not log that session/prompt failed earlier".to_string());
         assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn pre_output_marker_is_detected() {
+        // monorepo#764: the marker run_prompt_turn wraps a transport failure
+        // with when the turn provably streamed nothing.
+        let err = Error::Internal(
+            "session/prompt transport closed before output: transport closed: writer task closed"
+                .to_string(),
+        );
+        assert!(pre_output_transport_failure(&err));
+        let err = Error::Internal(
+            "session/prompt transport closed before output: JSON-RPC error 0: agent stdout closed"
+                .to_string(),
+        );
+        assert!(pre_output_transport_failure(&err));
+    }
+
+    #[test]
+    fn pre_output_marker_needs_events_emitted() {
+        // run_prompt_turn SUPPRESSED the terminal pair for the marker — when
+        // the one-retry budget is spent, handle_terminal_turn_failure must
+        // emit it (the marker is not the PROMPT_FAILED_PREFIX).
+        let err = Error::Internal(
+            "session/prompt transport closed before output: transport closed: writer task closed"
+                .to_string(),
+        );
+        assert!(!turn_failure_events_already_emitted(&err));
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_pre_output_marked() {
+        // Post-output / non-transport failures carry the ordinary wrapper and
+        // must not trigger the silent redrive; mid-string mentions are inert.
+        let err = Error::Internal(
+            "session/prompt failed: transport closed: writer task closed".to_string(),
+        );
+        assert!(!pre_output_transport_failure(&err));
+        let err = Error::Internal(
+            "store: session/prompt transport closed before output: logged".to_string(),
+        );
+        assert!(!pre_output_transport_failure(&err));
     }
 }
 

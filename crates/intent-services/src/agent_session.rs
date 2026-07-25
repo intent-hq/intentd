@@ -17,7 +17,7 @@ use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
     SessionModeState, StopReason,
 };
-use intent_acp::{Connection, IncomingNotification};
+use intent_acp::{AcpError, Connection, IncomingNotification};
 use intent_core::events::{
     AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_STREAM_STATUS,
     AGENT_TOOL_CALL,
@@ -37,6 +37,32 @@ mod tests;
 
 #[cfg(test)]
 mod tests_meta;
+
+/// Prefix marking a `session/prompt` failure that is a silent-redrive
+/// candidate (monorepo#764): the transport to the child closed BEFORE the
+/// turn streamed any output, so the prompt provably produced nothing and the
+/// worker may redrive it once on a fresh child. [`Services::run_prompt_turn`]
+/// suppresses the terminal `agent:failed` + `agent:stream:end` pair for these
+/// errors — the worker either redrives silently (its retried attempt emits
+/// the turn's terminal events) or, once the one-retry budget is spent, routes
+/// the error through the terminal-failure path, which emits the pair itself.
+pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
+    "session/prompt transport closed before output:";
+
+/// Whether a `session/prompt` failure is transport-shaped: the writer task
+/// observed a closed pipe (`transport closed: …`, e.g. "writer task closed")
+/// or the child's stdout closed with the request still pending (the transport
+/// synthesizes a code-0 "agent stdout closed" JSON-RPC error for that —
+/// see `provider_models::probe::map_acp_error` for the same special case).
+/// Provider JSON-RPC errors (including `-32800` cancels), timeouts, and
+/// everything else are NOT transport-shaped.
+fn transport_closed_error(err: &AcpError) -> bool {
+    match err {
+        AcpError::Transport(_) => true,
+        AcpError::Rpc(e) => e.code == 0 && e.message == "agent stdout closed",
+        _ => false,
+    }
+}
 
 /// Result of opening or resuming an ACP session: the canonical `acpSessionId`
 /// (persisted on `AgentSession`) plus the modes the provider advertised in the
@@ -801,13 +827,19 @@ impl Services {
         let prompt_fut = session::prompt(conn, acp_session_id, prompt, &activity);
         tokio::pin!(prompt_fut);
         let mut closed = false;
+        // Whether ANY `session/update` for this turn was applied — an input to
+        // the silent-redrive eligibility below (monorepo#764): once the
+        // provider streamed anything, a transport failure is no longer
+        // provably output-free.
+        let mut updates_applied = false;
         let result = loop {
             tokio::select! {
                 res = &mut prompt_fut => break res,
                 maybe = notifications.recv(), if !closed => match maybe {
                     Some(note) => {
                         activity.touch();
-                        self.route_notification(&note, agent_id, workspace_id, &mut transcript)
+                        updates_applied |= self
+                            .route_notification(&note, agent_id, workspace_id, &mut transcript)
                             .await;
                     }
                     None => closed = true,
@@ -816,7 +848,8 @@ impl Services {
         };
         // Drain updates buffered before the prompt response resolved.
         while let Ok(note) = notifications.try_recv() {
-            self.route_notification(&note, agent_id, workspace_id, &mut transcript)
+            updates_applied |= self
+                .route_notification(&note, agent_id, workspace_id, &mut transcript)
                 .await;
         }
         // §7.1 deterministic attach — turn-end drain: append the registered
@@ -840,6 +873,16 @@ impl Services {
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
+        // Silent-redrive eligibility (monorepo#764): the transport closed
+        // before the turn streamed ANYTHING (no session/update applied, zero
+        // transcript blocks) — the prompt provably never produced output, so
+        // the worker may redrive it once on a fresh child. Classified here,
+        // BEFORE the terminal emits below, so a redriven attempt never
+        // flashes a failed turn at the FE. Any error after streamed content
+        // keeps the existing terminal emit path unchanged.
+        let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
+            && !updates_applied
+            && blocks.is_empty();
         if !blocks.is_empty() {
             self.store
                 .append_agent_message_with_id(
@@ -912,14 +955,20 @@ impl Services {
                 chain.insert(agent_id.clone(), handle);
             }
         }
-        // Exactly ONE terminal stream:end — complete and error both map here (§7).
-        self.publish_agent_event(
-            workspace_id,
-            agent_id,
-            AGENT_STREAM_END,
-            json!({ "agentId": agent_id.0 }),
-        )
-        .await;
+        // Exactly ONE terminal stream:end — complete and error both map here
+        // (§7), EXCEPT a pre-output transport failure (monorepo#764): the
+        // worker either redrives the prompt (the redriven attempt emits the
+        // turn's terminal events) or, when the one-retry budget is spent,
+        // emits the pair itself via the terminal-failure path.
+        if !pre_output_transport_failure {
+            self.publish_agent_event(
+                workspace_id,
+                agent_id,
+                AGENT_STREAM_END,
+                json!({ "agentId": agent_id.0 }),
+            )
+            .await;
+        }
         // Session-completion lifecycle signal, emitted AFTER the terminal
         // stream:end (the auto-subscription wake keys off this). A normal
         // turn-end goes idle (`agent:idle`); a turn error maps to `agent:failed`.
@@ -978,6 +1027,16 @@ impl Services {
                     "agent:idle suppressed — ready-to-send queue non-empty",
                 );
             }
+            Err(e) if pre_output_transport_failure => {
+                // Suppressed (monorepo#764): no user-visible failure for this
+                // attempt — the worker decides between a silent redrive and
+                // the terminal path (which emits agent:failed + stream:end).
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "pre-output transport failure — deferring terminal events to the turn worker",
+                );
+            }
             Err(e) => {
                 self.publish_agent_event(
                     workspace_id,
@@ -988,7 +1047,13 @@ impl Services {
                 .await;
             }
         }
-        result.map_err(|e| Error::Internal(format!("session/prompt failed: {e}")))
+        result.map_err(|e| {
+            if pre_output_transport_failure {
+                Error::Internal(format!("{PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX} {e}"))
+            } else {
+                Error::Internal(format!("session/prompt failed: {e}"))
+            }
+        })
     }
 
     /// Persist one turn's end-of-turn usage report and refresh the workspace
@@ -1089,16 +1154,20 @@ impl Services {
         }
     }
 
-    /// Map one `session/update` notification and publish/accumulate its effects.
+    /// Map one `session/update` notification and publish/accumulate its
+    /// effects. Returns whether the notification mapped to a turn update
+    /// (`true` even when a dropped tool update published no event) — the
+    /// silent-redrive eligibility in [`run_prompt_turn`](Self::run_prompt_turn)
+    /// keys off it (monorepo#764).
     async fn route_notification(
         &self,
         note: &IncomingNotification,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         transcript: &mut Transcript,
-    ) {
+    ) -> bool {
         let Some(mapped) = session::map_notification(note) else {
-            return;
+            return false;
         };
         let message_id = transcript.message_id.clone();
         match mapped {
@@ -1162,7 +1231,7 @@ impl Services {
                 // so they persist (and reach `agent.getConversation`). A dropped
                 // update (STAB-124: anonymous first sight) publishes no event.
                 let Some(block_index) = transcript.record_tool(&tc, registered.clone()) else {
-                    return;
+                    return true;
                 };
                 // D4: enrich additively — keep the existing fields, add agentId,
                 // the (previously dropped) toolCallId, and the block identity.
@@ -1194,6 +1263,7 @@ impl Services {
         // Refresh the live-turn slot with the partial transcript so a mid-turn
         // `chat.subscribe` snapshot reflects content streamed so far (CS-0 D5).
         self.update_live_turn(agent_id, transcript);
+        true
     }
 
     /// Publish an `agent:stream:status` turn-startup hint on the bus (PROTOCOL

@@ -466,6 +466,16 @@ impl Connection {
     pub fn auth_error_detected(&self) -> bool {
         self.auth_error.load(Ordering::SeqCst)
     }
+
+    /// Cheap transport liveness probe: `false` once the writer task has
+    /// exited (its exit drops `writer_rx`, closing the channel) — e.g. after
+    /// a broken-pipe write to a dead child's stdin. NOTE this signal is lazy:
+    /// the writer only notices the dead pipe on its NEXT write, so a child
+    /// that died with no traffic since still reports `true` here — pair with
+    /// `Child::try_wait` for a strong dead-child check (monorepo#764).
+    pub fn is_alive(&self) -> bool {
+        !self.writer_tx.is_closed()
+    }
 }
 
 impl Drop for Connection {

@@ -641,6 +641,19 @@ if (treePidFile) {
   }
 }
 
+// Dead-child recovery e2e (monorepo#764): when MOCK_AGENT_PID_FILE is set,
+// append this spawn's pid (one line per process) so a test can SIGKILL the
+// child out-of-band while the agent is idle and later prove the daemon
+// respawned a FRESH process (a second, distinct pid line).
+const pidFile = process.env.MOCK_AGENT_PID_FILE;
+if (pidFile) {
+  try {
+    fs.appendFileSync(pidFile, String(process.pid) + '\n');
+  } catch (err) {
+    log(`pid file write failed: ${err.message}`);
+  }
+}
+
 // Deterministic failure mode: exit immediately on launch for the first N spawns.
 // This triggers "agent stdout closed" handshake failure during initialize.
 let exitBehavior = {};
