@@ -12,7 +12,7 @@ use intent_core::{
 use serde_json::json;
 use sqlx::Row;
 
-use crate::{AgentQueueRow, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
+use crate::{AgentQueueRow, AutoVacuumActivation, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
 /// A unique temp DB path that cleans up its `.db`/`-wal`/`-shm` files on drop.
 struct TempDb {
@@ -2315,6 +2315,130 @@ async fn incremental_vacuum_releases_freelist_pages() {
     assert!(
         pages_after < pages_before,
         "page_count should shrink after vacuum ({pages_before} -> {pages_after})"
+    );
+}
+
+/// One-time activation (monorepo#720 finding 1): a legacy database created
+/// without auto_vacuum stays in NONE mode when reopened through `Store::open`
+/// (the connect pragma is recorded but inert), so
+/// `Store::activate_incremental_vacuum` must run a VACUUM that converts it to
+/// incremental mode, shrinks the file, and makes subsequent bounded
+/// `incremental_vacuum` calls effective. A second activation is a no-op.
+#[tokio::test]
+async fn activate_incremental_vacuum_converts_legacy_none_db() {
+    let tmp = TempDb::new();
+
+    // Build the legacy database with a raw connection that does NOT apply the
+    // auto_vacuum pragma (SQLite defaults to NONE), then seed + delete bulky
+    // rows so the freelist is non-empty and the file is bloated.
+    {
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&tmp.path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("open legacy pool");
+        sqlx::query("CREATE TABLE filler (id INTEGER PRIMARY KEY, data BLOB)")
+            .execute(&pool)
+            .await
+            .expect("create filler");
+        for i in 0..64i64 {
+            sqlx::query("INSERT INTO filler (id, data) VALUES (?, zeroblob(65536))")
+                .bind(i)
+                .execute(&pool)
+                .await
+                .expect("insert filler");
+        }
+        sqlx::query("DELETE FROM filler")
+            .execute(&pool)
+            .await
+            .expect("delete filler");
+        let mode: i64 = sqlx::query("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await
+            .expect("query auto_vacuum")
+            .get(0);
+        assert_eq!(mode, 0, "legacy DB should be created in NONE mode");
+        pool.close().await;
+    }
+
+    let store = Store::open(&tmp.path).await.expect("open store");
+    // The connect pragma alone does not convert an existing NONE database.
+    let mode: i64 = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("query auto_vacuum")
+        .get(0);
+    assert_eq!(mode, 0, "reopened legacy DB should still report NONE");
+    assert!(
+        store.freelist_count().await.expect("freelist") > 0,
+        "seed deletes should leave pages on the freelist"
+    );
+
+    // Activation runs the one-time VACUUM: incremental mode on, file shrunk.
+    match store
+        .activate_incremental_vacuum()
+        .await
+        .expect("activation")
+    {
+        AutoVacuumActivation::Activated {
+            pages_before,
+            pages_after,
+            ..
+        } => assert!(
+            pages_after < pages_before,
+            "VACUUM should shrink the file ({pages_before} -> {pages_after})"
+        ),
+        AutoVacuumActivation::AlreadyIncremental => {
+            panic!("first activation on a NONE DB should run VACUUM")
+        }
+    }
+    let mode: i64 = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("query auto_vacuum")
+        .get(0);
+    assert_eq!(mode, 2, "activation should leave auto_vacuum=INCREMENTAL");
+
+    // Post-activation churn proves incremental_vacuum is now effective:
+    // deletes land on the freelist and the bounded call releases them.
+    sqlx::query("CREATE TABLE churn (id INTEGER PRIMARY KEY, data BLOB)")
+        .execute(store.write_pool())
+        .await
+        .expect("create churn");
+    for i in 0..16i64 {
+        sqlx::query("INSERT INTO churn (id, data) VALUES (?, zeroblob(65536))")
+            .bind(i)
+            .execute(store.write_pool())
+            .await
+            .expect("insert churn");
+    }
+    sqlx::query("DELETE FROM churn")
+        .execute(store.write_pool())
+        .await
+        .expect("delete churn");
+    assert!(
+        store.freelist_count().await.expect("freelist") > 0,
+        "churn deletes should leave pages on the freelist"
+    );
+    let freed = store
+        .incremental_vacuum(1_000_000)
+        .await
+        .expect("incremental vacuum");
+    assert!(
+        freed > 0,
+        "incremental_vacuum should release pages after activation (got {freed})"
+    );
+
+    // Second activation is a no-op on the now-incremental database.
+    assert_eq!(
+        store
+            .activate_incremental_vacuum()
+            .await
+            .expect("second activation"),
+        AutoVacuumActivation::AlreadyIncremental
     );
 }
 

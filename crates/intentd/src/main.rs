@@ -584,6 +584,31 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // One-time auto_vacuum activation (monorepo#720 finding 1): a legacy
+    // database created before the `auto_vacuum = INCREMENTAL` pragma stays in
+    // NONE mode until a full VACUUM rebuilds the file, leaving the retention
+    // loop's bounded incremental_vacuum a no-op. Run it now — before any
+    // listener serves — so no client is blocked by the rebuild and no
+    // transaction is open on the write connection (a VACUUM requirement).
+    // Failure is non-fatal: the daemon runs degraded exactly as before
+    // (freelist pages are simply never returned to the filesystem).
+    match store.activate_incremental_vacuum().await {
+        Ok(intent_store::AutoVacuumActivation::Activated {
+            duration,
+            pages_before,
+            pages_after,
+        }) => tracing::info!(
+            duration_ms = duration.as_millis() as u64,
+            pages_before,
+            pages_after,
+            "auto_vacuum activated: one-time VACUUM converted the database to incremental mode"
+        ),
+        Ok(intent_store::AutoVacuumActivation::AlreadyIncremental) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "auto_vacuum activation failed; continuing without incremental vacuum"
+        ),
+    }
     // First-boot legacy workspace import: on a fresh DB with no completion
     // marker, scan the legacy roots and import `.workspace/workspace.json`
     // workspaces. Runs to completion inline after migrations (inside
@@ -2762,8 +2787,9 @@ async fn report_db_health(store: &Store) {
     // auto_vacuum / freelist: new databases are created with
     // auto_vacuum=INCREMENTAL so the retention loop's bounded
     // incremental_vacuum can release deleted pages. Existing databases stay
-    // in NONE mode until a one-time offline VACUUM — deliberately never run
-    // automatically (it blocks all writes) — so print the activation step.
+    // in NONE mode until a one-time VACUUM, which `intentd serve` runs
+    // automatically at startup (monorepo#720 finding 1); print that story
+    // plus the manual fallback.
     let auto_vacuum = sqlx::query("PRAGMA auto_vacuum")
         .fetch_one(store.read_pool())
         .await
@@ -2783,7 +2809,7 @@ async fn report_db_health(store: &Store) {
             );
             if mode == 0 {
                 println!(
-                    "         one-time activation (daemon must be STOPPED): sqlite3 <db_path> \"PRAGMA auto_vacuum=INCREMENTAL; VACUUM;\""
+                    "         will be activated automatically on the next daemon start (one-time VACUUM); manual fallback (daemon must be STOPPED): sqlite3 <db_path> \"PRAGMA auto_vacuum=INCREMENTAL; VACUUM;\""
                 );
             }
         }

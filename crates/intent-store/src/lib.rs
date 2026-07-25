@@ -239,6 +239,54 @@ impl Store {
             .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))
     }
 
+    /// Total number of pages in the database file (`PRAGMA page_count`).
+    async fn page_count(&self) -> Result<i64> {
+        sqlx::query("PRAGMA page_count")
+            .fetch_one(&self.write_pool)
+            .await
+            .map(|row| row.get::<i64, _>(0))
+            .map_err(|e| Error::Internal(format!("page_count failed: {e}")))
+    }
+
+    /// One-time activation of incremental auto-vacuum on a legacy database
+    /// (monorepo#720 finding 1). New databases are created with
+    /// `auto_vacuum = INCREMENTAL` (see [`connect_write`]), but on a database
+    /// created before that pragma existed the setting is recorded yet inert
+    /// until a full `VACUUM` rebuilds the file. This method checks
+    /// `PRAGMA auto_vacuum`; when it reports NONE it runs `VACUUM` on the
+    /// write pool so the recorded incremental setting takes effect and
+    /// [`Self::incremental_vacuum`] can release freelist pages from then on.
+    ///
+    /// Intended to run once during daemon startup, after [`Store::open`] and
+    /// before any listener serves: at that point the single write connection
+    /// has no open transaction (a `VACUUM` requirement) and no client is
+    /// blocked by the rebuild. Callers should treat a failure as non-fatal —
+    /// the daemon runs exactly as before, it just cannot return freelist
+    /// pages to the filesystem.
+    pub async fn activate_incremental_vacuum(&self) -> Result<AutoVacuumActivation> {
+        let mode = sqlx::query("PRAGMA auto_vacuum")
+            .fetch_one(&self.write_pool)
+            .await
+            .map(|row| row.get::<i64, _>(0))
+            .map_err(|e| Error::Internal(format!("auto_vacuum query failed: {e}")))?;
+        if mode != 0 {
+            return Ok(AutoVacuumActivation::AlreadyIncremental);
+        }
+        let pages_before = self.page_count().await?;
+        let started = std::time::Instant::now();
+        sqlx::query("VACUUM")
+            .execute(&self.write_pool)
+            .await
+            .map_err(|e| Error::Internal(format!("activation VACUUM failed: {e}")))?;
+        let duration = started.elapsed();
+        let pages_after = self.page_count().await?;
+        Ok(AutoVacuumActivation::Activated {
+            duration,
+            pages_before,
+            pages_after,
+        })
+    }
+
     /// Release up to `max_pages` freelist pages back to the filesystem via
     /// `PRAGMA incremental_vacuum(N)`. Only effective when the database has
     /// `auto_vacuum = INCREMENTAL` (a no-op otherwise — see [`connect_write`]
@@ -298,6 +346,21 @@ impl Store {
     }
 }
 
+/// Outcome of [`Store::activate_incremental_vacuum`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoVacuumActivation {
+    /// `PRAGMA auto_vacuum` already reports a non-NONE mode; nothing ran.
+    AlreadyIncremental,
+    /// The database was in NONE mode and a `VACUUM` rebuilt it in
+    /// incremental mode, taking `duration` and shrinking the file from
+    /// `pages_before` to `pages_after` pages.
+    Activated {
+        duration: std::time::Duration,
+        pages_before: i64,
+        pages_after: i64,
+    },
+}
+
 /// Migration diagnostics: the versions embedded in the binary (`expected`) and
 /// the versions recorded as applied in `_sqlx_migrations` (`applied`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,17 +400,19 @@ impl MigrationStatus {
 /// `journal_mode`, so a **new** database is created in incremental mode and
 /// [`Store::incremental_vacuum`] can release freelist pages in bounded slices.
 /// On an **existing** database created without auto_vacuum the pragma is
-/// recorded but inert until a one-time `VACUUM` rebuilds the file — that is
-/// deliberately NOT done automatically (a full VACUUM blocks all writes for
-/// the duration, unacceptable on a live daemon). One-time activation, with
-/// the daemon **stopped**:
+/// recorded but inert until a one-time `VACUUM` rebuilds the file. The daemon
+/// performs that activation automatically at startup — `intentd serve` calls
+/// [`Store::activate_incremental_vacuum`] right after [`Store::open`], before
+/// any listener serves, so no client is blocked by the rebuild (monorepo#720
+/// finding 1). Manual fallback, with the daemon **stopped**:
 ///
 /// ```sh
 /// sqlite3 ~/.intentd/intentd.db "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
 /// ```
 ///
 /// `intentd doctor` reports the current auto_vacuum mode and freelist size,
-/// and prints this activation step when the database is still in NONE mode.
+/// and notes the next-start activation when the database is still in NONE
+/// mode.
 pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
