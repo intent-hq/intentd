@@ -846,10 +846,12 @@ pub struct Comment {
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    /// Root comments always carry an anchor; replies carry `None` — they
-    /// anchor via their thread/parent (`thread_id`/`parent_id`), never
-    /// independently (monorepo#729). Replies stored before that contract
-    /// change may still carry a legacy clone of the parent's anchor.
+    /// Replies carry `None` — they anchor via their thread/parent
+    /// (`thread_id`/`parent_id`), never independently (monorepo#729). Roots
+    /// created by `comment.add` always carry an anchor, but legacy data can
+    /// deviate either way: legacy-imported roots without a `markId` have no
+    /// anchor, and replies stored before this contract change may still carry
+    /// a (non-authoritative) clone of the parent's anchor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<CommentAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1342,7 +1344,8 @@ pub struct CommentWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     /// Omitted for replies: they anchor via `threadId`/`parentId`
-    /// (monorepo#729). Always present on root comments.
+    /// (monorepo#729). Present on roots created by `comment.add`; may be
+    /// absent on legacy-imported roots that had no `markId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<CommentAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
