@@ -213,13 +213,25 @@ const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
     "agentType",
 ];
 
+/// True when a frontmatter/spec value marks the specialist as hidden: the
+/// frontmatter parser yields the string `"true"`, while wire specs carry the
+/// JSON boolean.
+fn is_hidden(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    }
+}
+
 /// Build a wire `SpecialistDef` from one file's `content`. `source` is the
 /// winning tier; `path` is the resolved file (omitted for `bundled`,
 /// PROTOCOL §5.11). `prompt` is the markdown body; the optional frontmatter
 /// scalars ([`OPTIONAL_FRONTMATTER_KEYS`]) are carried through when present so
-/// they round-trip losslessly. `behaviorPrompt` mirrors `prompt` and
-/// `isCustomized` is `true` for any non-`bundled` source (port of
-/// `serializeSpecialist`).
+/// they round-trip losslessly, and the optional boolean `hidden` is emitted as
+/// `true` when the frontmatter sets it (absent otherwise, PROTOCOL §5.11).
+/// `behaviorPrompt` mirrors `prompt` and `isCustomized` is `true` for any
+/// non-`bundled` source (port of `serializeSpecialist`).
 fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
     let (fm, body) = parse_frontmatter(content);
     let name = fm
@@ -244,6 +256,11 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
             }
         }
     }
+    // Optional boolean: emitted only when true so pickers can filter hidden
+    // specialists (absent ⇒ not hidden, PROTOCOL §5.11).
+    if is_hidden(fm.get("hidden")) {
+        def.insert("hidden".into(), json!(true));
+    }
     def.insert("prompt".into(), json!(body));
     // `behaviorPrompt` is the wire alias for the body (port of
     // `serializeSpecialist`: both `prompt` and `behaviorPrompt` carry it).
@@ -261,8 +278,9 @@ fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
 /// Serialize a wire `spec` into markdown-with-frontmatter (port of
 /// `writeSpecialistFile`): quoted `name`/`description` scalars, then any
 /// supplied optional scalars ([`OPTIONAL_FRONTMATTER_KEYS`]) in declaration
-/// order, then the prompt body. The body is taken from `prompt`, falling back
-/// to the `behaviorPrompt` alias (mirroring `SpecialistProposalPayload`). Only
+/// order, then `hidden: true` when the spec marks the specialist hidden, then
+/// the prompt body. The body is taken from `prompt`, falling back to the
+/// `behaviorPrompt` alias (mirroring `SpecialistProposalPayload`). Only
 /// documented fields are written so parse→write→parse round-trips losslessly.
 fn render_file(id: &str, spec: &Value) -> String {
     let name = spec.get("name").and_then(Value::as_str).unwrap_or(id);
@@ -280,6 +298,9 @@ fn render_file(id: &str, spec: &Value) -> String {
                 fm.push(format!("{key}: \"{}\"", escape_yaml(v)));
             }
         }
+    }
+    if is_hidden(spec.get("hidden")) {
+        fm.push("hidden: true".to_string());
     }
     let prompt = spec
         .get("prompt")
@@ -763,6 +784,46 @@ mod tests {
     }
 
     #[test]
+    fn build_def_emits_hidden_when_frontmatter_sets_it() {
+        let content = "---\nname: \"Ghost\"\ndescription: \"d\"\nhidden: true\n---\n\nbody";
+        let def = build_def("ghost", content, "bundled", Path::new(""));
+        assert_eq!(def["hidden"], true);
+    }
+
+    #[test]
+    fn build_def_omits_hidden_when_absent_or_false() {
+        let absent = "---\nname: \"Impl\"\ndescription: \"d\"\n---\n\nbody";
+        let def = build_def("impl", absent, "bundled", Path::new(""));
+        assert!(def.get("hidden").is_none(), "absent frontmatter → no field");
+        let falsy = "---\nname: \"Impl\"\ndescription: \"d\"\nhidden: false\n---\n\nbody";
+        let def = build_def("impl", falsy, "bundled", Path::new(""));
+        assert!(def.get("hidden").is_none(), "hidden: false → no field");
+    }
+
+    #[test]
+    fn render_file_round_trips_hidden() {
+        // Wire specs carry the JSON boolean (specialist.create/edit).
+        let spec = json!({
+            "name": "Ghost",
+            "description": "d",
+            "hidden": true,
+            "prompt": "body"
+        });
+        let rendered = render_file("ghost", &spec);
+        let def = build_def("ghost", &rendered, "user", Path::new("/tmp/ghost.md"));
+        assert_eq!(def["hidden"], true);
+        // A spec without hidden does not write the key.
+        let spec = json!({ "name": "Ghost", "description": "d", "prompt": "body" });
+        let def = build_def(
+            "ghost",
+            &render_file("ghost", &spec),
+            "user",
+            Path::new("/tmp/ghost.md"),
+        );
+        assert!(def.get("hidden").is_none());
+    }
+
+    #[test]
     fn auto_generate_role_reminder_combines_first_line_and_hard_rule() {
         let body = "# Implementor\n\nImplement your assigned task — nothing more.\n\n## Hard Rules\n1. **No scope creep** — only what the task note asks\n2. **No refactors** — ask first\n";
         assert_eq!(
@@ -889,6 +950,15 @@ mod tests {
         let specs = list["specialists"].as_array().unwrap();
         for id in EMBEDDED_IDS {
             assert!(specs.iter().any(|s| s["id"] == id), "{id} listed");
+        }
+        // The bundled chief-of-staff is flagged hidden; every other embedded
+        // definition omits the field (absent ⇒ not hidden).
+        for spec in specs {
+            if spec["id"] == "chief-of-staff" {
+                assert_eq!(spec["hidden"], true, "chief-of-staff carries hidden");
+            } else {
+                assert!(spec.get("hidden").is_none(), "{}: not hidden", spec["id"]);
+            }
         }
         // Frontmatter-driven resolution works too: ralph declares an agentType,
         // implementor an explicit roleReminder.

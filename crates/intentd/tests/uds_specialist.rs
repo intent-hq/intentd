@@ -204,9 +204,14 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     assert_eq!(imp["name"], "Implementor");
     assert_eq!(imp["description"], "Bundled implementor", "dir file wins");
     assert!(imp.get("path").is_none(), "bundled exposes no path");
+    let chief = specs
+        .iter()
+        .find(|s| s["id"] == "chief-of-staff")
+        .expect("embedded-only id listed");
+    assert_eq!(chief["hidden"], true, "bundled chief-of-staff is hidden");
     assert!(
-        specs.iter().any(|s| s["id"] == "chief-of-staff"),
-        "embedded-only id listed"
+        imp.get("hidden").is_none(),
+        "non-hidden specialists omit the field"
     );
 
     // get — resolved view of a bundled id.
@@ -322,8 +327,9 @@ async fn specialist_full_crud_and_three_tier_resolution() {
 #[tokio::test]
 async fn specialist_full_frontmatter_wire_parity() {
     let h = start().await;
-    // Seed a bundled specialist whose frontmatter carries every optional scalar.
-    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\n---\n\nYou loop.";
+    // Seed a bundled specialist whose frontmatter carries every optional scalar
+    // plus the optional `hidden` boolean.
+    let body = "---\nname: \"Ralph\"\ndescription: \"Loops forever\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nroleReminder: \"Never stop early\"\nagentType: \"ralph-loop\"\nhidden: true\n---\n\nYou loop.";
     std::fs::write(h.bundled_dir.join("ralph.md"), body).unwrap();
 
     let (read, mut w) = connect_retry(&h.socket).await.into_split();
@@ -350,6 +356,7 @@ async fn specialist_full_frontmatter_wire_parity() {
         "behaviorPrompt aliases prompt"
     );
     assert_eq!(s["isCustomized"], false, "bundled is not customized");
+    assert_eq!(s["hidden"], true, "hidden frontmatter surfaces on get");
 
     // list — same fields visible in the list projection.
     let list = ok(&mut w, &mut r, 2, "specialist.list", json!({})).await;
@@ -358,6 +365,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(ralph["agentType"], "ralph-loop");
     assert_eq!(ralph["roleReminder"], "Never stop early");
     assert_eq!(ralph["isCustomized"], false);
+    assert_eq!(ralph["hidden"], true, "hidden surfaces in list");
 
     // create→get round-trip: a user specialist persists every field losslessly,
     // and the body may be supplied via the `behaviorPrompt` alias.
@@ -371,6 +379,7 @@ async fn specialist_full_frontmatter_wire_parity() {
             "description": "Loops again", "codingAgent": "claude",
             "model": "opus4.5", "modelTier": "smart",
             "roleReminder": "Keep going", "agentType": "ralph-loop",
+            "hidden": true,
             "behaviorPrompt": "Loop body." } }),
     )
     .await;
@@ -378,6 +387,7 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(created["specialist"]["isCustomized"], true);
     assert_eq!(created["specialist"]["prompt"], "Loop body.");
     assert_eq!(created["specialist"]["behaviorPrompt"], "Loop body.");
+    assert_eq!(created["specialist"]["hidden"], true);
 
     let got = ok(
         &mut w,
@@ -397,6 +407,25 @@ async fn specialist_full_frontmatter_wire_parity() {
     assert_eq!(s["prompt"], "Loop body.");
     assert_eq!(s["behaviorPrompt"], "Loop body.");
     assert_eq!(s["isCustomized"], true);
+    assert_eq!(s["hidden"], true, "create round-trips hidden");
+
+    // edit — a spec that still carries hidden does not drop the flag.
+    let edited = ok(
+        &mut w,
+        &mut r,
+        5,
+        "specialist.edit",
+        json!({ "id": "ralph2", "scope": "user", "spec": {
+            "id": "ralph2", "name": "Ralph II",
+            "description": "Loops again", "hidden": true,
+            "prompt": "Edited body." } }),
+    )
+    .await;
+    assert_eq!(edited["specialist"]["prompt"], "Edited body.");
+    assert_eq!(
+        edited["specialist"]["hidden"], true,
+        "edit round-trips hidden"
+    );
 
     h.shutdown().await;
 }
