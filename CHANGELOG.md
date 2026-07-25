@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7] - 2026-07-25
+
+### 🚀 Features
+
+- BaseRef-aware PR-workspace matching (intent-hq/monorepo#459)
+- Add hidden flag to specialist definitions ([#471](https://github.com/intent-hq/intentd/pull/471))
+- Turn-attachment registry for deterministic resource-block attach ([#482](https://github.com/intent-hq/intentd/pull/482))
+- Carry stopReason and messageId on interrupt agent:stream:end ([#492](https://github.com/intent-hq/intentd/pull/492))
+- Capture live token usage from ACP turn end ([#485](https://github.com/intent-hq/intentd/pull/485))
+- Expose workspace archive/unarchive on the agent MCP bridge ([#733](https://github.com/intent-hq/intentd/pull/733)) ([#499](https://github.com/intent-hq/intentd/pull/499))
+- Make comment.respond reply-anchoring contract explicit (monorepo#729) ([#496](https://github.com/intent-hq/intentd/pull/496))
+- Carry isBackground on agent:idle payload ([#501](https://github.com/intent-hq/intentd/pull/501))
+
+### 🐛 Bug Fixes
+
+- Comment.getThread/resolveThread/list caller-input errors return -32602 (intent-hq/monorepo#649)
+- *(test)* Scale fixed 5s daemon-read timeouts by the shared test budget (intent-hq/monorepo#615) ([#457](https://github.com/intent-hq/intentd/pull/457))
+- Reject review-requested filter on github.issues.search (intent-hq/monorepo#551) ([#462](https://github.com/intent-hq/intentd/pull/462))
+- Include script:output in ephemeral event retention sweep (monorepo#620) ([#432](https://github.com/intent-hq/intentd/pull/432))
+- Inherit hidden flag across specialist tiers ([#480](https://github.com/intent-hq/intentd/pull/480))
+- Use UTF-16 offset kind and recover poisoned CRDT sessions mutex (monorepo#721) ([#487](https://github.com/intent-hq/intentd/pull/487))
+- Route line-attribution:updated through the transient publish path (monorepo#720) ([#488](https://github.com/intent-hq/intentd/pull/488))
+- Auto-activate incremental auto_vacuum at daemon startup (monorepo#720) ([#500](https://github.com/intent-hq/intentd/pull/500))
+- Emit full applied delta on workspace archive/unarchive ([#508](https://github.com/intent-hq/intentd/pull/508))
+
+### ⚡ Performance
+
+- Relax sweep cadences and pause between workspaces (monorepo#703) ([#465](https://github.com/intent-hq/intentd/pull/465))
+
+### 🧪 Testing
+
+- Deflake queue-drain event-order race in e2e_wss_agent_lifecycle (monorepo#456) ([#459](https://github.com/intent-hq/intentd/pull/459))
+
+
 ## [0.2.6] - 2026-07-24
 
 ### 🚀 Features
