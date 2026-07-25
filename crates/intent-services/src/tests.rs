@@ -12403,7 +12403,10 @@ mod worktree_provisioning {
             )
             .await
             .expect_err("create must fail on unresolvable base ref");
-        assert!(matches!(err, Error::InvalidParams(_)), "got: {err}");
+        assert!(
+            matches!(err, Error::BaseRefUnresolvable { .. }),
+            "got: {err}"
+        );
         assert!(store.list_workspaces(true).await.expect("list").is_empty());
         assert!(
             std::fs::read_dir(&root.0)
