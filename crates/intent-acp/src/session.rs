@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CancelNotification, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
     SessionId, SessionNotification, ToolCall, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
@@ -42,7 +42,7 @@ use crate::IncomingNotification;
 // Re-export the schema types used in this module's public signatures so the
 // service layer can consume them without depending on `agent-client-protocol`
 // directly (§3.2 keeps that crate an `intent-acp` implementation detail).
-pub use agent_client_protocol::schema::{
+pub use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, Meta, NewSessionResponse,
     SessionMode, SessionModeState, SessionUpdate, StopReason,
 };

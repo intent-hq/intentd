@@ -493,7 +493,10 @@ impl SettingsFile {
     /// rejected; the error message names the offending key path (camelCase,
     /// dotted) plus the TOML line/column context.
     pub fn parse_str(text: &str) -> Result<Self> {
-        let de = toml::de::Deserializer::new(text);
+        let de = toml::de::Deserializer::parse(text).map_err(|e| {
+            let detail = e.to_string();
+            Error::InvalidInput(format!("invalid config.toml: {}", detail.trim_end()))
+        })?;
         let file: SettingsFile = serde_path_to_error::deserialize(de).map_err(|e| {
             let key_path = e.path().to_string();
             let detail = e.into_inner().to_string();

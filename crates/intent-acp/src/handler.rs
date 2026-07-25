@@ -13,7 +13,7 @@ use intent_core::events::{AGENT_PERMISSION_REQUEST, AGENT_PERMISSION_RESOLVED, F
 use intent_core::{ActorType, AgentId, BoxFuture, EventActor, WorkspaceId};
 use serde_json::{json, Value};
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionRequest, TerminalExitStatus, TerminalOutputRequest, TerminalOutputResponse,

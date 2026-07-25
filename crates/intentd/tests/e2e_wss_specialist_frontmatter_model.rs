@@ -283,6 +283,78 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for the optional `hidden` flag (PROTOCOL §5.11): a user-tier
+/// specialist whose frontmatter sets `hidden: true` surfaces the boolean on
+/// `specialist.get` and `specialist.list` over the real WSS transport, while a
+/// non-hidden specialist omits the field entirely.
+#[tokio::test]
+async fn specialist_hidden_round_trips_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Hermetic user tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("ghost.md"),
+        "---\nname: \"Ghost\"\ndescription: \"Hidden helper\"\nhidden: true\n---\n\nGhost body.",
+    )
+    .expect("write hidden specialist");
+    std::fs::write(
+        specialists_dir.join("visible.md"),
+        "---\nname: \"Visible\"\ndescription: \"Shown helper\"\n---\n\nVisible body.",
+    )
+    .expect("write visible specialist");
+
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // get — the hidden boolean surfaces on the resolved view.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "ghost" })).await;
+    assert_eq!(
+        got["specialist"]["hidden"], true,
+        "hidden frontmatter surfaces on specialist.get over WSS"
+    );
+
+    // list — hidden surfaces in the list projection; non-hidden omits it.
+    let list = wss_rpc(&mut ws, 3, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let ghost = specs
+        .iter()
+        .find(|s| s["id"] == "ghost")
+        .expect("ghost listed");
+    assert_eq!(ghost["hidden"], true, "hidden surfaces in specialist.list");
+    let visible = specs
+        .iter()
+        .find(|s| s["id"] == "visible")
+        .expect("visible listed");
+    assert!(
+        visible.get("hidden").is_none(),
+        "non-hidden specialists omit the field over WSS"
+    );
+
+    drop(daemon);
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();

@@ -11,11 +11,11 @@
 
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AuthMethodId, AuthenticateRequest, ClientCapabilities, FileSystemCapabilities, Implementation,
-    InitializeRequest, InitializeResponse, ProtocolVersion, SessionModeState,
-    SetSessionModeRequest,
+    InitializeRequest, InitializeResponse, SessionModeState, SetSessionModeRequest,
 };
+use agent_client_protocol::schema::ProtocolVersion;
 use intent_providers::{auth_error_message, is_provider_authentication_error, ProviderConfig};
 
 use crate::error::{AcpError, AcpResult};
@@ -157,7 +157,7 @@ pub async fn set_session_mode(conn: &Connection, session_id: &str, mode_id: &str
 ///    for a mode it never offered.
 pub fn select_preferred_mode<'a>(
     mode_map: Option<&'a [(&'a str, &'a str)]>,
-    available_modes: &'a [agent_client_protocol::schema::SessionMode],
+    available_modes: &'a [agent_client_protocol::schema::v1::SessionMode],
 ) -> Option<&'a str> {
     if let Some(map) = mode_map {
         if let Some((_, mapped)) = map
@@ -235,7 +235,7 @@ pub async fn try_bypass_permissions_mode(
 #[cfg(test)]
 mod mode_select_tests {
     use super::*;
-    use agent_client_protocol::schema::SessionMode;
+    use agent_client_protocol::schema::v1::SessionMode;
 
     fn mode(id: &str) -> SessionMode {
         SessionMode::new(id.to_string(), id.to_string())
