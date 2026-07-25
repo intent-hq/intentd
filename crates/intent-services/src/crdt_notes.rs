@@ -18,11 +18,11 @@
 //! next `setContent` is the current stored content.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use intent_core::{NoteId, WorkspaceId};
-use yrs::{Doc, GetString, Text, Transact, TransactionMut};
+use yrs::{Doc, GetString, OffsetKind, Options, Text, Transact, TransactionMut};
 
 /// Reference parity (`SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000`): sweep sessions
 /// idle for more than a day. Wired from the composition root via
@@ -55,6 +55,14 @@ impl CrdtNoteManager {
         }
     }
 
+    /// Lock the session map, recovering from poisoning. The map is a
+    /// session-only cache of best-effort merge state (never persisted), so a
+    /// panic while holding the lock cannot leave it logically corrupt in a way
+    /// that matters — worst case a session re-seeds from disk on next touch.
+    fn lock_sessions(&self) -> MutexGuard<'_, HashMap<(WorkspaceId, NoteId), Session>> {
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Route `new_content` through the yrs doc for `(workspace, note)` and
     /// return the merged content that the caller should persist. `base_content`
     /// is the stored note content the request started from; it seeds the doc
@@ -69,9 +77,16 @@ impl CrdtNoteManager {
         new_content: &str,
     ) -> String {
         let key = (workspace_id.clone(), note_id.clone());
-        let mut sessions = self.sessions.lock().expect("crdt sessions poisoned");
+        let mut sessions = self.lock_sessions();
         let session = sessions.entry(key).or_insert_with(|| {
-            let doc = Doc::new();
+            // `apply_diff` computes UTF-16 code-unit offsets (JS string / `Y.Text`
+            // parity), so the doc must index text by UTF-16 units too — the yrs
+            // default is byte offsets, which corrupts or panics on multi-byte
+            // content (monorepo#721).
+            let doc = Doc::with_options(Options {
+                offset_kind: OffsetKind::Utf16,
+                ..Default::default()
+            });
             seed_doc(&doc, base_content);
             Session {
                 doc,
@@ -98,7 +113,7 @@ impl CrdtNoteManager {
     /// restoreVersion).
     pub fn invalidate(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
         let key = (workspace_id.clone(), note_id.clone());
-        let mut sessions = self.sessions.lock().expect("crdt sessions poisoned");
+        let mut sessions = self.lock_sessions();
         sessions.remove(&key);
     }
 
@@ -113,7 +128,7 @@ impl CrdtNoteManager {
     /// [`SESSION_SWEEP_INTERVAL`] / [`SESSION_IDLE_TIMEOUT`].
     pub fn sweep_stale(&self, timeout: Duration) -> usize {
         let now = Instant::now();
-        let mut sessions = self.sessions.lock().expect("crdt sessions poisoned");
+        let mut sessions = self.lock_sessions();
         let before = sessions.len();
         sessions.retain(|_, session| now.duration_since(session.last_access) <= timeout);
         before - sessions.len()
@@ -123,10 +138,7 @@ impl CrdtNoteManager {
     #[cfg(test)]
     pub fn has_session(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> bool {
         let key = (workspace_id.clone(), note_id.clone());
-        self.sessions
-            .lock()
-            .expect("crdt sessions poisoned")
-            .contains_key(&key)
+        self.lock_sessions().contains_key(&key)
     }
 
     /// Test-only: seed the last-access timestamp so `sweep_stale` observes an
@@ -139,12 +151,7 @@ impl CrdtNoteManager {
         when: Instant,
     ) {
         let key = (workspace_id.clone(), note_id.clone());
-        if let Some(session) = self
-            .sessions
-            .lock()
-            .expect("crdt sessions poisoned")
-            .get_mut(&key)
-        {
+        if let Some(session) = self.lock_sessions().get_mut(&key) {
             session.last_access = when;
         }
     }
@@ -324,5 +331,56 @@ mod tests {
         let removed = mgr.sweep_stale(SESSION_IDLE_TIMEOUT);
         assert_eq!(removed, 0);
         assert!(mgr.has_session(&ws, &note));
+    }
+
+    #[test]
+    fn multibyte_content_edits_before_and_after_emoji() {
+        // Regression (monorepo#721): `apply_diff` computes UTF-16 code-unit
+        // offsets, so the doc must index text the same way. With the default
+        // byte offsets, edits around multi-byte chars (emoji + CJK) land on
+        // non-boundary byte offsets and panic inside yrs.
+        let mgr = CrdtNoteManager::new();
+        let (ws, note) = ids();
+        let base = "héllo 🌍 世界";
+        mgr.apply_full_content(&ws, &note, base, base);
+
+        // Edit before the emoji.
+        let after_prefix = mgr.apply_full_content(&ws, &note, base, "héllo! 🌍 世界");
+        assert_eq!(after_prefix, "héllo! 🌍 世界");
+
+        // Edit after the emoji (between the multi-byte tail chars).
+        let after_suffix =
+            mgr.apply_full_content(&ws, &note, after_prefix.as_str(), "héllo! 🌍 世界 end");
+        assert_eq!(after_suffix, "héllo! 🌍 世界 end");
+    }
+
+    #[test]
+    fn poisoned_sessions_mutex_recovers() {
+        // Regression (monorepo#721): a panic while holding the sessions lock
+        // poisoned the mutex, and every later call panicked on
+        // `.expect("crdt sessions poisoned")`. The map is a session-only
+        // cache, so recovery via `PoisonError::into_inner` must keep all
+        // entry points working.
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let mgr = CrdtNoteManager::new();
+        let (ws, note) = ids();
+        mgr.apply_full_content(&ws, &note, "seed", "seed");
+
+        // Poison the mutex: panic while holding the lock.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = mgr.sessions.lock().unwrap();
+            panic!("poison the crdt sessions mutex");
+        }));
+        assert!(result.is_err());
+        assert!(mgr.sessions.is_poisoned());
+
+        // All entry points must keep working on the poisoned mutex.
+        assert!(mgr.has_session(&ws, &note));
+        mgr.invalidate(&ws, &note);
+        assert!(!mgr.has_session(&ws, &note));
+        let merged = mgr.apply_full_content(&ws, &note, "seed", "seed two");
+        assert_eq!(merged, "seed two");
+        assert_eq!(mgr.sweep_stale(SESSION_IDLE_TIMEOUT), 0);
     }
 }
