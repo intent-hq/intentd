@@ -40,6 +40,23 @@ fn conflict_code_and_display_and_payload() {
 }
 
 #[test]
+fn base_ref_unresolvable_code_and_display_and_payload() {
+    let e = Error::BaseRefUnresolvable {
+        base_ref: "no-such-ref".to_string(),
+    };
+    assert_eq!(e.code(), -32602);
+    assert_eq!(
+        e.to_string(),
+        "invalid params: cannot resolve base ref 'no-such-ref'"
+    );
+    if let Error::BaseRefUnresolvable { base_ref } = e {
+        assert_eq!(base_ref, "no-such-ref");
+    } else {
+        panic!("variant should be BaseRefUnresolvable");
+    }
+}
+
+#[test]
 fn debug_includes_variant_name() {
     let e = Error::InvalidParams("x".to_string());
     let dbg = format!("{e:?}");

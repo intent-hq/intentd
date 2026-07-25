@@ -171,3 +171,48 @@ async fn workspace_create_branch_already_checked_out_returns_invalid_params() {
 
     let _ = std::fs::remove_dir_all(&repo_dir);
 }
+
+#[tokio::test]
+async fn workspace_create_unresolvable_base_ref_returns_invalid_params_with_data() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+
+    // Create a local git repository with one commit.
+    let repo_dir =
+        std::env::temp_dir().join(format!("wt-err-repo-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_git_repo(&repo_dir);
+
+    // Attempt to create a workspace from a base ref that does not exist.
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({
+            "repositoryPath": repo_dir.to_string_lossy(),
+            "branch": "feature-from-bogus-ref",
+            "baseRef": "no-such-ref",
+        }),
+    )
+    .await;
+
+    // Assert the error envelope: -32602, unchanged human message, plus the
+    // machine-readable data payload (monorepo#761).
+    let err = resp.get("error").expect("workspace.create should error");
+    assert_eq!(
+        err["code"], -32602,
+        "expected -32602 (InvalidParams), got: {resp}"
+    );
+    assert_eq!(
+        err["message"],
+        json!("invalid params: cannot resolve base ref 'no-such-ref'"),
+        "human message must stay byte-identical, got: {resp}"
+    );
+    assert_eq!(
+        err["data"],
+        json!({ "code": "base-ref-unresolvable", "baseRef": "no-such-ref" }),
+        "expected structured error.data, got: {resp}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo_dir);
+}

@@ -338,6 +338,17 @@ pub(crate) struct LiveTurn {
 /// writer observe the same state.
 pub(crate) type LiveTurns = Arc<Mutex<HashMap<AgentId, LiveTurn>>>;
 
+/// Per-agent chain of detached turn-end usage-bookkeeping tasks
+/// (monorepo#738): the `JoinHandle` of the most recently spawned bookkeeping
+/// task per agent. Each new turn's task awaits its predecessor before
+/// running, so per-agent bookkeeping stays ordered across turns even though
+/// it is detached from the stream path — a delayed task from turn N could
+/// otherwise let turn N+1's stats delta be computed against a stale snapshot
+/// (durable double-count in `usage_stats_hourly`) or overwrite turn N+1's
+/// newer cumulative snapshot (a regression the watermark scan cannot see).
+/// One entry per agent, replaced each turn; shared across [`Services`] clones.
+pub(crate) type TurnBookkeeping = Arc<Mutex<HashMap<AgentId, tokio::task::JoinHandle<()>>>>;
+
 /// RAII guard that clears an agent's live-turn slot when a turn ends — including
 /// the interrupt/abort path, where the worker future is dropped before
 /// `stream:end` is reached. Without it an aborted turn would leave a stale
@@ -889,30 +900,60 @@ impl Services {
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
         // remains as the abort-path fallback.
         self.clear_live_turn(agent_id);
-        // Global usage-stats recording: fold this turn into the current UTC
-        // hour bucket of `usage_stats_hourly` under the session's normalized
-        // model — the per-turn token delta plus, for completed turns, a `runs`
-        // increment and the wall-clock duration for the longest-run MAX. MUST
-        // run BEFORE `persist_turn_token_usage` below replaces the cumulative
-        // snapshot the delta is computed against. Best-effort: never fails
-        // the turn.
-        self.record_turn_usage_stats(
-            agent_id,
-            workspace_id,
-            turn_usage.as_ref(),
-            turn_started.elapsed(),
-            result.is_ok(),
-        )
-        .await;
-        // Live token-usage update (§5.23): when the agent reported end-of-turn
-        // usage, REPLACE the session's cumulative snapshot (never sum — ACP
-        // counts are cumulative per session) and re-aggregate the workspace
-        // tally immediately, persisting + emitting `workspace:tokenUsage-changed`
-        // without waiting for the periodic scan. Best-effort: a failure is
-        // logged and never fails the turn.
-        if let Some(usage) = &turn_usage {
-            self.persist_turn_token_usage(agent_id, workspace_id, usage)
-                .await;
+        // Turn-end usage bookkeeping, detached (monorepo#738): the global
+        // usage-stats recording (fold this turn's token delta + run counters
+        // into the current UTC hour bucket of `usage_stats_hourly`) and the
+        // live token-usage update (§5.23: REPLACE the session's cumulative
+        // snapshot — never sum, ACP counts are cumulative per session — then
+        // re-aggregate the workspace tally and emit
+        // `workspace:tokenUsage-changed`) run in a spawned task so the
+        // terminal `agent:stream:end` below never waits on them —
+        // `workspace:tokenUsage-changed` therefore has NO ordering guarantee
+        // relative to `agent:stream:end` (the FE handles it independently and
+        // no contract depends on the order). Best-effort: failures are logged
+        // and never fail the turn.
+        //
+        // Ordering WITHIN the bookkeeping is still load-bearing: the stats
+        // delta is computed against the previously persisted snapshot, so
+        // `record_turn_usage_stats` runs before `persist_turn_token_usage`
+        // replaces it, and tasks for the SAME agent are chained (each awaits
+        // its predecessor via [`TurnBookkeeping`]) so a delayed task from
+        // turn N can neither skew turn N+1's stats delta nor overwrite its
+        // newer cumulative snapshot.
+        let run_completed = result.is_ok();
+        if turn_usage.is_some() || run_completed {
+            let services = self.clone();
+            let agent_id_task = agent_id.clone();
+            let workspace_id_task = workspace_id.clone();
+            let turn_duration = turn_started.elapsed();
+            let turn_usage = turn_usage.take();
+            let prev = self
+                .turn_bookkeeping
+                .lock()
+                .ok()
+                .and_then(|mut chain| chain.remove(agent_id));
+            let handle = tokio::spawn(async move {
+                if let Some(prev) = prev {
+                    let _ = prev.await;
+                }
+                services
+                    .record_turn_usage_stats(
+                        &agent_id_task,
+                        &workspace_id_task,
+                        turn_usage.as_ref(),
+                        turn_duration,
+                        run_completed,
+                    )
+                    .await;
+                if let Some(usage) = turn_usage {
+                    services
+                        .persist_turn_token_usage(&agent_id_task, &workspace_id_task, &usage)
+                        .await;
+                }
+            });
+            if let Ok(mut chain) = self.turn_bookkeeping.lock() {
+                chain.insert(agent_id.clone(), handle);
+            }
         }
         // Exactly ONE terminal stream:end — complete and error both map here
         // (§7), EXCEPT a pre-output transport failure (monorepo#764): the
@@ -1056,10 +1097,12 @@ impl Services {
     /// prompt turns), a `runs` increment and the turn's wall-clock duration
     /// folded into the bucket's `longest_run_ms` MAX. Counters land in the
     /// current UTC hour bucket keyed by the session's normalized model name
-    /// (`"unknown"` fallback), with no workspace dimension. MUST be called
-    /// BEFORE `persist_turn_token_usage` replaces the session snapshot the
-    /// delta is computed against. Best-effort: errors are logged, never
-    /// propagated — stats bookkeeping must not fail a turn.
+    /// (`"unknown"` fallback), with no workspace dimension. MUST run BEFORE
+    /// `persist_turn_token_usage` replaces the session snapshot the delta is
+    /// computed against — the per-agent chained bookkeeping task spawned in
+    /// [`run_prompt_turn`](Self::run_prompt_turn) calls the two in that
+    /// order. Best-effort: errors are logged, never propagated — stats
+    /// bookkeeping must not fail a turn.
     pub(crate) async fn record_turn_usage_stats(
         &self,
         agent_id: &AgentId,

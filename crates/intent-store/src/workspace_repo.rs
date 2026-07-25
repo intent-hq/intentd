@@ -7,7 +7,8 @@ use intent_core::{
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
-use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, Store};
+use crate::agent_repo::fetch_agent_usage_rows;
+use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, attention, path, repository_path, repository_owner, repository_name, \
@@ -124,6 +125,87 @@ impl Store {
             return Err(Error::NotFound(format!("workspace {}", ws.id)));
         }
         Ok(())
+    }
+
+    /// Recompute-and-store a workspace's `token_usage` snapshot atomically
+    /// (§5.23, monorepo#738): inside ONE write-pool transaction, read the
+    /// per-session usage rows and the stored workspace `token_usage`, invoke
+    /// the caller's synchronous `compute` closure with both, and — when it
+    /// returns `Some(new_usage)` — perform a scoped
+    /// `UPDATE workspace SET token_usage=?, updated_at=?` (never a full-row
+    /// replace, so a concurrent title/status update is never clobbered).
+    /// Returns the written [`TokenUsage`] on a committed write, `None` when
+    /// the closure declined. `NotFound` if the workspace row is absent.
+    /// Layering: aggregation stays in intent-services via the closure; the
+    /// store only supplies the transactional read→write envelope.
+    ///
+    /// Uses raw `BEGIN IMMEDIATE` (same pattern as `insert_events`):
+    /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
+    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
+    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// `max_connections=1` on the write pool, concurrent recomputes serialize
+    /// at `pool.acquire()` instead.
+    ///
+    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`)
+    /// hydrates full `agent_message` logs for legacy sessions with neither a
+    /// snapshot nor a baseline, and that work happens while holding the
+    /// daemon's sole write connection and the SQLite write lock. The
+    /// snapshot/baseline hydration skip keeps the common case cheap; a
+    /// workspace of snapshot-less long-history sessions pays the cost on
+    /// every recompute until its sessions report usage once.
+    pub async fn update_workspace_token_usage<F>(
+        &self,
+        workspace_id: &WorkspaceId,
+        compute: F,
+    ) -> Result<Option<TokenUsage>>
+    where
+        F: FnOnce(&[AgentUsageRow], Option<&TokenUsage>) -> Option<TokenUsage>,
+    {
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("token usage recompute acquire failed: {e}"))
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("token usage recompute begin failed: {e}")))?;
+
+        let body_result = async {
+            let row = sqlx::query("SELECT token_usage FROM workspace WHERE id = ?")
+                .bind(&workspace_id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("token usage recompute read failed: {e}")))?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {workspace_id}")));
+            };
+            // Best-effort decode: a malformed stored snapshot degrades to None so
+            // the recompute writes a fresh one rather than failing.
+            let current: Option<TokenUsage> = row
+                .get::<Option<String>, _>("token_usage")
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let usage_rows = fetch_agent_usage_rows(&mut conn, workspace_id).await?;
+            let Some(new_usage) = compute(&usage_rows, current.as_ref()) else {
+                return Ok(None);
+            };
+            let json = serde_json::to_string(&new_usage)
+                .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
+            let res = sqlx::query("UPDATE workspace SET token_usage=?, updated_at=? WHERE id=?")
+                .bind(json)
+                .bind(now_iso())
+                .bind(&workspace_id.0)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("token usage recompute write failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {workspace_id}")));
+            }
+            Ok(Some(new_usage))
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "token usage recompute commit failed")
+            .await
     }
 
     /// Delete a workspace by id, or `NotFound`. Records a tombstone in

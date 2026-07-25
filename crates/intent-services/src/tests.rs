@@ -12718,7 +12718,9 @@ mod worktree_provisioning {
             )
             .await
             .expect_err("create must fail");
-        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(
+            matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "no-such-ref")
+        );
     }
 
     /// `skipWorktree`, non-git `repositoryPath`, and a caller-supplied
@@ -16702,5 +16704,124 @@ mod turn_token_usage {
         assert_eq!(scanned.totals, live.totals);
         assert_eq!(scanned.by_agent_id, live.by_agent_id);
         assert_eq!(scanned.by_model, live.by_model);
+    }
+
+    /// Clobber regression (monorepo#738): the recompute persists via a scoped
+    /// `token_usage` + `updated_at` write inside one transaction, so a
+    /// recompute racing a workspace title update can never revert the title
+    /// (the old full-row `update_workspace` replace could write back the
+    /// stale title it read before the rename landed).
+    #[tokio::test]
+    async fn recompute_racing_title_update_does_not_revert_title() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+
+        for i in 0..10u64 {
+            // A fresh snapshot each round forces the recompute to write.
+            h.store
+                .set_agent_session_token_usage(
+                    &h.ws,
+                    &agent,
+                    &intent_core::TokenUsageTotals {
+                        input_tokens: (i + 1) * 10,
+                        output_tokens: i + 1,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                )
+                .await
+                .expect("set snapshot");
+            let title = format!("Title {i}");
+            let rename = {
+                let store = h.store.clone();
+                let ws_id = h.ws.clone();
+                let title = title.clone();
+                async move {
+                    let mut ws = store.get_workspace(&ws_id).await.expect("get ws");
+                    ws.title = title;
+                    store.update_workspace(&ws).await.expect("rename");
+                }
+            };
+            let recompute = h.services.recompute_workspace_token_usage(&h.ws, false);
+            let (_, recomputed) = tokio::join!(rename, recompute);
+            recomputed.expect("recompute ok");
+            let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+            assert_eq!(ws.title, title, "recompute must never revert the title");
+        }
+    }
+
+    /// Serialization (monorepo#738): N concurrent `persist_turn_token_usage`
+    /// calls on one session fully serialize on the write-pool transaction —
+    /// the final workspace tally equals the session's last-landed snapshot
+    /// (the old read→tally→full-row-write cycle could commit a stale tally
+    /// last), and every emitted `workspace:tokenUsage-changed` carries a
+    /// tally equal to some committed snapshot, never a torn aggregate.
+    #[tokio::test]
+    async fn concurrent_persist_turn_token_usage_serializes() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        let mut sub = subscribe_usage(&h);
+
+        let snapshots: Vec<u64> = (1..=8).map(|i| i * 10).collect();
+        let mut handles = Vec::new();
+        for &input in &snapshots {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            let agent = agent.clone();
+            handles.push(tokio::spawn(async move {
+                services
+                    .persist_turn_token_usage(&agent, &ws, &acp_usage(input, input / 10, 0, 0))
+                    .await;
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task joined");
+        }
+
+        // The stored session snapshot is whichever cumulative report landed
+        // last; the workspace tally must equal exactly that snapshot.
+        let rows = h
+            .store
+            .get_workspace_agent_usage_data(&h.ws)
+            .await
+            .expect("usage rows");
+        let landed = rows[0].2.as_ref().expect("snapshot landed").clone();
+        assert!(
+            snapshots.contains(&landed.input_tokens),
+            "stored snapshot is one of the reported values"
+        );
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(
+            usage.totals, landed,
+            "workspace tally equals the last-landed session snapshot"
+        );
+        assert_eq!(usage.by_agent_id[&agent.0], landed);
+
+        // Every emitted event carries a committed snapshot value — never a
+        // torn/mixed aggregate.
+        let mut seen = 0usize;
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(200), sub.recv()).await {
+            for ev in batch {
+                let data = serde_json::to_value(&ev).expect("serialize event");
+                let input = data["data"]["tokenUsage"]["totals"]["inputTokens"]
+                    .as_u64()
+                    .expect("inputTokens");
+                assert!(
+                    snapshots.contains(&input),
+                    "event tally {input} must equal a committed snapshot"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 1, "at least one tokenUsage-changed event fired");
     }
 }

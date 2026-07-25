@@ -103,7 +103,9 @@ pub fn provision_worktree(
         .iter()
         .find_map(|spec| repo.revparse_single(spec).ok())
         .and_then(|obj| obj.peel_to_commit().ok())
-        .ok_or_else(|| Error::InvalidParams(format!("cannot resolve base ref '{r}'")))?,
+        .ok_or_else(|| Error::BaseRefUnresolvable {
+            base_ref: r.to_string(),
+        })?,
         None => repo
             .head()
             .and_then(|h| h.peel_to_commit())
@@ -412,7 +414,9 @@ mod tests {
             "origin",
         )
         .unwrap_err();
-        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(
+            matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "no-such-ref")
+        );
     }
 
     #[test]
