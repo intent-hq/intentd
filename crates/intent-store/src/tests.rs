@@ -667,6 +667,75 @@ async fn append_note_version_rolls_back_on_failed_commit() {
     assert_eq!(v, 1);
 }
 
+/// Regression for monorepo#680: when the explicit ROLLBACK after a body
+/// error also fails, `append_note_version` must detach+close the connection
+/// instead of returning the potentially poisoned handle to the sole-
+/// connection write pool. A `RAISE(ROLLBACK)` trigger fails the version
+/// INSERT *and* auto-rolls the transaction back, so the explicit ROLLBACK
+/// that follows fails ("cannot rollback - no transaction is active");
+/// pre-fix that failure was ignored and the connection went back to the
+/// pool (write pool size stayed 1 instead of dropping to 0).
+#[tokio::test]
+async fn append_note_version_detaches_conn_on_failed_body_error_rollback() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    let ts = now_iso();
+
+    // Arm the trap: the version INSERT fails its own statement and rolls
+    // the whole transaction back, so the explicit ROLLBACK finds none open.
+    sqlx::query(
+        "CREATE TRIGGER rollback_trap AFTER INSERT ON note_version BEGIN
+             SELECT RAISE(ROLLBACK, 'rollback trap');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let err = store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect_err("INSERT must fail on the rollback trigger");
+    assert!(
+        err.to_string().contains("insert note_version failed"),
+        "unexpected error: {err}"
+    );
+
+    // The failed ROLLBACK detached+closed the connection rather than
+    // returning it to the pool.
+    assert_eq!(store.write_pool().size(), 0);
+
+    // Nothing persisted from the trapped append...
+    assert!(store
+        .list_note_versions(&ws_id, &note.id)
+        .await
+        .expect("list versions")
+        .is_empty());
+    // ...and the pool opens a fresh replacement on demand: with the trap
+    // disarmed, the next append succeeds.
+    sqlx::query("DROP TRIGGER rollback_trap")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let v = store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect("append after detach");
+    assert_eq!(v, 1);
+}
+
 #[tokio::test]
 async fn note_rev_increments_on_update() {
     let tmp = TempDb::new();
@@ -1067,6 +1136,66 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
         other => panic!("expected NotFound for absent note, got {other:?}"),
     }
     assert!(store.get_comment("c2").await.is_err());
+}
+
+/// Regression for monorepo#680 at the `update_note_with_comment` site: a
+/// `RAISE(ROLLBACK)` trigger on the note UPDATE fails the body *and*
+/// auto-rolls the transaction back, so the explicit ROLLBACK fails and the
+/// hardened arm must detach+close the connection (write pool size drops to
+/// 0) instead of pooling the potentially poisoned handle.
+#[tokio::test]
+async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+
+    // Arm the trap: the note UPDATE fails its own statement and rolls the
+    // whole transaction back, so the explicit ROLLBACK finds none open.
+    sqlx::query(
+        "CREATE TRIGGER rollback_trap AFTER UPDATE ON note BEGIN
+             SELECT RAISE(ROLLBACK, 'rollback trap');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    note.content = "rewrite-that-must-roll-back".to_string();
+    let c1 = sample_comment(&note.id, "c1", "c1");
+    let err = store
+        .update_note_with_comment(&note, &c1)
+        .await
+        .expect_err("UPDATE must fail on the rollback trigger");
+    assert!(
+        err.to_string().contains("update note failed"),
+        "unexpected error: {err}"
+    );
+
+    // The failed ROLLBACK detached+closed the connection rather than
+    // returning it to the pool.
+    assert_eq!(store.write_pool().size(), 0);
+
+    // Nothing persisted from the trapped call...
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!(stored.rev, 0);
+    assert!(store.get_comment("c1").await.is_err());
+    // ...and the pool opens a fresh replacement on demand: with the trap
+    // disarmed, the same call succeeds.
+    sqlx::query("DROP TRIGGER rollback_trap")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let rev = store
+        .update_note_with_comment(&note, &c1)
+        .await
+        .expect("update after detach");
+    assert_eq!(rev, 1);
 }
 
 /// `update_comment` must not drop legacy/unknown `extra_json` keys preserved
@@ -1569,6 +1698,76 @@ async fn insert_events_rolls_back_on_body_error() {
         .await
         .expect("insert after body error");
     assert_eq!(inserted.len(), 2);
+}
+
+/// Regression for monorepo#680 at the `insert_events` site: unlike the
+/// `RAISE(ABORT)` body trap above (statement fails, transaction stays open,
+/// explicit ROLLBACK succeeds), a `RAISE(ROLLBACK)` trigger fails the body
+/// *and* auto-rolls the transaction back, so the explicit ROLLBACK fails
+/// and the hardened arm must detach+close the connection (write pool size
+/// drops to 0) instead of pooling the potentially poisoned handle.
+#[tokio::test]
+async fn insert_events_detaches_conn_on_failed_body_error_rollback() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Arm the trap: the event INSERT fails its own statement and rolls the
+    // whole transaction back, so the explicit ROLLBACK finds none open.
+    sqlx::query(
+        "CREATE TRIGGER rollback_trap AFTER INSERT ON event BEGIN
+             SELECT RAISE(ROLLBACK, 'rollback trap');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let trapped = typed_event(
+        &ws,
+        "2026-01-01T00:00:01Z",
+        events::AGENT_MESSAGE,
+        actor.clone(),
+    );
+    let err = store
+        .insert_events(std::slice::from_ref(&trapped))
+        .await
+        .expect_err("INSERT must fail on the rollback trigger");
+    assert!(
+        err.to_string().contains("insert events failed"),
+        "unexpected error: {err}"
+    );
+
+    // The failed ROLLBACK detached+closed the connection rather than
+    // returning it to the pool.
+    assert_eq!(store.write_pool().size(), 0);
+
+    // Nothing persisted from the trapped insert...
+    assert!(store
+        .events_by_workspace(&ws, 10)
+        .await
+        .expect("query events")
+        .is_empty());
+    // ...and the pool opens a fresh replacement on demand: with the trap
+    // disarmed, the next insert succeeds.
+    sqlx::query("DROP TRIGGER rollback_trap")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let inserted = store
+        .insert_events(std::slice::from_ref(&trapped))
+        .await
+        .expect("insert after detach");
+    assert_eq!(inserted.len(), 1);
 }
 
 /// Finding F4: extended ephemeral-event retention sweep deletes high-volume

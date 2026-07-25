@@ -169,7 +169,10 @@ impl Store {
                 crate::commit_with_rollback_guard(conn, "commit failed").await?;
             }
             Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                // Roll back the failed body; detach+close on a failed
+                // ROLLBACK so a poisoned connection is never returned to
+                // the pool (monorepo#680).
+                crate::rollback_or_poison(conn).await;
                 return Err(e);
             }
         }
