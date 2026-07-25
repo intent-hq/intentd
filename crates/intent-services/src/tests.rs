@@ -8483,6 +8483,156 @@ mod metrics {
     }
 }
 
+/// Global usage-stats recording for lines changed (D5): `track_change` returns
+/// the clamped per-row delta, `usage_stats::record_lines_changed` attributes it
+/// to the acting agent's normalized session model, and the accrued counters are
+/// independent of the clearable `workspace_metrics` / `agent_metrics`.
+mod usage_stats_recording {
+    use super::*;
+    use intent_store::NewTrackedChange;
+
+    async fn setup() -> (TempDb, Services, WorkspaceId) {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        (tmp, Services::new(store), ws)
+    }
+
+    fn change(
+        ws: &WorkspaceId,
+        path: &str,
+        agent: Option<&str>,
+        additions: i64,
+        deletions: i64,
+    ) -> NewTrackedChange {
+        NewTrackedChange {
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            stage: "unstaged".to_string(),
+            status: "modified".to_string(),
+            agent_id: agent.map(str::to_string),
+            session_id: None,
+            turn: None,
+            commit_hash: None,
+            old_blob_sha: None,
+            new_blob_sha: None,
+            additions,
+            deletions,
+        }
+    }
+
+    /// Create an agent session via the real `agent.create` path and return its id.
+    async fn create_agent(svc: &Services, ws: &WorkspaceId, model: Option<&str>) -> String {
+        let created = svc
+            .agent_create_op(
+                ws.clone(),
+                Some("Stats".into()),
+                model.map(str::to_string),
+                None,
+                None,
+                None,
+                false,
+                Default::default(),
+            )
+            .await
+            .expect("create agent");
+        created["agent"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// Sum of `(lines_added, lines_deleted)` across every bucket of one model.
+    async fn lines_for(svc: &Services, model: &str) -> (u64, u64) {
+        svc.store()
+            .list_usage_stats_hourly()
+            .await
+            .expect("list usage stats")
+            .iter()
+            .filter(|r| r.model == model)
+            .fold((0, 0), |(a, d), r| (a + r.lines_added, d + r.lines_deleted))
+    }
+
+    /// `track_change` reports the growth of the row's cumulative per-file
+    /// counters — full values on create, the increase on update, and a
+    /// clamped zero when the diff shrinks (reverted lines never go negative).
+    #[tokio::test]
+    async fn track_change_returns_clamped_row_delta() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        let first = crate::file_tracking::track_change(store, change(&ws, "a.ts", None, 10, 2))
+            .await
+            .expect("first");
+        assert_eq!(first, (10, 2));
+        let grown = crate::file_tracking::track_change(store, change(&ws, "a.ts", None, 15, 3))
+            .await
+            .expect("grown");
+        assert_eq!(grown, (5, 1));
+        let shrunk = crate::file_tracking::track_change(store, change(&ws, "a.ts", None, 7, 1))
+            .await
+            .expect("shrunk");
+        assert_eq!(shrunk, (0, 0), "shrinking diff clamps to zero");
+    }
+
+    /// The recorded delta lands in `usage_stats_hourly` under the acting
+    /// agent's normalized model, keeps accruing across recordings, and is
+    /// untouched by clearing the workspace/agent metrics aggregates
+    /// (`metrics.clearAgentStats` independence).
+    #[tokio::test]
+    async fn lines_changed_accrue_by_model_and_survive_metrics_clear() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        let agent = create_agent(&svc, &ws, Some("auggie:claude-opus-4-8")).await;
+
+        let delta =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some(&agent), 10, 2))
+                .await
+                .expect("track");
+        crate::usage_stats::record_lines_changed(store, &ws, Some(&agent), delta.0, delta.1).await;
+        let delta =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some(&agent), 15, 3))
+                .await
+                .expect("track grown");
+        crate::usage_stats::record_lines_changed(store, &ws, Some(&agent), delta.0, delta.1).await;
+        assert_eq!(lines_for(&svc, "Opus 4.8").await, (15, 3));
+
+        // Clearing the workspace/agent metrics aggregates must not touch the
+        // time-bucketed usage stats (D5: period-scoped true totals).
+        crate::metrics::recompute(store, &ws)
+            .await
+            .expect("recompute");
+        let cleared = svc
+            .metrics_clear_agent_stats(agent.clone())
+            .await
+            .expect("clear agent stats");
+        assert_eq!(cleared, serde_json::json!({ "success": true }));
+        store
+            .delete_workspace_metrics(&ws)
+            .await
+            .expect("delete ws metrics");
+        assert_eq!(lines_for(&svc, "Opus 4.8").await, (15, 3));
+    }
+
+    /// Zero deltas and unattributed (agent-less) changes record nothing; an
+    /// attributed agent whose model cannot be resolved falls back to "unknown".
+    #[tokio::test]
+    async fn lines_changed_skips_zero_and_unattributed_falls_back_unknown() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        // No acting agent → not agentic activity → skipped.
+        crate::usage_stats::record_lines_changed(store, &ws, None, 5, 1).await;
+        // Attributed but zero delta → skipped.
+        crate::usage_stats::record_lines_changed(store, &ws, Some("agent-x"), 0, 0).await;
+        assert!(store
+            .list_usage_stats_hourly()
+            .await
+            .expect("list")
+            .is_empty());
+        // Attributed to an agent whose session (and thus model) is unknown →
+        // recorded under the "unknown" model.
+        crate::usage_stats::record_lines_changed(store, &ws, Some("agent-ghost"), 3, 1).await;
+        assert_eq!(lines_for(&svc, "unknown").await, (3, 1));
+    }
+}
+
 /// `search.*` wire glue (§5.15): requestId mint/echo, the worktree-rooted
 /// matches/files shape, and the idempotent no-op cancel. The ripgrep walk
 /// itself is covered in `intent-search`.

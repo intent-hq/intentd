@@ -1,12 +1,17 @@
 //! Global usage-stats recording helpers behind the agentic usage-stats cards:
-//! UTC hour bucketing, per-turn token deltas, and model-name normalization.
+//! UTC hour bucketing, per-turn token deltas, and model-name normalization,
+//! plus the best-effort session-start / lines-changed recorders.
 //!
-//! The recording side effects live in `agent_session.rs`
-//! (`record_turn_usage_stats`); everything here is pure and unit-testable
-//! without a store. Stats aggregate globally across workspaces into the
-//! `usage_stats_hourly` table (one row per UTC hour bucket + normalized model).
+//! The turn-end recording side effects live in `agent_session.rs`
+//! (`record_turn_usage_stats`); the bucketing/delta/normalization helpers here
+//! are pure and unit-testable without a store, while
+//! [`record_session_started`] / [`record_lines_changed`] fold their one-shot
+//! deltas straight into the store. Stats aggregate globally across workspaces
+//! into the `usage_stats_hourly` table (one row per UTC hour bucket +
+//! normalized model).
 
-use intent_core::TokenUsageTotals;
+use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
+use intent_store::{Store, UsageStatsDelta};
 use time::OffsetDateTime;
 
 use crate::token_usage::UNKNOWN_MODEL;
@@ -114,6 +119,67 @@ pub fn normalize_model_name(raw: &str) -> String {
         }
     }
     base.to_string()
+}
+
+/// Record one agent-session start (D2: *sessions* = agent sessions) into the
+/// current UTC hour bucket of `usage_stats_hourly`, keyed by the session's
+/// normalized model (`"unknown"` when no model is resolved at creation time).
+/// Best-effort: errors are logged, never propagated — stats bookkeeping must
+/// not fail `agent.create`.
+pub async fn record_session_started(store: &Store, raw_model: Option<&str>) {
+    let bucket = hour_bucket_utc(OffsetDateTime::now_utc());
+    let model = normalize_model_name(raw_model.unwrap_or(""));
+    let delta = UsageStatsDelta {
+        sessions_started: 1,
+        ..Default::default()
+    };
+    if let Err(e) = store.add_usage_stats(&bucket, &model, &delta).await {
+        tracing::warn!(error = %e, "record session-start usage stats failed");
+    }
+}
+
+/// Record one lines-changed delta (D5: period-scoped true totals, accrued as
+/// attribution is recorded) into the current UTC hour bucket of
+/// `usage_stats_hourly`, keyed by the acting agent's normalized session model
+/// (`"unknown"` when the model cannot be resolved). Zero deltas and changes
+/// with no attributed agent (manual/user edits are not agentic activity) are
+/// skipped. Independent of `workspace_metrics` / `agent_metrics` by
+/// construction — clearing those (e.g. `metrics.clearAgentStats`) never
+/// touches `usage_stats_hourly`. Best-effort: errors are logged, never
+/// propagated.
+pub async fn record_lines_changed(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent_id: Option<&str>,
+    lines_added: u64,
+    lines_deleted: u64,
+) {
+    if lines_added == 0 && lines_deleted == 0 {
+        return;
+    }
+    let Some(agent_id) = agent_id else {
+        return;
+    };
+    let raw_model = match store
+        .get_agent_session_token_usage(workspace_id, &AgentId(agent_id.to_string()))
+        .await
+    {
+        Ok((model, _)) => model,
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "read agent model for lines-changed stats failed");
+            None
+        }
+    };
+    let bucket = hour_bucket_utc(OffsetDateTime::now_utc());
+    let model = normalize_model_name(raw_model.as_deref().unwrap_or(""));
+    let delta = UsageStatsDelta {
+        lines_added,
+        lines_deleted,
+        ..Default::default()
+    };
+    if let Err(e) = store.add_usage_stats(&bucket, &model, &delta).await {
+        tracing::warn!(agent = %agent_id, error = %e, "record lines-changed usage stats failed");
+    }
 }
 
 /// Pull a dotted version out of the tokens following a family keyword:

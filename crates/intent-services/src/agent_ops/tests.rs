@@ -1984,6 +1984,68 @@ async fn create_rejects_unknown_provider() {
     create_agent(&svc, &ws, "OK").await;
 }
 
+/// `agent.create` records one `sessions_started` tick into the global
+/// `usage_stats_hourly` store (D2: *sessions* = agent sessions) under the
+/// session's normalized model, with the `"unknown"` fallback when no model is
+/// resolved at creation time. Only the session counter accrues — no
+/// tokens/runs/lines.
+#[tokio::test]
+async fn create_records_session_started_usage_stats() {
+    let (_t, svc, ws) = setup().await;
+    // Explicit (compound) model → one tick under the normalized display name.
+    svc.agent_create_op(
+        ws.clone(),
+        Some("WithModel".into()),
+        Some("auggie:claude-opus-4-8".into()),
+        None,
+        None,
+        None,
+        false,
+        Default::default(),
+    )
+    .await
+    .expect("create with model");
+    // No model param and no configured defaults → "unknown".
+    svc.agent_create_op(
+        ws.clone(),
+        Some("NoModel".into()),
+        None,
+        None,
+        None,
+        None,
+        false,
+        Default::default(),
+    )
+    .await
+    .expect("create without model");
+
+    let rows = svc
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("list usage stats");
+    let sessions_for = |model: &str| -> u64 {
+        rows.iter()
+            .filter(|r| r.model == model)
+            .map(|r| r.sessions_started)
+            .sum()
+    };
+    assert_eq!(sessions_for("Opus 4.8"), 1);
+    assert_eq!(sessions_for("unknown"), 1);
+    assert!(
+        rows.iter().all(|r| r.bucket_utc.ends_with(":00:00Z")),
+        "buckets are UTC hour floors: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.runs == 0
+            && r.input_tokens == 0
+            && r.output_tokens == 0
+            && r.lines_added == 0
+            && r.lines_deleted == 0),
+        "session start accrues only sessions_started: {rows:?}"
+    );
+}
+
 /// `agent.setModel` rejects an unknown compound-prefix provider with -32602
 /// InvalidParams and leaves session.model / session.provider untouched.
 #[tokio::test]
