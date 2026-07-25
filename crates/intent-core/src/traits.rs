@@ -1531,6 +1531,27 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `stats.getUsage`: the global usage-stats read behind the agentic
+    /// usage-stats cards, aggregated over the `usage_stats_hourly` store; no
+    /// `workspaceId`. `period` is `"24h"` / `"month"` / `"year"` (`key` —
+    /// `"YYYY-MM"` / `"YYYY"` — is required for month/year and ignored for
+    /// 24h); `tz_offset_minutes` is the client's offset east of UTC, applied
+    /// to the UTC hour buckets before period filtering and hour-of-day /
+    /// month grouping so results reflect the client's local time.
+    fn stats_get_usage(
+        &self,
+        period: String,
+        key: Option<String>,
+        tz_offset_minutes: i64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (period, key, tz_offset_minutes);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::stats_get_usage not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.enhancePrompt`: one-shot prompt-enhance / AI-layout generation via
     /// the auggie CLI — `{ enhanced, original, mode }`; `mode` is `"enhance"` or
     /// `"layout"`, `workspaceId` optionally pins the CLI's cwd (PROTOCOL §5.31).
