@@ -251,7 +251,19 @@ impl Supervisor {
                 .current_version
                 .filter(|v| self.paths.daemon_binary(v).exists())
             {
-                Some(version) => version,
+                Some(version) => {
+                    // The channel flag only governs updater behavior, which
+                    // one-shots don't have; surface a mismatch but run anyway.
+                    if state.channel != self.channel {
+                        eprintln!(
+                            "intentd-sitter: note: channel {} requested but the installed \
+                             daemon was installed from channel {}; one-shot commands run \
+                             the installed daemon as-is",
+                            self.channel, state.channel
+                        );
+                    }
+                    version
+                }
                 None => {
                     eprintln!(
                         "intentd-sitter: no intentd daemon is installed for channel {}; \

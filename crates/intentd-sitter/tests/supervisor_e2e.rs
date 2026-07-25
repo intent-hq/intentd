@@ -534,6 +534,45 @@ fn one_shot_with_installed_version_never_touches_the_updater() {
         !paths.daemon_binary("0.2.0").exists(),
         "one-shot must not install"
     );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        !stderr.contains("note: channel"),
+        "no channel-mismatch notice when channels match; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn one_shot_channel_mismatch_warns_and_runs_installed_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // preinstall records channel `stable` in state.json.
+    preinstall(&paths, "0.1.0", &args_dump_script());
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(routes);
+
+    // The channel flag only governs updater behavior, which one-shots don't
+    // have: a mismatch prints a notice but still runs the installed daemon.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .args(["--sitter-channel=beta", "doctor"])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(read_or_empty(&daemon_log_path(dir.path())), "doctor\n");
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[] as &[String],
+        "one-shot must not make any HTTP requests"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains(
+            "note: channel beta requested but the installed daemon was installed \
+             from channel stable"
+        ),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
