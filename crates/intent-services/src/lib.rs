@@ -4013,6 +4013,16 @@ fn cleanup_workspace_cow_checkout_locked(checkout: &Path) -> Option<PathBuf> {
     trash
 }
 
+/// Best-effort removal of the `<root>/<workspaceId>` dir a CoW probe created
+/// when checkout provisioning fails afterwards (`provision_cow_checkout`
+/// already removes the clone itself, leaving the parent empty) — repeated
+/// failures must not accumulate empty dirs in the workspaces root
+/// (intent-hq/monorepo#774). `remove_dir` refuses non-empty directories, so a
+/// dir holding any content is never touched; errors are ignored.
+fn remove_workspace_dir_if_empty(ws_dir: &Path) {
+    let _ = std::fs::remove_dir(ws_dir);
+}
+
 /// Unlocked phase of the `workspace.delete` cleanup: recursively remove the
 /// checkout that [`cleanup_workspace_worktree_locked`] renamed to a trash
 /// path. Runs after the per-repo lock is released so a multi-GB
@@ -7540,7 +7550,7 @@ impl WorkspaceApi for Services {
                                 } else {
                                     intent_core::CheckoutMode::Worktree
                                 };
-                                let sha = worktree_locks
+                                let sha = match worktree_locks
                                     .with_lock(&repo_dir, move || async move {
                                         tokio::task::spawn_blocking(move || match mode {
                                             intent_core::CheckoutMode::Cow => {
@@ -7570,7 +7580,22 @@ impl WorkspaceApi for Services {
                                             ))
                                         })?
                                     })
-                                    .await?;
+                                    .await
+                                {
+                                    Ok(sha) => sha,
+                                    Err(e) => {
+                                        // `provision_cow_checkout` already
+                                        // removed the failed clone; also drop
+                                        // the `<root>/<wsId>` parent the probe
+                                        // created if it is left empty, so a
+                                        // failed create leaves the workspaces
+                                        // root clean (#774).
+                                        if mode == intent_core::CheckoutMode::Cow {
+                                            remove_workspace_dir_if_empty(&ws_dir);
+                                        }
+                                        return Err(e);
+                                    }
+                                };
                                 ws.worktree_path =
                                     Some(wt_path.to_string_lossy().to_string());
                                 ws.checkout_mode = Some(mode);
@@ -8906,6 +8931,13 @@ impl WorkspaceApi for Services {
                             );
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree returned Err").await;
+                            } else {
+                                // CoW: the failed clone is already gone; drop
+                                // the `<root>/<wsId>` parent the probe created
+                                // if it is left empty (#774). The metadata
+                                // write below recreates the dir with content
+                                // for the (worktree-less) duplicate row.
+                                remove_workspace_dir_if_empty(&ws_dir);
                             }
                         }
                         Err(join_err) => {
@@ -8916,6 +8948,8 @@ impl WorkspaceApi for Services {
                             );
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree task JoinError").await;
+                            } else {
+                                remove_workspace_dir_if_empty(&ws_dir);
                             }
                         }
                     }
