@@ -12372,6 +12372,123 @@ mod worktree_provisioning {
         assert_eq!(rows.len(), 1, "no duplicate row inserted on failure");
     }
 
+    /// Regression for monorepo#774 (`workspace.create` path): when the CoW
+    /// probe succeeds but `provision_cow_checkout` fails afterwards (here: an
+    /// unresolvable `baseRef`), the create fails without inserting a row and
+    /// without leaving the empty `<root>/<wsId>` dir the probe created behind
+    /// — the workspaces root ends up clean.
+    #[tokio::test]
+    async fn create_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowfail-repo");
+        let root = unique_dir("intentd-cowfail-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some("no-such-ref".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail on unresolvable base ref");
+        assert!(matches!(err, Error::InvalidParams(_)), "got: {err}");
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(
+            std::fs::read_dir(&root.0)
+                .expect("read workspaces root")
+                .next()
+                .is_none(),
+            "workspaces root must have no leftover empty <root>/<wsId> dir"
+        );
+    }
+
+    /// monorepo#774, `workspace.duplicate` path: a CoW provisioning failure
+    /// after a successful probe is swallowed (the duplicate continues without
+    /// a worktree), and the empty `<root>/<wsId>` dir the probe created is
+    /// removed on the error path — the dir only reappears via the metadata
+    /// write, carrying `.workspace/workspace.json` (never left empty).
+    ///
+    /// Note: because that (best-effort) metadata write recreates the dir
+    /// either way, the end state here is identical with or without the
+    /// cleanup — this is a characterization test of the swallowed-error
+    /// flow, not a mutation-killing regression test. The #774 regression
+    /// coverage lives in the create-path test above and the
+    /// `remove_workspace_dir_if_empty` unit test below.
+    #[tokio::test]
+    async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowdupfail-repo");
+        let root = unique_dir("intentd-cowdupfail-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        // Registry-style source row (no checkout of its own) carrying an
+        // unresolvable baseRef, which the duplicate inherits — the probe
+        // succeeds but `provision_cow_checkout` fails on the bad ref.
+        let src_id = WorkspaceId::from("cow-dupfail-src");
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        src_ws.base_ref = Some("no-such-ref".to_string());
+        store.insert_workspace(&src_ws).await.expect("insert");
+
+        let dup = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect("duplicate continues without worktree");
+        assert!(dup.worktree_path.is_none(), "no worktree on failure");
+        assert_eq!(dup.checkout_mode, None);
+        // No empty dir left behind: the duplicate's dir exists only because
+        // the metadata write recreated it, and holds exactly `.workspace`.
+        let entries: Vec<String> = std::fs::read_dir(root.0.join(dup.id.as_str()))
+            .expect("duplicate ws dir exists (metadata write)")
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![".workspace".to_string()],
+            "duplicate ws dir holds only the metadata dir"
+        );
+    }
+
+    /// The #774 cleanup helper only ever removes *empty* dirs: a non-empty
+    /// `<root>/<wsId>` dir (e.g. holding a provisioned checkout) is never
+    /// deleted, and a missing dir is a no-op.
+    #[test]
+    fn remove_workspace_dir_if_empty_never_deletes_non_empty_dirs() {
+        let root = unique_dir("intentd-rmempty-root");
+        let empty = root.0.join("empty-ws");
+        std::fs::create_dir_all(&empty).unwrap();
+        crate::remove_workspace_dir_if_empty(&empty);
+        assert!(!empty.exists(), "empty dir is removed");
+
+        let full = root.0.join("full-ws");
+        std::fs::create_dir_all(full.join("repo")).unwrap();
+        crate::remove_workspace_dir_if_empty(&full);
+        assert!(full.join("repo").exists(), "non-empty dir is never deleted");
+
+        // Missing dir: best-effort no-op, no panic.
+        crate::remove_workspace_dir_if_empty(&root.0.join("missing-ws"));
+    }
+
     /// cowIsolation off keeps `workspace.duplicate` on the linked-worktree
     /// path, persisting `checkoutMode: "worktree"`.
     #[tokio::test]
