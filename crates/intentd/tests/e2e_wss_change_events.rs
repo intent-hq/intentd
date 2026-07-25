@@ -2062,3 +2062,115 @@ async fn comment_respond_author_type_round_trips_over_wss() {
     .await;
     assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
 }
+
+/// Wait up to `secs` for the next `subscription.push` notification on `ws`;
+/// ignore other frames (heartbeats, unrelated notifications). Returns the
+/// `params` sub-object (`{ subscriptionId, kind, seq, snapshot|delta }`).
+async fn next_subscription_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for subscription.push"
+        );
+        let next = timeout(remaining, ws.next())
+            .await
+            .expect("timeout elapsed");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = match serde_json::from_str(&text) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                if v["method"] == json!("subscription.push") {
+                    return v["params"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// End-to-end (intent-hq/monorepo#775): the `workspace.subscribe` seq-0
+/// snapshot over WSS includes archived workspaces with their `Archived`
+/// status — matching the deltas, which upsert archived workspaces. Mirrors
+/// the UDS assertion in
+/// `uds_channel_subscriptions::workspace_channel_snapshot_then_updated_delta`;
+/// the channel logic is transport-shared, but the WSS wire path (§3.3
+/// `subscription.push` after the `{ subscriptionId }` response on the same
+/// connection) is the contract production clients drive.
+#[tokio::test]
+async fn workspace_subscribe_snapshot_includes_archived_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Seed one active and one archived workspace off UDS so the WSS side
+    // drives only the subscribe.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Active WS", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let active_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("active workspace id")
+        .to_string();
+    let create = uds_rpc(
+        &socket,
+        3,
+        "workspace.create",
+        json!({ "title": "Archived WS", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let archived_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("archived workspace id")
+        .to_string();
+    uds_rpc(
+        &socket,
+        4,
+        "workspace.archive",
+        json!({ "workspaceId": archived_id }),
+    )
+    .await;
+
+    // Subscribe over WSS. The workspace channel is global (no `workspaceId`
+    // param): `{ subscriptionId }` response first, then the seq-0 snapshot
+    // push on the same connection (§3.4 ordering).
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(&mut sub, 1, "workspace.subscribe", json!({})).await;
+    let sub_id = sub_res["subscriptionId"]
+        .as_str()
+        .expect("subscriptionId")
+        .to_string();
+
+    let push = next_subscription_push(&mut sub, 10).await;
+    assert_eq!(push["subscriptionId"], sub_id.as_str(), "push: {push}");
+    assert_eq!(push["kind"], json!("snapshot"), "push: {push}");
+    assert_eq!(push["seq"], json!(0), "push: {push}");
+    let snap = push["snapshot"].as_array().expect("snapshot array");
+    let active = snap
+        .iter()
+        .find(|e| e["id"] == json!(active_id))
+        .expect("active workspace in snapshot");
+    assert_eq!(active["status"], json!("Active"), "active: {active}");
+    let archived = snap
+        .iter()
+        .find(|e| e["id"] == json!(archived_id))
+        .expect("archived workspace in snapshot (intent-hq/monorepo#775)");
+    assert_eq!(
+        archived["status"],
+        json!("Archived"),
+        "snapshot includes archived workspaces with their status: {archived}"
+    );
+}
