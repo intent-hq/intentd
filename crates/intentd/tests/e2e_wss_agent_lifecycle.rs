@@ -699,7 +699,10 @@ async fn mock_agent_full_turn_over_wss_with_session_mcp_servers() {
 /// created session persists the legacy `AgentStatus::Idle` (wire form
 /// `"Idle"`) for reference parity with `agent-factory.ts:435`; end-of-turn
 /// then rewrites to `AgentStatus::RuntimeIdle` (wire form `"idle"`).
-/// Co-emitted with `agent:idle` at turn end.
+/// Co-emitted with `agent:idle` at turn end. The `agent:idle` payload also
+/// carries `isBackground` from the session row: `false` for this normal
+/// (foreground) agent, and `true` for a second agent created with
+/// `isBackground: true`.
 #[tokio::test]
 async fn agent_session_status_persists_idle_active_idle_over_wss() {
     let Some(script) = gate("WSS status-lifecycle E2E") else {
@@ -787,7 +790,7 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
     // releases the in-flight slot via `end_turn`, so we keep draining events
     // until both transitions are observed.
     let mut transitions: Vec<(String, bool)> = Vec::new();
-    let mut saw_idle = false;
+    let mut idle_payload: Option<Value> = None;
     for _ in 0..160 {
         let frame = wss_event(&mut sub, 30).await;
         let ev = &frame["params"]["event"];
@@ -803,17 +806,23 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
                 transitions.push((s, active));
             }
             Some("agent:idle") if ev["data"]["agentId"].as_str() == Some(agent_id.as_str()) => {
-                saw_idle = true;
+                idle_payload = Some(ev["data"].clone());
             }
             _ => {}
         }
-        if saw_idle && transitions.contains(&("idle".to_string(), false)) {
+        if idle_payload.is_some() && transitions.contains(&("idle".to_string(), false)) {
             break;
         }
     }
-    assert!(
-        saw_idle,
-        "terminal agent:idle emitted at turn end (transitions so far: {transitions:?})"
+    let idle = idle_payload.expect(
+        "terminal agent:idle emitted at turn end (no idle observed within the event window)",
+    );
+    // The idle payload carries `isBackground` from the session row — `false`
+    // for a normal (foreground) agent.
+    assert_eq!(
+        idle["isBackground"],
+        json!(false),
+        "agent:idle carries isBackground=false for a foreground agent: {idle}"
     );
     assert!(
         transitions.contains(&("active".to_string(), true)),
@@ -839,6 +848,56 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
     assert_eq!(
         post["agent"]["isActive"], false,
         "agent_session.is_active cleared after turn: {post}"
+    );
+
+    // Background counterpart: an agent created with `isBackground: true`
+    // (G-A1/P3-1.2c) must emit its terminal `agent:idle` with
+    // `isBackground: true` so subscribers (e.g. notification routing) can
+    // branch without a follow-up `agent.get`.
+    let bg_created = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id,
+            "name": "WSS-Status-BG",
+            "model": "mock:default",
+            "isBackground": true,
+        }),
+    )
+    .await;
+    let bg_agent_id = bg_created["agent"]["id"]
+        .as_str()
+        .expect("background agent id")
+        .to_string();
+    let bg_sent = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": bg_agent_id, "content": "drive a turn" }),
+    )
+    .await;
+    assert_eq!(
+        bg_sent["success"], true,
+        "background sendMessage ok: {bg_sent}"
+    );
+
+    let mut bg_idle_payload: Option<Value> = None;
+    for _ in 0..160 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:idle"
+            && ev["data"]["agentId"].as_str() == Some(bg_agent_id.as_str())
+        {
+            bg_idle_payload = Some(ev["data"].clone());
+            break;
+        }
+    }
+    let bg_idle = bg_idle_payload.expect("background agent emitted terminal agent:idle");
+    assert_eq!(
+        bg_idle["isBackground"],
+        json!(true),
+        "agent:idle carries isBackground=true for a background agent: {bg_idle}"
     );
 }
 

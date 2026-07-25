@@ -2323,10 +2323,12 @@ impl AgentManager {
                     "reason": "interrupted",
                     "status": "idle",
                 });
-                // Enrich with agentName + completion report (reuse the session
-                // loaded earlier in this method; avoids duplicate I/O).
+                // Enrich with agentName + isBackground + completion report
+                // (reuse the session loaded earlier in this method; avoids
+                // duplicate I/O).
                 if let Some(ref session) = session {
                     data["agentName"] = json!(session.name);
+                    data["isBackground"] = json!(session.is_background);
                     if let Some(ref report) = session.completion_report {
                         data["report"] = json!(report);
                     }

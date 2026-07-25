@@ -2187,6 +2187,18 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
         types.contains(&"agent:idle"),
         "STAB-28: interrupt NOW emits agent:idle when queue is empty (got {types:?})"
     );
+    // The synthetic idle carries the session enrichment — `isBackground`
+    // reflects the session row's flag (`false` for this foreground agent).
+    let idle = events
+        .iter()
+        .find(|e| e.event_type == "agent:idle")
+        .expect("agent:idle event");
+    assert_eq!(
+        idle.data["isBackground"],
+        json!(false),
+        "interrupt-path agent:idle carries isBackground (got {:?})",
+        idle.data
+    );
     // The interrupt terminal is distinguishable from a normal turn end: it
     // carries `stopReason: "interrupted"`. No live-turn slot existed here, so
     // no interrupted row was persisted and `messageId` is absent.
