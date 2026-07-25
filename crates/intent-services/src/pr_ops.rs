@@ -171,7 +171,7 @@ pub(crate) fn pr_matches_branch(pr: &PullRequest, branch: &str) -> bool {
 /// Port of the FE `baseref-matching.ts::matchesBaseRef` (§7.6): true when a
 /// PR's `source_branch` matches the workspace's `baseRef`. Raw equality always
 /// wins (covers plain branches and slashed local branches alike); when
-/// `base_ref` starts with a known remote from [`crate::CANONICAL_BASE_REF_REMOTES`]
+/// `base_ref` starts with a known remote from [`intent_git::refs::CANONICAL_BASE_REF_REMOTES`]
 /// the stripped remainder is also compared — defensive, covering legacy rows
 /// persisted before write-side canonicalisation. First path segments outside
 /// the allowlist are NOT stripped (`feature/foo` never matches `foo`);

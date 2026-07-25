@@ -153,6 +153,32 @@ fn map_worktree_add_err(e: git2::Error, branch: &str) -> Error {
     }
 }
 
+/// Whether `base_ref` resolves in the repository at `repo_path`, using the
+/// exact 3-spec resolution [`provision_worktree`] applies at apply time
+/// (`refs/remotes/{remote}/{r}` → `refs/heads/{r}` → any rev-parsable spec),
+/// so propose-time and apply-time agree on what "resolvable" means. An empty
+/// `base_ref` is `Ok(true)`: [`provision_worktree`] treats it as "no baseRef"
+/// and falls back to HEAD, never an unresolvable ref. Read-only probe backing
+/// the best-effort base-ref validation of chief workspace-create proposals
+/// (monorepo#761).
+pub fn base_ref_resolves(repo_path: &Path, base_ref: &str, remote: &str) -> Result<bool> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    if base_ref.is_empty() {
+        return Ok(true);
+    }
+    let r = base_ref;
+    let resolves = [
+        format!("refs/remotes/{remote}/{r}"),
+        format!("refs/heads/{r}"),
+        r.to_string(),
+    ]
+    .iter()
+    .find_map(|spec| repo.revparse_single(spec).ok())
+    .and_then(|obj| obj.peel_to_commit().ok())
+    .is_some();
+    Ok(resolves)
+}
+
 /// The branch checked out in the worktree at `worktree_path` (ports the
 /// `git rev-parse --abbrev-ref HEAD` probe in `removeGitWorktree`). `None` on
 /// a detached HEAD or when the worktree cannot be opened (the TS flow treats
@@ -387,6 +413,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidParams(_)));
+    }
+
+    #[test]
+    fn base_ref_resolves_uses_provision_spec_order() {
+        let dir = init_repo("wt-resolves");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap();
+        let branch = head.shorthand().expect("branch name").to_string();
+        let sha = head.target().unwrap().to_string();
+
+        // Local branch, raw SHA, and a remote-tracking-only ref all resolve.
+        assert!(base_ref_resolves(dir.path(), &branch, "origin").unwrap());
+        assert!(base_ref_resolves(dir.path(), &sha, "origin").unwrap());
+        repo.reference(
+            "refs/remotes/origin/remote-only",
+            head.target().unwrap(),
+            false,
+            "test",
+        )
+        .unwrap();
+        assert!(base_ref_resolves(dir.path(), "remote-only", "origin").unwrap());
+
+        // Missing ref → Ok(false); unopenable repo path → Err.
+        assert!(!base_ref_resolves(dir.path(), "no-such-ref", "origin").unwrap());
+        assert!(base_ref_resolves(Path::new("/no/such/repo"), "main", "origin").is_err());
+
+        // Empty base_ref → Ok(true): provision_worktree treats it as "no
+        // baseRef" and uses HEAD, never an unresolvable ref.
+        assert!(base_ref_resolves(dir.path(), "", "origin").unwrap());
     }
 
     #[test]
