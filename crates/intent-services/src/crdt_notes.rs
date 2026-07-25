@@ -56,9 +56,11 @@ impl CrdtNoteManager {
     }
 
     /// Lock the session map, recovering from poisoning. The map is a
-    /// session-only cache of best-effort merge state (never persisted), so a
-    /// panic while holding the lock cannot leave it logically corrupt in a way
-    /// that matters — worst case a session re-seeds from disk on next touch.
+    /// session-only cache of best-effort merge state (never persisted). A
+    /// panic inside `apply_full_content` can leave a session entry behind with
+    /// a partially-committed transaction, but that state self-heals on the
+    /// next full-content write: `apply_diff` diffs against whatever the doc
+    /// currently holds and converges it to the incoming content.
     fn lock_sessions(&self) -> MutexGuard<'_, HashMap<(WorkspaceId, NoteId), Session>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -175,6 +177,12 @@ fn seed_doc(doc: &Doc, content: &str) {
 /// exactly — and to keep `yrs::Text::insert` / `remove_range` from panicking
 /// when the requested offset does not land on a UTF-16 boundary — we walk
 /// both sides as `u16` code units too.
+///
+/// Trim boundaries can land inside a surrogate pair when the old and new code
+/// points share one half of the pair (monorepo#730), e.g. U+1F600
+/// `[0xD83D, 0xDE00]` → U+1F601 `[0xD83D, 0xDE01]` share the high surrogate.
+/// Both boundaries are backed off to the nearest pair boundary so the deleted
+/// range and the inserted middle segment are always well-formed UTF-16.
 fn apply_diff(txn: &mut TransactionMut<'_>, text: &yrs::TextRef, current: &str, target: &str) {
     let cur: Vec<u16> = current.encode_utf16().collect();
     let tgt: Vec<u16> = target.encode_utf16().collect();
@@ -182,6 +190,12 @@ fn apply_diff(txn: &mut TransactionMut<'_>, text: &yrs::TextRef, current: &str, 
     let mut prefix = 0;
     while prefix < cur.len() && prefix < tgt.len() && cur[prefix] == tgt[prefix] {
         prefix += 1;
+    }
+    // Back off if the prefix trim stopped between the halves of a surrogate
+    // pair: the matched unit before the boundary is a high surrogate whose low
+    // surrogate differs between the two sides.
+    if prefix > 0 && is_high_surrogate(cur[prefix - 1]) {
+        prefix -= 1;
     }
 
     let mut suffix = 0;
@@ -191,6 +205,11 @@ fn apply_diff(txn: &mut TransactionMut<'_>, text: &yrs::TextRef, current: &str, 
     {
         suffix += 1;
     }
+    // Symmetric back-off: the first retained suffix unit is a low surrogate
+    // whose high surrogate differs between the two sides.
+    if suffix > 0 && is_low_surrogate(cur[cur.len() - suffix]) {
+        suffix -= 1;
+    }
 
     let delete_len = cur.len() - prefix - suffix;
     let insert_slice = &tgt[prefix..tgt.len() - suffix];
@@ -199,13 +218,23 @@ fn apply_diff(txn: &mut TransactionMut<'_>, text: &yrs::TextRef, current: &str, 
         text.remove_range(txn, prefix as u32, delete_len as u32);
     }
     if !insert_slice.is_empty() {
-        // `encode_utf16` always yields well-formed pairs, and slicing between
-        // matched prefix/suffix boundaries preserves surrogate pairs, so
+        // `encode_utf16` always yields well-formed pairs, and the surrogate
+        // back-offs above move both trim boundaries to pair boundaries, so
         // `from_utf16` on the middle segment is safe.
         let insert_text = String::from_utf16(insert_slice)
-            .expect("utf-16 middle segment is well-formed by construction");
+            .expect("utf-16 middle segment is well-formed after surrogate back-off");
         text.insert(txn, prefix as u32, &insert_text);
     }
+}
+
+/// True for the leading (high) half of a UTF-16 surrogate pair.
+fn is_high_surrogate(unit: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&unit)
+}
+
+/// True for the trailing (low) half of a UTF-16 surrogate pair.
+fn is_low_surrogate(unit: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&unit)
 }
 
 #[cfg(test)]
@@ -352,6 +381,65 @@ mod tests {
         let after_suffix =
             mgr.apply_full_content(&ws, &note, after_prefix.as_str(), "héllo! 🌍 世界 end");
         assert_eq!(after_suffix, "héllo! 🌍 世界 end");
+    }
+
+    #[test]
+    fn surrogate_pair_edit_sharing_high_surrogate() {
+        // Regression (monorepo#730): U+1F600 [0xD83D, 0xDE00] → U+1F601
+        // [0xD83D, 0xDE01] share the high surrogate, so the prefix trim used
+        // to stop mid-pair and `apply_diff` panicked on a lone low surrogate.
+        let grinning = "\u{1F600}";
+        let beaming = "\u{1F601}";
+        let g: Vec<u16> = grinning.encode_utf16().collect();
+        let b: Vec<u16> = beaming.encode_utf16().collect();
+        assert_eq!(g[0], b[0], "test pair must share the high surrogate");
+        assert_ne!(g[1], b[1], "test pair must differ in the low surrogate");
+
+        let mgr = CrdtNoteManager::new();
+        let (ws, note) = ids();
+        mgr.apply_full_content(&ws, &note, grinning, grinning);
+        let after = mgr.apply_full_content(&ws, &note, grinning, beaming);
+        assert_eq!(after, beaming);
+    }
+
+    #[test]
+    fn surrogate_pair_edit_sharing_low_surrogate() {
+        // Regression (monorepo#730), symmetric case: U+1F600 [0xD83D, 0xDE00]
+        // → U+1FA00 [0xD83E, 0xDE00] share the low surrogate, so the suffix
+        // trim used to stop mid-pair and `apply_diff` panicked on a lone high
+        // surrogate.
+        let grinning = "\u{1F600}";
+        let chess = "\u{1FA00}";
+        let g: Vec<u16> = grinning.encode_utf16().collect();
+        let c: Vec<u16> = chess.encode_utf16().collect();
+        assert_ne!(g[0], c[0], "test pair must differ in the high surrogate");
+        assert_eq!(g[1], c[1], "test pair must share the low surrogate");
+
+        let mgr = CrdtNoteManager::new();
+        let (ws, note) = ids();
+        mgr.apply_full_content(&ws, &note, grinning, grinning);
+        let after = mgr.apply_full_content(&ws, &note, grinning, chess);
+        assert_eq!(after, chess);
+    }
+
+    #[test]
+    fn surrogate_pair_edits_in_mixed_content() {
+        // Regression (monorepo#730): pair-splitting emoji edits embedded in
+        // longer mixed content (ASCII + CJK + emoji) round-trip correctly.
+        let mgr = CrdtNoteManager::new();
+        let (ws, note) = ids();
+        let base = "notes 世界 \u{1F600} tail 🌍";
+        mgr.apply_full_content(&ws, &note, base, base);
+
+        // Shared-high-surrogate swap in the middle of the string.
+        let step_1 = "notes 世界 \u{1F601} tail 🌍";
+        let after_1 = mgr.apply_full_content(&ws, &note, base, step_1);
+        assert_eq!(after_1, step_1);
+
+        // Shared-low-surrogate swap plus a trailing ASCII edit.
+        let step_2 = "notes 世界 \u{1FA00} tail 🌍!";
+        let after_2 = mgr.apply_full_content(&ws, &note, step_1, step_2);
+        assert_eq!(after_2, step_2);
     }
 
     #[test]
