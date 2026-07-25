@@ -26,6 +26,11 @@
 //!   (mock ACP provider → `workspace_api` tool → service registry → wake
 //!   delivery), plus the non-chief gating error — see the three
 //!   `*_waitfor_*` tests at the bottom of this file.
+//! - `ws.workspace.archive` / `ws.workspace.unarchive` (#733): the regular-
+//!   workspace roundtrip through the real MCP bridge (tool result shapes,
+//!   `details()` reflecting the status flip, `workspace:updated` deltas over
+//!   a live subscription) and the chief-workspace binding-layer refusal —
+//!   see the two `*_archive_*` tests at the bottom of this file.
 
 #![cfg(unix)]
 
@@ -1743,4 +1748,283 @@ async fn non_chief_waitfor_gated_over_wss() {
         json!([]),
         "no groups for the gated caller: {resp}"
     );
+}
+
+/// `ws.workspace.archive()` / `.unarchive()` end-to-end over the real WSS
+/// wire (#733): a regular-workspace agent drives archive → details →
+/// unarchive → details through the real MCP bridge (mock ACP provider →
+/// `workspace_api` tool → binding dispatch → services → store), and the
+/// existing service emitters publish `workspace:updated` with the applied
+/// `{ archived }` delta over a live WSS subscription.
+///
+/// Asserts:
+/// - the archive tool result is `{ ok: true, status: "Archived", archivedAt }`
+///   and `ws.workspace.details()` reflects `Archived`,
+/// - the unarchive tool result is `{ ok: true, status: "Active" }` and a
+///   follow-up `details()` reflects `Active`,
+/// - `workspace:updated` fires twice on the workspace — `archived: true`
+///   then `archived: false` — without any binding-layer re-emit,
+/// - `workspace.get` over the wire agrees with the persisted flip both ways.
+#[tokio::test]
+async fn workspace_archive_unarchive_bridge_over_wss() {
+    let Some(script) = gate("WSS ws.workspace.archive E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "const archived = await ws.workspace.archive();\n\
+              const afterArchive = await ws.workspace.details();\n\
+              const unarchived = await ws.workspace.unarchive();\n\
+              const afterUnarchive = await ws.workspace.details();\n\
+              return { archived, afterArchive, unarchived, afterUnarchive };";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "ARCHIVE_ROUNDTRIP",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "archive roundtrip e2e" },
+            },
+            "response": "archive roundtrip done",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    let (ws_id, agent_id) = seed_target(&mut rpc, 2, "Archive WS", "Archiver").await;
+
+    // Live `workspace:updated` subscription BEFORE the turn: the service
+    // emitters (not the binding) publish the `{ archived }` deltas.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let resp = wss_rpc_envelope(
+        &mut sub,
+        4,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        resp["result"]["subscriptionId"].is_string(),
+        "events.subscribe failed: {resp}"
+    );
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "user asked: ARCHIVE_ROUNDTRIP this workspace",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    // The persisted tool result carries all four stages of the roundtrip.
+    let roundtrip = poll_conversation(&mut rpc, 300, &agent_id, "archive roundtrip result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v.get("archived").is_some() && v.get("afterUnarchive").is_some())
+    })
+    .await;
+    let archived = &roundtrip["archived"];
+    assert_eq!(archived["ok"], json!(true), "archive ok: {archived}");
+    assert_eq!(archived["status"], json!("Archived"), "{archived}");
+    assert!(archived["archivedAt"].is_string(), "archivedAt: {archived}");
+    assert_eq!(
+        roundtrip["afterArchive"]["status"],
+        json!("Archived"),
+        "details after archive: {roundtrip}"
+    );
+    let unarchived = &roundtrip["unarchived"];
+    assert_eq!(unarchived["ok"], json!(true), "unarchive ok: {unarchived}");
+    assert_eq!(unarchived["status"], json!("Active"), "{unarchived}");
+    assert_eq!(
+        roundtrip["afterUnarchive"]["status"],
+        json!("Active"),
+        "details after unarchive: {roundtrip}"
+    );
+
+    // The service emitters published both `{ archived }` deltas in order
+    // over the live WSS subscription. Other `workspace:updated` frames
+    // (e.g. `lastActivity` deltas from the agent turn) may interleave, so
+    // skip until the archived-change frames arrive.
+    let mut archived_deltas = Vec::new();
+    while archived_deltas.len() < 2 {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        assert_eq!(ev["type"], json!("workspace:updated"), "{ev}");
+        assert_eq!(ev["workspaceId"], json!(ws_id), "{ev}");
+        if let Some(a) = ev["data"]["changes"]["archived"].as_bool() {
+            archived_deltas.push(a);
+        }
+    }
+    assert_eq!(
+        archived_deltas,
+        vec![true, false],
+        "archive then unarchive deltas in order"
+    );
+
+    // The persisted row agrees with the final state on the wire.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "workspace.get",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let w = &resp["result"]["workspace"];
+    assert_eq!(w["status"], json!("Active"), "final status: {w}");
+    assert_eq!(w["archived"], json!(false), "final archived flag: {w}");
+
+    let _ = wss_rpc_envelope(&mut rpc, 200, "agent.stop", json!({ "agentId": agent_id })).await;
+}
+
+/// Chief-workspace gate for `ws.workspace.archive` / `.unarchive` over the
+/// real WSS wire (#733): a `__chief__` agent attempting either method
+/// receives the explicit binding-layer refusal through the MCP tool result —
+/// NOT the silent service-layer no-op that would look like success — and the
+/// Chief row keeps its synthesized non-archived shape.
+#[tokio::test]
+async fn chief_workspace_archive_gated_over_wss() {
+    let Some(script) = gate("WSS chief archive gating E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let js = "const out = {};\n\
+              try { out.archive = { ok: true, result: await ws.workspace.archive() }; }\n\
+              catch (e) { out.archive = { ok: false, error: e.message }; }\n\
+              try { out.unarchive = { ok: true, result: await ws.workspace.unarchive() }; }\n\
+              catch (e) { out.unarchive = { ok: false, error: e.message }; }\n\
+              return out;";
+    let behavior = json!({
+        "response": "ok",
+        "rules": [{
+            "ifPromptContains": "TRY_ARCHIVE",
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": js, "summary": "chief archive gating e2e" },
+            },
+            "response": "gating checked",
+            "emitToolBlocks": true,
+        }],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut rpc = connect_ws(port, cfg).await;
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "name": "Chief Archiver",
+            "model": "mock:default",
+        }),
+    )
+    .await;
+    let agent_id = resp["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": CHIEF_WORKSPACE_ID,
+            "agentId": agent_id,
+            "content": "TRY_ARCHIVE from the chief workspace",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["success"],
+        json!(true),
+        "sendMessage: {resp}"
+    );
+
+    let gate_result = poll_conversation(&mut rpc, 300, &agent_id, "gating tool result", |m| {
+        tool_result_jsons(m)
+            .into_iter()
+            .rev()
+            .find(|v| v.get("archive").is_some() && v.get("unarchive").is_some())
+    })
+    .await;
+    for method in ["archive", "unarchive"] {
+        let outcome = &gate_result[method];
+        assert_eq!(
+            outcome["ok"],
+            json!(false),
+            "chief {method} must be refused: {outcome}"
+        );
+        let msg = outcome["error"].as_str().expect("error string");
+        assert!(
+            msg.contains("chief-of-staff"),
+            "clear chief-gating error for {method}, got: {msg}"
+        );
+    }
+
+    // Chief keeps its synthesized non-archived shape.
+    let resp = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "workspace.get",
+        json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+    )
+    .await;
+    let chief = &resp["result"]["workspace"];
+    assert_eq!(chief["archived"], json!(false), "{chief}");
+    assert_eq!(chief["status"], json!("Active"), "{chief}");
+
+    let _ = wss_rpc_envelope(&mut rpc, 200, "agent.stop", json!({ "agentId": agent_id })).await;
 }

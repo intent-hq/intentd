@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use intent_core::{
-    AgentId, Error, WorkspaceApi, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    AgentId, AgentStatus, Error, WorkspaceApi, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
     WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
 };
 use serde_json::{json, Value};
@@ -26,6 +26,8 @@ pub(crate) const PRELUDE: &str = r#"
         setStatusMessage: (statusMessage) =>
             host({ method: 'workspace.setStatusMessage', args: { statusMessage } }),
         setAgentName: (name) => host({ method: 'workspace.setAgentName', args: { name } }),
+        archive: () => host({ method: 'workspace.archive' }),
+        unarchive: () => host({ method: 'workspace.unarchive' }),
         context: () => host({ method: 'workspace.context' }),
         timeline: (limit, type) =>
             host({ method: 'workspace.timeline', args: { limit, type } }),
@@ -49,6 +51,8 @@ pub(crate) async fn dispatch(
         "setTitle" => set_title(api, ws, args).await,
         "setStatusMessage" => set_status_message(api, ws, args).await,
         "setAgentName" => set_agent_name(api, caller_agent_id, args).await,
+        "archive" => archive(api, ws, caller_agent_id).await,
+        "unarchive" => unarchive(api, ws).await,
         "context" => {
             Err("ws.workspace.context is not yet available in this daemon port".to_string())
         }
@@ -206,4 +210,72 @@ async fn set_agent_name(
         .await
         .map_err(map_err)?;
     Ok(r)
+}
+
+/// The chief workspace is virtual and cannot be archived/unarchived. The
+/// service methods silently no-op for chief (they return the synthesized
+/// `chief_workspace()` unchanged), which would misleadingly look like
+/// success to the agent — so the refusal lives here in the binding layer.
+fn chief_guard(ws: &WorkspaceId, method: &str) -> Result<(), String> {
+    if ws.is_chief() {
+        return Err(format!(
+            "ws.workspace.{method} is not available in the chief-of-staff workspace"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an [`intent_core::AgentLite`] projection counts as running/queued
+/// for the archive guardrail: the daemon-owned in-flight signal
+/// (`is_responding`) or a persisted in-flight/queued status. `RuntimeIdle`,
+/// `Idle`, `Completed`, `Error`, and `Deleted` sessions do not block.
+fn is_running_or_queued(agent: &intent_core::AgentLite) -> bool {
+    agent.is_responding
+        || matches!(
+            agent.status,
+            AgentStatus::Pending
+                | AgentStatus::Active
+                | AgentStatus::Processing
+                | AgentStatus::Waiting
+        )
+}
+
+async fn archive(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+) -> Result<Value, String> {
+    chief_guard(ws, "archive")?;
+    // Hard refusal when OTHER agents are running/queued — no force override.
+    // The calling agent is necessarily mid-turn, so it is excluded.
+    let agents = api.agent_list(ws.clone()).await.map_err(map_err)?;
+    let blocking: Vec<String> = agents
+        .iter()
+        .filter(|a| Some(&a.id) != caller_agent_id)
+        .filter(|a| is_running_or_queued(a))
+        .map(|a| format!("{} ({})", a.name, a.id.as_str()))
+        .collect();
+    if !blocking.is_empty() {
+        return Err(format!(
+            "Cannot archive: {} other agent(s) running or queued in this workspace: {}. \
+             Wait for them to finish or stop them first.",
+            blocking.len(),
+            blocking.join(", ")
+        ));
+    }
+    let updated = api.archive_workspace(ws.clone()).await.map_err(map_err)?;
+    Ok(json!({
+        "ok": true,
+        "status": updated.status,
+        "archivedAt": updated.archived_at,
+    }))
+}
+
+async fn unarchive(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
+    chief_guard(ws, "unarchive")?;
+    let updated = api.unarchive_workspace(ws.clone()).await.map_err(map_err)?;
+    Ok(json!({
+        "ok": true,
+        "status": updated.status,
+    }))
 }
