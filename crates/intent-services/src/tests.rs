@@ -12257,8 +12257,9 @@ mod worktree_provisioning {
         assert!(store.list_workspaces(true).await.expect("list").is_empty());
         assert!(
             std::fs::read_dir(&root.0)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true),
+                .expect("read workspaces root")
+                .next()
+                .is_none(),
             "workspaces root must have no leftover empty <root>/<wsId> dir"
         );
     }
@@ -12268,6 +12269,13 @@ mod worktree_provisioning {
     /// a worktree), and the empty `<root>/<wsId>` dir the probe created is
     /// removed on the error path — the dir only reappears via the metadata
     /// write, carrying `.workspace/workspace.json` (never left empty).
+    ///
+    /// Note: because that (best-effort) metadata write recreates the dir
+    /// either way, the end state here is identical with or without the
+    /// cleanup — this is a characterization test of the swallowed-error
+    /// flow, not a mutation-killing regression test. The #774 regression
+    /// coverage lives in the create-path test above and the
+    /// `remove_workspace_dir_if_empty` unit test below.
     #[tokio::test]
     async fn duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails() {
         let tmp = TempDb::new();
