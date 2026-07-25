@@ -35,6 +35,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
@@ -625,5 +626,91 @@ async fn e2e_idle_session_reaping() {
     .await
     .unwrap_or(false);
     assert!(reaped, "idle agent was not reaped by the TTL sweep");
+    drop(daemon);
+}
+
+/// One-time auto_vacuum activation at startup (monorepo#720 finding 1): boot a
+/// REAL `intentd serve` on a pre-seeded legacy database in `auto_vacuum = NONE`
+/// mode and assert the daemon serves normally while the startup VACUUM has
+/// converted the file to incremental mode, so retention-loop
+/// `incremental_vacuum` calls can release freelist pages from then on.
+#[tokio::test]
+async fn e2e_auto_vacuum_activation_on_legacy_db() {
+    let data_dir = temp_data_dir();
+    let db_path = data_dir.join("intentd.db");
+
+    // Pre-seed the legacy database with a raw connection that does NOT apply
+    // the auto_vacuum pragma (SQLite defaults to NONE); seed + delete bulky
+    // rows so the startup VACUUM has real work to do.
+    {
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("open legacy pool");
+        sqlx::query("CREATE TABLE filler (id INTEGER PRIMARY KEY, data BLOB)")
+            .execute(&pool)
+            .await
+            .expect("create filler");
+        for i in 0..16i64 {
+            sqlx::query("INSERT INTO filler (id, data) VALUES (?, zeroblob(65536))")
+                .bind(i)
+                .execute(&pool)
+                .await
+                .expect("insert filler");
+        }
+        sqlx::query("DELETE FROM filler")
+            .execute(&pool)
+            .await
+            .expect("delete filler");
+        let mode: i64 = sqlx::query("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await
+            .expect("query auto_vacuum")
+            .get(0);
+        assert_eq!(mode, 0, "pre-seeded DB should be in NONE mode");
+        pool.close().await;
+    }
+
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "uds", &[]),
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(
+        await_uds(&socket).await,
+        "daemon did not start (see {}/daemon.log)",
+        data_dir.display()
+    );
+
+    // The daemon serves normally on the converted database.
+    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    assert_eq!(status["result"]["running"], true, "status: {status}");
+
+    // The startup activation converted the file to incremental mode. The UDS
+    // only accepts after the activation ran (it happens before any listener
+    // serves), so no polling is needed. Query through a separate plain
+    // connection so the daemon's own pragma-carrying pools are not involved.
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .busy_timeout(Duration::from_millis(5000));
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .expect("open probe pool");
+    let mode: i64 = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(&pool)
+        .await
+        .expect("query auto_vacuum")
+        .get(0);
+    assert_eq!(
+        mode, 2,
+        "startup should have activated auto_vacuum=INCREMENTAL"
+    );
+    pool.close().await;
     drop(daemon);
 }
