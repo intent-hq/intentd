@@ -145,6 +145,14 @@ impl Store {
     /// that intermittently fails with SQLITE_BUSY (code 5). With
     /// `max_connections=1` on the write pool, concurrent recomputes serialize
     /// at `pool.acquire()` instead.
+    ///
+    /// Trade-off: the in-transaction row read (`fetch_agent_usage_rows`)
+    /// hydrates full `agent_message` logs for legacy sessions with neither a
+    /// snapshot nor a baseline, and that work happens while holding the
+    /// daemon's sole write connection and the SQLite write lock. The
+    /// snapshot/baseline hydration skip keeps the common case cheap; a
+    /// workspace of snapshot-less long-history sessions pays the cost on
+    /// every recompute until its sessions report usage once.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,

@@ -305,6 +305,10 @@ pub struct Services {
     /// clones so the [`AgentManager`]'s turn writer and the `WorkspaceApi` chat
     /// read door observe the same state; populated only while a turn streams.
     live_turns: agent_session::LiveTurns,
+    /// Per-agent chain of detached turn-end usage-bookkeeping tasks
+    /// (monorepo#738): see [`agent_session::TurnBookkeeping`]. Shared across
+    /// clones so consecutive turns of one agent chain onto the same handle.
+    turn_bookkeeping: agent_session::TurnBookkeeping,
     /// Test-only override for [`WorkspaceApi::agent_is_busy`]: lets unit/UDS
     /// tests simulate an in-flight worker without spawning a real
     /// [`AgentManager`]. Production composition always attaches a manager and
@@ -454,6 +458,7 @@ impl Services {
             mcp_hub: Arc::new(McpHub::new()),
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
+            turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
@@ -1992,6 +1997,10 @@ impl Services {
         let Some(usage) = written else {
             return Ok(false);
         };
+        // Post-commit publish: commits serialize at the write pool but these
+        // publishes can interleave, so a subscriber may briefly observe the
+        // events out of commit order. Each event still carries a committed
+        // snapshot and the next event/scan converges (pre-existing).
         publish_event(
             &self.event_bus,
             token_usage_changed_event(workspace_id, &usage),

@@ -1382,3 +1382,90 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
     assert_eq!(usage.totals.input_tokens, 70);
     assert_eq!(usage.by_agent_id[&agent_id.0].input_tokens, 70);
 }
+
+/// Cross-turn bookkeeping ordering (monorepo#738): detached turn-end
+/// bookkeeping tasks for one agent are CHAINED — each awaits its predecessor
+/// — so a delayed task from turn N can neither skew turn N+1's usage-stats
+/// delta nor overwrite its newer cumulative snapshot. Seed the chain with a
+/// slow predecessor that lands the prior turn's snapshot (70 input tokens)
+/// late; the next turn (cumulative 100) must wait for it, record a stats
+/// delta of 30 (not a double-counting 100) into `usage_stats_hourly`, and
+/// leave its own newer snapshot in place.
+#[tokio::test]
+async fn detached_bookkeeping_chains_per_agent_across_turns() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with_prompt_result(
+        prompt_updates(),
+        json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "totalTokens": 100,
+                "inputTokens": 100,
+                "outputTokens": 0,
+                "cachedReadTokens": 0,
+                "cachedWriteTokens": 0
+            }
+        }),
+    );
+
+    // Seed the per-agent chain with a slow "previous turn" bookkeeping task
+    // that persists the earlier cumulative snapshot late.
+    let store = bus.store().clone();
+    let prev_agent = agent_id.clone();
+    let prev_ws = workspace_id.clone();
+    let prev = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = intent_core::TokenUsageTotals {
+            input_tokens: 70,
+            ..Default::default()
+        };
+        store
+            .set_agent_session_token_usage(&prev_ws, &prev_agent, &snapshot)
+            .await
+            .expect("late snapshot persists");
+    });
+    services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .insert(agent_id.clone(), prev);
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+        )
+        .await
+        .expect("turn completes");
+
+    // Await the chained bookkeeping task the turn registered.
+    let handle = services
+        .turn_bookkeeping
+        .lock()
+        .unwrap()
+        .remove(&agent_id)
+        .expect("turn registered a bookkeeping task");
+    handle.await.expect("bookkeeping task completes");
+
+    // The turn's newer snapshot survives — the late predecessor did not win.
+    let (_model, snapshot) = bus
+        .store()
+        .get_agent_session_token_usage(&workspace_id, &agent_id)
+        .await
+        .expect("read snapshot");
+    assert_eq!(snapshot.expect("snapshot persisted").input_tokens, 100);
+
+    // The stats delta was computed against the predecessor's snapshot
+    // (100 - 70 = 30), not the pre-chain state (a double-counting 100).
+    let rows = bus
+        .store()
+        .list_usage_stats_hourly()
+        .await
+        .expect("stats rows");
+    let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+    assert_eq!(input, 30);
+}
