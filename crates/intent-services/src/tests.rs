@@ -10559,7 +10559,7 @@ mod rules {
             agent_summary: None,
             diff_summary: None,
             token_usage: None,
-            cow_supported: None, // Not computed for worktree mode
+            cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
         };
 
         let agent_session = intent_core::AgentSession {

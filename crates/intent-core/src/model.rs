@@ -185,9 +185,10 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
-    /// Whether CoW agent isolation is supported for this workspace. Computed as:
-    /// direct mode AND git repo AND cow_probe(userDir, workspacesRoot) Supported.
-    /// Used by the FE to gate the "Use Copy-on-Write for Agent Isolation" toggle.
+    /// Whether CoW isolation is supported for this workspace. Computed as:
+    /// git repo AND cow_probe(repoPath, workspacesRoot) Supported — a
+    /// machine/filesystem capability, independent of checkout mode. Used by
+    /// the FE to gate the Copy-on-Write opt-in toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cow_supported: Option<bool>,
 }

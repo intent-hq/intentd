@@ -885,7 +885,8 @@ impl Services {
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
-        // Compute cow_supported (Task 5): direct mode + git repo + CoW probe Supported.
+        // Compute cow_supported: git repo + CoW probe Supported. Reports
+        // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported(ws).await;
     }
 
@@ -1041,17 +1042,15 @@ impl Services {
         Ok(())
     }
 
-    /// Compute whether CoW agent isolation is supported for this workspace (Task 5).
-    /// Returns Some(true) if direct mode + git repo + CoW probe Supported; Some(false)
-    /// if worktree mode or unsupported filesystem; None if probe fails. The live
-    /// probe is offloaded to the blocking pool and cached per
-    /// `(repository_path, workspaces_root)` pair by the shared aggregate cache.
+    /// Compute whether CoW isolation is supported for this workspace. Reports
+    /// machine/filesystem capability for any repo-backed workspace regardless
+    /// of checkout mode (the FE uses it to gate the CoW opt-in toggle, which
+    /// affects newly created workspaces). Returns Some(true) if git repo +
+    /// CoW probe Supported; Some(false) on an unsupported filesystem; None if
+    /// the probe cannot run. The live probe is offloaded to the blocking pool
+    /// and cached per `(repository_path, workspaces_root)` pair by the shared
+    /// aggregate cache.
     async fn compute_cow_supported(&self, ws: &Workspace) -> Option<bool> {
-        // Only direct-mode workspaces
-        let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
-        if !is_direct_mode {
-            return Some(false);
-        }
         // Must have a repository path
         let repo_path = ws.repository_path.as_ref()?;
         // Must have workspaces root
