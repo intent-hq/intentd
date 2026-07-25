@@ -19,13 +19,13 @@
 //!   omits the aggregate — the wire shape keeps both fields optional. The
 //!   detached computation still finishes and fills the cache, so a subsequent
 //!   poll picks the value up.
-//! - **CoW probe cache**: `cowSupported` is invariant per
-//!   `(repository_path, workspaces_root)` pair, so successful probes are
-//!   cached for the daemon's lifetime (over-budget probes finish detached and
-//!   backfill the cache; failed probes are not cached so a later call
-//!   retries). Live probes are serialized because concurrent probes into the
-//!   same `workspaces_root` would collide on the shared `.cow_probe_temp`
-//!   file now that enrichment fans out in parallel.
+//! - **CoW probe cache**: `cowSupported` is invariant per workspaces root
+//!   (it is a machine capability of the root's filesystem), so successful
+//!   probes are cached for the daemon's lifetime (over-budget probes finish
+//!   detached and backfill the cache; failed probes are not cached so a
+//!   later call retries). Live probes are serialized because concurrent
+//!   probes into the same `workspaces_root` would collide on the shared
+//!   `.cow_probe_temp` file now that enrichment fans out in parallel.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -71,13 +71,12 @@ pub(crate) struct WorkspaceAggregateCache {
     diff_in_flight: Arc<Mutex<HashSet<String>>>,
     /// Bounds concurrent blocking rollups.
     gate: tokio::sync::Semaphore,
-    /// CoW support per `(repository_path, workspaces_root)` pair. This is a
-    /// second layer over `intent_git::cow_probe`'s own process-wide cache: a
-    /// hit here skips the `tokio::spawn` + probe-gate + `spawn_blocking`
-    /// round-trip entirely.
-    cow: Mutex<HashMap<(String, PathBuf), bool>>,
-    /// Pairs with a probe currently in flight (single-flight guard).
-    cow_in_flight: Arc<Mutex<HashSet<(String, PathBuf)>>>,
+    /// CoW support per workspaces root. This is a second layer over
+    /// `intent_git::cow_probe`'s own process-wide cache: a hit here skips the
+    /// `tokio::spawn` + probe-gate + `spawn_blocking` round-trip entirely.
+    cow: Mutex<HashMap<PathBuf, bool>>,
+    /// Roots with a probe currently in flight (single-flight guard).
+    cow_in_flight: Arc<Mutex<HashSet<PathBuf>>>,
     /// Serializes live CoW probes (shared `.cow_probe_temp` collision guard).
     cow_probe_gate: tokio::sync::Mutex<()>,
     ttl: Duration,

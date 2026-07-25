@@ -77,6 +77,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 
@@ -3811,6 +3812,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     diff_summary: None,
                     token_usage: None,
                     cow_supported: None,
+                    checkout_mode: None,
                 };
                 store.insert_workspace(&workspace).await
             })

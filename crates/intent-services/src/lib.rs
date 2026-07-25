@@ -7146,6 +7146,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         let settings_branch_prefix = settings::branch_prefix(&self.effective_settings());
+        let cow_isolation = self.effective_settings().workspace.cow_isolation;
         Box::pin(async move {
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
@@ -7424,15 +7425,21 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                         cow_supported: None,
+                        checkout_mode: None,
                     };
-                    // Provision the git worktree (TS `createGitWorktree` parity):
-                    // a local workspace created off a local git repo gets a
-                    // linked worktree at `<root>/<workspaceId>/<repo-slug>` on
+                    // Provision the workspace checkout (TS `createGitWorktree`
+                    // parity): a local workspace created off a local git repo
+                    // gets a checkout at `<root>/<workspaceId>/<repo-slug>` on
                     // its branch, so agents spawn inside a real checkout instead
-                    // of falling back to a temp dir. Skipped for remote/
-                    // `skipWorktree` workspaces, callers supplying their own
-                    // `worktreePath`, and repository paths that are not a local
-                    // git repo (registry-only rows keep the prior behavior).
+                    // of falling back to a temp dir. When `workspace.cowIsolation`
+                    // is on, the checkout is a standalone CoW clone of the repo
+                    // dir (deps/build artifacts carried over) instead of a
+                    // linked worktree — and an Unsupported/failed probe fails
+                    // the create outright (no silent worktree fallback).
+                    // Skipped for remote/`skipWorktree` workspaces, callers
+                    // supplying their own `worktreePath`, and repository paths
+                    // that are not a local git repo (registry-only rows keep
+                    // the prior behavior).
                     let has_worktree = ws
                         .worktree_path
                         .as_deref()
@@ -7450,9 +7457,9 @@ impl WorkspaceApi for Services {
                                     ws.repository_name.as_deref(),
                                     &repo_dir.to_string_lossy(),
                                 );
-                                let wt_path = workspaces_root_pathbuf
-                                    .join(&ws.id.0)
-                                    .join(worktree_folder_slug(&repo_name));
+                                let ws_dir = workspaces_root_pathbuf.join(&ws.id.0);
+                                let wt_path =
+                                    ws_dir.join(worktree_folder_slug(&repo_name));
                                 let name = ws.id.0.clone();
                                 let branch = ws.branch.clone();
                                 let base_ref = ws.base_ref.clone();
@@ -7460,28 +7467,79 @@ impl WorkspaceApi for Services {
                                     input.remote.unwrap_or_else(|| "origin".to_string());
                                 let repo = repo_dir.clone();
                                 let wt = wt_path.clone();
+                                let mode = if cow_isolation {
+                                    // CoW probe: repo dir → `<root>/<wsId>` (the
+                                    // clone's parent). Unsupported or a probe
+                                    // error fails the create with an actionable
+                                    // message — no silent worktree fallback.
+                                    std::fs::create_dir_all(&ws_dir).map_err(|e| {
+                                        Error::Internal(format!(
+                                            "cannot create workspace dir for CoW probe: {e}"
+                                        ))
+                                    })?;
+                                    let probe_repo = repo_dir.clone();
+                                    let probe_dst = ws_dir.clone();
+                                    let support = tokio::task::spawn_blocking(move || {
+                                        intent_git::cow_probe(&probe_repo, &probe_dst)
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        Error::Internal(format!(
+                                            "CoW probe task failed: {e}"
+                                        ))
+                                    })?;
+                                    match support {
+                                        Ok(intent_git::CowSupport::Supported) => {
+                                            intent_core::CheckoutMode::Cow
+                                        }
+                                        Ok(intent_git::CowSupport::Unsupported)
+                                        | Err(_) => {
+                                            // Remove the just-created (empty)
+                                            // `<root>/<wsId>` dir so no partial
+                                            // checkout is left behind.
+                                            let _ = std::fs::remove_dir(&ws_dir);
+                                            return Err(Error::Unsupported(
+                                                "CoW isolation is enabled but the filesystem does not support CoW cloning — disable workspace.cowIsolation or move the workspaces root to a supported filesystem".to_string(),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    intent_core::CheckoutMode::Worktree
+                                };
                                 let sha = worktree_locks
                                     .with_lock(&repo_dir, move || async move {
-                                        tokio::task::spawn_blocking(move || {
-                                            intent_git::worktree::provision_worktree(
-                                                &repo,
-                                                &name,
-                                                &wt,
-                                                &branch,
-                                                base_ref.as_deref(),
-                                                &remote,
-                                            )
+                                        tokio::task::spawn_blocking(move || match mode {
+                                            intent_core::CheckoutMode::Cow => {
+                                                intent_git::cow_checkout::provision_cow_checkout(
+                                                    &repo,
+                                                    &wt,
+                                                    &branch,
+                                                    base_ref.as_deref(),
+                                                    &remote,
+                                                )
+                                            }
+                                            intent_core::CheckoutMode::Worktree => {
+                                                intent_git::worktree::provision_worktree(
+                                                    &repo,
+                                                    &name,
+                                                    &wt,
+                                                    &branch,
+                                                    base_ref.as_deref(),
+                                                    &remote,
+                                                )
+                                            }
                                         })
                                         .await
                                         .map_err(|e| {
                                             Error::Internal(format!(
-                                                "worktree provisioning task failed: {e}"
+                                                "checkout provisioning task failed: {e}"
                                             ))
                                         })?
                                     })
                                     .await?;
                                 ws.worktree_path =
                                     Some(wt_path.to_string_lossy().to_string());
+                                ws.checkout_mode = Some(mode);
                                 if ws.base_commit_sha.is_none() {
                                     ws.base_commit_sha = Some(sha);
                                 }
@@ -8613,6 +8671,7 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                checkout_mode: None,
             };
             // Provision the git worktree for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`

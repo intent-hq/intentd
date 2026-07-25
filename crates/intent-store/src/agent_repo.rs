@@ -1429,6 +1429,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store
             .insert_workspace(&workspace)
@@ -2214,6 +2215,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store
             .insert_workspace(&workspace)
@@ -2341,6 +2343,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store
             .insert_workspace(&workspace)
@@ -2421,6 +2424,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store
             .insert_workspace(&workspace)
@@ -2560,6 +2564,7 @@ mod tests {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                checkout_mode: None,
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -2702,6 +2707,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store.insert_workspace(&workspace).await.expect("insert");
 

@@ -19,6 +19,7 @@ pub mod branches;
 pub mod commit;
 pub mod conflicts;
 pub mod cow;
+pub mod cow_checkout;
 pub mod diff;
 pub mod fetch;
 pub mod history;

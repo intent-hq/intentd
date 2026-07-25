@@ -191,6 +191,23 @@ pub struct Workspace {
     /// the FE to gate the Copy-on-Write opt-in toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cow_supported: Option<bool>,
+    /// How the workspace checkout was provisioned by `workspace.create` (§5.1):
+    /// `worktree` (linked git worktree) or `cow` (standalone copy-on-write
+    /// clone). Omitted for rows without a daemon-provisioned checkout
+    /// (`skipWorktree`, remote, caller-supplied `worktreePath`, non-git repo
+    /// paths, pre-existing rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_mode: Option<CheckoutMode>,
+}
+
+/// Provisioning mode of a workspace checkout (`Workspace.checkoutMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckoutMode {
+    /// Linked git worktree of the source repository.
+    Worktree,
+    /// Standalone copy-on-write clone of the source repository directory.
+    Cow,
 }
 
 /// Fixed timestamp for the synthetic Chief workspace (TS
@@ -242,6 +259,7 @@ pub fn chief_workspace() -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 
@@ -2786,6 +2804,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");

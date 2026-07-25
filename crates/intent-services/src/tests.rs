@@ -140,6 +140,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 
@@ -10319,6 +10320,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            checkout_mode: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -10444,6 +10446,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            checkout_mode: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -10560,6 +10563,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
+            checkout_mode: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -10671,6 +10675,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
+            checkout_mode: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -10781,6 +10786,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
+            checkout_mode: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -10896,6 +10902,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+            checkout_mode: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -11460,6 +11467,7 @@ mod known_repo {
             agent_summary: None,
             diff_summary: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -11643,6 +11651,206 @@ mod worktree_provisioning {
             ws.branch.as_str()
         );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "cowIsolation off provisions a worktree checkout"
+        );
+    }
+
+    /// Build Services with the `workspace.cowIsolation` setting applied.
+    fn services_with_cow_isolation(
+        store: Store,
+        root: PathBuf,
+        enabled: bool,
+    ) -> (Services, tempfile::TempDir) {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.cowIsolation".to_string(),
+                serde_json::json!(enabled),
+            )])
+            .expect("set cowIsolation");
+        let svc = Services::new(store)
+            .with_workspaces_root(root)
+            .with_settings_registry(registry);
+        (svc, config_dir)
+    }
+
+    /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
+    /// standalone CoW clone (not a linked worktree) checked out on the
+    /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
+    /// populated, `checkoutMode: "cow"` persisted, and untracked source files
+    /// carried over.
+    #[tokio::test]
+    async fn create_provisions_cow_checkout_when_isolation_enabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, head_sha, head_branch) = seed_repo("intentd-cowprov-repo");
+        // Untracked build artifact in the source repo — CoW carries it over.
+        std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
+        let root = unique_dir("intentd-cowprov-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    repository_name: Some("My Repo".to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let wt = ws.worktree_path.as_deref().expect("worktree path set");
+        assert_eq!(
+            wt,
+            root.0
+                .join(&ws.id.0)
+                .join("my-repo")
+                .to_string_lossy()
+                .as_ref(),
+            "CoW checkout lives at <root>/<workspaceId>/<repo-slug>"
+        );
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Cow));
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "CoW checkout is a standalone repo");
+        assert_eq!(
+            clone.head().unwrap().shorthand().expect("branch name"),
+            ws.branch.as_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(wt).join("untracked.log")).unwrap(),
+            "artifact\n",
+            "untracked source files are carried into the CoW checkout"
+        );
+        // checkout_mode round-trips through the store.
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow)
+        );
+    }
+
+    /// cowIsolation on + CoW-incapable filesystem: `workspace.create` fails
+    /// with the actionable error and leaves no workspace row or partial
+    /// checkout behind (no silent worktree fallback). Runs only where the
+    /// probe reports Unsupported (the inverse of the test above).
+    #[tokio::test]
+    async fn create_fails_when_isolation_enabled_but_cow_unsupported() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowunsup-repo");
+        let root = unique_dir("intentd-cowunsup-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            == intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW is supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string().contains("workspace.cowIsolation"),
+            "error names the setting: {err}"
+        );
+        // No workspace row and no partial checkout left behind.
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(
+            std::fs::read_dir(&root.0)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "workspaces root has no partial checkout"
+        );
+    }
+
+    /// cowIsolation off keeps worktree behavior even on CoW-capable
+    /// filesystems, persisting `checkoutMode: "worktree"`.
+    #[tokio::test]
+    async fn create_provisions_worktree_when_isolation_disabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowoff-repo");
+        let root = unique_dir("intentd-cowoff-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), false);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+        let wt_repo =
+            git2::Repository::open(ws.worktree_path.as_deref().unwrap()).expect("worktree opens");
+        assert!(wt_repo.is_worktree(), "setting off keeps a linked worktree");
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree)
+        );
+    }
+
+    /// `skipWorktree` keeps `checkoutMode` unset even with cowIsolation on —
+    /// no checkout is provisioned, so there is no mode to record.
+    #[tokio::test]
+    async fn create_skip_worktree_leaves_checkout_mode_unset_with_isolation_on() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowskip-repo");
+        let root = unique_dir("intentd-cowskip-root");
+        let (svc, _config) = services_with_cow_isolation(store, root.0.clone(), true);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    skip_worktree: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(ws.worktree_path.is_none());
+        assert!(ws.checkout_mode.is_none());
     }
 
     /// Assert a `word-word` slug branch, optionally with a `-N` collision

@@ -1,8 +1,8 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, Error, PullRequestInfo, Result, SetupScript, TokenUsage, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus, CHIEF_WORKSPACE_ID,
+    now_iso, CheckoutMode, Error, PullRequestInfo, Result, SetupScript, TokenUsage, Workspace,
+    WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -13,14 +13,14 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     status_message, attention, path, repository_path, repository_owner, repository_name, \
     worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, \
     active_pull_request, pull_requests, archived, archived_at, tags, created_at, updated_at, \
-    last_activity, token_usage, setup_script";
+    last_activity, token_usage, setup_script, checkout_mode";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -53,6 +53,7 @@ impl Store {
             .bind(&ws.last_activity)
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
+            .bind(checkout_mode_to_db(ws)?)
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
@@ -82,7 +83,7 @@ impl Store {
              repository_name=?, worktree_path=?, scope=?, skip_worktree=?, is_remote=?, \
              default_model=?, pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, \
              pull_requests=?, archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, \
-             last_activity=?, token_usage=?, setup_script=? \
+             last_activity=?, token_usage=?, setup_script=?, checkout_mode=? \
              WHERE id=?",
         )
         .bind(&ws.title)
@@ -114,6 +115,7 @@ impl Store {
         .bind(&ws.last_activity)
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
+        .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
         .execute(self.write_pool())
         .await
@@ -339,6 +341,11 @@ fn setup_script_from_db(s: Option<String>) -> Result<Option<SetupScript>> {
     .transpose()
 }
 
+/// Encode the optional `checkout_mode` enum to a TEXT column (§5.1).
+fn checkout_mode_to_db(ws: &Workspace) -> Result<Option<String>> {
+    ws.checkout_mode.as_ref().map(enum_to_db).transpose()
+}
+
 fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let pr_number: Option<i64> = col(row, "pr_number")?;
     let pr_status = col::<Option<String>>(row, "pr_status")?
@@ -349,6 +356,9 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
     let pull_requests = pull_requests_from_db(col::<Option<String>>(row, "pull_requests")?)?;
     let token_usage = token_usage_from_db(col::<Option<String>>(row, "token_usage")?)?;
     let setup_script = setup_script_from_db(col::<Option<String>>(row, "setup_script")?)?;
+    let checkout_mode = col::<Option<String>>(row, "checkout_mode")?
+        .map(|s| enum_from_db::<CheckoutMode>(&s))
+        .transpose()?;
     Ok(Workspace {
         id: WorkspaceId(col(row, "id")?),
         title: col(row, "title")?,
@@ -389,5 +399,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         token_usage,
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,
+        checkout_mode,
     })
 }

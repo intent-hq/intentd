@@ -5210,6 +5210,7 @@ mod role_reminder_tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
         }
     }
 
@@ -6168,6 +6169,7 @@ mod agent_retry_tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            checkout_mode: None,
             task_stats: None,
         }
     }
