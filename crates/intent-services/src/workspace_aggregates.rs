@@ -257,7 +257,16 @@ impl WorkspaceAggregateCache {
             }
             let started = Instant::now();
             let root = key.clone();
-            match tokio::task::spawn_blocking(move || intent_git::cow_probe(&root, &root)).await {
+            // A fresh configured `workspaces.root` may not exist yet; the
+            // probe needs the directory to write its temp file into.
+            match tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&root).map_err(|e| {
+                    intent_core::Error::Internal(format!("create workspaces root: {e}"))
+                })?;
+                intent_git::cow_probe(&root, &root)
+            })
+            .await
+            {
                 Ok(Ok(support)) => {
                     let supported = matches!(support, intent_git::CowSupport::Supported);
                     cache.cow.lock().unwrap().insert(key, supported);
@@ -544,5 +553,18 @@ mod tests {
         assert_eq!(cache.cow.lock().unwrap().len(), 1);
         let second = cache.cow_supported(root.clone()).await;
         assert_eq!(first, second);
+    }
+
+    /// A fresh configured `workspaces.root` may not exist on disk yet; the
+    /// probe must create it rather than omit `cowSupported`.
+    #[tokio::test]
+    async fn cow_supported_creates_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-yet-created").join("workspaces");
+        assert!(!root.exists());
+        let cache = Arc::new(WorkspaceAggregateCache::new());
+        let result = cache.cow_supported(root.clone()).await;
+        assert!(result.is_some(), "probe should create the missing root");
+        assert!(root.exists());
     }
 }

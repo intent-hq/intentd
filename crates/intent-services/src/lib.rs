@@ -7527,10 +7527,11 @@ impl WorkspaceApi for Services {
                                         }
                                         Ok(intent_git::CowSupport::Unsupported)
                                         | Err(_) => {
-                                            // Remove the just-created (empty)
-                                            // `<root>/<wsId>` dir so no partial
+                                            // Remove the just-created
+                                            // `<root>/<wsId>` dir (including any
+                                            // probe temp files) so no partial
                                             // checkout is left behind.
-                                            let _ = std::fs::remove_dir(&ws_dir);
+                                            let _ = std::fs::remove_dir_all(&ws_dir);
                                             return Err(Error::Unsupported(
                                                 "CoW isolation is enabled but the filesystem does not support CoW cloning — disable workspace.cowIsolation or move the workspaces root to a supported filesystem".to_string(),
                                             ));
@@ -8762,10 +8763,10 @@ impl WorkspaceApi for Services {
                         match support {
                             Ok(intent_git::CowSupport::Supported) => intent_core::CheckoutMode::Cow,
                             Ok(intent_git::CowSupport::Unsupported) | Err(_) => {
-                                // Remove the just-created (empty)
-                                // `<root>/<wsId>` dir so no partial checkout
-                                // is left behind.
-                                let _ = std::fs::remove_dir(&ws_dir);
+                                // Remove the just-created `<root>/<wsId>` dir
+                                // (including any probe temp files) so no
+                                // partial checkout is left behind.
+                                let _ = std::fs::remove_dir_all(&ws_dir);
                                 return Err(Error::Unsupported(
                                     "CoW isolation is enabled but the filesystem does not support CoW cloning — disable workspace.cowIsolation or move the workspaces root to a supported filesystem".to_string(),
                                 ));
