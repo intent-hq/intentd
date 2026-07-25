@@ -1,6 +1,13 @@
 //! Supervisor loop: run the installed daemon, keep it updated, babysit it.
 //!
-//! Lifecycle:
+//! Only a `serve` invocation ever talks to the updater. One-shot subcommands
+//! (`status`, `stop`, `doctor`, `call`, …, including empty args) have zero
+//! updater side effects — no manifest fetch, no `state.json` write, no prune:
+//! they run the installed `state.current_version` directly, and when nothing
+//! is installed they exit non-zero with guidance to run `intentd serve` (or
+//! `brew services start intentd`) so the daemon gets installed.
+//!
+//! `serve` lifecycle:
 //!
 //! 1. startup update check (fail-fast): on success run the manifest version;
 //!    on failure fall back to `state.current_version`; nothing installed AND
@@ -189,42 +196,74 @@ struct Supervisor {
 
 impl Supervisor {
     async fn supervise(self) -> i32 {
-        // Startup check: always runs, regardless of the persisted schedule.
-        let startup = self.check().await;
-        let mut next_check_at = self.schedule_next_check();
-        let mut current_version = match startup {
-            Ok(UpdateOutcome::Installed { version, previous }) => {
-                match previous {
-                    Some(previous) => {
-                        eprintln!("intentd-sitter: updated intentd {previous} -> {version}")
+        // Only a long-running `serve` child is babysat (startup + periodic
+        // update checks, crash respawn, mid-run update restarts). One-shot
+        // subcommands never touch the updater: they run the installed
+        // version exactly once and their exit status passes through.
+        let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
+
+        let (mut current_version, mut next_check_at) = if supervised {
+            // Startup check: always runs, regardless of the persisted schedule.
+            let startup = self.check().await;
+            let next_check_at = self.schedule_next_check();
+            let version = match startup {
+                Ok(UpdateOutcome::Installed { version, previous }) => {
+                    match previous {
+                        Some(previous) => {
+                            eprintln!("intentd-sitter: updated intentd {previous} -> {version}")
+                        }
+                        None => eprintln!("intentd-sitter: installed intentd {version}"),
                     }
-                    None => eprintln!("intentd-sitter: installed intentd {version}"),
+                    version
                 }
-                version
-            }
-            Ok(UpdateOutcome::AlreadyCurrent { version }) => version,
-            Err(e) => {
-                eprintln!("intentd-sitter: update check failed: {e}");
-                let state = state::load(&self.paths.state_path);
-                match state
-                    .current_version
-                    .filter(|v| self.paths.daemon_binary(v).exists())
-                {
-                    Some(version) => {
-                        eprintln!("intentd-sitter: falling back to installed intentd {version}");
-                        version
-                    }
-                    None => {
-                        eprintln!(
-                            "intentd-sitter: no intentd daemon is installed for channel {} \
-                             and the update check failed; cannot start (check network access \
-                             and retry)",
-                            self.channel
-                        );
-                        return 1;
+                Ok(UpdateOutcome::AlreadyCurrent { version }) => version,
+                Err(e) => {
+                    eprintln!("intentd-sitter: update check failed: {e}");
+                    let state = state::load(&self.paths.state_path);
+                    match state
+                        .current_version
+                        .filter(|v| self.paths.daemon_binary(v).exists())
+                    {
+                        Some(version) => {
+                            eprintln!(
+                                "intentd-sitter: falling back to installed intentd {version}"
+                            );
+                            version
+                        }
+                        None => {
+                            eprintln!(
+                                "intentd-sitter: no intentd daemon is installed for channel {} \
+                                 and the update check failed; cannot start (check network access \
+                                 and retry)",
+                                self.channel
+                            );
+                            return 1;
+                        }
                     }
                 }
-            }
+            };
+            (version, next_check_at)
+        } else {
+            // One-shot: resolve the installed version with no updater
+            // activity (no manifest fetch, no state.json write, no prune).
+            let state = state::load(&self.paths.state_path);
+            let version = match state
+                .current_version
+                .filter(|v| self.paths.daemon_binary(v).exists())
+            {
+                Some(version) => version,
+                None => {
+                    eprintln!(
+                        "intentd-sitter: no intentd daemon is installed for channel {}; \
+                         start the daemon first (`intentd serve` or \
+                         `brew services start intentd`) so it gets installed",
+                        self.channel
+                    );
+                    return 1;
+                }
+            };
+            // Never polled: the periodic-check select arm is serve-only.
+            (version, Instant::now())
         };
 
         let mut signals = match Signals::new() {
@@ -235,10 +274,6 @@ impl Supervisor {
             }
         };
         let mut backoff = self.config.backoff_initial;
-        // Only a long-running `serve` child is babysat (crash respawn and
-        // mid-run update restarts); one-shot subcommands run exactly once
-        // and their exit status passes through.
-        let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
 
         loop {
             let binary = self.paths.daemon_binary(&current_version);

@@ -1,9 +1,11 @@
 //! intentd-sitter binary entry point.
 //!
 //! Parses the sitter-owned `--sitter-*` flags, resolves the data-dir/state
-//! layout, and hands off to [`intentd_sitter::supervisor`]: startup update
-//! check, spawn the installed daemon with all forwarded args verbatim, keep
-//! it updated on the randomized 12–24h cadence, and babysit crashes.
+//! layout, and hands off to [`intentd_sitter::supervisor`]. For `serve`:
+//! startup update check, spawn the installed daemon with all forwarded args
+//! verbatim, keep it updated on the randomized 12–24h cadence, and babysit
+//! crashes. One-shot subcommands run the installed daemon exactly once with
+//! no updater activity.
 
 use intentd_sitter::cli::{self, SitterArgs};
 use intentd_sitter::manifest;
