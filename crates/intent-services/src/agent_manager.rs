@@ -2150,7 +2150,7 @@ impl AgentManager {
         }
         if let Some(live) = partial_turn {
             self.services
-                .flush_partial_turn_on_interruption(agent_id, live)
+                .flush_partial_turn_on_interruption(agent_id, live, false)
                 .await;
         }
         // Drop any pending recreate/prepend flags: the next spawn re-decides
@@ -2224,19 +2224,23 @@ impl AgentManager {
             worker.abort();
         }
         // Persist the streamed-so-far assistant content as an interrupted
-        // assistant row (no-op for empty blocks, so the STAB-114 zero-output
-        // requeue in `interrupt_send_message` never sees a phantom row). Runs
-        // AFTER the abort (a worker append already in flight can still land,
-        // but the `agent_message.id` PK keeps the outcome convergent — the
-        // flush absorbs the UNIQUE collision) and BEFORE the terminal
-        // `agent:stream:end` emit below so the chat-channel terminal
-        // reconcile sees the persisted row and keeps the blocks instead of
-        // removing them.
-        if let Some(live) = partial_turn {
-            self.services
-                .flush_partial_turn_on_interruption(agent_id, live)
-                .await;
-        }
+        // assistant row. Runs AFTER the abort (a worker append already in
+        // flight can still land, but the `agent_message.id` PK keeps the
+        // outcome convergent — the flush absorbs the UNIQUE collision) and
+        // BEFORE the terminal `agent:stream:end` emit below so the
+        // chat-channel terminal reconcile sees the persisted row and keeps
+        // the blocks instead of removing them. Only the plain `agent.stop`
+        // path (`!suppress_idle_emit`) opts into persisting an EMPTY row for
+        // a pre-first-token stop — the STAB-114 zero-output requeue in
+        // `interrupt_send_message` must never see a phantom row.
+        let interrupted_message_id = match partial_turn {
+            Some(live) => {
+                self.services
+                    .flush_partial_turn_on_interruption(agent_id, live, !suppress_idle_emit)
+                    .await
+            }
+            None => None,
+        };
         // Cancel the current turn over the wire (keep-alive interrupt). The agent
         // resolves its in-flight `session/prompt` with `StopReason::Cancelled`;
         // best-effort — a wire error never blocks the stop.
@@ -2283,13 +2287,23 @@ impl AgentManager {
         self.registry.mark_idle(agent_id);
         // Emit the single terminal `agent:stream:end` on stop (parity #14): the
         // aborted worker's `run_prompt_turn` no longer reaches its own emit.
+        // Unlike the normal-completion emit, the interrupt terminal carries
+        // `stopReason: "interrupted"` (+ `messageId` when an interrupted row
+        // was persisted) so clients can render the Stopped indicator live.
         if let Some(workspace_id) = workspace_id {
+            let mut end_data = json!({
+                "agentId": agent_id.0,
+                "stopReason": "interrupted",
+            });
+            if let Some(ref message_id) = interrupted_message_id {
+                end_data["messageId"] = json!(message_id);
+            }
             self.services
                 .publish_agent_event(
                     &workspace_id,
                     agent_id,
                     intent_core::events::AGENT_STREAM_END,
-                    json!({ "agentId": agent_id.0 }),
+                    end_data,
                 )
                 .await;
             // STAB-28: emit agent:idle after interrupt so completion watches fire.
@@ -3494,7 +3508,7 @@ impl AgentManager {
             // degenerate status read/encode failure never drops the content.
             if let Some(live) = partial_turn {
                 self.services
-                    .flush_partial_turn_on_interruption(id, live)
+                    .flush_partial_turn_on_interruption(id, live, false)
                     .await;
             }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.

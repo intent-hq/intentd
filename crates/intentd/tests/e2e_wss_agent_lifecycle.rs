@@ -964,25 +964,60 @@ async fn agent_stop_keep_alive_resume_over_wss() {
         "mid-turn getConversation carries lastStreamActivityAt: {conv}"
     );
 
-    // Stop the agent mid-turn — interrupt (not kill); terminal stream:end fires.
+    // Stop the agent mid-turn — interrupt (not kill); terminal stream:end fires
+    // carrying `stopReason: "interrupted"` + the interrupted row's `messageId`
+    // (distinguishable from a normal turn end, which carries neither).
     let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
-    let mut saw_stop_end = false;
+    let mut interrupted_message_id = None;
     for _ in 0..50 {
         let frame = wss_event(&mut sub, 30).await;
         if frame["params"]["event"]["type"] == "agent:stream:end" {
+            let data = &frame["params"]["event"]["data"];
             assert_eq!(
-                frame["params"]["event"]["data"]["agentId"]
-                    .as_str()
-                    .unwrap_or_default(),
+                data["agentId"].as_str().unwrap_or_default(),
                 agent_id,
                 "terminal stream:end carries the agent id"
             );
-            saw_stop_end = true;
+            assert_eq!(
+                data["stopReason"], "interrupted",
+                "interrupt stream:end carries stopReason: {data}"
+            );
+            interrupted_message_id = Some(
+                data["messageId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("interrupt stream:end carries messageId: {data}"))
+                    .to_string(),
+            );
             break;
         }
     }
-    assert!(saw_stop_end, "terminal agent:stream:end emitted on stop");
+    let interrupted_message_id =
+        interrupted_message_id.expect("terminal agent:stream:end emitted on stop");
+
+    // The interrupted row persisted with `metadata.interrupted: true` under the
+    // messageId the event carried.
+    let conv = wss_rpc(
+        &mut rpc,
+        22,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"] == interrupted_message_id.as_str())
+        .unwrap_or_else(|| panic!("interrupted row persisted: {conv}"));
+    assert_eq!(
+        row["role"], "assistant",
+        "interrupted row is assistant: {row}"
+    );
+    assert_eq!(
+        row["metadata"]["interrupted"], true,
+        "interrupted row tagged metadata.interrupted: {row}"
+    );
 
     // Keep-alive: a follow-up resumes the SAME child (mock reports turn=2).
     let resumed = wss_rpc(
@@ -1009,6 +1044,11 @@ async fn agent_stop_keep_alive_resume_over_wss() {
                 }
             }
             Some("agent:stream:end") => {
+                // A NORMAL turn end stays `{ agentId }` — no stopReason.
+                assert!(
+                    frame["params"]["event"]["data"].get("stopReason").is_none(),
+                    "normal stream:end carries no stopReason: {frame}"
+                );
                 saw_resume_end = true;
                 break;
             }
@@ -6714,6 +6754,27 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
         saw_requeue,
         "STAB-114: original message should be re-queued after zero-output interrupt"
     );
+
+    // No phantom row: the zero-output interrupt-send must NOT persist an
+    // interrupted assistant row (contrast the plain `agent.stop` path, which
+    // persists an empty synthetic one — see
+    // `agent_stop_before_first_token_persists_empty_interrupted_row_over_wss`).
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let phantom = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["metadata"]["interrupted"] == true);
+    assert!(
+        phantom.is_none(),
+        "STAB-114: zero-output interrupt-send persists no interrupted assistant row: {conv}"
+    );
 }
 
 /// STAB-114 regression: When an interrupt lands AFTER streaming started, the
@@ -6822,6 +6883,145 @@ async fn stab_114_interrupt_after_streaming_no_requeue_over_wss() {
     assert!(
         messages.is_empty(),
         "STAB-114: interrupt after streaming should NOT re-queue"
+    );
+}
+
+/// Pre-first-token stop: a plain `agent.stop` landing after the turn started
+/// but BEFORE any assistant content streamed persists an EMPTY interrupted
+/// assistant row (explicit opt-in on the plain-stop path only), and the
+/// terminal `agent:stream:end` carries `stopReason: "interrupted"` plus the
+/// synthetic row's `messageId` so clients can render the Stopped indicator
+/// live. Contrast the STAB-114 interrupt-send path above, which keeps the
+/// zero-output no-op (no phantom row).
+#[tokio::test]
+async fn agent_stop_before_first_token_persists_empty_interrupted_row_over_wss() {
+    let Some(script) = gate("pre-first-token agent.stop E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    // parkBeforeFirstChunk parks immediately without streaming any chunks.
+    let behavior = json!({ "parkBeforeFirstChunk": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": &ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": &ws_id, "name": "PreToken", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": &ws_id, "agentId": &agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+
+    // Deterministic wait for phase="prompt": the live-turn slot opens (message
+    // id minted) immediately BEFORE this status emit, so once observed the
+    // turn has started — but nothing has streamed (the mock parks).
+    let mut saw_prompt_phase = false;
+    for _ in 0..50 {
+        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
+            if frame["params"]["event"]["type"] == "agent:stream:status"
+                && frame["params"]["event"]["data"]["phase"] == "prompt"
+            {
+                saw_prompt_phase = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_prompt_phase, "turn started (phase=prompt) before stop");
+
+    // Plain stop before the first token.
+    let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": &agent_id })).await;
+    assert_eq!(stopped["success"], true, "stop ok: {stopped}");
+
+    // Terminal stream:end carries stopReason + the synthetic row's messageId.
+    let mut interrupted_message_id = None;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:end" {
+            let data = &frame["params"]["event"]["data"];
+            assert_eq!(
+                data["stopReason"], "interrupted",
+                "pre-first-token stop stream:end carries stopReason: {data}"
+            );
+            interrupted_message_id = Some(
+                data["messageId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("stream:end carries messageId: {data}"))
+                    .to_string(),
+            );
+            break;
+        }
+    }
+    let interrupted_message_id =
+        interrupted_message_id.expect("terminal agent:stream:end emitted on stop");
+
+    // The transcript durably records the stop: an EMPTY assistant row under
+    // the event's messageId, tagged metadata.interrupted.
+    let conv = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getConversation",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let row = conv["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"] == interrupted_message_id.as_str())
+        .unwrap_or_else(|| panic!("empty synthetic interrupted row persisted: {conv}"));
+    assert_eq!(
+        row["role"], "assistant",
+        "synthetic row is assistant: {row}"
+    );
+    assert_eq!(
+        row["contentBlocks"],
+        json!([]),
+        "synthetic row has empty contentBlocks: {row}"
+    );
+    assert_eq!(
+        row["metadata"]["interrupted"], true,
+        "synthetic row tagged metadata.interrupted: {row}"
     );
 }
 
