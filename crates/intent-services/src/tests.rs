@@ -15439,6 +15439,77 @@ mod turn_token_usage {
         assert_eq!(usage.totals.output_tokens, 150);
     }
 
+    /// Reconciliation guard: a periodic scan whose recount comes out all-zero
+    /// (e.g. it raced a live update and read the session rows before the
+    /// turn's snapshot landed) never clobbers a fresher non-zero live tally —
+    /// while a later non-zero recount still applies normally.
+    #[tokio::test]
+    async fn scan_never_regresses_live_tally_to_zero() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+
+        // Simulate a fresher live update: the workspace tally is non-zero,
+        // but the session rows visible to the scan carry no snapshot and no
+        // message usage (an all-zero recount).
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load ws");
+        let mut live = intent_core::TokenUsage::default();
+        live.totals.input_tokens = 70;
+        live.totals.output_tokens = 50;
+        live.by_agent_id
+            .insert(agent.0.clone(), live.totals.clone());
+        live.by_model.insert("opus-4.8".into(), live.totals.clone());
+        live.last_scan_at = Some(now_iso());
+        ws.token_usage = Some(live);
+        h.store
+            .update_workspace(&ws)
+            .await
+            .expect("seed live tally");
+
+        let mut sub = subscribe_usage(&h);
+        let changed = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan ok");
+        assert!(!changed, "zero recount must not overwrite the live tally");
+        assert!(
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
+            "no event when the guard skips the write"
+        );
+        let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = reloaded.token_usage.as_ref().expect("live tally kept");
+        assert_eq!(usage.totals.input_tokens, 70);
+        assert_eq!(usage.totals.output_tokens, 50);
+
+        // A subsequent NON-zero recount is not blocked by the guard: new
+        // message usage moves the watermark and the scan reconciles to it.
+        h.store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 12, "outputTokens": 3 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append usage message");
+        let changed2 = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan 2 ok");
+        assert!(changed2, "non-zero recount reconciles normally");
+        let reconciled = h.store.get_workspace(&h.ws).await.expect("reload 2");
+        let usage2 = reconciled.token_usage.as_ref().expect("tally updated");
+        assert_eq!(usage2.totals.input_tokens, 12);
+        assert_eq!(usage2.totals.output_tokens, 3);
+    }
+
     /// A snapshot for a session that no longer exists is logged, not fatal:
     /// no panic, no workspace-tally write, no event.
     #[tokio::test]

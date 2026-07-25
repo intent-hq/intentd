@@ -1,11 +1,15 @@
 //! Token-usage tallying for the workspace `TokenUsage` snapshot (§5.23 / §19.1),
-//! shared by the daemon-internal periodic scan job and the end-of-turn live
-//! update.
+//! shared by the end-of-turn live update (primary) and the daemon-internal
+//! periodic reconciliation scan.
 //!
-//! The scan loop (in `lib.rs`, alongside the PR refresh loop) lists a workspace's
-//! agent sessions and rolls each session's per-turn token counters up into the
-//! durable `TokenUsage` workspace field surfaced by `workspace.getTokenUsage`.
-//! The aggregation here is pure and side-effect free so it is unit-testable
+//! **Live-primary / scan-reconciliation split**: the end-of-turn live update
+//! (`agent_session.rs`) persists each session's cumulative usage snapshot and
+//! re-aggregates immediately, so the workspace tally is fresh at every turn
+//! end. The 300 s scan loop (in `lib.rs`, alongside the PR refresh loop) is a
+//! reconciliation pass: per-session tallies prefer the stored snapshot when
+//! present ([`agent_token_tally`]) and fall back to legacy per-message usage
+//! summing only for sessions that never reported end-of-turn usage. The
+//! aggregation here is pure and side-effect free so it is unit-testable
 //! without a store or bus; only the read + `workspace:tokenUsage-changed` event
 //! cross the wire (the scan itself has no RPC, §6.8).
 
@@ -248,6 +252,34 @@ mod tests {
         // No snapshot → falls back to summing message usage.
         let fallback = agent_token_tally("agent-s", None, None, &contents);
         assert_eq!(fallback.totals, totals(999, 0, 0, 0));
+    }
+
+    #[test]
+    fn mixed_snapshot_and_fallback_sessions_aggregate_correctly() {
+        // One session with a persisted end-of-turn snapshot (its message
+        // usage must be ignored), one snapshot-less session that falls back
+        // to per-message summing.
+        let snap_contents = vec![serde_json::json!({ "usage": { "inputTokens": 500 } })];
+        let snapshot = totals(40, 30, 20, 10);
+        let legacy_contents = vec![
+            serde_json::json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } }),
+            serde_json::json!({ "_meta": { "usage": { "cacheReadTokens": 2 } } }),
+        ];
+        let tallies = vec![
+            agent_token_tally(
+                "agent-snap",
+                Some("opus-4.8"),
+                Some(&snapshot),
+                &snap_contents,
+            ),
+            agent_token_tally("agent-legacy", Some("sonnet-5"), None, &legacy_contents),
+        ];
+        let usage = aggregate_token_usage(&tallies);
+        assert_eq!(usage.by_agent_id["agent-snap"], totals(40, 30, 20, 10));
+        assert_eq!(usage.by_agent_id["agent-legacy"], totals(7, 3, 2, 0));
+        assert_eq!(usage.totals, totals(47, 33, 22, 10));
+        assert_eq!(usage.by_model["opus-4.8"], totals(40, 30, 20, 10));
+        assert_eq!(usage.by_model["sonnet-5"], totals(7, 3, 2, 0));
     }
 
     #[test]

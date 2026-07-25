@@ -932,7 +932,10 @@ impl Services {
             tracing::warn!(agent = %agent_id, error = %e, "persist turn token usage failed");
             return;
         }
-        if let Err(e) = self.recompute_workspace_token_usage(workspace_id).await {
+        if let Err(e) = self
+            .recompute_workspace_token_usage(workspace_id, false)
+            .await
+        {
             tracing::warn!(
                 workspace = %workspace_id.as_str(),
                 error = %e,
