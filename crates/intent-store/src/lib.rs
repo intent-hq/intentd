@@ -92,26 +92,38 @@ where
     Err(last_error.unwrap_or_else(|| Error::Internal("retry exhausted".to_string())))
 }
 
+/// Roll back the transaction open on `conn` after a failed statement or
+/// COMMIT (monorepo#680). If the ROLLBACK itself fails, detach the
+/// connection from the pool and close it so a potentially poisoned handle
+/// (open transaction + write lock on the sole write-pool connection,
+/// `max_connections=1`) is never reused — the pool opens a fresh
+/// replacement on demand.
+///
+/// Takes the connection by value: the transaction is over either way, and
+/// the detach path consumes it.
+pub(crate) async fn rollback_or_poison(mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+    use sqlx::Connection;
+    if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
+        let _ = conn.detach().close().await;
+    }
+}
+
 /// COMMIT the transaction open on `conn`, guarding against a failed COMMIT
 /// (monorepo#638 / #657 / #670): a failed COMMIT can leave the transaction
 /// open on the pooled connection, so roll back explicitly so the connection
-/// is not returned to the pool still holding the write lock. If the ROLLBACK
-/// fails too, detach the connection from the pool and close it so the
-/// poisoned handle is never reused (the pool opens a fresh replacement on
-/// demand). On failure returns `Error::Internal` with the message
+/// is not returned to the pool still holding the write lock (with
+/// detach+close on a failed ROLLBACK, via [`rollback_or_poison`]). On
+/// failure returns `Error::Internal` with the message
 /// `"{context}: {commit error}"`.
 ///
 /// Takes the connection by value: COMMIT must be the last statement of the
-/// raw `BEGIN IMMEDIATE` transaction, and the detach path consumes it.
+/// raw `BEGIN IMMEDIATE` transaction, and the rollback path consumes it.
 pub(crate) async fn commit_with_rollback_guard(
     mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
     context: &str,
 ) -> Result<()> {
-    use sqlx::Connection;
     if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
-        if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
-            let _ = conn.detach().close().await;
-        }
+        rollback_or_poison(conn).await;
         return Err(Error::Internal(format!("{context}: {e}")));
     }
     Ok(())

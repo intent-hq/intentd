@@ -271,8 +271,10 @@ impl Store {
                 Ok(rev)
             }
             Err(e) => {
-                // Best-effort rollback to avoid leaving connection with open transaction.
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                // Roll back the failed body; detach+close on a failed
+                // ROLLBACK so a poisoned connection is never returned to
+                // the pool (monorepo#680).
+                crate::rollback_or_poison(conn).await;
                 Err(e)
             }
         }
