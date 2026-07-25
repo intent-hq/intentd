@@ -1886,6 +1886,52 @@ async fn comment_add_duplicate_supplied_comment_id_is_invalid_params() {
     assert_eq!(note.content.matches("<!--anchor:").count(), 2);
 }
 
+/// An `idempotencyKey` replay carrying the same supplied `commentId` returns
+/// the cached result — the duplicate-id rejection must not fire because the
+/// replay short-circuits before the mutation body runs.
+#[tokio::test]
+async fn comment_add_idempotent_replay_with_same_supplied_comment_id_returns_cached() {
+    let (_tmp, svc, ws, id) = setup("alpha target-a omega").await;
+    let supplied = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let key = Some("replay-with-comment-id".to_string());
+    let first = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha target-a".into(),
+            "target-a".into(),
+            "first".into(),
+            None,
+            None,
+            None,
+            key.clone(),
+            Some(supplied.into()),
+        )
+        .await
+        .expect("first add");
+    assert_eq!(first.comment_id, supplied);
+    let second = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha target-a".into(),
+            "target-a".into(),
+            "first".into(),
+            None,
+            None,
+            None,
+            key,
+            Some(supplied.into()),
+        )
+        .await
+        .expect("replay must return the cached result, not a duplicate-id error");
+    assert_eq!(second.comment_id, supplied);
+    assert_eq!(second.note_rev, first.note_rev);
+    // Still exactly one set of markers — the replay did not re-anchor.
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert_eq!(note.content.matches("<!--anchor:").count(), 2);
+}
+
 /// Backward compatibility: omitting `commentId` keeps minting a fresh UUID.
 #[tokio::test]
 async fn comment_add_omitted_comment_id_mints_fresh_uuid() {
