@@ -838,6 +838,92 @@ async fn reap_idle_older_than_skips_in_flight_agents() {
     assert_eq!(mgr.registry().size(), 1);
 }
 
+/// Track a mock agent whose handle owns a REAL child process (a long sleep),
+/// the way `create_agent` installs one, and arm the child-exit watcher for it.
+/// Returns the child's pid and the watcher task.
+#[cfg(unix)]
+fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::JoinHandle<bool>) {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", "sleep 300"]);
+    cmd.kill_on_drop(true);
+    cmd.process_group(0);
+    let child = cmd.spawn().expect("spawn sleeper child");
+    let pid = child.id().expect("live child has a pid");
+    let mut handle = mock_handle();
+    handle._child = Some(child);
+    mgr.handles.lock().unwrap().insert(id.clone(), handle);
+    mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+    let watcher = mgr.arm_child_exit_watcher(id.clone(), Some(pid));
+    (pid, watcher)
+}
+
+/// Proactive dead-child detection (monorepo#764): an idle agent's child that
+/// is killed EXTERNALLY (SIGKILL) is reaped by the watcher within a bounded
+/// delay — handle removed, registry deregistered — and the watcher reports it
+/// fired the unexpected-exit cleanup.
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_watcher_reaps_idle_agent_on_external_kill() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-watched");
+    let (pid, watcher) = track_with_child(&mgr, &id);
+    assert!(mgr.contains(&id));
+    assert!(mgr.registry().is_registered(&id));
+
+    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("external SIGKILL");
+
+    let fired = timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher fires within a bounded delay")
+        .expect("watcher task completes");
+    assert!(fired, "watcher fired the unexpected-exit cleanup");
+    assert!(!mgr.contains(&id), "handle removed");
+    assert!(!mgr.registry().is_registered(&id), "registry deregistered");
+}
+
+/// Deliberate teardown must NOT fire the watcher: `stop()` removes the handle
+/// before killing the child, so the watcher observes the missing handle and
+/// stands down (returns `false`, no "unexpected exit" cleanup/log).
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_watcher_stands_down_on_deliberate_stop() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-stopped");
+    let (_pid, watcher) = track_with_child(&mgr, &id);
+
+    assert!(mgr.stop(&id).await, "stop removes the tracked handle");
+
+    let fired = timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher stands down within a bounded delay")
+        .expect("watcher task completes");
+    assert!(!fired, "deliberate stop must not fire the watcher");
+}
+
+/// `kill_child_only` (the retry/respawn teardown) likewise removes the handle
+/// before the kill, so the watcher stands down without firing.
+#[cfg(unix)]
+#[tokio::test]
+async fn child_exit_watcher_stands_down_on_kill_child_only() {
+    let (_tmp, mgr) = manager().await;
+    let id = AgentId::from("a-killed-deliberately");
+    let (_pid, watcher) = track_with_child(&mgr, &id);
+
+    mgr.kill_child_only(&id).await;
+
+    let fired = timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("watcher stands down within a bounded delay")
+        .expect("watcher task completes");
+    assert!(
+        !fired,
+        "deliberate kill_child_only must not fire the watcher"
+    );
+}
+
 /// Process-tree teardown (§5.6): a provider's whole process group is signalled,
 /// so a grandchild spawned by the direct child is terminated too — `kill_on_drop`
 /// alone would leave it orphaned.

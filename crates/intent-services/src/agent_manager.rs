@@ -1231,6 +1231,10 @@ impl AgentManager {
         let spawned = spawn_provider(&spawn_opts, hooks)
             .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection) = spawned.into_parts();
+        // Pin the spawned child's pid for the exit watcher armed below: the
+        // watcher stands down when the handle's child no longer matches it
+        // (a respawn installed a newer child with its own watcher).
+        let child_pid = child.id();
         let connection = Arc::new(connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
@@ -1285,7 +1289,16 @@ impl AgentManager {
                 kill_child_tree(child).await;
             }
         }
-        self.handles.lock().unwrap().insert(agent_id, handle);
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), handle);
+        // Proactive dead-child detection (monorepo#764): watch the installed
+        // child for an unexpected exit so an idle agent's death is reaped
+        // (handle + registry) as it happens, not just at the next prompt.
+        // Detached: the watcher stands down on its own when the handle goes
+        // away (deliberate teardown) or a respawn supersedes the child.
+        let _watcher = self.arm_child_exit_watcher(agent_id, child_pid);
         Ok(())
     }
 
@@ -3666,7 +3679,115 @@ impl AgentManager {
             })
         })
     }
+
+    /// Arm the proactive child-exit watcher for a freshly installed handle
+    /// (monorepo#764): a background task `try_wait`-polls the handle's owned
+    /// child and, when it exits UNEXPECTEDLY while the agent is idle, removes
+    /// the handle + deregisters the process slot and logs one WARN carrying
+    /// the exit status (plus the stderr-capture dir hint when capture is on).
+    ///
+    /// Every deliberate teardown path (`kill_child_only`, `detach`/`stop`,
+    /// the registry kill callback, `shutdown`, and `create_agent`'s stale
+    /// reap) removes the handle from the map BEFORE killing the child, so the
+    /// watcher observes the missing handle (or a respawn's pid mismatch) and
+    /// stands down without firing. A mid-turn death (agent in `busy`) is left
+    /// to the in-flight turn's terminal-failure teardown — the watcher keeps
+    /// polling and only fires when the exit is observed while idle. Persisted
+    /// agent status is deliberately untouched: the agent stays resumable and
+    /// the next message spawns a fresh child (`ensure_started`).
+    ///
+    /// Returns the watcher task: resolves `true` when it fired the
+    /// unexpected-exit cleanup, `false` when it stood down.
+    fn arm_child_exit_watcher(
+        &self,
+        agent_id: AgentId,
+        child_pid: Option<u32>,
+    ) -> JoinHandle<bool> {
+        let handles = Arc::downgrade(&self.handles);
+        let registry = Arc::downgrade(&self.registry);
+        let busy = Arc::downgrade(&self.busy);
+        let stderr_dir = self.agent_stderr_log_dir(&agent_id);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+                let (Some(handles), Some(registry), Some(busy)) =
+                    (handles.upgrade(), registry.upgrade(), busy.upgrade())
+                else {
+                    return false; // manager torn down
+                };
+                // Snapshot busy membership BEFORE the handles lock (no nested
+                // locking). Losing the race to a just-starting turn is safe:
+                // the removal below only happens when the child is confirmed
+                // dead, and `ensure_started` spawns fresh over a dead child.
+                let is_busy = busy.lock().unwrap().contains(&agent_id);
+                let exited = {
+                    let mut map = handles.lock().unwrap();
+                    // Handle gone: a deliberate teardown (stop / kill /
+                    // shutdown / respawn reap) already cleaned up.
+                    let Some(handle) = map.get_mut(&agent_id) else {
+                        return false;
+                    };
+                    let Some(child) = handle._child.as_mut() else {
+                        return false;
+                    };
+                    // A respawn installed a NEWER child under this agent id
+                    // (which armed its own watcher) — stand down. A child
+                    // already reaped by a prior `try_wait` reports
+                    // `id() == None` and falls through: `try_wait` then
+                    // returns its cached exit status.
+                    if let Some(current) = child.id() {
+                        if Some(current) != child_pid {
+                            return false;
+                        }
+                    }
+                    match child.try_wait() {
+                        // Alive — keep polling. A transient probe error is
+                        // treated as alive so it never forces a teardown.
+                        Ok(None) | Err(_) => None,
+                        // Exited. Mid-turn (busy) the in-flight turn's
+                        // terminal-failure path owns the teardown: keep
+                        // polling until it removes the handle (or the agent
+                        // goes idle with the dead child still installed).
+                        // Idle deaths are reaped here, removing the handle
+                        // under the same lock the probe ran under so a
+                        // concurrent respawn's fresh handle is never removed.
+                        Ok(Some(status)) => {
+                            if is_busy {
+                                None
+                            } else {
+                                map.remove(&agent_id);
+                                Some(status)
+                            }
+                        }
+                    }
+                };
+                if let Some(status) = exited {
+                    registry.deregister(&agent_id);
+                    match &stderr_dir {
+                        Some(dir) => tracing::warn!(
+                            agent = %agent_id,
+                            exit_status = %status,
+                            "idle agent child exited unexpectedly; handle reaped (agent stderr captured at {})",
+                            dir.display()
+                        ),
+                        None => tracing::warn!(
+                            agent = %agent_id,
+                            exit_status = %status,
+                            "idle agent child exited unexpectedly; handle reaped"
+                        ),
+                    }
+                    return true;
+                }
+            }
+        })
+    }
 }
+
+/// Poll interval for the proactive child-exit watcher
+/// ([`AgentManager::arm_child_exit_watcher`], monorepo#764): how often an
+/// installed handle's child is `try_wait`-probed for an unexpected exit.
+/// Bounds the idle-death cleanup delay.
+const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Grace period between SIGTERM and SIGKILL when tearing down a provider's
 /// process group, giving the tree a chance to exit cleanly first.
