@@ -161,18 +161,11 @@ impl Store {
         }
         .await;
 
-        match result {
-            Ok(_) => {
-                // Rollback (and detach+close on double failure) if the COMMIT
-                // itself fails, so the sole write-pool connection is never
-                // returned holding an open transaction (monorepo#670).
-                crate::commit_with_rollback_guard(conn, "commit failed").await?;
-            }
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                return Err(e);
-            }
-        }
+        // COMMIT on success / ROLLBACK on body error, detaching+closing the
+        // connection if the finishing statement itself fails, so the sole
+        // write-pool connection is never returned holding an open
+        // transaction (monorepo#670 / #680).
+        crate::commit_with_rollback_guard(conn, result, "commit failed").await?;
 
         // Reconstruct Event structs in insertion order.
         let mut result = Vec::with_capacity(events.len());

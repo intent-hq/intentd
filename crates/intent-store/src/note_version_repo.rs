@@ -85,20 +85,11 @@ impl Store {
         }
         .await;
 
-        match result {
-            Ok(v) => {
-                // Rollback (and detach+close on double failure) if the COMMIT
-                // itself fails, so the sole write-pool connection is never
-                // returned holding an open transaction (monorepo#657).
-                crate::commit_with_rollback_guard(conn, "commit note_version tx failed").await?;
-                Ok(v)
-            }
-            Err(e) => {
-                // Best-effort rollback to avoid leaving connection with open transaction.
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        // COMMIT on success / ROLLBACK on body error, detaching+closing the
+        // connection if the finishing statement itself fails, so the sole
+        // write-pool connection is never returned holding an open
+        // transaction (monorepo#657 / #680).
+        crate::commit_with_rollback_guard(conn, result, "commit note_version tx failed").await
     }
 
     /// List a note's stored versions ascending by `v`, without content blobs

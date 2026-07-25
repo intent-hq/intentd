@@ -581,13 +581,18 @@ async fn append_note_version_rolls_back_on_body_error() {
     };
     let ts = now_iso();
 
-    // Ghost note row → the version INSERT violates the FK immediately.
+    // Ghost note row → the version INSERT violates the FK immediately. The
+    // original body error is what surfaces, not a rollback error.
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
-    assert!(store
+    let err = store
         .append_note_version(&ghost, &author, &ts)
         .await
-        .is_err());
+        .expect_err("ghost append must fail at INSERT time");
+    assert!(
+        err.to_string().contains("insert note_version failed"),
+        "unexpected error: {err}"
+    );
     assert!(store
         .list_note_versions(&ws_id, &ghost.id)
         .await
@@ -665,6 +670,61 @@ async fn append_note_version_rolls_back_on_failed_commit() {
         .await
         .expect("append after failed COMMIT");
     assert_eq!(v, 1);
+}
+
+/// Regression for monorepo#680: when the transaction body fails AND the
+/// guard's ROLLBACK also fails (simulated here by handing the guard a
+/// connection with no transaction open, so SQLite reports "cannot rollback -
+/// no transaction is active"), `commit_with_rollback_guard` must detach and
+/// close the poisoned handle instead of returning it to the write pool, and
+/// must propagate the original body error — never the rollback error.
+#[tokio::test]
+async fn commit_with_rollback_guard_detaches_on_body_error_rollback_failure() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    sqlx::query("CREATE TABLE scratch (id INTEGER PRIMARY KEY)")
+        .execute(store.write_pool())
+        .await
+        .expect("create scratch table");
+
+    // No BEGIN on this connection → the guard's ROLLBACK fails.
+    let conn = store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("acquire write conn");
+    let err = crate::commit_with_rollback_guard::<()>(
+        conn,
+        Err(Error::Internal("body boom".to_string())),
+        "ctx",
+    )
+    .await
+    .expect_err("body error must propagate");
+    assert!(
+        err.to_string().contains("body boom"),
+        "original body error must propagate, not the rollback error: {err}"
+    );
+
+    // The poisoned handle was detached+closed, not returned to the pool: a
+    // fresh acquire yields a working connection and a full BEGIN IMMEDIATE
+    // transaction succeeds on it.
+    let mut conn = store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("acquire fresh conn");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .expect("begin immediate after detach");
+    sqlx::query("INSERT INTO scratch (id) VALUES (1)")
+        .execute(&mut *conn)
+        .await
+        .expect("write after detach");
+    sqlx::query("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .expect("commit after detach");
 }
 
 #[tokio::test]

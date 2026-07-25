@@ -262,20 +262,11 @@ impl Store {
         }
         .await;
 
-        match result {
-            Ok(rev) => {
-                // Rollback (and detach+close on double failure) if the COMMIT
-                // itself fails, so the sole write-pool connection is never
-                // returned holding an open transaction (monorepo#638).
-                crate::commit_with_rollback_guard(conn, "commit note+comment tx failed").await?;
-                Ok(rev)
-            }
-            Err(e) => {
-                // Best-effort rollback to avoid leaving connection with open transaction.
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        // COMMIT on success / ROLLBACK on body error, detaching+closing the
+        // connection if the finishing statement itself fails, so the sole
+        // write-pool connection is never returned holding an open
+        // transaction (monorepo#638 / #680).
+        crate::commit_with_rollback_guard(conn, result, "commit note+comment tx failed").await
     }
 
     /// Fetch a single comment by id, or `NotFound`.
