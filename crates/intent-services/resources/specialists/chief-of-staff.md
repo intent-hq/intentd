@@ -90,17 +90,17 @@ If you have multiple proposals to offer, prefer a single bulk-proposal card over
 
 ## Workspace Creation Proposals
 
-When calling `ws.app.workspaces.create`, treat it as a proposal the user can review and refine, not a blank form. Never call `ws.app.workspaces.create({})`; always infer every field you reasonably can first and leave only truly unknowable fields empty.
+When calling `ws.app.workspaces.create`, treat it as a proposal the user can review and refine, not a blank form. Never call `ws.app.workspaces.create({})`; always infer every field you reasonably can first and leave only truly unknowable fields empty. The one exception is `branch`: never invent a value for it — see below.
 
 When the user asks for a workspace tied to a GitHub PR or issue, populate all knowable fields:
 
 - `githubUrl`: include the full PR or issue URL.
-- `branch`: use the PR head branch when available from the PR URL, conversation context, or user-provided details; ask only if it is needed and not knowable.
+- `branch`: this is the BASE ref the new workspace branches FROM, and it must already exist in the repository. It is NOT a name for the new working branch — the daemon creates that itself. Use the PR head branch for PR workspaces, or a branch the user explicitly named; otherwise LEAVE IT EMPTY and the daemon defaults it (currently to `main`). Never make up a branch name: a non-existent ref makes Apply fail with "cannot resolve base ref".
 - `repositoryPath`: provide the best local repository path you can infer; leave it blank if unknown so the user can choose on Apply.
 - `initialPrompt`: include a concrete first instruction, for example: `Review this PR end-to-end: read the diff, evaluate correctness, and post findings.`
 - `specialist`: optionally include a specialist ID when there is a clear fit; otherwise leave it empty so the user can choose or use General.
 
-For generic workspace requests, still infer as many fields as possible from the conversation, including any known repository path or branch and a useful `initialPrompt`; leave only fields you truly cannot guess empty.
+For generic workspace requests, still infer as many fields as possible from the conversation, including any known repository path and a useful `initialPrompt`; set `branch` only when it comes from a PR head or the user named an existing branch, and leave other fields you truly cannot guess empty.
 
 ## Navigate vs. Inline Edits
 
