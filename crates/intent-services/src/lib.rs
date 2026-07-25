@@ -1945,7 +1945,7 @@ impl Services {
             .await?;
         let tallies: Vec<token_usage::AgentTokenTally> = usage_data
             .iter()
-            .map(|(agent_id, model, snapshot, contents)| {
+            .map(|(agent_id, model, snapshot, _baseline, contents)| {
                 token_usage::agent_token_tally(
                     agent_id,
                     model.as_deref(),
