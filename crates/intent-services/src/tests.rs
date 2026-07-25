@@ -797,12 +797,12 @@ async fn delete_note_cascades_comments_and_unlinks_children() {
         author_type: AuthorType::User,
         status: CommentStatus::Open,
         parent_id: None,
-        anchor: CommentAnchor {
+        anchor: Some(CommentAnchor {
             kind: CommentAnchorType::Range,
             start_id: None,
             end_id: None,
             point_id: None,
-        },
+        }),
         anchor_text: None,
         anchor_before: None,
         anchor_after: None,
@@ -2092,10 +2092,17 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
         .await
         .expect("respond");
     // The wire DTO nests suggestionDiff.
-    let diff = resp.comment.suggestion_diff.expect("diff");
+    let diff = resp.comment.suggestion_diff.as_ref().expect("diff");
     assert_eq!(diff.original, "old text");
     assert_eq!(diff.proposed, "new text");
     assert_eq!(resp.thread.total_comments, 2);
+    // Reply-anchoring contract (monorepo#729): the reply carries no anchor of
+    // its own — it anchors via threadId/parentId, and the wire omits the keys.
+    assert!(resp.comment.anchor.is_none());
+    assert!(resp.comment.anchor_text.is_none());
+    let reply_json = serde_json::to_value(&resp.comment).expect("serialize reply");
+    assert!(reply_json.get("anchor").is_none());
+    assert!(reply_json.get("anchorText").is_none());
 
     // getThread returns the root + one reply.
     let thread = svc
@@ -2619,12 +2626,12 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
         author_type: AuthorType::User,
         status: CommentStatus::Open,
         parent_id: None,
-        anchor: CommentAnchor {
+        anchor: Some(CommentAnchor {
             kind: CommentAnchorType::Range,
             start_id: None,
             end_id: None,
             point_id: None,
-        },
+        }),
         anchor_text: None,
         anchor_before: None,
         anchor_after: None,
@@ -4572,10 +4579,10 @@ mod change_event_parity {
             author_type: AuthorType::User,
             status: CommentStatus::Open,
             parent_id: None,
-            anchor: CommentAnchor {
+            anchor: Some(CommentAnchor {
                 kind: CommentAnchorType::Range,
                 ..Default::default()
-            },
+            }),
             anchor_text: None,
             anchor_before: None,
             anchor_after: None,

@@ -846,7 +846,14 @@ pub struct Comment {
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    pub anchor: CommentAnchor,
+    /// Replies carry `None` — they anchor via their thread/parent
+    /// (`thread_id`/`parent_id`), never independently (monorepo#729). Roots
+    /// created by `comment.add` always carry an anchor, but legacy data can
+    /// deviate either way: legacy-imported roots without a `markId` have no
+    /// anchor, and replies stored before this contract change may still carry
+    /// a (non-authoritative) clone of the parent's anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<CommentAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1336,7 +1343,11 @@ pub struct CommentWire {
     pub status: CommentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
-    pub anchor: CommentAnchor,
+    /// Omitted for replies: they anchor via `threadId`/`parentId`
+    /// (monorepo#729). Present on roots created by `comment.add`; may be
+    /// absent on legacy-imported roots that had no `markId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<CommentAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2562,12 +2573,12 @@ mod tests {
             author_type: AuthorType::Agent,
             status: CommentStatus::Open,
             parent_id: None,
-            anchor: CommentAnchor {
+            anchor: Some(CommentAnchor {
                 kind: CommentAnchorType::Range,
                 start_id: Some("c1".to_string()),
                 end_id: Some("c1".to_string()),
                 point_id: None,
-            },
+            }),
             anchor_text: Some("Seed".to_string()),
             anchor_before: Some("be".to_string()),
             anchor_after: Some("af".to_string()),
@@ -2600,7 +2611,9 @@ mod tests {
     }
 
     /// A suggestion comment nests `suggestionDiff` and omits `anchorContext`
-    /// when no anchor context is present (matches `comment-loader.ts`).
+    /// when no anchor context is present (matches `comment-loader.ts`). As a
+    /// reply it carries no `anchor`/`anchorText` of its own — both keys are
+    /// absent on the wire (monorepo#729).
     #[test]
     fn comment_wire_suggestion_nests_suggestion_diff() {
         let comment = Comment {
@@ -2613,7 +2626,7 @@ mod tests {
             author_type: AuthorType::Agent,
             status: CommentStatus::Open,
             parent_id: Some("c1".to_string()),
-            anchor: CommentAnchor::default(),
+            anchor: None,
             anchor_text: None,
             anchor_before: None,
             anchor_after: None,
@@ -2633,6 +2646,9 @@ mod tests {
         );
         assert!(value.get("anchorContext").is_none());
         assert!(value.get("suggestion_original").is_none());
+        // Reply-anchoring contract (monorepo#729): no anchor/anchorText keys.
+        assert!(value.get("anchor").is_none());
+        assert!(value.get("anchorText").is_none());
     }
 
     /// `comment.add` echoes a camelCase `commentId` + nested `location`

@@ -1009,12 +1009,12 @@ fn sample_comment(note_id: &NoteId, thread_id: &str, id: &str) -> Comment {
         author_type: AuthorType::User,
         status: CommentStatus::Open,
         parent_id: None,
-        anchor: CommentAnchor {
+        anchor: Some(CommentAnchor {
             kind: CommentAnchorType::Range,
             start_id: Some("a1".to_string()),
             end_id: Some("a2".to_string()),
             point_id: None,
-        },
+        }),
         anchor_text: Some("foo".to_string()),
         anchor_before: Some("the ".to_string()),
         anchor_after: Some(" bar".to_string()),
@@ -1040,31 +1040,51 @@ async fn comment_round_trip_update_delete_and_thread() {
     store.insert_note(&note).await.expect("insert note");
 
     let c1 = sample_comment(&note.id, "thread-1", "c1");
+    // c2 is a legacy-row scenario: a reply persisted before monorepo#729 that
+    // still carries a cloned anchor — it must round-trip unchanged.
     let mut c2 = sample_comment(&note.id, "thread-1", "c2");
     c2.parent_id = Some("c1".to_string());
     c2.kind = CommentType::Comment;
-    c2.anchor = CommentAnchor {
+    c2.anchor = Some(CommentAnchor {
         kind: CommentAnchorType::Point,
         point_id: Some("p1".to_string()),
         ..Default::default()
-    };
+    });
     c2.anchor_before = None;
     c2.anchor_after = None;
     c2.suggestion_original = None;
     c2.suggestion_proposed = None;
     c2.agent_id = None;
+    // c3 is a contract-shaped reply: no anchor at all — the store must
+    // persist `null` and decode it back as `None` (monorepo#729).
+    let mut c3 = sample_comment(&note.id, "thread-1", "c3");
+    c3.parent_id = Some("c1".to_string());
+    c3.kind = CommentType::Comment;
+    c3.anchor = None;
+    c3.anchor_text = None;
+    c3.anchor_before = None;
+    c3.anchor_after = None;
+    c3.suggestion_original = None;
+    c3.suggestion_proposed = None;
+    c3.agent_id = None;
     store.insert_comment(&ws_id, &c1).await.expect("insert c1");
     store.insert_comment(&ws_id, &c2).await.expect("insert c2");
+    store.insert_comment(&ws_id, &c3).await.expect("insert c3");
 
     let got = store.get_comment("c1").await.expect("get c1");
     assert_eq!(got, c1);
+    let got = store.get_comment("c2").await.expect("get c2");
+    assert_eq!(got, c2);
+    let got = store.get_comment("c3").await.expect("get c3");
+    assert_eq!(got, c3);
+    assert!(got.anchor.is_none());
 
     let by_note = store.list_comments(&note.id).await.expect("list comments");
-    assert_eq!(by_note.len(), 2);
+    assert_eq!(by_note.len(), 3);
 
     let thread = store.get_thread("thread-1").await.expect("get thread");
     assert_eq!(thread.thread_id, "thread-1");
-    assert_eq!(thread.comments.len(), 2);
+    assert_eq!(thread.comments.len(), 3);
 
     let mut updated = c1.clone();
     updated.status = CommentStatus::Resolved;
@@ -1085,7 +1105,7 @@ async fn comment_round_trip_update_delete_and_thread() {
             .await
             .expect("list after del")
             .len(),
-        1
+        2
     );
 }
 

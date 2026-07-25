@@ -782,6 +782,37 @@ async fn comment_respond_emits_comment_added_over_wss() {
         .expect("reply id")
         .to_string();
     assert_ne!(reply_id, root_comment_id, "reply must have its own id");
+    // Reply-anchoring contract (monorepo#729): the reply anchors via its
+    // threadId/parentId — the wire omits `anchor`/`anchorText` entirely.
+    assert!(
+        reply["comment"].get("anchor").is_none(),
+        "reply must not carry an anchor: {reply}"
+    );
+    assert!(
+        reply["comment"].get("anchorText").is_none(),
+        "reply must not carry anchorText: {reply}"
+    );
+    assert_eq!(reply["comment"]["parentId"], json!(root_comment_id));
+
+    // The root comment keeps its authoritative anchor: getThread returns the
+    // root with anchor/anchorText intact and the anchorless reply.
+    let thread = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "commentId": root_comment_id }),
+    )
+    .await;
+    let root = &thread["rootComment"];
+    assert!(root["anchor"].is_object(), "root keeps anchor: {thread}");
+    assert_eq!(root["anchorText"], json!("target"));
+    let replies = thread["replies"].as_array().expect("replies");
+    assert_eq!(replies.len(), 1);
+    assert!(
+        replies[0].get("anchor").is_none(),
+        "reply in thread: {thread}"
+    );
+    assert!(replies[0].get("anchorText").is_none());
 
     let evt = next_event(&mut sub, &["comment:added"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());

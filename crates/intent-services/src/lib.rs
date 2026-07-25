@@ -10693,12 +10693,12 @@ impl WorkspaceApi for Services {
                         author_type,
                         status: CommentStatus::Open,
                         parent_id: None,
-                        anchor: CommentAnchor {
+                        anchor: Some(CommentAnchor {
                             kind: CommentAnchorType::Range,
                             start_id: Some(comment_id.clone()),
                             end_id: Some(comment_id.clone()),
                             point_id: None,
-                        },
+                        }),
                         anchor_text: Some(anchored_text.clone()),
                         anchor_before: if ctx_before.is_empty() {
                             None
@@ -10866,7 +10866,7 @@ impl WorkspaceApi for Services {
                     thread_id: tid,
                     note_id: note_id.clone(),
                     targeted_text: root.anchor_text.clone(),
-                    anchor_id: derive_mark_id(&root.anchor),
+                    anchor_id: root.anchor.as_ref().and_then(derive_mark_id),
                     status: thread_status.to_string(),
                     created_at: root.created_at.clone(),
                     last_activity,
@@ -11054,8 +11054,11 @@ impl WorkspaceApi for Services {
                 author_type,
                 status: CommentStatus::Open,
                 parent_id: Some(parent.id.clone()),
-                anchor: parent.anchor.clone(),
-                anchor_text: parent.anchor_text.clone(),
+                // Replies never anchor independently — they anchor via their
+                // thread/parent (threadId/parentId), so no anchor/anchorText
+                // is cloned from the parent (monorepo#729).
+                anchor: None,
+                anchor_text: None,
                 anchor_before: None,
                 anchor_after: None,
                 suggestion_original: if kind_parsed == CommentType::Suggestion {

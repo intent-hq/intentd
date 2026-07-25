@@ -1,17 +1,16 @@
 //! Router error-matrix + dispatch unit tests using a fake `WorkspaceApi`.
 
 use intent_core::{
-    AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentAnchor, CommentAnchorType,
-    CommentLocation, CommentResolveThreadResult, CommentRespondResult, CommentRespondThread,
-    CommentStatus, CommentType, CommentWire, ContentType, Error, Event, EventQueryParams,
-    FileActivity, FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult,
-    GitFileStatus, GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate,
-    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
-    NoteId, NoteMetadata, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVisibility, ReadAssetResult, RepoConfig, Result,
-    ScriptCreateParams, ScriptMode, TaskUpdateResult, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceUpdate,
+    AgentId, AuthorType, BoxFuture, Comment, CommentAddResult, CommentLocation,
+    CommentResolveThreadResult, CommentRespondResult, CommentRespondThread, CommentStatus,
+    CommentType, CommentWire, ContentType, Error, Event, EventQueryParams, FileActivity,
+    FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
+    GitMergeConflicts, GitStatus, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
+    ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -539,13 +538,9 @@ impl WorkspaceApi for FakeApi {
                 author_type: AuthorType::Agent,
                 status: CommentStatus::Open,
                 parent_id: Some("c1".to_string()),
-                anchor: CommentAnchor {
-                    kind: CommentAnchorType::Range,
-                    start_id: Some("c1".to_string()),
-                    end_id: Some("c1".to_string()),
-                    point_id: None,
-                },
-                anchor_text: Some("target".to_string()),
+                // Replies carry no anchor of their own (monorepo#729).
+                anchor: None,
+                anchor_text: None,
                 anchor_before: None,
                 anchor_after: None,
                 suggestion_original,
@@ -2581,6 +2576,9 @@ async fn comment_respond_nests_suggestion_diff_on_wire() {
     );
     // Flat storage fields must NOT leak onto the wire.
     assert!(v["result"]["comment"]["suggestionOriginal"].is_null());
+    // Reply-anchoring contract (monorepo#729): replies carry no anchor keys.
+    assert!(v["result"]["comment"].get("anchor").is_none());
+    assert!(v["result"]["comment"].get("anchorText").is_none());
     assert_eq!(v["result"]["thread"]["totalComments"], serde_json::json!(2));
 }
 

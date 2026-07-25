@@ -1027,16 +1027,13 @@ fn comment_from_legacy_json(
     obj.remove("noteId");
 
     // `markId` is the legacy anchor-mark id → point anchor. Without one the
-    // exact offsets (`from`/`to`) stay in `extra_json` and the anchor is a
-    // default (unanchored) range.
-    let anchor = match take_string(&mut obj, "markId") {
-        Some(mark_id) => CommentAnchor {
-            kind: CommentAnchorType::Point,
-            point_id: Some(mark_id),
-            ..Default::default()
-        },
-        None => CommentAnchor::default(),
-    };
+    // exact offsets (`from`/`to`) stay in `extra_json` and no anchor is
+    // stored (the wire omits the field, monorepo#729).
+    let anchor = take_string(&mut obj, "markId").map(|mark_id| CommentAnchor {
+        kind: CommentAnchorType::Point,
+        point_id: Some(mark_id),
+        ..Default::default()
+    });
 
     let (suggestion_original, suggestion_proposed) = match obj.remove("suggestionDiff") {
         Some(Value::Object(mut diff)) => {
@@ -2561,8 +2558,12 @@ mod tests {
         assert_eq!(root_c.status, CommentStatus::Open);
         assert_eq!(root_c.author, "clement");
         assert_eq!(root_c.author_type, AuthorType::User);
-        assert_eq!(root_c.anchor.kind, CommentAnchorType::Point);
-        assert_eq!(root_c.anchor.point_id, Some("mark-abc".to_string()));
+        let root_anchor = root_c
+            .anchor
+            .as_ref()
+            .expect("root comment keeps its anchor");
+        assert_eq!(root_anchor.kind, CommentAnchorType::Point);
+        assert_eq!(root_anchor.point_id, Some("mark-abc".to_string()));
         assert_eq!(root_c.anchor_text, Some("## Design".to_string()));
         assert_eq!(root_c.created_at, "2025-06-01T00:00:00Z");
         // Unmapped legacy fields survive in extra_json.
