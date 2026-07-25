@@ -772,7 +772,9 @@ impl Store {
     /// snapshot, atomically with the id swap (see [`Store::write_acp_session_id`],
     /// monorepo#737): the recreated ACP session restarts its cumulative counts
     /// from zero, so the old session's totals must be banked first. The
-    /// CAS-loss (diverged) branch writes nothing and therefore never folds.
+    /// CAS-loss (diverged) branch writes nothing and therefore never folds;
+    /// the CAS predicate is re-checked inside the write transaction, so a
+    /// swap that races between this read and the write also loses cleanly.
     pub async fn replace_acp_session_id(
         &self,
         workspace_id: &WorkspaceId,
@@ -787,24 +789,26 @@ impl Store {
         match current.acp_session_id.as_deref() {
             // The id we failed to load is still canonical → swap in the fresh one.
             Some(existing) if existing == expected_old => {
-                self.write_acp_session_id(workspace_id, id, new_acp_session_id)
-                    .await?;
-                Ok(new_acp_session_id.to_string())
+                self.write_acp_session_id(workspace_id, id, Some(expected_old), new_acp_session_id)
+                    .await
             }
             // Diverged (a concurrent recreate already swapped) → reuse the stored
             // canonical value instead of clobbering it.
             Some(existing) => Ok(existing.to_string()),
             // Nothing stored to clobber → set the fresh id.
             None => {
-                self.write_acp_session_id(workspace_id, id, new_acp_session_id)
-                    .await?;
-                Ok(new_acp_session_id.to_string())
+                self.write_acp_session_id(workspace_id, id, None, new_acp_session_id)
+                    .await
             }
         }
     }
 
-    /// Unconditional `acp_session_id` write helper shared by the CAS replace
-    /// branches (callers gate the overwrite policy before invoking this).
+    /// CAS-guarded `acp_session_id` write helper shared by the writing
+    /// branches of [`Store::replace_acp_session_id`]. Re-reads the stored id
+    /// inside the write transaction and compares it (NULL-safe) against
+    /// `expected_old` so the caller's read → write window cannot clobber a
+    /// concurrent swap; on a mismatch it writes nothing and returns the
+    /// stored canonical id. Returns the id that is canonical after the call.
     ///
     /// In the same transaction as the id write it folds the session's current
     /// `token_usage` snapshot into `token_usage_baseline` (component-wise
@@ -818,14 +822,15 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
+        expected_old: Option<&str>,
         acp_session_id: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut tx =
             self.write_pool().begin().await.map_err(|e| {
                 Error::Internal(format!("replace acp session id begin failed: {e}"))
             })?;
         let row = sqlx::query(
-            "SELECT token_usage, token_usage_baseline FROM agent_session \
+            "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
              WHERE id=? AND workspace_id=?",
         )
         .bind(&id.0)
@@ -833,6 +838,15 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
+        let stored_id = row
+            .as_ref()
+            .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
+        if stored_id.as_deref() != expected_old {
+            // The stored id changed between the caller's CAS read and this
+            // transaction: treat it as a CAS loss and keep the canonical value
+            // (falling back to the fresh id only if the row vanished).
+            return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
+        }
         let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
             .map(|r| {
                 (
@@ -877,7 +891,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("replace acp session id commit failed: {e}")))?;
-        Ok(())
+        Ok(acp_session_id.to_string())
     }
 
     /// Delete an agent session and its message log (the `agent_message` rows
@@ -1933,6 +1947,163 @@ mod tests {
         let replace_row = by_id(&replace_none);
         assert!(replace_row.2.is_none(), "replace clears the snapshot");
         assert_eq!(replace_row.3.as_ref(), Some(&snap), "replace folds it");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Malformed stored JSON in `token_usage` / `token_usage_baseline`
+    /// decodes to `None` and folds as zero: a malformed snapshot folds
+    /// nothing (an existing baseline carries over), and a malformed baseline
+    /// is overwritten by the folded (valid-snapshot) totals rather than
+    /// preserved.
+    #[tokio::test]
+    async fn replace_acp_session_id_treats_malformed_json_as_zero() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-baseline".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let snap = TokenUsageTotals {
+            input_tokens: 11,
+            output_tokens: 22,
+            cache_read_tokens: 33,
+            cache_creation_tokens: 44,
+        };
+
+        // Malformed snapshot + valid baseline: the fold treats the snapshot
+        // as zero, so the baseline carries over unchanged (not dropped).
+        let bad_snap = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(
+                &bad_snap,
+                &ws_id,
+                &ts,
+                Some("acp-1"),
+            ))
+            .await
+            .expect("insert");
+        sqlx::query(
+            "UPDATE agent_session SET token_usage='not json', token_usage_baseline=? \
+             WHERE id=?",
+        )
+        .bind(serde_json::to_string(&snap).unwrap())
+        .bind(&bad_snap.0)
+        .execute(store.write_pool())
+        .await
+        .expect("inject malformed snapshot");
+        let canonical = store
+            .replace_acp_session_id(&ws_id, &bad_snap, "acp-1", "acp-2")
+            .await
+            .expect("swap with malformed snapshot");
+        assert_eq!(canonical, "acp-2");
+
+        // Malformed baseline + valid snapshot: the fold treats the baseline
+        // as zero and overwrites it with the snapshot totals.
+        let bad_base = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(
+                &bad_base,
+                &ws_id,
+                &ts,
+                Some("acp-1"),
+            ))
+            .await
+            .expect("insert");
+        store
+            .set_agent_session_token_usage(&ws_id, &bad_base, &snap)
+            .await
+            .expect("set snapshot");
+        sqlx::query("UPDATE agent_session SET token_usage_baseline='{broken' WHERE id=?")
+            .bind(&bad_base.0)
+            .execute(store.write_pool())
+            .await
+            .expect("inject malformed baseline");
+        let canonical = store
+            .replace_acp_session_id(&ws_id, &bad_base, "acp-1", "acp-2")
+            .await
+            .expect("swap with malformed baseline");
+        assert_eq!(canonical, "acp-2");
+
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        let by_id = |id: &AgentId| rows.iter().find(|r| r.0 == id.0).expect("row");
+        let bad_snap_row = by_id(&bad_snap);
+        assert!(bad_snap_row.2.is_none(), "malformed snapshot cleared");
+        assert_eq!(
+            bad_snap_row.3.as_ref(),
+            Some(&snap),
+            "valid baseline carries over when the snapshot is malformed"
+        );
+        let bad_base_row = by_id(&bad_base);
+        assert!(bad_base_row.2.is_none(), "snapshot cleared");
+        assert_eq!(
+            bad_base_row.3.as_ref(),
+            Some(&snap),
+            "malformed baseline overwritten by the folded snapshot"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The in-transaction CAS re-check in `write_acp_session_id`: when the
+    /// stored id diverges from `expected_old` between the caller's read and
+    /// the write transaction, nothing is written — id, snapshot, and baseline
+    /// are untouched and the stored canonical id is returned.
+    #[tokio::test]
+    async fn write_acp_session_id_recheck_loses_cleanly() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-baseline".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(
+                &agent_id,
+                &ws_id,
+                &ts,
+                Some("acp-winner"),
+            ))
+            .await
+            .expect("insert");
+        let snap = TokenUsageTotals {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 3,
+            cache_creation_tokens: 4,
+        };
+        store
+            .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
+            .await
+            .expect("set snapshot");
+
+        // Simulate a caller whose CAS read saw "acp-stale" before a
+        // concurrent recreate stored "acp-winner".
+        let canonical = store
+            .write_acp_session_id(&ws_id, &agent_id, Some("acp-stale"), "acp-loser")
+            .await
+            .expect("recheck loss returns canonical id");
+        assert_eq!(canonical, "acp-winner", "stored id not clobbered");
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot untouched");
+        assert!(rows[0].3.is_none(), "baseline untouched on recheck loss");
 
         let _ = std::fs::remove_file(&tmp);
     }
