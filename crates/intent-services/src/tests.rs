@@ -1697,6 +1697,7 @@ async fn comment_add_unique_match_anchors_and_persists() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("comment.add");
@@ -1731,6 +1732,7 @@ async fn comment_add_persists_anchor_context() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,
@@ -1776,6 +1778,144 @@ async fn fetch_comment_by_id(
         .expect("comment present")
 }
 
+/// Round 14 root cause A (monorepo optimistic-vs-canonical id split): a
+/// client-supplied `commentId` must be used for the comment row, the thread
+/// id, the anchor ids, AND the embedded markers — not a daemon-minted UUID.
+#[tokio::test]
+async fn comment_add_supplied_comment_id_used_for_row_thread_anchor_and_markers() {
+    let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+    let supplied = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(supplied.into()),
+        )
+        .await
+        .expect("comment.add");
+    assert_eq!(r.comment_id, supplied);
+    let note = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    assert!(
+        note.content.contains(&format!(
+            "<!--anchor:{supplied}:start-->test<!--anchor:{supplied}:end-->"
+        )),
+        "markers must embed the supplied id: {}",
+        note.content
+    );
+    let comment = fetch_comment_by_id(&svc, &ws, &id, supplied).await;
+    assert_eq!(comment.id, supplied);
+    assert_eq!(comment.thread_id, supplied);
+    let anchor = comment.anchor.expect("root comment has an anchor");
+    assert_eq!(anchor.start_id.as_deref(), Some(supplied));
+    assert_eq!(anchor.end_id.as_deref(), Some(supplied));
+}
+
+#[tokio::test]
+async fn comment_add_invalid_supplied_comment_id_is_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("some note content").await;
+    let err = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "some note content".into(),
+            "content".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+            Some("not-a-uuid".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("commentId")),
+        "unexpected error: {err:?}"
+    );
+    // The rejected add must not have touched the note.
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert!(!note.content.contains("<!--anchor:"));
+}
+
+#[tokio::test]
+async fn comment_add_duplicate_supplied_comment_id_is_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("alpha target-a and target-b omega").await;
+    let supplied = "11111111-2222-4333-8444-555555555555";
+    svc.comment_add(
+        ws.clone(),
+        id.clone(),
+        "alpha target-a and".into(),
+        "target-a".into(),
+        "first".into(),
+        None,
+        None,
+        None,
+        None,
+        Some(supplied.into()),
+    )
+    .await
+    .expect("first add");
+    let err = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "and target-b omega".into(),
+            "target-b".into(),
+            "second".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(supplied.into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("commentId")),
+        "unexpected error: {err:?}"
+    );
+    // The failed second add must not have embedded markers around target-b.
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert_eq!(note.content.matches("<!--anchor:").count(), 2);
+}
+
+/// Backward compatibility: omitting `commentId` keeps minting a fresh UUID.
+#[tokio::test]
+async fn comment_add_omitted_comment_id_mints_fresh_uuid() {
+    let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+    assert!(
+        uuid::Uuid::parse_str(&r.comment_id).is_ok(),
+        "minted id must be a UUID: {}",
+        r.comment_id
+    );
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert!(note
+        .content
+        .contains(&format!("<!--anchor:{}:start-->", r.comment_id)));
+}
+
 #[tokio::test]
 async fn edit_above_anchor_preserves_healthy_state() {
     // H1: an edit that touches text BEFORE the anchored range must leave both
@@ -1788,6 +1928,7 @@ async fn edit_above_anchor_preserves_healthy_state() {
             "target word here".into(),
             "target word".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -1829,6 +1970,7 @@ async fn edit_that_destroys_start_marker_recovers_via_context() {
             "prefix target here suffix".into(),
             "target".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -1881,6 +2023,7 @@ async fn edit_that_destroys_both_markers_marks_orphaned() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add");
@@ -1916,6 +2059,7 @@ async fn comment_add_ambiguous_context_errors() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1943,6 +2087,7 @@ async fn comment_add_plaintext_context_over_formatted_markdown() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("comment.add via plaintext fallback");
@@ -1965,6 +2110,7 @@ async fn comment_add_context_not_found_is_invalid_params() {
             "totally absent context".into(),
             "absent".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -2010,6 +2156,7 @@ async fn comment_add_mention_at_prefixed_needle_anchors() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2028,6 +2175,7 @@ async fn comment_add_empty_target_is_invalid_params() {
             "some note content".into(),
             "".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -2051,6 +2199,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "alpha unique-target omega".into(),
             "unique-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2140,6 +2289,7 @@ async fn comment_respond_author_type_persists_and_validates() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add");
@@ -2212,6 +2362,7 @@ async fn comment_respond_caller_input_errors_are_invalid_params() {
             "alpha reply-target omega".into(),
             "reply-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2294,6 +2445,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
             "alpha resolve-target omega".into(),
             "resolve-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2514,6 +2666,7 @@ async fn comment_ops_reject_cross_workspace_bare_id_writes() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,
@@ -3364,6 +3517,7 @@ mod change_event_parity {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("comment");
@@ -3408,6 +3562,7 @@ mod change_event_parity {
                 None,
                 None,
                 key.clone(),
+                None,
             )
             .await
             .expect("first add");
@@ -3430,6 +3585,7 @@ mod change_event_parity {
                 None,
                 None,
                 key,
+                None,
             )
             .await
             .expect("replay add");
@@ -3461,6 +3617,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "root".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -3513,6 +3670,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "nice".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -14188,6 +14346,7 @@ mod line_attribution_hooks {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,

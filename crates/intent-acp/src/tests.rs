@@ -4602,6 +4602,7 @@ mod wsapi3_bindings_tests {
             _author: Option<String>,
             _author_type: Option<String>,
             _idempotency_key: Option<String>,
+            _comment_id: Option<String>,
         ) -> BoxFuture<'_, Result<CommentAddResult>> {
             self.comment_add_calls.lock().unwrap().push((
                 note_id.as_str().to_string(),
