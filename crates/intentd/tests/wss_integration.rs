@@ -3424,6 +3424,147 @@ async fn wss_note_version_history_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Regression for monorepo#721 over the real WSS wire: full-content note
+/// writes (`note.setContent`) with non-ASCII content (emoji/CJK) must not
+/// corrupt content or panic the daemon. The CRDT merge engine computes
+/// UTF-16 code-unit offsets, but the `yrs` doc used byte offsets — so the
+/// second full-content write (the diff path over a doc already holding
+/// multi-byte chars) landed at wrong byte positions, panicking inside `yrs`
+/// and poisoning the sessions mutex (every later CRDT call then panicked,
+/// dropping the WSS connection). Post-fix: setContent with emoji/CJK, an
+/// edited setContent (diff path), a surgical `note.add`, and a reseeded
+/// setContent after the add all succeed with the expected merged content.
+#[tokio::test]
+async fn wss_note_set_content_non_ascii_merge_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Unicode Merge"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"note.create","params":{{"workspaceId":"{ws_id}","title":"Unicode","content":"ascii seed"}}}}"#
+        )],
+    )
+    .await;
+    let note_id = sess[0]["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    // v1 introduces emoji + CJK; v2 edits between multi-byte regions (common
+    // prefix ends on the emoji, common suffix starts mid-CJK) so the diff
+    // offsets are only correct under UTF-16 offset kind — this exact frame
+    // panicked the pre-fix daemon and dropped the connection.
+    let v1 = "Intro 😀 中文段落 emoji tail ✅";
+    let v2 = "Intro 😀🎉 中文段落改写 emoji tail ✅";
+    let appended = "尾注 with emoji 🚀";
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"note.setContent",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":v1}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":5,"method":"note.setContent",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":v2}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":6,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":7,"method":"note.add",
+                "params":{"workspaceId":ws_id,"noteId":note_id,"content":appended,"position":"end"}})
+            .to_string(),
+            serde_json::json!({"jsonrpc":"2.0","id":8,"method":"note.get",
+                "params":{"workspaceId":ws_id,"noteId":note_id}})
+            .to_string(),
+        ],
+    )
+    .await;
+    for (i, resp) in sess.iter().enumerate() {
+        assert_eq!(resp["jsonrpc"], "2.0", "envelope: {resp}");
+        assert_eq!(resp["id"].as_i64(), Some(i as i64 + 3), "envelope: {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "all frames must be success envelopes: {resp}"
+        );
+    }
+    assert_eq!(sess[0]["result"]["ok"], true, "setContent v1: {}", sess[0]);
+    assert_eq!(
+        sess[1]["result"]["note"]["content"], v1,
+        "v1 persisted verbatim: {}",
+        sess[1]
+    );
+    assert_eq!(
+        sess[2]["result"]["ok"], true,
+        "setContent v2 (diff path over multi-byte doc): {}",
+        sess[2]
+    );
+    assert_eq!(
+        sess[3]["result"]["note"]["content"], v2,
+        "v2 merged without corruption: {}",
+        sess[3]
+    );
+    assert_eq!(sess[4]["result"]["ok"], true, "note.add: {}", sess[4]);
+    let after_add = sess[5]["result"]["note"]["content"]
+        .as_str()
+        .expect("content after add")
+        .to_string();
+    assert!(
+        after_add.starts_with(v2),
+        "surgical add preserves the merged v2 prefix: {after_add}"
+    );
+    assert!(
+        after_add.contains(appended),
+        "surgical add appends the non-ASCII content: {after_add}"
+    );
+
+    // The surgical add invalidated the CRDT session; a follow-up full-content
+    // write reseeds from the persisted content and must again merge a
+    // multi-byte edit correctly.
+    let v3 = after_add.replace("中文段落改写", "中文段落终稿");
+    assert_ne!(v3, after_add, "fixture edit must change the content");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({"jsonrpc":"2.0","id":9,"method":"note.setContent",
+            "params":{"workspaceId":ws_id,"noteId":note_id,"content":v3}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["ok"], true,
+        "reseeded setContent after surgical add: {resp}"
+    );
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({"jsonrpc":"2.0","id":10,"method":"note.get",
+            "params":{"workspaceId":ws_id,"noteId":note_id}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["note"]["content"].as_str(),
+        Some(v3.as_str()),
+        "v3 merged from the reseeded session: {resp}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// `git.showFile` over WSS (PROTOCOL §5.6 extensions): file content at a
 /// revision (`HEAD` / `HEAD^`), the empty-content fallback for a path missing
 /// at the ref, and -32603 for an unresolvable ref.
