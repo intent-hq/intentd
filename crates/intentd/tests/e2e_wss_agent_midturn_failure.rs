@@ -6,6 +6,11 @@
 //! the child's stderr captured under `<data_dir>/agent-logs/<agent-id>/`
 //! with the terminal-failure WARN pointing at the capture path (STAB-53).
 //!
+//! Also home to the monorepo#764 dead-child RECOVERY paths, which reuse the
+//! same fixture machinery: a child that dies while the agent is idle respawns
+//! transparently on the next message, and a transport-closed prompt failure
+//! BEFORE any streamed output is silently redriven once on a fresh child.
+//!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 
 #![cfg(unix)]
@@ -789,5 +794,469 @@ async fn agent_retry_with_empty_queue_clears_to_idle_over_wss() {
     assert_eq!(
         session["session"]["status"], "idle",
         "session status cleared to idle after empty-queue retry"
+    );
+}
+
+/// Bounded poll: wait until the mock's `MOCK_AGENT_PID_FILE` holds at least
+/// `n` pid lines (one appended per spawn) and return them all.
+async fn await_pid_lines(path: &Path, n: usize) -> Vec<u32> {
+    for _ in 0..400 {
+        if let Ok(contents) = tokio::fs::read_to_string(path).await {
+            let pids: Vec<u32> = contents
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+            if pids.len() >= n {
+                return pids;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("pid file {} never reached {n} line(s)", path.display());
+}
+
+/// Bounded poll: wait until the daemon log contains `needle`.
+async fn await_daemon_log_contains(data_dir: &Path, needle: &str) {
+    let log_path = data_dir.join("daemon.log");
+    for _ in 0..400 {
+        if tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("daemon log never contained {needle:?}");
+}
+
+/// Bounded poll: wait until `agent.getSession` reports `status == "idle"`,
+/// returning the final response for follow-up assertions.
+async fn await_session_idle<S>(
+    ws: &mut WebSocketStream<S>,
+    id_base: i64,
+    ws_id: &str,
+    agent_id: &str,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut last = Value::Null;
+    for i in 0..100 {
+        last = wss_rpc(
+            ws,
+            id_base + i,
+            "agent.getSession",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if last["session"]["status"] == "idle" {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("agent session never settled to idle; last: {last}");
+}
+
+/// DEAD-IDLE (monorepo#764): the child is SIGKILLed out-of-band while the
+/// agent sits idle after a completed turn. The proactive child-exit watcher
+/// reaps the handle (one WARN, no events, status untouched), and the next
+/// message transparently spawns a FRESH child and completes the turn — no
+/// terminal `agent:failed`, no error status, and the transcript carries both
+/// turns.
+#[tokio::test]
+async fn agent_dead_while_idle_respawns_transparently_over_wss() {
+    let Some(script) = gate("WSS dead-while-idle recovery E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let pid_file = data_dir.join("pids.txt");
+    let pid_file_s = pid_file.to_string_lossy().into_owned();
+    // Distinct per-turn responses so turn 2's stream provably comes from the
+    // respawned child answering the SECOND message, not a turn-1 leftover.
+    let behavior = json!({
+        "response": "first-turn-response-764",
+        "rules": [
+            { "ifPromptContains": "idle-kill-turn-two", "response": "respawned-turn-response-764" },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PID_FILE", &pid_file_s),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-DEAD-IDLE", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // Turn 1 completes normally on the first child.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "first sendMessage ok: {sent}");
+    let mut saw_chunk = false;
+    let mut saw_end = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => panic!("agent:failed during the healthy first turn: {frame}"),
+            Some("agent:stream:chunk") => {
+                if event["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("first-turn-response-764")
+                {
+                    saw_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_chunk, "first turn streamed the mock response");
+    assert!(saw_end, "first turn ended with agent:stream:end");
+    await_session_idle(&mut rpc, 100, &ws_id, &agent_id).await;
+
+    // SIGKILL the mock child out-of-band while the agent is idle.
+    let pids = await_pid_lines(&pid_file, 1).await;
+    let pid1 = pids[0];
+    let killed = Command::new("kill")
+        .args(["-9", &pid1.to_string()])
+        .status()
+        .expect("run kill")
+        .success();
+    assert!(killed, "SIGKILL delivered to idle mock child {pid1}");
+    // Deterministic sync point (no sleeps racing the watcher): the proactive
+    // child-exit watcher observes the idle death, reaps the handle, and logs
+    // exactly this WARN. Persisted status is untouched, so nothing else to
+    // wait on.
+    await_daemon_log_contains(
+        &data_dir,
+        "idle agent child exited unexpectedly; handle reaped",
+    )
+    .await;
+
+    // Turn 2 succeeds transparently on a FRESH child — no agent:failed, no
+    // error status, a normal `{ agentId }` stream:end.
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "idle-kill-turn-two" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "post-kill sendMessage ok: {sent}");
+    let mut saw_respawn_chunk = false;
+    let mut saw_respawn_end = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => {
+                panic!("dead-while-idle recovery must not surface agent:failed: {frame}")
+            }
+            Some("agent:status-changed") if event["data"]["status"] == "error" => {
+                panic!("dead-while-idle recovery must not park the agent in error: {frame}")
+            }
+            Some("agent:stream:chunk") => {
+                if event["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("respawned-turn-response-764")
+                {
+                    saw_respawn_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                assert!(
+                    event["data"].get("stopReason").is_none(),
+                    "transparent respawn turn ends with a normal stream:end: {frame}"
+                );
+                saw_respawn_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_respawn_chunk,
+        "post-kill turn streamed the respawned child's response"
+    );
+    assert!(
+        saw_respawn_end,
+        "post-kill turn ended with agent:stream:end"
+    );
+
+    // Fresh-spawn proof: a second, distinct pid line from the mock.
+    let pids = await_pid_lines(&pid_file, 2).await;
+    assert_eq!(pids.len(), 2, "exactly two spawns (one respawn): {pids:?}");
+    assert_ne!(pids[0], pids[1], "respawn used a fresh process: {pids:?}");
+
+    // Status settled back to idle with no stopReason.
+    let session = await_session_idle(&mut rpc, 300, &ws_id, &agent_id).await;
+    assert!(
+        session["session"]["stopReason"].is_null(),
+        "no stopReason after transparent recovery: {:?}",
+        session["session"]["stopReason"]
+    );
+
+    // Resume continuity: ONE transcript carries both turns.
+    let convo = wss_rpc(
+        &mut rpc,
+        500,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows = convo["messages"]
+        .as_array()
+        .expect("conversation messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .count();
+    assert_eq!(user_rows, 2, "both user turns persisted: {convo}");
+    let serialized = convo.to_string();
+    assert!(
+        serialized.contains("first-turn-response-764")
+            && serialized.contains("respawned-turn-response-764"),
+        "both assistant responses persisted in one transcript: {convo}"
+    );
+}
+
+/// PRE-TOKEN REDRIVE (monorepo#764): the first child handshakes fine, then
+/// dies on `session/prompt` BEFORE emitting any output (first attempt only —
+/// the respawned child answers normally). The one-shot silent redrive must
+/// complete the turn on a fresh child with nothing user-visible: no
+/// `agent:failed`, no error status, no requeued message (no Retry surface),
+/// and a normal stream on the wire. The daemon log carries the redrive WARN,
+/// proving the failure actually happened and was consumed silently.
+#[tokio::test]
+async fn agent_pre_token_transport_failure_redrives_silently_over_wss() {
+    let Some(script) = gate("WSS pre-token silent-redrive E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let attempt_file = data_dir.join("attempts.txt");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    let pid_file = data_dir.join("pids.txt");
+    let pid_file_s = pid_file.to_string_lossy().into_owned();
+    // ONE pre-output death: consumed by the one-shot silent redrive, so the
+    // respawned child (attempt 2) answers normally.
+    let behavior = json!({
+        "exitDuringPromptAttempts": 1,
+        "response": "silent-redrive-response-764",
+    })
+    .to_string();
+    let env: [(&str, &str); 8] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
+        ("MOCK_AGENT_PID_FILE", &pid_file_s),
+        ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
+        ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-SILENT-REDRIVE", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "dies once before output" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // The turn must complete via the single silent redrive: any terminal
+    // failure surface on the wire is a regression.
+    let mut saw_chunk = false;
+    let mut saw_end = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("agent:failed") => {
+                panic!("pre-token failure must be silently redriven, not surfaced: {frame}")
+            }
+            Some("agent:status-changed") if event["data"]["status"] == "error" => {
+                panic!("silent redrive must not park the agent in error: {frame}")
+            }
+            Some("agent:stream:chunk") => {
+                if event["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("silent-redrive-response-764")
+                {
+                    saw_chunk = true;
+                }
+            }
+            Some("agent:stream:end") => {
+                assert!(
+                    event["data"].get("stopReason").is_none(),
+                    "silently redriven turn ends with a normal stream:end: {frame}"
+                );
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_chunk,
+        "redriven turn streamed the fresh child's response"
+    );
+    assert!(saw_end, "redriven turn ended with agent:stream:end");
+
+    // The failure actually happened and took the redrive path (this is not a
+    // plain healthy turn): the one-shot WARN is in the daemon log…
+    await_daemon_log_contains(&data_dir, "redriving the prompt once on a fresh child").await;
+    // …and the dead first child was replaced by a fresh process.
+    let pids = await_pid_lines(&pid_file, 2).await;
+    assert_eq!(pids.len(), 2, "exactly two spawns (one redrive): {pids:?}");
+    assert_ne!(pids[0], pids[1], "redrive used a fresh process: {pids:?}");
+
+    // No Retry surface: nothing was requeued for `agent.retry`.
+    let queue = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        queue["queue"].as_array().expect("queue array").len(),
+        0,
+        "silent redrive leaves nothing requeued: {queue}"
+    );
+
+    // Status settled to idle with no stopReason (no Error status ever
+    // persisted — the event loop above panics on a status=error event).
+    let session = await_session_idle(&mut rpc, 100, &ws_id, &agent_id).await;
+    assert!(
+        session["session"]["stopReason"].is_null(),
+        "no stopReason after silent redrive: {:?}",
+        session["session"]["stopReason"]
+    );
+
+    // The redrive must not duplicate the user message in the transcript.
+    let convo = wss_rpc(
+        &mut rpc,
+        300,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let user_rows = convo["messages"]
+        .as_array()
+        .expect("conversation messages array")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .count();
+    assert_eq!(user_rows, 1, "exactly one user row (no duplicate): {convo}");
+    assert!(
+        convo.to_string().contains("silent-redrive-response-764"),
+        "redriven assistant response persisted: {convo}"
     );
 }
