@@ -592,6 +592,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // transaction is open on the write connection (a VACUUM requirement).
     // Failure is non-fatal: the daemon runs degraded exactly as before
     // (freelist pages are simply never returned to the filesystem).
+    // Pre-log the rebuild (PR #500 review): on a large legacy DB the VACUUM
+    // can take a while with no socket accepting yet, so an operator tailing
+    // the log needs to see why startup is slow before it completes.
+    if let Ok(row) = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.write_pool())
+        .await
+    {
+        if row.get::<i64, _>(0) == 0 {
+            tracing::info!(
+                "legacy database in auto_vacuum=NONE mode; running one-time VACUUM \
+                 (may take a while on large databases)"
+            );
+        }
+    }
     match store.activate_incremental_vacuum().await {
         Ok(intent_store::AutoVacuumActivation::Activated {
             duration,
