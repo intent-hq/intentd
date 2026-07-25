@@ -15587,4 +15587,197 @@ mod turn_token_usage {
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         assert!(ws.token_usage.is_none(), "tally untouched");
     }
+
+    /// Regression for monorepo#737: an ACP session recreate (CAS swap) folds
+    /// the cumulative snapshot into `token_usage_baseline`; the workspace
+    /// tally must report baseline + new snapshot, never just the recreated
+    /// session's small fresh count.
+    #[tokio::test]
+    async fn recreated_session_tally_includes_baseline() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        h.store
+            .set_acp_session_id(&h.ws, &agent, "acp-1")
+            .await
+            .expect("set acp id");
+
+        // Session reports cumulative 100/80 before the recreate.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 0, 0))
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.token_usage.unwrap().totals.input_tokens, 100);
+
+        // ACP session recreated: the CAS swap folds 100/80 into the baseline
+        // and clears the snapshot.
+        h.store
+            .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+
+        // The recreated ACP session restarts its cumulative counts: its first
+        // turn reports 5/3. The tally must be 105/83, not 5/3.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(5, 3, 0, 0))
+            .await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(
+            usage.totals.input_tokens, 105,
+            "recreate must not undercount: baseline + new snapshot"
+        );
+        assert_eq!(usage.totals.output_tokens, 83);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 105);
+        assert_eq!(usage.by_agent_id[&agent.0].output_tokens, 83);
+        assert_eq!(usage.by_model["opus-4.8"].input_tokens, 105);
+    }
+
+    /// Recreate followed by a turn that reports NO usage: the baseline alone
+    /// carries the tally (never baseline + message sums), so the totals stay
+    /// at the pre-recreate 100/80.
+    #[tokio::test]
+    async fn recreate_without_new_usage_report_keeps_baseline() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        h.store
+            .set_acp_session_id(&h.ws, &agent, "acp-1")
+            .await
+            .expect("set acp id");
+        // Message-embedded usage exists but must NOT be added on top of the
+        // baseline (the snapshot already superseded it before the recreate).
+        h.store
+            .append_agent_message(
+                &agent,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 500, "outputTokens": 100 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append message");
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 0, 0))
+            .await;
+        h.store
+            .replace_acp_session_id(&h.ws, &agent, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+
+        // Turn ends with no usage report → nothing persisted for the new ACP
+        // session; recompute directly (live path, unguarded) so the guard
+        // cannot mask a baseline-unaware zero recount.
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "baseline alone, not zero");
+        assert_eq!(usage.totals.output_tokens, 80);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+    }
+
+    /// Mixed workspace: one recreated agent (baseline only), one normal
+    /// snapshot agent, one legacy message-sum fallback agent — the live path
+    /// aggregates all three correctly, and the scan/reconciliation path
+    /// yields the same numbers.
+    #[tokio::test]
+    async fn mixed_baseline_snapshot_and_fallback_agents_scan_matches_live() {
+        let h = harness().await;
+        let recreated = AgentId::new();
+        let normal = AgentId::new();
+        let fallback = AgentId::new();
+        for (agent, model) in [
+            (&recreated, "opus-4.8"),
+            (&normal, "opus-4.8"),
+            (&fallback, "sonnet-5"),
+        ] {
+            h.store
+                .insert_agent_session(&agent_session(agent, &h.ws, model))
+                .await
+                .expect("insert session");
+        }
+
+        // Recreated agent: snapshot 100/80 folded into the baseline by the
+        // CAS swap; no usage reported since.
+        h.store
+            .set_acp_session_id(&h.ws, &recreated, "acp-1")
+            .await
+            .expect("set acp id");
+        h.services
+            .persist_turn_token_usage(&recreated, &h.ws, &acp_usage(100, 80, 0, 0))
+            .await;
+        h.store
+            .replace_acp_session_id(&h.ws, &recreated, "acp-1", "acp-2")
+            .await
+            .expect("CAS swap");
+        // Normal agent: live cumulative snapshot 70/50.
+        h.services
+            .persist_turn_token_usage(&normal, &h.ws, &acp_usage(70, 50, 0, 0))
+            .await;
+        // Fallback agent: never reported end-of-turn usage; message sums only.
+        h.store
+            .append_agent_message(
+                &fallback,
+                "assistant",
+                &serde_json::json!({ "usage": { "inputTokens": 7, "outputTokens": 3 } }),
+                &now_iso(),
+            )
+            .await
+            .expect("append message");
+
+        // Live path.
+        h.services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        let live = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload")
+            .token_usage
+            .expect("usage persisted");
+        assert_eq!(live.by_agent_id[&recreated.0].input_tokens, 100);
+        assert_eq!(live.by_agent_id[&recreated.0].output_tokens, 80);
+        assert_eq!(live.by_agent_id[&normal.0].input_tokens, 70);
+        assert_eq!(live.by_agent_id[&fallback.0].input_tokens, 7);
+        assert_eq!(live.totals.input_tokens, 177);
+        assert_eq!(live.totals.output_tokens, 133);
+        assert_eq!(live.by_model["opus-4.8"].input_tokens, 170);
+        assert_eq!(live.by_model["sonnet-5"].input_tokens, 7);
+
+        // Scan/reconciliation path recomputes the same numbers (no change,
+        // no spurious event).
+        let mut sub = subscribe_usage(&h);
+        let changed = h
+            .services
+            .scan_workspace_token_usage(&h.ws)
+            .await
+            .expect("scan ok");
+        assert!(!changed, "scan agrees with the live tally");
+        assert!(
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
+            "no event when scan matches the live tally"
+        );
+        let scanned = h
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .expect("reload 2")
+            .token_usage
+            .expect("usage kept");
+        assert_eq!(scanned.totals, live.totals);
+        assert_eq!(scanned.by_agent_id, live.by_agent_id);
+        assert_eq!(scanned.by_model, live.by_model);
+    }
 }
