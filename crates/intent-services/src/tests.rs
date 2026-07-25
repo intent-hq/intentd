@@ -12065,7 +12065,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12174,7 +12174,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     branch: Some("exact/name".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12264,7 +12264,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12436,7 +12436,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12468,7 +12468,7 @@ mod worktree_provisioning {
         let svc = Services::new(store).with_workspaces_root(root.0.clone());
 
         let make = |prompt: &str| WorkspaceCreate {
-            skip_worktree: Some(true),
+            skip_isolation: Some(true),
             initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                 prompt: Some(prompt.to_string()),
                 ..Default::default()
@@ -12504,7 +12504,7 @@ mod worktree_provisioning {
         let svc = Services::new(store).with_workspaces_root(root.0.clone());
 
         let make = |prompt: &str| WorkspaceCreate {
-            skip_worktree: Some(true),
+            skip_isolation: Some(true),
             initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                 prompt: Some(prompt.to_string()),
                 ..Default::default()
@@ -12558,7 +12558,7 @@ mod worktree_provisioning {
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12586,7 +12586,7 @@ mod worktree_provisioning {
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12624,7 +12624,7 @@ mod worktree_provisioning {
                 WorkspaceCreate {
                     title: Some("My workspace".to_string()),
                     branch: Some("feat/wsjson".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12675,7 +12675,7 @@ mod worktree_provisioning {
                 WorkspaceCreate {
                     // Onboarding sends `title: ''` today; simulate that.
                     title: Some(String::new()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12721,7 +12721,7 @@ mod worktree_provisioning {
                 WorkspaceCreate {
                     // `title` field absent from the wire payload.
                     title: None,
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12749,7 +12749,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     title: Some("   \t  ".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12778,7 +12778,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     title: Some("My Explicit Title".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()

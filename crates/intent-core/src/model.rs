@@ -548,7 +548,13 @@ pub struct WorkspaceCreate {
     pub repository_name: Option<String>,
     pub worktree_path: Option<String>,
     pub scope: Option<String>,
-    pub skip_worktree: Option<bool>,
+    /// Opt out of the isolated checkout (worktree or CoW clone) and work
+    /// directly in the repository folder. Canonical wire name is
+    /// `skipIsolation`; `skipWorktree` is the deprecated pre-CoW alias
+    /// (either set ⇒ direct mode). The persisted column keeps its historical
+    /// `skip_worktree` name (`Workspace.skipWorktree`) — no DB migration.
+    #[serde(alias = "skipWorktree")]
+    pub skip_isolation: Option<bool>,
     pub setup_script: Option<String>,
     pub is_remote: Option<bool>,
     pub default_model: Option<String>,
@@ -3455,5 +3461,21 @@ mod tests {
         assert_eq!(bare.prompt.as_deref(), Some("p"));
         assert!(bare.specialist.is_none());
         assert!(bare.metadata.is_none());
+    }
+
+    #[test]
+    fn workspace_create_skip_isolation_accepts_both_wire_names() {
+        // PROTOCOL §5.1: `skipIsolation` is canonical; `skipWorktree` is the
+        // deprecated pre-CoW alias. Either set ⇒ direct mode.
+        let new_name: WorkspaceCreate =
+            serde_json::from_value(json!({ "skipIsolation": true })).unwrap();
+        assert_eq!(new_name.skip_isolation, Some(true));
+
+        let old_name: WorkspaceCreate =
+            serde_json::from_value(json!({ "skipWorktree": true })).unwrap();
+        assert_eq!(old_name.skip_isolation, Some(true));
+
+        let absent: WorkspaceCreate = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(absent.skip_isolation, None);
     }
 }

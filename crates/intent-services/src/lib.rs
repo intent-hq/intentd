@@ -7441,7 +7441,7 @@ impl WorkspaceApi for Services {
                         repository_name: input.repository_name,
                         worktree_path: input.worktree_path,
                         scope: input.scope,
-                        skip_worktree: input.skip_worktree.unwrap_or(false),
+                        skip_worktree: input.skip_isolation.unwrap_or(false),
                         setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
