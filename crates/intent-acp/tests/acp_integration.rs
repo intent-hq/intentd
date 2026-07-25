@@ -537,10 +537,13 @@ async fn happy_path_streams_chunk_then_end_turn() {
     );
     let sid = open_session(&s).await;
     let activity = session::ActivityTracker::new();
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("hi")], &activity)
+    let outcome = session::prompt(s.conn.as_ref(), &sid, vec![text_block("hi")], &activity)
         .await
         .expect("prompt resolves");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("end_turn")
+    );
     let note = recv_note(&mut s.notes).await;
     assert_eq!(chunk_text(&note), "Hello from the mock agent");
 }
@@ -586,8 +589,11 @@ async fn mid_turn_cancel_resolves_cancelled() {
         .await
         .expect("cancel notification sent");
 
-    let stop = task.await.unwrap().expect("prompt resolves");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("cancelled"));
+    let outcome = task.await.unwrap().expect("prompt resolves");
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("cancelled")
+    );
 }
 
 /// Drive the permission scenario, resolving the mediated prompt from "the UI"
@@ -622,8 +628,11 @@ async fn run_permission(option_id: &str) -> Value {
         "registry delivers the outcome to the waiting handler"
     );
 
-    let stop = task.await.unwrap().expect("prompt resolves");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    let outcome = task.await.unwrap().expect("prompt resolves");
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("end_turn")
+    );
     assert!(s
         .sink
         .types()
@@ -660,10 +669,13 @@ async fn fs_read_request_served_from_sandbox() {
     std::fs::write(s.root.join("data.txt"), "file data here").unwrap();
     let sid = open_session(&s).await;
     let activity = session::ActivityTracker::new();
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("read")], &activity)
+    let outcome = session::prompt(s.conn.as_ref(), &sid, vec![text_block("read")], &activity)
         .await
         .expect("prompt resolves");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("end_turn")
+    );
 
     let resp = s
         .mock
@@ -684,10 +696,13 @@ async fn oversized_stderr_truncated_and_terminal_stub() {
     );
     let sid = open_session(&s).await;
     let activity = session::ActivityTracker::new();
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")], &activity)
+    let outcome = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")], &activity)
         .await
         .expect("prompt resolves");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("end_turn")
+    );
 
     // `terminal/*` is a clean JSON-RPC "method not found" stub until M6.
     let resp = s
@@ -735,10 +750,13 @@ async fn malformed_frame_recovery_resyncs_on_newline() {
     );
     let sid = open_session(&s).await;
     let activity = session::ActivityTracker::new();
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("x")], &activity)
+    let outcome = session::prompt(s.conn.as_ref(), &sid, vec![text_block("x")], &activity)
         .await
         .expect("prompt resolves after garbage frame");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("end_turn")
+    );
     let note = recv_note(&mut s.notes).await;
     assert_eq!(chunk_text(&note), "recovered after garbage");
 }
@@ -889,10 +907,13 @@ async fn terminal_requests_run_on_real_pty_host() {
     );
     let sid = open_session(&s).await;
     let activity = session::ActivityTracker::new();
-    let stop = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")], &activity)
+    let outcome = session::prompt(s.conn.as_ref(), &sid, vec![text_block("term")], &activity)
         .await
         .expect("prompt resolves");
-    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    assert_eq!(
+        serde_json::to_value(outcome.stop_reason).unwrap(),
+        json!("end_turn")
+    );
 
     // create → the fresh host mints `pty-0`.
     let created = s

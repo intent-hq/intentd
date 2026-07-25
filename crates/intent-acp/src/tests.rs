@@ -311,7 +311,13 @@ mod session_tests {
 
     /// Mock agent that answers the session lifecycle methods and records every
     /// frame it received. `session/cancel` is a notification (no id) → no reply.
-    fn spawn_session_responder<R, W>(read: R, write: W) -> JoinHandle<Vec<Value>>
+    /// `prompt_result` is the JSON returned for `session/prompt` (tests vary it
+    /// to exercise the optional end-of-turn `usage` snapshot).
+    fn spawn_session_responder_with<R, W>(
+        read: R,
+        write: W,
+        prompt_result: Value,
+    ) -> JoinHandle<Vec<Value>>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -337,7 +343,7 @@ mod session_tests {
                     }
                     "session/new" => json!({ "sessionId": "acp-session-1" }),
                     "session/load" => json!({}),
-                    "session/prompt" => json!({ "stopReason": "end_turn" }),
+                    "session/prompt" => prompt_result.clone(),
                     _ => json!({}),
                 };
                 let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -352,9 +358,17 @@ mod session_tests {
     }
 
     fn connect_session() -> (Connection, JoinHandle<Vec<Value>>) {
+        connect_session_with_prompt_result(json!({ "stopReason": "end_turn" }))
+    }
+
+    /// Like [`connect_session`] but with a caller-supplied `session/prompt`
+    /// result payload.
+    fn connect_session_with_prompt_result(
+        prompt_result: Value,
+    ) -> (Connection, JoinHandle<Vec<Value>>) {
         let (c2a_client, c2a_agent) = tokio::io::duplex(8 * 1024);
         let (a2c_agent, a2c_client) = tokio::io::duplex(8 * 1024);
-        let responder = spawn_session_responder(c2a_agent, a2c_agent);
+        let responder = spawn_session_responder_with(c2a_agent, a2c_agent, prompt_result);
         let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
         (conn, responder)
     }
@@ -554,14 +568,69 @@ mod session_tests {
 
         let block = ContentBlock::Text(TextContent::new("hello"));
         let activity = session::ActivityTracker::new();
-        let stop = session::prompt(&conn, "acp-session-1", vec![block], &activity)
+        let outcome = session::prompt(&conn, "acp-session-1", vec![block], &activity)
             .await
             .expect("session/prompt resolves");
         assert_eq!(
-            serde_json::to_value(stop).unwrap(),
+            serde_json::to_value(outcome.stop_reason).unwrap(),
             json!("end_turn"),
             "stop reason round-trips as end_turn"
         );
+        assert!(
+            outcome.usage.is_none(),
+            "no usage field in the response → usage is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_captures_end_of_turn_usage_snapshot() {
+        let (conn, _responder) = connect_session_with_prompt_result(json!({
+            "stopReason": "end_turn",
+            "usage": {
+                "totalTokens": 120,
+                "inputTokens": 70,
+                "outputTokens": 50,
+                "thoughtTokens": 8,
+                "cachedReadTokens": 30,
+                "cachedWriteTokens": 4
+            }
+        }));
+        let block = ContentBlock::Text(TextContent::new("hello"));
+        let activity = session::ActivityTracker::new();
+        let outcome = session::prompt(&conn, "acp-session-1", vec![block], &activity)
+            .await
+            .expect("session/prompt resolves");
+        assert_eq!(
+            serde_json::to_value(outcome.stop_reason).unwrap(),
+            json!("end_turn")
+        );
+        let usage = outcome.usage.expect("usage snapshot parsed");
+        assert_eq!(usage.total_tokens, 120);
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.thought_tokens, Some(8));
+        assert_eq!(usage.cached_read_tokens, Some(30));
+        assert_eq!(usage.cached_write_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn prompt_with_malformed_usage_yields_none() {
+        // The schema deserializes `usage` best-effort (`DefaultOnError`), so a
+        // malformed payload degrades to None instead of failing the turn.
+        let (conn, _responder) = connect_session_with_prompt_result(json!({
+            "stopReason": "end_turn",
+            "usage": { "totalTokens": "not-a-number" }
+        }));
+        let block = ContentBlock::Text(TextContent::new("hello"));
+        let activity = session::ActivityTracker::new();
+        let outcome = session::prompt(&conn, "acp-session-1", vec![block], &activity)
+            .await
+            .expect("session/prompt resolves despite malformed usage");
+        assert_eq!(
+            serde_json::to_value(outcome.stop_reason).unwrap(),
+            json!("end_turn")
+        );
+        assert!(outcome.usage.is_none(), "malformed usage degrades to None");
     }
 
     #[tokio::test]

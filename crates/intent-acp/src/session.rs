@@ -44,7 +44,7 @@ use crate::IncomingNotification;
 // directly (§3.2 keeps that crate an `intent-acp` implementation detail).
 pub use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, Meta, NewSessionResponse,
-    SessionMode, SessionModeState, SessionUpdate, StopReason,
+    SessionMode, SessionModeState, SessionUpdate, StopReason, Usage,
 };
 
 /// Timeout for session setup requests (`session/new`, `session/load`). Generous
@@ -162,8 +162,22 @@ pub async fn load_session(
         .map_err(|e| AcpError::Protocol(format!("invalid session/load response: {e}")))
 }
 
+/// Outcome of a completed `session/prompt` turn: why the agent stopped plus
+/// the end-of-turn token-usage snapshot when the agent reports one (the
+/// `unstable_end_turn_token_usage` extension; counts are cumulative per ACP
+/// session). `usage` is `None` when the agent omits the field or sends a
+/// malformed payload (the schema deserializes it best-effort to `None`).
+#[derive(Debug, Clone)]
+pub struct PromptOutcome {
+    /// Why the agent stopped processing the turn (§6.5).
+    pub stop_reason: StopReason,
+    /// Cumulative-per-session token usage reported at end of turn, if any.
+    pub usage: Option<Usage>,
+}
+
 /// `session/prompt` with the user content blocks → drives a turn; the agent
-/// streams `session/update`s then returns a [`StopReason`] (§6.5).
+/// streams `session/update`s then returns a [`PromptOutcome`] carrying the
+/// [`StopReason`] and optional end-of-turn usage snapshot (§6.5).
 ///
 /// Uses an activity-based idle timeout: the turn times out only after a
 /// sustained period of silence (no `session/update` traffic). The caller must
@@ -174,7 +188,7 @@ pub async fn prompt(
     session_id: &str,
     prompt: Vec<ContentBlock>,
     activity: &ActivityTracker,
-) -> AcpResult<StopReason> {
+) -> AcpResult<PromptOutcome> {
     let request = PromptRequest::new(SessionId::new(session_id), prompt);
     let params = serde_json::to_value(&request)?;
     let idle_window = prompt_idle_timeout();
@@ -195,7 +209,10 @@ pub async fn prompt(
                 let result = res?;
                 let response: PromptResponse = serde_json::from_value(result)
                     .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
-                return Ok(response.stop_reason);
+                return Ok(PromptOutcome {
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                });
             }
             _ = tokio::time::sleep(poll_interval) => {
                 let idle = Duration::from_millis(activity.idle_ms());

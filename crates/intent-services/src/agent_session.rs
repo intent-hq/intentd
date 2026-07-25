@@ -797,6 +797,9 @@ impl Services {
         for attachment in self.turn_attachments.finish_turn(agent_id) {
             transcript.push_block(attachment.resource_item());
         }
+        // Reduce the PromptOutcome to its stop reason; the end-of-turn usage
+        // snapshot is not persisted here yet (usage persistence is a follow-up).
+        let result = result.map(|outcome| outcome.stop_reason);
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
