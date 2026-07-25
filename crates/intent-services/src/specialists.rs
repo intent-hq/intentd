@@ -216,6 +216,13 @@ const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
 /// True when a frontmatter/spec value marks the specialist as hidden: the
 /// frontmatter parser yields a string (matched case-insensitively so YAML-style
 /// `true`/`True`/`TRUE` all count), while wire specs carry the JSON boolean.
+///
+/// Accepted forms, intentionally:
+/// - The string arm also applies to wire specs, so a JSON string `"true"` on
+///   `specialist.create`/`edit` counts as hidden even though PROTOCOL §5.11
+///   declares `hidden?: boolean` (deliberately liberal in what we accept).
+/// - YAML 1.1 truthy spellings (`yes`, `on`, `1`) are **not** recognized —
+///   only case-insensitive `true`. A hand-edited `hidden: yes` stays visible.
 fn is_hidden(value: Option<&Value>) -> bool {
     match value {
         Some(Value::Bool(b)) => *b,

@@ -427,6 +427,36 @@ async fn specialist_full_frontmatter_wire_parity() {
         "edit round-trips hidden"
     );
 
+    // edit — a spec that omits hidden unhides (omit ⇒ unhide: the written
+    // file is the source of truth, no merge with the previous def).
+    let edited = ok(
+        &mut w,
+        &mut r,
+        6,
+        "specialist.edit",
+        json!({ "id": "ralph2", "scope": "user", "spec": {
+            "id": "ralph2", "name": "Ralph II",
+            "description": "Loops again",
+            "prompt": "Edited body." } }),
+    )
+    .await;
+    assert!(
+        edited["specialist"].get("hidden").is_none(),
+        "edit omitting hidden drops the flag"
+    );
+    let got = ok(
+        &mut w,
+        &mut r,
+        7,
+        "specialist.get",
+        json!({ "id": "ralph2" }),
+    )
+    .await;
+    assert!(
+        got["specialist"].get("hidden").is_none(),
+        "subsequent get confirms omit ⇒ unhide"
+    );
+
     h.shutdown().await;
 }
 
