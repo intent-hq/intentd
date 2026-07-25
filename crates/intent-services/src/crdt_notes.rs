@@ -58,9 +58,10 @@ impl CrdtNoteManager {
     /// Lock the session map, recovering from poisoning. The map is a
     /// session-only cache of best-effort merge state (never persisted). A
     /// panic inside `apply_full_content` can leave a session entry behind with
-    /// a partially-committed transaction, but that state self-heals on the
-    /// next full-content write: `apply_diff` diffs against whatever the doc
-    /// currently holds and converges it to the incoming content.
+    /// a partially-applied edit (committed when the transaction unwinds), but
+    /// that state self-heals on the next full-content write: `apply_diff`
+    /// diffs against whatever the doc currently holds and converges it to the
+    /// incoming content.
     fn lock_sessions(&self) -> MutexGuard<'_, HashMap<(WorkspaceId, NoteId), Session>> {
         self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -440,6 +441,21 @@ mod tests {
         let step_2 = "notes 世界 \u{1FA00} tail 🌍!";
         let after_2 = mgr.apply_full_content(&ws, &note, step_1, step_2);
         assert_eq!(after_2, step_2);
+    }
+
+    #[test]
+    fn surrogate_pair_edit_triggering_both_backoffs_in_one_diff() {
+        // Regression (monorepo#730): a single diff whose prefix trim stops
+        // inside the leading pair (shared high surrogate) AND whose suffix
+        // trim stops inside the trailing pair (shared low surrogate), so both
+        // back-offs fire in one hunk.
+        let mgr = CrdtNoteManager::new();
+        let (ws, note) = ids();
+        let base = "\u{1F600} x \u{1FA00}";
+        let target = "\u{1F601} x \u{1F600}";
+        mgr.apply_full_content(&ws, &note, base, base);
+        let after = mgr.apply_full_content(&ws, &note, base, target);
+        assert_eq!(after, target);
     }
 
     #[test]
