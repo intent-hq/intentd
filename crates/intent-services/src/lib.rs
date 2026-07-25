@@ -10680,21 +10680,13 @@ impl WorkspaceApi for Services {
                     // client instead of minting a second, never-reconciled id.
                     // Validated inside the idempotency scope so a replayed key
                     // still returns the cached result before these checks fire.
+                    let client_supplied_id = comment_id.is_some();
                     let comment_id = match comment_id {
                         Some(supplied) => {
                             if uuid::Uuid::parse_str(&supplied).is_err() {
                                 return Err(Error::InvalidParams(format!(
                                     "Invalid 'commentId': {supplied}. Must be a valid UUID."
                                 )));
-                            }
-                            match store.get_comment(&supplied).await {
-                                Ok(_) => {
-                                    return Err(Error::InvalidParams(format!(
-                                        "Invalid 'commentId': {supplied}. A comment with this id already exists."
-                                    )))
-                                }
-                                Err(Error::NotFound(_)) => {}
-                                Err(e) => return Err(e),
                             }
                             supplied
                         }
@@ -10768,7 +10760,19 @@ impl WorkspaceApi for Services {
                     // atomically: a failure can never leave markers embedded
                     // with no comment row (monorepo#638). The returned rev is
                     // the authoritative post-rewrite value echoed to clients.
-                    let note_rev = store.update_note_with_comment(&note, &new_comment).await?;
+                    // Duplicate-id detection rides the INSERT's PK constraint
+                    // inside that same transaction (no TOCTOU pre-check), so a
+                    // colliding client-supplied `commentId` is InvalidParams
+                    // even when two adds race.
+                    let note_rev = match store.update_note_with_comment(&note, &new_comment).await {
+                        Ok(rev) => rev,
+                        Err(Error::InvalidInput(_)) if client_supplied_id => {
+                            return Err(Error::InvalidParams(format!(
+                                "Invalid 'commentId': {comment_id}. A comment with this id already exists."
+                            )))
+                        }
+                        Err(e) => return Err(e),
+                    };
                     services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
                         note.workspace_id.clone(),
