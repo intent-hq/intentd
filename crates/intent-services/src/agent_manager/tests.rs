@@ -62,7 +62,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// guard: constructing a second before the first drops deadlocks the test
 /// thread. Mutate every var (sets AND unsets) through a single
 /// [`EnvGuard::apply`] call instead.
-struct EnvGuard {
+pub(super) struct EnvGuard {
     saved: Vec<(&'static str, Option<String>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -77,7 +77,7 @@ impl EnvGuard {
 
     /// Apply every `(key, value)` mutation under one guard: `Some(v)` sets
     /// the var, `None` unsets it. Prior values are restored on drop.
-    fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
+    pub(super) fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
         let lock = Self::acquire();
         let mut saved = Vec::new();
         for (key, value) in pairs {

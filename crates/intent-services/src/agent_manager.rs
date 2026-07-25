@@ -5946,7 +5946,20 @@ mod dead_child_respawn_tests {
     //! (`Connection::is_alive`) is unit-tested in `intent-acp`.
 
     use super::role_reminder_tests::{manager_with, session};
+    use super::tests::EnvGuard;
     use super::*;
+
+    /// Pin the mock provider's env for one test: set the fixture script path
+    /// and unset the behavior knobs so a spawned child can't inherit
+    /// exit-inducing behavior leaked by a concurrently guarded test (the
+    /// guard also holds `ENV_LOCK`, serializing all env-mutating tests).
+    fn mock_env(script: &str) -> EnvGuard {
+        EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(script)),
+            ("MOCK_AGENT_BEHAVIOR", None),
+            ("MOCK_AGENT_ATTEMPT_FILE", None),
+        ])
+    }
 
     /// Path to the deterministic mock ACP agent fixture (the node E2E mock),
     /// reused here so the respawn fall-through spawns a real child.
@@ -6010,7 +6023,8 @@ mod dead_child_respawn_tests {
     /// RPC would fail the turn).
     #[tokio::test]
     async fn reuses_cached_session_when_child_alive() {
-        std::env::set_var("MOCK_AGENT_SCRIPT_PATH", mock_agent_script());
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
         let (mgr, _seeded) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-alive");
         seed_mock_session(&mgr, &agent_id, "acp-cached").await;
@@ -6032,7 +6046,8 @@ mod dead_child_respawn_tests {
     /// recreates.
     #[tokio::test]
     async fn respawns_when_cached_child_is_dead() {
-        std::env::set_var("MOCK_AGENT_SCRIPT_PATH", mock_agent_script());
+        let script = mock_agent_script();
+        let _env = mock_env(&script);
         let (mgr, _seeded) = manager_with(None, None).await;
         let agent_id = AgentId::from("agent-764-dead");
         seed_mock_session(&mgr, &agent_id, "acp-stale").await;
