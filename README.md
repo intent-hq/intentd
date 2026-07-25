@@ -70,11 +70,13 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 ## Install
 
 Installing intentd installs the **sitter** — a small self-updating supervisor shim,
-packaged and named `intentd` (built from `crates/intentd-sitter`). On first run it
-downloads the real daemon from the per-channel release manifests (**stable** by default),
-checks for updates at startup and then every 12–24 hours, forwards **all** CLI args to
-the daemon verbatim, and respawns the daemon if it crashes. You never install the daemon
-binary directly.
+packaged and named `intentd` (built from `crates/intentd-sitter`). On the first `serve`
+it downloads the real daemon from the per-channel release manifests (**stable** by
+default), checks for updates at startup and then every 12–24 hours, forwards **all** CLI
+args to the daemon verbatim, and respawns the daemon if it crashes. Update checks happen
+only for `intentd serve`; one-shot subcommands (`doctor`, `status`, `stop`, `call`, …)
+run the already-installed daemon immediately without checking for or installing updates.
+You never install the daemon binary directly.
 
 > **Note:** the install commands below download artifacts from public GitHub Release
 > URLs, so they require this repository (and `intent-hq/homebrew-tap`) to be **public**.
@@ -138,14 +140,20 @@ else (e.g. `serve`, `--resume-all`, `--version`) goes to the daemon verbatim.
 
 ### How updates work
 
-- The sitter checks the channel manifest at startup and then on a randomized 12–24 h
-  cadence; when a newer daemon version lands it downloads, sha256-verifies, and installs
-  it atomically, then restarts the daemon on the new version.
+- On `intentd serve` the sitter checks the channel manifest at startup and then on a
+  randomized 12–24 h cadence; when a newer daemon version lands it downloads,
+  sha256-verifies, and installs it atomically, then restarts the daemon on the new
+  version.
+- One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
+  install updates: they run the already-installed daemon directly. If no daemon is
+  installed yet, they fail fast with guidance to start it first (`intentd serve` or
+  `brew services start intentd`) so it gets installed.
 - Sitter state lives under `<data-dir>/sitter/` (`versions/<version>/intentd`,
   `state.json`, `tmp/`). The current and previous daemon versions are kept; older ones
   are pruned.
-- If an update check fails (e.g. offline), the sitter falls back to the last installed
-  daemon; only a first run with nothing installed and no network exits with an error.
+- If a `serve` update check fails (e.g. offline), the sitter falls back to the last
+  installed daemon; only a first `serve` with nothing installed and no network exits
+  with an error.
 
 ## Quickstart
 

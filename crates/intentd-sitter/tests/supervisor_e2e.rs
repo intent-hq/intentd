@@ -34,23 +34,33 @@ const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
 const FAKE_DAEMON_LOG: &str = "FAKE_DAEMON_LOG";
 
 type Routes = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+type RequestLog = Arc<Mutex<Vec<String>>>;
 
 /// Minimal HTTP/1.1 fixture server over swappable routes: tests mutate the
 /// map mid-run to publish a "new release".
 fn serve(routes: Routes) -> String {
+    serve_recording(routes).0
+}
+
+/// [`serve`] plus a log of every request path received, so tests can assert
+/// the sitter made (or did not make) HTTP requests.
+fn serve_recording(routes: Routes) -> (String, RequestLog) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let server_log = Arc::clone(&log);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let routes = Arc::clone(&routes);
-            thread::spawn(move || handle(stream, &routes));
+            let log = Arc::clone(&server_log);
+            thread::spawn(move || handle(stream, &routes, &log));
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), log)
 }
 
-fn handle(mut stream: TcpStream, routes: &Routes) {
+fn handle(mut stream: TcpStream, routes: &Routes, log: &RequestLog) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -64,6 +74,7 @@ fn handle(mut stream: TcpStream, routes: &Routes) {
         }
     }
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+    log.lock().unwrap().push(path.to_string());
     let (status, body) = match routes.lock().unwrap().get(path) {
         Some(body) => ("200 OK", body.clone()),
         None => ("404 Not Found", b"not found".to_vec()),
@@ -247,7 +258,7 @@ fn forwards_args_verbatim_and_clean_exit_passes_through() {
         MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
-    let base_url = serve(routes);
+    let (base_url, requests) = serve_recording(routes);
 
     // No timing overrides: the persisted schedule must use the real 12–24h
     // jitter window (the sitter exits with the one-shot child long before).
@@ -269,6 +280,13 @@ fn forwards_args_verbatim_and_clean_exit_passes_through() {
     assert_eq!(
         read_or_empty(&daemon_log_path(dir.path())),
         "serve\n--resume-all\n--weird-flag=x y\n-v\npositional arg\n"
+    );
+
+    // `serve` performs the startup update check.
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        [MANIFEST_PATH.to_string()],
+        "serve must fetch the channel manifest exactly once at startup"
     );
 
     let state = state::load(&paths.state_path);
@@ -456,6 +474,150 @@ fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
     assert_eq!(runs, 1, "one-shot subcommands must run exactly once");
     let stderr = read_or_empty(&stderr_path(dir.path()));
     assert!(!stderr.contains("respawning"), "stderr: {stderr}");
+}
+
+/// Routes serving a fully installable 0.2.0 release (manifest + archive):
+/// a one-shot must never even ask for it.
+fn routes_with_release(base_url: &str, version: &str) -> (String, Vec<u8>, Vec<u8>) {
+    let archive = make_tar_xz(args_dump_script().as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    let manifest = manifest_json(version, base_url, &asset, &sha);
+    (asset, archive, manifest)
+}
+
+#[test]
+fn one_shot_with_installed_version_never_touches_the_updater() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &args_dump_script());
+
+    // A reachable manifest server offering a newer release: the one-shot
+    // must make zero HTTP requests, install nothing, and leave state.json
+    // untouched.
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+    let (asset, archive, manifest) = routes_with_release(&base_url, "0.2.0");
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(MANIFEST_PATH.to_string(), manifest);
+    }
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .args(["doctor", "--verbose"])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(
+        read_or_empty(&daemon_log_path(dir.path())),
+        "doctor\n--verbose\n"
+    );
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[] as &[String],
+        "one-shot must not make any HTTP requests"
+    );
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.current_version.as_deref(), Some("0.1.0"));
+    assert!(
+        state.last_check_at.is_none(),
+        "state.json must not be rewritten"
+    );
+    assert!(
+        state.next_check_at.is_none(),
+        "state.json must not be rewritten"
+    );
+    assert!(
+        !paths.daemon_binary("0.2.0").exists(),
+        "one-shot must not install"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        !stderr.contains("note: channel"),
+        "no channel-mismatch notice when channels match; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn one_shot_channel_mismatch_warns_and_runs_installed_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // preinstall records channel `stable` in state.json.
+    preinstall(&paths, "0.1.0", &args_dump_script());
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(routes);
+
+    // The channel flag only governs updater behavior, which one-shots don't
+    // have: a mismatch prints a notice but still runs the installed daemon.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .args(["--sitter-channel=beta", "doctor"])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(read_or_empty(&daemon_log_path(dir.path())), "doctor\n");
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[] as &[String],
+        "one-shot must not make any HTTP requests"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains(
+            "note: channel beta requested but the installed daemon was installed \
+             from channel stable"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn one_shot_with_nothing_installed_fails_fast_without_installing() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+
+    // A reachable server could bootstrap-install, but a one-shot must fail
+    // fast with guidance instead. Empty passthrough args are also one-shot.
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+    let (asset, archive, manifest) = routes_with_release(&base_url, "0.2.0");
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(MANIFEST_PATH.to_string(), manifest);
+    }
+
+    let mut sitter = sitter_command(dir.path(), &base_url).spawn().unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(1), "expected a non-zero fail-fast exit");
+
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("no intentd daemon is installed for channel stable"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("intentd serve"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("brew services start intentd"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[] as &[String],
+        "one-shot must not make any HTTP requests"
+    );
+    assert!(
+        !daemon_log_path(dir.path()).exists(),
+        "no daemon must have run"
+    );
+    assert!(
+        !paths.daemon_binary("0.2.0").exists(),
+        "one-shot must not install"
+    );
 }
 
 #[test]
