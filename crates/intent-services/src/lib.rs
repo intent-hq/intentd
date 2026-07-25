@@ -1587,7 +1587,11 @@ impl Services {
     /// re-reading the workspace row — on every call: the background sweep
     /// resolves the provider once per cycle and passes each workspace from its
     /// sweep-start `list_workspaces` snapshot (avoiding a redundant per-workspace
-    /// point read, intent-hq/monorepo#703).
+    /// point read, intent-hq/monorepo#703). Accepted tradeoff: when a PR delta
+    /// is persisted, `update_workspace` writes back the (possibly stale)
+    /// snapshot row, so concurrent workspace mutations made after the snapshot
+    /// was taken can be clobbered — callers who need fresh-read semantics must
+    /// fetch immediately before calling (as [`refresh_workspace_pr`] does).
     async fn refresh_workspace_pr_with_sc(
         &self,
         mut ws: Workspace,
