@@ -20,7 +20,7 @@ jobs:
     steps:
       # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
       # this job's target dir stays small; the stock ~16G headroom is plenty.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -77,7 +77,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -127,7 +127,7 @@ jobs:
         run: |
           sudo -n true
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -183,7 +183,7 @@ jobs:
         run: |
           sudo -n true
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup >/dev/null 2>&1 &
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -247,7 +247,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Assert systemd user unit content
         run: |
           unit=packaging/deb/intentd.service
