@@ -3179,9 +3179,16 @@ impl Services {
             use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
             let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
-                // Only direct-mode workspaces (no worktree or skip_worktree=true)
-                let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
-                if is_direct_mode && ws.repository_path.is_some() {
+                // Sandbox-eligible: direct-mode workspaces (no worktree or
+                // skip_worktree=true; sandbox sourced from the user's repo folder)
+                // and CoW-checkout workspaces (sourced from the workspace
+                // checkout). Worktree-mode workspaces keep the shared checkout
+                // (no sandbox).
+                let is_direct_mode = (ws.skip_worktree || ws.worktree_path.is_none())
+                    && ws.repository_path.is_some();
+                let is_cow_checkout = ws.checkout_mode == Some(intent_core::CheckoutMode::Cow)
+                    && ws.worktree_path.is_some();
+                if is_direct_mode || is_cow_checkout {
                     if let Some(root) = self.workspaces_root.clone() {
                         let config = ProvisionConfig {
                             workspaces_root: root,

@@ -15855,9 +15855,10 @@ impl WorkspaceApi for Services {
     }
 }
 
-/// Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode workspaces).
+/// Sandbox provisioning and lifecycle for CoW agent isolation (direct-mode and
+/// CoW-checkout workspaces).
 impl Services {
-    /// Provision a sandbox for an agent in a direct-mode workspace.
+    /// Provision a sandbox for an agent in a direct-mode or CoW-checkout workspace.
     /// Returns `ProvisionOutcome::Supported` if CoW is available, or `Unsupported` for fallback.
     pub async fn provision_sandbox(
         &self,
