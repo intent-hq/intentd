@@ -2945,26 +2945,12 @@ const LAST_ACTIVITY_DEBOUNCE_MS: u64 = 3000;
 /// `agent_activity_begin` within the window cancels it (no idle/running event pair).
 const WORKSPACE_IDLE_DEBOUNCE_MS: u64 = 3000;
 
-/// Conservative allowlist of remote names whose first path segment may be
-/// stripped when canonicalising a workspace `baseRef` on write. Mirrors the
-/// FE `baseref-matching.ts` allowlist so a persisted `baseRef` compares raw-
-/// equal to a PR `sourceBranch` (§7.6). Slashed local branches like
-/// `feature/foo` are never stripped.
-const CANONICAL_BASE_REF_REMOTES: &[&str] = &["origin/", "upstream/", "fork/"];
-
-/// Strip a known remote prefix (`origin/`, `upstream/`, `fork/`) from a raw
-/// `baseRef` string, returning the canonical plain branch name. Values without
-/// a known prefix, and empty stripped remainders, are returned unchanged.
-fn canonicalise_base_ref(raw: &str) -> String {
-    for prefix in CANONICAL_BASE_REF_REMOTES {
-        if let Some(rest) = raw.strip_prefix(prefix) {
-            if !rest.is_empty() {
-                return rest.to_string();
-            }
-        }
-    }
-    raw.to_string()
-}
+/// Re-export of the shared `baseRef` canonicalisation (allowlist prefix
+/// strip, `intent_git::refs`) used by the write path here and the propose-time
+/// validation in `intent-acp` — one definition so both sides agree (§7.6,
+/// monorepo#761). See `intent_git::refs::CANONICAL_BASE_REF_REMOTES` for the
+/// allowlist.
+pub(crate) use intent_git::refs::canonicalise_base_ref;
 
 /// Build a `line-attribution:updated` change event with the FE-parity payload
 /// `{ workspaceId, noteId, attributions }` (`line-attribution.service.ts`

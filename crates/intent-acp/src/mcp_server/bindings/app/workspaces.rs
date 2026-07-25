@@ -753,19 +753,31 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
     // because of validation. Apply-time worktree provisioning stays the
     // enforcement point.
     let mut warnings: Vec<String> = Vec::new();
+    // The default branch actually resolved from the local repo (not the
+    // static `main` fallback); written back into the payload below so
+    // applying the proposal provisions from the same branch the preview
+    // shows instead of whatever HEAD happens to be.
+    let mut resolved_default_branch: Option<String> = None;
     let local_repo = fields
         .repo_path
         .clone()
         .filter(|p| std::path::Path::new(p).exists());
     match (fields.branch.clone(), local_repo) {
-        // Explicit branch + local repo: resolve with the exact 3-spec order
-        // apply-time `provision_worktree` uses. Unresolvable → warn, keep the
-        // proposed value in the preview so the FE can show what the agent
-        // asked for and preselect the default branch in the dialog.
+        // Explicit branch + local repo: apply-time canonicalises the wire
+        // `baseRef` (allowlist remote-prefix strip) before `provision_worktree`
+        // resolves it with the 3-spec order against `input.remote` (default
+        // `origin`) — mirror both steps here so propose-time and apply-time
+        // agree on what "resolvable" means.
         (Some(branch), Some(repo_path)) => {
-            let (b, p) = (branch.clone(), repo_path.clone());
+            let canonical = intent_git::refs::canonicalise_base_ref(&branch);
+            let remote = string_value(&params, "remote").unwrap_or_else(|| "origin".to_string());
+            let p = repo_path.clone();
             let resolved = tokio::task::spawn_blocking(move || {
-                intent_git::worktree::base_ref_resolves(std::path::Path::new(&p), &b, "origin")
+                intent_git::worktree::base_ref_resolves(
+                    std::path::Path::new(&p),
+                    &canonical,
+                    &remote,
+                )
             })
             .await;
             if matches!(resolved, Ok(Ok(false))) {
@@ -783,7 +795,10 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
             })
             .await;
             fields.branch = Some(match default {
-                Ok(Ok(name)) => name,
+                Ok(Ok(name)) => {
+                    resolved_default_branch = Some(name.clone());
+                    name
+                }
                 _ => "main".to_string(),
             });
         }
@@ -811,6 +826,16 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
     }
     if let Some(path) = &fields.clone_path {
         payload_params.insert("clonePath".to_string(), json!(path));
+    }
+    // Write the repo-resolved default branch back as `baseRef` (the wire key
+    // the FE apply path also maps the dialog's branch into) so a direct
+    // payload apply provisions from the branch the preview shows, not from
+    // whatever HEAD the checkout happens to be on. The static `main` fallback
+    // is intentionally NOT written back: it is a display guess, and forcing it
+    // into the payload could turn a working HEAD-based apply into a failure
+    // when no `main` exists.
+    if let Some(branch) = &resolved_default_branch {
+        payload_params.insert("baseRef".to_string(), json!(branch));
     }
 
     // `warnings` is the optional `preview.warnings?: string[]` of the TS
@@ -1667,10 +1692,44 @@ mod tests {
         let proposal = create_proposal(json!({ "repositoryPath": repo.path_str() })).await;
 
         // Empty branch → the repo's actual default branch, not hardcoded
-        // `main`; defaulting is not a warning.
+        // `main`; defaulting is not a warning. The resolved default is also
+        // written back into the payload as `baseRef` so a direct payload
+        // apply provisions from the branch the preview shows, not from
+        // whatever HEAD happens to be.
         let fields = preview_fields(&proposal);
         assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "trunk");
         assert!(preview_warnings(&proposal).is_none());
+        assert_eq!(
+            payload_params(&proposal)
+                .get("baseRef")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "trunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_validation_canonicalises_like_apply_time() {
+        // Apply-time strips allowlisted remote prefixes (`origin/` etc.) via
+        // canonicalise_base_ref before resolving; propose-time must probe the
+        // same canonical value so `origin/trunk` never warns when `trunk`
+        // resolves.
+        let repo = TempRepo::init("canon", "trunk");
+        let proposal = create_proposal(json!({
+            "repositoryPath": repo.path_str(),
+            "branch": "origin/trunk"
+        }))
+        .await;
+        assert!(preview_warnings(&proposal).is_none());
+
+        // Non-allowlisted first segments are not stripped: still a warning.
+        let proposal = create_proposal(json!({
+            "repositoryPath": repo.path_str(),
+            "branch": "feature/trunk"
+        }))
+        .await;
+        assert!(preview_warnings(&proposal).is_some());
     }
 
     #[tokio::test]
@@ -1698,11 +1757,13 @@ mod tests {
         assert!(preview_warnings(&proposal).is_none());
 
         // Same dir with an empty branch: default-branch lookup fails →
-        // static `main` fallback.
+        // static `main` fallback, which stays a display guess: it is NOT
+        // written back into the payload as `baseRef`.
         let proposal = create_proposal(json!({ "repositoryPath": plain.path_str() })).await;
         let fields = preview_fields(&proposal);
         assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "main");
         assert!(preview_warnings(&proposal).is_none());
+        assert!(payload_params(&proposal).get("baseRef").is_none());
     }
 
     #[tokio::test]
