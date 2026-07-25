@@ -104,6 +104,9 @@ impl WorkspaceApi for FakeApi {
         _idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<intent_core::WorkspaceCreateResult>> {
         Box::pin(async move {
+            if let Some(base_ref) = input.base_ref.filter(|r| r == "no-such-ref") {
+                return Err(Error::BaseRefUnresolvable { base_ref });
+            }
             let mut ws = sample_ws();
             if let Some(t) = input.title {
                 ws.title = t;
@@ -1922,6 +1925,27 @@ async fn domain_not_found_maps_to_minus_32602() {
             .await
             .unwrap();
     assert_eq!(err_code(&v), -32602);
+}
+
+#[tokio::test]
+async fn workspace_create_base_ref_unresolvable_maps_to_minus_32602_with_data() {
+    // An unresolvable base ref on `workspace.create` keeps the -32602 code and
+    // the exact human message, and gains machine-readable `error.data`
+    // (monorepo#761).
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":3,"method":"workspace.create","params":{"repositoryPath":"/tmp/repo","baseRef":"no-such-ref"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["message"],
+        serde_json::json!("invalid params: cannot resolve base ref 'no-such-ref'")
+    );
+    assert_eq!(
+        v["error"]["data"],
+        serde_json::json!({ "code": "base-ref-unresolvable", "baseRef": "no-such-ref" })
+    );
 }
 
 #[tokio::test]

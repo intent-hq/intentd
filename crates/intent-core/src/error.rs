@@ -34,13 +34,24 @@ pub enum Error {
     /// Invalid input provided to an operation (e.g., file already exists, path doesn't exist).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// A workspace base ref could not be resolved during checkout
+    /// provisioning. Surfaces as `-32602` with the same human message as the
+    /// plain `InvalidParams` shape plus machine-readable
+    /// `error.data = { code: "base-ref-unresolvable", baseRef }` so clients
+    /// stop matching on prose (monorepo#761).
+    #[error("invalid params: cannot resolve base ref '{base_ref}'")]
+    BaseRefUnresolvable { base_ref: String },
 }
 
 impl Error {
     /// JSON-RPC 2.0 numeric error code for this error (PROTOCOL §9).
     pub fn code(&self) -> i32 {
         match self {
-            Error::InvalidParams(_) | Error::NotFound(_) | Error::InvalidInput(_) => -32602,
+            Error::InvalidParams(_)
+            | Error::NotFound(_)
+            | Error::InvalidInput(_)
+            | Error::BaseRefUnresolvable { .. } => -32602,
             Error::Internal(_) => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now

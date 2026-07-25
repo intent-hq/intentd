@@ -12601,7 +12601,9 @@ mod worktree_provisioning {
             )
             .await
             .expect_err("create must fail");
-        assert!(matches!(err, Error::InvalidParams(_)));
+        assert!(
+            matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "no-such-ref")
+        );
     }
 
     /// `skipWorktree`, non-git `repositoryPath`, and a caller-supplied

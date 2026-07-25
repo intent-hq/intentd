@@ -50,6 +50,14 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Conflict".to_string(),
             data: Some(json!({ "code": "conflict", "current": current })),
         },
+        // Unresolvable base ref during checkout provisioning: same -32602 code
+        // and human message as before, plus machine-readable data so clients
+        // stop matching on prose (monorepo#761).
+        ref e @ Error::BaseRefUnresolvable { ref base_ref } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
