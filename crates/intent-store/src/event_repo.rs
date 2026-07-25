@@ -161,21 +161,11 @@ impl Store {
         }
         .await;
 
-        match result {
-            Ok(_) => {
-                // Rollback (and detach+close on double failure) if the COMMIT
-                // itself fails, so the sole write-pool connection is never
-                // returned holding an open transaction (monorepo#670).
-                crate::commit_with_rollback_guard(conn, "commit failed").await?;
-            }
-            Err(e) => {
-                // Roll back the failed body; detach+close on a failed
-                // ROLLBACK so a poisoned connection is never returned to
-                // the pool (monorepo#680).
-                crate::rollback_or_poison(conn).await;
-                return Err(e);
-            }
-        }
+        // COMMIT on success (with rollback, and detach+close on double
+        // failure, if the COMMIT itself fails — monorepo#670) or roll back
+        // the failed body (monorepo#680), so the sole write-pool connection
+        // is never returned holding an open transaction.
+        crate::commit_with_rollback_guard(conn, result, "commit failed").await?;
 
         // Reconstruct Event structs in insertion order.
         let mut result = Vec::with_capacity(events.len());

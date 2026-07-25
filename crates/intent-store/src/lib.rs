@@ -100,33 +100,48 @@ where
 /// replacement on demand.
 ///
 /// Takes the connection by value: the transaction is over either way, and
-/// the detach path consumes it.
-pub(crate) async fn rollback_or_poison(mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
+/// the detach path consumes it. Implementation detail of
+/// [`commit_with_rollback_guard`] — call that instead (monorepo#716).
+async fn rollback_or_poison(mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
     use sqlx::Connection;
     if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
         let _ = conn.detach().close().await;
     }
 }
 
-/// COMMIT the transaction open on `conn`, guarding against a failed COMMIT
-/// (monorepo#638 / #657 / #670): a failed COMMIT can leave the transaction
-/// open on the pooled connection, so roll back explicitly so the connection
-/// is not returned to the pool still holding the write lock (with
-/// detach+close on a failed ROLLBACK, via [`rollback_or_poison`]). On
-/// failure returns `Error::Internal` with the message
-/// `"{context}: {commit error}"`.
+/// Finish the raw `BEGIN IMMEDIATE` transaction open on `conn` given the
+/// result of the transaction body — the single entry point for both the
+/// commit and rollback paths (monorepo#716):
 ///
-/// Takes the connection by value: COMMIT must be the last statement of the
-/// raw `BEGIN IMMEDIATE` transaction, and the rollback path consumes it.
-pub(crate) async fn commit_with_rollback_guard(
+/// - `Ok(v)`: COMMIT, guarding against a failed COMMIT (monorepo#638 /
+///   #657 / #670) — a failed COMMIT can leave the transaction open on the
+///   pooled connection, so roll back explicitly so the connection is not
+///   returned to the pool still holding the write lock (with detach+close
+///   on a failed ROLLBACK, via [`rollback_or_poison`]), and return
+///   `Error::Internal` with the message `"{context}: {commit error}"`.
+/// - `Err(body_err)`: roll back the failed body via [`rollback_or_poison`]
+///   (monorepo#680) and return the original `body_err`.
+///
+/// Takes the connection by value: COMMIT/ROLLBACK is the last statement of
+/// the transaction either way, and the rollback path consumes it.
+pub(crate) async fn commit_with_rollback_guard<T>(
     mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    body_result: Result<T>,
     context: &str,
-) -> Result<()> {
-    if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
-        rollback_or_poison(conn).await;
-        return Err(Error::Internal(format!("{context}: {e}")));
+) -> Result<T> {
+    match body_result {
+        Ok(v) => {
+            if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                rollback_or_poison(conn).await;
+                return Err(Error::Internal(format!("{context}: {e}")));
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            rollback_or_poison(conn).await;
+            Err(e)
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
