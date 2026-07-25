@@ -245,7 +245,11 @@ fn effective_hidden(def: &Value) -> bool {
 /// PROTOCOL §5.11). `prompt` is the markdown body; the optional frontmatter
 /// scalars ([`OPTIONAL_FRONTMATTER_KEYS`]) are carried through when present so
 /// they round-trip losslessly, and the optional boolean `hidden` is emitted as
-/// `true` when the frontmatter sets it (absent otherwise, PROTOCOL §5.11).
+/// `true` when the effective value resolves to true (absent otherwise,
+/// PROTOCOL §5.11). This wrapper is the no-inheritance form — it passes
+/// `inherited_hidden = false` to [`build_def_inheriting`], so only an explicit
+/// frontmatter `hidden: true` emits the field; callers merging across tiers
+/// use [`build_def_inheriting`] directly to carry the lower tiers' value.
 /// `behaviorPrompt` mirrors `prompt` and `isCustomized` is `true` for any
 /// non-`bundled` source (port of `serializeSpecialist`).
 fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
