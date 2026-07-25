@@ -183,21 +183,27 @@ pub async fn record_lines_changed(
 }
 
 /// Pull a dotted version out of the tokens following a family keyword:
-/// consumes up to two bare numeric tokens (`["4", "8"]` → `"4.8"`) or a
-/// single already-dotted token (`["4.8"]` → `"4.8"`). Date-like stamps
-/// (all-digit tokens of 6+ chars, e.g. `20260115`) and any non-numeric token
-/// end the version. Returns the version (if any) and the unconsumed tail.
+/// consumes up to two bare numeric tokens (`["4", "8"]` → `"4.8"`), a
+/// single already-dotted token (`["4.8"]` → `"4.8"`), or a single digit-led
+/// alphanumeric token (`["4o"]` → `"4o"`, so `gpt-4o` and `gpt-4o-mini` stay
+/// distinct instead of both collapsing to the bare family). Date-like stamps
+/// (all-digit tokens of 6+ chars, e.g. `20260115`) and any token not starting
+/// with a digit end the version. Returns the version (if any) and the
+/// unconsumed tail.
 fn extract_version<'a>(tokens: &'a [&'a str]) -> (Option<String>, &'a [&'a str]) {
     let mut parts: Vec<&str> = Vec::new();
     let mut consumed = 0;
     for t in tokens {
         let numeric = !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.');
-        if !numeric || (t.len() >= 6 && !t.contains('.')) {
+        let alnum_version = !numeric
+            && t.starts_with(|c: char| c.is_ascii_digit())
+            && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+        if (!numeric && !alnum_version) || (numeric && t.len() >= 6 && !t.contains('.')) {
             break;
         }
         parts.push(t);
         consumed += 1;
-        if t.contains('.') || parts.len() == 2 {
+        if t.contains('.') || alnum_version || parts.len() == 2 {
             break;
         }
     }
@@ -278,6 +284,21 @@ mod tests {
         assert_eq!(normalize_model_name("gpt-5.2-codex"), "GPT 5.2 Codex");
         assert_eq!(normalize_model_name("sonnet-5"), "Sonnet 5");
         assert_eq!(normalize_model_name("claude-haiku-4-5"), "Haiku 4.5");
+    }
+
+    #[test]
+    fn normalization_keeps_alphanumeric_version_variants_distinct() {
+        // Digit-led alphanumeric versions ("4o") are part of model identity:
+        // gpt-4o and gpt-4o-mini must not both collapse to bare "GPT".
+        assert_eq!(normalize_model_name("gpt-4o"), "GPT 4o");
+        assert_eq!(normalize_model_name("gpt-4o-mini"), "GPT 4o Mini");
+        assert_eq!(
+            normalize_model_name("gpt-4o-mini-2024-07-18"),
+            "GPT 4o Mini"
+        );
+        // ...while the same model via different hosts still combines.
+        assert_eq!(normalize_model_name("openai/gpt-4o"), "GPT 4o");
+        assert_eq!(normalize_model_name("GPT-4o"), "GPT 4o");
     }
 
     #[test]
