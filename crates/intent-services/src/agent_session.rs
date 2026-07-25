@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::Services;
+use crate::{token_usage, Services};
 
 #[cfg(test)]
 mod tests;
@@ -797,9 +797,14 @@ impl Services {
         for attachment in self.turn_attachments.finish_turn(agent_id) {
             transcript.push_block(attachment.resource_item());
         }
-        // Reduce the PromptOutcome to its stop reason; the end-of-turn usage
-        // snapshot is not persisted here yet (usage persistence is a follow-up).
-        let result = result.map(|outcome| outcome.stop_reason);
+        // Split the PromptOutcome into its stop reason and the optional
+        // end-of-turn usage snapshot (persisted below once the turn's message
+        // is durable).
+        let mut turn_usage = None;
+        let result = result.map(|outcome| {
+            turn_usage = outcome.usage;
+            outcome.stop_reason
+        });
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
@@ -820,6 +825,16 @@ impl Services {
         // in-flight copy) BEFORE the terminal `stream:end` is observed. The guard
         // remains as the abort-path fallback.
         self.clear_live_turn(agent_id);
+        // Live token-usage update (§5.23): when the agent reported end-of-turn
+        // usage, REPLACE the session's cumulative snapshot (never sum — ACP
+        // counts are cumulative per session) and re-aggregate the workspace
+        // tally immediately, persisting + emitting `workspace:tokenUsage-changed`
+        // without waiting for the periodic scan. Best-effort: a failure is
+        // logged and never fails the turn.
+        if let Some(usage) = &turn_usage {
+            self.persist_turn_token_usage(agent_id, workspace_id, usage)
+                .await;
+        }
         // Exactly ONE terminal stream:end — complete and error both map here (§7).
         self.publish_agent_event(
             workspace_id,
@@ -893,6 +908,37 @@ impl Services {
             }
         }
         result.map_err(|e| Error::Internal(format!("session/prompt failed: {e}")))
+    }
+
+    /// Persist one turn's end-of-turn usage report and refresh the workspace
+    /// tally (§5.23). The report is interpreted as the session's cumulative
+    /// snapshot (see `token_usage::snapshot_from_turn_usage`), so it REPLACES
+    /// the previously stored snapshot; the workspace `TokenUsage` is then
+    /// re-aggregated, persisted, and `workspace:tokenUsage-changed` emitted
+    /// when it changed. Best-effort: errors are logged, never propagated —
+    /// usage bookkeeping must not fail an otherwise-successful turn.
+    pub(crate) async fn persist_turn_token_usage(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        usage: &session::Usage,
+    ) {
+        let snapshot = token_usage::snapshot_from_turn_usage(usage);
+        if let Err(e) = self
+            .store
+            .set_agent_session_token_usage(agent_id, &snapshot)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "persist turn token usage failed");
+            return;
+        }
+        if let Err(e) = self.recompute_workspace_token_usage(workspace_id).await {
+            tracing::warn!(
+                workspace = %workspace_id.as_str(),
+                error = %e,
+                "recompute workspace token usage after turn failed"
+            );
+        }
     }
 
     /// Map one `session/update` notification and publish/accumulate its effects.

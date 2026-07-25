@@ -15210,3 +15210,251 @@ mod last_activity_events {
         );
     }
 }
+
+/// Tests for the end-of-turn live token-usage update (§5.23):
+/// `persist_turn_token_usage` REPLACES the session's cumulative snapshot and
+/// re-aggregates the workspace `TokenUsage`, emitting
+/// `workspace:tokenUsage-changed` immediately (no periodic scan involved).
+#[cfg(test)]
+mod turn_token_usage {
+    use super::*;
+    use crate::{EventBus, Subscription, SubscriptionFilter};
+    use intent_acp::session::Usage;
+    use intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED;
+    use serde_json::Value;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("temp store");
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("seed workspace");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    /// Subscribe to `workspace:tokenUsage-changed` only, so the debounced
+    /// `workspace:updated { lastActivity }` never races the assertions.
+    fn subscribe_usage(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec![WORKSPACE_TOKEN_USAGE_CHANGED.to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_usage_event(sub: &mut Subscription) -> Value {
+        let batch = timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("tokenUsage-changed delivered")
+            .expect("subscription open");
+        assert!(!batch.is_empty());
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    fn acp_usage(input: u64, output: u64, cached_read: u64, cached_write: u64) -> Usage {
+        // `Usage` is #[non_exhaustive]; construct via its camelCase wire form.
+        serde_json::from_value(serde_json::json!({
+            "totalTokens": input + output + cached_read + cached_write,
+            "inputTokens": input,
+            "outputTokens": output,
+            "cachedReadTokens": cached_read,
+            "cachedWriteTokens": cached_write,
+        }))
+        .expect("usage deserializes")
+    }
+
+    fn agent_session(agent_id: &AgentId, ws: &WorkspaceId, model: &str) -> AgentSession {
+        AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("test-{}", agent_id.0),
+            name_explicitly_set: false,
+            model: Some(model.into()),
+            provider: Some("test".into()),
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            messages: vec![],
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+        }
+    }
+
+    /// Two turns on the same session: the workspace tally equals the LATEST
+    /// cumulative snapshot, never the sum, and each change emits one
+    /// `workspace:tokenUsage-changed` carrying the new tally.
+    #[tokio::test]
+    async fn turn_end_replaces_snapshot_latest_wins() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        let mut sub = subscribe_usage(&h);
+
+        // Turn 1: cumulative snapshot 70/50 (+30 cached read, +4 cached write).
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(70, 50, 30, 4))
+            .await;
+        let ev1 = recv_usage_event(&mut sub).await;
+        assert_eq!(ev1["type"], WORKSPACE_TOKEN_USAGE_CHANGED);
+        assert_eq!(ev1["data"]["tokenUsage"]["totals"]["inputTokens"], 70);
+        assert_eq!(ev1["data"]["tokenUsage"]["totals"]["cacheReadTokens"], 30);
+        assert_eq!(
+            ev1["data"]["tokenUsage"]["totals"]["cacheCreationTokens"],
+            4
+        );
+
+        // Turn 2: cumulative snapshot grows to 100/80. REPLACES turn 1 — the
+        // tally is 100/80, NOT 170/130.
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(100, 80, 45, 6))
+            .await;
+        let ev2 = recv_usage_event(&mut sub).await;
+        assert_eq!(ev2["data"]["tokenUsage"]["totals"]["inputTokens"], 100);
+        assert_eq!(ev2["data"]["tokenUsage"]["totals"]["outputTokens"], 80);
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        assert_eq!(usage.totals.input_tokens, 100, "latest snapshot, not sum");
+        assert_eq!(usage.totals.output_tokens, 80);
+        assert_eq!(usage.totals.cache_read_tokens, 45);
+        assert_eq!(usage.totals.cache_creation_tokens, 6);
+        assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100);
+        assert_eq!(usage.by_model["opus-4.8"].input_tokens, 100);
+        assert!(usage.last_scan_at.is_some());
+    }
+
+    /// An identical snapshot re-report leaves the tally unchanged and emits no
+    /// spurious `workspace:tokenUsage-changed`.
+    #[tokio::test]
+    async fn unchanged_snapshot_emits_no_event() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert session");
+        let mut sub = subscribe_usage(&h);
+
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(10, 5, 0, 0))
+            .await;
+        recv_usage_event(&mut sub).await;
+
+        // Same cumulative snapshot again (e.g. a zero-cost turn).
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, &acp_usage(10, 5, 0, 0))
+            .await;
+        assert!(
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
+            "no event when the tally is unchanged"
+        );
+    }
+
+    /// Mixed workspace: a session with a persisted snapshot uses it as-is
+    /// (message-embedded usage is NOT double-counted), while snapshot-less
+    /// sessions still contribute their message-tallied sums.
+    #[tokio::test]
+    async fn snapshot_takes_precedence_over_message_tallies() {
+        let h = harness().await;
+        let with_snapshot = AgentId::new();
+        let without_snapshot = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&with_snapshot, &h.ws, "opus-4.8"))
+            .await
+            .expect("insert 1");
+        h.store
+            .insert_agent_session(&agent_session(&without_snapshot, &h.ws, "sonnet-5"))
+            .await
+            .expect("insert 2");
+
+        // Both sessions carry message-embedded usage metadata.
+        let msg_usage = serde_json::json!({ "usage": { "inputTokens": 500, "outputTokens": 100 } });
+        h.store
+            .append_agent_message(&with_snapshot, "assistant", &msg_usage, &now_iso())
+            .await
+            .expect("append 1");
+        h.store
+            .append_agent_message(&without_snapshot, "assistant", &msg_usage, &now_iso())
+            .await
+            .expect("append 2");
+
+        // Only the first session reports end-of-turn usage.
+        h.services
+            .persist_turn_token_usage(&with_snapshot, &h.ws, &acp_usage(70, 50, 0, 0))
+            .await;
+
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        let usage = ws.token_usage.expect("usage persisted");
+        // Snapshot session: 70/50 (its 500/100 message usage is superseded).
+        assert_eq!(usage.by_agent_id[&with_snapshot.0].input_tokens, 70);
+        assert_eq!(usage.by_agent_id[&with_snapshot.0].output_tokens, 50);
+        // Snapshot-less session: message fallback still applies.
+        assert_eq!(usage.by_agent_id[&without_snapshot.0].input_tokens, 500);
+        // Workspace totals: snapshot + fallback.
+        assert_eq!(usage.totals.input_tokens, 570);
+        assert_eq!(usage.totals.output_tokens, 150);
+    }
+
+    /// A snapshot for a session that no longer exists is logged, not fatal:
+    /// no panic, no workspace-tally write, no event.
+    #[tokio::test]
+    async fn missing_session_is_best_effort() {
+        let h = harness().await;
+        let mut sub = subscribe_usage(&h);
+        h.services
+            .persist_turn_token_usage(&AgentId::new(), &h.ws, &acp_usage(1, 1, 0, 0))
+            .await;
+        assert!(
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
+            "no event when the session row is absent"
+        );
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert!(ws.token_usage.is_none(), "tally untouched");
+    }
+}

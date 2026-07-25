@@ -8,7 +8,8 @@
 //! a derived snapshot and is never persisted — sessions load with `stats: None`.
 
 use intent_core::{
-    AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, WorkspaceId,
+    AgentId, AgentMessage, AgentSession, AgentStatus, Error, NoteId, Result, TokenUsageTotals,
+    WorkspaceId,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -357,16 +358,48 @@ impl Store {
         Ok(count as u64)
     }
 
+    /// Upsert one session's cumulative end-of-turn token-usage snapshot
+    /// (§5.23): the JSON-encoded [`TokenUsageTotals`] REPLACES any previous
+    /// snapshot (ACP end-of-turn counts are cumulative per session, never
+    /// summed). `NotFound` if the session row is absent.
+    pub async fn set_agent_session_token_usage(
+        &self,
+        id: &AgentId,
+        snapshot: &TokenUsageTotals,
+    ) -> Result<()> {
+        let json = serde_json::to_string(snapshot)
+            .map_err(|e| Error::Internal(format!("encode session token_usage failed: {e}")))?;
+        let res = sqlx::query("UPDATE agent_session SET token_usage=? WHERE id=?")
+            .bind(json)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set agent session token usage failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(())
+    }
+
     /// Get lightweight usage data for all agents in a workspace: for each agent,
-    /// returns the agent_id, model, and all message content JSON (for tallying
-    /// without full AgentSession hydration; finding F2). Used by the token-usage
+    /// returns the agent_id, model, the persisted end-of-turn `token_usage`
+    /// snapshot (if any), and all message content JSON (for tallying without
+    /// full AgentSession hydration; finding F2). Used by the token-usage
     /// scan to avoid reading full message logs when only the usage metadata is needed.
+    #[allow(clippy::type_complexity)]
     pub async fn get_workspace_agent_usage_data(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<(String, Option<String>, Vec<serde_json::Value>)>> {
+    ) -> Result<
+        Vec<(
+            String,
+            Option<String>,
+            Option<TokenUsageTotals>,
+            Vec<serde_json::Value>,
+        )>,
+    > {
         // First get all sessions for this workspace with their models
-        let session_sql = "SELECT id, model FROM agent_session WHERE workspace_id = ?";
+        let session_sql = "SELECT id, model, token_usage FROM agent_session WHERE workspace_id = ?";
         let session_rows = sqlx::query(session_sql)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
@@ -377,6 +410,11 @@ impl Store {
         for session_row in session_rows {
             let agent_id: String = session_row.get("id");
             let model: Option<String> = session_row.get("model");
+            // Best-effort decode (mirrors the content parse below): a malformed
+            // snapshot degrades to None so the tally falls back to message sums.
+            let snapshot: Option<TokenUsageTotals> = session_row
+                .get::<Option<String>, _>("token_usage")
+                .and_then(|s| serde_json::from_str(&s).ok());
 
             // Get all message content for this agent
             let message_sql =
@@ -397,7 +435,7 @@ impl Store {
                 })
                 .collect();
 
-            result.push((agent_id, model, contents));
+            result.push((agent_id, model, snapshot, contents));
         }
         Ok(result)
     }
@@ -1346,6 +1384,147 @@ mod tests {
             ),
             other => panic!("expected Internal, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `set_agent_session_token_usage` replaces (never sums) the persisted
+    /// snapshot, `get_workspace_agent_usage_data` surfaces it, and an unknown
+    /// session id maps to `NotFound`.
+    #[tokio::test]
+    async fn token_usage_snapshot_roundtrip_and_replace() {
+        use intent_core::{
+            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
+        };
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-test".to_string());
+        let workspace = Workspace {
+            id: ws_id.clone(),
+            title: "Test".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            last_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+        };
+        store
+            .insert_workspace(&workspace)
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let session = AgentSession {
+            id: agent_id.clone(),
+            workspace_id: ws_id.clone(),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Usage".to_string(),
+            name_explicitly_set: false,
+            model: Some("opus-4.8".to_string()),
+            provider: None,
+            status: AgentStatus::Idle,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            messages: vec![],
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            stats: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+        };
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // No snapshot yet.
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].2.is_none(), "no snapshot before first set");
+
+        // First snapshot, then a REPLACING second snapshot.
+        let first = TokenUsageTotals {
+            input_tokens: 70,
+            output_tokens: 50,
+            cache_read_tokens: 30,
+            cache_creation_tokens: 4,
+        };
+        store
+            .set_agent_session_token_usage(&agent_id, &first)
+            .await
+            .expect("set first");
+        let second = TokenUsageTotals {
+            input_tokens: 100,
+            output_tokens: 80,
+            cache_read_tokens: 45,
+            cache_creation_tokens: 6,
+        };
+        store
+            .set_agent_session_token_usage(&agent_id, &second)
+            .await
+            .expect("set second");
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data after set");
+        assert_eq!(
+            rows[0].2.as_ref(),
+            Some(&second),
+            "latest snapshot replaces the previous one"
+        );
+
+        // Unknown session → NotFound.
+        let missing = AgentId("agent-missing".to_string());
+        let err = store
+            .set_agent_session_token_usage(&missing, &first)
+            .await
+            .expect_err("unknown session rejected");
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
         let _ = std::fs::remove_file(&tmp);
     }
 

@@ -1893,15 +1893,43 @@ impl Services {
             }
         }
 
-        // Watermark changed or first scan: tally usage without hydrating full message logs.
+        // Watermark changed or first scan: recompute the tally.
+        let changed = self.recompute_workspace_token_usage(workspace_id).await?;
+        // Update watermark after successful scan (changed or not).
+        self.token_usage_watermarks
+            .lock()
+            .unwrap()
+            .insert(workspace_id.clone(), current_watermark);
+        Ok(changed)
+    }
+
+    /// Recompute one workspace's durable `tokenUsage` from its agent sessions
+    /// (§5.23): sessions with a persisted end-of-turn snapshot use it as-is;
+    /// others fall back to summing per-message usage metadata. Persists the
+    /// snapshot and emits `workspace:tokenUsage-changed` only when the
+    /// materialized tally (ignoring `lastScanAt`) actually changed; returns
+    /// whether a change was written. Shared by the periodic scan (above, which
+    /// adds watermark-based change detection) and the end-of-turn live update
+    /// in `agent_session.rs` (which calls this directly — a persisted snapshot
+    /// changes no `agent_message` rows, so the watermark cannot see it).
+    pub(crate) async fn recompute_workspace_token_usage(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
+        // Tally usage without hydrating full message logs (finding F2).
         let usage_data = self
             .store
             .get_workspace_agent_usage_data(workspace_id)
             .await?;
         let tallies: Vec<token_usage::AgentTokenTally> = usage_data
             .iter()
-            .map(|(agent_id, model, contents)| {
-                token_usage::agent_token_tally_from_contents(agent_id, model.as_deref(), contents)
+            .map(|(agent_id, model, snapshot, contents)| {
+                token_usage::agent_token_tally(
+                    agent_id,
+                    model.as_deref(),
+                    snapshot.as_ref(),
+                    contents,
+                )
             })
             .collect();
         let mut usage = token_usage::aggregate_token_usage(&tallies);
@@ -1917,11 +1945,6 @@ impl Services {
             None => true,
         };
         if !changed {
-            // Tally unchanged — update watermark and skip write.
-            self.token_usage_watermarks
-                .lock()
-                .unwrap()
-                .insert(workspace_id.clone(), current_watermark);
             return Ok(false);
         }
         ws.token_usage = Some(usage.clone());
@@ -1934,11 +1957,6 @@ impl Services {
         .await;
         // Schedule debounced lastActivity event (§10.1).
         self.schedule_last_activity_event(workspace_id.clone());
-        // Update watermark after successful scan.
-        self.token_usage_watermarks
-            .lock()
-            .unwrap()
-            .insert(workspace_id.clone(), current_watermark);
         Ok(true)
     }
 
