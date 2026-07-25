@@ -3170,11 +3170,13 @@ impl Services {
         let mut isolation = input.isolation.clone();
         if isolation.is_none() {
             // Check workspace.cowIsolation setting
-            if let Ok(value) = self
+            // `settings_get` returns the `{ path, value, definition }`
+            // envelope (§5.9) — read the nested `value`.
+            if let Ok(setting) = self
                 .settings_get("workspace.cowIsolation".to_string())
                 .await
             {
-                if value.as_bool().unwrap_or(false) {
+                if setting["value"].as_bool().unwrap_or(false) {
                     isolation = Some("cow".to_string());
                 }
             }
@@ -3183,10 +3185,24 @@ impl Services {
             use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
             let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
-                // Only direct-mode workspaces (no worktree or skip_worktree=true)
-                let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
-                if is_direct_mode && ws.repository_path.is_some() {
-                    if let Some(root) = self.workspaces_root.clone() {
+                // Sandbox-eligible: direct-mode workspaces (no worktree or
+                // skip_worktree=true; sandbox sourced from the user's repo folder)
+                // and CoW-checkout workspaces (sourced from the workspace
+                // checkout). Worktree-mode workspaces keep the shared checkout
+                // (no sandbox).
+                let is_direct_mode = (ws.skip_worktree || ws.worktree_path.is_none())
+                    && ws.repository_path.is_some();
+                let is_cow_checkout = ws.checkout_mode == Some(intent_core::CheckoutMode::Cow)
+                    && ws.worktree_path.is_some();
+                if is_direct_mode || is_cow_checkout {
+                    // Same root fallback as `workspace.create` (the intentd
+                    // binary configures the root via INTENTD_WORKSPACES_DIR /
+                    // `workspaces.root` rather than `.with_workspaces_root`).
+                    let root = self
+                        .workspaces_root
+                        .clone()
+                        .unwrap_or_else(crate::default_workspaces_root);
+                    {
                         let config = ProvisionConfig {
                             workspaces_root: root,
                         };

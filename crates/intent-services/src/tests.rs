@@ -140,6 +140,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        checkout_mode: None,
     }
 }
 
@@ -1697,6 +1698,7 @@ async fn comment_add_unique_match_anchors_and_persists() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("comment.add");
@@ -1731,6 +1733,7 @@ async fn comment_add_persists_anchor_context() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,
@@ -1776,6 +1779,190 @@ async fn fetch_comment_by_id(
         .expect("comment present")
 }
 
+/// Round 14 root cause A (monorepo optimistic-vs-canonical id split): a
+/// client-supplied `commentId` must be used for the comment row, the thread
+/// id, the anchor ids, AND the embedded markers — not a daemon-minted UUID.
+#[tokio::test]
+async fn comment_add_supplied_comment_id_used_for_row_thread_anchor_and_markers() {
+    let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+    let supplied = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(supplied.into()),
+        )
+        .await
+        .expect("comment.add");
+    assert_eq!(r.comment_id, supplied);
+    let note = svc.get_note(ws.clone(), id.clone()).await.unwrap();
+    assert!(
+        note.content.contains(&format!(
+            "<!--anchor:{supplied}:start-->test<!--anchor:{supplied}:end-->"
+        )),
+        "markers must embed the supplied id: {}",
+        note.content
+    );
+    let comment = fetch_comment_by_id(&svc, &ws, &id, supplied).await;
+    assert_eq!(comment.id, supplied);
+    assert_eq!(comment.thread_id, supplied);
+    let anchor = comment.anchor.expect("root comment has an anchor");
+    assert_eq!(anchor.start_id.as_deref(), Some(supplied));
+    assert_eq!(anchor.end_id.as_deref(), Some(supplied));
+}
+
+#[tokio::test]
+async fn comment_add_invalid_supplied_comment_id_is_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("some note content").await;
+    let err = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "some note content".into(),
+            "content".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+            Some("not-a-uuid".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("commentId")),
+        "unexpected error: {err:?}"
+    );
+    // The rejected add must not have touched the note.
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert!(!note.content.contains("<!--anchor:"));
+}
+
+#[tokio::test]
+async fn comment_add_duplicate_supplied_comment_id_is_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("alpha target-a and target-b omega").await;
+    let supplied = "11111111-2222-4333-8444-555555555555";
+    svc.comment_add(
+        ws.clone(),
+        id.clone(),
+        "alpha target-a and".into(),
+        "target-a".into(),
+        "first".into(),
+        None,
+        None,
+        None,
+        None,
+        Some(supplied.into()),
+    )
+    .await
+    .expect("first add");
+    let err = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "and target-b omega".into(),
+            "target-b".into(),
+            "second".into(),
+            None,
+            None,
+            None,
+            None,
+            Some(supplied.into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("commentId")),
+        "unexpected error: {err:?}"
+    );
+    // The failed second add must not have embedded markers around target-b.
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert_eq!(note.content.matches("<!--anchor:").count(), 2);
+}
+
+/// An `idempotencyKey` replay carrying the same supplied `commentId` returns
+/// the cached result — the duplicate-id rejection must not fire because the
+/// replay short-circuits before the mutation body runs.
+#[tokio::test]
+async fn comment_add_idempotent_replay_with_same_supplied_comment_id_returns_cached() {
+    let (_tmp, svc, ws, id) = setup("alpha target-a omega").await;
+    let supplied = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let key = Some("replay-with-comment-id".to_string());
+    let first = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha target-a".into(),
+            "target-a".into(),
+            "first".into(),
+            None,
+            None,
+            None,
+            key.clone(),
+            Some(supplied.into()),
+        )
+        .await
+        .expect("first add");
+    assert_eq!(first.comment_id, supplied);
+    let second = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha target-a".into(),
+            "target-a".into(),
+            "first".into(),
+            None,
+            None,
+            None,
+            key,
+            Some(supplied.into()),
+        )
+        .await
+        .expect("replay must return the cached result, not a duplicate-id error");
+    assert_eq!(second.comment_id, supplied);
+    assert_eq!(second.note_rev, first.note_rev);
+    // Still exactly one set of markers — the replay did not re-anchor.
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert_eq!(note.content.matches("<!--anchor:").count(), 2);
+}
+
+/// Backward compatibility: omitting `commentId` keeps minting a fresh UUID.
+#[tokio::test]
+async fn comment_add_omitted_comment_id_mints_fresh_uuid() {
+    let (_tmp, svc, ws, id) = setup("Hello world, this is a test sentence.").await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "this is a test sentence".into(),
+            "test".into(),
+            "nice".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("comment.add");
+    assert!(
+        uuid::Uuid::parse_str(&r.comment_id).is_ok(),
+        "minted id must be a UUID: {}",
+        r.comment_id
+    );
+    let note = svc.get_note(ws, id).await.unwrap();
+    assert!(note
+        .content
+        .contains(&format!("<!--anchor:{}:start-->", r.comment_id)));
+}
+
 #[tokio::test]
 async fn edit_above_anchor_preserves_healthy_state() {
     // H1: an edit that touches text BEFORE the anchored range must leave both
@@ -1788,6 +1975,7 @@ async fn edit_above_anchor_preserves_healthy_state() {
             "target word here".into(),
             "target word".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -1829,6 +2017,7 @@ async fn edit_that_destroys_start_marker_recovers_via_context() {
             "prefix target here suffix".into(),
             "target".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -1881,6 +2070,7 @@ async fn edit_that_destroys_both_markers_marks_orphaned() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add");
@@ -1916,6 +2106,7 @@ async fn comment_add_ambiguous_context_errors() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1943,6 +2134,7 @@ async fn comment_add_plaintext_context_over_formatted_markdown() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("comment.add via plaintext fallback");
@@ -1965,6 +2157,7 @@ async fn comment_add_context_not_found_is_invalid_params() {
             "totally absent context".into(),
             "absent".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -2010,6 +2203,7 @@ async fn comment_add_mention_at_prefixed_needle_anchors() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2028,6 +2222,7 @@ async fn comment_add_empty_target_is_invalid_params() {
             "some note content".into(),
             "".into(),
             "c".into(),
+            None,
             None,
             None,
             None,
@@ -2051,6 +2246,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "alpha unique-target omega".into(),
             "unique-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2140,6 +2336,7 @@ async fn comment_respond_author_type_persists_and_validates() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("add");
@@ -2212,6 +2409,7 @@ async fn comment_respond_caller_input_errors_are_invalid_params() {
             "alpha reply-target omega".into(),
             "reply-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2294,6 +2492,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
             "alpha resolve-target omega".into(),
             "resolve-target".into(),
             "root".into(),
+            None,
             None,
             None,
             None,
@@ -2514,6 +2713,7 @@ async fn comment_ops_reject_cross_workspace_bare_id_writes() {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,
@@ -3364,6 +3564,7 @@ mod change_event_parity {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("comment");
@@ -3408,6 +3609,7 @@ mod change_event_parity {
                 None,
                 None,
                 key.clone(),
+                None,
             )
             .await
             .expect("first add");
@@ -3430,6 +3632,7 @@ mod change_event_parity {
                 None,
                 None,
                 key,
+                None,
             )
             .await
             .expect("replay add");
@@ -3461,6 +3664,7 @@ mod change_event_parity {
                 "hello world".to_string(),
                 "hello".to_string(),
                 "root".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -3517,6 +3721,7 @@ mod change_event_parity {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("comment");
@@ -3561,22 +3766,33 @@ mod change_event_parity {
     }
 
     /// §6.5 has no `workspace:archived`; the reference emitter publishes
-    /// `workspace:updated` with the applied `{ archived }` delta. Verify
-    /// `archive_workspace` fires exactly one such event (Audit D C3).
+    /// `workspace:updated` with the full applied delta
+    /// (`archived`/`status`/`archivedAt`). Verify `archive_workspace` fires
+    /// exactly one such event whose `archivedAt` equals the persisted
+    /// timestamp (Audit D C3).
     #[tokio::test]
     async fn archive_workspace_emits_workspace_updated_once() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
         let mut sub = subscribe(&h);
-        h.services
+        let ws = h
+            .services
             .archive_workspace(h.ws.clone())
             .await
             .expect("archive");
+        let archived_at = ws.archived_at.expect("archivedAt persisted");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "changes": { "archived": true } })
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": true,
+                    "status": "Archived",
+                    "archivedAt": archived_at,
+                }
+            })
         );
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
@@ -3586,7 +3802,8 @@ mod change_event_parity {
     }
 
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
-    /// carrying `{ archived: false }` (Audit D C3).
+    /// carrying the full applied delta with an explicit `archivedAt: null` so
+    /// clients clear the field (Audit D C3).
     #[tokio::test]
     async fn unarchive_workspace_emits_workspace_updated_once() {
         use intent_core::{WorkspaceApi, WorkspaceStatus};
@@ -3606,7 +3823,14 @@ mod change_event_parity {
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "changes": { "archived": false } })
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": false,
+                    "status": "Active",
+                    "archivedAt": null,
+                }
+            })
         );
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
@@ -10450,6 +10674,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            checkout_mode: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -10575,6 +10800,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            checkout_mode: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -10690,7 +10916,8 @@ mod rules {
             agent_summary: None,
             diff_summary: None,
             token_usage: None,
-            cow_supported: None, // Not computed for worktree mode
+            cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
+            checkout_mode: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -10802,6 +11029,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
+            checkout_mode: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -10912,6 +11140,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
+            checkout_mode: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -11027,6 +11256,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+            checkout_mode: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -11591,6 +11821,7 @@ mod known_repo {
             agent_summary: None,
             diff_summary: None,
             cow_supported: None,
+            checkout_mode: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -11774,6 +12005,430 @@ mod worktree_provisioning {
             ws.branch.as_str()
         );
         assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "cowIsolation off provisions a worktree checkout"
+        );
+    }
+
+    /// Build Services with the `workspace.cowIsolation` setting applied.
+    fn services_with_cow_isolation(
+        store: Store,
+        root: PathBuf,
+        enabled: bool,
+    ) -> (Services, tempfile::TempDir) {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "workspace.cowIsolation".to_string(),
+                serde_json::json!(enabled),
+            )])
+            .expect("set cowIsolation");
+        let svc = Services::new(store)
+            .with_workspaces_root(root)
+            .with_settings_registry(registry);
+        (svc, config_dir)
+    }
+
+    /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
+    /// standalone CoW clone (not a linked worktree) checked out on the
+    /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
+    /// populated, `checkoutMode: "cow"` persisted, and untracked source files
+    /// carried over.
+    #[tokio::test]
+    async fn create_provisions_cow_checkout_when_isolation_enabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, head_sha, head_branch) = seed_repo("intentd-cowprov-repo");
+        // Untracked build artifact in the source repo — CoW carries it over.
+        std::fs::write(repo_dir.0.join("untracked.log"), "artifact\n").unwrap();
+        let root = unique_dir("intentd-cowprov-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    repository_name: Some("My Repo".to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        let wt = ws.worktree_path.as_deref().expect("worktree path set");
+        assert_eq!(
+            wt,
+            root.0
+                .join(&ws.id.0)
+                .join("my-repo")
+                .to_string_lossy()
+                .as_ref(),
+            "CoW checkout lives at <root>/<workspaceId>/<repo-slug>"
+        );
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Cow));
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(!clone.is_worktree(), "CoW checkout is a standalone repo");
+        assert_eq!(
+            clone.head().unwrap().shorthand().expect("branch name"),
+            ws.branch.as_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(wt).join("untracked.log")).unwrap(),
+            "artifact\n",
+            "untracked source files are carried into the CoW checkout"
+        );
+        // checkout_mode round-trips through the store.
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow)
+        );
+    }
+
+    /// cowIsolation on + CoW-incapable filesystem: `workspace.create` fails
+    /// with the actionable error and leaves no workspace row or partial
+    /// checkout behind (no silent worktree fallback). Runs only where the
+    /// probe reports Unsupported (the inverse of the test above).
+    #[tokio::test]
+    async fn create_fails_when_isolation_enabled_but_cow_unsupported() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowunsup-repo");
+        let root = unique_dir("intentd-cowunsup-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            == intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW is supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string().contains("workspace.cowIsolation"),
+            "error names the setting: {err}"
+        );
+        // No workspace row and no partial checkout left behind.
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(
+            std::fs::read_dir(&root.0)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "workspaces root has no partial checkout"
+        );
+    }
+
+    /// cowIsolation off keeps worktree behavior even on CoW-capable
+    /// filesystems, persisting `checkoutMode: "worktree"`.
+    #[tokio::test]
+    async fn create_provisions_worktree_when_isolation_disabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowoff-repo");
+        let root = unique_dir("intentd-cowoff-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), false);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+        let wt_repo =
+            git2::Repository::open(ws.worktree_path.as_deref().unwrap()).expect("worktree opens");
+        assert!(wt_repo.is_worktree(), "setting off keeps a linked worktree");
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree)
+        );
+    }
+
+    /// `workspace.delete` of a CoW workspace removes the checkout directory
+    /// and its `<root>/<workspaceId>` parent but never touches the source
+    /// repository: no registration prune and — critically — no branch delete,
+    /// even when the source carries a same-named branch and the workspace's
+    /// branch is flagged auto-generated (the guard that deletes worktree
+    /// branches). The CoW workspace's branch lives only inside the clone.
+    /// CI-safe: the standalone checkout is a plain `git clone`, so no CoW
+    /// filesystem support is needed to exercise the delete path.
+    #[tokio::test]
+    async fn delete_cow_checkout_removes_dir_without_touching_source_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowdel-repo");
+        let root = unique_dir("intentd-cowdel-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        // Standalone clone at <root>/<wsId>/<slug> standing in for a CoW
+        // checkout, on a branch that also exists (same name) in the source.
+        let ws_id = WorkspaceId::from("cow-del-ws");
+        let branch = "cow-del-branch";
+        let wt = root.0.join(ws_id.as_str()).join("repo");
+        {
+            let clone = git2::Repository::clone(repo_dir.0.to_str().unwrap(), &wt).expect("clone");
+            let head = clone.head().unwrap().peel_to_commit().unwrap();
+            clone.branch(branch, &head, false).expect("clone branch");
+            clone
+                .set_head(&format!("refs/heads/{branch}"))
+                .expect("checkout");
+        }
+        {
+            let src = git2::Repository::open(&repo_dir.0).unwrap();
+            let src_head = src.head().unwrap().peel_to_commit().unwrap();
+            src.branch(branch, &src_head, false).expect("source branch");
+        }
+
+        let mut ws = workspace(&ws_id);
+        ws.branch = branch.to_string();
+        ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        ws.worktree_path = Some(wt.to_string_lossy().to_string());
+        ws.checkout_mode = Some(intent_core::CheckoutMode::Cow);
+        store.insert_workspace(&ws).await.expect("insert");
+        store
+            .set_workspace_branch_auto_generated(&ws_id, true)
+            .await
+            .expect("flag branch");
+
+        svc.delete_workspace(ws_id.clone()).await.expect("delete");
+
+        // Fast-ack: poll for the background cleanup.
+        for _ in 0..100 {
+            if !wt.exists() && !root.0.join(ws_id.as_str()).exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(!wt.exists(), "CoW checkout directory removed");
+        assert!(
+            !root.0.join(ws_id.as_str()).exists(),
+            "empty <root>/<workspaceId> parent removed"
+        );
+        assert!(
+            !sweep_leftover_trash(&root.0),
+            "no orphaned *.deleting-* trash left under the workspaces root"
+        );
+        let src = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            src.find_branch(branch, git2::BranchType::Local).is_ok(),
+            "same-named source-repo branch survives a CoW delete"
+        );
+    }
+
+    /// Whether any `*.deleting-*` trash entry remains under `root` (leak probe
+    /// for the delete cleanup's rename-to-trash phase).
+    fn sweep_leftover_trash(root: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Ok(inner) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for e in inner.flatten() {
+                if e.file_name().to_string_lossy().contains(".deleting-") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// cowIsolation on + CoW-capable filesystem: `workspace.duplicate`
+    /// mirrors the create decision matrix — the duplicate gets a standalone
+    /// CoW clone with `checkoutMode: "cow"` persisted, and the source repo
+    /// gains no branch for the duplicate (the branch lives in the clone).
+    #[tokio::test]
+    async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
+        let root = unique_dir("intentd-cowdup-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+
+        assert_eq!(dup.checkout_mode, Some(intent_core::CheckoutMode::Cow));
+        let wt = dup.worktree_path.as_deref().expect("worktree path set");
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(
+            !clone.is_worktree(),
+            "duplicate checkout is a standalone repo"
+        );
+        assert_eq!(
+            clone.head().unwrap().shorthand().expect("branch name"),
+            dup.branch.as_str()
+        );
+        assert!(dup.base_commit_sha.is_some());
+        // The duplicate's branch exists only inside its clone.
+        let src = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            src.find_branch(&dup.branch, git2::BranchType::Local)
+                .is_err(),
+            "CoW duplicate must not create a branch in the source repo"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow)
+        );
+    }
+
+    /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
+    /// fails with the same actionable error as create (no silent worktree
+    /// fallback) and inserts no duplicate row.
+    #[tokio::test]
+    async fn duplicate_fails_when_isolation_enabled_but_cow_unsupported() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowdupun-repo");
+        let root = unique_dir("intentd-cowdupun-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            == intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW is supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        // Source row without a checkout (registry-style) keeps the test
+        // independent of provisioning: only the duplicate path runs the probe.
+        let src_id = WorkspaceId::from("cow-dupun-src");
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        store.insert_workspace(&src_ws).await.expect("insert");
+
+        let err = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect_err("duplicate must fail");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string().contains("workspace.cowIsolation"),
+            "error names the setting: {err}"
+        );
+        let rows = store.list_workspaces(true).await.expect("list");
+        assert_eq!(rows.len(), 1, "no duplicate row inserted on failure");
+    }
+
+    /// cowIsolation off keeps `workspace.duplicate` on the linked-worktree
+    /// path, persisting `checkoutMode: "worktree"`.
+    #[tokio::test]
+    async fn duplicate_provisions_worktree_when_isolation_disabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowdupoff-repo");
+        let root = unique_dir("intentd-cowdupoff-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), false);
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+
+        assert_eq!(dup.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+        let wt_repo = git2::Repository::open(dup.worktree_path.as_deref().unwrap()).expect("opens");
+        assert!(wt_repo.is_worktree(), "setting off keeps a linked worktree");
+    }
+
+    /// `skipWorktree` keeps `checkoutMode` unset even with cowIsolation on —
+    /// no checkout is provisioned, so there is no mode to record.
+    #[tokio::test]
+    async fn create_skip_worktree_leaves_checkout_mode_unset_with_isolation_on() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowskip-repo");
+        let root = unique_dir("intentd-cowskip-root");
+        let (svc, _config) = services_with_cow_isolation(store, root.0.clone(), true);
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    skip_isolation: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        assert!(ws.worktree_path.is_none());
+        assert!(ws.checkout_mode.is_none());
     }
 
     /// Assert a `word-word` slug branch, optionally with a `-N` collision
@@ -11873,7 +12528,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     branch: Some("exact/name".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -11963,7 +12618,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12135,7 +12790,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12167,7 +12822,7 @@ mod worktree_provisioning {
         let svc = Services::new(store).with_workspaces_root(root.0.clone());
 
         let make = |prompt: &str| WorkspaceCreate {
-            skip_worktree: Some(true),
+            skip_isolation: Some(true),
             initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                 prompt: Some(prompt.to_string()),
                 ..Default::default()
@@ -12203,7 +12858,7 @@ mod worktree_provisioning {
         let svc = Services::new(store).with_workspaces_root(root.0.clone());
 
         let make = |prompt: &str| WorkspaceCreate {
-            skip_worktree: Some(true),
+            skip_isolation: Some(true),
             initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                 prompt: Some(prompt.to_string()),
                 ..Default::default()
@@ -12257,7 +12912,7 @@ mod worktree_provisioning {
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12285,7 +12940,7 @@ mod worktree_provisioning {
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12323,7 +12978,7 @@ mod worktree_provisioning {
                 WorkspaceCreate {
                     title: Some("My workspace".to_string()),
                     branch: Some("feat/wsjson".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     ..Default::default()
                 },
                 None,
@@ -12374,7 +13029,7 @@ mod worktree_provisioning {
                 WorkspaceCreate {
                     // Onboarding sends `title: ''` today; simulate that.
                     title: Some(String::new()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12420,7 +13075,7 @@ mod worktree_provisioning {
                 WorkspaceCreate {
                     // `title` field absent from the wire payload.
                     title: None,
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12448,7 +13103,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     title: Some("   \t  ".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -12477,7 +13132,7 @@ mod worktree_provisioning {
             .create_workspace(
                 WorkspaceCreate {
                     title: Some("My Explicit Title".to_string()),
-                    skip_worktree: Some(true),
+                    skip_isolation: Some(true),
                     initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
                         prompt: Some("fix the auth flow".to_string()),
                         ..Default::default()
@@ -14319,6 +14974,7 @@ mod line_attribution_hooks {
             "this is a test sentence".into(),
             "test".into(),
             "nice".into(),
+            None,
             None,
             None,
             None,

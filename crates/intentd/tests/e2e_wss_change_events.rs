@@ -1026,9 +1026,11 @@ async fn comment_add_echoes_note_rev_and_emits_note_updated_over_wss() {
 }
 
 /// End-to-end (Audit D C3): `workspace.archive` over WSS publishes
-/// `workspace:updated` with `changes: { archived: true }`. §6.5 has no
-/// `workspace:archived` event; the reference emitter dispatches
-/// `workspaceUpdated` with a `changes` delta.
+/// `workspace:updated` with the full applied delta
+/// `changes: { archived: true, status: "Archived", archivedAt: <ts> }` where
+/// `<ts>` equals the persisted `archivedAt`. §6.5 has no `workspace:archived`
+/// event; the reference emitter dispatches `workspaceUpdated` with a
+/// `changes` delta.
 #[tokio::test]
 async fn archive_workspace_emits_workspace_updated_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -1073,12 +1075,20 @@ async fn archive_workspace_emits_workspace_updated_over_wss() {
     assert!(archive_res["workspace"]["archivedAt"].is_string());
     assert!(archive_res["workspace"]["lastActivity"].is_string());
     assert!(archive_res.get("success").is_none());
+    let archived_at = archive_res["workspace"]["archivedAt"].clone();
 
     let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert_eq!(
         evt["data"],
-        json!({ "workspaceId": ws_id, "changes": { "archived": true } })
+        json!({
+            "workspaceId": ws_id,
+            "changes": {
+                "archived": true,
+                "status": "Archived",
+                "archivedAt": archived_at,
+            }
+        })
     );
 
     let extra = drain_extra(&mut sub, "workspace:updated", 500).await;
@@ -1089,7 +1099,9 @@ async fn archive_workspace_emits_workspace_updated_over_wss() {
 }
 
 /// End-to-end (Audit D C3, symmetric): `workspace.unarchive` over WSS
-/// publishes `workspace:updated` with `changes: { archived: false }`.
+/// publishes `workspace:updated` with the full applied delta
+/// `changes: { archived: false, status: "Active", archivedAt: null }` — the
+/// explicit JSON `null` tells clients to clear the field.
 #[tokio::test]
 async fn unarchive_workspace_emits_workspace_updated_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -1146,7 +1158,14 @@ async fn unarchive_workspace_emits_workspace_updated_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert_eq!(
         evt["data"],
-        json!({ "workspaceId": ws_id, "changes": { "archived": false } })
+        json!({
+            "workspaceId": ws_id,
+            "changes": {
+                "archived": false,
+                "status": "Active",
+                "archivedAt": null,
+            }
+        })
     );
 
     let extra = drain_extra(&mut sub, "workspace:updated", 500).await;
@@ -1583,6 +1602,158 @@ async fn comment_add_context_not_found_returns_invalid_params_over_wss() {
     assert_eq!(
         v["error"]["message"],
         json!("invalid params: Could not find the search context in the document."),
+        "envelope: {v}"
+    );
+}
+
+/// End-to-end (Round 14 root cause A): a client-supplied `commentId` is used
+/// for the comment row, the thread id, and the embedded anchor markers, so
+/// the FE's optimistic anchors converge with the daemon's rewrite.
+#[tokio::test]
+async fn comment_add_supplied_comment_id_round_trips_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "ClientCommentId", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "anchor target text" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let supplied = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "anchor target text",
+            "commentTarget": "target",
+            "comment": "root",
+            "commentId": supplied,
+        }),
+    )
+    .await;
+    assert_eq!(add["success"], json!(true), "add: {add}");
+    assert_eq!(add["commentId"], json!(supplied), "add: {add}");
+
+    // The rewrite embedded the SUPPLIED id in the markers.
+    let read = wss_rpc(
+        &mut rpc,
+        2,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = read["note"]["content"].as_str().expect("content");
+    assert!(
+        content.contains(&format!(
+            "<!--anchor:{supplied}:start-->target<!--anchor:{supplied}:end-->"
+        )),
+        "markers must embed the supplied id: {content}"
+    );
+
+    // The stored row + thread use the supplied id too.
+    let thread = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "commentId": supplied }),
+    )
+    .await;
+    assert_eq!(thread["threadId"], json!(supplied), "thread: {thread}");
+    assert_eq!(thread["rootComment"]["id"], json!(supplied));
+
+    // A duplicate supplied id (fresh idempotency scope) is rejected -32602.
+    let dup = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "anchor target text",
+            "commentTarget": "anchor",
+            "comment": "again",
+            "commentId": supplied,
+        }),
+    )
+    .await;
+    assert_eq!(dup["error"]["code"], json!(-32602), "envelope: {dup}");
+    assert!(
+        dup["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("commentId"),
+        "envelope: {dup}"
+    );
+}
+
+/// End-to-end: a malformed `commentId` returns `-32602` naming the param.
+#[tokio::test]
+async fn comment_add_invalid_comment_id_returns_invalid_params_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "BadCommentId", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "some note content" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let v = wss_rpc_envelope(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "some note content",
+            "commentTarget": "content",
+            "comment": "c",
+            "commentId": "not-a-uuid",
+        }),
+    )
+    .await;
+    assert_eq!(v["error"]["code"], json!(-32602), "envelope: {v}");
+    assert_eq!(
+        v["error"]["message"],
+        json!("invalid params: Invalid 'commentId': not-a-uuid. Must be a valid UUID."),
         "envelope: {v}"
     );
 }

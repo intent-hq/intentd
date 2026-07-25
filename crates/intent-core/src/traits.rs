@@ -1956,6 +1956,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// `idempotency_key` is the optional `params.idempotencyKey` (design note TB-0
     /// §5): when present and previously recorded, the original result is returned
     /// without re-executing; soft-launch when absent (warn + execute).
+    ///
+    /// `comment_id` is the optional wire `commentId`: a client-supplied UUID used
+    /// for the comment row, thread id, anchor ids, and the embedded
+    /// `<!--anchor:{id}:start/end-->` markers, so a client that inserted
+    /// optimistic anchors under that id converges with the daemon's rewrite.
+    /// Absent → the daemon mints a fresh UUID (backward compatible).
     #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
@@ -1968,6 +1974,7 @@ pub trait WorkspaceApi: Send + Sync {
         author: Option<String>,
         author_type: Option<String>,
         idempotency_key: Option<String>,
+        comment_id: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let _ = (
             workspace_id,
@@ -1979,6 +1986,7 @@ pub trait WorkspaceApi: Send + Sync {
             author,
             author_type,
             idempotency_key,
+            comment_id,
         );
         Box::pin(async {
             Err(Error::Internal(

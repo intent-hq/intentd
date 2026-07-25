@@ -840,8 +840,8 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         ),
         boolean(
             "workspace.cowIsolation",
-            "Copy-on-Write Agent Isolation",
-            "Enable CoW agent sandboxing for direct-mode delegations (requires CoW filesystem support)",
+            "Copy-on-Write Isolation",
+            "CoW workspaces + per-agent sandboxes (requires CoW filesystem support on the workspaces root)",
             "workspace",
             false,
         ),
