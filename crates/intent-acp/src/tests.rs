@@ -142,6 +142,32 @@ async fn routes_requests_and_notifications() {
     let _ = conn;
 }
 
+/// monorepo#764: `is_alive()` is true on a fresh connection and flips to
+/// false once the writer task dies on a broken pipe (the child side of stdin
+/// dropped) — the writer's exit drops its receiver, closing the channel.
+#[tokio::test]
+async fn is_alive_flips_after_writer_hits_closed_stdin() {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+    let (_a2c_agent, a2c_client) = tokio::io::duplex(4096);
+    let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+    assert!(conn.is_alive(), "fresh connection reports alive");
+
+    // Drop the child end of stdin, then attempt a send: the enqueue succeeds
+    // (channel still open) but the writer's flush hits the broken pipe and
+    // the task exits, dropping `writer_rx`.
+    drop(c2a_agent);
+    let _ = conn.notify("session/ping", json!({})).await;
+    let mut alive = true;
+    for _ in 0..200 {
+        alive = conn.is_alive();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!alive, "writer task exit closes the channel → not alive");
+}
+
 #[tokio::test]
 async fn stderr_captured_and_auth_flagged() {
     let hooks = ConnectionHooks {

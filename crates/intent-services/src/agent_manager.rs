@@ -3382,6 +3382,28 @@ impl AgentManager {
         self.end_turn(agent_id).await;
     }
 
+    /// Whether the cached handle's child process + transport still look live
+    /// (monorepo#764). The connection probe catches a writer task that
+    /// already died on a broken pipe, but it is lazy — the writer only
+    /// notices on its next write — so a child that died while the agent sat
+    /// idle is caught by `Child::try_wait` instead. A missing handle counts
+    /// as dead; a handle without an owned child trusts the connection probe
+    /// alone, and an errored `try_wait` probe is treated as live so a
+    /// transient wait failure never forces a spurious respawn.
+    fn handle_is_live(&self, agent_id: &AgentId) -> bool {
+        let mut handles = self.handles.lock().unwrap();
+        let Some(handle) = handles.get_mut(agent_id) else {
+            return false;
+        };
+        if !handle.connection.is_alive() {
+            return false;
+        }
+        match handle._child.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    }
+
     /// Ensure the agent's child process + ACP session exist, spawning lazily on
     /// first turn (the TS spawn-on-first-message semantics) and reusing the live
     /// session otherwise. When the session's model/provider has changed (via
@@ -3435,8 +3457,17 @@ impl AgentManager {
                 // worker/busy-flag touch, matching the retry-spawn teardown path.
                 self.kill_child_only(agent_id).await;
             } else if let Some(acp) = session.acp_session_id.clone() {
-                // Model unchanged and child is live — reuse the existing session.
-                return Ok(acp);
+                if self.handle_is_live(agent_id) {
+                    // Model unchanged and child is live — reuse the existing session.
+                    return Ok(acp);
+                }
+                // The child/transport died while the agent sat idle
+                // (monorepo#764): clear the stale handle + registry entry and
+                // fall through to the spawn path below, which respawns the
+                // child and resumes via `session/load` (or the recreate
+                // fallback in `start_session`).
+                tracing::warn!(agent_id = %agent_id, "cached agent child is dead; respawning before turn");
+                self.kill_child_only(agent_id).await;
             }
         }
         let mut opts = SpawnOptions::new(&resolved.provider);
@@ -5213,7 +5244,7 @@ mod role_reminder_tests {
         }
     }
 
-    fn session(
+    pub(super) fn session(
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         specialist: Option<&str>,
@@ -5255,7 +5286,7 @@ mod role_reminder_tests {
     }
 
     /// Build a manager over a temp store seeded with a workspace + agent session.
-    async fn manager_with(
+    pub(super) async fn manager_with(
         specialist: Option<&str>,
         specialists_dir: Option<PathBuf>,
     ) -> (AgentManager, AgentId) {
@@ -5736,6 +5767,135 @@ mod role_reminder_tests {
             text.starts_with("<system>\nSP\n</system>\n\nContext:\nctx\n\n---\n\n[Role Reminder:"),
             "unexpected ordering: {text:?}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod dead_child_respawn_tests {
+    //! Regression tests for monorepo#764: `ensure_started` must not hand back
+    //! the cached ACP session when the provider child died while the agent
+    //! sat idle — it clears the stale handle and falls through to the
+    //! respawn + resume path. The companion transport probe
+    //! (`Connection::is_alive`) is unit-tested in `intent-acp`.
+
+    use super::role_reminder_tests::{manager_with, session};
+    use super::*;
+
+    /// Path to the deterministic mock ACP agent fixture (the node E2E mock),
+    /// reused here so the respawn fall-through spawns a real child.
+    fn mock_agent_script() -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
+            .canonicalize()
+            .expect("mock-acp-agent.mjs fixture exists")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Insert a fresh agent session on provider `mock` with a cached acp
+    /// session id (the provider is immutable once set, so it must be seeded
+    /// at insert time, not patched onto `manager_with`'s default agent).
+    async fn seed_mock_session(mgr: &AgentManager, agent_id: &AgentId, acp: &str) {
+        let mut s = session(agent_id, &WorkspaceId::from("ws-1"), None);
+        s.provider = Some("mock".to_string());
+        s.acp_session_id = Some(acp.to_string());
+        mgr.services.store.insert_agent_session(&s).await.unwrap();
+    }
+
+    /// Install a fake duplex-backed handle (live connection, no responder).
+    /// Returns the far ends, which must stay in scope for the connection's
+    /// writer to stay alive. `spawned_model`/`spawned_provider` match what
+    /// `resolve_spawn` yields for the mock provider so the model-change
+    /// respawn branch stays cold.
+    fn install_fake_handle(
+        mgr: &AgentManager,
+        agent_id: &AgentId,
+        child: Option<Child>,
+    ) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(4096);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let connection = Arc::new(Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks::default(),
+        ));
+        let (_note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+        let handle = AgentHandle {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: child,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "node".to_string(),
+        };
+        mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
+        (c2a_agent, a2c_agent)
+    }
+
+    /// Live child + unchanged model → the cached session comes back with no
+    /// respawn and no extra RPC (the fake connection has no responder, so any
+    /// RPC would fail the turn).
+    #[tokio::test]
+    async fn reuses_cached_session_when_child_alive() {
+        std::env::set_var("MOCK_AGENT_SCRIPT_PATH", mock_agent_script());
+        let (mgr, _seeded) = manager_with(None, None).await;
+        let agent_id = AgentId::from("agent-764-alive");
+        seed_mock_session(&mgr, &agent_id, "acp-cached").await;
+        let _ends = install_fake_handle(&mgr, &agent_id, None);
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("live-child reuse path succeeds");
+        assert_eq!(acp, "acp-cached", "live child reuses the cached session");
+        // No respawn happened: the fake handle (no owned child) is untouched.
+        let handles = mgr.handles.lock().unwrap();
+        assert!(handles.get(&agent_id).unwrap()._child.is_none());
+    }
+
+    /// Handle present but the child already exited → `ensure_started` must
+    /// NOT return the stale cached session: it reaps the handle and falls
+    /// through to a fresh spawn (real mock child) whose session resumes /
+    /// recreates.
+    #[tokio::test]
+    async fn respawns_when_cached_child_is_dead() {
+        std::env::set_var("MOCK_AGENT_SCRIPT_PATH", mock_agent_script());
+        let (mgr, _seeded) = manager_with(None, None).await;
+        let agent_id = AgentId::from("agent-764-dead");
+        seed_mock_session(&mgr, &agent_id, "acp-stale").await;
+
+        // A real child that has already exited: `try_wait` reports it dead
+        // even though the (fake) transport writer never observed a write
+        // failure — the exact died-while-idle shape from monorepo#764.
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        child.wait().await.expect("child exits");
+        let _ends = install_fake_handle(&mgr, &agent_id, Some(child));
+
+        let acp = mgr
+            .ensure_started(&agent_id, &WorkspaceId::from("ws-1"))
+            .await
+            .expect("dead child falls through to a fresh spawn");
+        // The mock agent advertises `loadSession: false`, so the respawn path
+        // recreated the session — the stale cached id must NOT come back.
+        assert_ne!(acp, "acp-stale", "stale session must not be reused");
+        // The stale fake handle was replaced by a real spawned child.
+        {
+            let handles = mgr.handles.lock().unwrap();
+            assert!(
+                handles.get(&agent_id).unwrap()._child.is_some(),
+                "respawn installed a real child-owning handle"
+            );
+        }
+        mgr.stop(&agent_id).await;
     }
 }
 
