@@ -871,11 +871,15 @@ impl Services {
                 // DELIV-1: enrich the idle payload with `agentName` (so
                 // subscribers don't fall back to a generic "Agent" label)
                 // and — when the child persisted one via `agent.reportToParent`
-                // — the completion `report`. The lookup is a single indexed
-                // row read per idle event; a store error is swallowed and the
-                // event still fires with the base payload.
+                // — the completion `report`. `isBackground` rides along so
+                // subscribers (e.g. iOS notifications) can branch on the
+                // session's background flag without a follow-up read. The
+                // lookup is a single indexed row read per idle event; a store
+                // error is swallowed and the event still fires with the base
+                // payload.
                 if let Ok(session) = self.store.get_agent_session(agent_id).await {
                     data["agentName"] = Value::String(session.name);
+                    data["isBackground"] = Value::Bool(session.is_background);
                     if let Some(report) = session.completion_report {
                         data["report"] = Value::String(report);
                     }

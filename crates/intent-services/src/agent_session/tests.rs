@@ -483,8 +483,10 @@ async fn prompt_turn_streams_events_and_accumulates() {
     // DELIV-1: `agent:idle` MUST carry `agentName` so subscribers don't fall
     // back to a generic label; `completion_report` is `None` on this session,
     // so `report` is absent (only present when a delegated child called
-    // `agent.reportToParent`).
+    // `agent.reportToParent`). `isBackground` rides along from the session
+    // row — `false` for this foreground session.
     assert_eq!(idle.data["agentName"], json!("Builder"));
+    assert_eq!(idle.data["isBackground"], json!(false));
     assert!(
         idle.data.get("report").is_none(),
         "no completion_report was set on this session"
