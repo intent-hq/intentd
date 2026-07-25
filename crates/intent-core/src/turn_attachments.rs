@@ -20,6 +20,7 @@
 //! leftovers are dropped at turn end so nothing leaks across turns.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -97,6 +98,10 @@ impl TurnAttachment {
 
 struct Entry {
     attachment: TurnAttachment,
+    /// Registration-batch id: all attachments registered by ONE tool
+    /// invocation share a batch, so a claim attaches them together (a nonce
+    /// match on any member claims the whole batch).
+    batch: u64,
     registered_at: Instant,
 }
 
@@ -106,6 +111,7 @@ struct Entry {
 #[derive(Default)]
 pub struct TurnAttachmentRegistry {
     inner: Mutex<HashMap<AgentId, Vec<Entry>>>,
+    batch_seq: AtomicU64,
 }
 
 impl TurnAttachmentRegistry {
@@ -113,54 +119,80 @@ impl TurnAttachmentRegistry {
         Self::default()
     }
 
-    /// Register a pending attachment for `agent_id`. Evicts expired entries
-    /// and enforces the per-agent cap (oldest dropped first).
+    /// Register one pending attachment for `agent_id` (a single-item batch).
     pub fn register(&self, agent_id: &AgentId, attachment: TurnAttachment) {
+        self.register_all(agent_id, vec![attachment]);
+    }
+
+    /// Register the attachments produced by ONE tool invocation as a single
+    /// batch — a later claim attaches all of them together. Evicts expired
+    /// entries and enforces the per-agent cap (oldest dropped first).
+    pub fn register_all(&self, agent_id: &AgentId, attachments: Vec<TurnAttachment>) {
+        if attachments.is_empty() {
+            return;
+        }
+        let batch = self.batch_seq.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.lock().unwrap();
         let entries = inner.entry(agent_id.clone()).or_default();
         evict_expired(entries);
-        if entries.len() >= MAX_PER_AGENT {
-            entries.remove(0);
+        for attachment in attachments {
+            if entries.len() >= MAX_PER_AGENT {
+                entries.remove(0);
+            }
+            entries.push(Entry {
+                attachment,
+                batch,
+                registered_at: Instant::now(),
+            });
         }
-        entries.push(Entry {
-            attachment,
-            registered_at: Instant::now(),
-        });
     }
 
-    /// Claim the `AtToolResult` attachment for a completed tool call.
+    /// Claim the `AtToolResult` attachments for a completed tool call — the
+    /// full registration batch, in registration order.
     ///
-    /// Precise path: the serialized `echoed_output` contains an entry's nonce
-    /// (the dispatch layer stamped it into the model-facing output, so any
-    /// non-garbled echo carries it). Fallback path: when no nonce matches and
-    /// `tool_name` is the daemon's own `workspace_api` tool, the oldest
-    /// `AtToolResult` entry is claimed FIFO — a garbled echo cannot defeat
-    /// the attach, and only the tool that registers through this registry can
-    /// trigger the blind claim. Returns `None` when nothing is pending (the
-    /// caller falls back to echo parsing).
+    /// Precise path: the serialized `echoed_output` contains a batch member's
+    /// nonce (the dispatch layer stamped it into the model-facing output, so
+    /// any non-garbled echo carries it). Fallback path: when no nonce matches
+    /// and `tool_name` is the daemon's own `workspace_api` tool, the oldest
+    /// batch with an `AtToolResult` entry is claimed FIFO — a garbled echo
+    /// cannot defeat the attach, and only the tool that registers through
+    /// this registry can trigger the blind claim. Empty when nothing is
+    /// pending (the caller falls back to echo parsing).
     pub fn claim_at_tool_result(
         &self,
         agent_id: &AgentId,
         echoed_output: Option<&Value>,
         tool_name: &str,
-    ) -> Option<TurnAttachment> {
+    ) -> Vec<TurnAttachment> {
         let mut inner = self.inner.lock().unwrap();
-        let entries = inner.get_mut(agent_id)?;
+        let Some(entries) = inner.get_mut(agent_id) else {
+            return Vec::new();
+        };
         evict_expired(entries);
         let echo = echoed_output.map(Value::to_string).unwrap_or_default();
-        let by_nonce = entries.iter().position(|e| {
-            e.attachment.policy == AttachmentPolicy::AtToolResult
-                && !echo.is_empty()
-                && echo.contains(&e.attachment.id)
+        let is_claimable = |e: &Entry| e.attachment.policy == AttachmentPolicy::AtToolResult;
+        let by_nonce = entries
+            .iter()
+            .find(|e| is_claimable(e) && !echo.is_empty() && echo.contains(&e.attachment.id))
+            .map(|e| e.batch);
+        let batch = by_nonce.or_else(|| {
+            tool_name
+                .contains("workspace_api")
+                .then(|| entries.iter().find(|e| is_claimable(e)).map(|e| e.batch))?
         });
-        let pos = by_nonce.or_else(|| {
-            tool_name.contains("workspace_api").then(|| {
-                entries
-                    .iter()
-                    .position(|e| e.attachment.policy == AttachmentPolicy::AtToolResult)
-            })?
-        })?;
-        Some(entries.remove(pos).attachment)
+        let Some(batch) = batch else {
+            return Vec::new();
+        };
+        let mut claimed = Vec::new();
+        entries.retain(|e| {
+            if e.batch == batch && is_claimable(e) {
+                claimed.push(e.attachment.clone());
+                false
+            } else {
+                true
+            }
+        });
+        claimed
     }
 
     /// Finish `agent_id`'s turn: return the pending `AtTurnEnd` attachments
@@ -212,6 +244,10 @@ mod tests {
         assert_ne!(id, new_attachment_id());
     }
 
+    fn ids(claimed: &[TurnAttachment]) -> Vec<&str> {
+        claimed.iter().map(|t| t.id.as_str()).collect()
+    }
+
     #[test]
     fn claim_matches_nonce_in_echoed_output() {
         let reg = TurnAttachmentRegistry::new();
@@ -220,15 +256,34 @@ mod tests {
         reg.register(&a, attachment("tar-bbb", AttachmentPolicy::AtToolResult));
         // The echo carries the SECOND nonce — nonce match must beat FIFO.
         let echo = json!({ "output": "…\"attachmentId\": \"tar-bbb\"…" });
-        let claimed = reg
-            .claim_at_tool_result(&a, Some(&echo), "some_other_tool")
-            .expect("nonce claim");
-        assert_eq!(claimed.id, "tar-bbb");
+        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "some_other_tool");
+        assert_eq!(ids(&claimed), vec!["tar-bbb"]);
         // First entry still pending.
-        let rest = reg
-            .claim_at_tool_result(&a, Some(&json!("tar-aaa")), "x")
-            .expect("second claim");
-        assert_eq!(rest.id, "tar-aaa");
+        let rest = reg.claim_at_tool_result(&a, Some(&json!("tar-aaa")), "x");
+        assert_eq!(ids(&rest), vec!["tar-aaa"]);
+    }
+
+    #[test]
+    fn claim_attaches_full_registration_batch() {
+        let reg = TurnAttachmentRegistry::new();
+        let a = agent();
+        // One tool invocation registered TWO resources (a batch); a second
+        // invocation registered another.
+        reg.register_all(
+            &a,
+            vec![
+                attachment("tar-b1a", AttachmentPolicy::AtToolResult),
+                attachment("tar-b1b", AttachmentPolicy::AtToolResult),
+            ],
+        );
+        reg.register(&a, attachment("tar-b2", AttachmentPolicy::AtToolResult));
+        // A nonce match on ANY batch member claims the whole batch, in order.
+        let echo = json!({ "output": "…tar-b1b…" });
+        let claimed = reg.claim_at_tool_result(&a, Some(&echo), "x");
+        assert_eq!(ids(&claimed), vec!["tar-b1a", "tar-b1b"]);
+        // The other batch is untouched.
+        let rest = reg.claim_at_tool_result(&a, None, "workspace_api");
+        assert_eq!(ids(&rest), vec!["tar-b2"]);
     }
 
     #[test]
@@ -240,15 +295,13 @@ mod tests {
         let garbled = json!({ "output": "garbage" });
         assert!(reg
             .claim_at_tool_result(&a, Some(&garbled), "str_replace")
-            .is_none());
+            .is_empty());
         // Same echo but the daemon's own tool (possibly prefixed) → FIFO claim.
-        let claimed = reg
-            .claim_at_tool_result(&a, Some(&garbled), "workspace-mcp_workspace_api")
-            .expect("fifo claim");
-        assert_eq!(claimed.id, "tar-aaa");
+        let claimed = reg.claim_at_tool_result(&a, Some(&garbled), "workspace-mcp_workspace_api");
+        assert_eq!(ids(&claimed), vec!["tar-aaa"]);
         assert!(reg
             .claim_at_tool_result(&a, Some(&garbled), "workspace_api")
-            .is_none());
+            .is_empty());
     }
 
     #[test]
@@ -258,10 +311,10 @@ mod tests {
         reg.register(&a, attachment("tar-end", AttachmentPolicy::AtTurnEnd));
         assert!(reg
             .claim_at_tool_result(&a, None, "workspace_api")
-            .is_none());
+            .is_empty());
         assert!(reg
             .claim_at_tool_result(&AgentId::from_string("agent-other"), None, "workspace_api")
-            .is_none());
+            .is_empty());
     }
 
     #[test]
@@ -272,14 +325,11 @@ mod tests {
         reg.register(&a, attachment("tar-e1", AttachmentPolicy::AtTurnEnd));
         reg.register(&a, attachment("tar-e2", AttachmentPolicy::AtTurnEnd));
         let drained = reg.finish_turn(&a);
-        assert_eq!(
-            drained.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
-            vec!["tar-e1", "tar-e2"]
-        );
+        assert_eq!(ids(&drained), vec!["tar-e1", "tar-e2"]);
         // Everything (including the unclaimed AtToolResult) is gone.
         assert!(reg
             .claim_at_tool_result(&a, None, "workspace_api")
-            .is_none());
+            .is_empty());
         assert!(reg.finish_turn(&a).is_empty());
     }
 
@@ -294,10 +344,8 @@ mod tests {
             );
         }
         // Oldest were dropped: FIFO claim yields the first surviving entry.
-        let claimed = reg
-            .claim_at_tool_result(&a, None, "workspace_api")
-            .expect("claim");
-        assert_eq!(claimed.id, "tar-004");
+        let claimed = reg.claim_at_tool_result(&a, None, "workspace_api");
+        assert_eq!(ids(&claimed), vec!["tar-004"]);
     }
 
     #[test]

@@ -5076,9 +5076,9 @@ mod mcp_callback {
 
         // The registry holds the canonical entry, claimable by nonce.
         let echo = json!({ "output": format!("…\"attachmentId\": \"{nonce}\"…") });
-        let claimed = registry
-            .claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool")
-            .expect("registered entry claimable by nonce");
+        let mut batch = registry.claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool");
+        assert_eq!(batch.len(), 1, "one registered entry claimable by nonce");
+        let claimed = batch.remove(0);
         assert_eq!(claimed.id, nonce);
         assert_eq!(claimed.mime_type, "application/vnd.intent.proposal+json");
         assert_eq!(
@@ -5136,7 +5136,7 @@ mod mcp_callback {
                 None,
                 "workspace_api"
             )
-            .is_none());
+            .is_empty());
     }
 }
 

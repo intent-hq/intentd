@@ -93,21 +93,24 @@ impl WorkspaceMcpServer {
     /// mimeType, text } }`) in a `workspace_api` result: mint a nonce, stamp
     /// it (as [`ATTACHMENT_ID_KEY`]) into the resource's JSON-object `text`,
     /// and register the canonical payload in the turn-attachment registry
-    /// under `AtToolResult`. The nonce is also stamped into every JSON-object
-    /// text item so a provider that collapses the content-item array to the
-    /// first text item still echoes it — that echo (or, failing that, the
-    /// `workspace_api` FIFO fallback) is what links the completed tool call
-    /// back to the registered entry. Registration happens strictly before the
-    /// result returns to the provider, so the entry always exists by the time
-    /// the provider can echo the tool's completion. Pass-through (no clone
-    /// mutation, no registration) when the registry or caller agent is unwired
-    /// or no resource item is present.
+    /// under `AtToolResult`. All resource items of one result register as ONE
+    /// batch, so the claim attaches every one of them together. The first
+    /// nonce is also stamped into every JSON-object text item so a provider
+    /// that collapses the content-item array to the first text item still
+    /// echoes it — that echo (or, failing that, the `workspace_api` FIFO
+    /// fallback) is what links the completed tool call back to the registered
+    /// batch. Registration happens strictly before the result returns to the
+    /// provider, so the entries always exist by the time the provider can
+    /// echo the tool's completion. Pass-through (no clone mutation, no
+    /// registration) when the registry or caller agent is unwired or no
+    /// resource item is present.
     fn register_turn_attachments(&self, items: &[Value]) -> Vec<Value> {
         let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id)
         else {
             return items.to_vec();
         };
         let mut out = items.to_vec();
+        let mut batch: Vec<TurnAttachment> = Vec::new();
         let mut first_nonce: Option<String> = None;
         for item in out.iter_mut() {
             if item.get("type").and_then(Value::as_str) != Some("resource") {
@@ -124,7 +127,7 @@ impl WorkspaceMcpServer {
             };
             let nonce = new_attachment_id();
             let stamped = stamp_attachment_id(text, &nonce, false).unwrap_or_else(|| text.into());
-            let attachment = TurnAttachment {
+            batch.push(TurnAttachment {
                 id: nonce.clone(),
                 policy: AttachmentPolicy::AtToolResult,
                 mime_type: mime_type.to_string(),
@@ -139,11 +142,11 @@ impl WorkspaceMcpServer {
                     .unwrap_or_default()
                     .to_string(),
                 text: stamped.clone(),
-            };
+            });
             resource.insert("text".to_string(), Value::String(stamped));
-            registry.register(agent_id, attachment);
             first_nonce.get_or_insert(nonce);
         }
+        registry.register_all(agent_id, batch);
         if let Some(nonce) = first_nonce {
             for item in out.iter_mut() {
                 if item.get("type").and_then(Value::as_str) != Some("text") {

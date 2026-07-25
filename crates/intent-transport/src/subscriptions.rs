@@ -654,34 +654,41 @@ impl ChatDeltaState {
                     res_added,
                     self.entity(&message_id, result_block, None, None, false),
                 );
-                // §7.1: the same standalone resource block the persisted
+                // §7.1: the same standalone resource block(s) the persisted
                 // transcript appends right after the `tool_result`. The
-                // registry-claimed canonical item carried on the event
-                // (`registeredAttachment`, deterministic attach) wins;
+                // registry-claimed canonical batch carried on the event
+                // (`registeredAttachments`, deterministic attach) wins;
                 // otherwise fall back to lifting a proposal-MIME resource
                 // item out of the echoed output. Gated on `completed` only
                 // (matching `record_tool`) — an errored tool must not surface
                 // an actionable ProposalCard.
                 if status == "completed" {
-                    if let Some(item) = d
-                        .get("registeredAttachment")
+                    let items: Vec<Value> = d
+                        .get("registeredAttachments")
+                        .and_then(Value::as_array)
                         .cloned()
-                        .or_else(|| intent_services::tool_block::lift_proposal_resource(output))
-                    {
-                        if let Some(proposal_id) = next_block_id(&result_id) {
-                            let proposal_block =
-                                intent_services::tool_block::build_proposal_resource_block(
-                                    &proposal_id,
-                                    &item,
-                                );
-                            let prop_added = self.note_block(&proposal_id);
-                            push_entity(
-                                &mut added,
-                                &mut updated,
-                                prop_added,
-                                self.entity(&message_id, proposal_block, None, None, false),
+                        .unwrap_or_else(|| {
+                            intent_services::tool_block::lift_proposal_resource(output)
+                                .into_iter()
+                                .collect()
+                        });
+                    let mut anchor_id = result_id.clone();
+                    for item in items {
+                        let Some(attach_id) = next_block_id(&anchor_id) else {
+                            break;
+                        };
+                        let attach_block =
+                            intent_services::tool_block::build_proposal_resource_block(
+                                &attach_id, &item,
                             );
-                        }
+                        let attach_added = self.note_block(&attach_id);
+                        push_entity(
+                            &mut added,
+                            &mut updated,
+                            attach_added,
+                            self.entity(&message_id, attach_block, None, None, false),
+                        );
+                        anchor_id = attach_id;
                     }
                 }
             }
