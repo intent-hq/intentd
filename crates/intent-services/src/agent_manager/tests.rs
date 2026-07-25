@@ -655,6 +655,7 @@ fn mock_handle() -> AgentHandle {
         notifications: Arc::new(TokioMutex::new(note_rx)),
         serve_task: tokio::spawn(async {}),
         _child: None,
+        child_pid: None,
         _mcp_bridge: None,
         _mcp_config: None,
         _rules_config: None,
@@ -852,6 +853,7 @@ fn track_with_child(mgr: &AgentManager, id: &AgentId) -> (u32, tokio::task::Join
     let pid = child.id().expect("live child has a pid");
     let mut handle = mock_handle();
     handle._child = Some(child);
+    handle.child_pid = Some(pid);
     mgr.handles.lock().unwrap().insert(id.clone(), handle);
     mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
     let watcher = mgr.arm_child_exit_watcher(id.clone(), Some(pid));
@@ -954,7 +956,7 @@ async fn kill_child_tree_terminates_grandchild() {
     let grandchild: u32 = line.trim().parse().expect("grandchild pid");
     assert!(pid_alive(grandchild), "grandchild alive before teardown");
 
-    super::kill_child_tree(child).await;
+    super::kill_child_tree(child, None).await;
 
     let mut dead = false;
     for _ in 0..100 {
@@ -965,6 +967,65 @@ async fn kill_child_tree_terminates_grandchild() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(dead, "grandchild terminated with the process group");
+}
+
+/// Regression (monorepo#764): after a `try_wait` liveness probe reaps the
+/// direct child (`Child::id()` reads `None`), the pgid teardown must still
+/// sweep same-group descendants via the spawn-time pid — this is the
+/// child-exit-watcher path, where the leader is reaped before the kill.
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_child_tree_sweeps_group_after_leader_reaped() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg("sleep 300 & echo $!; sleep 300");
+    cmd.stdout(Stdio::piped());
+    cmd.kill_on_drop(true);
+    cmd.process_group(0);
+    let mut child = cmd.spawn().expect("spawn sleep tree");
+    let spawn_pid = child.id().expect("live child has a pid");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let line = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("grandchild pid line in time")
+        .expect("read ok")
+        .expect("a pid line");
+    let grandchild: u32 = line.trim().parse().expect("grandchild pid");
+    assert!(pid_alive(grandchild), "grandchild alive before teardown");
+
+    // Kill ONLY the leader, then reap it via `try_wait` — same-group
+    // grandchild survives and `Child::id()` reads `None` afterwards.
+    kill(Pid::from_raw(spawn_pid as i32), Signal::SIGKILL).expect("kill leader");
+    let mut reaped = false;
+    for _ in 0..100 {
+        if child.try_wait().expect("try_wait ok").is_some() {
+            reaped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reaped, "leader reaped by try_wait");
+    assert!(child.id().is_none(), "id() cleared after reap");
+    assert!(pid_alive(grandchild), "grandchild outlives the leader");
+
+    super::kill_child_tree(child, Some(spawn_pid)).await;
+
+    let mut dead = false;
+    for _ in 0..100 {
+        if !pid_alive(grandchild) {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dead, "grandchild swept via the spawn-time pid");
 }
 
 /// Signal-0 liveness probe used by the process-group teardown test.
@@ -1295,6 +1356,7 @@ fn track_mock_agent_inner(
             notifications: Arc::new(TokioMutex::new(note_rx)),
             serve_task: tokio::spawn(async {}),
             _child: None,
+            child_pid: None,
             _mcp_bridge: None,
             _mcp_config: None,
             _rules_config: None,
