@@ -359,6 +359,26 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     .await;
     let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
 
+    // An archived workspace must also appear in the seq-0 snapshot, matching
+    // the deltas which upsert archived workspaces (intent-hq/monorepo#775).
+    let archived = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "workspace.create",
+        json!({ "title": "Archived WS" }),
+    )
+    .await;
+    let archived_id = archived["workspace"]["id"].as_str().unwrap().to_string();
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        12,
+        "workspace.archive",
+        json!({ "workspaceId": archived_id }),
+    )
+    .await;
+
     // The workspace channel is global (no `workspaceId` param).
     let (mut sub_reader, _sub_write, _sub_id, snap) =
         subscribe(&socket, "workspace.subscribe", json!({})).await;
@@ -366,6 +386,11 @@ async fn workspace_channel_snapshot_then_updated_delta() {
     assert!(
         ws_entry["rev"].is_null(),
         "workspace entities carry no rev (R3 scopes rev to Note/Task)"
+    );
+    let archived_entry = find(&snap, &archived_id).expect("archived workspace in snapshot");
+    assert_eq!(
+        archived_entry["status"], "Archived",
+        "snapshot includes archived workspaces with their status"
     );
 
     // A workspace status event re-reads the workspace into an `updated` delta.
