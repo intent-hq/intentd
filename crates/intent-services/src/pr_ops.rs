@@ -100,7 +100,7 @@ pub(crate) const SWEEP_IDLE_TICK_MULTIPLE: u64 = 10;
 /// down. Malformed workspace timestamps — and a `None` cutoff — fail open
 /// (count as active) so a bad record never slows its own refreshes.
 pub(crate) fn sweep_due(ws: &Workspace, active_cutoff: Option<OffsetDateTime>, tick: u64) -> bool {
-    if tick % SWEEP_IDLE_TICK_MULTIPLE == 0 {
+    if tick.is_multiple_of(SWEEP_IDLE_TICK_MULTIPLE) {
         return true;
     }
     let Some(cutoff) = active_cutoff else {
@@ -287,7 +287,7 @@ pub(crate) async fn discover_matching_open_pr(
             .filter(|p| Some(p.number) != exclude && pr_matches_workspace(p, branch, base_ref))
             .max_by_key(|p| p.number);
         if let Some(p) = matched {
-            if best.as_ref().map_or(true, |b| p.number > b.number) {
+            if best.as_ref().is_none_or(|b| p.number > b.number) {
                 best = Some(p);
             }
         }
