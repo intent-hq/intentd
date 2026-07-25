@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
@@ -90,6 +90,31 @@ where
     }
 
     Err(last_error.unwrap_or_else(|| Error::Internal("retry exhausted".to_string())))
+}
+
+/// COMMIT the transaction open on `conn`, guarding against a failed COMMIT
+/// (monorepo#638 / #657 / #670): a failed COMMIT can leave the transaction
+/// open on the pooled connection, so roll back explicitly so the connection
+/// is not returned to the pool still holding the write lock. If the ROLLBACK
+/// fails too, detach the connection from the pool and close it so the
+/// poisoned handle is never reused (the pool opens a fresh replacement on
+/// demand). On failure returns `Error::Internal` with the message
+/// `"{context}: {commit error}"`.
+///
+/// Takes the connection by value: COMMIT must be the last statement of the
+/// raw `BEGIN IMMEDIATE` transaction, and the detach path consumes it.
+pub(crate) async fn commit_with_rollback_guard(
+    mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    context: &str,
+) -> Result<()> {
+    use sqlx::Connection;
+    if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+        if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
+            let _ = conn.detach().close().await;
+        }
+        return Err(Error::Internal(format!("{context}: {e}")));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,6 +200,48 @@ impl Store {
         })
     }
 
+    /// Number of pages on the database freelist (`PRAGMA freelist_count`):
+    /// pages emptied by deletes that have not yet been reclaimed. On an
+    /// incremental-auto-vacuum database these are the pages
+    /// [`Self::incremental_vacuum`] can release back to the filesystem.
+    pub async fn freelist_count(&self) -> Result<i64> {
+        sqlx::query("PRAGMA freelist_count")
+            .fetch_one(&self.write_pool)
+            .await
+            .map(|row| row.get::<i64, _>(0))
+            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))
+    }
+
+    /// Release up to `max_pages` freelist pages back to the filesystem via
+    /// `PRAGMA incremental_vacuum(N)`. Only effective when the database has
+    /// `auto_vacuum = INCREMENTAL` (a no-op otherwise — see [`connect_write`]
+    /// for the activation story). Bounded `N` keeps each call short so the
+    /// single-connection write pool is never held for long; call it
+    /// periodically (e.g. after retention sweeps) to reclaim space
+    /// incrementally. Returns the number of pages actually freed.
+    pub async fn incremental_vacuum(&self, max_pages: u32) -> Result<u64> {
+        let before = self.freelist_count().await?;
+        sqlx::query(&format!("PRAGMA incremental_vacuum({max_pages})"))
+            .execute(&self.write_pool)
+            .await
+            .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
+        let after = self.freelist_count().await?;
+        Ok((before - after).max(0) as u64)
+    }
+
+    /// Run `PRAGMA optimize` on the write connection. Cheap when called
+    /// repeatedly (SQLite only re-analyzes tables whose content changed
+    /// enough to matter); intended to run periodically after retention
+    /// sweeps so the query planner statistics track the shrinking event
+    /// table. See <https://sqlite.org/pragma.html#pragma_optimize>.
+    pub async fn optimize(&self) -> Result<()> {
+        sqlx::query("PRAGMA optimize")
+            .execute(&self.write_pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Internal(format!("PRAGMA optimize failed: {e}")))
+    }
+
     /// Close both pools gracefully, checkpointing the WAL and freeing resources.
     /// Call this during daemon shutdown to checkpoint the WAL and close the pools.
     /// This ensures WAL changes are visible to subsequent daemon instances
@@ -236,10 +303,29 @@ impl MigrationStatus {
 /// `busy_timeout=5000` is kept to protect against cross-process access (e.g.,
 /// manual sqlite3 CLI probes during development), though in-process contention
 /// is eliminated by the single-writer design.
+///
+/// **auto_vacuum = INCREMENTAL**: without auto_vacuum, pages emptied by
+/// deletes (retention sweeps) accumulate on the freelist forever and the file
+/// only ever grows. sqlx applies the `auto_vacuum` pragma before
+/// `journal_mode`, so a **new** database is created in incremental mode and
+/// [`Store::incremental_vacuum`] can release freelist pages in bounded slices.
+/// On an **existing** database created without auto_vacuum the pragma is
+/// recorded but inert until a one-time `VACUUM` rebuilds the file — that is
+/// deliberately NOT done automatically (a full VACUUM blocks all writes for
+/// the duration, unacceptable on a live daemon). One-time activation, with
+/// the daemon **stopped**:
+///
+/// ```sh
+/// sqlite3 ~/.intentd/intentd.db "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
+/// ```
+///
+/// `intentd doctor` reports the current auto_vacuum mode and freelist size,
+/// and prints this activation step when the database is still in NONE mode.
 pub async fn connect_write(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(5000))
@@ -276,6 +362,7 @@ pub async fn connect_read(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(5000))
@@ -301,6 +388,7 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(5000))

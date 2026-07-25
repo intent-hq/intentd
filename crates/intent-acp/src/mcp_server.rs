@@ -21,6 +21,13 @@ mod tools;
 
 pub use tools::ToolDef;
 
+// Canonical proposal helpers (§7.1): the collapsed-output proposal lift in
+// `intent-services::tool_block` reuses these so validation and resource-item
+// construction cannot drift from what `ws.app.proposal.show` emits.
+pub use bindings::app::proposal::{
+    is_valid_proposal, proposal_resource_uri, PROPOSAL_KINDS, PROPOSAL_RESOURCE_MIME_TYPE,
+};
+
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 

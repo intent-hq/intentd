@@ -43,7 +43,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Parse and validate tag
@@ -101,7 +101,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Resolve pinned Rust channel
@@ -200,7 +200,7 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Download artifacts
@@ -273,7 +273,7 @@ jobs:
     env:
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Download artifacts
@@ -294,7 +294,7 @@ jobs:
           cp intentd.rb "$(brew --repository scratch/sitter)/Formula/intentd.rb"
           brew style --formula scratch/sitter/intentd \
             || echo "::warning::brew style reported offenses on intentd.rb (non-blocking)"
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: intent-hq/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -334,7 +334,7 @@ jobs:
       TAG: ${{ needs.plan.outputs.tag }}
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Download linux artifacts

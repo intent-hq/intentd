@@ -207,12 +207,12 @@ impl Transcript {
                 // place (the transcript is append-only; index-derived ids
                 // preclude removal).
                 if tc.status == "completed" {
-                    if let Some(item) = crate::tool_block::find_proposal_resource(output) {
+                    if let Some(item) = crate::tool_block::lift_proposal_resource(output) {
                         match self.proposal_index.get(&tc.tool_call_id) {
                             Some(&pi) => {
                                 let id = self.block_id(pi);
                                 self.blocks[pi] =
-                                    crate::tool_block::build_proposal_resource_block(&id, item);
+                                    crate::tool_block::build_proposal_resource_block(&id, &item);
                             }
                             None => {
                                 self.flush_text();
@@ -220,7 +220,7 @@ impl Transcript {
                                 let pid = self.block_id(pindex);
                                 self.blocks
                                     .push(crate::tool_block::build_proposal_resource_block(
-                                        &pid, item,
+                                        &pid, &item,
                                     ));
                                 self.proposal_index.insert(tc.tool_call_id.clone(), pindex);
                             }

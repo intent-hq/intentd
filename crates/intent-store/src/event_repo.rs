@@ -16,6 +16,12 @@ use crate::{enum_to_db, Store};
 const EVENT_COLUMNS: &str = "id, workspace_id, timestamp, event_type, actor, session_id, \
     correlation_id, parent_event_id, metadata_json, data_json";
 
+/// Max rows removed per retention DELETE statement. Each chunk is its own
+/// implicit transaction, so the single-connection write pool is released
+/// between chunks and concurrent writers stay responsive (the old
+/// single-statement full-table-scan sweep held the pool 2–3.5s on a 1.2GB DB).
+pub(crate) const RETENTION_DELETE_CHUNK: i64 = 1000;
+
 /// Input to [`Store::insert_event`]: an event without its id. The repository
 /// mints a UUIDv7 `id` and returns the persisted [`Event`].
 #[derive(Debug, Clone)]
@@ -157,10 +163,10 @@ impl Store {
 
         match result {
             Ok(_) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("commit failed: {e}")))?;
+                // Rollback (and detach+close on double failure) if the COMMIT
+                // itself fails, so the sole write-pool connection is never
+                // returned holding an open transaction (monorepo#670).
+                crate::commit_with_rollback_guard(conn, "commit failed").await?;
             }
             Err(e) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
@@ -253,13 +259,16 @@ impl Store {
 
     /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
     /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
-    /// `host:exec:*`) whose `timestamp` is strictly older than `cutoff` (an
-    /// RFC-3339 string), and return the number of rows removed. Lifecycle/tool/
-    /// note/task/workspace events are preserved regardless of age. This is the
-    /// sole delete path on the otherwise append-only log; it is deliberately
-    /// scoped to high-volume families that can be safely trimmed so the log stays
-    /// the source of truth for everything else. Runs as a single statement
-    /// (implicitly transactional) and is idempotent — a re-run with the same
+    /// `host:exec:*`, `script:output`) whose `timestamp` is strictly older
+    /// than `cutoff` (an RFC-3339 string), and return the number of rows
+    /// removed. Lifecycle/note/task/workspace events are preserved regardless
+    /// of age (`agent:tool:call` has its own TTL via
+    /// [`Store::delete_tool_call_events_before`]). This is deliberately scoped
+    /// to high-volume families that can be safely trimmed so the log stays the
+    /// source of truth for everything else. Each family is deleted separately
+    /// in index-driven chunks (see
+    /// [`Store::delete_events_by_type_range_before`]) so no single write
+    /// transaction holds the pool for long. Idempotent — a re-run with the same
     /// cutoff removes nothing more.
     pub async fn delete_ephemeral_events_before(&self, cutoff: &str) -> Result<u64> {
         // High-volume event families eligible for retention sweep:
@@ -267,23 +276,110 @@ impl Store {
         // - file:* — file watcher events (finding F4: 87% of event table)
         // - terminal:data — live PTY output
         // - host:exec:* — streaming command output
-        let result = sqlx::query(
-            "DELETE FROM event WHERE timestamp < ? AND (
-                event_type LIKE ? OR
-                event_type LIKE ? OR
-                event_type = ? OR
-                event_type LIKE ?
-            )",
-        )
-        .bind(cutoff)
-        .bind(format!("{}%", intent_core::events::AGENT_STREAM_PREFIX))
-        .bind("file:%")
-        .bind(intent_core::events::TERMINAL_DATA)
-        .bind("host:exec:%")
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("ephemeral event retention sweep failed: {e}")))?;
-        Ok(result.rows_affected())
+        // - script:output — script PTY output chunks (monorepo#620: same
+        //   live-output shape as terminal:data; was leaking pre-fix and
+        //   dominated the event table on long-lived daemons). Exact type,
+        //   not a `script:` prefix, so `script:state` (lifecycle) survives.
+        let mut removed = 0;
+        removed += self
+            .delete_type_prefix_before(intent_core::events::AGENT_STREAM_PREFIX, cutoff)
+            .await?;
+        removed += self.delete_type_prefix_before("file:", cutoff).await?;
+        removed += self
+            .delete_exact_type_before(intent_core::events::TERMINAL_DATA, cutoff)
+            .await?;
+        removed += self.delete_type_prefix_before("host:exec:", cutoff).await?;
+        removed += self
+            .delete_exact_type_before(intent_core::events::SCRIPT_OUTPUT, cutoff)
+            .await?;
+        Ok(removed)
+    }
+
+    /// Retention sweep for `agent:tool:call` events (87% of live data on the
+    /// dev seat): delete rows whose `timestamp` is strictly older than `cutoff`
+    /// and return the number removed. Kept separate from
+    /// [`Store::delete_ephemeral_events_before`] because tool calls carry a
+    /// longer TTL (24h) than the ephemeral stream families. No consumer reads
+    /// persisted `agent:tool:call` rows beyond bounded recent windows —
+    /// conversation replay uses `agent_message`, and live streaming synthesizes
+    /// tool blocks from the in-memory bus.
+    pub async fn delete_tool_call_events_before(&self, cutoff: &str) -> Result<u64> {
+        self.delete_exact_type_before(intent_core::events::AGENT_TOOL_CALL, cutoff)
+            .await
+    }
+
+    /// Chunked delete of one exact `event_type` older than `cutoff`, driven by
+    /// `idx_event_type_time` (equality on `event_type`, range on `timestamp`).
+    async fn delete_exact_type_before(&self, event_type: &str, cutoff: &str) -> Result<u64> {
+        self.delete_events_by_type_range_before(event_type, None, cutoff)
+            .await
+    }
+
+    /// Chunked delete of an `event_type` prefix family older than `cutoff`.
+    /// Uses a half-open range (`event_type >= prefix AND event_type < upper`)
+    /// instead of `LIKE` so the BINARY-collated `idx_event_type_time` index
+    /// serves the predicate (SQLite's default case-insensitive LIKE cannot use
+    /// a BINARY index).
+    async fn delete_type_prefix_before(&self, prefix: &str, cutoff: &str) -> Result<u64> {
+        let upper = prefix_upper_bound(prefix);
+        self.delete_events_by_type_range_before(prefix, Some(&upper), cutoff)
+            .await
+    }
+
+    /// Core retention delete: remove events matching an `event_type` bound
+    /// (`= lower` when `upper` is `None`, else `>= lower AND < upper`) with
+    /// `timestamp < cutoff`, in chunks of [`RETENTION_DELETE_CHUNK`] rows.
+    /// Each chunk is a single small statement (implicitly transactional) whose
+    /// inner SELECT is an `idx_event_type_time` range scan and whose outer
+    /// DELETE resolves rowids directly, so the write pool is held only for
+    /// milliseconds at a time instead of one long full-table-scan transaction.
+    /// Loops until a chunk deletes fewer rows than the limit.
+    async fn delete_events_by_type_range_before(
+        &self,
+        lower: &str,
+        upper: Option<&str>,
+        cutoff: &str,
+    ) -> Result<u64> {
+        let mut removed: u64 = 0;
+        loop {
+            let result = match upper {
+                Some(upper) => {
+                    sqlx::query(
+                        "DELETE FROM event WHERE rowid IN (
+                            SELECT rowid FROM event
+                            WHERE event_type >= ? AND event_type < ? AND timestamp < ?
+                            LIMIT ?
+                        )",
+                    )
+                    .bind(lower)
+                    .bind(upper)
+                    .bind(cutoff)
+                    .bind(RETENTION_DELETE_CHUNK)
+                    .execute(self.write_pool())
+                    .await
+                }
+                None => {
+                    sqlx::query(
+                        "DELETE FROM event WHERE rowid IN (
+                            SELECT rowid FROM event
+                            WHERE event_type = ? AND timestamp < ?
+                            LIMIT ?
+                        )",
+                    )
+                    .bind(lower)
+                    .bind(cutoff)
+                    .bind(RETENTION_DELETE_CHUNK)
+                    .execute(self.write_pool())
+                    .await
+                }
+            }
+            .map_err(|e| Error::Internal(format!("event retention sweep failed: {e}")))?;
+            let affected = result.rows_affected();
+            removed += affected;
+            if affected < RETENTION_DELETE_CHUNK as u64 {
+                return Ok(removed);
+            }
+        }
     }
 
     /// Legacy alias for `delete_ephemeral_events_before`. Preserved for
@@ -350,6 +446,16 @@ impl Store {
         })
         .await
     }
+}
+
+/// Smallest string strictly greater than every string starting with `prefix`,
+/// for half-open `[prefix, upper)` index ranges over `event_type`. Increments
+/// the final byte; valid because event-type prefixes are ASCII.
+fn prefix_upper_bound(prefix: &str) -> String {
+    debug_assert!(prefix.is_ascii() && !prefix.is_empty());
+    let mut bytes = prefix.as_bytes().to_vec();
+    *bytes.last_mut().expect("non-empty prefix") += 1;
+    String::from_utf8(bytes).expect("ascii prefix")
 }
 
 /// Escape LIKE wildcards so a prefix is matched literally (paired with

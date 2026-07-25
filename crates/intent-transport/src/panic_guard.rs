@@ -102,28 +102,6 @@ where
     }
 }
 
-/// Synchronous variant of [`guard_frame`] for inline sync handlers.
-pub(crate) fn guard_frame_sync<F>(method: &str, rpc_id: Option<Value>, handler: F) -> Option<String>
-where
-    F: FnOnce() -> Option<String>,
-{
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        maybe_inject_panic(method);
-        handler()
-    }));
-    match result {
-        Ok(frame) => frame,
-        Err(payload) => {
-            tracing::error!(
-                method,
-                panic = %panic_message(payload.as_ref()),
-                "JSON-RPC handler panicked; connection kept alive"
-            );
-            rpc_id.map(internal_error_frame)
-        }
-    }
-}
-
 /// Run an async handler that sends its own frames and returns channel
 /// liveness. On panic, sends the `-32603` frame for requests (nothing for
 /// notifications) and reports whether the outbound channel is still open.
@@ -209,22 +187,6 @@ mod tests {
     async fn guard_frame_passes_through_without_panic() {
         let frame = guard_frame("x.y", Some(json!(1)), async { Some("ok".to_string()) }).await;
         assert_eq!(frame.as_deref(), Some("ok"));
-    }
-
-    #[test]
-    fn guard_frame_sync_panic_echoes_string_id() {
-        let frame =
-            with_quiet_panics(|| guard_frame_sync("x.y", Some(json!("abc")), || panic!("boom")))
-                .expect("request panic must produce a frame");
-        let v: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(v["id"], json!("abc"));
-        assert_eq!(v["error"]["code"], json!(-32603));
-    }
-
-    #[test]
-    fn guard_frame_sync_panic_on_notification_yields_no_frame() {
-        let frame = with_quiet_panics(|| guard_frame_sync("x.y", None, || panic!("boom")));
-        assert!(frame.is_none());
     }
 
     #[tokio::test]

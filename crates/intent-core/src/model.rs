@@ -1406,6 +1406,11 @@ pub struct CommentAddResult {
     pub message: String,
     pub comment_id: String,
     pub anchored: bool,
+    /// The note's post-rewrite revision: `comment.add` embeds anchor markers
+    /// into the note markdown (an `update_note` that bumps `rev`), so the
+    /// result echoes the authoritative new `rev` instead of leaving clients
+    /// to assume "exactly one bump per add" (monorepo#638).
+    pub note_rev: i64,
     pub location: CommentLocation,
 }
 
@@ -2631,7 +2636,8 @@ mod tests {
     }
 
     /// `comment.add` echoes a camelCase `commentId` + nested `location`
-    /// (`anchoredText`), matching the TS `ws.comment.add` return (§5.3).
+    /// (`anchoredText`), matching the TS `ws.comment.add` return (§5.3),
+    /// plus the post-rewrite `noteRev` (monorepo#638).
     #[test]
     fn comment_add_result_camel_case_parity() {
         let result = CommentAddResult {
@@ -2639,6 +2645,7 @@ mod tests {
             message: "Comment successfully anchored to \"Seed\"".to_string(),
             comment_id: "c1".to_string(),
             anchored: true,
+            note_rev: 3,
             location: CommentLocation {
                 line: 1,
                 anchored_text: "Seed".to_string(),
@@ -2651,6 +2658,7 @@ mod tests {
                 "message": "Comment successfully anchored to \"Seed\"",
                 "commentId": "c1",
                 "anchored": true,
+                "noteRev": 3,
                 "location": { "line": 1, "anchoredText": "Seed" }
             })
         );

@@ -1978,6 +1978,45 @@ async fn comment_add_context_not_found_is_invalid_params() {
     );
 }
 
+#[test]
+fn bounded_needle_snippet_bounds_long_needles() {
+    let short = "short needle";
+    assert_eq!(crate::bounded_needle_snippet(short), short);
+    let long = "a".repeat(30) + &"b".repeat(30);
+    let snippet = crate::bounded_needle_snippet(&long);
+    assert_eq!(snippet, format!("{}…{}", "a".repeat(24), "b".repeat(24)));
+    // Char-based edges: multi-byte input must not split codepoints.
+    let unicode = "é".repeat(60);
+    assert_eq!(
+        crate::bounded_needle_snippet(&unicode),
+        format!("{}…{}", "é".repeat(24), "é".repeat(24))
+    );
+}
+
+#[tokio::test]
+async fn comment_add_mention_at_prefixed_needle_anchors() {
+    // Round-4 repro: the FE needle carries `@KNOWN_ISSUES.md` (mention chip
+    // canonical text) where the markdown has the bare filename.
+    let (_tmp, svc, ws, id) =
+        setup("issue filed+closed; KNOWN_ISSUES.md was retired on main.").await;
+    let res = svc
+        .comment_add(
+            ws,
+            id,
+            "filed+closed; @KNOWN_ISSUES.md was retired".into(),
+            "@KNOWN_ISSUES.md was retired".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(res.anchored);
+    assert_eq!(res.location.anchored_text, "KNOWN_ISSUES.md was retired");
+}
+
 #[tokio::test]
 async fn comment_add_empty_target_is_invalid_params() {
     // Caret-only selections send an empty commentTarget.
@@ -2030,6 +2069,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "please change".into(),
             Some("suggestion".into()),
             None,
+            None,
             Some("only-original".into()),
             None,
         )
@@ -2045,6 +2085,7 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
             "please change".into(),
             Some("suggestion".into()),
             Some("Bob".into()),
+            None,
             Some("old text".into()),
             Some("new text".into()),
         )
@@ -2073,6 +2114,169 @@ async fn comment_respond_suggestion_nests_diff_and_threads() {
     assert!(del.success);
 }
 
+/// `comment.respond` persists the optional `authorType` (defaulting `author`
+/// to `"User"` / `"Agent"` when absent) and rejects invalid values with
+/// `InvalidParams`, mirroring `comment.add`'s validation.
+#[tokio::test]
+async fn comment_respond_author_type_persists_and_validates() {
+    use intent_core::AuthorType;
+
+    let (_tmp, svc, ws, id) = setup("alpha reply-target omega").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha reply-target omega".into(),
+            "reply-target".into(),
+            "root".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+
+    let user_reply = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "hi".into(),
+            None,
+            None,
+            Some("user".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("user respond");
+    assert_eq!(user_reply.comment.author_type, AuthorType::User);
+    assert_eq!(user_reply.comment.author, "User");
+
+    let agent_reply = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "on it".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("agent respond");
+    assert_eq!(agent_reply.comment.author_type, AuthorType::Agent);
+    assert_eq!(agent_reply.comment.author, "Agent");
+
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id),
+            "bad".into(),
+            None,
+            None,
+            Some("robot".into()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("invalid authorType must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+}
+
+/// `comment.respond`'s pre-existing caller-input validations — missing
+/// `threadId`/`commentId`, empty `comment`, and a missing
+/// `suggestionOriginal`/`suggestionProposed` pair — return `InvalidParams`
+/// (-32602) like `comment.add`, not `Internal` (-32603) (monorepo#632).
+#[tokio::test]
+async fn comment_respond_caller_input_errors_are_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("alpha reply-target omega").await;
+    let added = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha reply-target omega".into(),
+            "reply-target".into(),
+            "root".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add");
+
+    // Missing threadId AND commentId.
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            None,
+            "hi".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing threadId/commentId must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Either threadId or commentId")),
+        "got: {err:?}"
+    );
+
+    // Empty (whitespace-only) comment.
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id.clone()),
+            "   ".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("empty comment must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("non-empty")),
+        "got: {err:?}"
+    );
+
+    // type='suggestion' without the suggestionOriginal/suggestionProposed pair.
+    let err = svc
+        .comment_respond(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some(added.comment_id),
+            "try this".into(),
+            Some("suggestion".into()),
+            None,
+            None,
+            Some("only original".into()),
+            None,
+        )
+        .await
+        .expect_err("suggestion without both fields must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("suggestionOriginal and suggestionProposed")),
+        "got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn comment_resolve_thread_marks_and_reopens() {
     let (_tmp, svc, ws, id) = setup("alpha resolve-target omega").await;
@@ -2097,6 +2301,7 @@ async fn comment_resolve_thread_marks_and_reopens() {
         Some(added.comment_id.clone()),
         None,
         "a reply".into(),
+        None,
         None,
         None,
         None,
@@ -2165,7 +2370,119 @@ async fn comment_resolve_thread_requires_thread_or_comment_id() {
         .comment_resolve_thread(ws, id, None, None, true)
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::Internal(ref m) if m.contains("Either threadId or commentId")));
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Either threadId or commentId")),
+        "got: {err:?}"
+    );
+}
+
+/// `comment.getThread` / `comment.resolveThread`'s missing
+/// `threadId`/`commentId` validation and `comment.list`'s filter validations
+/// (`since`, `authorType`, `status`) are caller-input errors and return
+/// `InvalidParams` (-32602) like `comment.add`/`comment.respond`, not
+/// `Internal` (-32603) (monorepo#649). Lookup failures (unknown
+/// commentId/threadId) keep their existing `Internal` semantics.
+#[tokio::test]
+async fn comment_get_thread_and_resolve_caller_input_errors_are_invalid_params() {
+    let (_tmp, svc, ws, id) = setup("alpha lookup-target omega").await;
+
+    // getThread: missing threadId AND commentId.
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), None, None)
+        .await
+        .expect_err("getThread without threadId/commentId must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Either threadId or commentId")),
+        "got: {err:?}"
+    );
+
+    // list: invalid `since` / `authorType` / `status` filters.
+    let err = svc
+        .comment_list(
+            ws.clone(),
+            id.clone(),
+            Some("not-a-timestamp".into()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("invalid since must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Invalid 'since'")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_list(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some("robot".into()),
+            None,
+            false,
+        )
+        .await
+        .expect_err("invalid authorType must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Invalid 'authorType'")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_list(
+            ws.clone(),
+            id.clone(),
+            None,
+            None,
+            Some("closed".into()),
+            false,
+        )
+        .await
+        .expect_err("invalid status must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("Invalid 'status'")),
+        "got: {err:?}"
+    );
+
+    // Lookup failures stay Internal: unknown commentId / threadId on
+    // getThread/resolveThread.
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), None, Some("comment-missing".into()))
+        .await
+        .expect_err("unknown commentId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Comment not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_resolve_thread(
+            ws.clone(),
+            id.clone(),
+            None,
+            Some("comment-missing".into()),
+            true,
+        )
+        .await
+        .expect_err("unknown commentId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Comment not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_get_thread(ws.clone(), id.clone(), Some("thread-missing".into()), None)
+        .await
+        .expect_err("unknown threadId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Thread not found")),
+        "got: {err:?}"
+    );
+    let err = svc
+        .comment_resolve_thread(ws, id, Some("thread-missing".into()), None, true)
+        .await
+        .expect_err("unknown threadId must fail");
+    assert!(
+        matches!(err, Error::Internal(ref m) if m.contains("Thread not found")),
+        "got: {err:?}"
+    );
 }
 
 /// Cross-workspace bare-id probes must not delete a comment that lives in a
@@ -2333,6 +2650,7 @@ async fn comment_respond_rejects_cross_workspace_comment_id_probe() {
             None,
             Some(seeded_a.id.clone()),
             "leaked reply".into(),
+            None,
             None,
             None,
             None,
@@ -3042,6 +3360,16 @@ mod change_event_parity {
             )
             .await
             .expect("comment");
+        // The add rewrites the note markdown (anchor markers), so a
+        // `note:updated` precedes the `comment:added` (monorepo#638) and the
+        // result echoes the post-rewrite rev (insert=0 → 1).
+        assert_eq!(added.note_rev, 1);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
+        assert_eq!(
+            ev["data"],
+            json!({ "noteId": "n-1", "title": "Title", "action": "update" })
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "comment:added");
         assert_eq!(
@@ -3076,6 +3404,8 @@ mod change_event_parity {
             )
             .await
             .expect("first add");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "note:updated");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "comment:added");
 
@@ -3141,6 +3471,7 @@ mod change_event_parity {
                 None,
                 Some(added.comment_id.clone()),
                 "reply body".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -6342,6 +6673,107 @@ mod pr {
         assert!(evs.is_empty());
     }
 
+    /// Like [`refresh_setup`], but also seeds the workspace's `baseRef` —
+    /// written directly to the store so tests can exercise legacy
+    /// remote-qualified rows that predate write-side canonicalisation.
+    async fn refresh_setup_with_base_ref(
+        forge: StubForge,
+        branch: &str,
+        base_ref: &str,
+        pr_number: Option<u64>,
+    ) -> (TempDb, Services, WorkspaceId) {
+        let (tmp, svc, ws_id) = refresh_setup(forge, branch, pr_number, false).await;
+        let mut ws = svc.store().get_workspace(&ws_id).await.expect("ws");
+        ws.base_ref = Some(base_ref.to_string());
+        svc.store().update_workspace(&ws).await.expect("update ws");
+        (tmp, svc, ws_id)
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_link_on_branch_mismatch_with_baseref_match() {
+        // Review workspace: branch "main" mismatches the PR head "feature",
+        // but `baseRef == "feature"` rescues the link (§7.6, FE
+        // `matchesBaseRef` parity) — the refresh updates instead of unlinking.
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(StubForge::default(), "main", "feature", Some(42)).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:unlinked", 10)
+            .await
+            .unwrap();
+        assert!(evs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_unlinks_when_neither_branch_nor_baseref_match() {
+        // Both the branch ("main") and the baseRef ("dev") positively
+        // mismatch the PR head ("feature"): the stale link is cleared.
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(StubForge::default(), "main", "dev", Some(42)).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unlinked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, None);
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:unlinked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_links_via_baseref_discovery() {
+        // Unlinked review workspace on its own branch; discovery's branch
+        // query yields no head-ref match, and the baseRef fallback links the
+        // PR whose head equals the workspace `baseRef`.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(forge, "review-ws", "feature", None).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+        assert_eq!(after.pr_status, Some(intent_core::PullRequestStatus::Open));
+        let evs = svc
+            .store()
+            .events_by_type(&ws_id, "pr:linked", 10)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].data["prNumber"], 42);
+    }
+
+    #[tokio::test]
+    async fn refresh_links_via_legacy_remote_qualified_baseref() {
+        // Legacy row persisted before write-side canonicalisation:
+        // `baseRef == "origin/feature"` still matches the PR head "feature"
+        // via the allowlist-stripped candidate.
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) =
+            refresh_setup_with_base_ref(forge, "review-ws", "origin/feature", None).await;
+        let outcome = svc.refresh_workspace_pr(&ws_id).await.expect("refresh");
+        assert_eq!(outcome, crate::PrRefreshOutcome::Linked);
+
+        let after = svc.store().get_workspace(&ws_id).await.unwrap();
+        assert_eq!(after.pr_number, Some(42));
+    }
+
     // ------------------------------------------------------------------------
     // `pr.refresh` (PROTOCOL §5.7 extension): the on-demand RPC wraps
     // `refresh_workspace_pr` and reports the post-refresh linkage state; the
@@ -6537,6 +6969,42 @@ mod pr {
             .await
             .unwrap();
         assert_eq!(evs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_all_pauses_between_workspaces() {
+        // Inter-workspace pause (intent-hq/monorepo#703): the sweep sleeps
+        // `SWEEP_INTER_WORKSPACE_PAUSE` after each workspace so it never
+        // monopolizes SQLite pool slots — and still completes correctly over
+        // several workspaces. `tokio::time::sleep` guarantees at least the
+        // requested duration, so the wall-clock lower bound proves the pause
+        // is wired. (Paused time is unusable here: auto-advance trips sqlx's
+        // pool-acquire timeout.)
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+        let ws2_id = WorkspaceId::new();
+        let mut ws2 = workspace(&ws2_id);
+        ws2.branch = "feature".to_string();
+        ws2.repository_owner = Some("o".into());
+        ws2.repository_name = Some("r".into());
+        ws2.updated_at = now_iso();
+        svc.store().insert_workspace(&ws2).await.expect("ws2");
+
+        let start = std::time::Instant::now();
+        svc.refresh_all_workspace_prs(0).await;
+        assert!(
+            start.elapsed() >= crate::SWEEP_INTER_WORKSPACE_PAUSE * 2,
+            "sweep should pause between each of the 2 workspaces"
+        );
+
+        // Both workspaces were linked despite the pauses.
+        for id in [&ws_id, &ws2_id] {
+            let after = svc.store().get_workspace(id).await.unwrap();
+            assert_eq!(after.pr_number, Some(42));
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -6911,6 +7379,25 @@ mod pr {
             .await
             .unwrap();
         assert_eq!(s["issues"][0]["number"], 11);
+
+        // PR-only `review-requested` is rejected for issues (monorepo#551):
+        // the error lists the issues filter set from PROTOCOL §5.
+        let err = svc
+            .github_issues_search(
+                "o".into(),
+                "r".into(),
+                Some("review-requested".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("all, assigned, created, involves"),
+            "error must list the issues filter set: {err}"
+        );
     }
 
     #[tokio::test]
@@ -8700,6 +9187,18 @@ mod script {
     use crate::events::{EventBus, Subscription, SubscriptionFilter};
     use crate::Services;
 
+    /// Pure-liveness deadline for the event-driven waits below (monorepo#515):
+    /// `drain_until` returns as soon as the awaited event arrives, so this
+    /// bound only has to outlast a worst-case multi-suite machine stall
+    /// (login-shell spawn + exit-poll + bus delivery), never a passing run.
+    const LIVENESS: Duration = Duration::from_secs(300);
+    /// Service lifetime long enough that a service under test cannot exit
+    /// (and auto-restart, killing its PTY) before the post-wait assertions
+    /// run under load (monorepo#515). Strictly outlives `LIVENESS` so waits
+    /// bounded by it can never be outlived by the command exiting first.
+    /// Every test that starts one stops it.
+    const KEEPALIVE: &str = "sleep 3600";
+
     struct Harness {
         _tmp: TempDb,
         services: Services,
@@ -8769,7 +9268,12 @@ mod script {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let batch = tokio::time::timeout(remaining, sub.recv())
                 .await
-                .expect("script event delivered")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "script event not delivered within {timeout:?}; output so far: {:?}",
+                        String::from_utf8_lossy(&data)
+                    )
+                })
                 .expect("subscription open");
             for ev in &batch {
                 let v = serde_json::to_value(ev).expect("serialize");
@@ -8790,9 +9294,11 @@ mod script {
     async fn command_runs_once_and_captures_output() {
         let h = harness().await;
         let id = create(&h, "echo", "echo run-once-output", ScriptMode::Command).await;
+        // The timeout is a liveness bound only — the run ends when `echo`
+        // exits — so keep it far above any plausible machine stall.
         let out = h
             .services
-            .script_run(h.ws.clone(), id, None, Some(10))
+            .script_run(h.ws.clone(), id, None, Some(300))
             .await
             .expect("run");
         assert_eq!(out["timedOut"], false);
@@ -8816,7 +9322,7 @@ mod script {
         let id = create(
             &h,
             "svc",
-            "echo OUTPUT-PARITY-MARK ; sleep 5",
+            &format!("echo OUTPUT-PARITY-MARK ; {KEEPALIVE}"),
             ScriptMode::Service,
         )
         .await;
@@ -8824,7 +9330,7 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(5), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:output" {
                 let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
                 contains(&bytes, b"OUTPUT-PARITY-MARK").then_some(())
@@ -8874,25 +9380,28 @@ mod script {
     /// A service that exits faster than the too-fast floor is treated as a
     /// config error and is NOT auto-restarted (the ported backoff guard).
     ///
-    /// Load-independent (monorepo#514): the floor is raised far above any
-    /// plausible scheduling stall so the supervisor's wall-clock measurement of
-    /// the `echo` run can never legitimately cross it, and the test awaits the
-    /// supervisor's *positive* "Exited too quickly" separator (emitted right
-    /// before it stops supervising) instead of watching a fixed window for the
-    /// absence of a restart. A spurious restart still fails fast: the restart
+    /// Load-independent (monorepo#514, monorepo#623): the floor is injected as
+    /// `u128::MAX` so the supervisor's wall-clock measurement of the `echo` run
+    /// can never cross it — the no-restart decision is time-independent by
+    /// construction — and the test awaits the supervisor's *positive* "Exited
+    /// too quickly" separator (emitted right before it stops supervising)
+    /// instead of watching a fixed window for the absence of a restart. The
+    /// await deadline is purely liveness (real login-shell spawn + exit-poll +
+    /// bus delivery) and is kept far above any plausible multi-suite machine
+    /// stall (monorepo#623). A spurious restart still fails fast: the restart
     /// separator or a `running` state with `restartCount` >= 1 would arrive
     /// before the too-fast separator ever could.
     #[tokio::test]
     async fn service_too_fast_exit_does_not_restart() {
         let mut h = harness().await;
-        h.services = h.services.with_script_too_fast_ms(10 * 60 * 1000);
+        h.services = h.services.with_script_too_fast_ms(u128::MAX);
         let mut sub = subscribe(&h);
         let id = create(&h, "boom", "echo boom", ScriptMode::Service).await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(60), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:state"
                 && v["data"]["status"] == "running"
                 && v["data"]["restartCount"].as_i64().unwrap_or(0) >= 1
@@ -8931,19 +9440,25 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        drain_until(&mut sub, Duration::from_secs(12), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             (v["type"] == "script:state"
                 && v["data"]["status"] == "running"
                 && v["data"]["restartCount"] == 1)
                 .then_some(())
         })
         .await;
+        // The `restartCount: 1` event above proves the single auto-restart;
+        // a stalled scheduler can let the short-lived second run exit (and
+        // restart again) before this status call, so only assert the floor.
         let st = h
             .services
             .script_status(h.ws.clone(), id.clone())
             .await
             .expect("status");
-        assert_eq!(st["restartCount"], 1);
+        assert!(
+            st["restartCount"].as_i64().unwrap_or(0) >= 1,
+            "restartCount reflects at least the observed restart: {st}"
+        );
         h.services
             .script_stop(h.ws.clone(), id)
             .await
@@ -8959,7 +9474,7 @@ mod script {
         let id = create(
             &h,
             "dev",
-            "echo listening on http://localhost:3000/ ; sleep 5",
+            &format!("echo listening on http://localhost:3000/ ; {KEEPALIVE}"),
             ScriptMode::Service,
         )
         .await;
@@ -8967,7 +9482,7 @@ mod script {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        let (url, _) = drain_until(&mut sub, Duration::from_secs(5), |v| {
+        let (url, _) = drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:state" {
                 v["data"]["detectedUrl"].as_str().map(str::to_string)
             } else {
@@ -8992,7 +9507,7 @@ mod script {
         let id = create(
             &h,
             "svc",
-            "echo SCRIPT-PTY-MARK ; sleep 5",
+            &format!("echo SCRIPT-PTY-MARK ; {KEEPALIVE}"),
             ScriptMode::Service,
         )
         .await;
@@ -9001,7 +9516,7 @@ mod script {
             .await
             .expect("start");
         // Wait until the marker has streamed (so it is in the PTY scrollback).
-        drain_until(&mut sub, Duration::from_secs(5), |v| {
+        drain_until(&mut sub, LIVENESS, |v| {
             if v["type"] == "script:output" {
                 let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
                 contains(&bytes, b"SCRIPT-PTY-MARK").then_some(())
@@ -13913,6 +14428,37 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     assert_eq!(usage.totals.output_tokens, 0);
     assert_eq!(usage.totals.cache_read_tokens, 0);
     assert_eq!(usage.totals.cache_creation_tokens, 0);
+}
+
+/// Inter-workspace pause (intent-hq/monorepo#703): `scan_all_token_usage`
+/// sleeps `SWEEP_INTER_WORKSPACE_PAUSE` after each workspace so the sweep
+/// never monopolizes SQLite pool slots — and still completes correctly over
+/// several workspaces. `tokio::time::sleep` guarantees at least the requested
+/// duration, so the wall-clock lower bound proves the pause is wired. (Paused
+/// time is unusable here: auto-advance trips sqlx's pool-acquire timeout.)
+#[tokio::test]
+async fn scan_all_token_usage_pauses_between_workspaces() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ids: Vec<WorkspaceId> = (0..3).map(|_| WorkspaceId::new()).collect();
+    for id in &ids {
+        store.insert_workspace(&workspace(id)).await.expect("ws");
+    }
+    let svc = Services::new(store);
+
+    let start = std::time::Instant::now();
+    svc.scan_all_token_usage().await;
+    assert!(
+        start.elapsed() >= crate::SWEEP_INTER_WORKSPACE_PAUSE * 3,
+        "sweep should pause between each of the 3 workspaces"
+    );
+
+    // Every workspace still got its snapshot despite the pauses.
+    for id in ids {
+        let ws = svc.get_workspace(id).await.expect("get ws");
+        assert!(ws.token_usage.is_some());
+    }
 }
 
 /// `parse_undo_metadata` extracts undo commit metadata from JSON, skipping

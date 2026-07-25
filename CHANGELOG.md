@@ -2,6 +2,69 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.6] - 2026-07-24
+
+### 🚀 Features
+
+- Add recoverable legacy import RPC ([#423](https://github.com/intent-hq/intentd/pull/423))
+- Extend bare-model ownership validation to cached dynamic catalogs ([#607](https://github.com/intent-hq/intentd/pull/607)) ([#433](https://github.com/intent-hq/intentd/pull/433))
+- Accept optional authorType on comment.respond ([#434](https://github.com/intent-hq/intentd/pull/434))
+- Comment.add echoes post-rewrite noteRev, commits atomically, and emits note:updated (intent-hq/monorepo#638) ([#447](https://github.com/intent-hq/intentd/pull/447))
+- *(providers)* Deliver workspace MCP tools to pi via bundled extension ([#452](https://github.com/intent-hq/intentd/pull/452))
+
+### 🐛 Bug Fixes
+
+- Enrich host PATH from login shell ([#422](https://github.com/intent-hq/intentd/pull/422))
+- Enforce UDS-only guard on system.shutdown (monorepo#630) ([#436](https://github.com/intent-hq/intentd/pull/436))
+- Harden skills/specialists watchers and follow workspace lifecycle ([#439](https://github.com/intent-hq/intentd/pull/439))
+- Comment.respond returns -32602 for all caller-input validation errors (intent-hq/monorepo#632) ([#445](https://github.com/intent-hq/intentd/pull/445))
+- Survive load spikes on agent spawn — 30s initialize timeout + jittered retry backoff (monorepo#616)
+
+### ⚡ Performance
+
+- *(store)* Index-friendly event retention sweep, 24h agent:tool:call TTL, incremental vacuum
+
+### 🧪 Testing
+
+- Deflake script-runtime and WSS runtime-control tests under load (monorepo#515) ([#448](https://github.com/intent-hq/intentd/pull/448))
+
+### ⚙️ Miscellaneous Tasks
+
+- Add cargo-deny license policy (monorepo#420) ([#451](https://github.com/intent-hq/intentd/pull/451))
+
+
+## [0.2.5] - 2026-07-24
+
+### 🐛 Bug Fixes
+
+- Reject bare-model/provider mismatch at agent creation and setModel ([#425](https://github.com/intent-hq/intentd/pull/425))
+- Lift proposals when the provider collapses raw_output ([#427](https://github.com/intent-hq/intentd/pull/427))
+
+### 🧪 Testing
+
+- Deflake graceful_shutdown_allows_immediate_restart port contention (monorepo#466) ([#429](https://github.com/intent-hq/intentd/pull/429))
+
+
+## [0.2.4] - 2026-07-24
+
+### 🚀 Features
+
+- Emit specialists:changed on specialist file changes ([#426](https://github.com/intent-hq/intentd/pull/426))
+
+### 🐛 Bug Fixes
+
+- Fail closed on nonexistent agent in agent.queueMessage and agent.watchCompletion (monorepo#568) ([#408](https://github.com/intent-hq/intentd/pull/408))
+- Deliver workspace MCP servers to grok sessions ([#412](https://github.com/intent-hq/intentd/pull/412))
+- Annotate stale queued-message redrives and keep delivered completion report ([#576](https://github.com/intent-hq/intentd/pull/576)) ([#413](https://github.com/intent-hq/intentd/pull/413))
+- Drop the draft workspace FK so opaque draft keys work (PROTOCOL 5.16) ([#420](https://github.com/intent-hq/intentd/pull/420))
+- Spawn chief agents in dedicated empty chief-cwd dir instead of /tmp ([#419](https://github.com/intent-hq/intentd/pull/419))
+
+### 🧪 Testing
+
+- Poll system.status for WSS port with bounded backoff ([#409](https://github.com/intent-hq/intentd/pull/409))
+- Deflake uds_note_subscription frame/state awaits (monorepo#601)
+
+
 ## [0.2.3] - 2026-07-23
 
 ### 🐛 Bug Fixes

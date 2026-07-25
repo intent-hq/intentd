@@ -10,7 +10,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use portable_pty::{
-    native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize as PortablePtySize,
+    native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtyPair,
+    PtySize as PortablePtySize, SlavePty,
 };
 use tokio::sync::broadcast;
 
@@ -26,6 +27,24 @@ const READ_CHUNK: usize = 8192;
 const TERM_GRACE: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for a signalled child to exit.
 const REAP_POLL: Duration = Duration::from_millis(20);
+/// Poll interval while the exit watcher waits for the reader to drain the
+/// master queue after the child has been reaped (monorepo#587).
+const DRAIN_POLL: Duration = Duration::from_millis(5);
+/// Upper bound on that drain wait: the child is already dead, so the queue is
+/// finite and normally empties within a few reads — the bound only guards
+/// against a wedged reader keeping the held slave fd open forever.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Attempt budget for `openpty`: transient pty/fd-pool exhaustion (e.g.
+/// EMFILE/ENFILE-class errors under heavy parallel load — monorepo#653)
+/// usually clears within milliseconds as other PTYs close, so a short
+/// backed-off retry rides it out. A persistent failure still surfaces as the
+/// same `Internal` error after the last attempt.
+const OPENPTY_ATTEMPTS: u32 = 8;
+/// Initial backoff between `openpty` attempts; doubles per retry up to
+/// [`OPENPTY_BACKOFF_CAP`] (~0.8s worst-case total across all attempts).
+const OPENPTY_BACKOFF: Duration = Duration::from_millis(10);
+/// Ceiling for the per-attempt `openpty` backoff.
+const OPENPTY_BACKOFF_CAP: Duration = Duration::from_millis(250);
 
 /// Opaque identifier for a spawned PTY, unique within a [`PtyHost`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -180,11 +199,21 @@ struct PtySession {
     cwd: Option<String>,
     pid: Option<u32>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    /// Parent-side slave end, held open until the child is reaped and the
+    /// reader has drained the master queue (monorepo#587): if the child's exit
+    /// closed the *last* slave fd, macOS would discard any PTY output the
+    /// reader had not yet read — a fast-exiting child's entire output could be
+    /// lost. The exit watcher (or teardown) takes it so the reader still
+    /// observes EOF and its thread exits.
+    slave: Mutex<Option<Box<dyn SlavePty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     fanout: Arc<Mutex<Fanout>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Exit watcher thread: reaps the child, then releases `slave` once the
+    /// reader has drained the queue (see `exit_watch_loop`).
+    watcher: Mutex<Option<JoinHandle<()>>>,
     /// Cached exit status, latched the first time the child is observed exited so
     /// it survives later teardown/removal (the `portable-pty` child only yields
     /// its status once).
@@ -215,6 +244,31 @@ fn internal(e: impl std::fmt::Display) -> Error {
     Error::Internal(e.to_string())
 }
 
+/// Open a fresh PTY pair, retrying transient failures with bounded backoff
+/// (monorepo#653). `openpty` has no non-transient failure mode for a valid
+/// size — an error means pty/fd pressure — so every failure is retried until
+/// the attempt budget runs out, then the last error is returned unchanged.
+fn openpty_with_retry(size: PortablePtySize) -> Result<PtyPair> {
+    retry_transient(|| native_pty_system().openpty(size))
+}
+
+/// Run `op` up to [`OPENPTY_ATTEMPTS`] times, sleeping an exponentially
+/// growing backoff between attempts; the final attempt's error is mapped to
+/// [`Error::Internal`].
+fn retry_transient<T, E: std::fmt::Display>(
+    mut op: impl FnMut() -> std::result::Result<T, E>,
+) -> Result<T> {
+    let mut backoff = OPENPTY_BACKOFF;
+    for _ in 1..OPENPTY_ATTEMPTS {
+        if let Ok(value) = op() {
+            return Ok(value);
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(OPENPTY_BACKOFF_CAP);
+    }
+    op().map_err(internal)
+}
+
 /// The unified host owning every spawned PTY (terminals and scripts).
 #[derive(Default)]
 pub struct PtyHost {
@@ -229,10 +283,14 @@ impl PtyHost {
     }
 
     /// Spawn a process attached to a fresh PTY and start fanning out its output.
+    ///
+    /// This is a blocking call (`openpty`/fork are blocking syscalls); on
+    /// transient `openpty` failure it additionally sleeps between bounded
+    /// retries (monorepo#653), up to ~0.8s worst-case before giving up. Async
+    /// callers that cannot tolerate that on a runtime thread should wrap the
+    /// call in `spawn_blocking`.
     pub fn spawn(&self, spec: SpawnSpec) -> Result<PtyId> {
-        let pair = native_pty_system()
-            .openpty(spec.size.to_portable())
-            .map_err(internal)?;
+        let pair = openpty_with_retry(spec.size.to_portable())?;
 
         let mut cmd = CommandBuilder::new(&spec.command);
         cmd.args(&spec.args);
@@ -247,9 +305,13 @@ impl PtyHost {
         }
 
         let child = pair.slave.spawn_command(cmd).map_err(internal)?;
-        // Drop the slave so the master reader observes EOF once the child exits;
-        // otherwise our retained slave fd keeps the stream open forever.
-        drop(pair.slave);
+        // Keep the parent-side slave open (monorepo#587): if we dropped it
+        // here, a fast-exiting child would close the *last* slave fd before
+        // the reader thread's first read(), and macOS discards buffered PTY
+        // output on last-slave close — the child's output would be lost
+        // entirely. The exit watcher releases it once the child is reaped and
+        // the reader has drained the queue, so the reader still observes EOF
+        // and its thread exits (no fd or thread leak).
 
         let pid = child.process_id();
         let killer = child.clone_killer();
@@ -281,13 +343,19 @@ impl PtyHost {
             cwd,
             pid,
             master: Mutex::new(Some(pair.master)),
+            slave: Mutex::new(Some(pair.slave)),
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             fanout,
             reader: Mutex::new(Some(handle)),
+            watcher: Mutex::new(None),
             exit: Mutex::new(None),
         });
+
+        let watcher_session = Arc::clone(&session);
+        let watcher = std::thread::spawn(move || exit_watch_loop(&watcher_session));
+        *session.watcher.lock().unwrap() = Some(watcher);
 
         let id = PtyId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.sessions.lock().unwrap().insert(id, session);
@@ -328,6 +396,12 @@ impl PtyHost {
 
     /// Wait until the PTY's child exits and return its status (ACP
     /// `terminal/wait_for_exit`). Polls the child rather than blocking a thread.
+    ///
+    /// Note: exit becomes observable as soon as the child is reaped, which can
+    /// be slightly before the reader has drained the last of its output into
+    /// scrollback (monorepo#587 makes that output eventually-complete rather
+    /// than lost). Callers reading scrollback right after `wait()` should poll
+    /// briefly rather than assume it is final.
     pub async fn wait(&self, id: PtyId) -> Result<PtyExit> {
         let session = self.get(id)?;
         loop {
@@ -456,6 +530,87 @@ impl PtyHost {
             .cloned()
             .ok_or_else(|| Error::NotFound(format!("{id}")))
     }
+
+    /// Whether the PTY's reader thread has finished (leak inspection).
+    #[cfg(all(test, unix))]
+    fn reader_finished(&self, id: PtyId) -> bool {
+        self.sessions.lock().unwrap().get(&id).is_none_or(|s| {
+            s.reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|h| h.is_finished())
+        })
+    }
+
+    /// Whether the parent-side slave fd is still held (leak inspection).
+    #[cfg(all(test, unix))]
+    fn slave_held(&self, id: PtyId) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|s| s.slave.lock().unwrap().is_some())
+    }
+}
+
+/// Whether the PTY master has unread output pending in the kernel queue
+/// (POLLIN with a zero timeout). `false` once the reader has drained
+/// everything, or when the master is already torn down. A poll error is
+/// reported as *pending*: prematurely declaring "drained" would close the
+/// held slave and could discard queued output (the exact loss this guards
+/// against), while over-reporting only costs up to `DRAIN_GRACE`.
+#[cfg(unix)]
+fn master_pending(session: &PtySession) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::BorrowedFd;
+
+    let guard = session.master.lock().unwrap();
+    let Some(fd) = guard.as_ref().and_then(|m| m.as_raw_fd()) else {
+        return false;
+    };
+    // SAFETY: `guard` keeps the master (and thus `fd`) alive for the borrow.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+    match poll(&mut fds, PollTimeout::ZERO) {
+        Ok(_) => fds[0]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLIN)),
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn master_pending(_session: &PtySession) -> bool {
+    false
+}
+
+/// Per-PTY exit watcher (own thread): poll until the child is reaped (latching
+/// its exit status), then wait — bounded — for the reader to drain any output
+/// still queued on the master, and release the held slave fd so the reader
+/// observes EOF and its thread exits (monorepo#587). Returns early when
+/// teardown has already released the slave.
+fn exit_watch_loop(session: &PtySession) {
+    loop {
+        if session.slave.lock().unwrap().is_none() {
+            return; // torn down; teardown joins the reader itself
+        }
+        if observe_exit(session).is_some() {
+            break;
+        }
+        std::thread::sleep(REAP_POLL);
+    }
+    // The child is reaped, so no further output arrives from it — only unread
+    // bytes can remain queued. Closing the held slave while bytes are queued
+    // would discard them on macOS (the very loss this fd guards against), so
+    // wait for the reader to drain the queue first. The bound only protects
+    // against a wedged reader; a grandchild that inherited the slave keeps
+    // the stream open regardless of when we release ours.
+    let deadline = std::time::Instant::now() + DRAIN_GRACE;
+    while master_pending(session) && std::time::Instant::now() < deadline {
+        std::thread::sleep(DRAIN_POLL);
+    }
+    session.slave.lock().unwrap().take();
 }
 
 /// Blocking reader loop (own thread): append each chunk to scrollback and
@@ -505,9 +660,15 @@ async fn teardown(session: &PtySession) {
     {
         let _ = session.killer.lock().unwrap().kill();
     }
-    // Drop the master fd so the reader observes EOF, then join its thread.
+    // Release the held slave and the master fd so the reader observes EOF,
+    // then join the reader and exit-watcher threads (the watcher exits on its
+    // own once it sees the slave released).
+    session.slave.lock().unwrap().take();
     session.master.lock().unwrap().take();
     if let Some(handle) = session.reader.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+    if let Some(handle) = session.watcher.lock().unwrap().take() {
         let _ = handle.join();
     }
 }
@@ -532,6 +693,18 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Deadline scale factor for slow environments (coverage runs export
+    /// INTENTD_TEST_TIMEOUT_MULTIPLIER); never below 1.0, and non-finite
+    /// values (`inf`/`NaN`) are ignored so `Duration::mul_f64` cannot panic.
+    fn timeout_multiplier() -> f64 {
+        std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|m| m.is_finite())
+            .unwrap_or(1.0)
+            .max(1.0)
     }
 
     /// Drain a live receiver until `needle` is seen or the deadline passes.
@@ -594,6 +767,38 @@ mod tests {
     /// Spec for `cat`, which echoes its stdin back through the PTY.
     fn cat_spec(scope: &str) -> SpawnSpec {
         SpawnSpec::new(scope, "cat")
+    }
+
+    /// Transient failures inside the attempt budget are retried to success and
+    /// never surface to the caller (monorepo#653).
+    #[test]
+    fn retry_transient_rides_out_transient_failures() {
+        let mut attempts = 0u32;
+        let out = retry_transient(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err("pty pool exhausted")
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+    }
+
+    /// A persistent failure exhausts the whole attempt budget, then surfaces
+    /// the last error as `Internal` — the same shape as before the retry.
+    #[test]
+    fn retry_transient_surfaces_persistent_failure_after_budget() {
+        let mut attempts = 0u32;
+        let out: Result<()> = retry_transient(|| {
+            attempts += 1;
+            Err::<(), _>("failed to openpty")
+        });
+        assert_eq!(attempts, OPENPTY_ATTEMPTS);
+        match out {
+            Err(Error::Internal(msg)) => assert!(msg.contains("failed to openpty")),
+            other => panic!("expected Internal error, got {other:?}"),
+        }
     }
 
     /// `SpawnSpec::name` is surfaced through `info()`; unnamed PTYs stay `None`.
@@ -739,6 +944,132 @@ mod tests {
         host.kill(id).await;
     }
 
+    /// Regression test for monorepo#587: a fast-exiting child's PTY output must
+    /// not be lost. Pre-fix, `PtyHost::spawn` dropped the parent-side slave fd
+    /// immediately, so when the child wrote and exited before the reader
+    /// thread's first `read()` drained it, closing the last slave fd (the
+    /// child's, at exit) discarded the buffered PTY output on macOS — the
+    /// scrollback stayed empty forever even though `wait()` returned exit 0
+    /// (see intentd#411 / monorepo#587). Concurrent spawn bursts of a bare
+    /// `echo` (no shell startup) on a multi-threaded runtime amplify the repro
+    /// odds under parallel host load.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fast_exiting_child_output_is_captured() {
+        let host = Arc::new(PtyHost::new());
+        for round in 0..4 {
+            let mut tasks = Vec::new();
+            for i in 0..32 {
+                let host = Arc::clone(&host);
+                tasks.push(tokio::spawn(async move {
+                    let marker = format!("pty587-fast-exit-{round}-{i}");
+                    let mut spec = SpawnSpec::new("s", "echo");
+                    spec.args = vec![marker.clone()];
+                    let id = host.spawn(spec).unwrap();
+
+                    // Exit codes must be unaffected by the race (or the fix).
+                    let exit = host.wait(id).await.unwrap();
+                    assert_eq!(exit.exit_code, 0, "{marker}: child must exit 0");
+                    assert!(exit.success);
+
+                    // Poll scrollback for the marker, event-driven rather than
+                    // on a fixed clock (monorepo#648): the drain is provably
+                    // over once the reader thread has exited (it only exits at
+                    // EOF, after pushing everything it read into scrollback),
+                    // so a missing marker at that point is genuine *loss*, not
+                    // lateness. The generous deadline only guards against a
+                    // drain that never completes on a badly overloaded host.
+                    let deadline =
+                        Instant::now() + Duration::from_secs(60).mul_f64(timeout_multiplier());
+                    loop {
+                        let drained = host.reader_finished(id);
+                        let out = host.scrollback(id).unwrap();
+                        if contains(&out, marker.as_bytes()) {
+                            break;
+                        }
+                        if drained {
+                            panic!(
+                                "{marker}: fast-exiting child's output was lost; \
+                                 exit 0 and reader drained to EOF but scrollback stayed {:?}",
+                                String::from_utf8_lossy(&out)
+                            );
+                        }
+                        if Instant::now() >= deadline {
+                            panic!(
+                                "{marker}: output drain never completed within deadline; \
+                                 scrollback so far {:?}",
+                                String::from_utf8_lossy(&out)
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+
+                    host.kill(id).await;
+                }));
+            }
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        assert_eq!(host.count(), 0);
+    }
+
+    /// After a fast-exiting child is reaped and its output drained, the host
+    /// releases the held slave fd on its own and the reader thread exits — no
+    /// fd or reader-thread leak for naturally-exiting children (monorepo#587).
+    #[tokio::test]
+    async fn fast_exit_releases_slave_and_reader_without_kill() {
+        let host = PtyHost::new();
+        let mut spec = SpawnSpec::new("s", "echo");
+        spec.args = vec!["pty587-leak-check".into()];
+        let id = host.spawn(spec).unwrap();
+
+        let exit = host.wait(id).await.unwrap();
+        assert_eq!(exit.exit_code, 0);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while host.slave_held(id) || !host.reader_finished(id) {
+            assert!(
+                Instant::now() < deadline,
+                "held slave fd or reader thread leaked after natural exit \
+                 (slave_held={}, reader_finished={})",
+                host.slave_held(id),
+                host.reader_finished(id)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The drained output must have reached scrollback before the release.
+        assert!(contains(
+            &host.scrollback(id).unwrap(),
+            b"pty587-leak-check"
+        ));
+        host.kill(id).await;
+        assert_eq!(host.count(), 0);
+    }
+
+    /// A long-running child keeps the held slave and its reader thread until
+    /// teardown; `kill()` releases both and joins the reader and watcher
+    /// threads promptly (no leak on the kill path either).
+    #[tokio::test]
+    async fn long_running_child_holds_slave_until_kill() {
+        let host = PtyHost::new();
+        let id = host.spawn(cat_spec("s")).unwrap();
+        let mut rx = host.attach(id).unwrap().live;
+
+        host.write(id, b"still-alive\n").unwrap();
+        let out = collect_until(&mut rx, b"still-alive", Duration::from_secs(5)).await;
+        assert!(contains(&out, b"still-alive"));
+
+        assert!(host.slave_held(id), "slave must stay held while running");
+        assert!(
+            !host.reader_finished(id),
+            "reader must keep tailing a live child"
+        );
+
+        assert!(host.kill(id).await);
+        assert_eq!(host.count(), 0);
+    }
+
     /// Killing a scope reaps the whole process group: a backgrounded grandchild
     /// is terminated too, leaving no orphan (mirrors the M5 reaping test).
     #[tokio::test]
@@ -753,12 +1084,7 @@ mod tests {
         // line before `attach()` subscribes, in which case the PID only ever
         // exists in scrollback and a live tail would wait out the whole
         // deadline. Honor INTENTD_TEST_TIMEOUT_MULTIPLIER for coverage runs.
-        let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .max(1.0);
-        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(multiplier);
+        let deadline = Instant::now() + Duration::from_secs(10).mul_f64(timeout_multiplier());
 
         let grandchild: u32 = loop {
             let out = host.scrollback(id).unwrap();

@@ -1,16 +1,20 @@
-//! System control fast-path: `system.status` + `system.shutdown` (§5.7).
+//! System control fast-path: `system.status`, `system.shutdown`, and
+//! `system.importLegacy` (§5.7).
 //!
-//! These two control methods surface live daemon state and request a graceful
-//! shutdown. They sit one layer above the domain [`WorkspaceApi`] router because
+//! These control methods surface live daemon state, request graceful shutdown,
+//! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
 //! the data they expose (bound port, connected clients, active agents, the TLS
 //! fingerprint) and the action they take (tear down the listener) are
 //! transport/process concerns, not domain operations. The composition root
-//! (`intentd`) implements [`SystemControl`]; each listener intercepts the two
+//! (`intentd`) implements [`SystemControl`]; each listener intercepts these
 //! methods before the JSON-RPC dispatcher, mirroring the `events.` fast-path.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use serde_json::{json, Value};
 
-use crate::events::success_frame;
+use crate::events::{error_frame, success_frame};
 use crate::protocol::PROTOCOL_VERSION;
 
 /// A point-in-time snapshot of daemon state for `system.status` (§5.7, §12.3).
@@ -65,12 +69,18 @@ pub trait SystemControl: Send + Sync {
     /// Request a graceful shutdown (idempotent). Returns immediately; the daemon
     /// tears the listeners down asynchronously.
     fn request_shutdown(&self);
+    /// Import legacy workspaces into the daemon's live store.
+    fn import_legacy(
+        &self,
+        force: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
 }
 
 /// The two control methods, once classified.
 pub(crate) enum SystemMethod {
     Status,
     Shutdown,
+    ImportLegacy { force: Result<bool, ()> },
 }
 
 /// A classified `system.*` request awaiting handling by the connection task.
@@ -99,6 +109,18 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
     let method = match method {
         "system.status" => SystemMethod::Status,
         "system.shutdown" => SystemMethod::Shutdown,
+        "system.importLegacy" => {
+            let force = match obj.get("params") {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::Object(params)) => match params.get("force") {
+                    None | Some(Value::Null) => Ok(false),
+                    Some(Value::Bool(force)) => Ok(*force),
+                    Some(_) => Err(()),
+                },
+                Some(_) => Err(()),
+            };
+            SystemMethod::ImportLegacy { force }
+        }
         _ => return None,
     };
     Some(SystemRequest {
@@ -143,23 +165,44 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
 
 /// Handle a classified `system.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `system.shutdown` triggers the
-/// graceful teardown before acknowledging.
-pub(crate) fn handle(
+/// graceful teardown before acknowledging; like `system.importLegacy` it is
+/// UDS-only, so remote (TCP/WSS) callers get -32001 and remote shutdown
+/// notifications are ignored.
+pub(crate) async fn handle(
     req: SystemRequest,
     control: &dyn SystemControl,
     is_local: bool,
+    is_uds: bool,
 ) -> Option<String> {
-    let result = match req.method {
-        SystemMethod::Status => status_json(&control.status(), is_local),
+    let result: Result<Value, (i32, String)> = match req.method {
+        SystemMethod::Status => Ok(status_json(&control.status(), is_local)),
+        SystemMethod::Shutdown if !is_uds => Err((
+            -32001,
+            "system.shutdown is available over UDS only".to_string(),
+        )),
         SystemMethod::Shutdown => {
             control.request_shutdown();
-            json!({ "ok": true, "stopping": true })
+            Ok(json!({ "ok": true, "stopping": true }))
         }
+        SystemMethod::ImportLegacy { .. } if !is_uds => Err((
+            -32001,
+            "system.importLegacy is available over UDS only".to_string(),
+        )),
+        SystemMethod::ImportLegacy { force: Err(()) } => {
+            Err((-32602, "force must be a boolean".to_string()))
+        }
+        SystemMethod::ImportLegacy { force: Ok(force) } => control
+            .import_legacy(force)
+            .await
+            .map_err(|message| (-32603, message)),
     };
     if !req.id_present {
         return None;
     }
-    Some(success_frame(req.id_echo, result))
+    Some(match result {
+        Ok(value) => success_frame(req.id_echo, value),
+        Err((code, message)) => error_frame(req.id_echo, code, &message),
+    })
 }
 
 #[cfg(test)]

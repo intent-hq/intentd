@@ -80,6 +80,33 @@ pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
 /// verbatim, like the FE `commonPaths` option) → OS-common directories.
 /// Returns the first existing absolute path, or `None`.
 pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option<PathBuf> {
+    resolve_binary_path_with_tool_dirs(name, common_paths, &path_utils::enriched_tool_dirs())
+}
+
+/// Test seam for [`resolve_binary_path`]: derives the enriched tool
+/// directories from an injected `home` (via
+/// [`path_utils::enriched_tool_dirs_with_home`]) instead of the real
+/// environment, so tests never mutate process-global `HOME`.
+#[cfg(test)]
+fn resolve_binary_path_with_home(
+    name: &str,
+    common_paths: &[String],
+    home: &Path,
+) -> Option<PathBuf> {
+    resolve_binary_path_with_tool_dirs(
+        name,
+        common_paths,
+        &path_utils::enriched_tool_dirs_with_home(Some(home)),
+    )
+}
+
+/// Core of [`resolve_binary_path`] with the enriched tool directories
+/// injected by the caller.
+fn resolve_binary_path_with_tool_dirs(
+    name: &str,
+    common_paths: &[String],
+    enriched_tool_dirs: &[PathBuf],
+) -> Option<PathBuf> {
     if name.is_empty() {
         return None;
     }
@@ -97,7 +124,7 @@ pub(crate) fn resolve_binary_path(name: &str, common_paths: &[String]) -> Option
         }
     }
     // 3. Enriched tool directories (hardcoded + login-shell PATH)
-    for dir in path_utils::enriched_tool_dirs() {
+    for dir in enriched_tool_dirs {
         let candidate = dir.join(binary_filename(name));
         if candidate.is_file() || candidate.is_symlink() {
             return Some(candidate);
@@ -435,41 +462,25 @@ fn essential_system_paths() -> Vec<String> {
     }
 }
 
-/// Compute the "enhanced" PATH (mirrors the FE `getEnhancedPath`): the host
-/// PATH with the essential system directories merged in, de-duplicated and
-/// order-preserving (existing entries first, then any missing essentials).
+/// Compute the daemon's canonical enhanced PATH: inherited entries first, then
+/// common tool locations, the login-shell PATH, and platform essentials,
+/// de-duplicated in order.
 pub(crate) fn enhanced_path_from(current_path: &str) -> String {
-    let sep = path_separator();
-    let mut seen = std::collections::HashSet::new();
-    let mut ordered: Vec<String> = Vec::new();
-    for entry in current_path.split(sep).filter(|s| !s.is_empty()) {
-        if seen.insert(entry.to_string()) {
-            ordered.push(entry.to_string());
-        }
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in std::env::split_paths(current_path) {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
-    for entry in essential_system_paths() {
-        if seen.insert(entry.clone()) {
-            ordered.push(entry);
-        }
+    for dir in path_utils::enriched_tool_dirs() {
+        path_utils::push_dir(&mut dirs, &mut seen, dir);
     }
-    ordered.join(&sep.to_string())
-}
-
-/// Resolve the host login shell (mirrors the FE `getLoginShellPath`): the
-/// `SHELL` env var, else the platform default (empty on Windows).
-fn login_shell() -> String {
-    if let Ok(shell) = std::env::var("SHELL") {
-        if !shell.is_empty() {
-            return shell;
-        }
+    for dir in essential_system_paths() {
+        path_utils::push_dir(&mut dirs, &mut seen, PathBuf::from(dir));
     }
-    if cfg!(target_os = "macos") {
-        "/bin/zsh".to_string()
-    } else if cfg!(windows) {
-        String::new()
-    } else {
-        "/bin/bash".to_string()
-    }
+    std::env::join_paths(dirs)
+        .unwrap_or_else(|_| OsString::from(current_path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Build the `host.env` result. Returns the host PATH (raw + split `entries`),
@@ -498,9 +509,16 @@ pub(crate) fn build_env_json(
 
 /// Production `host.env` — reads the daemon's actual environment. See
 /// [`build_env_json`] for the secret-safety contract (names only, no values).
+/// The login shell comes from the shared [`path_utils::login_shell`] resolver
+/// (`SHELL` env → user database → `/bin/zsh` on macOS), so the reported shell
+/// always matches the one login-shell PATH enrichment uses. A set `SHELL` env
+/// var is honoured on every platform, including Windows (e.g. MSYS/Git Bash),
+/// as it was before the resolvers were unified; when no shell can be resolved
+/// (Windows without `SHELL`, or non-macOS unix without a user-db entry) the
+/// field is empty and enrichment is skipped.
 pub(crate) fn env_probe() -> Value {
     let raw_path = std::env::var("PATH").unwrap_or_default();
-    let shell = login_shell();
+    let shell = path_utils::login_shell().unwrap_or_default();
     let home = home_dir();
     let mut var_names: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())

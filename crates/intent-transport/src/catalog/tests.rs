@@ -71,6 +71,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("host.rs", "host."),
         ("control.rs", "system."),
         ("pairing.rs", "pairing."),
+        ("server.rs", "server."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {} at test time", filename));
@@ -119,7 +120,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// removed methods without updating the catalog. The catalog freeze is
 /// intentional: any surface change requires a protocol version bump and a
 /// PROTOCOL.md update.
-const EXPECTED_TOTAL_METHODS: usize = 295;
+const EXPECTED_TOTAL_METHODS: usize = 298;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
@@ -127,7 +128,7 @@ const EXPECTED_TOTAL_METHODS: usize = 295;
 const EXPECTED_ROUTER_METHODS: usize = 263;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 30;
+const EXPECTED_FASTPATH_METHODS: usize = 33;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;

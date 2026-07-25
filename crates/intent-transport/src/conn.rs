@@ -85,11 +85,14 @@ impl ConnSubs {
 }
 
 /// Route one frame: deliver replies to daemon-initiated reverse RPCs (§12.4),
-/// then intercept the `system.*` control methods (UDS only), the `host.status`
-/// capability probe (both transports), the `forward.*` port-forwarding methods,
-/// and the `events.` fast-path, else hand to the JSON-RPC dispatcher. `control`
-/// is `Some` only on a transport that exposes the control surface (the UDS
-/// listener); `forwards`/`reverse` are the connection's port-forward registry
+/// then intercept the `system.*` control methods (`system.status` on both
+/// transports; `system.shutdown`/`system.importLegacy` UDS-only via the
+/// `is_uds` guard inside `control::handle`), the `host.status` capability
+/// probe (both transports), the `forward.*` port-forwarding methods, and the
+/// `events.` fast-path, else hand to the JSON-RPC dispatcher. `control` is
+/// `Some` on every transport that wires the control surface — the composition
+/// root passes `Some(control)` to both the UDS and WSS listeners (remote
+/// `system.status` needs it); `forwards`/`reverse` are the connection's port-forward registry
 /// and reverse-RPC channel; `client_id` is the connection's logical-client
 /// binding, set by `client.hello` and consumed by `drafts.*` (§16); `is_local`
 /// reflects that connection's resolved locality (§5.14). Returns `false` when
@@ -142,9 +145,13 @@ pub(crate) async fn process_frame(
         let (rpc_id, method) = panic_guard::request_identity(value);
         if let Some(control) = control {
             if let Some(req) = control::classify(value) {
-                let frame = panic_guard::guard_frame_sync(&method, rpc_id.clone(), || {
-                    control::handle(req, control.as_ref(), is_local)
-                });
+                let is_uds = !crate::context::is_tcp_connection();
+                let frame = panic_guard::guard_frame(
+                    &method,
+                    rpc_id.clone(),
+                    control::handle(req, control.as_ref(), is_local, is_uds),
+                )
+                .await;
                 return match frame {
                     Some(frame) => out_tx.send(frame).await.is_ok(),
                     None => true,

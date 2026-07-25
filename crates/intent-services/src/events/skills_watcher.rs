@@ -2,29 +2,34 @@
 //!
 //! Watches the 7-tier skills scan roots (4 user-tier + 3 project-tier per workspace)
 //! and emits `skills:changed` events when SKILL.md files are created, modified, or
-//! deleted. User-tier changes affect all workspaces; project-tier changes are scoped
+//! deleted — or when a tier directory itself appears or disappears (#612).
+//! User-tier changes affect all workspaces; project-tier changes are scoped
 //! to their workspace. Debounce is 500ms per workspace to coalesce rapid edits.
+//! Workspaces can be registered/deregistered at runtime (#611) via
+//! [`SkillsWatcher::add_workspace`] / [`SkillsWatcher::remove_workspace`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use intent_core::{events::SKILLS_CHANGED, now_iso, ActorType, EventActor, WorkspaceId};
 use intent_store::NewEvent;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::bus::EventBus;
+use super::root_watch::{watch_root, RootWatch};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Holds watchers for all skills directories (user-tier + project-tier).
 /// Dropping this tears down all watchers.
 pub struct SkillsWatcher {
-    _user_watchers: Vec<RecommendedWatcher>,
-    _workspace_watchers: Vec<RecommendedWatcher>,
+    _user_watchers: Vec<RootWatch>,
+    workspace_watchers: Mutex<HashMap<WorkspaceId, Vec<RootWatch>>>,
+    raw_tx: mpsc::UnboundedSender<SkillsMsg>,
     task: JoinHandle<()>,
 }
 
@@ -38,7 +43,7 @@ impl SkillsWatcher {
     /// Start watching skills directories for all workspaces.
     /// `workspaces` is a list of (workspace_id, workspace_path) pairs.
     pub fn start(bus: EventBus, workspaces: Vec<(WorkspaceId, PathBuf)>) -> Self {
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsEvent>();
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<SkillsMsg>();
 
         // Start user-tier watchers (affect all workspaces)
         let mut user_watchers = Vec::new();
@@ -50,70 +55,91 @@ impl SkillsWatcher {
         }
 
         // Start project-tier watchers (per-workspace)
-        let mut workspace_watchers = Vec::new();
+        let mut workspace_watchers: HashMap<WorkspaceId, Vec<RootWatch>> = HashMap::new();
         for (ws_id, ws_path) in &workspaces {
-            let project_roots = get_project_skill_roots(ws_path);
-            for root in project_roots {
-                if let Ok(watcher) = watch_directory(root, Some(ws_id.clone()), raw_tx.clone()) {
-                    workspace_watchers.push(watcher);
-                }
-            }
+            workspace_watchers.insert(
+                ws_id.clone(),
+                start_project_watchers(ws_id, ws_path, &raw_tx),
+            );
         }
 
         let task = tokio::spawn(debounce_loop(bus, workspaces, raw_rx));
 
         Self {
             _user_watchers: user_watchers,
-            _workspace_watchers: workspace_watchers,
+            workspace_watchers: Mutex::new(workspace_watchers),
+            raw_tx,
             task,
         }
     }
+
+    /// Register a workspace at runtime (#611). The debounce loop learns the
+    /// path first so events from the new watches (including the promotion
+    /// catch-up for tier roots created later) are attributable, then the
+    /// project-tier roots are watched. Re-registering replaces the watches.
+    pub fn add_workspace(&self, workspace_id: WorkspaceId, workspace_path: PathBuf) {
+        let _ = self
+            .raw_tx
+            .send(SkillsMsg::Add(workspace_id.clone(), workspace_path.clone()));
+        let watchers = start_project_watchers(&workspace_id, &workspace_path, &self.raw_tx);
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.insert(workspace_id, watchers);
+        }
+    }
+
+    /// Deregister a workspace at runtime (#611): tear down its project-tier
+    /// watches and drop any pending flush so it stops emitting.
+    pub fn remove_workspace(&self, workspace_id: &WorkspaceId) {
+        if let Ok(mut map) = self.workspace_watchers.lock() {
+            map.remove(workspace_id);
+        }
+        let _ = self.raw_tx.send(SkillsMsg::Remove(workspace_id.clone()));
+    }
 }
 
+/// Watch the project-tier skill roots of one workspace.
+fn start_project_watchers(
+    workspace_id: &WorkspaceId,
+    workspace_path: &Path,
+    raw_tx: &mpsc::UnboundedSender<SkillsMsg>,
+) -> Vec<RootWatch> {
+    let mut watchers = Vec::new();
+    for root in get_project_skill_roots(workspace_path) {
+        if let Ok(watcher) = watch_directory(root, Some(workspace_id.clone()), raw_tx.clone()) {
+            watchers.push(watcher);
+        }
+    }
+    watchers
+}
+
+/// Message into the debounce loop: a raw filesystem change, or a runtime
+/// (de)registration of a workspace (#611).
 #[derive(Debug, Clone)]
-struct SkillsEvent {
-    workspace_id: Option<WorkspaceId>, // None = affects all workspaces
+enum SkillsMsg {
+    /// Raw change from a root watch; `None` = user tier (all workspaces).
+    Change(Option<WorkspaceId>),
+    /// Workspace registered after start.
+    Add(WorkspaceId, PathBuf),
+    /// Workspace deregistered; its pending flush is dropped.
+    Remove(WorkspaceId),
 }
 
-/// Watch a single directory (or its nearest existing ancestor).
+/// Watch a single root, forwarding `SKILL.md` and directory-level events.
+/// Missing roots are handled by [`watch_root`]: a non-recursive watch on the
+/// nearest existing ancestor is promoted to a recursive watch on the root
+/// once it appears.
 fn watch_directory(
     root: PathBuf,
     workspace_id: Option<WorkspaceId>,
-    tx: mpsc::UnboundedSender<SkillsEvent>,
-) -> notify::Result<RecommendedWatcher> {
-    let watch_path = find_existing_ancestor(&root);
-
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            // Only care about SKILL.md files
-            if event.paths.iter().any(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n == "SKILL.md")
-                    .unwrap_or(false)
-            }) {
-                let _ = tx.send(SkillsEvent {
-                    workspace_id: workspace_id.clone(),
-                });
-            }
-        }
-    })?;
-
-    watcher.watch(&watch_path, RecursiveMode::Recursive)?;
-    Ok(watcher)
+    tx: mpsc::UnboundedSender<SkillsMsg>,
+) -> notify::Result<RootWatch> {
+    watch_root(root, is_skill_md, move || {
+        let _ = tx.send(SkillsMsg::Change(workspace_id.clone()));
+    })
 }
 
-/// Find the nearest existing ancestor of a path (for non-existent roots).
-fn find_existing_ancestor(path: &Path) -> PathBuf {
-    let mut current = path.to_path_buf();
-    while !current.exists() && current.parent().is_some() {
-        current = current.parent().unwrap().to_path_buf();
-    }
-    if current.exists() {
-        current
-    } else {
-        path.to_path_buf()
-    }
+fn is_skill_md(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md")
 }
 
 fn get_user_skill_roots() -> Vec<PathBuf> {
@@ -143,26 +169,27 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// Debounce loop that coalesces rapid skill file changes per workspace.
+/// `Add`/`Remove` messages keep the workspace map in step with runtime
+/// (de)registrations (#611).
 async fn debounce_loop(
     bus: EventBus,
     workspaces: Vec<(WorkspaceId, PathBuf)>,
-    mut raw_rx: mpsc::UnboundedReceiver<SkillsEvent>,
+    mut raw_rx: mpsc::UnboundedReceiver<SkillsMsg>,
 ) {
     let mut pending: HashMap<WorkspaceId, tokio::time::Instant> = HashMap::new();
-    let workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
-    let all_workspace_ids: Vec<WorkspaceId> = workspace_paths.keys().cloned().collect();
+    let mut workspace_paths: HashMap<WorkspaceId, PathBuf> = workspaces.into_iter().collect();
 
     loop {
         let next_deadline = pending.values().copied().min();
 
         tokio::select! {
             maybe = raw_rx.recv() => match maybe {
-                Some(event) => {
+                Some(SkillsMsg::Change(workspace_id)) => {
                     let deadline = tokio::time::Instant::now() + DEBOUNCE;
-                    match event.workspace_id {
+                    match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
-                            for ws_id in &all_workspace_ids {
+                            for ws_id in workspace_paths.keys() {
                                 pending.insert(ws_id.clone(), deadline);
                             }
                         }
@@ -171,6 +198,13 @@ async fn debounce_loop(
                             pending.insert(ws_id, deadline);
                         }
                     }
+                }
+                Some(SkillsMsg::Add(ws_id, path)) => {
+                    workspace_paths.insert(ws_id, path);
+                }
+                Some(SkillsMsg::Remove(ws_id)) => {
+                    workspace_paths.remove(&ws_id);
+                    pending.remove(&ws_id);
                 }
                 None => {
                     // All senders dropped: flush and exit
@@ -249,5 +283,147 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
         tokio::time::sleep_until(d).await;
     } else {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use intent_core::Event;
+    use intent_store::Store;
+    use tokio::time::{timeout, Instant};
+
+    use super::super::filter::SubscriptionFilter;
+    use super::*;
+
+    /// Self-cleaning temp directory (workspace root).
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "intentd-skills-watch-{tag}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("intentd-skills-watch-{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ =
+                    std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
+            }
+        }
+    }
+
+    async fn bus_and_sub() -> (TempDb, EventBus, super::super::bus::Subscription) {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.expect("open store");
+        let bus = EventBus::new(store);
+        let sub = bus.subscribe(SubscriptionFilter::default());
+        (db, bus, sub)
+    }
+
+    /// Drain `skills:changed` events until `quiet` elapses with no new batch
+    /// (or `deadline` passes).
+    async fn drain_skills_events(
+        sub: &mut super::super::bus::Subscription,
+        quiet: Duration,
+        deadline: Duration,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        let end = Instant::now() + deadline;
+        loop {
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(quiet.min(remaining), sub.recv()).await {
+                Ok(Some(batch)) => {
+                    for ev in batch {
+                        if ev.event_type == SKILLS_CHANGED {
+                            events.push(ev);
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        events
+    }
+
+    fn skill_md(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: d\n---\n\nbody")
+    }
+
+    #[tokio::test]
+    async fn workspace_added_after_start_gains_watching_and_removal_stops_it() {
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let ws = TempDir::new("dyn-ws");
+        let ws_id = WorkspaceId::from("ws-skills-dyn");
+
+        // Start with NO workspaces; register at runtime (#611).
+        let watcher = SkillsWatcher::start(bus.clone(), vec![]);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        watcher.add_workspace(ws_id.clone(), ws.path.clone());
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // A project-tier SKILL.md created after registration emits for the
+        // new workspace.
+        let skill_dir = ws.path.join(".intent").join("skills").join("dyn-skill");
+        std::fs::create_dir_all(&skill_dir).expect("mk skill dir");
+        std::fs::write(skill_dir.join("SKILL.md"), skill_md("dyn-skill")).expect("write skill");
+
+        let events =
+            drain_skills_events(&mut sub, Duration::from_secs(2), Duration::from_secs(10)).await;
+        assert!(
+            events.iter().any(|e| e.workspace_id == ws_id),
+            "change after runtime registration must emit for the workspace, got {events:?}"
+        );
+
+        // Deregister: further project-tier changes no longer emit.
+        watcher.remove_workspace(&ws_id);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let late_dir = ws.path.join(".intent").join("skills").join("late-skill");
+        std::fs::create_dir_all(&late_dir).expect("mk late skill dir");
+        std::fs::write(late_dir.join("SKILL.md"), skill_md("late-skill"))
+            .expect("write skill after removal");
+
+        let events = drain_skills_events(
+            &mut sub,
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            events.iter().all(|e| e.workspace_id != ws_id),
+            "deregistered workspace must stop emitting, got {events:?}"
+        );
     }
 }
