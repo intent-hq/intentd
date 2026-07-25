@@ -885,9 +885,9 @@ impl Services {
         if activity_max.is_some() {
             ws.last_activity = activity_max;
         }
-        // Compute cow_supported: git repo + CoW probe Supported. Reports
+        // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
-        ws.cow_supported = self.compute_cow_supported(ws).await;
+        ws.cow_supported = self.compute_cow_supported().await;
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -1042,23 +1042,21 @@ impl Services {
         Ok(())
     }
 
-    /// Compute whether CoW isolation is supported for this workspace. Reports
-    /// machine/filesystem capability for any repo-backed workspace regardless
-    /// of checkout mode (the FE uses it to gate the CoW opt-in toggle, which
-    /// affects newly created workspaces). Returns Some(true) if git repo +
-    /// CoW probe Supported; Some(false) on an unsupported filesystem; None if
-    /// the probe cannot run. The live probe is offloaded to the blocking pool
-    /// and cached per `(repository_path, workspaces_root)` pair by the shared
-    /// aggregate cache.
-    async fn compute_cow_supported(&self, ws: &Workspace) -> Option<bool> {
-        // Must have a repository path
-        let repo_path = ws.repository_path.as_ref()?;
+    /// Compute whether CoW isolation is supported on this machine. Probes the
+    /// workspaces root's filesystem (root→root) — a machine capability,
+    /// independent of any workspace or checkout mode (the FE uses it to gate
+    /// the CoW opt-in toggle, which affects newly created workspaces).
+    /// Returns Some(true) if the CoW probe reports Supported; Some(false) on
+    /// an unsupported filesystem; None if the probe cannot run. The live
+    /// probe is offloaded to the blocking pool and cached per workspaces root
+    /// by the shared aggregate cache.
+    async fn compute_cow_supported(&self) -> Option<bool> {
         // Must have workspaces root
         let workspaces_root = self.workspaces_root.as_ref()?;
 
-        // Probe CoW support for the (repo, workspaces_root) pair
+        // Probe CoW support for the workspaces root
         self.workspace_aggregates
-            .cow_supported(repo_path.clone(), workspaces_root.clone())
+            .cow_supported(workspaces_root.clone())
             .await
     }
 

@@ -122,8 +122,8 @@ pub struct WorkspaceSettings {
     /// `workspace.autoFetch` — periodically fetch from the remote.
     pub auto_fetch: bool,
     /// `workspace.cowIsolation` — CoW workspace provisioning and per-agent
-    /// sandboxing (requires CoW filesystem support; falls back to worktrees
-    /// when unsupported).
+    /// sandboxing (requires CoW filesystem support on the workspaces root;
+    /// workspace creation fails when unsupported).
     pub cow_isolation: bool,
 }
 
@@ -700,8 +700,8 @@ providerSettings = {}
 # defaultShell = "/bin/zsh"
 # Auto-fetch -- periodically fetch from the remote.
 autoFetch = false
-# Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes; falls back
-# to worktrees when unsupported (requires CoW filesystem support).
+# Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
+# CoW filesystem support on the workspaces root).
 cowIsolation = false
 
 [git]
