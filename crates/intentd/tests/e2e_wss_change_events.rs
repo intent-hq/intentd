@@ -1026,9 +1026,11 @@ async fn comment_add_echoes_note_rev_and_emits_note_updated_over_wss() {
 }
 
 /// End-to-end (Audit D C3): `workspace.archive` over WSS publishes
-/// `workspace:updated` with `changes: { archived: true }`. §6.5 has no
-/// `workspace:archived` event; the reference emitter dispatches
-/// `workspaceUpdated` with a `changes` delta.
+/// `workspace:updated` with the full applied delta
+/// `changes: { archived: true, status: "Archived", archivedAt: <ts> }` where
+/// `<ts>` equals the persisted `archivedAt`. §6.5 has no `workspace:archived`
+/// event; the reference emitter dispatches `workspaceUpdated` with a
+/// `changes` delta.
 #[tokio::test]
 async fn archive_workspace_emits_workspace_updated_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -1073,12 +1075,20 @@ async fn archive_workspace_emits_workspace_updated_over_wss() {
     assert!(archive_res["workspace"]["archivedAt"].is_string());
     assert!(archive_res["workspace"]["lastActivity"].is_string());
     assert!(archive_res.get("success").is_none());
+    let archived_at = archive_res["workspace"]["archivedAt"].clone();
 
     let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert_eq!(
         evt["data"],
-        json!({ "workspaceId": ws_id, "changes": { "archived": true } })
+        json!({
+            "workspaceId": ws_id,
+            "changes": {
+                "archived": true,
+                "status": "Archived",
+                "archivedAt": archived_at,
+            }
+        })
     );
 
     let extra = drain_extra(&mut sub, "workspace:updated", 500).await;
@@ -1089,7 +1099,9 @@ async fn archive_workspace_emits_workspace_updated_over_wss() {
 }
 
 /// End-to-end (Audit D C3, symmetric): `workspace.unarchive` over WSS
-/// publishes `workspace:updated` with `changes: { archived: false }`.
+/// publishes `workspace:updated` with the full applied delta
+/// `changes: { archived: false, status: "Active", archivedAt: null }` — the
+/// explicit JSON `null` tells clients to clear the field.
 #[tokio::test]
 async fn unarchive_workspace_emits_workspace_updated_over_wss() {
     let (daemon, port, cfg) = boot().await;
@@ -1146,7 +1158,14 @@ async fn unarchive_workspace_emits_workspace_updated_over_wss() {
     assert_eq!(evt["workspaceId"], ws_id.as_str());
     assert_eq!(
         evt["data"],
-        json!({ "workspaceId": ws_id, "changes": { "archived": false } })
+        json!({
+            "workspaceId": ws_id,
+            "changes": {
+                "archived": false,
+                "status": "Active",
+                "archivedAt": null,
+            }
+        })
     );
 
     let extra = drain_extra(&mut sub, "workspace:updated", 500).await;

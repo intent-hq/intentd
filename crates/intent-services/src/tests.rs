@@ -3561,22 +3561,33 @@ mod change_event_parity {
     }
 
     /// §6.5 has no `workspace:archived`; the reference emitter publishes
-    /// `workspace:updated` with the applied `{ archived }` delta. Verify
-    /// `archive_workspace` fires exactly one such event (Audit D C3).
+    /// `workspace:updated` with the full applied delta
+    /// (`archived`/`status`/`archivedAt`). Verify `archive_workspace` fires
+    /// exactly one such event whose `archivedAt` equals the persisted
+    /// timestamp (Audit D C3).
     #[tokio::test]
     async fn archive_workspace_emits_workspace_updated_once() {
         use intent_core::WorkspaceApi;
         let h = harness().await;
         let mut sub = subscribe(&h);
-        h.services
+        let ws = h
+            .services
             .archive_workspace(h.ws.clone())
             .await
             .expect("archive");
+        let archived_at = ws.archived_at.expect("archivedAt persisted");
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "changes": { "archived": true } })
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": true,
+                    "status": "Archived",
+                    "archivedAt": archived_at,
+                }
+            })
         );
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
@@ -3586,7 +3597,8 @@ mod change_event_parity {
     }
 
     /// Symmetric to archive: `unarchive_workspace` emits one `workspace:updated`
-    /// carrying `{ archived: false }` (Audit D C3).
+    /// carrying the full applied delta with an explicit `archivedAt: null` so
+    /// clients clear the field (Audit D C3).
     #[tokio::test]
     async fn unarchive_workspace_emits_workspace_updated_once() {
         use intent_core::{WorkspaceApi, WorkspaceStatus};
@@ -3606,7 +3618,14 @@ mod change_event_parity {
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
             ev["data"],
-            json!({ "workspaceId": h.ws.0, "changes": { "archived": false } })
+            json!({
+                "workspaceId": h.ws.0,
+                "changes": {
+                    "archived": false,
+                    "status": "Active",
+                    "archivedAt": null,
+                }
+            })
         );
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(

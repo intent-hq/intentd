@@ -8455,11 +8455,20 @@ impl WorkspaceApi for Services {
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
             // §6.5 has no `workspace:archived`; mirror the reference emitter and
-            // publish `workspace:updated` with the applied `{ archived }` delta
-            // so subscribers flip state without a re-read.
+            // publish `workspace:updated` with the full applied delta
+            // (`archived`/`status`/`archivedAt`) so subscribers flip state
+            // without a re-read. `archivedAt` is the same timestamp persisted
+            // on the row above.
             publish_event(
                 &bus,
-                workspace_updated_event(&ws.id, serde_json::json!({ "archived": true })),
+                workspace_updated_event(
+                    &ws.id,
+                    serde_json::json!({
+                        "archived": true,
+                        "status": ws.status,
+                        "archivedAt": ws.archived_at,
+                    }),
+                ),
             )
             .await;
             Ok(ws)
@@ -8485,9 +8494,18 @@ impl WorkspaceApi for Services {
             // response carries `agent_running` when agents are in-flight,
             // not the stale default `idle` from the persisted row.
             ws.activity = this.workspace_activity(&ws.id);
+            // Full applied delta with an explicit JSON `null` for `archivedAt`
+            // so clients clear the field instead of keeping the stale value.
             publish_event(
                 &bus,
-                workspace_updated_event(&ws.id, serde_json::json!({ "archived": false })),
+                workspace_updated_event(
+                    &ws.id,
+                    serde_json::json!({
+                        "archived": false,
+                        "status": ws.status,
+                        "archivedAt": serde_json::Value::Null,
+                    }),
+                ),
             )
             .await;
             Ok(ws)
