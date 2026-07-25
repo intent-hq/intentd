@@ -35,7 +35,7 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 thiserror = "1"
 anyhow = "1"
 toml = "0.8"
-directories = "5"
+directories = "6"
 nix = { version = "0.31", features = ["signal", "process", "poll"] }
 portable-pty = "0.8"
 grep = "0.4"
