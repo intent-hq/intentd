@@ -128,9 +128,7 @@ impl Store {
     }
 
     /// Recompute-and-store a workspace's `token_usage` snapshot atomically
-    /// (§5.23, monorepo#738): inside ONE write-pool transaction (the write
-    /// pool is `max_connections=1`, so transactions fully serialize — same
-    /// pattern as the #737 fold in `write_acp_session_id`), read the
+    /// (§5.23, monorepo#738): inside ONE write-pool transaction, read the
     /// per-session usage rows and the stored workspace `token_usage`, invoke
     /// the caller's synchronous `compute` closure with both, and — when it
     /// returns `Some(new_usage)` — perform a scoped
@@ -140,6 +138,13 @@ impl Store {
     /// the closure declined. `NotFound` if the workspace row is absent.
     /// Layering: aggregation stays in intent-services via the closure; the
     /// store only supplies the transactional read→write envelope.
+    ///
+    /// Uses raw `BEGIN IMMEDIATE` (same pattern as `insert_events`):
+    /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
+    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
+    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// `max_connections=1` on the write pool, concurrent recomputes serialize
+    /// at `pool.acquire()` instead.
     pub async fn update_workspace_token_usage<F>(
         &self,
         workspace_id: &WorkspaceId,
@@ -148,44 +153,51 @@ impl Store {
     where
         F: FnOnce(&[AgentUsageRow], Option<&TokenUsage>) -> Option<TokenUsage>,
     {
-        let mut tx = self
-            .write_pool()
-            .begin()
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("token usage recompute acquire failed: {e}"))
+            })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("token usage recompute begin failed: {e}")))?;
-        let row = sqlx::query("SELECT token_usage FROM workspace WHERE id = ?")
-            .bind(&workspace_id.0)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("token usage recompute read failed: {e}")))?;
-        let Some(row) = row else {
-            return Err(Error::NotFound(format!("workspace {workspace_id}")));
-        };
-        // Best-effort decode: a malformed stored snapshot degrades to None so
-        // the recompute writes a fresh one rather than failing.
-        let current: Option<TokenUsage> = row
-            .get::<Option<String>, _>("token_usage")
-            .and_then(|s| serde_json::from_str(&s).ok());
-        let usage_rows = fetch_agent_usage_rows(&mut tx, workspace_id).await?;
-        let Some(new_usage) = compute(&usage_rows, current.as_ref()) else {
-            return Ok(None);
-        };
-        let json = serde_json::to_string(&new_usage)
-            .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
-        let res = sqlx::query("UPDATE workspace SET token_usage=?, updated_at=? WHERE id=?")
-            .bind(json)
-            .bind(now_iso())
-            .bind(&workspace_id.0)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("token usage recompute write failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("workspace {workspace_id}")));
+
+        let body_result = async {
+            let row = sqlx::query("SELECT token_usage FROM workspace WHERE id = ?")
+                .bind(&workspace_id.0)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("token usage recompute read failed: {e}")))?;
+            let Some(row) = row else {
+                return Err(Error::NotFound(format!("workspace {workspace_id}")));
+            };
+            // Best-effort decode: a malformed stored snapshot degrades to None so
+            // the recompute writes a fresh one rather than failing.
+            let current: Option<TokenUsage> = row
+                .get::<Option<String>, _>("token_usage")
+                .and_then(|s| serde_json::from_str(&s).ok());
+            let usage_rows = fetch_agent_usage_rows(&mut conn, workspace_id).await?;
+            let Some(new_usage) = compute(&usage_rows, current.as_ref()) else {
+                return Ok(None);
+            };
+            let json = serde_json::to_string(&new_usage)
+                .map_err(|e| Error::Internal(format!("encode token_usage failed: {e}")))?;
+            let res = sqlx::query("UPDATE workspace SET token_usage=?, updated_at=? WHERE id=?")
+                .bind(json)
+                .bind(now_iso())
+                .bind(&workspace_id.0)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("token usage recompute write failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Err(Error::NotFound(format!("workspace {workspace_id}")));
+            }
+            Ok(Some(new_usage))
         }
-        tx.commit()
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "token usage recompute commit failed")
             .await
-            .map_err(|e| Error::Internal(format!("token usage recompute commit failed: {e}")))?;
-        Ok(Some(new_usage))
     }
 
     /// Delete a workspace by id, or `NotFound`. Records a tombstone in
