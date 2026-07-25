@@ -1913,8 +1913,10 @@ impl Services {
     }
 
     /// Recompute one workspace's durable `tokenUsage` from its agent sessions
-    /// (§5.23): sessions with a persisted end-of-turn snapshot use it as-is;
-    /// others fall back to summing per-message usage metadata. Persists the
+    /// (§5.23): each session's effective total is its recreate baseline plus
+    /// its persisted end-of-turn snapshot (either may be absent, monorepo#737);
+    /// sessions with neither fall back to summing per-message usage metadata
+    /// (see `token_usage::agent_token_tally`). Persists the
     /// snapshot and emits `workspace:tokenUsage-changed` only when the
     /// materialized tally (ignoring `lastScanAt`) actually changed; returns
     /// whether a change was written. Shared by the periodic reconciliation
@@ -1945,10 +1947,11 @@ impl Services {
             .await?;
         let tallies: Vec<token_usage::AgentTokenTally> = usage_data
             .iter()
-            .map(|(agent_id, model, snapshot, contents)| {
+            .map(|(agent_id, model, snapshot, baseline, contents)| {
                 token_usage::agent_token_tally(
                     agent_id,
                     model.as_deref(),
+                    baseline.as_ref(),
                     snapshot.as_ref(),
                     contents,
                 )

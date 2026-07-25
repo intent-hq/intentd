@@ -6,9 +6,10 @@
 //! (`agent_session.rs`) persists each session's cumulative usage snapshot and
 //! re-aggregates immediately, so the workspace tally is fresh at every turn
 //! end. The 300 s scan loop (in `lib.rs`, alongside the PR refresh loop) is a
-//! reconciliation pass: per-session tallies prefer the stored snapshot when
-//! present ([`agent_token_tally`]) and fall back to legacy per-message usage
-//! summing only for sessions that never reported end-of-turn usage. The
+//! reconciliation pass: per-session tallies combine the recreate baseline and
+//! the stored snapshot when either is present ([`agent_token_tally`]) and fall
+//! back to legacy per-message usage summing only for sessions that never
+//! reported end-of-turn usage. The
 //! aggregation here is pure and side-effect free so it is unit-testable
 //! without a store or bus; only the read + `workspace:tokenUsage-changed` event
 //! cross the wire (the scan itself has no RPC, §6.8).
@@ -96,6 +97,14 @@ pub fn session_token_tally(session: &AgentSession) -> AgentTokenTally {
 /// `cachedWriteTokens` → `cacheCreationTokens`; absent optional counters map
 /// to zero. `thoughtTokens` has no slot in [`TokenUsageTotals`] and is
 /// intentionally dropped (as is `totalTokens`, which is derivable).
+///
+/// **Recreate baseline** (monorepo#737): counters are cumulative per *ACP*
+/// session, so when the resume-impossible fallback recreates the ACP session,
+/// the fresh session restarts from zero. The store banks the outgoing
+/// session's snapshot into `token_usage_baseline` atomically with the id swap
+/// (`Store::replace_acp_session_id`); the agent's effective total is then
+/// `baseline + snapshot` (see [`agent_token_tally`]). The snapshot itself
+/// stays replace-only — the baseline lives outside it.
 pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
     TokenUsageTotals {
         input_tokens: usage.input_tokens,
@@ -105,25 +114,35 @@ pub fn snapshot_from_turn_usage(usage: &Usage) -> TokenUsageTotals {
     }
 }
 
-/// One agent's tally for the workspace roll-up, preferring the persisted
-/// end-of-turn snapshot when the session has one (§5.23): the snapshot is
-/// already cumulative for the session (see [`snapshot_from_turn_usage`]), so
-/// it is used as-is; sessions that never reported end-of-turn usage fall back
-/// to summing per-message usage metadata via
+/// One agent's tally for the workspace roll-up (§5.23): the effective total
+/// is `baseline + snapshot`, component-wise, where either part may be absent.
+/// The `baseline` banks the cumulative totals of ACP sessions folded away by
+/// a recreate (monorepo#737) and the `snapshot` is the current ACP session's
+/// cumulative end-of-turn report (see [`snapshot_from_turn_usage`]), so their
+/// sum never double-counts. A baseline WITHOUT a snapshot uses the baseline
+/// alone — never baseline + message sums, since the pre-recreate snapshot
+/// already superseded the message metadata. Only when BOTH are absent (the
+/// session never reported end-of-turn usage and was never recreated) does the
+/// tally fall back to summing per-message usage metadata via
 /// [`agent_token_tally_from_contents`].
 pub fn agent_token_tally(
     agent_id: &str,
     model: Option<&str>,
+    baseline: Option<&TokenUsageTotals>,
     snapshot: Option<&TokenUsageTotals>,
     contents: &[serde_json::Value],
 ) -> AgentTokenTally {
-    match snapshot {
-        Some(totals) => AgentTokenTally {
-            agent_id: agent_id.to_string(),
-            model: model.unwrap_or("").to_string(),
-            totals: totals.clone(),
-        },
-        None => agent_token_tally_from_contents(agent_id, model, contents),
+    if baseline.is_none() && snapshot.is_none() {
+        return agent_token_tally_from_contents(agent_id, model, contents);
+    }
+    let mut totals = baseline.cloned().unwrap_or_default();
+    if let Some(snapshot) = snapshot {
+        add_totals(&mut totals, snapshot);
+    }
+    AgentTokenTally {
+        agent_id: agent_id.to_string(),
+        model: model.unwrap_or("").to_string(),
+        totals,
     }
 }
 
@@ -246,12 +265,44 @@ mod tests {
         let contents = vec![serde_json::json!({ "usage": { "inputTokens": 999 } })];
         let snapshot = totals(70, 50, 30, 4);
         // Snapshot present → used as-is; message usage is NOT added on top.
-        let tally = agent_token_tally("agent-s", Some("opus-4.8"), Some(&snapshot), &contents);
+        let tally = agent_token_tally(
+            "agent-s",
+            Some("opus-4.8"),
+            None,
+            Some(&snapshot),
+            &contents,
+        );
         assert_eq!(tally.totals, snapshot);
         assert_eq!(tally.model, "opus-4.8");
-        // No snapshot → falls back to summing message usage.
-        let fallback = agent_token_tally("agent-s", None, None, &contents);
+        // No baseline, no snapshot → falls back to summing message usage.
+        let fallback = agent_token_tally("agent-s", None, None, None, &contents);
         assert_eq!(fallback.totals, totals(999, 0, 0, 0));
+    }
+
+    #[test]
+    fn agent_token_tally_combines_baseline_and_snapshot() {
+        let contents = vec![serde_json::json!({ "usage": { "inputTokens": 999 } })];
+        let baseline = totals(100, 80, 10, 2);
+        let snapshot = totals(5, 3, 1, 1);
+        // Baseline + snapshot → component-wise sum; message usage ignored.
+        let both = agent_token_tally(
+            "agent-r",
+            Some("opus-4.8"),
+            Some(&baseline),
+            Some(&snapshot),
+            &contents,
+        );
+        assert_eq!(both.totals, totals(105, 83, 11, 3));
+        // Baseline WITHOUT a snapshot → baseline alone, never baseline +
+        // message sums (the pre-recreate snapshot superseded the messages).
+        let baseline_only = agent_token_tally(
+            "agent-r",
+            Some("opus-4.8"),
+            Some(&baseline),
+            None,
+            &contents,
+        );
+        assert_eq!(baseline_only.totals, baseline);
     }
 
     #[test]
@@ -269,10 +320,17 @@ mod tests {
             agent_token_tally(
                 "agent-snap",
                 Some("opus-4.8"),
+                None,
                 Some(&snapshot),
                 &snap_contents,
             ),
-            agent_token_tally("agent-legacy", Some("sonnet-5"), None, &legacy_contents),
+            agent_token_tally(
+                "agent-legacy",
+                Some("sonnet-5"),
+                None,
+                None,
+                &legacy_contents,
+            ),
         ];
         let usage = aggregate_token_usage(&tallies);
         assert_eq!(usage.by_agent_id["agent-snap"], totals(40, 30, 20, 10));
