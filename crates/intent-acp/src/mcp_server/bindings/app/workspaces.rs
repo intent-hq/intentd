@@ -342,7 +342,9 @@ struct WorkspaceCreateFields {
     github_url: Option<String>,
     pr_number: Option<u64>,
     clone_path: Option<String>,
-    branch: String,
+    /// `None` when the caller supplied no branch/baseRef; `create()` fills in
+    /// the repo's actual default branch (or `main`) before building the preview.
+    branch: Option<String>,
     is_new_repo: bool,
     scope: Option<String>,
     specialist: Option<String>,
@@ -588,9 +590,7 @@ fn normalize_workspace_create_fields(
                 None
             }
         }),
-        branch: string_value(params, "branch")
-            .or_else(|| string_value(params, "baseRef"))
-            .unwrap_or_else(|| "main".to_string()),
+        branch: string_value(params, "branch").or_else(|| string_value(params, "baseRef")),
         is_new_repo: params
             .get("isNewRepo")
             .and_then(Value::as_bool)
@@ -627,7 +627,10 @@ fn workspace_create_preview(fields: &WorkspaceCreateFields) -> Value {
     if let Some(v) = &fields.clone_path {
         m.insert("clonePath".to_string(), json!(v));
     }
-    m.insert("branch".to_string(), json!(fields.branch));
+    m.insert(
+        "branch".to_string(),
+        json!(fields.branch.as_deref().unwrap_or("main")),
+    );
     m.insert("isNewRepo".to_string(), json!(fields.is_new_repo));
     if let Some(v) = &fields.scope {
         m.insert("scope".to_string(), json!(v));
@@ -743,6 +746,53 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         }
     }
 
+    // Best-effort branch defaulting + validation against the local checkout
+    // (monorepo#761). Only runs when the proposal references a local repo
+    // path that exists on disk; any repo-open/IO failure degrades silently
+    // (empty branch falls back to `main`, no warning) — propose never fails
+    // because of validation. Apply-time worktree provisioning stays the
+    // enforcement point.
+    let mut warnings: Vec<String> = Vec::new();
+    let local_repo = fields
+        .repo_path
+        .clone()
+        .filter(|p| std::path::Path::new(p).exists());
+    match (fields.branch.clone(), local_repo) {
+        // Explicit branch + local repo: resolve with the exact 3-spec order
+        // apply-time `provision_worktree` uses. Unresolvable → warn, keep the
+        // proposed value in the preview so the FE can show what the agent
+        // asked for and preselect the default branch in the dialog.
+        (Some(branch), Some(repo_path)) => {
+            let (b, p) = (branch.clone(), repo_path.clone());
+            let resolved = tokio::task::spawn_blocking(move || {
+                intent_git::worktree::base_ref_resolves(std::path::Path::new(&p), &b, "origin")
+            })
+            .await;
+            if matches!(resolved, Ok(Ok(false))) {
+                warnings.push(format!(
+                    "Base branch '{branch}' does not exist in {repo_path}; \
+                     the default branch will be preselected in the dialog"
+                ));
+            }
+        }
+        // Empty branch + local repo: default to the repo's actual default
+        // branch (origin/HEAD, else HEAD's branch), `main` as last resort.
+        (None, Some(repo_path)) => {
+            let default = tokio::task::spawn_blocking(move || {
+                intent_git::branches::repo_default_branch(std::path::Path::new(&repo_path))
+            })
+            .await;
+            fields.branch = Some(match default {
+                Ok(Ok(name)) => name,
+                _ => "main".to_string(),
+            });
+        }
+        // No local repo to ask (GitHub-URL-only, missing path): static
+        // default; the FE branch listing handles those flows.
+        (None, None) => fields.branch = Some("main".to_string()),
+        (Some(_), None) => {}
+    }
+
     // Payload params: strip preview-only fields (TS
     // `workspaceCreatePayloadParams`) and write back the normalized repo
     // fields so applying the proposal uses the same sane values the preview
@@ -763,17 +813,33 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         payload_params.insert("clonePath".to_string(), json!(path));
     }
 
+    // `warnings` is the optional `preview.warnings?: string[]` of the TS
+    // reference (`shared/types/proposal.ts`); omitted when empty, matching
+    // JSON serialization dropping `undefined`.
+    let mut preview = serde_json::Map::new();
+    preview.insert(
+        "title".to_string(),
+        json!(format!("Create workspace{}", title)),
+    );
+    preview.insert(
+        "summary".to_string(),
+        json!("Review and adjust workspace creation details before creating a new space."),
+    );
+    preview.insert(
+        "workspaceCreate".to_string(),
+        workspace_create_preview(&fields),
+    );
+    if !warnings.is_empty() {
+        preview.insert("warnings".to_string(), json!(warnings));
+    }
+
     let proposal = json!({
         "kind": "workspace-create",
         "payload": {
             "operation": "workspace.create",
             "params": payload_params
         },
-        "preview": {
-            "title": format!("Create workspace{}", title),
-            "summary": "Review and adjust workspace creation details before creating a new space.",
-            "workspaceCreate": workspace_create_preview(&fields)
-        }
+        "preview": preview
     });
 
     proposal_result(proposal)
@@ -1314,6 +1380,68 @@ mod tests {
         proposal.get("payload").unwrap().get("params").unwrap()
     }
 
+    fn preview_warnings(proposal: &Value) -> Option<&Value> {
+        proposal.get("preview").unwrap().get("warnings")
+    }
+
+    /// Temp git repo fixture for the propose-time base-ref validation tests;
+    /// removed on drop.
+    struct TempRepo {
+        path: std::path::PathBuf,
+    }
+
+    impl TempRepo {
+        fn unique_dir(tag: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("intent-acp-ws-{tag}-{nanos}"));
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        /// Init a repo whose initial (HEAD) branch is `head_branch`, with one
+        /// commit so refs resolve.
+        fn init(tag: &str, head_branch: &str) -> Self {
+            let path = Self::unique_dir(tag);
+            let mut opts = git2::RepositoryInitOptions::new();
+            opts.initial_head(head_branch);
+            let repo = git2::Repository::init_opts(&path, &opts).unwrap();
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+            std::fs::write(path.join("a.txt"), "x\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("a.txt")).unwrap();
+            index.write().unwrap();
+            let tree_oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            Self { path }
+        }
+
+        /// A plain directory that exists on disk but is not a git repository
+        /// (repo-open fails → validation must degrade silently).
+        fn plain_dir(tag: &str) -> Self {
+            Self {
+                path: Self::unique_dir(tag),
+            }
+        }
+
+        fn path_str(&self) -> String {
+            self.path.to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[tokio::test]
     async fn test_create_normalizes_issues_url_to_repo_url() {
         let proposal = create_proposal(json!({
@@ -1475,6 +1603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_branch_defaults_and_base_ref_fallback() {
+        // No repo path at all → nothing to ask, static `main` fallback.
         let proposal = create_proposal(json!({})).await;
         let fields = preview_fields(&proposal);
         assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "main");
@@ -1483,6 +1612,97 @@ mod tests {
         let proposal = create_proposal(json!({ "baseRef": "develop" })).await;
         let fields = preview_fields(&proposal);
         assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "develop");
+    }
+
+    #[tokio::test]
+    async fn test_create_unresolvable_branch_warns_but_returns_proposal() {
+        let repo = TempRepo::init("badref", "trunk");
+        let proposal = create_proposal(json!({
+            "repositoryPath": repo.path_str(),
+            "branch": "no-such-branch"
+        }))
+        .await;
+
+        // Warn-don't-reject: the proposal is returned with the proposed
+        // value intact in preview and payload.
+        let fields = preview_fields(&proposal);
+        assert_eq!(
+            fields.get("branch").unwrap().as_str().unwrap(),
+            "no-such-branch"
+        );
+        assert_eq!(
+            payload_params(&proposal)
+                .get("branch")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "no-such-branch"
+        );
+
+        let warnings = preview_warnings(&proposal).unwrap().as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        let warning = warnings[0].as_str().unwrap();
+        assert!(warning.contains("Base branch 'no-such-branch' does not exist"));
+        assert!(warning.contains(&repo.path_str()));
+        assert!(warning.contains("default branch will be preselected"));
+    }
+
+    #[tokio::test]
+    async fn test_create_resolvable_branch_no_warning() {
+        let repo = TempRepo::init("goodref", "trunk");
+        let proposal = create_proposal(json!({
+            "repositoryPath": repo.path_str(),
+            "branch": "trunk"
+        }))
+        .await;
+
+        let fields = preview_fields(&proposal);
+        assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "trunk");
+        assert!(preview_warnings(&proposal).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_empty_branch_defaults_to_repo_default_branch() {
+        let repo = TempRepo::init("repodefault", "trunk");
+        let proposal = create_proposal(json!({ "repositoryPath": repo.path_str() })).await;
+
+        // Empty branch → the repo's actual default branch, not hardcoded
+        // `main`; defaulting is not a warning.
+        let fields = preview_fields(&proposal);
+        assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "trunk");
+        assert!(preview_warnings(&proposal).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_validation_degrades_silently_on_io_failure() {
+        // Path missing on disk: no validation runs — no warning, no error.
+        let proposal = create_proposal(json!({
+            "repositoryPath": "/no/such/checkout",
+            "branch": "anything-goes"
+        }))
+        .await;
+        let fields = preview_fields(&proposal);
+        assert_eq!(
+            fields.get("branch").unwrap().as_str().unwrap(),
+            "anything-goes"
+        );
+        assert!(preview_warnings(&proposal).is_none());
+
+        // Existing dir that is not a git repo: repo open fails → degrade.
+        let plain = TempRepo::plain_dir("plain");
+        let proposal = create_proposal(json!({
+            "repositoryPath": plain.path_str(),
+            "branch": "anything-goes"
+        }))
+        .await;
+        assert!(preview_warnings(&proposal).is_none());
+
+        // Same dir with an empty branch: default-branch lookup fails →
+        // static `main` fallback.
+        let proposal = create_proposal(json!({ "repositoryPath": plain.path_str() })).await;
+        let fields = preview_fields(&proposal);
+        assert_eq!(fields.get("branch").unwrap().as_str().unwrap(), "main");
+        assert!(preview_warnings(&proposal).is_none());
     }
 
     #[tokio::test]

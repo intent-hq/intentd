@@ -231,6 +231,34 @@ fn local_branches(repo: &Repository) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The repository's actual default branch when determinable: `origin/HEAD`'s
+/// symbolic target, else the branch HEAD currently points at. Unlike the
+/// listing default above (which guesses `master`/`main`), this errors when
+/// neither source is available (detached or unborn HEAD) so callers can apply
+/// their own last-resort fallback. Backs the propose-time empty-branch
+/// default for chief workspace-create proposals (monorepo#761).
+pub fn repo_default_branch(repo_path: &Path) -> Result<String> {
+    let repo = Repository::open(repo_path).map_err(map_git_err)?;
+    if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
+        if let Ok(Some(target)) = reference.symbolic_target() {
+            if let Some(name) = target.strip_prefix("refs/remotes/origin/") {
+                if !name.is_empty() {
+                    return Ok(name.to_string());
+                }
+            }
+        }
+    }
+    let head = repo.head().map_err(map_git_err)?;
+    if head.is_branch() {
+        if let Ok(name) = head.shorthand() {
+            return Ok(name.to_string());
+        }
+    }
+    Err(Error::Internal(
+        "cannot determine default branch (detached HEAD and no origin/HEAD)".to_string(),
+    ))
+}
+
 /// Resolve the default branch: `origin/HEAD`'s symbolic target, else `master`
 /// when it exists locally, else `main` (matching the TS fallback chain).
 fn default_branch(repo: &Repository, local: &[String]) -> String {
@@ -311,6 +339,43 @@ fn rank_default(name: &str, default_branch: &str) -> u8 {
 mod tests {
     use super::*;
     use crate::testutil::{commit_file, create_branch as create_branch_util, init_repo};
+
+    #[test]
+    fn repo_default_branch_prefers_origin_head_then_head() {
+        let dir = init_repo("branches-repo-default");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let head_branch = repo
+            .head()
+            .unwrap()
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+
+        // No origin/HEAD → the branch HEAD points at.
+        assert_eq!(repo_default_branch(dir.path()).unwrap(), head_branch);
+
+        // origin/HEAD's symbolic target wins over HEAD.
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+            false,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(repo_default_branch(dir.path()).unwrap(), "trunk");
+    }
+
+    #[test]
+    fn repo_default_branch_errors_on_detached_head() {
+        let dir = init_repo("branches-detached");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let oid = repo.head().unwrap().target().unwrap();
+        repo.set_head_detached(oid).unwrap();
+        assert!(repo_default_branch(dir.path()).is_err());
+        assert!(repo_default_branch(Path::new("/no/such/repo")).is_err());
+    }
 
     #[test]
     fn lists_local_branches_default_first() {

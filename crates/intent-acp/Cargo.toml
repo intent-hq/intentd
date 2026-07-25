@@ -9,6 +9,10 @@ description = "ACP client, session multiplexing, and agent→BE MCP server"
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.1.0" }
+# Best-effort propose-time base-ref validation + repo-default-branch lookup
+# for chief workspace-create proposals (monorepo#761). `intent-git` depends
+# only on `intent-core`, so this edge introduces no dependency cycle.
+intent-git = { path = "../intent-git", version = "0.1.0" }
 intent-providers = { path = "../intent-providers", version = "0.1.0" }
 # WSAPI-2: the workspace_api MCP tool runs agent-supplied JavaScript through
 # the QuickJS engine in intent-js. Non-optional so the tool is always wired
@@ -28,6 +32,9 @@ nix = { workspace = true, features = ["signal", "process"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Workspace-create proposal tests seed real temp repositories to exercise
+# the propose-time base-ref validation against libgit2.
+git2 = { workspace = true }
 # Integration tests drive the client-served `terminal/*` handlers against the
 # real unified PTY host. `intent-pty` depends only on `intent-core`, so this
 # dev-only edge introduces no dependency cycle.
