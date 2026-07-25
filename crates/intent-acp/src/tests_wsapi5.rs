@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use intent_core::{
-    AgentId, BoxFuture, Error, FileStatus, GitAgentCommitResult, GitCommitResult, GitFileStatus,
-    GitMergeConflicts, GitStatus, NoteId, Result, ScriptCreateParams, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, FileStatus,
+    GitAgentCommitResult, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, NoteId,
+    Result, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
+    WorkspaceId, WorkspaceStatus, WorkspaceUpdate, CHIEF_WORKSPACE_ID,
 };
 use serde_json::{json, Value};
 
@@ -42,6 +43,10 @@ struct FakeApi {
     file_rename_calls: Mutex<Vec<(String, String)>>,
     update_calls: Mutex<Vec<WorkspaceUpdate>>,
     rename_calls: Mutex<Vec<(String, String, bool)>>,
+    archive_calls: Mutex<Vec<String>>,
+    unarchive_calls: Mutex<Vec<String>>,
+    /// Agents returned by `agent_list` — seeds for the archive guardrail.
+    agents: Mutex<Vec<AgentLite>>,
     workspace_variant: Mutex<WorkspaceVariant>,
     // `None` = no override (use the `make_workspace` default `Some("hi")`);
     // `Some(Some(x))` or `Some(None)` = the value the last `update_workspace`
@@ -165,6 +170,47 @@ impl WorkspaceApi for FakeApi {
             skip_if_explicitly_set,
         ));
         Box::pin(async move { Ok(json!({ "success": true, "name": name })) })
+    }
+
+    fn agent_list(&self, _workspace_id: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
+        let agents = self.agents.lock().unwrap().clone();
+        Box::pin(async move { Ok(agents) })
+    }
+
+    fn archive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+        self.archive_calls
+            .lock()
+            .unwrap()
+            .push(id.as_str().to_string());
+        let variant = *self.workspace_variant.lock().unwrap();
+        Box::pin(async move {
+            if matches!(variant, WorkspaceVariant::NotFound) {
+                return Err(Error::NotFound(format!("workspace {}", id.as_str())));
+            }
+            let mut w = make_workspace(id.as_str(), variant);
+            w.status = WorkspaceStatus::Archived;
+            w.archived = true;
+            w.archived_at = Some("2026-02-02T00:00:00Z".to_string());
+            Ok(w)
+        })
+    }
+
+    fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+        self.unarchive_calls
+            .lock()
+            .unwrap()
+            .push(id.as_str().to_string());
+        let variant = *self.workspace_variant.lock().unwrap();
+        Box::pin(async move {
+            if matches!(variant, WorkspaceVariant::NotFound) {
+                return Err(Error::NotFound(format!("workspace {}", id.as_str())));
+            }
+            let mut w = make_workspace(id.as_str(), variant);
+            w.status = WorkspaceStatus::Active;
+            w.archived = false;
+            w.archived_at = None;
+            Ok(w)
+        })
     }
 
     fn git_status(&self, _id: WorkspaceId) -> BoxFuture<'_, Result<GitStatus>> {
@@ -621,6 +667,144 @@ async fn workspace_emit_notification_reports_unavailable_in_port() {
     let resp = call(&srv, "return await ws.workspace.emitNotification('t','m');").await;
     assert_eq!(resp["result"]["isError"], json!(true));
     assert!(text(&resp).contains("not yet available in this daemon port"));
+}
+
+/// Minimal [`AgentLite`] for seeding the fake's `agent_list` — only `id`,
+/// `name`, `status`, and `is_responding` matter to the archive guardrail.
+fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) -> AgentLite {
+    AgentLite {
+        id: AgentId::from_string(id),
+        workspace_id: WorkspaceId::from_string("ws-1"),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: name.to_string(),
+        name_explicitly_set: false,
+        model: None,
+        provider: None,
+        status,
+        is_active: false,
+        is_streaming: false,
+        is_processing: false,
+        is_responding,
+        is_waiting_on_tool: false,
+        is_waiting_for_other_agents: false,
+        waiting_for_agent_ids: vec![],
+        turn_in_flight: false,
+        last_stream_activity_at: None,
+        stats: None,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        last_activity: None,
+        message_count: 0,
+        last_agent_response: None,
+        last_user_message: None,
+        digest: None,
+        context_references: None,
+        image_blocks: None,
+        stop_reason: None,
+        metadata: AgentMetadata {
+            is_background: false,
+            specialist: None,
+            created_by_agent_id: None,
+            task_note_id: None,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+        },
+    }
+}
+
+fn chief_server() -> (WorkspaceMcpServer, Arc<FakeApi>) {
+    let api = Arc::new(FakeApi::default());
+    let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string(CHIEF_WORKSPACE_ID));
+    (srv, api)
+}
+
+#[tokio::test]
+async fn workspace_archive_happy_path() {
+    // The calling agent itself is mid-turn (isResponding) but must be
+    // excluded from the guardrail.
+    let (srv, api) = server_with_caller("agent-self");
+    *api.agents.lock().unwrap() = vec![
+        agent_lite("agent-self", "Me", AgentStatus::Active, true),
+        agent_lite("agent-done", "Done", AgentStatus::Completed, false),
+        agent_lite("agent-idle", "Idle", AgentStatus::RuntimeIdle, false),
+    ];
+    let resp = call(&srv, "return await ws.workspace.archive();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["status"], json!("Archived"));
+    assert_eq!(v["archivedAt"], json!("2026-02-02T00:00:00Z"));
+    assert_eq!(*api.archive_calls.lock().unwrap(), vec!["ws-1".to_string()]);
+}
+
+#[tokio::test]
+async fn workspace_unarchive_happy_path() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.workspace.unarchive();").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    let v = body(&resp);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["status"], json!("Active"));
+    assert!(v.get("archivedAt").is_none());
+    assert_eq!(
+        *api.unarchive_calls.lock().unwrap(),
+        vec!["ws-1".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn workspace_archive_refuses_when_other_agents_running() {
+    let (srv, api) = server_with_caller("agent-self");
+    *api.agents.lock().unwrap() = vec![
+        agent_lite("agent-self", "Me", AgentStatus::Active, true),
+        agent_lite("agent-busy", "Busy Worker", AgentStatus::Active, true),
+        agent_lite("agent-queued", "Queued One", AgentStatus::Pending, false),
+    ];
+    let resp = call(&srv, "return await ws.workspace.archive();").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let msg = text(&resp);
+    assert!(msg.contains("Cannot archive"), "message: {msg}");
+    assert!(msg.contains("Busy Worker (agent-busy)"), "message: {msg}");
+    assert!(msg.contains("Queued One (agent-queued)"), "message: {msg}");
+    assert!(
+        !msg.contains("agent-self"),
+        "caller must be excluded: {msg}"
+    );
+    assert!(api.archive_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_archive_refuses_in_chief_workspace() {
+    let (srv, api) = chief_server();
+    let resp = call(&srv, "return await ws.workspace.archive();").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(api.archive_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_unarchive_refuses_in_chief_workspace() {
+    let (srv, api) = chief_server();
+    let resp = call(&srv, "return await ws.workspace.unarchive();").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(api.unarchive_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_archive_not_found_errors() {
+    let (srv, api) = server();
+    *api.workspace_variant.lock().unwrap() = WorkspaceVariant::NotFound;
+    let resp = call(&srv, "return await ws.workspace.archive();").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("not found"));
 }
 
 // ============================================================================
