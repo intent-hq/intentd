@@ -399,6 +399,14 @@ pub struct Services {
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
 }
 
+/// Pause inserted between per-workspace iterations of the background sweeps
+/// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage`])
+/// so a single sweep never monopolizes SQLite pool slots: a real sleep (not a
+/// bare `yield_now`) lets queued interactive acquires win the slot between
+/// workspaces (intent-hq/monorepo#703).
+pub(crate) const SWEEP_INTER_WORKSPACE_PAUSE: std::time::Duration =
+    std::time::Duration::from_millis(50);
+
 impl Services {
     /// Wire the services surface over a persistence handle.
     pub fn new(store: Store) -> Self {
@@ -1570,22 +1578,27 @@ impl Services {
         }
 
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        self.refresh_workspace_pr_with_sc(workspace_id, &sc).await
+        self.refresh_workspace_pr_with_sc(ws, &sc).await
     }
 
     /// Refresh one workspace's PR linkage with a pre-resolved [`SourceControl`]
-    /// provider (§7.6). Same semantics as [`refresh_workspace_pr`], but avoids
-    /// re-resolving the provider on every call — used by the background sweep to
-    /// resolve once per cycle and reuse across all workspaces, avoiding spamming
-    /// warnings when unconfigured.
+    /// provider and an already-fetched [`Workspace`] (§7.6). Same semantics as
+    /// [`refresh_workspace_pr`], but avoids re-resolving the provider — and
+    /// re-reading the workspace row — on every call: the background sweep
+    /// resolves the provider once per cycle and passes each workspace from its
+    /// sweep-start `list_workspaces` snapshot (avoiding a redundant per-workspace
+    /// point read, intent-hq/monorepo#703). Accepted tradeoff: when a PR delta
+    /// is persisted, `update_workspace` writes back the (possibly stale)
+    /// snapshot row, so concurrent workspace mutations made after the snapshot
+    /// was taken can be clobbered — callers who need fresh-read semantics must
+    /// fetch immediately before calling (as [`refresh_workspace_pr`] does).
     async fn refresh_workspace_pr_with_sc(
         &self,
-        workspace_id: &WorkspaceId,
+        mut ws: Workspace,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
 
-        let mut ws = self.store.get_workspace(workspace_id).await?;
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
@@ -1612,7 +1625,7 @@ impl Services {
                     ws.active_pull_request = None;
                     ws.updated_at = now_iso();
                     self.store.update_workspace(&ws).await?;
-                    publish_event(&self.event_bus, pr_unlinked_event(workspace_id)).await;
+                    publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
                     return Ok(PrRefreshOutcome::Unlinked);
                 }
                 let info = pr_ops::build_pr_info(&pr);
@@ -1643,7 +1656,7 @@ impl Services {
                         Ok(found) => found,
                         Err(e) => {
                             tracing::warn!(
-                                workspace_id = %workspace_id.as_str(),
+                                workspace_id = %ws.id.as_str(),
                                 error = %e,
                                 "pr refresh: relink discovery failed, persisting status only"
                             );
@@ -1726,6 +1739,12 @@ impl Services {
     /// `tick` (including tick 0) refreshes every workspace; ticks in between
     /// refresh only workspaces active within
     /// [`pr_ops::SWEEP_ACTIVE_WINDOW_MINUTES`].
+    ///
+    /// The sweep operates on the workspace snapshot taken at sweep start
+    /// (`list_workspaces`); each workspace is passed into the refresh path
+    /// as-is instead of being re-read per iteration, and the sweep pauses
+    /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
+    /// monopolizes SQLite pool slots (intent-hq/monorepo#703).
     async fn refresh_all_workspace_prs(&self, tick: u64) {
         let mut workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
@@ -1757,28 +1776,35 @@ impl Services {
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
-            if let Err(e) = self.refresh_workspace_pr_with_sc(&ws.id, &sc).await {
+            let ws_id = ws.id.clone();
+            if let Err(e) = self.refresh_workspace_pr_with_sc(ws, &sc).await {
                 tracing::warn!(
-                    workspace = %ws.id.as_str(),
+                    workspace = %ws_id.as_str(),
                     error = %e,
                     "pr refresh: workspace refresh failed"
                 );
             }
+            // Release the SQLite pool slot between workspaces so queued
+            // interactive acquires win it (intent-hq/monorepo#703).
+            tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
-    /// Spawn the background PR refresh loop (§7.6): every `interval` it sweeps
-    /// active workspaces — discovering open PRs by head-ref or baseRef match
-    /// for unlinked workspaces (emitting `pr:linked`) and updating linked PRs
-    /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
-    /// `interval` and refreshes every workspace (tick 0); thereafter the sweep
-    /// is tiered by recency (see [`Services::refresh_all_workspace_prs`]) so
-    /// idle workspaces only refresh every
-    /// [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th tick. Missed ticks are skipped
-    /// (no pile-up). No-op-safe when source control is unconfigured (a sweep
-    /// with due workspaces logs a single warning and returns; an all-idle tick
-    /// returns silently before resolving the provider). Returns the task
-    /// handle so the composition root can hold/abort it.
+    /// Spawn the background PR refresh loop (§7.6): every `interval` (180 s at
+    /// the composition root) it sweeps active workspaces — discovering open PRs
+    /// by head-ref or baseRef match for unlinked workspaces (emitting
+    /// `pr:linked`) and updating linked PRs (emitting
+    /// `pr:updated`/`pr:unlinked`). The first sweep runs after one `interval`
+    /// and refreshes every workspace (tick 0); thereafter the sweep is tiered
+    /// by recency (see [`Services::refresh_all_workspace_prs`]) so idle
+    /// workspaces only refresh every [`pr_ops::SWEEP_IDLE_TICK_MULTIPLE`]-th
+    /// tick (~30 min). Each sweep pauses [`SWEEP_INTER_WORKSPACE_PAUSE`]
+    /// between workspaces so it never monopolizes SQLite pool slots. Missed
+    /// ticks are skipped (no pile-up). No-op-safe when source control is
+    /// unconfigured (a sweep with due workspaces logs a single warning and
+    /// returns; an all-idle tick returns silently before resolving the
+    /// provider). Returns the task handle so the composition root can
+    /// hold/abort it.
     pub fn spawn_pr_refresh_loop(
         &self,
         interval: std::time::Duration,
@@ -1898,8 +1924,10 @@ impl Services {
         Ok(true)
     }
 
-    /// Re-scan token usage for every non-archived workspace. Errors are logged
-    /// per workspace and never abort the sweep.
+    /// Re-scan token usage for every non-archived workspace, pausing
+    /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so the sweep never
+    /// monopolizes SQLite pool slots (intent-hq/monorepo#703). Errors are
+    /// logged per workspace and never abort the sweep.
     async fn scan_all_token_usage(&self) {
         let workspaces = match self.store.list_workspaces(false).await {
             Ok(list) => list,
@@ -1916,14 +1944,20 @@ impl Services {
                     "token usage scan: workspace scan failed"
                 );
             }
+            // Release the SQLite pool slot between workspaces so queued
+            // interactive acquires win it (intent-hq/monorepo#703).
+            tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
     }
 
     /// Spawn the daemon-internal periodic token-usage scan loop (§5.23 / §19.1):
-    /// every `interval` it re-tallies each workspace's usage, persisting deltas
-    /// and pushing `workspace:tokenUsage-changed`. The first sweep runs after one
-    /// `interval`; missed ticks are skipped (no pile-up). Returns the task handle
-    /// so the composition root can hold/abort it.
+    /// every `interval` (300 s at the composition root) it re-tallies each
+    /// workspace's usage, persisting deltas and pushing
+    /// `workspace:tokenUsage-changed`. Each sweep pauses
+    /// [`SWEEP_INTER_WORKSPACE_PAUSE`] between workspaces so it never
+    /// monopolizes SQLite pool slots. The first sweep runs after one
+    /// `interval`; missed ticks are skipped (no pile-up). Returns the task
+    /// handle so the composition root can hold/abort it.
     pub fn spawn_token_usage_scan_loop(
         &self,
         interval: std::time::Duration,

@@ -6971,6 +6971,42 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
+    #[tokio::test]
+    async fn refresh_all_pauses_between_workspaces() {
+        // Inter-workspace pause (intent-hq/monorepo#703): the sweep sleeps
+        // `SWEEP_INTER_WORKSPACE_PAUSE` after each workspace so it never
+        // monopolizes SQLite pool slots — and still completes correctly over
+        // several workspaces. `tokio::time::sleep` guarantees at least the
+        // requested duration, so the wall-clock lower bound proves the pause
+        // is wired. (Paused time is unusable here: auto-advance trips sqlx's
+        // pool-acquire timeout.)
+        let forge = StubForge {
+            discover: true,
+            ..Default::default()
+        };
+        let (_t, svc, ws_id) = refresh_setup(forge, "feature", None, false).await;
+        let ws2_id = WorkspaceId::new();
+        let mut ws2 = workspace(&ws2_id);
+        ws2.branch = "feature".to_string();
+        ws2.repository_owner = Some("o".into());
+        ws2.repository_name = Some("r".into());
+        ws2.updated_at = now_iso();
+        svc.store().insert_workspace(&ws2).await.expect("ws2");
+
+        let start = std::time::Instant::now();
+        svc.refresh_all_workspace_prs(0).await;
+        assert!(
+            start.elapsed() >= crate::SWEEP_INTER_WORKSPACE_PAUSE * 2,
+            "sweep should pause between each of the 2 workspaces"
+        );
+
+        // Both workspaces were linked despite the pauses.
+        for id in [&ws_id, &ws2_id] {
+            let after = svc.store().get_workspace(id).await.unwrap();
+            assert_eq!(after.pr_number, Some(42));
+        }
+    }
+
     // ------------------------------------------------------------------------
     // accept-changes.* orchestration (§5.18): the commit→push→create-PR
     // pipeline against a real worktree + local bare remote, then mergePR via the
@@ -14392,6 +14428,37 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     assert_eq!(usage.totals.output_tokens, 0);
     assert_eq!(usage.totals.cache_read_tokens, 0);
     assert_eq!(usage.totals.cache_creation_tokens, 0);
+}
+
+/// Inter-workspace pause (intent-hq/monorepo#703): `scan_all_token_usage`
+/// sleeps `SWEEP_INTER_WORKSPACE_PAUSE` after each workspace so the sweep
+/// never monopolizes SQLite pool slots — and still completes correctly over
+/// several workspaces. `tokio::time::sleep` guarantees at least the requested
+/// duration, so the wall-clock lower bound proves the pause is wired. (Paused
+/// time is unusable here: auto-advance trips sqlx's pool-acquire timeout.)
+#[tokio::test]
+async fn scan_all_token_usage_pauses_between_workspaces() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ids: Vec<WorkspaceId> = (0..3).map(|_| WorkspaceId::new()).collect();
+    for id in &ids {
+        store.insert_workspace(&workspace(id)).await.expect("ws");
+    }
+    let svc = Services::new(store);
+
+    let start = std::time::Instant::now();
+    svc.scan_all_token_usage().await;
+    assert!(
+        start.elapsed() >= crate::SWEEP_INTER_WORKSPACE_PAUSE * 3,
+        "sweep should pause between each of the 3 workspaces"
+    );
+
+    // Every workspace still got its snapshot despite the pauses.
+    for id in ids {
+        let ws = svc.get_workspace(id).await.expect("get ws");
+        assert!(ws.token_usage.is_some());
+    }
 }
 
 /// `parse_undo_metadata` extracts undo commit metadata from JSON, skipping
