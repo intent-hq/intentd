@@ -730,6 +730,7 @@ async fn dispatch(
             let author = opt_str(params, "author");
             let author_type = opt_str(params, "authorType");
             let idempotency_key = opt_nonempty_str(params, "idempotencyKey");
+            let comment_id = opt_str(params, "commentId");
             let result = api
                 .comment_add(
                     ws,
@@ -741,6 +742,7 @@ async fn dispatch(
                     author,
                     author_type,
                     idempotency_key,
+                    comment_id,
                 )
                 .await
                 .map_err(domain_to_rpc)?;

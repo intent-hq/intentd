@@ -10781,6 +10781,7 @@ impl WorkspaceApi for Services {
         author: Option<String>,
         author_type: Option<String>,
         idempotency_key: Option<String>,
+        comment_id: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
@@ -10832,6 +10833,24 @@ impl WorkspaceApi for Services {
                             )))
                         }
                     };
+                    // Client-supplied `commentId` (monorepo Round 14 root cause
+                    // A): the FE inserts optimistic anchors under its own id, so
+                    // honoring that id lets the daemon rewrite converge with the
+                    // client instead of minting a second, never-reconciled id.
+                    // Validated inside the idempotency scope so a replayed key
+                    // still returns the cached result before these checks fire.
+                    let client_supplied_id = comment_id.is_some();
+                    let comment_id = match comment_id {
+                        Some(supplied) => {
+                            if uuid::Uuid::parse_str(&supplied).is_err() {
+                                return Err(Error::InvalidParams(format!(
+                                    "Invalid 'commentId': {supplied}. Must be a valid UUID."
+                                )));
+                            }
+                            supplied
+                        }
+                        None => uuid::Uuid::new_v4().to_string(),
+                    };
                     let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
                     let (from, to, line) = note_ops::find_and_anchor_text(
                         &note.content,
@@ -10847,7 +10866,6 @@ impl WorkspaceApi for Services {
                     // partial-marker survivor without needing note versions.
                     let ctx_before = note_ops::context_before(&note.content, from);
                     let ctx_after = note_ops::context_after(&note.content, to);
-                    let comment_id = uuid::Uuid::new_v4().to_string();
                     note.content = format!(
                         "{}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{}",
                         &note.content[..from],
@@ -10901,7 +10919,19 @@ impl WorkspaceApi for Services {
                     // atomically: a failure can never leave markers embedded
                     // with no comment row (monorepo#638). The returned rev is
                     // the authoritative post-rewrite value echoed to clients.
-                    let note_rev = store.update_note_with_comment(&note, &new_comment).await?;
+                    // Duplicate-id detection rides the INSERT's PK constraint
+                    // inside that same transaction (no TOCTOU pre-check), so a
+                    // colliding client-supplied `commentId` is InvalidParams
+                    // even when two adds race.
+                    let note_rev = match store.update_note_with_comment(&note, &new_comment).await {
+                        Ok(rev) => rev,
+                        Err(Error::InvalidInput(_)) if client_supplied_id => {
+                            return Err(Error::InvalidParams(format!(
+                                "Invalid 'commentId': {comment_id}. A comment with this id already exists."
+                            )))
+                        }
+                        Err(e) => return Err(e),
+                    };
                     services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
                         note.workspace_id.clone(),

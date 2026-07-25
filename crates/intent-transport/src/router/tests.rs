@@ -495,14 +495,18 @@ impl WorkspaceApi for FakeApi {
         _author: Option<String>,
         _author_type: Option<String>,
         idempotency_key: Option<String>,
+        comment_id: Option<String>,
     ) -> BoxFuture<'_, Result<CommentAddResult>> {
         Box::pin(async move {
             Ok(CommentAddResult {
                 success: true,
                 message: format!("Comment successfully anchored to \"{comment_target}\""),
-                // Echo the key so router tests can pin that the arm forwards
-                // `params.idempotencyKey` instead of silently dropping it.
-                comment_id: idempotency_key.unwrap_or_else(|| "c1".to_string()),
+                // Echo the supplied `commentId` (then the idempotency key) so
+                // router tests can pin that the arm forwards both params
+                // instead of silently dropping them.
+                comment_id: comment_id
+                    .or(idempotency_key)
+                    .unwrap_or_else(|| "c1".to_string()),
                 anchored: true,
                 note_rev: 1,
                 location: CommentLocation {
@@ -2535,6 +2539,31 @@ async fn comment_add_forwards_idempotency_key() {
     // first cached result. The fake falls back to "c1" when the key is None.
     let v = call(
         r#"{"jsonrpc":"2.0","id":2,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice","idempotencyKey":"  "}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["commentId"], serde_json::json!("c1"));
+}
+
+/// Round 14 root cause A: the `comment.add` arm forwards `params.commentId`
+/// to the service (the fake echoes it back as the comment id) so a
+/// client-supplied id survives the router boundary.
+#[tokio::test]
+async fn comment_add_forwards_comment_id() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice","commentId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["commentId"],
+        serde_json::json!("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+    );
+
+    // Absent commentId falls through to the fake's default, pinning that the
+    // arm passes None rather than fabricating a value.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"comment.add","params":{"workspaceId":"ws-1","noteId":"n1","searchContext":"a test sentence","commentTarget":"test","comment":"nice"}}"#,
     )
     .await
     .unwrap();

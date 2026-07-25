@@ -256,7 +256,19 @@ impl Store {
                 .bind(&note.workspace_id.0)
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| Error::Internal(format!("insert comment failed: {e}")))?;
+                .map_err(|e| {
+                    // A duplicate `comment.id` is caller input, not an internal
+                    // failure: surface it distinguishably so the service layer
+                    // can reject a client-supplied `commentId` collision with
+                    // InvalidParams even when the race beats a pre-check.
+                    if e.as_database_error()
+                        .is_some_and(|d| d.is_unique_violation())
+                    {
+                        Error::InvalidInput(format!("comment {} already exists", c.id))
+                    } else {
+                        Error::Internal(format!("insert comment failed: {e}"))
+                    }
+                })?;
 
             Ok(new_rev)
         }
