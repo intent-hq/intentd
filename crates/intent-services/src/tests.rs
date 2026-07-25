@@ -11827,6 +11827,230 @@ mod worktree_provisioning {
         );
     }
 
+    /// `workspace.delete` of a CoW workspace removes the checkout directory
+    /// and its `<root>/<workspaceId>` parent but never touches the source
+    /// repository: no registration prune and — critically — no branch delete,
+    /// even when the source carries a same-named branch and the workspace's
+    /// branch is flagged auto-generated (the guard that deletes worktree
+    /// branches). The CoW workspace's branch lives only inside the clone.
+    /// CI-safe: the standalone checkout is a plain `git clone`, so no CoW
+    /// filesystem support is needed to exercise the delete path.
+    #[tokio::test]
+    async fn delete_cow_checkout_removes_dir_without_touching_source_repo() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowdel-repo");
+        let root = unique_dir("intentd-cowdel-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        // Standalone clone at <root>/<wsId>/<slug> standing in for a CoW
+        // checkout, on a branch that also exists (same name) in the source.
+        let ws_id = WorkspaceId::from("cow-del-ws");
+        let branch = "cow-del-branch";
+        let wt = root.0.join(ws_id.as_str()).join("repo");
+        {
+            let clone = git2::Repository::clone(repo_dir.0.to_str().unwrap(), &wt).expect("clone");
+            let head = clone.head().unwrap().peel_to_commit().unwrap();
+            clone.branch(branch, &head, false).expect("clone branch");
+            clone
+                .set_head(&format!("refs/heads/{branch}"))
+                .expect("checkout");
+        }
+        {
+            let src = git2::Repository::open(&repo_dir.0).unwrap();
+            let src_head = src.head().unwrap().peel_to_commit().unwrap();
+            src.branch(branch, &src_head, false).expect("source branch");
+        }
+
+        let mut ws = workspace(&ws_id);
+        ws.branch = branch.to_string();
+        ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        ws.worktree_path = Some(wt.to_string_lossy().to_string());
+        ws.checkout_mode = Some(intent_core::CheckoutMode::Cow);
+        store.insert_workspace(&ws).await.expect("insert");
+        store
+            .set_workspace_branch_auto_generated(&ws_id, true)
+            .await
+            .expect("flag branch");
+
+        svc.delete_workspace(ws_id.clone()).await.expect("delete");
+
+        // Fast-ack: poll for the background cleanup.
+        for _ in 0..100 {
+            if !wt.exists() && !root.0.join(ws_id.as_str()).exists() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(!wt.exists(), "CoW checkout directory removed");
+        assert!(
+            !root.0.join(ws_id.as_str()).exists(),
+            "empty <root>/<workspaceId> parent removed"
+        );
+        assert!(
+            !sweep_leftover_trash(&root.0),
+            "no orphaned *.deleting-* trash left under the workspaces root"
+        );
+        let src = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            src.find_branch(branch, git2::BranchType::Local).is_ok(),
+            "same-named source-repo branch survives a CoW delete"
+        );
+    }
+
+    /// Whether any `*.deleting-*` trash entry remains under `root` (leak probe
+    /// for the delete cleanup's rename-to-trash phase).
+    fn sweep_leftover_trash(root: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Ok(inner) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for e in inner.flatten() {
+                if e.file_name().to_string_lossy().contains(".deleting-") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// cowIsolation on + CoW-capable filesystem: `workspace.duplicate`
+    /// mirrors the create decision matrix — the duplicate gets a standalone
+    /// CoW clone with `checkoutMode: "cow"` persisted, and the source repo
+    /// gains no branch for the duplicate (the branch lives in the clone).
+    #[tokio::test]
+    async fn duplicate_provisions_cow_checkout_when_isolation_enabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowdup-repo");
+        let root = unique_dir("intentd-cowdup-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            != intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW not supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+
+        assert_eq!(dup.checkout_mode, Some(intent_core::CheckoutMode::Cow));
+        let wt = dup.worktree_path.as_deref().expect("worktree path set");
+        let clone = git2::Repository::open(wt).expect("checkout opens as a git repo");
+        assert!(
+            !clone.is_worktree(),
+            "duplicate checkout is a standalone repo"
+        );
+        assert_eq!(
+            clone.head().unwrap().shorthand().expect("branch name"),
+            dup.branch.as_str()
+        );
+        assert!(dup.base_commit_sha.is_some());
+        // The duplicate's branch exists only inside its clone.
+        let src = git2::Repository::open(&repo_dir.0).unwrap();
+        assert!(
+            src.find_branch(&dup.branch, git2::BranchType::Local)
+                .is_err(),
+            "CoW duplicate must not create a branch in the source repo"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Cow)
+        );
+    }
+
+    /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
+    /// fails with the same actionable error as create (no silent worktree
+    /// fallback) and inserts no duplicate row.
+    #[tokio::test]
+    async fn duplicate_fails_when_isolation_enabled_but_cow_unsupported() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, _) = seed_repo("intentd-cowdupun-repo");
+        let root = unique_dir("intentd-cowdupun-root");
+        if intent_git::cow_probe(&repo_dir.0, &root.0)
+            .unwrap_or(intent_git::CowSupport::Unsupported)
+            == intent_git::CowSupport::Supported
+        {
+            eprintln!("Skipping test: CoW is supported on this filesystem");
+            return;
+        }
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
+
+        // Source row without a checkout (registry-style) keeps the test
+        // independent of provisioning: only the duplicate path runs the probe.
+        let src_id = WorkspaceId::from("cow-dupun-src");
+        let mut src_ws = workspace(&src_id);
+        src_ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
+        store.insert_workspace(&src_ws).await.expect("insert");
+
+        let err = svc
+            .duplicate_workspace(src_id, None)
+            .await
+            .expect_err("duplicate must fail");
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(
+            err.to_string().contains("workspace.cowIsolation"),
+            "error names the setting: {err}"
+        );
+        let rows = store.list_workspaces(true).await.expect("list");
+        assert_eq!(rows.len(), 1, "no duplicate row inserted on failure");
+    }
+
+    /// cowIsolation off keeps `workspace.duplicate` on the linked-worktree
+    /// path, persisting `checkoutMode: "worktree"`.
+    #[tokio::test]
+    async fn duplicate_provisions_worktree_when_isolation_disabled() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-cowdupoff-repo");
+        let root = unique_dir("intentd-cowdupoff-root");
+        let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), false);
+
+        let source = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create source")
+            .workspace;
+
+        let dup = svc
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+
+        assert_eq!(dup.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+        let wt_repo = git2::Repository::open(dup.worktree_path.as_deref().unwrap()).expect("opens");
+        assert!(wt_repo.is_worktree(), "setting off keeps a linked worktree");
+    }
+
     /// `skipWorktree` keeps `checkoutMode` unset even with cowIsolation on —
     /// no checkout is provisioned, so there is no mode to record.
     #[tokio::test]
