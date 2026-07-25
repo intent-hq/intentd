@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
 use serde_json::{json, Map, Value};

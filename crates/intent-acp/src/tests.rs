@@ -301,7 +301,7 @@ async fn spawn_real_child_handshake() {
 mod session_tests {
     use super::*;
 
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         ContentBlock, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
         ToolCallUpdate, ToolCallUpdateFields, ToolKind,
     };
@@ -590,7 +590,7 @@ mod session_tests {
     #[test]
     fn maps_message_chunk_to_stream_chunk() {
         let update =
-            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::ContentChunk::new(
+            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::v1::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("tok")),
             ));
         assert_eq!(
@@ -1106,7 +1106,7 @@ mod session_tests {
     #[test]
     fn unmapped_variants_return_none() {
         let thought =
-            SessionUpdate::AgentThoughtChunk(agent_client_protocol::schema::ContentChunk::new(
+            SessionUpdate::AgentThoughtChunk(agent_client_protocol::schema::v1::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("thinking")),
             ));
         assert_eq!(session::map_session_update(&thought), None);
@@ -1116,7 +1116,7 @@ mod session_tests {
     fn map_notification_parses_session_update() {
         let note = SessionNotification::new(
             "acp-session-1",
-            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::ContentChunk::new(
+            SessionUpdate::AgentMessageChunk(agent_client_protocol::schema::v1::ContentChunk::new(
                 ContentBlock::Text(TextContent::new("hi")),
             )),
         );
