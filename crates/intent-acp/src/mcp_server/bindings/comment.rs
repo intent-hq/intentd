@@ -161,6 +161,7 @@ async fn respond(
     }
     let kind = opt_str(args, "type");
     let author = opt_str(args, "author");
+    let author_type = opt_str(args, "authorType");
     let suggestion_original = opt_str(args, "suggestionOriginal");
     let suggestion_proposed = opt_str(args, "suggestionProposed");
     if kind.as_deref() == Some("suggestion")
@@ -180,6 +181,7 @@ async fn respond(
             comment,
             kind,
             author,
+            author_type,
             suggestion_original,
             suggestion_proposed,
         )

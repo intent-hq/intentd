@@ -9,6 +9,8 @@
 //! is session-scoped and exposed here for M3.4 (it is not part of the initial
 //! connection handshake, which runs before any session exists).
 
+use std::time::Duration;
+
 use agent_client_protocol::schema::{
     AuthMethodId, AuthenticateRequest, ClientCapabilities, FileSystemCapabilities, Implementation,
     InitializeRequest, InitializeResponse, ProtocolVersion, SessionModeState,
@@ -21,6 +23,33 @@ use crate::transport::Connection;
 
 /// Client name advertised to agents in `clientInfo`.
 const CLIENT_NAME: &str = "Intent";
+/// Default timeout for the `initialize` request. Deliberately much more
+/// generous than the 5s [`DEFAULT_REQUEST_TIMEOUT`](crate::transport::DEFAULT_REQUEST_TIMEOUT):
+/// `initialize` is the first reply from a freshly spawned agent process, so it
+/// absorbs node cold-start and provider startup work, which under host load
+/// spikes can far exceed 5s (monorepo#616). Compare: the npx provider probe
+/// allows 45s and the daemon's own MCP handshake 10s.
+const DEFAULT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for the `initialize` handshake request. Overridable via
+/// `INTENTD_ACP_INITIALIZE_TIMEOUT_MS` (positive integer milliseconds;
+/// unset/invalid → default), primarily for tests/CI.
+fn initialize_timeout() -> Duration {
+    initialize_timeout_from(std::env::var("INTENTD_ACP_INITIALIZE_TIMEOUT_MS").ok())
+}
+
+/// Parse the timeout override, falling back to [`DEFAULT_INITIALIZE_TIMEOUT`]
+/// when absent, non-numeric, or zero.
+fn initialize_timeout_from(val: Option<String>) -> Duration {
+    if let Some(val) = val {
+        if let Ok(ms) = val.trim().parse::<u64>() {
+            if ms > 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+    }
+    DEFAULT_INITIALIZE_TIMEOUT
+}
 /// Auth method id used when no interactive auth is required (parity: TS sends
 /// `methodId: "none"`).
 const NO_AUTH_METHOD_ID: &str = "none";
@@ -69,7 +98,9 @@ pub async fn initialize(conn: &Connection) -> AcpResult<InitializeResponse> {
         .client_info(Implementation::new(CLIENT_NAME, env!("CARGO_PKG_VERSION")));
 
     let params = serde_json::to_value(&request)?;
-    let result = conn.request("initialize", params).await?;
+    let result = conn
+        .request_timeout("initialize", params, initialize_timeout())
+        .await?;
     serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid initialize response: {e}")))
 }
@@ -251,5 +282,35 @@ mod mode_select_tests {
     #[test]
     fn empty_available_modes_returns_none() {
         assert_eq!(select_preferred_mode(None, &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod initialize_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_30s_when_unset() {
+        assert_eq!(initialize_timeout_from(None), DEFAULT_INITIALIZE_TIMEOUT);
+        assert_eq!(DEFAULT_INITIALIZE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn valid_override_is_applied() {
+        assert_eq!(
+            initialize_timeout_from(Some("1500".to_string())),
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn invalid_override_falls_back_to_default() {
+        for bad in ["", "abc", "-5", "1.5", "0"] {
+            assert_eq!(
+                initialize_timeout_from(Some(bad.to_string())),
+                DEFAULT_INITIALIZE_TIMEOUT,
+                "override {bad:?} must fall back to the default"
+            );
+        }
     }
 }

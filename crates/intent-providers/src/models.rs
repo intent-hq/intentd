@@ -91,6 +91,22 @@ pub fn tiers_for(provider_id: &str) -> Option<&'static ModelTiers> {
         .map(|(_, t)| t)
 }
 
+/// Provider ids whose static tier table ([`PROVIDER_MODEL_TIERS`]) lists
+/// `model_id` exactly (any tier). Empty when no static tier claims the id —
+/// unknown or dynamic-only models — in which case ownership cannot be proven.
+///
+/// Caveat: claude-code's smart tier is the literal `"default"` *sentinel*
+/// ("use the CLI default"), so `providers_claiming_model("default")` returns
+/// `["claude-code"]`. Callers treating a claim as an ownership proof (e.g.
+/// the bare-model/provider mismatch guard) must special-case `"default"`.
+pub fn providers_claiming_model(model_id: &str) -> Vec<&'static str> {
+    PROVIDER_MODEL_TIERS
+        .iter()
+        .filter(|(_, tiers)| [tiers.fast, tiers.balanced, tiers.smart].contains(&model_id))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Parse a compound model id `{provider}:{model}` into its parts. A bare id
 /// (no `:`) belongs to the default provider. Port of `parseCompoundModelId`.
 pub fn parse_compound_model_id(compound: &str) -> (String, String) {
@@ -280,7 +296,7 @@ fn thousands_separated(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -520,7 +536,7 @@ fn is_grok_header_or_status_line(line: &str) -> bool {
         let boundary = |s: &str| {
             s.chars()
                 .next()
-                .map_or(true, |c| !(c.is_ascii_alphanumeric() || c == '_'))
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
         };
         if boundary(rest) || rest.strip_prefix("id").is_some_and(boundary) {
             return true;

@@ -88,6 +88,21 @@ pub(crate) fn parse_pr_involvement(filter: Option<&str>) -> Result<Option<PrInvo
     }
 }
 
+/// Validate the `github.issues.search` `filter` against the issues value set
+/// from PROTOCOL §5 (`all`/`assigned`/`created`/`involves`, absent == `all`).
+/// The PR-only `review-requested` (and anything else) throws → `-32603`
+/// (parity with [`parse_pr_involvement`]). The parsed value is not returned:
+/// the host-agnostic engine cannot express `@me` involvement for issues yet
+/// (v1 limitation), so validation is all this gate does.
+pub(crate) fn parse_issue_filter(filter: Option<&str>) -> Result<()> {
+    match filter {
+        None | Some("all" | "assigned" | "created" | "involves") => Ok(()),
+        Some(_) => Err(Error::Internal(
+            "filter must be one of: all, assigned, created, involves".to_string(),
+        )),
+    }
+}
+
 /// Normalize the optional free-text search `query`: trim and drop blanks so an
 /// absent or whitespace-only query preserves the listing behavior exactly.
 pub(crate) fn normalize_search_query(query: Option<String>) -> Option<String> {
@@ -335,6 +350,23 @@ mod tests {
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(9000)), 200);
         assert_eq!(clamp_limit(Some(30)), 30);
+    }
+
+    #[test]
+    fn issue_filter_rejects_pr_only_review_requested() {
+        // The issues filter set (PROTOCOL §5) has no `review-requested`.
+        assert!(parse_issue_filter(None).is_ok());
+        assert!(parse_issue_filter(Some("all")).is_ok());
+        assert!(parse_issue_filter(Some("assigned")).is_ok());
+        assert!(parse_issue_filter(Some("created")).is_ok());
+        assert!(parse_issue_filter(Some("involves")).is_ok());
+
+        let err = parse_issue_filter(Some("review-requested")).unwrap_err();
+        assert!(
+            err.to_string().contains("all, assigned, created, involves"),
+            "error must list the issues filter set: {err}"
+        );
+        assert!(parse_issue_filter(Some("bad")).is_err());
     }
 
     #[test]

@@ -95,7 +95,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
         .expect("uds rpc timed out")
         .expect("read uds response");
@@ -282,7 +282,7 @@ async fn repo_config_wss_e2e() {
     );
 
     // Get server fingerprint and port
-    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().unwrap() as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()

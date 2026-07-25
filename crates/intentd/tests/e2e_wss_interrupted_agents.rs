@@ -69,7 +69,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
         .expect("uds rpc timed out")
         .expect("read uds response");
@@ -337,7 +337,7 @@ async fn interrupted_agents_persisted_across_restart() {
     assert!(await_uds(&socket).await, "daemon did not restart");
 
     // Fetch fingerprint and port for TLS cert pinning.
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -388,7 +388,7 @@ async fn interrupted_agents_persisted_across_restart() {
     let _guard3 = DaemonGuard::new(child3, data_dir.clone(), true);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint 2")
@@ -483,7 +483,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     }
 
     // Fetch fingerprint and actual bound port for TLS cert pinning.
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -589,7 +589,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let _daemon2 = DaemonGuard::new(child2, data_dir.clone(), true);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
-    let status = uds_rpc(&socket, 3, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint 2")

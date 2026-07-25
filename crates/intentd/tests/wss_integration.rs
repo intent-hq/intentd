@@ -338,7 +338,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.1",
+        sess[0]["result"]["protocolVersion"], "2.2",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -373,6 +373,41 @@ async fn wss_client_hello_and_drafts_round_trip() {
     assert_eq!(
         sess[1]["result"]["attachments"][0]["imageData"], "aGk=",
         "reconnect restores the attachments"
+    );
+    srv.ws.stop().await;
+}
+
+/// Regression (PROTOCOL §5.16 "Opaque keys & reserved sentinels"): draft keys
+/// are opaque — the FE's New Workspace modal saves its pre-creation draft
+/// under `__new-workspace__` / `__initializer__` before any workspace row
+/// exists, so `drafts.set` → `drafts.get` → `drafts.clear` must round-trip
+/// without a workspace.
+#[tokio::test]
+async fn wss_drafts_sentinel_keys_round_trip_without_workspace() {
+    let srv = start(WsOptions::default()).await;
+    let sess = wss_session(
+        srv.port,
+        srv.cfg.clone(),
+        vec![
+            r#"{"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":"cli-sentinel","name":"WSS"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"method":"drafts.set","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__","text":"pre-create draft"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":3,"method":"drafts.get","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":4,"method":"drafts.clear","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__"}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":5,"method":"drafts.get","params":{"workspaceId":"__new-workspace__","agentId":"__initializer__"}}"#.to_string(),
+        ],
+    )
+    .await;
+    assert_eq!(sess[0]["result"]["clientId"], "cli-sentinel");
+    assert_eq!(
+        sess[1]["result"]["ok"], true,
+        "drafts.set under the sentinel keys succeeds with no workspace row (§5.16)"
+    );
+    assert!(sess[1]["result"]["updatedAt"].is_string());
+    assert_eq!(sess[2]["result"]["text"], "pre-create draft");
+    assert_eq!(sess[3]["result"]["ok"], true);
+    assert!(
+        sess[4]["result"].is_null(),
+        "cleared sentinel draft reads back null"
     );
     srv.ws.stop().await;
 }
@@ -531,6 +566,155 @@ async fn wss_agent_create_rejects_client_supplied_agent_id() {
     srv.ws.stop().await;
 }
 
+/// monorepo#564: `agent.sendMessage` to a nonexistent agent id (e.g. a
+/// truncated id) fails closed with `-32602` naming the unknown id — it must
+/// NOT auto-queue a phantom message (`queued: true`) the sender then waits on
+/// forever. A send to a real agent on the same connection still succeeds.
+#[tokio::test]
+async fn wss_agent_send_message_rejects_unknown_agent() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Send Unknown"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Nonexistent (truncated-style) id → -32602 naming the id, no queueing.
+    let ghost = "agent-00000000-0000-0000-0000-000000000000";
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{ghost}","content":"hello?"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "sendMessage to an unknown agent must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(ghost),
+        "error must name the unknown agent id: {rejected}"
+    );
+
+    // No phantom queue entry was created for the ghost id.
+    let queue_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{ghost}"}}}}"#
+    );
+    let queue = wss_call(srv.port, srv.cfg.clone(), &queue_frame).await;
+    assert_eq!(
+        queue["result"]["queue"].as_array().map(Vec::len),
+        Some(0),
+        "no phantom queue entry for an unknown agent: {queue}"
+    );
+
+    // A send to a REAL agent still succeeds (the store-only fallback path).
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Real Recv"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let send_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.sendMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hi"}}}}"#
+    );
+    let sent = wss_call(srv.port, srv.cfg.clone(), &send_frame).await;
+    assert_eq!(
+        sent["result"]["success"],
+        Value::Bool(true),
+        "send to a real agent succeeds: {sent}"
+    );
+    assert_eq!(
+        sent["result"]["queued"],
+        Value::Bool(false),
+        "send to a real agent persists directly: {sent}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// monorepo#568: `agent.queueMessage` to a nonexistent agent id fails closed
+/// with `-32602` naming the unknown id — it must NOT create a queue entry
+/// that never drains. A queue to a real agent on the same connection still
+/// succeeds.
+#[tokio::test]
+async fn wss_agent_queue_message_rejects_unknown_agent() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Queue Unknown"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Nonexistent (truncated-style) id → -32602 naming the id, no queueing.
+    let ghost = "agent-00000000-0000-0000-0000-000000000000";
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{ghost}","content":"hello?"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "queueMessage to an unknown agent must be -32602: {rejected}"
+    );
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(ghost),
+        "error must name the unknown agent id: {rejected}"
+    );
+
+    // No phantom queue entry was created for the ghost id.
+    let queue_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getQueue","params":{{"agentId":"{ghost}"}}}}"#
+    );
+    let queue = wss_call(srv.port, srv.cfg.clone(), &queue_frame).await;
+    assert_eq!(
+        queue["result"]["queue"].as_array().map(Vec::len),
+        Some(0),
+        "no phantom queue entry for an unknown agent: {queue}"
+    );
+
+    // A queue to a REAL agent still succeeds.
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Real Queue Recv"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let queue_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.queueMessage","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","content":"hi"}}}}"#
+    );
+    let queued = wss_call(srv.port, srv.cfg.clone(), &queue_frame).await;
+    assert_eq!(
+        queued["result"]["success"],
+        Value::Bool(true),
+        "queue to a real agent succeeds: {queued}"
+    );
+    assert_eq!(
+        queued["result"]["queuedMessage"]["content"], "hi",
+        "queued entry carries the content: {queued}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Unknown providers hard-fail at the front door (PROTOCOL §5.5, §9):
 /// `agent.create` with an unknown explicit `provider` or an unknown compound
 /// model prefix, and `agent.setModel` with an unknown compound prefix, are all
@@ -655,6 +839,231 @@ async fn wss_agent_create_and_set_model_reject_unknown_provider() {
         "model must be unchanged after the rejected setModel: {got}"
     );
 
+    srv.ws.stop().await;
+}
+
+/// Regression for monorepo#607 over the real WSS wire: a bare model id
+/// provably owned by another provider's static tiers is rejected with the
+/// exact `-32602` JSON-RPC error envelope on both `agent.create` (explicit
+/// mismatched `provider`) and `agent.setModel` (session's effective
+/// provider), no session row / model mutation persists, and a bare id
+/// unknown to every static tier still passes (dynamic-model lists).
+#[tokio::test]
+async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Bare Model Mismatch"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Incident-shaped create: explicit `provider: "grok"` + a bare auggie
+    // static-tier model → -32602 naming model, provider, and owner.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","provider":"grok","model":"sonnet4.5"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["jsonrpc"],
+        Value::from("2.0"),
+        "envelope: {rejected}"
+    );
+    assert_eq!(rejected["id"], Value::from(2), "envelope: {rejected}");
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "bare-model/provider mismatch must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.create: model sonnet4.5 does not belong to provider grok"),
+        "error must name the model and provider: {rejected}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "error must name the owning provider: {rejected}"
+    );
+
+    // No session row persisted by the rejection.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row may persist after the rejection: {listed}"
+    );
+
+    // A bare id unknown to every static tier passes for the same provider
+    // (grok's model list is dynamic-only; ownership cannot be proven).
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Good","provider":"grok","model":"grok-4-fast"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("grok-4-fast"),
+        "unknown-to-all bare id must pass: {created}"
+    );
+
+    // An auggie session (compound-prefix derived provider) rejects a bare
+    // claude-code model via agent.setModel with the same envelope shape…
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Auggie","model":"auggie:sonnet4.5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let set_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"agent.setModel","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}","modelId":"haiku"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &set_frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "setModel bare-model mismatch must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.setModel: model haiku does not belong to provider auggie"),
+        "error must name the model and provider: {rejected}"
+    );
+    assert!(
+        msg.contains("claude-code"),
+        "error must name the owning provider: {rejected}"
+    );
+
+    // …and the rejected setModel left the session's model untouched.
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":7,"method":"agent.get","params":{{"agentId":"{agent_id}"}}}}"#
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    assert_eq!(
+        got["result"]["agent"]["model"],
+        Value::from("auggie:sonnet4.5"),
+        "model must be unchanged after the rejected setModel: {got}"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Regression for monorepo#607 (dynamic gap) over the real WSS wire: with a
+/// warm auggie catalog cached (seeded through the persisted models-cache
+/// file) that claims the dynamic-only `fable-5` and a grok catalog without
+/// it, the exact incident payload — `agent.create` with `provider: "grok"` +
+/// bare `model: "fable-5"` — is rejected -32602 naming auggie, and no
+/// session row persists. The same id passes when grok has no cached catalog
+/// entry (absence of evidence is not a mismatch).
+#[tokio::test]
+async fn wss_agent_create_rejects_bare_dynamic_model_via_cached_catalog() {
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Path::new("/tmp").join(format!("intentd-wss-bare-cache-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = DirGuard(dir.clone());
+    // Ownership evidence ignores TTL (fetchedAtMs: 0 is fine): only the
+    // version key must match each provider's current one ("" — no pin).
+    let cache = serde_json::json!({
+        "version": 1,
+        "entries": {
+            "auggie": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "fable-5", "name": "Fable 5", "provider": "auggie" } ]
+            },
+            "grok": {
+                "versionKey": "",
+                "fetchedAtMs": 0,
+                "models": [ { "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" } ]
+            }
+        }
+    });
+    std::fs::write(
+        dir.join("models-cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+    let srv =
+        start_with_auggie_and_models_cache(WsOptions::default(), None, Some(dir.clone())).await;
+
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS Cached Catalog Guard"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // The exact incident payload: grok + bare auggie dynamic model.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Bad","provider":"grok","model":"fable-5"}}}}"#
+    );
+    let rejected = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        rejected["error"]["code"].as_i64(),
+        Some(-32602),
+        "cached-catalog mismatch must be -32602: {rejected}"
+    );
+    let msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("agent.create: model fable-5 does not belong to provider grok"),
+        "error must name the model and provider: {rejected}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "error must name the owning provider: {rejected}"
+    );
+
+    // No session row persisted by the rejection.
+    let list_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+    let listed = wss_call(srv.port, srv.cfg.clone(), &list_frame).await;
+    assert_eq!(
+        listed["result"]["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row may persist after the rejection: {listed}"
+    );
+
+    srv.ws.stop().await;
+
+    // Cold-start counterpart: without any cached catalogs the same payload
+    // passes — absence of evidence is not a mismatch (Phase 2 behavior).
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"workspace.create","params":{"title":"WSS Cold Cache"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Cold","provider":"grok","model":"fable-5"}}}}"#
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &frame).await;
+    assert_eq!(
+        created["result"]["agent"]["model"],
+        Value::from("fable-5"),
+        "cold start must pass without cache evidence: {created}"
+    );
     srv.ws.stop().await;
 }
 
@@ -1808,24 +2217,64 @@ async fn insecure_mode_serves_plain_ws_without_token() {
 
 #[tokio::test]
 async fn graceful_shutdown_allows_immediate_restart() {
-    // NOTE: This test verifies fixed-port restart semantics (same port reclaimed
-    // after stop). Pick a dynamically-available port to avoid hard-coded collisions.
-    let fixed_port = free_port();
-    let srv = start(WsOptions {
-        base_port: fixed_port,
-        ..WsOptions::default()
-    })
-    .await;
-    let port = srv.port;
-    srv.ws.stop().await;
-    // Re-start the SAME listener immediately; the freed port must rebind.
-    let again = srv
-        .ws
-        .start()
-        .await
-        .expect("restart binds with no EADDRINUSE");
-    assert_eq!(again, port, "restart should reclaim the same port");
-    srv.ws.stop().await;
+    // Verifies fixed-port restart semantics: a graceful `stop()` fully releases
+    // the listen port (it awaits the accept loop) so the SAME listener can
+    // immediately rebind it. `free_port()` hands back a port from the kernel's
+    // ephemeral range, so under parallel test load another process's
+    // `base_port: 0` bind can be assigned that port inside either
+    // release->bind window (before the first start, or between stop and
+    // restart); the listener is single-bind fail-fast by design (§5.6, no port
+    // walking), so that exogenous contention surfaces as `AddrInUse`. Retry the
+    // whole scenario on a fresh port within a bounded number of attempts
+    // (monorepo#466); any non-`AddrInUse` error still fails immediately.
+    let (api, bus, _store, dir) = make_services(None, None).await;
+    let tls = ensure_tls_certificate(&dir).expect("cert");
+    let token_store_inner = Arc::new(MemTokenStore::default());
+    token_store_inner.store_token(TOKEN).unwrap();
+    let token_store = Arc::new(AsyncTokenStore::new(token_store_inner));
+    const MAX_ATTEMPTS: u32 = 10;
+    for _ in 0..MAX_ATTEMPTS {
+        let fixed_port = free_port();
+        let opts = WsOptions {
+            base_port: fixed_port,
+            bind_address: Ipv4Addr::LOCALHOST.into(),
+            ..WsOptions::default()
+        };
+        let ws = WsApiServer::new(
+            api.clone(),
+            bus.clone(),
+            &tls,
+            token_store.clone(),
+            opts,
+            None,
+        )
+        .expect("server");
+        let port = match ws.start().await {
+            Ok(port) => port,
+            // A concurrent ephemeral bind stole the port before our first
+            // bind; the scenario never started, so retry on a fresh port.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("first start failed with non-contention error: {e}"),
+        };
+        assert_eq!(port, fixed_port, "fixed-port bind honours base_port");
+        ws.stop().await;
+        // Re-start the SAME listener immediately; the freed port must rebind.
+        match ws.start().await {
+            Ok(again) => {
+                assert_eq!(again, port, "restart should reclaim the same port");
+                ws.stop().await;
+                return;
+            }
+            // stop() released the port but an exogenous bind grabbed it in
+            // the stop->restart gap; retry on a fresh port.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("restart failed with non-contention error: {e}"),
+        }
+    }
+    panic!(
+        "gave up after {MAX_ATTEMPTS} attempts: every scenario lost its port to \
+         concurrent ephemeral binds"
+    );
 }
 
 #[tokio::test]

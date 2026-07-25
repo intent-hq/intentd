@@ -122,7 +122,10 @@ pub use agent_manager::{
 };
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-pub use events::{EventBus, FileWatcher, SkillsWatcher, Subscription, SubscriptionFilter};
+pub use events::{
+    EventBus, FileWatcher, SkillsWatcher, SpecialistsWatcher, Subscription, SubscriptionFilter,
+    WatcherRegistry,
+};
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
 
@@ -260,6 +263,11 @@ pub struct Services {
     /// Shared across clones so all `ScriptManager` instances serialize bootstrap
     /// per workspace (modeled after `intent-git::WorktreeLocks`).
     script_bootstrap_locks: script_ops::WorkspaceScriptLocks,
+    /// The `script.*` too-fast-exit floor in milliseconds
+    /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
+    /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
+    /// decision cannot flip under scheduler load (monorepo#514).
+    script_too_fast_ms: u128,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/secrets.json`); tests inject
@@ -419,6 +427,7 @@ impl Services {
             pty: Arc::new(intent_pty::PtyHost::new()),
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_bootstrap_locks: script_ops::WorkspaceScriptLocks::new(),
+            script_too_fast_ms: script_ops::TOO_FAST_MS,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -624,7 +633,17 @@ impl Services {
             self.store.clone(),
             self.scripts.clone(),
             self.script_bootstrap_locks.clone(),
+            self.script_too_fast_ms,
         )
+    }
+
+    /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
+    /// decision is independent of scheduler load (monorepo#514). Production
+    /// wiring keeps the [`script_ops::TOO_FAST_MS`] default.
+    #[cfg(test)]
+    pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
+        self.script_too_fast_ms = ms;
+        self
     }
 
     /// Hydrate the in-memory script registry from the persisted definitions
@@ -1522,15 +1541,17 @@ impl Services {
     /// Refresh one workspace's PR linkage against the forge (§7.6), persisting
     /// any change and emitting the matching `pr:*` event. Used both on demand
     /// and by the background loop. The matching rule is `pr.head.ref ==
-    /// workspace.branch` (NOT baseRef). When the workspace is already linked the
-    /// PR is re-fetched and its snapshot diffed (clearing a stale link on a
-    /// positive branch mismatch); a linked PR fetched as merged/closed stays
-    /// recorded in `pull_requests` and triggers discovery of a newer open PR on
-    /// the same branch (relinking + `pr:linked` when found); when unlinked, an
-    /// open PR whose head ref equals the branch is discovered and linked. Every
-    /// refreshed/discovered PR snapshot is upserted into the daemon-owned
-    /// `pull_requests` list. Remote/archived workspaces, and those lacking
-    /// repo/branch info, are skipped. A missing forge token (no
+    /// workspace.branch` OR a `baseRef` match ([`pr_ops::matches_base_ref`],
+    /// TS `performBackgroundEnrichment` parity). When the workspace is already
+    /// linked the PR is re-fetched and its snapshot diffed (clearing a stale
+    /// link only on a positive mismatch against BOTH branch and baseRef); a
+    /// linked PR fetched as merged/closed stays recorded in `pull_requests`
+    /// and triggers discovery of a newer open PR under the same rule
+    /// (relinking + `pr:linked` when found); when unlinked, an open PR
+    /// matching the branch — or, failing that, the baseRef — is discovered and
+    /// linked. Every refreshed/discovered PR snapshot is upserted into the
+    /// daemon-owned `pull_requests` list. Remote/archived workspaces, and
+    /// those lacking repo/branch info, are skipped. A missing forge token (no
     /// injected/registry provider) surfaces as `Internal`.
     pub async fn refresh_workspace_pr(
         &self,
@@ -1580,8 +1601,11 @@ impl Services {
                     .get_pr(&repo_ref, number)
                     .await
                     .map_err(pr_ops::map_sc_err)?;
-                // Clear a stale link only on a positive branch mismatch.
-                if pr_ops::pr_branch_mismatch(&pr, &ws.branch) {
+                // Clear a stale link only on a positive mismatch against BOTH
+                // the workspace's branch and its baseRef (review workspaces
+                // link PRs whose head equals the workspace's `baseRef`, §7.6);
+                // unknown inputs never unlink.
+                if pr_ops::pr_workspace_mismatch(&pr, &ws.branch, ws.base_ref.as_deref()) {
                     ws.pr_number = None;
                     ws.pr_url = None;
                     ws.pr_status = None;
@@ -1596,39 +1620,37 @@ impl Services {
                 let list_changed = pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                 // A merged/closed linked PR stays recorded in `pull_requests`
                 // but no longer blocks discovery: relink to a newer open PR
-                // whose head ref equals the branch, so the workspace follows
-                // the latest PR without waiting for an unlink. A discovery
-                // failure degrades to the plain update path below so the
-                // merged/closed status delta is never lost to a transient
-                // `list_prs` error (the next sweep retries discovery).
+                // matching the branch (or, failing that, the baseRef), so the
+                // workspace follows the latest PR without waiting for an
+                // unlink. A discovery failure degrades to the plain update
+                // path below so the merged/closed status delta is never lost
+                // to a transient `list_prs` error (the next sweep retries
+                // discovery).
                 if matches!(
                     info.status,
                     intent_core::PullRequestStatus::Merged | intent_core::PullRequestStatus::Closed
-                ) && !ws.branch.is_empty()
+                ) && (!ws.branch.is_empty() || ws.base_ref.is_some())
                 {
-                    let query = intent_sourcecontrol::PrQuery {
-                        state: Some(intent_sourcecontrol::PrState::Open),
-                        head: Some(ws.branch.clone()),
-                        ..Default::default()
-                    };
-                    let prs = match sc.list_prs(&repo_ref, query).await {
-                        Ok(page) => page.items,
+                    let discovered = match pr_ops::discover_matching_open_pr(
+                        sc.as_ref(),
+                        &repo_ref,
+                        &ws.branch,
+                        ws.base_ref.as_deref(),
+                        Some(number),
+                    )
+                    .await
+                    {
+                        Ok(found) => found,
                         Err(e) => {
                             tracing::warn!(
                                 workspace_id = %workspace_id.as_str(),
                                 error = %e,
                                 "pr refresh: relink discovery failed, persisting status only"
                             );
-                            Vec::new()
+                            None
                         }
                     };
-                    // Highest PR number wins so successor selection is
-                    // deterministic regardless of forge sort order.
-                    if let Some(open_pr) = prs
-                        .into_iter()
-                        .filter(|p| p.number != number && pr_ops::pr_matches_branch(p, &ws.branch))
-                        .max_by_key(|p| p.number)
-                    {
+                    if let Some(open_pr) = discovered {
                         let open_info = pr_ops::build_pr_info(&open_pr);
                         pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
                         ws.pr_number = Some(open_pr.number);
@@ -1657,24 +1679,21 @@ impl Services {
                 Ok(PrRefreshOutcome::Updated)
             }
             None => {
-                // Discovery: link an open PR whose head ref equals the branch.
-                if ws.branch.is_empty() {
+                // Discovery: link an open PR matching the branch, or —
+                // failing that — the workspace's baseRef (§7.6).
+                if ws.branch.is_empty() && ws.base_ref.is_none() {
                     return Ok(PrRefreshOutcome::Skipped);
                 }
-                let query = intent_sourcecontrol::PrQuery {
-                    state: Some(intent_sourcecontrol::PrState::Open),
-                    head: Some(ws.branch.clone()),
-                    ..Default::default()
-                };
-                let prs = sc
-                    .list_prs(&repo_ref, query)
-                    .await
-                    .map_err(pr_ops::map_sc_err)?
-                    .items;
-                match prs
-                    .into_iter()
-                    .find(|p| pr_ops::pr_matches_branch(p, &ws.branch))
-                {
+                let found = pr_ops::discover_matching_open_pr(
+                    sc.as_ref(),
+                    &repo_ref,
+                    &ws.branch,
+                    ws.base_ref.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(pr_ops::map_sc_err)?;
+                match found {
                     Some(pr) => {
                         let info = pr_ops::build_pr_info(&pr);
                         pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
@@ -1695,8 +1714,9 @@ impl Services {
 
     /// Refresh active workspaces' PR linkage: existing links are re-fetched
     /// (persisting deltas + emitting `pr:updated`/`pr:unlinked`), and unlinked
-    /// workspaces discover a matching open PR by head ref (branch-only
-    /// matching per §7.6 — `pr.head.ref == workspace.branch`), persisting the
+    /// workspaces discover a matching open PR by head ref or baseRef
+    /// (per §7.6 — `pr.head.ref == workspace.branch` OR
+    /// [`pr_ops::matches_base_ref`]), persisting the
     /// link + emitting `pr:linked` on first match. Remote/archived workspaces and
     /// those lacking repo/branch info are skipped. Errors are logged per
     /// workspace and never abort the sweep.
@@ -1748,8 +1768,8 @@ impl Services {
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` it sweeps
-    /// active workspaces — discovering open PRs by head-ref match for
-    /// unlinked workspaces (emitting `pr:linked`) and updating linked PRs
+    /// active workspaces — discovering open PRs by head-ref or baseRef match
+    /// for unlinked workspaces (emitting `pr:linked`) and updating linked PRs
     /// (emitting `pr:updated`/`pr:unlinked`). The first sweep runs after one
     /// `interval` and refreshes every workspace (tick 0); thereafter the sweep
     /// is tiered by recency (see [`Services::refresh_all_workspace_prs`]) so
@@ -4381,6 +4401,33 @@ fn skills_changed_event(workspace_id: &WorkspaceId) -> NewEvent {
         parent_event_id: None,
         metadata: None,
         data: serde_json::json!({ "workspaceId": workspace_id.as_str() }),
+    }
+}
+
+/// Bounded head/tail snippet of a client-supplied anchoring needle for the
+/// `comment.add` failure WARN: first/last 24 chars joined by `…`, or the whole
+/// string when it is short enough. Never logs full note-scale text, and the
+/// work/allocation is bounded too (only the edges are walked — no full
+/// collect, so an oversized client-supplied needle costs O(EDGE)). Edges are
+/// char-boundary safe; a grapheme cluster (combining marks, emoji ZWJ) may
+/// still be split cosmetically at the cut, which is acceptable for a log line.
+fn bounded_needle_snippet(s: &str) -> String {
+    const EDGE: usize = 24;
+    // Byte offset after the first EDGE chars; None when the string has no
+    // more than EDGE chars.
+    let head_end = s.char_indices().nth(EDGE).map(|(i, _)| i);
+    // Byte offset of the EDGE-th char from the end.
+    let tail_start = s
+        .char_indices()
+        .rev()
+        .nth(EDGE - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    match head_end {
+        Some(head_end) if head_end < tail_start => {
+            format!("{}…{}", &s[..head_end], &s[tail_start..])
+        }
+        _ => s.to_string(),
     }
 }
 
@@ -7102,10 +7149,9 @@ impl WorkspaceApi for Services {
                         None
                     };
                     // Apply derived owner when caller left it blank.
-                    if !input
+                    if input
                         .repository_owner
-                        .as_deref()
-                        .is_some_and(|o| !o.is_empty())
+                        .as_deref().is_none_or(|o| o.is_empty())
                     {
                         if let Some((owner, _)) = origin_derived.as_ref() {
                             input.repository_owner = Some(owner.clone());
@@ -7113,10 +7159,9 @@ impl WorkspaceApi for Services {
                     }
                     // Apply derived name when caller left it blank; fall back to
                     // basename when origin remote is missing/unparseable.
-                    if !input
+                    if input
                         .repository_name
-                        .as_deref()
-                        .is_some_and(|n| !n.is_empty())
+                        .as_deref().is_none_or(|n| n.is_empty())
                     {
                         if let Some((_, name)) = origin_derived {
                             input.repository_name = Some(name);
@@ -7137,7 +7182,7 @@ impl WorkspaceApi for Services {
                     // `workspace.branchPrefix` setting, uniquified against
                     // existing local/remote branches with a `-N` suffix.
                     let branch_auto_generated =
-                        !input.branch.as_deref().is_some_and(|b| !b.is_empty());
+                        input.branch.as_deref().is_none_or(|b| b.is_empty());
                     let branch = match input.branch.clone().filter(|b| !b.is_empty()) {
                         Some(explicit) => explicit,
                         None => {
@@ -7917,6 +7962,9 @@ impl WorkspaceApi for Services {
         let agent_queues = self.agent_queues.clone();
         let live_turns = self.live_turns.clone();
         let agent_subscriptions = self.agent_subscriptions.clone();
+        // Full handle for the direct completion delivery below (Services is
+        // Clone — the same capture pattern the spawn helpers use).
+        let services = self.clone();
         Box::pin(async move {
             // Chief is virtual and never appears in `workspace.list`; delete is
             // a no-op success (TS `workspace.repository.delete` / virtual-guard
@@ -7997,6 +8045,76 @@ impl WorkspaceApi for Services {
                     },
                 )
                 .await;
+            }
+            // Deterministic cross-workspace consumption (monorepo#463): the
+            // publishes above are best-effort (`None` bus, logged-and-skipped
+            // delivery failures), so a chief parent's watch on a child here
+            // could otherwise leak forever (no cleanup deadline on oneShot
+            // watches) and a chief-anchored after_all group would stay
+            // incomplete until restart. Deliver the same synthetic
+            // `agent:deleted` directly, BEFORE the store cascade drops the
+            // session rows (grouped delivery still resolves the child's
+            // completion report). The remove-before-deliver guard in
+            // `deliver_completion_to_watches` makes the bus loop's later
+            // processing of the published event a no-op — no duplicate wake —
+            // and `record_group_child_completion` is idempotent.
+            for session in &sessions {
+                let event = Event {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    workspace_id: id.clone(),
+                    timestamp: now_iso(),
+                    event_type: AGENT_DELETED.to_string(),
+                    actor: system_actor(),
+                    session_id: Some(session.id.0.clone()),
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: serde_json::json!({ "agentId": session.id.0 }),
+                };
+                services
+                    .deliver_completion_to_watches(&session.id, &event)
+                    .await;
+            }
+            // Backstop sweep: grouped watches survive delivery (group
+            // settlement owns their lifecycle) and a racing registration can
+            // land behind the loop above — after this point no watch may
+            // reference the deleted workspace as its child side. In-memory
+            // retain + best-effort delete of the persisted rows. Each
+            // affected parent then gets a refreshed
+            // `agent:subscriptions-changed` so clients converge on the
+            // shrunken watch set without polling (PROTOCOL §6.5).
+            let leaked: Vec<(String, WorkspaceId, AgentId)> = {
+                let mut registry = agent_subscriptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut leaked = Vec::new();
+                registry.subscriptions.retain(|s| {
+                    if s.child_workspace_id == id {
+                        leaked.push((
+                            s.id.clone(),
+                            s.parent_workspace_id.clone(),
+                            s.parent_agent_id.clone(),
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                leaked
+            };
+            for (watch_id, _, _) in &leaked {
+                if let Err(e) = store.delete_completion_watch(watch_id).await {
+                    tracing::warn!("completion_watch delete failed {watch_id}: {e}");
+                }
+            }
+            let mut notified: Vec<(&WorkspaceId, &AgentId)> = Vec::new();
+            for (_, parent_ws, parent_id) in &leaked {
+                if !notified.contains(&(parent_ws, parent_id)) {
+                    notified.push((parent_ws, parent_id));
+                    services
+                        .publish_subscriptions_changed(parent_ws, parent_id)
+                        .await;
+                }
             }
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
@@ -10375,6 +10493,13 @@ impl WorkspaceApi for Services {
             let ws_scope = workspace_id.0.clone();
             let op_store = store.clone();
             let warn_note_id = note_id.clone();
+            // Bounded diagnostics captured BEFORE the params move into the
+            // idempotency closure: lengths + head/tail snippets (never the
+            // full text) so a failed add is reconstructable from the log.
+            let diag_ctx = bounded_needle_snippet(&search_context);
+            let diag_tgt = bounded_needle_snippet(&comment_target);
+            let diag_ctx_len = search_context.chars().count();
+            let diag_tgt_len = comment_target.chars().count();
             // Emission lives inside the idempotency scope so a replayed add
             // (same idempotencyKey) returns the cached result without a second
             // `comment:added` (design note TB-0 §5).
@@ -10435,12 +10560,6 @@ impl WorkspaceApi for Services {
                         anchored = anchored_text,
                     );
                     note.updated_at = now_iso();
-                    store.update_note(&note).await?;
-                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
-                    services.schedule_line_attribution_recompute(
-                        note.workspace_id.clone(),
-                        note.id.clone(),
-                    );
                     let now = now_iso();
                     let new_comment = Comment {
                         id: comment_id.clone(),
@@ -10482,7 +10601,30 @@ impl WorkspaceApi for Services {
                         created_at: now.clone(),
                         updated_at: now,
                     };
-                    store.insert_comment(&workspace_id, &new_comment).await?;
+                    // The anchor-marker note rewrite + comment INSERT commit
+                    // atomically: a failure can never leave markers embedded
+                    // with no comment row (monorepo#638). The returned rev is
+                    // the authoritative post-rewrite value echoed to clients.
+                    let note_rev = store.update_note_with_comment(&note, &new_comment).await?;
+                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
+                    services.schedule_line_attribution_recompute(
+                        note.workspace_id.clone(),
+                        note.id.clone(),
+                    );
+                    // `note:updated` fires because the add rewrote the note
+                    // markdown; without it clients hold a stale rev and hit
+                    // spurious conflicts on their next versioned write.
+                    publish_event(
+                        &bus,
+                        note_change_event(
+                            &workspace_id,
+                            &note_id,
+                            &note.title,
+                            NOTE_UPDATED,
+                            "update",
+                        ),
+                    )
+                    .await;
                     publish_event(
                         &bus,
                         comment_added_event(&workspace_id, &note_id, &comment_id),
@@ -10493,6 +10635,7 @@ impl WorkspaceApi for Services {
                         message: format!("Comment successfully anchored to \"{anchored_text}\""),
                         comment_id,
                         anchored: true,
+                        note_rev,
                         location: CommentLocation {
                             line,
                             anchored_text,
@@ -10502,9 +10645,18 @@ impl WorkspaceApi for Services {
             )
             .await;
             if let Err(e) = &result {
+                // `workspace_id` is essential: note ids are per-workspace (every
+                // workspace has a `spec` note), so a context-not-found here can
+                // mean the caller targeted the wrong workspace's same-id note
+                // (the round-5 dogfood failure was exactly that).
                 tracing::warn!(
+                    workspace_id = %ws_scope,
                     note_id = %warn_note_id.as_str(),
                     error = %e,
+                    search_context_len = diag_ctx_len,
+                    search_context = %diag_ctx,
+                    comment_target_len = diag_tgt_len,
+                    comment_target = %diag_tgt,
                     "comment.add failed"
                 );
             }
@@ -10527,7 +10679,7 @@ impl WorkspaceApi for Services {
                 Some(s) => match parse_iso(s) {
                     Some(dt) => Some(dt),
                     None => {
-                        return Err(Error::Internal(format!(
+                        return Err(Error::InvalidParams(format!(
                             "Invalid 'since' timestamp: {s}. Must be ISO 8601 format."
                         )))
                     }
@@ -10536,14 +10688,14 @@ impl WorkspaceApi for Services {
             };
             if let Some(at) = author_type.as_deref() {
                 if at != "user" && at != "agent" {
-                    return Err(Error::Internal(format!(
+                    return Err(Error::InvalidParams(format!(
                         "Invalid 'authorType': {at}. Must be 'user' or 'agent'."
                     )));
                 }
             }
             if let Some(st) = status.as_deref() {
                 if !["open", "resolved", "pending"].contains(&st) {
-                    return Err(Error::Internal(format!(
+                    return Err(Error::InvalidParams(format!(
                         "Invalid 'status': {st}. Must be 'open', 'resolved', or 'pending'."
                     )));
                 }
@@ -10643,7 +10795,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
                 ));
             }
@@ -10702,6 +10854,7 @@ impl WorkspaceApi for Services {
         comment: String,
         kind: Option<String>,
         author: Option<String>,
+        author_type: Option<String>,
         suggestion_original: Option<String>,
         suggestion_proposed: Option<String>,
     ) -> BoxFuture<'_, Result<CommentRespondResult>> {
@@ -10709,20 +10862,32 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
                 ));
             }
             if comment.trim().is_empty() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Comment text is required and must be non-empty".to_string(),
                 ));
             }
+            // Default `agent` keeps backward compatibility with
+            // agent/MCP callers that predate the param (parity with
+            // `comment.add`'s authorType validation).
+            let author_type = match author_type.as_deref() {
+                None | Some("agent") => AuthorType::Agent,
+                Some("user") => AuthorType::User,
+                Some(other) => {
+                    return Err(Error::InvalidParams(format!(
+                        "Invalid 'authorType': {other}. Must be 'user' or 'agent'."
+                    )))
+                }
+            };
             let kind_parsed = parse_comment_type(kind.as_deref());
             if kind_parsed == CommentType::Suggestion
                 && (suggestion_original.is_none() || suggestion_proposed.is_none())
             {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "For type='suggestion', both suggestionOriginal and suggestionProposed are required"
                         .to_string(),
                 ));
@@ -10763,8 +10928,14 @@ impl WorkspaceApi for Services {
                 note_id: Some(note_id.clone()),
                 kind: kind_parsed,
                 content: comment,
-                author: author.unwrap_or_else(|| "Agent".to_string()),
-                author_type: AuthorType::Agent,
+                author: author.unwrap_or_else(|| {
+                    match author_type {
+                        AuthorType::User => "User",
+                        AuthorType::Agent => "Agent",
+                    }
+                    .to_string()
+                }),
+                author_type,
                 status: CommentStatus::Open,
                 parent_id: Some(parent.id.clone()),
                 anchor: parent.anchor.clone(),
@@ -10840,7 +11011,7 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         Box::pin(async move {
             if thread_id.is_none() && comment_id.is_none() {
-                return Err(Error::Internal(
+                return Err(Error::InvalidParams(
                     "Either threadId or commentId must be provided".to_string(),
                 ));
             }
@@ -12543,6 +12714,7 @@ impl WorkspaceApi for Services {
                         image_blocks,
                         file_blocks,
                         message_metadata,
+                        ..crate::agent_manager::TurnOptions::default()
                     };
                     if crate::agent_ops::is_interrupt_priority(priority.as_deref()) {
                         manager
@@ -12601,6 +12773,7 @@ impl WorkspaceApi for Services {
                 image_blocks,
                 file_blocks,
                 message_metadata: message_metadata.clone(),
+                ..crate::agent_manager::TurnOptions::default()
             };
             match self.agent_manager() {
                 Some(manager) => {
@@ -14147,13 +14320,14 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         Box::pin(async move {
-            // Validate `filter` against the FE value set. The host-agnostic
-            // engine cannot express `@me` involvement for issues (v1
-            // limitation — that needs an involvement clause on `IssueQuery`);
-            // a free-text `query` routes through the engine's
-            // `GET /search/issues` path, and without one the search degrades
-            // to the repo-issue listing filtered by state.
-            let _ = github_ops::parse_pr_involvement(filter.as_deref())?;
+            // Validate `filter` against the issues value set from PROTOCOL §5
+            // (no PR-only `review-requested`). The host-agnostic engine
+            // cannot express `@me` involvement for issues (v1 limitation —
+            // that needs an involvement clause on `IssueQuery`); a free-text
+            // `query` routes through the engine's `GET /search/issues` path,
+            // and without one the search degrades to the repo-issue listing
+            // filtered by state.
+            github_ops::parse_issue_filter(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             let state = match state {
                 Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,

@@ -30,7 +30,6 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -57,26 +56,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-    )
-    .unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 #[derive(Debug)]
@@ -379,7 +358,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     }
 
     // Fetch fingerprint and port
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -561,7 +540,7 @@ async fn resolve_interrupted_invalid_params_validation() {
     }
 
     // Fetch fingerprint and port
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let fp = status["result"]["fingerprint"]
         .as_str()
         .expect("fingerprint")
@@ -580,7 +559,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "resume": "not-an-array" }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
@@ -611,7 +590,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "abandon": 123 }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
@@ -642,7 +621,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "resume": ["valid-id", 123, "another-id"] }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")
@@ -673,7 +652,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         "params": { "resume": ["agent-1", "agent-2"], "abandon": ["agent-3"] }
     });
     ws.send(Message::Text(req.to_string())).await.expect("send");
-    let resp = timeout(Duration::from_secs(5), ws.next())
+    let resp = timeout(common::rpc_read_timeout(), ws.next())
         .await
         .expect("timeout")
         .expect("msg")

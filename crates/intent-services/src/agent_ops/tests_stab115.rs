@@ -299,3 +299,70 @@ async fn agent_create_unknown_provider_falls_through_to_global() {
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
+
+/// monorepo#607 refinement: a *settings-derived* bare default that belongs to
+/// another provider's static tiers must not hard-fail `agent.create` — the
+/// caller never sent the model. It falls back to the CLI default
+/// (`session.model = None`) instead; only a client-supplied mismatch rejects.
+#[tokio::test]
+async fn agent_create_mismatched_settings_default_falls_back_to_cli_default() {
+    let (_t, svc, ws, _cfg) = setup().await;
+
+    // Global default is a bare auggie static-tier model.
+    set(&svc, "model.default", json!("sonnet4.5"));
+
+    // Explicit grok provider, no model param: creation succeeds and the
+    // mismatched settings default is dropped, not persisted or rejected.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".to_string()),
+        ..Default::default()
+    };
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("GrokNoModel".to_string()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect("create must not fail on a settings-derived mismatch");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    assert_eq!(
+        got.model, None,
+        "mismatched settings default must fall back to the CLI default"
+    );
+
+    // The same bare model sent explicitly by the client still rejects.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".to_string()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("GrokExplicit".to_string()),
+            Some("sonnet4.5".to_string()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("explicit bare mismatch must still reject");
+    assert!(
+        err.to_string()
+            .contains("model sonnet4.5 does not belong to provider grok"),
+        "unexpected err: {err}"
+    );
+
+    // A matching provider keeps consuming the settings default as before.
+    let id = create_agent(&svc, &ws, "AuggieDefault", None).await;
+    let got = svc.agent_get_op(id, None).await.expect("get");
+    assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
+}

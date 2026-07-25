@@ -404,6 +404,164 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     }
 }
 
+/// intent-hq/monorepo#511 regression class: a provider that collapses the MCP
+/// content items into `{ output: "<stringified {ok, proposal}>" }` (auggie's
+/// shape — the resource item is dropped entirely) still yields the standalone
+/// proposal-resource block in the persisted transcript via the fallback lift.
+#[tokio::test]
+async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
+    let Some(script) = gate() else { return };
+
+    let db = std::env::temp_dir().join(format!(
+        "intentd-e2e-ws-app-collapse-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(common::hermetic_workspaces_root())
+        .with_event_bus(bus.clone());
+
+    // Create a chief-workspace agent
+    let chief_ws = WorkspaceId(CHIEF_WORKSPACE_ID.to_string());
+    let agent_val = services
+        .agent_create(
+            chief_ws.clone(),
+            Some("Chief Collapse E2E".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create chief agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    // Call ws.app.proposal.show via MCP; the mock collapses the tool output.
+    let js = r#"
+        const proposal = {
+            kind: "settings-change",
+            payload: { key: "test.setting", value: "new-value" },
+            preview: {
+                title: "Update Test Setting",
+                description: "Change test setting to new value"
+            }
+        };
+        const result = await ws.app.proposal.show(proposal);
+        return result;
+    "#;
+
+    let behavior = json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "ws.app.proposal.show collapsed e2e" }
+        },
+        "response": "show proposal",
+        "emitToolBlocks": true,
+        "collapseToolOutput": true,
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    let cwd = std::env::temp_dir();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            agent_id.clone(),
+            chief_ws.clone(),
+            "Chief Collapse E2E",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(json!({ "type": "text", "text": "show proposal" })).unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block])
+        .await
+        .expect("run_turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+
+    let conversation = services
+        .agent_get_conversation(agent_id.clone(), None, Some(chief_ws.clone()), None)
+        .await
+        .expect("read conversation");
+    let messages = conversation["messages"].as_array().expect("messages array");
+
+    // The collapsed tool_result carries NO resource item — the output is the
+    // provider-flattened `{ output: "<string>" }` object.
+    let collapsed_result_present = messages.iter().any(|msg| {
+        msg["contentBlocks"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "tool_result" && block["output"]["output"].is_string()
+            })
+        })
+    });
+    assert!(
+        collapsed_result_present,
+        "Expected the collapsed tool_result shape in transcript: {}",
+        serde_json::to_string_pretty(&conversation).unwrap()
+    );
+
+    // §7.1 fallback: the standalone proposal-resource block is still lifted,
+    // rebuilt from the daemon's own {ok, proposal} payload.
+    let standalone = messages.iter().find_map(|msg| {
+        msg["contentBlocks"].as_array().and_then(|blocks| {
+            blocks.iter().find(|block| {
+                block["type"] == "resource"
+                    && block["resource"]["mimeType"] == "application/vnd.intent.proposal+json"
+                    && block["id"].is_string()
+            })
+        })
+    });
+    let standalone = standalone.unwrap_or_else(|| {
+        panic!(
+            "Standalone proposal resource block not lifted from collapsed output: {}",
+            serde_json::to_string_pretty(&conversation).unwrap()
+        )
+    });
+    assert_eq!(standalone["resource"]["name"], "Update Test Setting");
+    assert_eq!(
+        standalone["resource"]["uri"],
+        "intent-proposal://settings-change/Update%20Test%20Setting"
+    );
+    let text = standalone["resource"]["text"].as_str().expect("text");
+    let parsed: serde_json::Value = serde_json::from_str(text).expect("proposal text parses");
+    assert_eq!(parsed["kind"], "settings-change");
+    assert_eq!(parsed["payload"]["key"], "test.setting");
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+}
+
 /// Gap 3 (P3): Non-chief workspace agent calls ws.app.* and receives the
 /// gating error through the MCP tool result.
 #[tokio::test]

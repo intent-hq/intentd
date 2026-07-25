@@ -19,7 +19,6 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -83,29 +82,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-/// One UDS JSON-RPC round-trip (used only to discover bound port + fingerprint).
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    let mut line = serde_json::to_string(&req).unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    let v: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
-    // Validate JSON-RPC envelope (review thread PRRT_kwDOS9Wxuc6SIhDr)
-    assert_eq!(v["jsonrpc"], "2.0", "invalid jsonrpc field");
-    assert_eq!(v["id"], json!(id), "response id mismatch");
-    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
-    v
 }
 
 /// Pin the server's SHA-256 fingerprint (colon-UPPER hex over the DER cert).
@@ -269,7 +245,7 @@ async fn specialist_frontmatter_model_resolved_over_wss() {
     assert!(await_uds(&socket).await, "daemon did not boot");
 
     // Discover bound port + fingerprint via UDS
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fp = status["result"]["fingerprint"]
         .as_str()

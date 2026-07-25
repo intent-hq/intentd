@@ -394,7 +394,12 @@ async function handlePrompt(id, params) {
   const base = active.response || behavior.response || 'Mock agent completed.';
   // In keep-alive mode, stamp the turn count so a resumed follow-up turn is
   // distinguishable from a fresh spawn (which would report `turn=1`).
-  const text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  // With echoCwd, stamp the child's working directory so e2e tests can assert
+  // the daemon's spawn cwd (e.g. the dedicated chief-cwd dir, STAB-50).
+  let text = behavior.blockUntilCancel ? `${base} turn=${promptCount}` : base;
+  if (behavior.echoCwd) {
+    text = `${text} cwd=${process.cwd()}`;
+  }
   // Optional per-turn delay (MS) so a test can set up queue state during the
   // first turn before it resolves. Only applied to the FIRST turn so subsequent
   // queue-drained turns proceed at full speed.
@@ -440,14 +445,24 @@ async function handlePrompt(id, params) {
       // Emit tool_call_update with output (creates tool_result block in transcript).
       // The MCP result has { content: [...], isError?: boolean }. Each content item
       // can be text, image, or resource. The daemon will store the full array.
+      //
+      // With collapseToolOutput, emulate providers (e.g. auggie) that flatten
+      // the MCP content items into `{ output: "<first text item's text>" }`,
+      // dropping resource items entirely — the shape behind the proposal-lift
+      // fallback (intent-hq/monorepo#511 regression class).
       if (result && result.content && Array.isArray(result.content)) {
+        let rawOutput = result.content;
+        if (active.collapseToolOutput) {
+          const firstText = result.content.find((c) => c && c.type === 'text');
+          rawOutput = { output: firstText ? firstText.text : '' };
+        }
         note('session/update', {
           sessionId: SESSION_ID,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: result.isError ? 'error' : 'completed',
-            rawOutput: result.content,
+            rawOutput,
           },
         });
       }
@@ -485,6 +500,13 @@ async function dispatch(msg) {
 
   switch (msg.method) {
     case 'initialize':
+      // Slow cold-start simulation (monorepo#616): delay the initialize reply
+      // by `initializeDelayMs` so tests can prove the daemon's handshake
+      // timeout tolerates a slow-to-start agent (or trips when pinned lower).
+      if (Number.isFinite(behavior.initializeDelayMs) && behavior.initializeDelayMs > 0) {
+        log(`delaying initialize reply by ${behavior.initializeDelayMs}ms`);
+        await new Promise((r) => setTimeout(r, behavior.initializeDelayMs));
+      }
       return result(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: false } });
     case 'authenticate':
       return result(msg.id, {});

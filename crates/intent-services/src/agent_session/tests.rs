@@ -191,6 +191,43 @@ fn prompt_updates_with_proposal_resource() -> Vec<String> {
     vec![tool_call, tool_done]
 }
 
+/// A prompt turn whose tool completes with a provider-collapsed output —
+/// auggie flattens the MCP content items into `{ "output": "<stringified
+/// {ok, proposal}>" }`, dropping the resource item — exercising the fallback
+/// proposal lift (§7.1).
+fn prompt_updates_with_collapsed_proposal() -> Vec<String> {
+    let proposal = json!({
+        "kind": "settings-change",
+        "preview": { "title": "Update Setting" },
+        "payload": { "key": "k", "value": "v" },
+    });
+    let text = serde_json::to_string_pretty(&json!({ "ok": true, "proposal": proposal }))
+        .expect("serialize");
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "workspace_api", "kind": "other", "status": "in_progress",
+                "rawInput": { "code": "ws.app.proposal.show(p)" } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed",
+                "rawOutput": { "output": text } }
+        }
+    })
+    .to_string();
+    vec![tool_call, tool_done]
+}
+
 /// A prompt turn whose FIRST update is a stale `tool_call_update` for a
 /// toolCallId this turn never saw (the shape a cancelled child emits after an
 /// interrupt: no title, no rawInput → derived name ""), followed by a real
@@ -806,6 +843,64 @@ async fn tool_output_with_proposal_resource_appends_standalone_block() {
                 "text": "{\"kind\":\"settings-change\"}" } },
         ])
     );
+}
+
+/// A tool completing with a provider-collapsed output (auggie flattens the
+/// MCP content items into `{ "output": "<stringified {ok, proposal}>" }`,
+/// dropping the resource item) still persists the standalone
+/// proposal-resource block via the fallback lift (§7.1).
+#[tokio::test]
+async fn tool_output_with_collapsed_proposal_appends_standalone_block() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_collapsed_proposal());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    let blocks = messages[0].content.as_array().expect("content is array");
+    assert_eq!(
+        blocks.len(),
+        3,
+        "tool_use + tool_result + standalone proposal"
+    );
+    // tool_result output is the collapsed object, unchanged.
+    assert_eq!(blocks[1]["type"], "tool_result");
+    assert!(
+        blocks[1]["output"]["output"].is_string(),
+        "output unchanged"
+    );
+    // The standalone proposal block is rebuilt from the collapsed payload.
+    let proposal = &blocks[2];
+    assert_eq!(proposal["type"], "resource");
+    assert_eq!(proposal["id"], format!("{mid}:2"));
+    assert_eq!(
+        proposal["resource"]["mimeType"],
+        "application/vnd.intent.proposal+json"
+    );
+    assert_eq!(
+        proposal["resource"]["uri"],
+        "intent-proposal://settings-change/Update%20Setting"
+    );
+    let text = proposal["resource"]["text"].as_str().expect("text");
+    let parsed: Value = serde_json::from_str(text).expect("text parses");
+    assert_eq!(parsed["kind"], "settings-change");
+    assert_eq!(parsed["preview"]["title"], "Update Setting");
 }
 
 /// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn

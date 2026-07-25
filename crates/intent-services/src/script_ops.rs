@@ -34,7 +34,10 @@ const AUTO_RESTART_DELAY: Duration = Duration::from_millis(1000);
 /// Max consecutive auto-restarts for a service (mirrors `AUTO_RESTART_MAX_RETRIES`).
 const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 /// A run shorter than this is treated as a config error — do not auto-restart.
-const TOO_FAST_MS: u128 = 2000;
+/// The production floor; tests can raise it via
+/// [`Services::with_script_too_fast_ms`](crate::Services) so the decision is
+/// load-independent (monorepo#514).
+pub(crate) const TOO_FAST_MS: u128 = 2000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
@@ -97,6 +100,9 @@ pub(crate) struct ScriptManager {
     store: Store,
     scripts: ScriptRegistry,
     bootstrap_locks: WorkspaceScriptLocks,
+    /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
+    /// tests inject a larger floor so the decision is load-independent).
+    too_fast_ms: u128,
 }
 
 impl ScriptManager {
@@ -107,6 +113,7 @@ impl ScriptManager {
         store: Store,
         scripts: ScriptRegistry,
         bootstrap_locks: WorkspaceScriptLocks,
+        too_fast_ms: u128,
     ) -> Self {
         Self {
             pty,
@@ -114,6 +121,7 @@ impl ScriptManager {
             store,
             scripts,
             bootstrap_locks,
+            too_fast_ms,
         }
     }
 
@@ -596,7 +604,7 @@ impl ScriptManager {
             if stopped_by_user || def.mode != ScriptMode::Service {
                 break;
             }
-            if started.elapsed().as_millis() < TOO_FAST_MS {
+            if started.elapsed().as_millis() < self.too_fast_ms {
                 let ms = started.elapsed().as_millis();
                 self.emit_separator(
                     &ws,
@@ -1070,6 +1078,19 @@ mod tests {
     use super::*;
     use crate::events::{EventBus, Subscription, SubscriptionFilter};
     use crate::Services;
+
+    /// Pure-liveness deadline for event-driven waits (monorepo#515): the waits
+    /// below return as soon as the awaited event arrives, so this bound only
+    /// has to outlast a worst-case multi-suite machine stall (login-shell
+    /// spawn + exit-poll + bus delivery), never a passing run.
+    const LIVENESS: Duration = Duration::from_secs(300);
+    /// Service command lifetime long enough that a service under test cannot
+    /// exit (and auto-restart, killing its PTY) mid-assertion under load
+    /// (monorepo#515). Strictly outlives `LIVENESS` so negative checks bounded
+    /// by it (e.g. the upsert orphan `kill -0` poll) can still hard-fail on a
+    /// leaked process instead of the command exiting first. Every test that
+    /// starts one stops or removes it.
+    const SERVICE_CMD: &str = "sleep 3600";
 
     // ---- pure-helper tests (no PTY, no event bus) --------------------------
 
@@ -1627,7 +1648,7 @@ mod tests {
             &h,
             ScriptCreateParams {
                 name: "svc".into(),
-                command: "sleep 30".into(),
+                command: SERVICE_CMD.into(),
                 mode: ScriptMode::Service,
                 script_id: Some("upsert-1".into()),
                 ..Default::default()
@@ -1644,10 +1665,7 @@ mod tests {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        let running = await_state(&mut sub, Duration::from_secs(5), |v| {
-            v["data"]["status"] == "running"
-        })
-        .await;
+        let running = await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         let pid = running["data"]["pid"].as_i64().expect("pid");
 
         // Upsert the same id with a new command while the old one runs.
@@ -1676,7 +1694,7 @@ mod tests {
         assert_eq!(entry["runtime"]["status"], "idle", "runtime reset");
 
         // The replaced PTY process must die — no orphan (kill -0 fails).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + LIVENESS;
         loop {
             let alive = std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
@@ -1699,15 +1717,12 @@ mod tests {
     async fn script_start_is_noop_when_already_running() {
         let h = harness().await;
         let mut sub = subscribe(&h);
-        let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        await_state(&mut sub, Duration::from_secs(5), |v| {
-            v["data"]["status"] == "running"
-        })
-        .await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         // Second start while already running is a no-op (returns Ok, no extra `running` event).
         let v = h
             .services
@@ -1764,25 +1779,19 @@ mod tests {
     async fn script_restart_returns_ok_and_emits_running() {
         let h = harness().await;
         let mut sub = subscribe(&h);
-        let id = create_simple(&h, "svc", "sleep 5", ScriptMode::Service).await;
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        await_state(&mut sub, Duration::from_secs(5), |v| {
-            v["data"]["status"] == "running"
-        })
-        .await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         let v = h
             .services
             .script_restart(h.ws.clone(), id.clone())
             .await
             .expect("restart");
         assert_eq!(v["ok"], true);
-        await_state(&mut sub, Duration::from_secs(5), |v| {
-            v["data"]["status"] == "running"
-        })
-        .await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         let st = h
             .services
             .script_status(h.ws.clone(), id.clone())
@@ -1893,15 +1902,12 @@ mod tests {
     async fn script_remove_kills_running_pty_and_drops_definition() {
         let h = harness().await;
         let mut sub = subscribe(&h);
-        let id = create_simple(&h, "svc", "sleep 30", ScriptMode::Service).await;
+        let id = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
         h.services
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        await_state(&mut sub, Duration::from_secs(5), |v| {
-            v["data"]["status"] == "running"
-        })
-        .await;
+        await_state(&mut sub, LIVENESS, |v| v["data"]["status"] == "running").await;
         let res = h
             .services
             .script_remove(h.ws.clone(), id.clone())
@@ -2009,7 +2015,7 @@ mod tests {
             .script_start(h.ws.clone(), id.clone())
             .await
             .expect("start");
-        let ev = await_state(&mut sub, Duration::from_secs(5), |v| {
+        let ev = await_state(&mut sub, LIVENESS, |v| {
             v["data"]["status"] == "exited" && v["data"].get("error").is_some()
         })
         .await;

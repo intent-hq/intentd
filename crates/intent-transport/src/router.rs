@@ -778,6 +778,7 @@ async fn dispatch(
             let comment_id = opt_str(params, "commentId");
             let kind = opt_str(params, "type");
             let author = opt_str(params, "author");
+            let author_type = opt_str(params, "authorType");
             let suggestion_original = opt_str(params, "suggestionOriginal");
             let suggestion_proposed = opt_str(params, "suggestionProposed");
             let result = api
@@ -789,6 +790,7 @@ async fn dispatch(
                     comment,
                     kind,
                     author,
+                    author_type,
                     suggestion_original,
                     suggestion_proposed,
                 )

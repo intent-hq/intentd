@@ -10,6 +10,7 @@ use intent_core::{
     Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use serde_json::json;
+use sqlx::Row;
 
 use crate::{AgentQueueRow, EventQuery, NewEvent, Store, MAX_NOTE_VERSIONS};
 
@@ -90,7 +91,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49
+            47, 48, 49, 50, 51
         ]
     );
     assert_eq!(
@@ -98,7 +99,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49
+            47, 48, 49, 50, 51
         ]
     );
 }
@@ -557,6 +558,115 @@ async fn note_version_append_list_get_and_prune() {
     assert!(after.is_empty(), "note delete cascades to note_version");
 }
 
+/// A failed statement inside `append_note_version`'s transaction rolls the
+/// whole write back and leaves the pooled write connection usable: appending
+/// for an absent note trips the composite `(note_id, workspace_id)` FK at
+/// INSERT time (`foreign_keys = ON`), nothing persists, and a subsequent
+/// append for a real note succeeds.
+#[tokio::test]
+async fn append_note_version_rolls_back_on_body_error() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    let ts = now_iso();
+
+    // Ghost note row → the version INSERT violates the FK immediately.
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    assert!(store
+        .append_note_version(&ghost, &author, &ts)
+        .await
+        .is_err());
+    assert!(store
+        .list_note_versions(&ws_id, &ghost.id)
+        .await
+        .expect("list ghost versions")
+        .is_empty());
+
+    // The write connection is clean: a normal append still works.
+    let v = store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect("append after body error");
+    assert_eq!(v, 1);
+}
+
+/// Regression for monorepo#657: a failed COMMIT in `append_note_version`
+/// must roll the transaction back so the sole write-pool connection
+/// (max_connections=1) is not returned to the pool still holding an open
+/// transaction + write lock. `defer_foreign_keys = ON` postpones a
+/// ghost-note FK violation to COMMIT time, forcing the COMMIT itself to
+/// fail; pre-fix code propagated the error without ROLLBACK, poisoning the
+/// connection so every later `BEGIN IMMEDIATE` failed.
+#[tokio::test]
+async fn append_note_version_rolls_back_on_failed_commit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    let ts = now_iso();
+
+    // Arm the deferred-FK trap on the single write-pool connection; the
+    // pragma stays in effect until the next transaction concludes, so the
+    // append below passes its INSERT and fails at COMMIT instead.
+    {
+        let mut conn = store
+            .write_pool()
+            .acquire()
+            .await
+            .expect("acquire write conn");
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .expect("defer FKs");
+    }
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    let err = store
+        .append_note_version(&ghost, &author, &ts)
+        .await
+        .expect_err("COMMIT must fail on the deferred FK violation");
+    assert!(
+        err.to_string().contains("commit"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing persisted for the ghost note...
+    assert!(store
+        .list_note_versions(&ws_id, &ghost.id)
+        .await
+        .expect("list ghost versions")
+        .is_empty());
+    // ...and the failed COMMIT was rolled back, not left open: the next
+    // append reuses the same pooled connection and commits normally.
+    let v = store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect("append after failed COMMIT");
+    assert_eq!(v, 1);
+}
+
 #[tokio::test]
 async fn note_rev_increments_on_update() {
     let tmp = TempDb::new();
@@ -910,6 +1020,55 @@ async fn comment_round_trip_update_delete_and_thread() {
     );
 }
 
+/// `update_note_with_comment` commits the note rewrite + comment INSERT in
+/// one transaction (monorepo#638): success returns the post-rewrite `rev`
+/// and persists both; a failed INSERT rolls the note rewrite back (no
+/// anchor markers without a comment row); an absent note is `NotFound`.
+#[tokio::test]
+async fn update_note_with_comment_is_atomic_and_returns_rev() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let mut note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+
+    // Success: both persist, returned rev is the post-rewrite value (0 → 1).
+    note.content = "with <!--anchor:c1:start-->markers<!--anchor:c1:end-->".to_string();
+    let c1 = sample_comment(&note.id, "c1", "c1");
+    let rev = store
+        .update_note_with_comment(&note, &c1)
+        .await
+        .expect("atomic update+insert");
+    assert_eq!(rev, 1);
+    let stored = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(stored.content, note.content);
+    assert_eq!(store.get_comment("c1").await.expect("get c1"), c1);
+
+    // Failure (duplicate comment id → INSERT fails): the note rewrite must
+    // roll back — content and rev stay at the committed state above.
+    note.content = "rewrite-that-must-roll-back".to_string();
+    let dup = sample_comment(&note.id, "c1", "c1");
+    assert!(store.update_note_with_comment(&note, &dup).await.is_err());
+    let after_fail = store.get_note(&ws_id, &note.id).await.expect("get note");
+    assert_eq!(after_fail.rev, 1);
+    assert_eq!(after_fail.content, stored.content);
+
+    // Absent note row → NotFound, and the comment must not persist.
+    let mut ghost = note.clone();
+    ghost.id = NoteId::new();
+    let c2 = sample_comment(&ghost.id, "c2", "c2");
+    match store.update_note_with_comment(&ghost, &c2).await {
+        Err(intent_core::Error::NotFound(_)) => {}
+        other => panic!("expected NotFound for absent note, got {other:?}"),
+    }
+    assert!(store.get_comment("c2").await.is_err());
+}
+
 /// `update_comment` must not drop legacy/unknown `extra_json` keys preserved
 /// by `insert_comment_with_extras` (legacy importer): the update rebuilds the
 /// known fields but carries unknown keys over from the existing row.
@@ -1256,11 +1415,167 @@ async fn event_metadata_round_trips_through_store() {
     );
 }
 
+/// Regression for monorepo#670: a failed COMMIT in `insert_events` must roll
+/// the transaction back so the sole write-pool connection (max_connections=1)
+/// is not returned to the pool still holding an open transaction + write
+/// lock. The `event` table has no FK on `workspace_id`, so unlike the
+/// note_version variant this test plants a trap: a trigger on `event`
+/// inserts into a table whose FK is `DEFERRABLE INITIALLY DEFERRED`, so the
+/// violation only surfaces at COMMIT time, forcing the COMMIT itself to
+/// fail. Pre-fix code propagated the error without ROLLBACK, poisoning the
+/// connection so every later `BEGIN IMMEDIATE` failed.
+#[tokio::test]
+async fn insert_events_rolls_back_on_failed_commit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Plant the COMMIT trap: every event insert also inserts a row whose
+    // deferred FK points at a nonexistent workspace, so the violation is
+    // only detected when `insert_events` issues its COMMIT.
+    sqlx::query(
+        "CREATE TABLE commit_trap (
+             event_id TEXT PRIMARY KEY,
+             ws_ref   TEXT NOT NULL REFERENCES workspace(id)
+                      DEFERRABLE INITIALLY DEFERRED
+         )",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap table");
+    sqlx::query(
+        "CREATE TRIGGER commit_trap_trigger AFTER INSERT ON event BEGIN
+             INSERT INTO commit_trap (event_id, ws_ref)
+             VALUES (NEW.id, 'ghost-workspace');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let trapped = typed_event(
+        &ws,
+        "2026-01-01T00:00:01Z",
+        events::AGENT_MESSAGE,
+        actor.clone(),
+    );
+    let err = store
+        .insert_events(std::slice::from_ref(&trapped))
+        .await
+        .expect_err("COMMIT must fail on the deferred FK violation");
+    assert!(
+        err.to_string().contains("commit"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing persisted for the trapped insert...
+    assert!(store
+        .events_by_workspace(&ws, 10)
+        .await
+        .expect("query events")
+        .is_empty());
+    // ...and the failed COMMIT was rolled back, not left open: with the
+    // trap disarmed, the next insert reuses the same pooled connection and
+    // commits normally.
+    sqlx::query("DROP TRIGGER commit_trap_trigger")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let ok_event = typed_event(&ws, "2026-01-01T00:00:02Z", events::AGENT_MESSAGE, actor);
+    let inserted = store
+        .insert_events(std::slice::from_ref(&ok_event))
+        .await
+        .expect("insert after failed COMMIT");
+    assert_eq!(inserted.len(), 1);
+}
+
+/// A failed statement inside `insert_events`' transaction rolls the whole
+/// batch back and leaves the pooled write connection usable (monorepo#669,
+/// style of #453's `append_note_version_rolls_back_on_body_error`): an
+/// `AFTER INSERT` trigger raising ABORT fails the multi-row INSERT at
+/// statement time (not COMMIT time), nothing persists, and a subsequent
+/// batch on the same pooled connection succeeds.
+#[tokio::test]
+async fn insert_events_rolls_back_on_body_error() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let actor = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // Arm the body trap: any event insert aborts its own statement.
+    sqlx::query(
+        "CREATE TRIGGER body_trap AFTER INSERT ON event BEGIN
+             SELECT RAISE(ABORT, 'body trap');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let events = vec![
+        typed_event(
+            &ws,
+            "2026-01-01T00:00:01Z",
+            events::AGENT_MESSAGE,
+            actor.clone(),
+        ),
+        typed_event(
+            &ws,
+            "2026-01-01T00:00:02Z",
+            events::AGENT_MESSAGE,
+            actor.clone(),
+        ),
+    ];
+    let err = store
+        .insert_events(&events)
+        .await
+        .expect_err("INSERT must fail on the abort trigger");
+    assert!(
+        err.to_string().contains("insert events failed"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing persisted from the failed batch...
+    assert!(store
+        .events_by_workspace(&ws, 10)
+        .await
+        .expect("query events")
+        .is_empty());
+    // ...and the write connection is clean: with the trap disarmed, the same
+    // batch succeeds on the same pooled connection.
+    sqlx::query("DROP TRIGGER body_trap")
+        .execute(store.write_pool())
+        .await
+        .expect("drop trap trigger");
+    let inserted = store
+        .insert_events(&events)
+        .await
+        .expect("insert after body error");
+    assert_eq!(inserted.len(), 2);
+}
+
 /// Finding F4: extended ephemeral-event retention sweep deletes high-volume
-/// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`) older
-/// than the cutoff while preserving lifecycle/tool/note/task/workspace events
-/// regardless of age. The sweep is idempotent and the legacy
-/// `delete_stream_events_before` alias still works.
+/// families (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
+/// `script:output`) older than the cutoff while preserving lifecycle/tool/
+/// note/task/workspace events regardless of age. The sweep is idempotent and
+/// the legacy `delete_stream_events_before` alias still works.
 #[tokio::test]
 async fn ephemeral_event_retention_sweep_extended_families() {
     let tmp = TempDb::new();
@@ -1287,11 +1602,13 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         typed_event(&ws, old, events::HOST_EXEC_STDOUT, agent.clone()),
         typed_event(&ws, old, events::HOST_EXEC_STDERR, agent.clone()),
         typed_event(&ws, old, events::HOST_EXEC_EXIT, agent.clone()),
+        typed_event(&ws, old, events::SCRIPT_OUTPUT, agent.clone()),
         // New ephemeral events (within TTL — must survive).
         typed_event(&ws, new, events::AGENT_STREAM_CHUNK, agent.clone()),
         typed_event(&ws, new, events::FILE_CHANGED, agent.clone()),
         typed_event(&ws, new, events::TERMINAL_DATA, agent.clone()),
         typed_event(&ws, new, events::HOST_EXEC_STDOUT, agent.clone()),
+        typed_event(&ws, new, events::SCRIPT_OUTPUT, agent.clone()),
         // Old non-ephemeral families (must NEVER be deleted regardless of age).
         typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
         typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
@@ -1299,6 +1616,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         typed_event(&ws, old, events::TASK_STATUS_CHANGED, agent.clone()),
         typed_event(&ws, old, events::TERMINAL_EXIT, agent.clone()), // not terminal:data
         typed_event(&ws, old, events::GIT_COMMIT, agent.clone()),
+        typed_event(&ws, old, events::SCRIPT_STATE, agent.clone()), // not script:output
     ];
     for ev in &seed {
         store.insert_event(ev).await.expect("insert seed event");
@@ -1311,8 +1629,8 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         .await
         .expect("sweep");
     assert_eq!(
-        removed, 10,
-        "10 old ephemeral events removed (3 stream + 3 file + 1 terminal + 3 host:exec)"
+        removed, 11,
+        "11 old ephemeral events removed (3 stream + 3 file + 1 terminal + 3 host:exec + 1 script:output)"
     );
 
     let remaining = store
@@ -1321,8 +1639,8 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         .expect("remaining");
     assert_eq!(
         remaining.len(),
-        10,
-        "4 new ephemeral + 6 preserved families"
+        12,
+        "5 new ephemeral + 7 preserved families"
     );
 
     // New ephemeral events survive.
@@ -1331,6 +1649,7 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         events::FILE_CHANGED,
         events::TERMINAL_DATA,
         events::HOST_EXEC_STDOUT,
+        events::SCRIPT_OUTPUT,
     ] {
         assert!(
             remaining
@@ -1348,12 +1667,36 @@ async fn ephemeral_event_retention_sweep_extended_families() {
         events::TASK_STATUS_CHANGED,
         events::TERMINAL_EXIT,
         events::GIT_COMMIT,
+        events::SCRIPT_STATE,
     ] {
         assert!(
             remaining.iter().any(|e| e.event_type == t),
             "preserved family {t} missing"
         );
     }
+
+    // Explicit script:* assertions (monorepo#620): script:output is exact,
+    // not a prefix, so its lifecycle sibling script:state must be preserved.
+    // Stated directly rather than left to the count-based checks above so a
+    // future regression on either side is unambiguous.
+    assert!(
+        remaining
+            .iter()
+            .any(|e| e.event_type == events::SCRIPT_STATE && e.timestamp == old),
+        "script:state (old) must survive the ephemeral sweep"
+    );
+    assert!(
+        !remaining
+            .iter()
+            .any(|e| e.event_type == events::SCRIPT_OUTPUT && e.timestamp == old),
+        "old script:output must be pruned by the ephemeral sweep"
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|e| e.event_type == events::SCRIPT_OUTPUT && e.timestamp == new),
+        "new script:output (within TTL) must survive the ephemeral sweep"
+    );
 
     // Idempotent: a re-run with the same cutoff removes nothing more.
     let removed_again = store
@@ -1504,6 +1847,276 @@ async fn stream_retention_sweep_disabled_is_noop_in_practice() {
         .expect("sweep");
     assert_eq!(removed, 0);
     assert_eq!(store.events_by_workspace(&ws, 10).await.unwrap().len(), 1);
+}
+
+/// `agent:tool:call` has its own TTL sweep (`delete_tool_call_events_before`):
+/// tool calls older than the cutoff are removed, newer ones are retained, and
+/// no other family is touched. The ephemeral sweep continues to leave tool
+/// calls alone regardless of age.
+#[tokio::test]
+async fn tool_call_retention_sweep_trims_only_old_tool_calls() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let seed = vec![
+        // Old tool calls (eligible for the tool-call TTL sweep).
+        typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
+        typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()),
+        // New tool call (within TTL — must survive).
+        typed_event(&ws, new, events::AGENT_TOOL_CALL, agent.clone()),
+        // Other old families — the tool-call sweep must not touch them.
+        typed_event(&ws, old, events::AGENT_STARTED, agent.clone()),
+        typed_event(&ws, old, events::NOTE_UPDATED, agent.clone()),
+        typed_event(&ws, old, events::FILE_CHANGED, agent.clone()),
+    ];
+    for ev in &seed {
+        store.insert_event(ev).await.expect("insert seed event");
+    }
+
+    let cutoff = "2026-03-01T00:00:00Z";
+    let removed = store
+        .delete_tool_call_events_before(cutoff)
+        .await
+        .expect("tool-call sweep");
+    assert_eq!(removed, 2, "only the 2 old tool calls are removed");
+
+    let remaining = store
+        .events_by_workspace(&ws, 100)
+        .await
+        .expect("remaining");
+    assert_eq!(remaining.len(), 4);
+    assert!(
+        remaining
+            .iter()
+            .any(|e| e.event_type == events::AGENT_TOOL_CALL && e.timestamp == new),
+        "new tool call must survive"
+    );
+    for t in [
+        events::AGENT_STARTED,
+        events::NOTE_UPDATED,
+        events::FILE_CHANGED,
+    ] {
+        assert!(
+            remaining.iter().any(|e| e.event_type == t),
+            "other family {t} must be untouched"
+        );
+    }
+
+    // Idempotent: a re-run with the same cutoff removes nothing more.
+    let removed_again = store
+        .delete_tool_call_events_before(cutoff)
+        .await
+        .expect("re-run");
+    assert_eq!(removed_again, 0);
+
+    // The ephemeral sweep still never touches tool calls, even with a cutoff
+    // newer than every row (it removes only the old FILE_CHANGED here).
+    let ephemeral_removed = store
+        .delete_ephemeral_events_before("2027-01-01T00:00:00Z")
+        .await
+        .expect("ephemeral sweep");
+    assert_eq!(ephemeral_removed, 1, "only FILE_CHANGED is ephemeral here");
+    let after = store.events_by_workspace(&ws, 100).await.expect("after");
+    assert!(
+        after
+            .iter()
+            .any(|e| e.event_type == events::AGENT_TOOL_CALL && e.timestamp == new),
+        "tool call survives the ephemeral sweep"
+    );
+}
+
+/// Chunked deletion completes: seeding more old tool-call rows than
+/// `RETENTION_DELETE_CHUNK` still sweeps them all in a single call (the
+/// chunk loop keeps going until a short chunk), and newer rows survive.
+#[tokio::test]
+async fn retention_sweep_chunked_deletion_completes() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let total_old = crate::event_repo::RETENTION_DELETE_CHUNK as usize * 2 + 50;
+    let mut seed: Vec<NewEvent> = (0..total_old)
+        .map(|_| typed_event(&ws, old, events::AGENT_TOOL_CALL, agent.clone()))
+        .collect();
+    seed.push(typed_event(
+        &ws,
+        new,
+        events::AGENT_TOOL_CALL,
+        agent.clone(),
+    ));
+    for batch in seed.chunks(500) {
+        store.insert_events(batch).await.expect("insert batch");
+    }
+
+    let removed = store
+        .delete_tool_call_events_before("2026-03-01T00:00:00Z")
+        .await
+        .expect("chunked sweep");
+    assert_eq!(removed, total_old as u64, "all old chunks swept");
+
+    let remaining = store
+        .events_by_type(&ws, events::AGENT_TOOL_CALL, 10)
+        .await
+        .expect("remaining");
+    assert_eq!(remaining.len(), 1, "only the new tool call survives");
+    assert_eq!(remaining[0].timestamp, new);
+}
+
+/// The retention DELETEs must be index-driven (no full table scan): the inner
+/// row-selection of both the prefix-family and exact-type shapes uses the
+/// composite `idx_event_type_time` index (migration 0051).
+#[tokio::test]
+async fn retention_delete_query_plan_uses_index() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let prefix_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN DELETE FROM event WHERE rowid IN (
+            SELECT rowid FROM event
+            WHERE event_type >= ? AND event_type < ? AND timestamp < ?
+            LIMIT ?
+        )",
+    )
+    .bind("agent:stream:")
+    .bind("agent:stream;")
+    .bind("2026-01-01T00:00:00Z")
+    .bind(1000_i64)
+    .fetch_all(store.read_pool())
+    .await
+    .expect("explain prefix delete");
+
+    let exact_plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN DELETE FROM event WHERE rowid IN (
+            SELECT rowid FROM event
+            WHERE event_type = ? AND timestamp < ?
+            LIMIT ?
+        )",
+    )
+    .bind("agent:tool:call")
+    .bind("2026-01-01T00:00:00Z")
+    .bind(1000_i64)
+    .fetch_all(store.read_pool())
+    .await
+    .expect("explain exact delete");
+
+    for (name, plan) in [("prefix", &prefix_plan), ("exact", &exact_plan)] {
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            details.iter().any(|d| d.contains("idx_event_type_time")),
+            "{name} plan should use idx_event_type_time: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|d| d.trim() == "SCAN event"),
+            "{name} plan must not full-scan the event table: {details:?}"
+        );
+    }
+}
+
+/// Disk-space reclamation: a freshly created database is in
+/// `auto_vacuum = INCREMENTAL` mode, pages emptied by retention deletes land
+/// on the freelist, and bounded `Store::incremental_vacuum` calls actually
+/// release them (freelist shrinks, logical page_count drops).
+#[tokio::test]
+async fn incremental_vacuum_releases_freelist_pages() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    // New databases must be created in incremental auto-vacuum mode (2).
+    let auto_vacuum: i64 = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("query auto_vacuum")
+        .get(0);
+    assert_eq!(auto_vacuum, 2, "new DB should have auto_vacuum=INCREMENTAL");
+
+    // Seed enough bulky ephemeral events to allocate a meaningful number of
+    // pages (~4KB payload each, several hundred rows).
+    let payload = "x".repeat(4096);
+    let seed: Vec<NewEvent> = (0..300)
+        .map(|_| NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: events::TERMINAL_DATA.to_string(),
+            actor: agent.clone(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({ "chunk": payload }),
+        })
+        .collect();
+    for batch in seed.chunks(100) {
+        store.insert_events(batch).await.expect("insert batch");
+    }
+
+    let pages_before: i64 = sqlx::query("PRAGMA page_count")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("page_count before")
+        .get(0);
+
+    // Retention sweep deletes every seeded row; the emptied pages go to the
+    // freelist instead of being returned to the filesystem.
+    let removed = store
+        .delete_ephemeral_events_before("2027-01-01T00:00:00Z")
+        .await
+        .expect("sweep");
+    assert_eq!(removed, 300);
+    let freelist_after_delete = store.freelist_count().await.expect("freelist");
+    assert!(
+        freelist_after_delete > 0,
+        "deletes should leave pages on the freelist (got {freelist_after_delete})"
+    );
+
+    // A bounded call frees at most `max_pages` per invocation.
+    let freed_bounded = store.incremental_vacuum(8).await.expect("bounded vacuum");
+    assert!(
+        freed_bounded > 0 && freed_bounded <= 8,
+        "bounded incremental_vacuum should free 1..=8 pages (got {freed_bounded})"
+    );
+
+    // Draining the rest empties the freelist and shrinks the logical DB size.
+    let freed_rest = store
+        .incremental_vacuum(1_000_000)
+        .await
+        .expect("drain vacuum");
+    assert_eq!(
+        freed_bounded + freed_rest,
+        freelist_after_delete as u64,
+        "all freelist pages should be released"
+    );
+    assert_eq!(store.freelist_count().await.expect("freelist"), 0);
+
+    let pages_after: i64 = sqlx::query("PRAGMA page_count")
+        .fetch_one(store.write_pool())
+        .await
+        .expect("page_count after")
+        .get(0);
+    assert!(
+        pages_after < pages_before,
+        "page_count should shrink after vacuum ({pages_before} -> {pages_after})"
+    );
 }
 
 fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
@@ -2407,8 +3020,132 @@ async fn draft_round_trip_upsert_get_delete() {
         .is_none());
 }
 
+/// Regression (PROTOCOL §5.16 "Opaque keys & reserved sentinels"): draft keys
+/// are opaque — the daemon never validates `workspace_id` against live
+/// workspaces, so a `drafts.set` under the FE's `__new-workspace__` /
+/// `__initializer__` sentinel pair (no workspace row exists yet) must succeed
+/// and round-trip.
 #[tokio::test]
-async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
+async fn draft_round_trip_for_workspace_id_without_row() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let client = ClientId::from_string("cli-1");
+    store
+        .upsert_client(&client, None, None)
+        .await
+        .expect("client");
+    let ws = WorkspaceId::from("__new-workspace__");
+    let agent = AgentId::from_string("__initializer__");
+
+    store
+        .upsert_draft(&ws, &agent, &client, "pre-create draft", None)
+        .await
+        .expect("drafts.set succeeds for a workspaceId with no workspace row");
+    let got = store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .expect("present");
+    assert_eq!(got.text, "pre-create draft");
+
+    assert!(
+        store.delete_draft(&ws, &agent, &client).await.unwrap(),
+        "clear removes the sentinel draft"
+    );
+    assert!(store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// The 0050 rebuild (drop the draft→workspace FK) upgrades the pre-0050
+/// schema in place without losing rows — text, attachments, and the
+/// NULL-attachments shape all survive the create-new → copy → drop → rename
+/// cycle, and the workspace FK is actually gone afterwards. The embedded
+/// migrator has already run against an empty DB by the time we can insert
+/// rows, so the old 0007+0048 table shape (workspace FK included) is rebuilt
+/// by hand before replaying the migration SQL.
+#[tokio::test]
+async fn draft_fk_drop_migration_preserves_existing_rows() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let client = ClientId::from_string("cli-1");
+    store.upsert_client(&client, None, None).await.unwrap();
+
+    // Restore the pre-0050 shape: 0007 columns + workspace FK, with the 0048
+    // `attachments` column appended.
+    sqlx::raw_sql(
+        "DROP TABLE draft;
+         CREATE TABLE draft (
+           workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+           agent_id     TEXT NOT NULL,
+           client_id    TEXT NOT NULL REFERENCES client(id) ON DELETE CASCADE,
+           text         TEXT NOT NULL,
+           updated_at   TEXT NOT NULL,
+           attachments  TEXT,
+           PRIMARY KEY (workspace_id, agent_id, client_id)
+         );
+         CREATE INDEX idx_draft_client ON draft(client_id);",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("rebuild pre-0050 shape");
+
+    let agent = AgentId::from_string("agent-1");
+    let attachments = json!([{ "type": "image", "imageData": "aGk=" }]);
+    store
+        .upsert_draft(&ws, &agent, &client, "keep me", Some(&attachments))
+        .await
+        .unwrap();
+    let plain_agent = AgentId::from_string("agent-2");
+    store
+        .upsert_draft(&ws, &plain_agent, &client, "no attachments", None)
+        .await
+        .unwrap();
+    let sentinel_ws = WorkspaceId::from("__new-workspace__");
+    let sentinel_agent = AgentId::from_string("__initializer__");
+    store
+        .upsert_draft(&sentinel_ws, &sentinel_agent, &client, "rejected", None)
+        .await
+        .expect_err("pre-0050 FK rejects the sentinel workspaceId");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0050_draft_drop_workspace_fk.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .expect("run rebuild against the old shape");
+
+    // The FK is really gone: the sentinel write now succeeds.
+    store
+        .upsert_draft(&sentinel_ws, &sentinel_agent, &client, "accepted", None)
+        .await
+        .expect("post-0050 sentinel write succeeds");
+
+    let got = store
+        .get_draft(&ws, &agent, &client)
+        .await
+        .unwrap()
+        .expect("row survives the rebuild");
+    assert_eq!(got.text, "keep me");
+    assert_eq!(got.attachments, Some(attachments));
+    let got = store
+        .get_draft(&ws, &plain_agent, &client)
+        .await
+        .unwrap()
+        .expect("attachment-less row survives too");
+    assert_eq!(got.text, "no attachments");
+    assert_eq!(got.attachments, None);
+}
+
+#[tokio::test]
+async fn drafts_are_isolated_by_client_and_removed_on_workspace_delete() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -2452,7 +3189,11 @@ async fn drafts_are_isolated_by_client_and_cascade_on_workspace_delete() {
     store.delete_workspace(&ws).await.expect("delete ws");
     assert!(
         store.get_draft(&ws, &agent, &a).await.unwrap().is_none(),
-        "ON DELETE CASCADE removes drafts with their workspace"
+        "delete_workspace removes the workspace's drafts"
+    );
+    assert!(
+        store.get_draft(&ws, &agent, &b).await.unwrap().is_none(),
+        "delete_workspace removes drafts for every client"
     );
 }
 

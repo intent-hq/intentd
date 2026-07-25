@@ -164,6 +164,70 @@ fn ensure_known_provider(method: &str, provider_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a bare model id that provably belongs to a different provider with
+/// `-32602` (InvalidParams). Persisting the mismatch would make the spawn
+/// path feed another provider's model id to `provider_id`'s binary
+/// (monorepo#607). Ownership evidence is deterministic and probe-free:
+/// `PROVIDER_MODEL_TIERS` (static tiers) unioned with the in-memory
+/// last-good `ModelCatalogCache` entries under each provider's current
+/// registry version key — never a live fetch, so create/setModel cannot
+/// block on a catalog probe.
+///
+/// Evidence is asymmetric by strength:
+/// - a **static-tier** claim by another provider rejects outright (the
+///   original #425 rule, unchanged) unless the requested provider itself
+///   claims the id (static or cached);
+/// - a **cached-catalog** claim by another provider rejects only when the
+///   requested provider's ownership is affirmatively *disproven* — no static
+///   claim AND its own cached catalog exists but lacks the id. With no cache
+///   entry for the requested provider (cold start, expired pin), the bare id
+///   passes — absence of evidence is not a mismatch.
+///
+/// Two spawn-parity carve-outs:
+/// - the literal `"default"` id is claude-code's smart-tier *sentinel*
+///   ("use the CLI default"), not an ownership claim — it passes for every
+///   provider;
+/// - `provider_id` is normalized through `provider_config` first, so legacy
+///   default-provider aliases persisted on old sessions (`default`/`acp`/
+///   `augment` — see `DEFAULT_PROVIDER_ALIASES`) compare as the provider the
+///   spawn would actually run, not as the raw alias string.
+fn ensure_bare_model_matches_provider(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogCache,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<()> {
+    if model_id == "default" {
+        return Ok(());
+    }
+    let effective = intent_providers::provider_config(provider_id).id;
+    let static_owners = intent_providers::providers_claiming_model(model_id);
+    // The requested provider provably owns the id — static tier or its own
+    // current cached catalog — so any other claim is a shared id, not a
+    // mismatch.
+    let requested_cache = cache.cached_catalog_claims(effective, model_id);
+    if static_owners.contains(&effective) || requested_cache == Some(true) {
+        return Ok(());
+    }
+    let cached_owners = cache.providers_claiming_model_cached(model_id);
+    let reject =
+        !static_owners.is_empty() || (!cached_owners.is_empty() && requested_cache == Some(false));
+    if reject {
+        let mut owners: Vec<String> = static_owners.iter().map(|s| s.to_string()).collect();
+        for owner in cached_owners {
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+        return Err(Error::InvalidParams(format!(
+            "{method}: model {model_id} does not belong to provider {effective} \
+             (providers with this model: {})",
+            owners.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -1351,7 +1415,8 @@ impl Services {
         // afterwards; existing agents change model only via explicit agent.setModel.
         //
         // Precedence: explicit model > specialist frontmatter model > settings chain
-        let resolved_model = match model {
+        let model_explicit = model.is_some();
+        let mut resolved_model = match model {
             Some(m) => Some(m),
             None => {
                 // Try specialist frontmatter model first (3-tier: project > user > bundled)
@@ -1426,6 +1491,45 @@ impl Services {
             if m.contains(':') {
                 let (model_provider, _) = intent_providers::parse_compound_model_id(m);
                 ensure_known_provider("agent.create", &model_provider)?;
+            } else {
+                // A bare model that provably belongs to a different provider
+                // — static tiers or cached dynamic catalogs — must not be
+                // persisted either: the spawn would feed the effective
+                // provider another provider's model id (monorepo#607). The
+                // effective provider mirrors `resolve_provider_id` for a bare
+                // model: provider field → default. Bare ids with no ownership
+                // evidence pass — ownership cannot be proven for dynamic-only
+                // model lists that were never fetched.
+                //
+                // Only a *client-supplied* mismatch hard-fails. A mismatch in
+                // a derived default (specialist frontmatter / settings chain
+                // — e.g. a global `model.default` naming an auggie model
+                // while the caller asked for `provider: "grok"` with no model
+                // param) would reject a model the caller never sent and make
+                // the provider uncreatable until settings change; drop it to
+                // the CLI default instead (session.model stays None).
+                let effective = provider
+                    .as_deref()
+                    .unwrap_or(intent_providers::default_provider_id());
+                match ensure_bare_model_matches_provider(
+                    "agent.create",
+                    &self.models_catalog,
+                    effective,
+                    m,
+                ) {
+                    Ok(()) => {}
+                    Err(e) if model_explicit => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(
+                            model = m,
+                            provider = effective,
+                            error = %e,
+                            "configured default model belongs to another provider; \
+                             falling back to the CLI default"
+                        );
+                        resolved_model = None;
+                    }
+                }
             }
         }
         let session = AgentSession {
@@ -1552,6 +1656,22 @@ impl Services {
             ensure_known_provider("agent.setModel", &model_provider)?;
             Some(model_provider)
         } else {
+            // A bare model is validated against the session's effective
+            // provider (same precedence as `resolve_provider_id` when the
+            // model has no prefix: session.provider → default): a bare id
+            // provably owned by another provider — static tiers or cached
+            // dynamic catalogs — is the same misroute vector (monorepo#607).
+            let effective = session
+                .provider
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or(intent_providers::default_provider_id());
+            ensure_bare_model_matches_provider(
+                "agent.setModel",
+                &self.models_catalog,
+                effective,
+                &model_id,
+            )?;
             None
         };
         session.model = Some(model_id.clone());
@@ -2215,16 +2335,18 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
     ) -> Result<Value> {
+        // monorepo#568: reject nonexistent targets BEFORE enqueueing — a
+        // truncated/mistyped id would otherwise create a queue entry that
+        // never drains (same fail-closed contract as `agent.sendMessage`).
+        let session = self.require_agent_session(&agent_id).await?;
         let (queued, position) =
             self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
         let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
-            if let Ok(session) = self.store.get_agent_session(&agent_id).await {
-                manager
-                    .try_drain_queue(agent_id, session.workspace_id)
-                    .await;
-            }
+            manager
+                .try_drain_queue(agent_id, session.workspace_id)
+                .await;
         }
         Ok(result)
     }
@@ -2332,8 +2454,26 @@ impl Services {
         Ok(json!({ "success": true }))
     }
 
+    /// Resolve the target agent session, failing closed on a nonexistent id
+    /// (monorepo#564): a truncated/mistyped `agentId` must surface a
+    /// client-facing `-32602` naming the id instead of silently proceeding
+    /// (auto-queue / phantom watch). Only `NotFound` maps to `InvalidParams`;
+    /// internal store failures propagate unchanged — mirrors the
+    /// `app_agents_wait_op` target-validation loop.
+    pub(crate) async fn require_agent_session(&self, agent_id: &AgentId) -> Result<AgentSession> {
+        self.store
+            .get_agent_session(agent_id)
+            .await
+            .map_err(|e| match e {
+                Error::NotFound(_) => {
+                    Error::InvalidParams(format!("unknown agent id: {}", agent_id.0))
+                }
+                other => other,
+            })
+    }
+
     /// `agent.sendMessage`: persist the user message; on failure auto-queue
-    /// (PROTOCOL §5.5).
+    /// (PROTOCOL §5.5). Fails closed on a nonexistent target (monorepo#564).
     pub(crate) async fn agent_send_message_op(
         &self,
         agent_id: AgentId,
@@ -2352,6 +2492,10 @@ impl Services {
                 )));
             }
         }
+        // monorepo#564: reject nonexistent targets BEFORE any state change —
+        // the auto-queue fallback below is for store-append failures on a
+        // REAL agent, not a phantom queue for an id that will never drain.
+        let session = self.require_agent_session(&agent_id).await?;
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
@@ -2385,38 +2529,40 @@ impl Services {
             Ok(message) => {
                 // Refresh agent_session.updated_at so the FE agent-card timestamp
                 // reflects message activity, not just status transitions (STAB-19).
-                // Fetch the session to get workspace_id; best-effort (logged on error).
-                match self.store.get_agent_session(&agent_id).await {
-                    Ok(session) => {
-                        if let Err(e) = self
-                            .store
-                            .refresh_agent_session_timestamp(
-                                &session.workspace_id,
-                                &agent_id,
-                                &created_at,
-                            )
-                            .await
-                        {
-                            tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
-                        }
-                        // Publish agent:message event using the store-returned message id.
-                        self.publish_agent_mutation_event(
-                            &session.workspace_id,
-                            &agent_id,
-                            AGENT_MESSAGE,
-                            agent_message_event_payload(&agent_id, &message),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(agent = %agent_id, error = %e, "get_agent_session failed; skipping timestamp refresh and agent:message event");
-                    }
+                // Reuses the session validated above; best-effort (logged on error).
+                if let Err(e) = self
+                    .store
+                    .refresh_agent_session_timestamp(&session.workspace_id, &agent_id, &created_at)
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "refresh_agent_session_timestamp failed");
                 }
+                // Publish agent:message event using the store-returned message id.
+                self.publish_agent_mutation_event(
+                    &session.workspace_id,
+                    &agent_id,
+                    AGENT_MESSAGE,
+                    agent_message_event_payload(&agent_id, &message),
+                )
+                .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
             }
-            Err(_) => {
-                // STAB-7: preserve image_blocks and file_blocks when auto-queueing
-                // on store failure, matching the runtime-manager path's behavior.
+            Err(append_err) => {
+                // Check-then-act race guard (monorepo#564): if the session
+                // vanished between the up-front validation and the append
+                // (concurrent delete), fail closed like the guard rather than
+                // auto-queueing a phantom message for a gone agent.
+                if self.store.get_agent_session(&agent_id).await.is_err() {
+                    tracing::warn!(agent = %agent_id, error = %append_err, "agent session vanished mid-send; rejecting instead of auto-queueing");
+                    return Err(Error::InvalidParams(format!(
+                        "unknown agent id: {}",
+                        agent_id.0
+                    )));
+                }
+                // The agent exists but the append failed (e.g. duplicate
+                // client-supplied messageId). STAB-7: preserve image_blocks and
+                // file_blocks when auto-queueing, matching the runtime-manager
+                // path's behavior.
                 let (queued, position) =
                     self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
                 let result = json!({
@@ -3232,6 +3378,11 @@ impl Services {
         parent_agent_id: AgentId,
         child_agent_id: AgentId,
     ) -> Result<Value> {
+        // monorepo#568: fail closed on a nonexistent CHILD before any watch
+        // registration — a parent→child watch on an id that does not exist
+        // never fires, leaving the parent in a phantom "waiting" state
+        // (mirrors the SUB-1 sender-watch guard below).
+        let child_session = self.require_agent_session(&child_agent_id).await?;
         let parent_session = self.store.get_agent_session(&parent_agent_id).await.ok();
         let parent_deleted = parent_session
             .as_ref()
@@ -3243,21 +3394,16 @@ impl Services {
         let parent_name = parent_session.as_ref().map(|s| s.name.clone());
         // Anchor the watch in the parent's HOME workspace (falls back to the
         // call's workspace when the parent session lookup failed) and the
-        // child's own workspace (falls back likewise) — same-workspace pairs
-        // behave exactly as before; a chief parent registers cross-workspace.
-        // `resolved_home` is Some only when read from a real session row: the
-        // reuse path uses it to correct a watch whose anchor was registered
-        // from the fallback.
+        // child's own workspace (already resolved by the fail-closed guard
+        // above) — same-workspace pairs behave exactly as before; a chief
+        // parent registers cross-workspace. `resolved_home` is Some only when
+        // read from a real session row: the reuse path uses it to correct a
+        // watch whose anchor was registered from the fallback.
         let resolved_home = parent_session.as_ref().map(|s| s.workspace_id.clone());
         let parent_home_ws = resolved_home
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
-        let child_ws = self
-            .store
-            .get_agent_session(&child_agent_id)
-            .await
-            .map(|s| s.workspace_id)
-            .unwrap_or_else(|_| workspace_id.clone());
+        let child_ws = child_session.workspace_id;
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
         let id = match self.find_and_refresh_ungrouped_watch(
             &parent_agent_id,
@@ -3296,6 +3442,10 @@ impl Services {
         caller_agent_id: AgentId,
         target_agent_id: AgentId,
     ) -> Result<Value> {
+        // monorepo#564: fail closed on a nonexistent TARGET before any watch
+        // registration — a caller→target watch on an id that does not exist
+        // never fires, leaving the sender in a phantom "waiting" state.
+        let target_session = self.require_agent_session(&target_agent_id).await?;
         let caller_session = self.store.get_agent_session(&caller_agent_id).await.ok();
         let skip = caller_session
             .as_ref()
@@ -3319,20 +3469,16 @@ impl Services {
             return Ok(json!({ "ok": false, "subscriptionId": Value::Null }));
         }
         let caller_name = caller_session.as_ref().map(|s| s.name.clone());
-        // Anchor the watch in the caller's HOME workspace and the target's
-        // workspace (each falls back to the call's workspace when the session
-        // lookup fails), mirroring `agent_watch_completion_op` — including the
+        // Anchor the watch in the caller's HOME workspace (falls back to the
+        // call's workspace when the session lookup fails) and the target's own
+        // workspace (already resolved by the fail-closed guard above),
+        // mirroring `agent_watch_completion_op` — including the
         // `resolved_home` anchor-correction on the reuse path.
         let resolved_home = caller_session.as_ref().map(|s| s.workspace_id.clone());
         let caller_home_ws = resolved_home
             .clone()
             .unwrap_or_else(|| workspace_id.clone());
-        let target_ws = self
-            .store
-            .get_agent_session(&target_agent_id)
-            .await
-            .map(|s| s.workspace_id)
-            .unwrap_or_else(|_| workspace_id.clone());
+        let target_ws = target_session.workspace_id;
         // Dedupe: reuse an existing oneShot watch if present, otherwise create new.
         let id = match self.find_and_refresh_ungrouped_watch(
             &caller_agent_id,

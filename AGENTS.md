@@ -123,7 +123,7 @@ following must pass in `packages/intentd`:
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test
 ```
 

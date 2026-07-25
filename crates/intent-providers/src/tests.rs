@@ -104,6 +104,17 @@ fn registry_field_parity() {
         pi.login_docs_url,
         Some("https://pi.dev/docs/latest/quickstart")
     );
+    // MCP rides the bundled pi extension (wrapper + PI_ACP_PI_COMMAND) — pi
+    // has no MCP CLI flag and ignores the ACP session field.
+    assert!(pi.mcp_via_pi_extension);
+    assert!(!pi.supports_mcp_config && !pi.supports_session_mcp_servers);
+    for p in ACP_PROVIDERS.iter().filter(|p| p.id != "pi") {
+        assert!(
+            !p.mcp_via_pi_extension,
+            "{} must not use the pi-extension MCP delivery",
+            p.id
+        );
+    }
 
     let droid = find_provider("droid").unwrap();
     assert_eq!(droid.base_args, &["exec", "--output-format", "acp"]);
@@ -119,7 +130,10 @@ fn registry_field_parity() {
     // CLI model flag.
     assert!(grok.model_flag.is_none() && grok.supports_set_model);
     assert!(!grok.supports_authenticate && !grok.supports_set_mode);
-    assert!(!grok.supports_mcp_config && !grok.supports_rules_file);
+    // No CLI MCP flag — the workspace bridge rides the ACP `session/new`
+    // `mcpServers` field instead.
+    assert!(!grok.supports_mcp_config && grok.supports_session_mcp_servers);
+    assert!(!grok.supports_rules_file);
     assert!(grok.can_be_disabled);
     assert_eq!(grok.login_command_hint, Some("grok login"));
     assert_eq!(grok.auth_check_args, Some(&["models"][..]));
@@ -135,14 +149,14 @@ fn registry_field_parity() {
     assert_eq!(mock.requires_env_var, Some("MOCK_AGENT_SCRIPT_PATH"));
 }
 
-/// Exactly claude-code, codex, and droid consume MCP servers from the ACP
-/// `session/new` / `session/load` `mcpServers` field; every other provider
-/// receives MCP config out-of-band (auggie `--mcp-config`, opencode env
-/// config) or not at all. Asserted over the full registry so a newly added
-/// provider can't accidentally opt in without updating this partition.
+/// Exactly claude-code, codex, droid, and grok consume MCP servers from the
+/// ACP `session/new` / `session/load` `mcpServers` field; every other
+/// provider receives MCP config out-of-band (auggie `--mcp-config`, opencode
+/// env config) or not at all. Asserted over the full registry so a newly
+/// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid"];
+    let opted_in = ["claude-code", "codex", "droid", "grok"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -631,17 +645,22 @@ fn v8_runtime_node_options_heap_cap() {
 
 #[test]
 fn enhanced_path_prepends_bin_and_augment() {
-    std::env::set_var("HOME", "/home/tester");
-    std::env::set_var("USERPROFILE", "/home/tester");
-    std::env::set_var("PATH", "/usr/bin:/bin");
+    // Injected home / inherited PATH (never mutates process-global env — the
+    // env vars are shared with parallel PATH-dependent tests, monorepo#628).
+    let home = std::path::Path::new("/home/tester");
+    let inherited = std::ffi::OsStr::new("/usr/bin:/bin");
     let bin = std::path::PathBuf::from("/opt/tools/auggie");
-    let path = enhanced_path(Some(&bin));
+    let path = args::enhanced_path_with(Some(&bin), Some(home), Some(inherited));
     let parts: Vec<&str> = path.split([':', ';']).collect();
     assert_eq!(parts[0], "/opt/tools");
     assert!(path.contains(".augment"));
     assert!(parts.contains(&"/usr/bin") && parts.contains(&"/bin"));
     // Relative provider paths contribute no parent dir.
-    let rel = enhanced_path(Some(std::path::Path::new("auggie")));
+    let rel = args::enhanced_path_with(
+        Some(std::path::Path::new("auggie")),
+        Some(home),
+        Some(inherited),
+    );
     assert!(!rel.starts_with("auggie"));
 }
 
@@ -665,6 +684,25 @@ fn compound_model_id_round_trip() {
         create_compound_model_id("codex", "gpt-5.3-codex/high"),
         "codex:gpt-5.3-codex/high"
     );
+}
+
+#[test]
+fn providers_claiming_model_matches_static_tiers_exactly() {
+    assert_eq!(providers_claiming_model("opus4.7"), vec!["auggie"]);
+    assert_eq!(providers_claiming_model("haiku"), vec!["claude-code"]);
+    assert_eq!(
+        providers_claiming_model("claude-sonnet-4-5"),
+        vec!["cortex"]
+    );
+    // Exact match only — no fuzzy/prefix matching.
+    assert!(providers_claiming_model("opus").is_empty());
+    // Unknown / dynamic-only ids claim no provider.
+    assert!(providers_claiming_model("grok-4-fast").is_empty());
+    assert!(providers_claiming_model("").is_empty());
+    // Documented caveat: claude-code's smart tier is the literal "default"
+    // sentinel, so it *is* claimed here — callers using claims as ownership
+    // proofs must special-case it.
+    assert_eq!(providers_claiming_model("default"), vec!["claude-code"]);
 }
 
 #[test]

@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{Config, ServerControl, WorkspaceApi};
 use intent_services::{
-    default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus, FileWatcher,
-    PermissionPolicy, Services, SkillsWatcher,
+    default_process_cap, max_concurrent_agents, AgentManager, BusEventSink, EventBus,
+    PermissionPolicy, Services, WatcherRegistry,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -117,8 +117,7 @@ enum Command {
         /// Print the per-workspace plan without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Re-run even when the completion marker is already set, and update
-        /// rows whose workspace id already exists instead of skipping.
+        /// Update rows whose workspace id already exists instead of skipping.
         #[arg(long)]
         force: bool,
     },
@@ -328,11 +327,10 @@ async fn cmd_import(from: &Path) -> anyhow::Result<()> {
 
 /// Import legacy per-directory Intent workspaces into the configured SQLite
 /// store. `--root` (repeatable) narrows the scan to explicit directories
-/// (each must exist); otherwise the default legacy roots are scanned. When
-/// the completion marker is already set, the run is skipped unless `--force`
-/// or `--dry-run` is passed. A non-dry-run run always ends by rewriting the
-/// marker — even when every workspace was skipped or failed softly (the run
-/// itself "completed"; `--force` re-runs to retry problem workspaces).
+/// (each must exist); otherwise the default legacy roots are scanned. The
+/// first-boot completion marker does not gate explicit CLI runs. A
+/// non-dry-run run without manifest compatibility failures rewrites the marker;
+/// `--force` only controls whether existing workspace rows are updated.
 /// Per-workspace problems are soft (reported, exit 0); only an unusable
 /// explicit `--root` or a store-open failure exits non-zero. A dry-run
 /// against a not-yet-created DB removes the freshly created DB file
@@ -370,21 +368,6 @@ async fn cmd_import_legacy(
     let store = Store::open(&config.db_path)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // Marker gate: a completed import is not repeated unless forced. Dry-run
-    // stays allowed (it writes nothing, so previewing is always safe).
-    if !dry_run && !force {
-        if let Some(at) = store
-            .get_setting(legacy_import::LEGACY_IMPORT_MARKER_KEY)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        {
-            println!(
-                "legacy import already completed at {at}; use --force to re-run \
-                 or --dry-run to preview"
-            );
-            return Ok(());
-        }
-    }
     let report = legacy_import::run(
         &store,
         &legacy_import::Options {
@@ -398,16 +381,18 @@ async fn cmd_import_legacy(
     .await?;
     println!("{report}");
     if !dry_run {
-        // Marker write failure is a warning, not a command failure — the
-        // import itself completed (mirrors the first-boot hook in `serve`).
-        // Without the marker a later run/first-boot may re-import, which is
-        // safe: the import is idempotent.
-        if let Err(e) = legacy_import::write_completion_marker(&store).await {
-            eprintln!(
-                "warning: import completed but the completion marker could not \
-                 be written ({e}); a later run or first boot may re-import \
-                 (idempotent, existing rows are skipped)"
-            );
+        if !report.has_compatibility_failures() {
+            // Marker write failure is a warning, not a command failure — the
+            // import itself completed (mirrors the first-boot hook in `serve`).
+            // Without the marker a later run/first-boot may re-import, which is
+            // safe: the import is idempotent.
+            if let Err(e) = legacy_import::write_completion_marker(&store).await {
+                eprintln!(
+                    "warning: import completed but the completion marker could not \
+                     be written ({e}); a later run or first boot may re-import \
+                     (idempotent, existing rows are skipped)"
+                );
+            }
         }
     } else if !db_existed {
         // Dry-run on a fresh install: don't leave behind the DB file that
@@ -666,8 +651,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
+    let legacy_import_store = store.clone();
+    let assets_root = config.data_dir.join("assets");
     let services = Services::new(store)
-        .with_assets_root(config.data_dir.join("assets"))
+        .with_assets_root(assets_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(config.data_dir.clone())
         .with_event_bus(bus.clone())
@@ -698,7 +685,19 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         .with_policy(permission_policy)
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
-        .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir)),
+        .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
+        // STAB-50: chief provider children spawn in the dedicated, empty
+        // `<data_dir>/chief-cwd` directory instead of `/tmp`. Swept at
+        // startup (no chief child is live yet) so leftovers a provider
+        // scribbled into its cwd don't accumulate across daemon runs and
+        // get re-indexed.
+        .with_chief_cwd_root({
+            let root = intent_core::chief_cwd_root(&config.data_dir);
+            if let Err(e) = intent_core::sweep_chief_cwd(&root) {
+                tracing::warn!(error = %e, path = %root.display(), "chief-cwd sweep failed");
+            }
+            root
+        }),
     );
     // Attach the manager to the services surface so the `agent.*` RPC handlers
     // drive the live spawn/turn/MCP loop at runtime (the shared `OnceLock` is
@@ -818,8 +817,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
     // Event retention/compaction (§10.2 / finding F4): periodically delete
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-    // `host:exec:*`) older than the configured TTL, preserving lifecycle/tool/
-    // note/task/workspace events. Disabled when `events.streamRetentionHours == 0`.
+    // `host:exec:*`, `script:output`) older than the configured TTL, preserving
+    // lifecycle/tool/note/task/workspace events. Disabled when
+    // `events.streamRetentionHours == 0`.
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
@@ -841,14 +841,13 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
-    // Start a filesystem watcher per active workspace with a resolvable on-disk
-    // path; each publishes debounced `file:changed` events to the shared bus.
-    // The handles are held for the lifetime of `serve` and torn down on return.
-    let _watchers = start_workspace_watchers(&bus, api.as_ref()).await;
-
-    // Start skills directory watchers (user-tier + project-tier per workspace).
-    // Publishes debounced `skills:changed` events when SKILL.md files are modified.
-    let _skills_watcher = start_skills_watcher(&bus, api.as_ref()).await;
+    // Start the watcher registry (#611): seeds a filesystem watcher per active
+    // workspace (debounced `file:*` events), the skills watcher (`skills:changed`),
+    // and the specialists watcher (`specialists:changed`), then follows workspace
+    // lifecycle events so workspaces created/opened after boot gain watching and
+    // deleted/closed workspaces are torn down without a restart. The handle is
+    // held for the lifetime of `serve` and torn down on return.
+    let _watcher_registry = WatcherRegistry::start(bus.clone(), api.clone()).await;
 
     // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
     // construction args ALWAYS so settings can toggle the listener on/off at
@@ -911,6 +910,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         ws_runtime: runtime.clone(),
         start_time: std::time::Instant::now(),
         proc_usage,
+        legacy_import_store,
+        legacy_import_assets_root: assets_root,
+        legacy_import_lock: tokio::sync::Mutex::new(()),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -1129,8 +1131,8 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     Ok(())
 }
 
-/// Live daemon control surface backing `system.status` / `system.shutdown`
-/// (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
+/// Live daemon control surface backing `system.status`, `system.shutdown`, and
+/// `system.importLegacy` (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
 /// resolved WSS `port`/`fingerprint` are real (not guessed); `client_count`/agent
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
@@ -1146,6 +1148,11 @@ struct DaemonControl {
     start_time: std::time::Instant,
     /// Latest own-process CPU/memory sample from the background sampler.
     proc_usage: Arc<ProcUsage>,
+    /// Live store and asset destination shared with Services for legacy import.
+    legacy_import_store: Store,
+    legacy_import_assets_root: PathBuf,
+    /// Prevent overlapping import runs from racing workspace inserts/copies.
+    legacy_import_lock: tokio::sync::Mutex<()>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -1325,6 +1332,64 @@ impl SystemControl for DaemonControl {
         // `notify_one` stores a permit if the serve loop is not yet awaiting, so
         // the shutdown is never lost to a race with a freshly-arrived RPC.
         self.shutdown.notify_one();
+    }
+
+    fn import_legacy(
+        &self,
+        force: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let _guard = self.legacy_import_lock.lock().await;
+            let report = legacy_import::run(
+                &self.legacy_import_store,
+                &legacy_import::Options {
+                    roots: legacy_import::default_roots(),
+                    dry_run: false,
+                    force,
+                    assets_root: Some(self.legacy_import_assets_root.clone()),
+                    app_dir: legacy_import::default_app_dir(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let compatibility_failures = report.has_compatibility_failures();
+            let marker_written = if compatibility_failures {
+                false
+            } else {
+                match legacy_import::write_completion_marker(&self.legacy_import_store).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "legacy import RPC marker write failed");
+                        false
+                    }
+                }
+            };
+            let skip_summary: Vec<Value> = report
+                .entries
+                .iter()
+                .filter_map(|entry| match &entry.outcome {
+                    legacy_import::Outcome::Skipped(reason) => {
+                        Some(json!({ "id": &entry.id, "reason": reason }))
+                    }
+                    _ => None,
+                })
+                .take(20)
+                .collect();
+            Ok(json!({
+                "imported": report.imported(),
+                "updated": report.updated(),
+                "skipped": report.skipped(),
+                "notes": report.notes_imported(),
+                "comments": report.comments_imported(),
+                "agents": report.agent_sessions_imported(),
+                "assets": report.assets_imported(),
+                "skipSummary": skip_summary,
+                "compatibilityFailures": compatibility_failures,
+                "markerWritten": marker_written,
+            }))
+        })
     }
 }
 
@@ -1854,13 +1919,34 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
+/// Fixed TTL for persisted `agent:tool:call` events, swept on the same tick as
+/// the ephemeral families. Tool calls are the dominant share of the event
+/// table (87% of live data on the dev seat) and no consumer reads them beyond
+/// bounded recent windows — replay uses `agent_message`, live streaming uses
+/// the in-memory bus — so 24h is comfortably conservative.
+const TOOL_CALL_RETENTION_HOURS: u32 = 24;
+
+/// Upper bound on pages released per `PRAGMA incremental_vacuum(N)` call in
+/// the retention loop. 2000 pages ≈ 8 MiB at the 4 KiB default page size —
+/// enough to keep up with sweep-driven churn while keeping each call short on
+/// the single-connection write pool. A large backlog (e.g. the dev seat's
+/// ~54k free pages) drains over successive ticks instead of one long stall.
+const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
+
 /// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
 /// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
 /// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-/// `host:exec:*`) older than the TTL while preserving lifecycle/tool/note/task/
-/// workspace events. The sweep interval is derived from the TTL (≈4×/TTL),
-/// clamped so long TTLs still sweep periodically and short ones do not busy-loop.
-/// A failed sweep is logged and retried on the next tick (never aborts the loop).
+/// `host:exec:*`, `script:output`) older than the TTL, plus `agent:tool:call`
+/// events older than [`TOOL_CALL_RETENTION_HOURS`], while preserving
+/// lifecycle/note/task/workspace events. After the sweeps each tick runs a
+/// bounded `PRAGMA incremental_vacuum` ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to
+/// release freelist pages back to the filesystem (effective on
+/// incremental-auto-vacuum databases; a no-op otherwise — see
+/// `intent_store::connect_write` for the activation story) and
+/// `PRAGMA optimize` to keep planner statistics current. The sweep interval
+/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep
+/// periodically and short ones do not busy-loop. A failed sweep is logged and
+/// retried on the next tick (never aborts the loop).
 fn spawn_stream_retention_loop(
     store: Store,
     stream_retention_hours: u32,
@@ -1873,8 +1959,9 @@ fn spawn_stream_retention_loop(
     let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
     tracing::info!(
         ttl_hours = stream_retention_hours,
+        tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
         interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*)"
+        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, agent:tool:call)"
     );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -1892,6 +1979,31 @@ fn spawn_stream_retention_loop(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
+            }
+            let tool_cutoff = intent_core::iso_minutes_ago(TOOL_CALL_RETENTION_HOURS as i64 * 60);
+            match store.delete_tool_call_events_before(&tool_cutoff).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(
+                        removed,
+                        cutoff = tool_cutoff,
+                        "event retention sweep trimmed agent:tool:call events"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
+            }
+            match store.incremental_vacuum(INCREMENTAL_VACUUM_MAX_PAGES).await {
+                Ok(freed) if freed > 0 => {
+                    tracing::info!(
+                        pages_freed = freed,
+                        "incremental vacuum released freelist pages"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "incremental vacuum failed"),
+            }
+            if let Err(e) = store.optimize().await {
+                tracing::warn!(error = %e, "PRAGMA optimize failed");
             }
         }
     }))
@@ -1949,72 +2061,6 @@ fn spawn_idempotency_reap_loop(
             }
         }
     })
-}
-
-/// Start a [`FileWatcher`] for every non-archived workspace that exposes an
-/// existing on-disk path (`path`, falling back to `worktree_path`). Returns the
-/// live handles; dropping them stops the watchers (clean shutdown).
-async fn start_workspace_watchers(bus: &EventBus, services: &dyn WorkspaceApi) -> Vec<FileWatcher> {
-    let workspaces = match services.list_workspaces(false).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not list workspaces for file watching");
-            return Vec::new();
-        }
-    };
-    let mut watchers = Vec::new();
-    for ws in workspaces {
-        let Some(root) = ws.path.clone().or_else(|| ws.worktree_path.clone()) else {
-            continue;
-        };
-        let path = std::path::PathBuf::from(&root);
-        if !path.is_dir() {
-            continue;
-        }
-        match FileWatcher::start(bus.clone(), ws.id.clone(), path) {
-            Ok(w) => {
-                tracing::info!(workspace = %ws.id, path = %root, "watching workspace files");
-                watchers.push(w);
-            }
-            Err(e) => {
-                tracing::warn!(workspace = %ws.id, path = %root, error = %e, "file watcher start failed")
-            }
-        }
-    }
-    tracing::info!(count = watchers.len(), "file watchers started");
-    watchers
-}
-
-/// Start a [`SkillsWatcher`] covering all skills directories (user-tier + project-tier
-/// per workspace). Returns the live handle; dropping it stops the watcher.
-async fn start_skills_watcher(
-    bus: &EventBus,
-    services: &dyn WorkspaceApi,
-) -> Option<SkillsWatcher> {
-    let workspaces = match services.list_workspaces(false).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not list workspaces for skills watching");
-            return None;
-        }
-    };
-
-    let workspace_pairs: Vec<_> = workspaces
-        .into_iter()
-        .filter_map(|ws| {
-            let root = ws.path.clone().or_else(|| ws.worktree_path.clone())?;
-            let path = std::path::PathBuf::from(&root);
-            if path.is_dir() {
-                Some((ws.id, path))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let watcher = SkillsWatcher::start(bus.clone(), workspace_pairs);
-    tracing::info!("skills watcher started");
-    Some(watcher)
 }
 
 async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
@@ -2709,6 +2755,37 @@ async fn report_db_health(store: &Store) {
         Err(e) => {
             println!("  [WARN] wal_checkpoint failed: {}", e);
         }
+    }
+
+    // auto_vacuum / freelist: new databases are created with
+    // auto_vacuum=INCREMENTAL so the retention loop's bounded
+    // incremental_vacuum can release deleted pages. Existing databases stay
+    // in NONE mode until a one-time offline VACUUM — deliberately never run
+    // automatically (it blocks all writes) — so print the activation step.
+    let auto_vacuum = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(store.read_pool())
+        .await
+        .ok()
+        .and_then(|row| row.try_get::<i64, _>(0).ok());
+    let freelist = store.freelist_count().await;
+    match (auto_vacuum, &freelist) {
+        (Some(2), Ok(freelist)) => println!(
+            "  [ok] auto_vacuum: INCREMENTAL (freelist_count={} pages)",
+            freelist
+        ),
+        (Some(mode), Ok(freelist)) => {
+            let label = if mode == 1 { "FULL" } else { "NONE" };
+            println!(
+                "  [WARN] auto_vacuum: {} (freelist_count={} pages; deleted pages are not returned to the filesystem)",
+                label, freelist
+            );
+            if mode == 0 {
+                println!(
+                    "         one-time activation (daemon must be STOPPED): sqlite3 <db_path> \"PRAGMA auto_vacuum=INCREMENTAL; VACUUM;\""
+                );
+            }
+        }
+        _ => println!("  [WARN] auto_vacuum/freelist_count: failed to query"),
     }
 
     // Connection pool stats: report size and idle connections for both pools

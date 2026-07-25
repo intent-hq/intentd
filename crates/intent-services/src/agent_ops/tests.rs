@@ -2009,6 +2009,426 @@ async fn set_model_rejects_unknown_provider() {
     );
 }
 
+/// Regression for monorepo#607: `agent.create` rejects (-32602 InvalidParams)
+/// an incident-shaped payload — an explicit `provider` plus a bare model id
+/// provably owned by another provider's *static* tiers. Dynamic-only models
+/// absent from `PROVIDER_MODEL_TIERS` (the actual incident model `fable-5`)
+/// are covered by cached-catalog evidence instead — see
+/// [`create_rejects_bare_dynamic_model_via_cached_catalog`].
+#[tokio::test]
+async fn create_rejects_bare_model_owned_by_other_provider() {
+    let (_t, svc, ws) = setup().await;
+    // Incident shape: explicit grok provider + bare auggie static-tier model.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("bare auggie model + grok provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.create: model sonnet4.5 does not belong to provider grok"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "owning provider must be named: {msg}"
+    );
+    // Default-provider path (no provider param): a bare model owned
+    // exclusively by another provider is validated against the default
+    // provider (auggie) the same way.
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad2".into()),
+            Some("claude-sonnet-4-5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect_err("bare cortex model with defaulted provider must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string().contains("cortex"),
+        "owning provider must be named: {err}"
+    );
+    // No rejection persisted a session row.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+}
+
+/// Bare model ids pass `agent.create` when the provider matches the static
+/// tier owner, or when no static tier claims the id at all (dynamic-only
+/// model lists — ownership cannot be proven).
+#[tokio::test]
+async fn create_accepts_bare_model_for_matching_or_unknown_owner() {
+    let (_t, svc, ws) = setup().await;
+    // Matching provider passes.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK".into()),
+        Some("sonnet4.5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("matching provider + bare model");
+    // Bare id unknown to every static tier passes for any provider (grok's
+    // model list is dynamic-only).
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK2".into()),
+        Some("grok-4-fast".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("bare id unknown to every static tier");
+    // Cold start (monorepo#607): grok + bare `fable-5`, an auggie *dynamic*
+    // model absent from `PROVIDER_MODEL_TIERS`, passes while no cached
+    // catalog provides ownership evidence — absence of evidence is not a
+    // mismatch. With a warm auggie cache the same payload is rejected — see
+    // `create_rejects_bare_dynamic_model_via_cached_catalog`.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK2b".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("cold start: bare fable-5 + grok passes without cache evidence");
+    // The literal "default" id is claude-code's smart-tier *sentinel* ("use
+    // the CLI default"), not an ownership claim — it must pass for every
+    // provider.
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK2c".into()),
+        Some("default".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("bare \"default\" sentinel passes for any provider");
+    // Unknown-to-all bare id with a defaulted provider passes too.
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK3".into()),
+        Some("some-dynamic-model".into()),
+        None,
+        None,
+        None,
+        false,
+        Default::default(),
+    )
+    .await
+    .expect("unknown bare id with defaulted provider");
+}
+
+/// Regression for monorepo#607 (dynamic gap): with a warm auggie catalog
+/// cached, the exact incident payload — `provider: "grok"` + bare `fable-5`,
+/// an auggie dynamic-only model — is rejected -32602 naming auggie, because
+/// grok's own cached catalog affirmatively disproves ownership.
+#[tokio::test]
+async fn create_rejects_bare_dynamic_model_via_cached_catalog() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Bad".into()),
+            Some("fable-5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra,
+        )
+        .await
+        .expect_err("cached-catalog evidence must reject the incident payload");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.create: model fable-5 does not belong to provider grok"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "owning provider must be named: {msg}"
+    );
+    // No rejection persisted a session row.
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(agents.is_empty(), "no session row persisted: {agents:?}");
+}
+
+/// Cached-catalog evidence must not produce false rejects (monorepo#607):
+/// the bare id passes when the requested provider has no cached catalog
+/// (absence of evidence), when its own catalog claims the id (shared id),
+/// or when the only claiming entry sits under a stale version key.
+#[tokio::test]
+async fn create_accepts_bare_dynamic_model_without_disproof() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    let auggie_rows = vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })];
+    // Auggie claims fable-5, but grok has no cached catalog: ownership by
+    // grok is not disproven, so the id passes.
+    svc.models_catalog
+        .test_store("auggie", "", auggie_rows.clone(), now);
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK-a".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("no grok cache: absence of evidence is not a mismatch");
+    // Grok's catalog also claims the id (shared id): passes.
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "grok" })],
+        now,
+    );
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc.agent_create_op(
+        ws.clone(),
+        Some("OK-b".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("shared id claimed by the requested provider's own catalog");
+    // Fresh services: auggie's claiming entry sits under a stale version key
+    // (auggie's current key is "" — no version pin), so it is not evidence
+    // even though grok's own catalog disproves ownership.
+    let (_t2, svc2, ws2) = setup().await;
+    svc2.models_catalog
+        .test_store("auggie", "stale-pin", auggie_rows, now);
+    svc2.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    let extra = intent_core::AgentCreateExtra {
+        provider: Some("grok".into()),
+        ..Default::default()
+    };
+    svc2.agent_create_op(
+        ws2.clone(),
+        Some("OK-c".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("version-key-mismatched entries are not ownership evidence");
+}
+
+/// `agent.setModel` applies the cached-catalog evidence too (monorepo#607):
+/// a bare dynamic-only model owned by another provider's cached catalog is
+/// rejected against the session's effective provider when that provider's
+/// own catalog disproves ownership.
+#[tokio::test]
+async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
+    let (_t, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        "",
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
+        now,
+    );
+    svc.models_catalog.test_store(
+        "grok",
+        "",
+        vec![json!({ "id": "grok-4-fast", "name": "Grok 4 Fast", "provider": "grok" })],
+        now,
+    );
+    // Pin the session's provider to grok so the guard compares against it.
+    let id = create_agent(&svc, &ws, "CacheGuard").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = Some("grok".into());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist grok provider");
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "fable-5".into())
+        .await
+        .expect_err("cached auggie model on a grok session must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.setModel: model fable-5 does not belong to provider grok"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("auggie"),
+        "owning provider must be named: {msg}"
+    );
+    let after = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+}
+
+/// `agent.setModel` applies the same bare-model ownership guard against the
+/// session's effective provider and leaves session.model / session.provider
+/// untouched on rejection (monorepo#607).
+#[tokio::test]
+async fn set_model_rejects_bare_model_owned_by_other_provider() {
+    let (_t, svc, ws) = setup().await;
+    // create_agent yields an auggie session (provider derived from the
+    // compound model prefix).
+    let id = create_agent(&svc, &ws, "BareGuard").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(id.clone(), "haiku".into())
+        .await
+        .expect_err("bare claude-code model on an auggie session must be rejected");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("agent.setModel: model haiku does not belong to provider auggie"),
+        "unexpected err: {msg}"
+    );
+    assert!(
+        msg.contains("claude-code"),
+        "owning provider must be named: {msg}"
+    );
+    let after = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+    // Bare id unknown to every static tier still passes.
+    svc.agent_set_model_op(id, "some-dynamic-model".into())
+        .await
+        .expect("bare id unknown to every static tier");
+}
+
+/// `agent.setModel` normalizes legacy default-provider aliases persisted on
+/// old sessions (`default`/`acp`/`augment` — `DEFAULT_PROVIDER_ALIASES`)
+/// before the bare-model ownership comparison: a session whose raw
+/// `session.provider` is `"acp"` spawns the default provider (auggie), so a
+/// bare auggie model must pass, and a bare model owned by a *different*
+/// provider is still rejected naming the normalized provider.
+#[tokio::test]
+async fn set_model_normalizes_legacy_provider_aliases() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Alias").await;
+    let mut session = svc.agent_get_session_op(id.clone()).await.expect("get");
+    session.provider = Some("acp".into());
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("persist legacy alias");
+    // Bare auggie model on an "acp" session passes (spawn runs auggie).
+    svc.agent_set_model_op(id.clone(), "sonnet4.5".into())
+        .await
+        .expect("bare default-provider model on a legacy-alias session");
+    // A bare claude-code model is still rejected — naming the normalized
+    // provider, not the raw alias.
+    let err = svc
+        .agent_set_model_op(id, "haiku".into())
+        .await
+        .expect_err("bare claude-code model on a legacy-alias auggie session");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("model haiku does not belong to provider auggie"),
+        "normalized provider must be named: {err}"
+    );
+}
+
 #[tokio::test]
 async fn rename_missing_agent_is_internal() {
     let (_t, svc, _ws) = setup().await;
@@ -3764,12 +4184,150 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     );
 }
 
+/// monorepo#564 regression: `agent.sendMessage` to a nonexistent agent id
+/// (e.g. a truncated id) must fail closed with `-32602` naming the id —
+/// NOT auto-queue a phantom message the sender then waits on forever.
 #[tokio::test]
-async fn send_message_auto_queues_for_unknown_agent() {
+async fn send_message_op_rejects_unknown_agent() {
     let (_t, svc, _ws) = setup().await;
     let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let err = svc
+        .agent_send_message_op(id.clone(), "hi".into(), None, None, None, None)
+        .await
+        .expect_err("unknown agent must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&id.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry may be created for an unknown agent"
+    );
+}
+
+/// monorepo#564 regression: the SUB-1 sender auto-subscribe must fail closed
+/// when the TARGET agent does not exist — no caller→target watch may be
+/// registered for a nonexistent target (the phantom "waiting" state).
+#[tokio::test]
+async fn sender_watch_rejects_unknown_target() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let err = svc
+        .agent_watch_completion_for_sender_op(ws.clone(), caller.clone(), target.clone())
+        .await
+        .expect_err("unknown target must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&target.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&caller).is_empty(),
+        "no watch may be registered on a nonexistent target"
+    );
+}
+
+/// monorepo#568 regression: `agent.queueMessage` to a nonexistent agent id
+/// must fail closed with `-32602` naming the id — NOT create a phantom queue
+/// entry that never drains, and NOT publish `agent:queue:updated`.
+#[tokio::test]
+async fn queue_message_op_rejects_unknown_agent() {
+    let (_t, svc, _ws, bus) = setup_with_bus().await;
+    let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+    let err = svc
+        .agent_queue_message_op(id.clone(), "hi".into(), None, None)
+        .await
+        .expect_err("unknown agent must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&id.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "no phantom queue entry may be created for an unknown agent"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), sub.recv())
+            .await
+            .is_err(),
+        "no agent:queue:updated event may be published for an unknown agent"
+    );
+}
+
+/// monorepo#568 regression: `agent.watchCompletion` with a nonexistent CHILD
+/// must fail closed with `-32602` naming the id — no watch may be registered
+/// (the parent would otherwise report a phantom `waitingForAgentIds` entry
+/// for a completion that can never fire).
+#[tokio::test]
+async fn watch_completion_rejects_unknown_child() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let err = svc
+        .agent_watch_completion_op(ws.clone(), parent.clone(), child.clone())
+        .await
+        .expect_err("unknown child must be rejected");
+    match &err {
+        Error::InvalidParams(msg) => assert!(
+            msg.contains(&child.0),
+            "error must name the unknown agent id: {msg}"
+        ),
+        other => panic!("expected Error::InvalidParams, got {other:?}"),
+    }
+    assert!(
+        svc.list_watches_for_parent(&parent).is_empty(),
+        "no watch may be registered on a nonexistent child"
+    );
+    let lite = svc.agent_get_op(parent, None).await.expect("get parent");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(
+        v["waitingForAgentIds"],
+        json!([]),
+        "parent must not report a phantom waiting-on entry"
+    );
+}
+
+/// The auto-queue fallback still applies when the agent EXISTS but the store
+/// append fails (here: a duplicate client-supplied messageId hits the
+/// primary-key constraint) — only nonexistent agents fail closed.
+#[tokio::test]
+async fn send_message_auto_queues_on_store_failure_for_existing_agent() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "QueueRecv").await;
+    let first = svc
+        .agent_send_message_op(
+            id.clone(),
+            "first".into(),
+            Some("dup-id".into()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first send");
+    assert_eq!(first["queued"], false);
     let r = svc
-        .agent_send_message_op(id, "hi".into(), None, None, None, None)
+        .agent_send_message_op(
+            id.clone(),
+            "hi".into(),
+            Some("dup-id".into()),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("send");
     assert_eq!(r["queued"], true);
@@ -3778,11 +4336,22 @@ async fn send_message_auto_queues_for_unknown_agent() {
 
 /// STAB-7: agent_send_message_op fallback must preserve image_blocks and
 /// file_blocks when auto-queueing on store failure (matching the runtime
-/// manager path's behavior).
+/// manager path's behavior). Uses a duplicate messageId on an EXISTING agent
+/// to force the store failure (monorepo#564: unknown agents now fail closed).
 #[tokio::test]
 async fn send_message_op_preserves_attachments_on_auto_queue() {
-    let (_t, svc, _ws) = setup().await;
-    let id = AgentId::from("agent-00000000-0000-0000-0000-000000000000");
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "AttachQueue").await;
+    svc.agent_send_message_op(
+        id.clone(),
+        "first".into(),
+        Some("dup-id".into()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("first send");
     let image_blocks = json!([
         { "type": "image", "data": "base64data", "mimeType": "image/png" }
     ]);
@@ -3793,7 +4362,7 @@ async fn send_message_op_preserves_attachments_on_auto_queue() {
         .agent_send_message_op(
             id.clone(),
             "check these".into(),
-            None,
+            Some("dup-id".into()),
             Some(image_blocks.clone()),
             Some(file_blocks.clone()),
             None,
@@ -8360,6 +8929,237 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     let expected: std::collections::HashSet<String> =
         [&a, &b, &c].into_iter().map(|id| id.0.clone()).collect();
     assert_eq!(deleted_ids, expected, "one agent:deleted per session");
+}
+
+/// monorepo#463 regression: a chief parent's oneShot watch on a child in the
+/// deleted workspace must be consumed by `workspace.delete` itself — the
+/// `agent:deleted` bus publish is best-effort (a `None` bus is a quiet no-op),
+/// so with no bus wired the delete path must deliver the deleted-completion
+/// directly. Exactly one wake reaches the chief parent, the watch is gone from
+/// the registry (memory + persisted row), and a later bus-loop reprocessing of
+/// the same event delivers nothing (no duplicate wake).
+#[tokio::test]
+async fn delete_workspace_consumes_chief_oneshot_watch_without_bus() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    // Durable registration: the row is committed before the delete below, so
+    // the persisted-row assertion cannot race the spawned best-effort upsert.
+    svc.register_completion_watch_durable(
+        &chief_ws,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        true,
+        None,
+    )
+    .await
+    .expect("chief cross-workspace watch is allowed");
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The watch is consumed synchronously — no bus is wired, so nothing else
+    // could have delivered it.
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(svc.list_watches_for_parent(&parent).is_empty());
+
+    // Exactly one deleted-completion wake reached the chief parent.
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session survives the delete");
+    assert_eq!(parent_session.messages.len(), 1);
+
+    // The persisted completion_watch row is swept (delete is spawned; poll).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("list watches");
+        if rows.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "persisted completion_watch rows not swept: {rows:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A bus-loop reprocessing of the same `agent:deleted` (when a bus IS
+    // wired) finds no watch and delivers no second wake.
+    let event = completion_event(&ws, AGENT_DELETED, &child, json!({ "agentId": child.0 }));
+    svc.handle_completion_event(&event).await;
+    let parent_session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(parent_session.messages.len(), 1, "duplicate wake delivered");
+}
+
+/// monorepo#463 regression: a chief-anchored after_all group expecting a child
+/// in the deleted workspace records that child in `deleted_agent_ids` at
+/// delete time (no bus wired, no restart needed), and the grouped watch no
+/// longer references the deleted workspace as its child side.
+#[tokio::test]
+async fn delete_workspace_records_deleted_child_in_chief_after_all_group() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&chief_ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &chief_ws,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        false,
+        Some(gid.clone()),
+    )
+    .expect("chief grouped watch");
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The group survives (anchored at chief, still unsealed) and the child is
+    // already recorded as deleted — the fan-in can settle once sealed.
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("chief-anchored group survives the delete");
+    assert_eq!(group.deleted_agent_ids, vec![child.clone()]);
+
+    // Backstop: no surviving watch references the deleted workspace as child.
+    assert!(svc.find_watches_for_child(&child).is_empty());
+    assert!(svc.all_watches(&ws).is_empty());
+}
+
+/// The backstop sweep in `workspace.delete` emits a refreshed
+/// `agent:subscriptions-changed` for each affected cross-workspace parent, so
+/// clients converge on the shrunken watch set without polling — the swept
+/// grouped watch would otherwise leave stale waiting flags until the group
+/// settles.
+#[tokio::test]
+async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let chief_ws = WorkspaceId::chief();
+    let parent = create_agent(&svc, &chief_ws, "Chief").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+
+    let gid = svc.get_or_create_delegation_group(&chief_ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &chief_ws,
+        &ws,
+        parent.clone(),
+        "Chief".into(),
+        child.clone(),
+        false,
+        Some(gid.clone()),
+    )
+    .expect("chief grouped watch");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_SUBSCRIPTIONS_CHANGED.to_string()],
+        ..Default::default()
+    });
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The grouped watch survived the direct delivery (group settlement owns
+    // its lifecycle) and was removed by the backstop sweep, which publishes
+    // the parent's refreshed (now empty) waiting flags.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("subscriptions-changed after backstop sweep")
+        .expect("batch");
+    let last = batch.last().expect("event");
+    assert_eq!(last.event_type, AGENT_SUBSCRIPTIONS_CHANGED);
+    assert_eq!(last.data["agentId"], json!(parent.0));
+    assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
+    assert_eq!(last.data["waitingForAgentIds"], json!([]));
+}
+
+/// The workspace-delete sweep stays scoped: watches parented in the deleted
+/// workspace and groups anchored there are still dropped, while watches and
+/// groups that live entirely in another workspace are untouched.
+#[tokio::test]
+async fn delete_workspace_leaves_unrelated_watches_and_groups_untouched() {
+    let (_t, svc, ws_a) = setup().await;
+    let svc = svc.with_workspaces_root(_t.path.with_extension("workspaces"));
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+
+    // Doomed: watch parented in A on a child in A, group anchored in A.
+    let parent_a = create_agent(&svc, &ws_a, "ParentA").await;
+    let child_a = create_agent(&svc, &ws_a, "ChildA").await;
+    svc.register_completion_watch(
+        &ws_a,
+        &ws_a,
+        parent_a.clone(),
+        "ParentA".into(),
+        child_a.clone(),
+        true,
+        None,
+    )
+    .expect("ws-a watch");
+    let gid_a = svc.get_or_create_delegation_group(&ws_a, &parent_a);
+    svc.enroll_child_in_group(&gid_a, &child_a);
+
+    // Unrelated: watch parented in B on a child in B, group anchored in B.
+    let parent_b = create_agent(&svc, &ws_b, "ParentB").await;
+    let child_b = create_agent(&svc, &ws_b, "ChildB").await;
+    svc.register_completion_watch(
+        &ws_b,
+        &ws_b,
+        parent_b.clone(),
+        "ParentB".into(),
+        child_b.clone(),
+        true,
+        None,
+    )
+    .expect("ws-b watch");
+    let gid_b = svc.get_or_create_delegation_group(&ws_b, &parent_b);
+    svc.enroll_child_in_group(&gid_b, &child_b);
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws_a.clone())
+        .await
+        .expect("delete workspace A");
+
+    // A's entries are gone; the A parent got no wake destination so no
+    // residual watch survives under either anchor.
+    assert!(svc.all_watches(&ws_a).is_empty());
+    assert!(svc.list_watches_for_parent(&parent_a).is_empty());
+    assert!(svc.delegation_group_for_parent(&parent_a).is_none());
+
+    // B's entries are untouched.
+    assert_eq!(svc.find_watches_for_child(&child_b).len(), 1);
+    let group_b = svc
+        .delegation_group_for_parent(&parent_b)
+        .expect("ws-b group untouched");
+    assert_eq!(group_b.group_id, gid_b);
+    assert!(group_b.deleted_agent_ids.is_empty());
 }
 
 /// When a delegated agent starts a new turn after persisting a completion

@@ -96,7 +96,7 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
         .expect("uds rpc timed out")
         .expect("read uds response");
@@ -275,7 +275,7 @@ async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
-    let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+    let status = common::await_wss_status(&socket).await;
     let port = status["result"]["port"].as_u64().expect("port") as u16;
     let fingerprint = status["result"]["fingerprint"]
         .as_str()
@@ -891,6 +891,106 @@ async fn comment_add_idempotency_key_dedupes_over_wss() {
     assert!(
         extra.is_none(),
         "idempotent replay must not publish a second comment:added, got extra: {extra:?}"
+    );
+}
+
+/// End-to-end (monorepo#638): `comment.add` rewrites the note markdown
+/// (anchor markers), so over WSS the result must echo the authoritative
+/// post-rewrite `noteRev` AND publish exactly one `note:updated` alongside
+/// `comment:added` — otherwise subscribed clients hold a stale rev and hit
+/// spurious conflicts on their next versioned write. An idempotent replay
+/// returns the cached `noteRev` without a second `note:updated`.
+#[tokio::test]
+async fn comment_add_echoes_note_rev_and_emits_note_updated_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap workspace + note off UDS so the WSS side drives only the add.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Comments", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "anchor target text" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let rev_before = n["result"]["note"]["rev"].as_i64().expect("note rev");
+
+    // Subscribe over WSS before the add, scoped to note:updated.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["note:updated"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let params = json!({
+        "workspaceId": ws_id,
+        "noteId": note_id,
+        "searchContext": "anchor target text",
+        "commentTarget": "target",
+        "comment": "root",
+        "idempotencyKey": "wss-comment-rev-1",
+    });
+    let add = wss_rpc(&mut rpc, 2, "comment.add", params.clone()).await;
+    assert_eq!(add["success"], json!(true));
+    // The result echoes the post-rewrite rev: exactly one bump over create.
+    let note_rev = add["noteRev"].as_i64().expect("noteRev in result");
+    assert_eq!(note_rev, rev_before + 1, "result: {add}");
+
+    // The echoed rev is the authoritative stored value.
+    let read = wss_rpc(
+        &mut rpc,
+        3,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(read["note"]["rev"].as_i64(), Some(note_rev));
+
+    // Exactly one note:updated for the rewrite, with the §6.5 payload shape.
+    let evt = next_event(&mut sub, &["note:updated"], 10).await;
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+    );
+    let extra = drain_extra(&mut sub, "note:updated", 500).await;
+    assert!(
+        extra.is_none(),
+        "comment.add must publish exactly one note:updated, got extra: {extra:?}"
+    );
+
+    // Idempotent replay: cached result carries the SAME noteRev, no rewrite,
+    // no second note:updated.
+    let replay = wss_rpc(&mut rpc, 4, "comment.add", params).await;
+    assert_eq!(
+        replay["noteRev"].as_i64(),
+        Some(note_rev),
+        "replay: {replay}"
+    );
+    let extra = drain_extra(&mut sub, "note:updated", 500).await;
+    assert!(
+        extra.is_none(),
+        "idempotent replay must not publish a second note:updated, got extra: {extra:?}"
     );
 }
 
@@ -1560,6 +1660,202 @@ async fn comment_add_author_type_round_trips_over_wss() {
             "comment": "c",
             "authorType": "robot",
         }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+}
+
+/// End-to-end: `comment.respond` with `authorType: "user"` persists the
+/// author type and round-trips it through `comment.getThread`; omitting the
+/// param keeps the backward-compatible `agent` default.
+#[tokio::test]
+async fn comment_respond_author_type_round_trips_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "RespondAuthorType", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "Note", "content": "alpha reply-target omega" }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let add = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "alpha reply-target omega",
+            "commentTarget": "reply-target",
+            "comment": "root",
+        }),
+    )
+    .await;
+    let root_id = add["commentId"].as_str().expect("id").to_string();
+
+    let user_reply = wss_rpc(
+        &mut rpc,
+        2,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "hi from the user",
+            "authorType": "user",
+        }),
+    )
+    .await;
+    let user_reply_id = user_reply["comment"]["id"]
+        .as_str()
+        .expect("reply id")
+        .to_string();
+
+    let agent_reply = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "hi from an agent",
+        }),
+    )
+    .await;
+    let agent_reply_id = agent_reply["comment"]["id"]
+        .as_str()
+        .expect("reply id")
+        .to_string();
+
+    let thread = wss_rpc(
+        &mut rpc,
+        4,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "commentId": root_id }),
+    )
+    .await;
+    let replies = thread["replies"].as_array().expect("replies");
+    let by_id = |id: &str| {
+        replies
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap_or_else(|| panic!("reply {id} missing: {thread}"))
+    };
+    let user = by_id(&user_reply_id);
+    assert_eq!(user["authorType"], json!("user"), "{user}");
+    assert_eq!(user["author"], json!("User"), "{user}");
+    let agent = by_id(&agent_reply_id);
+    assert_eq!(agent["authorType"], json!("agent"), "{agent}");
+    assert_eq!(agent["author"], json!("Agent"), "{agent}");
+
+    // Invalid authorType is rejected with -32602.
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        5,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "c",
+            "authorType": "robot",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    // The pre-existing caller-input validations also reject with -32602, not
+    // -32603 (monorepo#632): missing threadId/commentId, empty comment, and a
+    // suggestion without the suggestionOriginal/suggestionProposed pair.
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        6,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "comment": "no target",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        7,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "   ",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        8,
+        "comment.respond",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "commentId": root_id,
+            "comment": "try this",
+            "type": "suggestion",
+            "suggestionOriginal": "only original",
+        }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    // The sibling caller-input validations on `comment.getThread` /
+    // `comment.resolveThread` (missing threadId AND commentId) and the
+    // `comment.list` filter checks also reject with -32602, not -32603
+    // (monorepo#649).
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        9,
+        "comment.getThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        10,
+        "comment.resolveThread",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "resolved": true }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");
+
+    let bad = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "authorType": "robot" }),
     )
     .await;
     assert_eq!(bad["error"]["code"], json!(-32602), "envelope: {bad}");

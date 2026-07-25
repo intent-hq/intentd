@@ -317,6 +317,20 @@ const PATH_SEP: char = if cfg!(windows) { ';' } else { ':' };
 /// de-duplicated while preserving order. Port of the `getAuggieExecPATH` behavior
 /// (generalized across providers).
 pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
+    enhanced_path_with(
+        provider_binary,
+        home_dir().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`enhanced_path`] with an explicit `home` and inherited `path` (test seam —
+/// avoids mutating the process-global `HOME` / `PATH` in parallel tests).
+pub(crate) fn enhanced_path_with(
+    provider_binary: Option<&Path>,
+    home: Option<&Path>,
+    inherited_path: Option<&std::ffi::OsStr>,
+) -> String {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -330,7 +344,7 @@ pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
     }
 
     // 2. ~/.augment/bin (auggie's install location, kept for auggie back-compat)
-    if let Some(home) = home_dir() {
+    if let Some(home) = home {
         path_utils::push_dir(&mut dirs, &mut seen, home.join(".augment").join("bin"));
     }
 
@@ -340,8 +354,8 @@ pub fn enhanced_path(provider_binary: Option<&Path>) -> String {
     }
 
     // 4. Inherited PATH (lowest priority)
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = inherited_path {
+        for dir in std::env::split_paths(path) {
             path_utils::push_dir(&mut dirs, &mut seen, dir);
         }
     }

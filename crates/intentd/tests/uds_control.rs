@@ -71,7 +71,7 @@ async fn rpc(socket: &PathBuf, method: &str) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut buf))
+    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
         .await
         .expect("status rpc timed out")
         .expect("read status response");

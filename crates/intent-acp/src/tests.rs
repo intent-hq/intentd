@@ -4546,6 +4546,7 @@ mod wsapi3_bindings_tests {
                     message: format!("Comment anchored to \"{comment_target}\""),
                     comment_id: "c-1".to_string(),
                     anchored: true,
+                    note_rev: 1,
                     location: CommentLocation {
                         line: 1,
                         anchored_text: comment_target,
@@ -4629,6 +4630,7 @@ mod wsapi3_bindings_tests {
             comment: String,
             _kind: Option<String>,
             _author: Option<String>,
+            _author_type: Option<String>,
             _suggestion_original: Option<String>,
             _suggestion_proposed: Option<String>,
         ) -> BoxFuture<'_, Result<CommentRespondResult>> {

@@ -87,10 +87,10 @@ impl Store {
 
         match result {
             Ok(v) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("commit note_version tx failed: {e}")))?;
+                // Rollback (and detach+close on double failure) if the COMMIT
+                // itself fails, so the sole write-pool connection is never
+                // returned holding an open transaction (monorepo#657).
+                crate::commit_with_rollback_guard(conn, "commit note_version tx failed").await?;
                 Ok(v)
             }
             Err(e) => {

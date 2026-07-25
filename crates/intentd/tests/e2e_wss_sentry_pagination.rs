@@ -14,7 +14,6 @@ mod common;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -36,7 +35,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -286,25 +284,14 @@ async fn boot() -> Fixture {
 /// Establish an authenticated WSS connection over pinned TLS (token in the
 /// query string).
 async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
-    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("tcp connect");
-    let name = ServerName::try_from("localhost").unwrap();
-    let tls = TlsConnector::from(cfg)
-        .connect(name, tcp)
-        .await
-        .expect("tls connect");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
-    let (ws, _resp) = tokio_tungstenite::client_async(url, tls)
-        .await
-        .expect("ws handshake");
-    ws
+    common::wss_connect_with_retry(port, cfg, &url).await
 }
 
 async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string())).await.unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(common::rpc_read_timeout(), async {
         loop {
             match ws.next().await.unwrap().unwrap() {
                 Message::Text(text) => {

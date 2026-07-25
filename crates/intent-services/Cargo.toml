@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
@@ -27,7 +28,7 @@ notify = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 time = { workspace = true, features = ["formatting"] }
-similar = { version = "2.7.0", default-features = false }
+similar = { version = "3.1.1", default-features = false }
 yrs = "0.27.2"
 serde_yaml = "0.9"
 async-recursion = "1.1"
