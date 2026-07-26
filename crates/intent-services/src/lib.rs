@@ -1051,17 +1051,21 @@ impl Services {
     /// workspaces root's filesystem (root→root) — a machine capability,
     /// independent of any workspace or checkout mode (the FE uses it to gate
     /// the CoW opt-in toggle, which affects newly created workspaces).
-    /// Returns Some(true) if the CoW probe reports Supported; Some(false) on
-    /// an unsupported filesystem; None if the probe cannot run. The live
-    /// probe is offloaded to the blocking pool and cached per workspaces root
-    /// by the shared aggregate cache.
+    /// Resolves the root like every other consumer — the injected
+    /// `workspaces_root`, else [`default_workspaces_root`]
+    /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`) — so
+    /// production daemons, which never inject a root, still report the
+    /// capability. Returns Some(true) if the CoW probe reports Supported;
+    /// Some(false) on an unsupported filesystem; None if the probe cannot
+    /// run. The live probe is offloaded to the blocking pool and cached per
+    /// workspaces root by the shared aggregate cache.
     async fn compute_cow_supported(&self) -> Option<bool> {
-        // Must have workspaces root
-        let workspaces_root = self.workspaces_root.as_ref()?;
-
-        // Probe CoW support for the workspaces root
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
         self.workspace_aggregates
-            .cow_supported(workspaces_root.clone())
+            .cow_supported(workspaces_root)
             .await
     }
 
@@ -7478,8 +7482,9 @@ impl WorkspaceApi for Services {
                     // of falling back to a temp dir. When `workspace.cowIsolation`
                     // is on, the checkout is a standalone CoW clone of the repo
                     // dir (deps/build artifacts carried over) instead of a
-                    // linked worktree — and an Unsupported/failed probe fails
-                    // the create outright (no silent worktree fallback).
+                    // linked worktree — and an Unsupported/failed probe falls
+                    // back to the linked-worktree path (the setting is a
+                    // preference, not a guarantee).
                     // Skipped for remote/`skipWorktree` workspaces, callers
                     // supplying their own `worktreePath`, and repository paths
                     // that are not a local git repo (registry-only rows keep
@@ -7513,9 +7518,12 @@ impl WorkspaceApi for Services {
                                 let wt = wt_path.clone();
                                 let mode = if cow_isolation {
                                     // CoW probe: repo dir → `<root>/<wsId>` (the
-                                    // clone's parent). Unsupported or a probe
-                                    // error fails the create with an actionable
-                                    // message — no silent worktree fallback.
+                                    // clone's parent). The repository can live on
+                                    // any filesystem and reflinks cannot cross
+                                    // volumes, so Unsupported (or a probe error)
+                                    // falls back to a linked worktree instead of
+                                    // failing the create — `workspace.cowIsolation`
+                                    // is a preference, not a guarantee.
                                     std::fs::create_dir_all(&ws_dir).map_err(|e| {
                                         Error::Internal(format!(
                                             "cannot create workspace dir for CoW probe: {e}"
@@ -7536,16 +7544,21 @@ impl WorkspaceApi for Services {
                                         Ok(intent_git::CowSupport::Supported) => {
                                             intent_core::CheckoutMode::Cow
                                         }
-                                        Ok(intent_git::CowSupport::Unsupported)
-                                        | Err(_) => {
-                                            // Remove the just-created
-                                            // `<root>/<wsId>` dir (including any
-                                            // probe temp files) so no partial
-                                            // checkout is left behind.
-                                            let _ = std::fs::remove_dir_all(&ws_dir);
-                                            return Err(Error::Unsupported(
-                                                "CoW isolation is enabled but the filesystem does not support CoW cloning — disable workspace.cowIsolation or move the workspaces root to a supported filesystem".to_string(),
-                                            ));
+                                        Ok(intent_git::CowSupport::Unsupported) => {
+                                            tracing::warn!(
+                                                repository_path = %repo_dir.display(),
+                                                workspaces_root = %workspaces_root_pathbuf.display(),
+                                                "workspace.create: CoW isolation is enabled but the repository's filesystem cannot CoW-clone into the workspaces root; falling back to a linked worktree"
+                                            );
+                                            intent_core::CheckoutMode::Worktree
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                repository_path = %repo_dir.display(),
+                                                error = %e,
+                                                "workspace.create: CoW probe failed; falling back to a linked worktree"
+                                            );
+                                            intent_core::CheckoutMode::Worktree
                                         }
                                     }
                                 } else {
@@ -7588,10 +7601,12 @@ impl WorkspaceApi for Services {
                                         // `provision_cow_checkout` already
                                         // removed the failed clone; also drop
                                         // the `<root>/<wsId>` parent the probe
-                                        // created if it is left empty, so a
-                                        // failed create leaves the workspaces
-                                        // root clean (#774).
-                                        if mode == intent_core::CheckoutMode::Cow {
+                                        // created (CoW mode, or a worktree
+                                        // fallback after a CoW request) if it
+                                        // is left empty, so a failed create
+                                        // leaves the workspaces root clean
+                                        // (#774).
+                                        if cow_isolation {
                                             remove_workspace_dir_if_empty(&ws_dir);
                                         }
                                         return Err(e);
@@ -8753,8 +8768,8 @@ impl WorkspaceApi for Services {
             // checkout at `<root>/<workspaceId>/<repo-slug>` on a branch named
             // for its id — a linked worktree, or a standalone CoW clone when
             // `workspace.cowIsolation` is on (same decision matrix as create,
-            // including the fail-loud Unsupported probe: no silent worktree
-            // fallback). Skipped for remote/`skipWorktree` sources and for
+            // including the worktree fallback on an Unsupported/failed
+            // probe). Skipped for remote/`skipWorktree` sources and for
             // non-repo `repositoryPath`s. Provisioning failures are logged
             // and swallowed — the FE reference continues on worktree failure
             // ("Continue without worktree - user can create it manually").
@@ -8771,9 +8786,11 @@ impl WorkspaceApi for Services {
                     let wt_path = ws_dir.join(worktree_folder_slug(&repo_name));
                     let mode = if cow_isolation {
                         // CoW probe: repo dir → `<root>/<wsId>` (the clone's
-                        // parent). Unsupported or a probe error fails the
-                        // duplicate with the same actionable message as
-                        // create — no silent worktree fallback.
+                        // parent). Same fallback semantics as create: the
+                        // repository can live on any filesystem and reflinks
+                        // cannot cross volumes, so Unsupported (or a probe
+                        // error) falls back to a linked worktree instead of
+                        // failing the duplicate.
                         std::fs::create_dir_all(&ws_dir).map_err(|e| {
                             Error::Internal(format!(
                                 "cannot create workspace dir for CoW probe: {e}"
@@ -8788,14 +8805,21 @@ impl WorkspaceApi for Services {
                         .map_err(|e| Error::Internal(format!("CoW probe task failed: {e}")))?;
                         match support {
                             Ok(intent_git::CowSupport::Supported) => intent_core::CheckoutMode::Cow,
-                            Ok(intent_git::CowSupport::Unsupported) | Err(_) => {
-                                // Remove the just-created `<root>/<wsId>` dir
-                                // (including any probe temp files) so no
-                                // partial checkout is left behind.
-                                let _ = std::fs::remove_dir_all(&ws_dir);
-                                return Err(Error::Unsupported(
-                                    "CoW isolation is enabled but the filesystem does not support CoW cloning — disable workspace.cowIsolation or move the workspaces root to a supported filesystem".to_string(),
-                                ));
+                            Ok(intent_git::CowSupport::Unsupported) => {
+                                tracing::warn!(
+                                    repository_path = %repo_dir.display(),
+                                    workspaces_root = %workspaces_root.display(),
+                                    "workspace.duplicate: CoW isolation is enabled but the repository's filesystem cannot CoW-clone into the workspaces root; falling back to a linked worktree"
+                                );
+                                intent_core::CheckoutMode::Worktree
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    repository_path = %repo_dir.display(),
+                                    error = %e,
+                                    "workspace.duplicate: CoW probe failed; falling back to a linked worktree"
+                                );
+                                intent_core::CheckoutMode::Worktree
                             }
                         }
                     } else {
@@ -8932,12 +8956,14 @@ impl WorkspaceApi for Services {
                             );
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree returned Err").await;
-                            } else {
-                                // CoW: the failed clone is already gone; drop
-                                // the `<root>/<wsId>` parent the probe created
-                                // if it is left empty (#774). The metadata
-                                // write below recreates the dir with content
-                                // for the (worktree-less) duplicate row.
+                            }
+                            if cow_isolation {
+                                // The CoW probe pre-created `<root>/<wsId>`
+                                // (both for a CoW checkout and for the
+                                // worktree fallback); drop it if it is left
+                                // empty (#774). The metadata write below
+                                // recreates the dir with content for the
+                                // (worktree-less) duplicate row.
                                 remove_workspace_dir_if_empty(&ws_dir);
                             }
                         }
@@ -8949,7 +8975,8 @@ impl WorkspaceApi for Services {
                             );
                             if mode == intent_core::CheckoutMode::Worktree {
                                 cleanup_orphan_branch("provision_worktree task JoinError").await;
-                            } else {
+                            }
+                            if cow_isolation {
                                 remove_workspace_dir_if_empty(&ws_dir);
                             }
                         }

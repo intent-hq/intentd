@@ -269,7 +269,10 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         .await
         .unwrap();
 
-    let svc = Services::new(store);
+    // Hermetic root: the get/list enrichment probes the workspaces root for
+    // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     // workspace.get
     let got = svc.get_workspace(ws.clone()).await.expect("get");
@@ -12035,6 +12038,37 @@ mod worktree_provisioning {
         (svc, config_dir)
     }
 
+    /// Regression: `compute_cow_supported` must resolve the workspaces root
+    /// like every other consumer — injected root, else
+    /// `default_workspaces_root()` — so production daemons (which never call
+    /// `.with_workspaces_root()`) still report the `cowSupported` capability.
+    /// Guarded by `INTENTD_WORKSPACES_DIR` (env-var mutation is
+    /// process-global, hence the lock + restore).
+    #[tokio::test]
+    async fn cow_supported_probes_default_root_when_none_injected() {
+        static ENV_WS_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-cowcap-root");
+        let svc = Services::new(store); // no .with_workspaces_root()
+
+        let result = {
+            let _lock = ENV_WS_DIR_LOCK.lock().await;
+            let prior = std::env::var_os("INTENTD_WORKSPACES_DIR");
+            std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
+            let result = svc.compute_cow_supported().await;
+            match prior {
+                Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
+                None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
+            }
+            result
+        };
+        assert!(
+            result.is_some(),
+            "capability reported (true or false) even without an injected root"
+        );
+    }
+
     /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
     /// standalone CoW clone (not a linked worktree) checked out on the
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`
@@ -12102,15 +12136,15 @@ mod worktree_provisioning {
         );
     }
 
-    /// cowIsolation on + CoW-incapable filesystem: `workspace.create` fails
-    /// with the actionable error and leaves no workspace row or partial
-    /// checkout behind (no silent worktree fallback). Runs only where the
-    /// probe reports Unsupported (the inverse of the test above).
+    /// cowIsolation on + CoW-incapable filesystem: `workspace.create` falls
+    /// back to a linked worktree (`checkoutMode: "worktree"`) instead of
+    /// failing — the setting is a preference, not a guarantee. Runs only
+    /// where the probe reports Unsupported (the inverse of the test above).
     #[tokio::test]
-    async fn create_fails_when_isolation_enabled_but_cow_unsupported() {
+    async fn create_falls_back_to_worktree_when_cow_unsupported() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let (repo_dir, _, head_branch) = seed_repo("intentd-cowunsup-repo");
+        let (repo_dir, head_sha, head_branch) = seed_repo("intentd-cowunsup-repo");
         let root = unique_dir("intentd-cowunsup-root");
         if intent_git::cow_probe(&repo_dir.0, &root.0)
             .unwrap_or(intent_git::CowSupport::Unsupported)
@@ -12121,29 +12155,36 @@ mod worktree_provisioning {
         }
         let (svc, _config) = services_with_cow_isolation(store.clone(), root.0.clone(), true);
 
-        let err = svc
+        let ws = svc
             .create_workspace(
                 WorkspaceCreate {
                     repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    repository_name: Some("My Repo".to_string()),
                     base_ref: Some(head_branch),
                     ..Default::default()
                 },
                 None,
             )
             .await
-            .expect_err("create must fail");
-        assert!(matches!(err, Error::Unsupported(_)));
-        assert!(
-            err.to_string().contains("workspace.cowIsolation"),
-            "error names the setting: {err}"
+            .expect("create falls back to a worktree instead of failing")
+            .workspace;
+
+        assert_eq!(
+            ws.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "unsupported probe falls back to a linked worktree"
         );
-        // No workspace row and no partial checkout left behind.
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        let wt = ws.worktree_path.as_deref().expect("worktree path set");
+        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
         assert!(
-            std::fs::read_dir(&root.0)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true),
-            "workspaces root has no partial checkout"
+            wt_repo.is_worktree(),
+            "fallback checkout is a linked worktree"
+        );
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+        let persisted = store.get_workspace(&ws.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree)
         );
     }
 
@@ -12335,10 +12376,10 @@ mod worktree_provisioning {
     }
 
     /// cowIsolation on + CoW-incapable filesystem: `workspace.duplicate`
-    /// fails with the same actionable error as create (no silent worktree
-    /// fallback) and inserts no duplicate row.
+    /// mirrors the create fallback — the duplicate gets a linked worktree
+    /// (`checkoutMode: "worktree"`) instead of failing.
     #[tokio::test]
-    async fn duplicate_fails_when_isolation_enabled_but_cow_unsupported() {
+    async fn duplicate_falls_back_to_worktree_when_cow_unsupported() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let (repo_dir, _, _) = seed_repo("intentd-cowdupun-repo");
@@ -12359,17 +12400,21 @@ mod worktree_provisioning {
         src_ws.repository_path = Some(repo_dir.0.to_string_lossy().to_string());
         store.insert_workspace(&src_ws).await.expect("insert");
 
-        let err = svc
+        let dup = svc
             .duplicate_workspace(src_id, None)
             .await
-            .expect_err("duplicate must fail");
-        assert!(matches!(err, Error::Unsupported(_)));
-        assert!(
-            err.to_string().contains("workspace.cowIsolation"),
-            "error names the setting: {err}"
+            .expect("duplicate falls back to a worktree instead of failing");
+        assert_eq!(
+            dup.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "unsupported probe falls back to a linked worktree"
         );
-        let rows = store.list_workspaces(true).await.expect("list");
-        assert_eq!(rows.len(), 1, "no duplicate row inserted on failure");
+        let wt = dup.worktree_path.as_deref().expect("worktree path set");
+        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
+        assert!(
+            wt_repo.is_worktree(),
+            "fallback checkout is a linked worktree"
+        );
     }
 
     /// Regression for monorepo#774 (`workspace.create` path): when the CoW
@@ -15281,7 +15326,10 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store);
+    // Hermetic root: the change-emit path enriches the workspace (including
+    // the `cowSupported` root probe); tests must never touch `~/intent/workspaces`.
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     let sess1 = intent_core::AgentSession {
         id: intent_core::AgentId::from("agent-1"),
@@ -15426,7 +15474,8 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
     store.insert_workspace(&workspace(&ws1)).await.expect("ws1");
     store.insert_workspace(&workspace(&ws2)).await.expect("ws2");
 
-    let svc = Services::new(store);
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
     let ts = now_iso();
 
     let sess = intent_core::AgentSession {
@@ -15506,7 +15555,8 @@ async fn scan_all_token_usage_pauses_between_workspaces() {
     for id in &ids {
         store.insert_workspace(&workspace(id)).await.expect("ws");
     }
-    let svc = Services::new(store);
+    let root = tempfile::tempdir().expect("temp workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     let start = std::time::Instant::now();
     svc.scan_all_token_usage().await;
