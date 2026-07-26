@@ -96,8 +96,6 @@ fn clone_entry(
             return Ok(());
         }
         fs::create_dir(dst).map_err(|e| Error::Internal(format!("create dest dir failed: {e}")))?;
-        fs::set_permissions(dst, metadata.permissions())
-            .map_err(|e| Error::Internal(format!("set dir permissions failed: {e}")))?;
 
         let entries =
             fs::read_dir(src).map_err(|e| Error::Internal(format!("read dir failed: {e}")))?;
@@ -107,6 +105,10 @@ fn clone_entry(
             let dst_path = dst.join(entry.file_name());
             clone_entry(&src_path, &dst_path, root_dev, clone_file, stats)?;
         }
+        // Applied after the children are cloned: a non-writable source dir
+        // (e.g. 0555) must not block creating entries inside the copy.
+        fs::set_permissions(dst, metadata.permissions())
+            .map_err(|e| Error::Internal(format!("set dir permissions failed: {e}")))?;
         Ok(())
     } else if file_type.is_file() {
         match clone_file(src, dst) {
@@ -115,10 +117,13 @@ fn clone_entry(
                 Ok(())
             }
             Err(Error::Unsupported(reason)) => {
-                tracing::debug!(
+                // warn, not debug: a skipped regular file is potentially
+                // data-bearing (an untracked file is simply absent from the
+                // clone), so leave an actionable per-path trace.
+                tracing::warn!(
                     path = %src.display(),
                     %reason,
-                    "cow_clone: skipping entry whose per-entry clone is unsupported"
+                    "cow_clone: skipping regular file whose per-entry clone is unsupported"
                 );
                 stats.skipped_unsupported += 1;
                 Ok(())

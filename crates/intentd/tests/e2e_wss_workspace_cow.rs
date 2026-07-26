@@ -1119,3 +1119,75 @@ async fn workspace_duplicate_provisions_cow_clone_over_wss() {
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);
 }
+
+/// Scenario E2 — `workspace.duplicate` mid-flight CoW failure safety net:
+/// with the clone forced to fail as unsupported (same seam as Scenario B2),
+/// both the create and the duplicate must transparently fall back to a linked
+/// worktree instead of failing — exercising the duplicate path's
+/// `Ok(Err(Unsupported))` retry arm.
+#[tokio::test]
+async fn workspace_duplicate_falls_back_to_worktree_when_clone_fails_midflight() {
+    const TEST: &str = "workspace.duplicate CoW mid-flight fallback WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("cowdupmid");
+    let (daemon, port, cfg) = boot(
+        &root,
+        &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
+    )
+    .await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut ws, 1, true).await;
+
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "CoW Dup Mid-flight Source",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let source_id = created["workspace"]["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        created["workspace"]["checkoutMode"],
+        json!("worktree"),
+        "create falls back mid-flight: {created}"
+    );
+
+    let dup = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.duplicate",
+        json!({ "workspaceId": source_id }),
+    )
+    .await;
+    let workspace = &dup["workspace"];
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "duplicate falls back mid-flight instead of failing: {workspace}"
+    );
+    let wt = workspace["worktreePath"].as_str().expect("worktreePath");
+    let wt_path = PathBuf::from(wt);
+    assert!(
+        wt_path.join("README.md").exists(),
+        "duplicate checkout populated"
+    );
+    assert!(
+        wt_path.join(".git").is_file(),
+        "duplicate fallback is a linked worktree (gitfile .git)"
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}

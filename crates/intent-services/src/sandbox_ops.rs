@@ -151,6 +151,16 @@ pub async fn provision_sandbox(
             .set_head(&refname)
             .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
 
+        // The best-effort clone can skip a TRACKED regular file (per-entry
+        // unsupported errno, or a tracked file under a skipped nested mount).
+        // Unlike `provision_cow_checkout` there is no hard reset here to heal
+        // it, and left alone the missing file would read as a deletion that
+        // `create_snapshot_commit` records — and a later merge-back could
+        // propagate to the user's tree. Restore just the index-tracked paths
+        // missing from the worktree before the dirty check; genuinely dirty
+        // state is untouched.
+        restore_missing_tracked_files(&sandbox_repo, &sandbox_path)?;
+
         // Check for dirty state and create a snapshot commit if needed
         let snapshot_commit_sha = if is_dirty(&sandbox_repo)? {
             Some(create_snapshot_commit(&sandbox_repo, agent_id)?)
@@ -548,6 +558,45 @@ fn slugify(s: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+/// Restore index-tracked files that are missing from the worktree (the
+/// best-effort CoW clone may have skipped them as non-clonable). Checks out
+/// ONLY those paths from the index, so genuinely dirty state — modified
+/// tracked files, staged changes, untracked files — is left untouched.
+fn restore_missing_tracked_files(
+    repo: &git2::Repository,
+    worktree_root: &std::path::Path,
+) -> Result<()> {
+    let index = repo
+        .index()
+        .map_err(|e| Error::Internal(format!("get index failed: {e}")))?;
+    let mut missing: Vec<Vec<u8>> = Vec::new();
+    for entry in index.iter() {
+        let rel = std::path::Path::new(
+            std::str::from_utf8(&entry.path)
+                .map_err(|e| Error::Internal(format!("non-UTF-8 path in sandbox index: {e}")))?,
+        );
+        if worktree_root.join(rel).symlink_metadata().is_err() {
+            missing.push(entry.path.clone());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        worktree = %worktree_root.display(),
+        count = missing.len(),
+        "provision_sandbox: restoring tracked files missing from the CoW clone (skipped by the best-effort walk)"
+    );
+    let mut opts = git2::build::CheckoutBuilder::new();
+    opts.force().update_index(false);
+    for path in &missing {
+        opts.path(std::path::Path::new(std::str::from_utf8(path).unwrap()));
+    }
+    repo.checkout_index(None, Some(&mut opts))
+        .map_err(|e| Error::Internal(format!("restore missing tracked files failed: {e}")))?;
+    Ok(())
 }
 
 /// Check if a git repository has uncommitted changes (staged, unstaged, or untracked).
@@ -1464,6 +1513,147 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&cross_volume_root);
+    }
+
+    #[tokio::test]
+    async fn provision_returns_unsupported_for_gitfile_canonical_dir() {
+        // A linked-worktree canonical dir (gitfile .git) must degrade to
+        // shared mode BEFORE any probe/clone: CoW-cloning it would corrupt
+        // the user's source checkout.
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("gitfile-src");
+
+        // Give the repo a real worktree with a commit, then link a worktree.
+        fs::write(repo_path.join("a.txt"), "x").unwrap();
+        {
+            let repo = git2::Repository::open(&repo_path).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("a.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "add a", &tree, &[&parent])
+                .unwrap();
+        }
+        let wt_path = test_root.join("linked-wt");
+        intent_git::worktree::provision_worktree(
+            &repo_path,
+            "linked-wt",
+            &wt_path,
+            "wt-branch",
+            None,
+            "origin",
+        )
+        .unwrap();
+        assert!(wt_path.join(".git").is_file(), "worktree .git is a gitfile");
+
+        // The workspace's canonical dir is the linked worktree.
+        let ws = workspace_for_repo(&wt_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let config = ProvisionConfig {
+            workspaces_root: test_root.join("workspaces"),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Unsupported = outcome else {
+            panic!("Expected Unsupported outcome for a gitfile canonical dir");
+        };
+        // The user's worktree is untouched.
+        assert_eq!(fs::read_to_string(wt_path.join("a.txt")).unwrap(), "x");
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(sandbox.is_none());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn provision_returns_unsupported_when_clone_fails_midflight() {
+        // Probe passes but the clone itself fails as unsupported (forced via
+        // the test seam): provision must degrade to shared mode, not error.
+        let (store, _db) = temp_store().await;
+        let unique = format!("midflight-{}", uuid::Uuid::new_v4());
+        let (test_root, repo_path) = temp_repo_in_target(&unique);
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        let agent_id = AgentId::new();
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        // Needle is the test-unique repo dir name, so parallel tests cloning
+        // other paths are unaffected.
+        std::env::set_var(intent_git::TEST_COW_CLONE_UNSUPPORTED_PATH_ENV, &unique);
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let outcome = provision_sandbox(&store, &ws.id, &agent_id, &config).await;
+        std::env::remove_var(intent_git::TEST_COW_CLONE_UNSUPPORTED_PATH_ENV);
+
+        let ProvisionOutcome::Unsupported = outcome.unwrap() else {
+            panic!("Expected Unsupported outcome for a mid-flight unsupported clone");
+        };
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(sandbox.is_none());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn restore_missing_tracked_files_restores_only_missing_paths() {
+        // A tracked file missing from the worktree (as if skipped by the
+        // best-effort clone) is restored from the index; dirty tracked files
+        // and untracked files are untouched.
+        let (test_root, repo_path) = temp_repo_in_target("restore-missing");
+        let repo = git2::Repository::open(&repo_path).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        fs::write(repo_path.join("kept.txt"), "kept").unwrap();
+        fs::write(repo_path.join("skipped.txt"), "skipped").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("kept.txt")).unwrap();
+        index.add_path(Path::new("skipped.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "add files", &tree, &[&parent])
+            .unwrap();
+
+        // Simulate the walk skipping one tracked file, plus genuine dirt.
+        fs::remove_file(repo_path.join("skipped.txt")).unwrap();
+        fs::write(repo_path.join("kept.txt"), "dirty edit").unwrap();
+        fs::write(repo_path.join("untracked.txt"), "new").unwrap();
+
+        restore_missing_tracked_files(&repo, &repo_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(repo_path.join("skipped.txt")).unwrap(),
+            "skipped",
+            "missing tracked file is restored from the index"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("kept.txt")).unwrap(),
+            "dirty edit",
+            "dirty tracked file is untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_path.join("untracked.txt")).unwrap(),
+            "new",
+            "untracked file is untouched"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
     }
 
     #[tokio::test]

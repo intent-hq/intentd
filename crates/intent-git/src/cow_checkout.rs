@@ -38,9 +38,21 @@ pub fn provision_cow_checkout(
     base_ref: Option<&str>,
     remote: &str,
 ) -> Result<String> {
+    // Canonicalize first: a symlinked `repo_path` would otherwise be cloned
+    // as the symlink itself (both the recursive clonefile and the best-effort
+    // walk preserve links without following the root), leaving `checkout_path`
+    // resolving THROUGH the link into the original repo — so the registration
+    // strip and hard reset below would operate on the user's source checkout.
+    let repo_path = repo_path.canonicalize().map_err(|e| {
+        Error::InvalidInput(format!(
+            "cannot canonicalize repository path {}: {e}",
+            repo_path.display()
+        ))
+    })?;
+    let repo_path = repo_path.as_path();
     if repo_path.join(".git").is_file() {
         return Err(Error::Unsupported(format!(
-            "repository at {} is a linked git worktree (gitfile .git); CoW-cloning it would corrupt the source checkout",
+            "repository at {} has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout",
             repo_path.display()
         )));
     }

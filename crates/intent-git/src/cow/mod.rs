@@ -31,7 +31,9 @@ mod windows;
 /// Test hook: force `cow_clone` to fail with `Error::Unsupported` when the
 /// source path contains this substring. Lets tests exercise the
 /// clone-fails-after-probe-passes fallback paths, which the best-effort walk
-/// otherwise makes hard to trigger naturally.
+/// otherwise makes hard to trigger naturally. NOTE: this seam is compiled
+/// into release binaries too (release-mode e2e runs need it); it is inert
+/// unless the namespaced env var is set.
 pub const TEST_COW_CLONE_UNSUPPORTED_PATH_ENV: &str = "INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH";
 
 /// CoW support result for a (src, dst) directory pair.
@@ -301,7 +303,13 @@ mod tests {
         let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
 
-        let probe = cow_probe(&src, &tmpdir).unwrap();
+        // Probe between test-unique dirs (same volume as the clone) so the
+        // probe's fixed temp filename cannot race parallel tests probing the
+        // shared tmpdir.
+        let probe_dst = tmpdir.join("cow_clone_special_probe");
+        fs::create_dir_all(&probe_dst).unwrap();
+        let probe = cow_probe(&src, &probe_dst).unwrap();
+        let _ = fs::remove_dir_all(&probe_dst);
         if probe == CowSupport::Unsupported {
             eprintln!("Skipping special-file test: CoW not supported on this filesystem");
             let _ = fs::remove_dir_all(&src);

@@ -7626,7 +7626,7 @@ impl WorkspaceApi for Services {
                                     // linked worktree instead.
                                     tracing::warn!(
                                         repository_path = %repo_dir.display(),
-                                        "workspace.create: repositoryPath is itself a linked git worktree; CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
+                                        "workspace.create: repositoryPath has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
                                     );
                                     intent_core::CheckoutMode::Worktree
                                 } else if cow_isolation {
@@ -7741,6 +7741,33 @@ impl WorkspaceApi for Services {
                                         match provision(mode).await {
                                             Ok(sha) => sha,
                                             Err(e) => {
+                                                // `provision_worktree` creates
+                                                // the branch before `git
+                                                // worktree add`; on partial
+                                                // failure the branch may exist
+                                                // in the SOURCE repo with no
+                                                // workspace row to clean it up
+                                                // later. Best-effort delete it.
+                                                let cleanup_repo = repo_dir.clone();
+                                                let cleanup_branch = branch.clone();
+                                                let cleanup = worktree_locks
+                                                    .with_lock(&repo_dir, move || async move {
+                                                        tokio::task::spawn_blocking(move || {
+                                                            intent_git::branches::delete_local_branch(
+                                                                &cleanup_repo,
+                                                                &cleanup_branch,
+                                                            )
+                                                        })
+                                                        .await
+                                                    })
+                                                    .await;
+                                                if let Ok(Err(cleanup_err)) = cleanup {
+                                                    tracing::debug!(
+                                                        branch = %branch,
+                                                        error = %cleanup_err,
+                                                        "workspace.create: best-effort branch cleanup did not delete branch (may not have been created)"
+                                                    );
+                                                }
                                                 remove_workspace_dir_if_empty(&ws_dir);
                                                 return Err(e);
                                             }
@@ -8943,7 +8970,7 @@ impl WorkspaceApi for Services {
                         // a linked worktree instead.
                         tracing::warn!(
                             repository_path = %repo_dir.display(),
-                            "workspace.duplicate: repositoryPath is itself a linked git worktree; CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
+                            "workspace.duplicate: repositoryPath has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
                         );
                         intent_core::CheckoutMode::Worktree
                     } else if cow_isolation {

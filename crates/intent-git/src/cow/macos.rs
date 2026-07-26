@@ -254,8 +254,14 @@ pub fn clone(src: &Path, dst: &Path) -> Result<()> {
             );
             if dst.exists() {
                 // A failed recursive copyfile leaves a partial destination
-                // tree behind; clear it before the walk.
-                let _ = std::fs::remove_dir_all(dst);
+                // tree behind; clear it before the walk. If the cleanup
+                // fails the walk would die on EEXIST and obscure the real
+                // failure, so surface the cleanup error directly.
+                std::fs::remove_dir_all(dst).map_err(|e| {
+                    Error::Internal(format!(
+                        "cannot remove partial clone before best-effort retry: {e}"
+                    ))
+                })?;
             }
             super::best_effort::clone_tree(src, dst, clone_file)
         }
