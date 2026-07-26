@@ -957,6 +957,137 @@ async fn comment_add_idempotency_key_dedupes_over_wss() {
     );
 }
 
+/// End-to-end (Round 15): over the real WSS router path, `comment.add`
+/// (a) self-heals phantom anchor markers — UUID-format debris with no live
+/// comment row no longer blocks the add and is scrubbed from the persisted
+/// note — and (b) supports overlapping ranges: a second add whose target
+/// spans the first comment's markers succeeds, the pairs interleave, and the
+/// stored anchorText/anchorContext contain no raw marker text.
+#[tokio::test]
+async fn comment_add_scrubs_phantoms_and_overlaps_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+
+    // Bootstrap workspace + a note pre-polluted with phantom debris off UDS.
+    let socket = daemon.data_dir.join("intentd.sock");
+    let create = uds_rpc(
+        &socket,
+        2,
+        "workspace.create",
+        json!({ "title": "Comments", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = create["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let phantom = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    let n = uds_rpc(
+        &socket,
+        3,
+        "note.create",
+        json!({
+            "workspaceId": ws_id,
+            "title": "Note",
+            "content": format!(
+                "alpha <!--anchor:{phantom}:start-->beta<!--anchor:{phantom}:end--> gamma delta"
+            ),
+        }),
+    )
+    .await;
+    let note_id = n["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+
+    // First add over WSS: the phantom debris around "beta" must not block the
+    // match, and the persisted note must be debris-free.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let first = wss_rpc(
+        &mut rpc,
+        1,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "alpha beta gamma delta",
+            "commentTarget": "beta",
+            "comment": "first",
+        }),
+    )
+    .await;
+    assert_eq!(first["anchored"], json!(true), "first add: {first}");
+    let c1 = first["commentId"].as_str().expect("c1 id").to_string();
+    let note = wss_rpc(
+        &mut rpc,
+        2,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = note["note"]["content"].as_str().expect("content");
+    assert!(
+        !content.contains(phantom),
+        "phantom debris must be scrubbed: {content}"
+    );
+    assert!(content.contains(&format!(
+        "<!--anchor:{c1}:start-->beta<!--anchor:{c1}:end-->"
+    )));
+
+    // Second add whose target spans c1's markers: overlapping ranges are
+    // supported — the pairs interleave and both comments stay healthy.
+    let second = wss_rpc(
+        &mut rpc,
+        3,
+        "comment.add",
+        json!({
+            "workspaceId": ws_id,
+            "noteId": note_id,
+            "searchContext": "alpha beta gamma delta",
+            "commentTarget": "beta gamma",
+            "comment": "second",
+        }),
+    )
+    .await;
+    assert_eq!(second["anchored"], json!(true), "overlapping add: {second}");
+    assert_eq!(second["location"]["anchoredText"], json!("beta gamma"));
+    let c2 = second["commentId"].as_str().expect("c2 id").to_string();
+    let note = wss_rpc(
+        &mut rpc,
+        4,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        note["note"]["content"],
+        json!(format!(
+            "alpha <!--anchor:{c1}:start--><!--anchor:{c2}:start-->beta<!--anchor:{c1}:end--> \
+             gamma<!--anchor:{c2}:end--> delta"
+        ))
+    );
+
+    // Stored rows over the wire: healthy, anchorText/context marker-free.
+    let list = wss_rpc(
+        &mut rpc,
+        5,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "includeComments": true }),
+    )
+    .await;
+    assert_eq!(list["totalThreads"], json!(2), "list: {list}");
+    let row2 = list["threads"]
+        .as_array()
+        .expect("threads")
+        .iter()
+        .flat_map(|t| t["comments"].as_array().cloned().unwrap_or_default())
+        .find(|c| c["id"] == json!(c2))
+        .expect("c2 row");
+    assert_ne!(row2["isOrphaned"], json!(true), "c2 row: {row2}");
+    assert_eq!(row2["anchorText"], json!("beta gamma"));
+    assert_eq!(row2["anchorContext"]["before"], json!("alpha "));
+    assert_eq!(row2["anchorContext"]["after"], json!(" delta"));
+}
+
 /// End-to-end (monorepo#638): `comment.add` rewrites the note markdown
 /// (anchor markers), so over WSS the result must echo the authoritative
 /// post-rewrite `noteRev` AND publish exactly one `note:updated` alongside
@@ -1785,7 +1916,9 @@ async fn comment_add_invalid_comment_id_returns_invalid_params_over_wss() {
     assert_eq!(v["error"]["code"], json!(-32602), "envelope: {v}");
     assert_eq!(
         v["error"]["message"],
-        json!("invalid params: Invalid 'commentId': not-a-uuid. Must be a valid UUID."),
+        json!(
+            "invalid params: Invalid 'commentId': not-a-uuid. Must be a canonical hyphenated UUID."
+        ),
         "envelope: {v}"
     );
 }

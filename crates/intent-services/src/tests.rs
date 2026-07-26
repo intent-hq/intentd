@@ -2239,6 +2239,309 @@ async fn comment_add_empty_target_is_invalid_params() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Round 15: phantom-marker scrub + overlapping comment ranges.
+// ---------------------------------------------------------------------------
+
+/// UUID-format marker id with no comment row behind it — phantom debris left
+/// by earlier bugs.
+const PHANTOM_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+/// Root-comment row builder for scrub tests (markers are embedded by the test
+/// content itself, not by `comment.add`).
+fn anchored_root_comment(
+    note_id: &NoteId,
+    comment_id: &str,
+    orphaned: bool,
+) -> intent_core::Comment {
+    use intent_core::{CommentAnchor, CommentAnchorType, CommentStatus, CommentType};
+    let now = now_iso();
+    intent_core::Comment {
+        id: comment_id.to_string(),
+        thread_id: comment_id.to_string(),
+        note_id: Some(note_id.clone()),
+        kind: CommentType::Comment,
+        content: format!("{comment_id} body"),
+        author: "User".to_string(),
+        author_type: intent_core::AuthorType::User,
+        status: CommentStatus::Open,
+        parent_id: None,
+        anchor: Some(CommentAnchor {
+            kind: CommentAnchorType::Range,
+            start_id: Some(comment_id.to_string()),
+            end_id: Some(comment_id.to_string()),
+            point_id: None,
+        }),
+        anchor_text: Some("beta".to_string()),
+        anchor_before: None,
+        anchor_after: None,
+        suggestion_original: None,
+        suggestion_proposed: None,
+        agent_id: None,
+        is_orphaned: orphaned.then_some(true),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+/// Round 15: phantom markers in the note must not block `comment.add` — the
+/// pre-add self-heal scrubs them so the search context matches, and the
+/// persisted rewrite drops the debris for good.
+#[tokio::test]
+async fn comment_add_scrubs_phantom_markers_before_anchoring() {
+    let (_tmp, svc, ws, id) = setup(&format!(
+        "alpha <!--anchor:{PHANTOM_UUID}:start-->beta<!--anchor:{PHANTOM_UUID}:end--> gamma"
+    ))
+    .await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha beta gamma".into(),
+            "beta".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("phantom debris must not block the add");
+    assert!(r.anchored);
+    let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
+    assert!(
+        !note.content.contains(PHANTOM_UUID),
+        "phantom markers must be scrubbed: {}",
+        note.content
+    );
+    assert!(note.content.contains(&format!(
+        "<!--anchor:{cid}:start-->beta<!--anchor:{cid}:end-->",
+        cid = r.comment_id
+    )));
+}
+
+/// Round 15 amendment: overlapping comment ranges are supported. A second add
+/// whose target spans an existing comment's markers succeeds, the marker
+/// pairs interleave, both comments stay healthy across a note round-trip, and
+/// the stored anchorText/context never contain raw marker text.
+#[tokio::test]
+async fn comment_add_overlapping_ranges_interleave_and_survive_roundtrip() {
+    let (_tmp, svc, ws, id) = setup("alpha beta gamma delta").await;
+    let c1 = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha beta gamma delta".into(),
+            "beta".into(),
+            "first".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first add");
+    // The second target spans c1's end marker; the plaintext projection finds
+    // the context and the raw span (marker included) anchors as-is.
+    let c2 = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha beta gamma delta".into(),
+            "beta gamma".into(),
+            "second".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("overlapping add must succeed");
+    assert!(c2.anchored);
+    assert_eq!(c2.location.anchored_text, "beta gamma");
+
+    let interleaved = format!(
+        "alpha <!--anchor:{c1}:start--><!--anchor:{c2}:start-->beta<!--anchor:{c1}:end--> \
+         gamma<!--anchor:{c2}:end--> delta",
+        c1 = c1.comment_id,
+        c2 = c2.comment_id
+    );
+    let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
+    assert_eq!(note.content, interleaved);
+
+    // Stored rows: healthy, and no raw marker text — not even clipped
+    // fragments — in anchorText/context. c1's start marker sits immediately
+    // before c2's span, exactly the adjacency that used to leak a clipped
+    // marker tail into `anchor_before` (PR #541 review).
+    let row2 = fetch_comment_by_id(&svc, &ws, &id, &c2.comment_id).await;
+    assert_ne!(row2.is_orphaned, Some(true));
+    assert_eq!(row2.anchor_text.as_deref(), Some("beta gamma"));
+    let ctx = row2.anchor_context.expect("context persisted");
+    for (label, s) in [("before", &ctx.before), ("after", &ctx.after)] {
+        assert!(!s.contains("<!--"), "{label}: {s:?}");
+        assert!(!s.contains(":start-->"), "{label}: {s:?}");
+        assert!(!s.contains(":end-->"), "{label}: {s:?}");
+        assert!(!s.contains(&c1.comment_id), "{label}: {s:?}");
+    }
+    assert_eq!(ctx.before, "alpha ");
+    assert_eq!(ctx.after, " delta");
+
+    // Round-trip: a note edit runs the reanchor + scrub pass; the interleaved
+    // pairs are live and must survive verbatim, both comments staying healthy.
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "delta".into(),
+            new: "DELTA".into(),
+        },
+        None,
+    )
+    .await
+    .expect("edit");
+    let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
+    assert_eq!(note.content, interleaved.replace("delta", "DELTA"));
+    for cid in [&c1.comment_id, &c2.comment_id] {
+        let row = fetch_comment_by_id(&svc, &ws, &id, cid).await;
+        assert_ne!(row.is_orphaned, Some(true), "{cid} must stay healthy");
+    }
+
+    // Other adjacency: a marker starting exactly at `to` (c1's end marker
+    // sits right after "beta") must not leak into `anchor_after` either.
+    let c3 = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha beta gamma".into(),
+            "beta".into(),
+            "third".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("third add");
+    let row3 = fetch_comment_by_id(&svc, &ws, &id, &c3.comment_id).await;
+    let ctx3 = row3.anchor_context.expect("context persisted");
+    assert_eq!(ctx3.before, "alpha ");
+    assert_eq!(ctx3.after, " gamma DELTA");
+}
+
+/// Round 15: documentation-literal marker text (non-UUID id) is ordinary user
+/// content — commentable, never scrubbed.
+#[tokio::test]
+async fn comment_add_doc_literal_marker_is_commentable_and_survives() {
+    let (_tmp, svc, ws, id) = setup("see `<!--anchor:{id}:start-->` example gamma tail here").await;
+    let r = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "see example gamma".into(),
+            "example gamma".into(),
+            "c".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("doc-literal text must be commentable");
+    assert!(r.anchored);
+    let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
+    assert!(note.content.contains("`<!--anchor:{id}:start-->`"));
+
+    // The literal also survives the reanchor + scrub pass on note.edit.
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "tail".into(),
+            new: "TAIL".into(),
+        },
+        None,
+    )
+    .await
+    .expect("edit");
+    let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
+    assert!(note.content.contains("`<!--anchor:{id}:start-->`"));
+    let row = fetch_comment_by_id(&svc, &ws, &id, &r.comment_id).await;
+    assert_ne!(row.is_orphaned, Some(true));
+}
+
+/// Round 15: `note.edit` scrubs phantom markers and stale-orphan markers
+/// while leaving live comments' markers and doc-literals untouched.
+#[tokio::test]
+async fn note_edit_scrubs_phantom_and_orphan_markers_keeps_live() {
+    const LIVE: &str = "11111111-1111-4111-8111-111111111111";
+    const ORPHAN: &str = "22222222-2222-4222-8222-222222222222";
+    let content = format!(
+        "alpha <!--anchor:{LIVE}:start-->beta<!--anchor:{LIVE}:end--> \
+         <!--anchor:{ORPHAN}:start-->gamma<!--anchor:{ORPHAN}:end--> \
+         <!--anchor:{PHANTOM_UUID}:point--> `<!--anchor:{{id}}:start-->` delta"
+    );
+    let (_tmp, svc, ws, id) = setup(&content).await;
+    svc.store()
+        .insert_comment(&ws, &anchored_root_comment(&id, LIVE, false))
+        .await
+        .expect("insert live");
+    svc.store()
+        .insert_comment(&ws, &anchored_root_comment(&id, ORPHAN, true))
+        .await
+        .expect("insert orphaned");
+
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "delta".into(),
+            new: "DELTA".into(),
+        },
+        None,
+    )
+    .await
+    .expect("edit");
+
+    let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
+    assert!(note.content.contains(&format!(
+        "<!--anchor:{LIVE}:start-->beta<!--anchor:{LIVE}:end-->"
+    )));
+    assert!(!note.content.contains(ORPHAN), "{}", note.content);
+    assert!(!note.content.contains(PHANTOM_UUID), "{}", note.content);
+    assert!(note.content.contains("`<!--anchor:{id}:start-->`"));
+    assert!(note.content.contains("DELTA"));
+    // The live row was never flipped orphaned.
+    let row = fetch_comment_by_id(&svc, &ws, &id, LIVE).await;
+    assert_ne!(row.is_orphaned, Some(true));
+}
+
+/// Round 15: `note.update` (full-content write) also runs the phantom scrub
+/// on the incoming markdown.
+#[tokio::test]
+async fn note_update_scrubs_phantom_markers_from_incoming_content() {
+    let (_tmp, svc, ws, id) = setup("v0").await;
+    svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            content: Some(format!(
+                "keep <!--anchor:{PHANTOM_UUID}:start-->beta\
+                 <!--anchor:{PHANTOM_UUID}:end--> tail"
+            )),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+    let note = svc.get_note(ws, id).await.expect("get");
+    assert_eq!(note.content, "keep beta tail");
+}
+
 #[tokio::test]
 async fn comment_respond_suggestion_nests_diff_and_threads() {
     let (_tmp, svc, ws, id) = setup("alpha unique-target omega").await;

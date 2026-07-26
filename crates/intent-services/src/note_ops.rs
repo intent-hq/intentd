@@ -849,15 +849,12 @@ fn plaintext_fallback_anchor(
         .expect("mapped offset is a char boundary")
         .len_utf8();
     let to = last_start + last_len;
-    // A projected match can span an existing `<!--anchor:…-->` marker (the
-    // projection strips them); embedding new markers around such a span would
-    // interleave with the existing pair and replay raw marker text into the
-    // note. Reject instead of producing a corrupt anchor.
-    if content[from..to].contains("<!--anchor:") {
-        return Err(Error::InvalidParams(
-            "The comment target overlaps an existing comment anchor.".to_string(),
-        ));
-    }
+    // A projected match may span existing `<!--anchor:…-->` markers (the
+    // projection strips them). That is fine: overlapping comment ranges are
+    // supported — the new pair interleaves with the existing pairs, and each
+    // comment's own id still pins its markers. Callers sanitize the STORED
+    // comment text separately (see [`strip_anchor_marker_text`]) so raw
+    // marker text never leaks into comment rows.
     Ok((from, to))
 }
 
@@ -976,6 +973,107 @@ pub fn remove_anchor_markers(markdown: &str, comment_id: &str) -> String {
     let start_pat = start_marker(comment_id);
     let end_pat = end_marker(comment_id);
     markdown.replace(&start_pat, "").replace(&end_pat, "")
+}
+
+const ANCHOR_MARKER_PREFIX: &str = "<!--anchor:";
+
+/// True when `id` is a canonical hyphenated UUID (`8-4-4-4-12` hex digits).
+/// Real anchor markers always carry a UUID id (`comment.add` mints v4 UUIDs
+/// and validates client-supplied ids against this same canonical form);
+/// anything else — e.g. the literal `{id}` in documentation examples — is
+/// ordinary user content.
+pub fn is_canonical_uuid(id: &str) -> bool {
+    let b = id.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    b.iter().enumerate().all(|(i, &c)| match i {
+        8 | 13 | 18 | 23 => c == b'-',
+        _ => c.is_ascii_hexdigit(),
+    })
+}
+
+/// Parse a real anchor marker at the start of `rest`
+/// (`<!--anchor:<uuid>:start|end|point-->`). Returns `(uuid, marker_len)`;
+/// `None` when the text merely resembles a marker (non-UUID id, unknown
+/// role, unterminated comment).
+fn parse_uuid_anchor_marker(rest: &str) -> Option<(&str, usize)> {
+    let after = rest.strip_prefix(ANCHOR_MARKER_PREFIX)?;
+    let colon = after.find(':')?;
+    let id = &after[..colon];
+    if !is_canonical_uuid(id) {
+        return None;
+    }
+    let tail = &after[colon + 1..];
+    ["start-->", "end-->", "point-->"]
+        .iter()
+        .find(|role| tail.starts_with(**role))
+        .map(|role| (id, ANCHOR_MARKER_PREFIX.len() + colon + 1 + role.len()))
+}
+
+/// Remove every `<!--anchor:…-->` substring (any id, real or lookalike) from
+/// `s`. Used to sanitize STORED comment text — `anchor_text`,
+/// `anchor_before`, `anchor_after` — when the anchored span overlaps other
+/// comments' markers: raw marker text must never leak into comment rows.
+/// Runs to a fixpoint so removals that concatenate into new marker text are
+/// also caught.
+///
+/// Removal is greedy from `<!--anchor:` to the NEXT `-->` anywhere in the
+/// string — deliberately looser than [`parse_uuid_anchor_marker`]: an
+/// unterminated lookalike followed by a real marker is one HTML comment in
+/// rendered markdown, so the whole run (including text between them) is
+/// dropped, matching what a renderer would hide.
+pub fn strip_anchor_marker_text(s: &str) -> String {
+    let mut cur = s.to_string();
+    loop {
+        let mut out = String::with_capacity(cur.len());
+        let mut i = 0;
+        let mut changed = false;
+        while let Some(rel) = cur[i..].find(ANCHOR_MARKER_PREFIX) {
+            let pos = i + rel;
+            let Some(close) = cur[pos..].find("-->") else {
+                break;
+            };
+            out.push_str(&cur[i..pos]);
+            i = pos + close + "-->".len();
+            changed = true;
+        }
+        out.push_str(&cur[i..]);
+        if !changed {
+            return out;
+        }
+        cur = out;
+    }
+}
+
+/// Remove every UUID-format anchor marker whose uuid is not in `live_ids` —
+/// phantom debris (an id with no comment row at all) and stale-orphan debris
+/// (markers of rows already flagged `is_orphaned`) alike. Non-UUID
+/// marker-lookalikes (documentation literals such as
+/// `<!--anchor:{id}:start-->`) are user content and are never touched.
+pub fn scrub_phantom_anchor_markers(
+    content: &str,
+    live_ids: &std::collections::HashSet<String>,
+) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while let Some(rel) = content[i..].find(ANCHOR_MARKER_PREFIX) {
+        let pos = i + rel;
+        out.push_str(&content[i..pos]);
+        match parse_uuid_anchor_marker(&content[pos..]) {
+            Some((id, len)) if !live_ids.contains(id) => i = pos + len,
+            Some((_, len)) => {
+                out.push_str(&content[pos..pos + len]);
+                i = pos + len;
+            }
+            None => {
+                out.push_str(ANCHOR_MARKER_PREFIX);
+                i = pos + ANCHOR_MARKER_PREFIX.len();
+            }
+        }
+    }
+    out.push_str(&content[i..]);
+    out
 }
 
 /// Outcome of an anchor recovery attempt (reference `RecoveryResult`).
@@ -1664,16 +1762,28 @@ mod tests {
     }
 
     #[test]
-    fn anchor_plaintext_fallback_rejects_span_over_existing_marker() {
-        // A target whose mapped source range would swallow an existing anchor
-        // marker must be rejected: embedding new markers there would
-        // interleave the pairs and replay raw marker text into the note.
-        let content = "alpha <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma delta";
-        let err = find_and_anchor_text(content, "beta gamma delta", "beta gamma").unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidParams(ref m) if m.contains("overlaps an existing comment anchor")),
-            "unexpected error: {err:?}"
-        );
+    fn anchor_plaintext_fallback_allows_span_over_existing_marker() {
+        // Overlapping comment ranges are supported: a target whose mapped
+        // source range swallows an existing anchor pair is anchored as-is,
+        // markers included — the pairs interleave and each id still pins its
+        // own markers.
+        let content = "alpha <!--anchor:11111111-2222-3333-4444-555555555555:start-->beta\
+                       <!--anchor:11111111-2222-3333-4444-555555555555:end--> gamma delta";
+        let (from, to, _line) = find_and_anchor_text(content, "beta gamma delta", "beta gamma")
+            .expect("span over an existing marker must anchor");
+        assert!(content[from..to].starts_with("beta"));
+        assert!(content[from..to].ends_with("gamma"));
+        assert!(content[from..to].contains(":end-->"));
+    }
+
+    #[test]
+    fn anchor_plaintext_fallback_allows_span_over_doc_literal_marker() {
+        // A documentation-literal marker (non-UUID id) is ordinary user
+        // content: a span containing it anchors fine and keeps the literal.
+        let content = "alpha `<!--anchor:{id}:start-->` gamma delta";
+        let (from, to, _line) = find_and_anchor_text(content, "alpha gamma delta", "alpha gamma")
+            .expect("doc-literal marker must not trip the overlap guard");
+        assert!(content[from..to].contains("<!--anchor:{id}:start-->"));
     }
 
     #[test]
@@ -1867,15 +1977,15 @@ mod tests {
     }
 
     #[test]
-    fn anchor_target_rescue_rejects_span_over_existing_marker() {
-        // Rescue output goes through the same marker-overlap rejection.
-        let content = "gone before <!--anchor:c1:start-->beta<!--anchor:c1:end--> gamma tail";
-        let err = find_and_anchor_text(content, "vanished before beta gamma tail", "beta gamma")
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidParams(ref m) if m.contains("overlaps an existing comment anchor")),
-            "unexpected error: {err:?}"
-        );
+    fn anchor_target_rescue_allows_span_over_existing_marker() {
+        // Rescue output may also span an existing pair; overlap is supported.
+        let content = "gone before <!--anchor:11111111-2222-3333-4444-555555555555:start-->beta\
+                       <!--anchor:11111111-2222-3333-4444-555555555555:end--> gamma tail";
+        let (from, to, _line) =
+            find_and_anchor_text(content, "vanished before beta gamma tail", "beta gamma")
+                .expect("rescued span over an existing marker must anchor");
+        assert!(content[from..to].starts_with("beta"));
+        assert!(content[from..to].ends_with("gamma"));
     }
 
     #[test]
@@ -2114,5 +2224,85 @@ mod tests {
         assert_eq!(stripped, "pre target post");
         // No-op when nothing to strip.
         assert_eq!(remove_anchor_markers("plain", "c1"), "plain");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phantom-marker scrub.
+    // -----------------------------------------------------------------------
+
+    const LIVE_ID: &str = "11111111-2222-3333-4444-555555555555";
+    const PHANTOM_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn scrub_removes_phantom_markers_keeps_live() {
+        let content = format!(
+            "a <!--anchor:{LIVE_ID}:start-->b<!--anchor:{LIVE_ID}:end--> \
+             c <!--anchor:{PHANTOM_ID}:start-->d<!--anchor:{PHANTOM_ID}:end--> \
+             e <!--anchor:{PHANTOM_ID}:point--> f"
+        );
+        let out = scrub_phantom_anchor_markers(&content, &live_set(&[LIVE_ID]));
+        assert_eq!(
+            out,
+            format!("a <!--anchor:{LIVE_ID}:start-->b<!--anchor:{LIVE_ID}:end--> c d e  f")
+        );
+    }
+
+    #[test]
+    fn scrub_never_touches_non_uuid_marker_lookalikes() {
+        // Documentation literals (`{id}`, short ids, unknown roles) and
+        // unterminated comments are user content — always preserved.
+        let content = "see `<!--anchor:{id}:start-->` and <!--anchor:c1:end--> \
+                       and <!--anchor:11111111-2222-3333-4444-555555555555:middle--> \
+                       and <!--anchor:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:start";
+        let out = scrub_phantom_anchor_markers(content, &live_set(&[]));
+        assert_eq!(out, content);
+    }
+
+    #[test]
+    fn scrub_empty_live_set_removes_all_uuid_markers() {
+        let content = format!("x<!--anchor:{PHANTOM_ID}:start-->y<!--anchor:{PHANTOM_ID}:end-->z");
+        let out = scrub_phantom_anchor_markers(&content, &live_set(&[]));
+        assert_eq!(out, "xyz");
+    }
+
+    #[test]
+    fn scrub_is_noop_without_markers() {
+        let content = "plain text, no markers";
+        assert_eq!(
+            scrub_phantom_anchor_markers(content, &live_set(&[LIVE_ID])),
+            content
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stored-text marker stripping.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_anchor_marker_text_removes_all_markers() {
+        let s = format!(
+            "beta<!--anchor:{LIVE_ID}:end--> gamma <!--anchor:{{id}}:start--> delta \
+             <!--anchor:{PHANTOM_ID}:point-->"
+        );
+        assert_eq!(strip_anchor_marker_text(&s), "beta gamma  delta ");
+    }
+
+    #[test]
+    fn strip_anchor_marker_text_reaches_fixpoint() {
+        // Removing the inner marker concatenates the halves of an outer one;
+        // the fixpoint loop must catch the newly-formed marker too.
+        let s = format!("a<!--anchor<!--anchor:{LIVE_ID}:end-->:x-->b");
+        assert_eq!(strip_anchor_marker_text(&s), "ab");
+    }
+
+    #[test]
+    fn strip_anchor_marker_text_keeps_unterminated_and_plain() {
+        assert_eq!(strip_anchor_marker_text("plain"), "plain");
+        let unterminated = "text <!--anchor:tail";
+        assert_eq!(strip_anchor_marker_text(unterminated), unterminated);
     }
 }

@@ -2840,9 +2840,13 @@ async fn reanchor_note_comments(
     let comments = store
         .list_comments_in_workspace(workspace_id, note_id)
         .await?;
+    // Ids that legitimately own markers after this pass; comments flipped to
+    // orphaned below are removed so the final scrub treats their markers as
+    // debris too.
+    let mut live_ids = live_comment_ids(&comments);
     let mut current = content;
     let mut orphaned: Vec<Comment> = Vec::new();
-    for comment in comments {
+    for comment in &comments {
         // Only root-level anchored comments carry markers; replies inherit the
         // parent's anchor and never inject their own into the note body.
         if comment.parent_id.is_some() {
@@ -2855,12 +2859,14 @@ async fn reanchor_note_comments(
         match state {
             note_ops::AnchorState::Healthy => {}
             note_ops::AnchorState::Missing => {
+                live_ids.remove(&comment.id);
                 let mut updated = comment.clone();
                 updated.is_orphaned = Some(true);
                 updated.updated_at = now_iso();
                 orphaned.push(updated);
             }
             note_ops::AnchorState::Degenerate => {
+                live_ids.remove(&comment.id);
                 current = note_ops::remove_anchor_markers(&current, &comment.id);
                 let mut updated = comment.clone();
                 updated.is_orphaned = Some(true);
@@ -2879,6 +2885,7 @@ async fn reanchor_note_comments(
                         current = new_md;
                     }
                     note_ops::RecoveryOutcome::Failed(_) => {
+                        live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
                         let mut updated = comment.clone();
                         updated.is_orphaned = Some(true);
@@ -2889,10 +2896,26 @@ async fn reanchor_note_comments(
             }
         }
     }
+    // Phantom scrub (Round 15): UUID-format markers whose id has no live
+    // comment row — an id with no row at all, or markers left behind by a
+    // row already flagged orphaned — are debris and would otherwise survive
+    // every mutation. Non-UUID marker-lookalikes (documentation literals)
+    // are user content and are never touched.
+    current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
     Ok(ReanchorPlan {
         content: current,
         orphaned,
     })
+}
+
+/// Ids of comment rows not flagged `is_orphaned` — the keep-set for
+/// [`note_ops::scrub_phantom_anchor_markers`].
+fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
+    comments
+        .iter()
+        .filter(|c| c.is_orphaned != Some(true))
+        .map(|c| c.id.clone())
+        .collect()
 }
 
 /// Result of [`reanchor_note_comments`]: the rewritten note markdown and the
@@ -10902,11 +10925,16 @@ impl WorkspaceApi for Services {
                     // Validated inside the idempotency scope so a replayed key
                     // still returns the cached result before these checks fire.
                     let client_supplied_id = comment_id.is_some();
+                    // Canonical hyphenated form required (not just any
+                    // `Uuid::parse_str`-accepted spelling): the phantom scrub
+                    // in `note_ops` only recognizes canonical ids inside
+                    // markers, so a looser form here would mint markers the
+                    // reanchor pass can never classify or clean up.
                     let comment_id = match comment_id {
                         Some(supplied) => {
-                            if uuid::Uuid::parse_str(&supplied).is_err() {
+                            if !note_ops::is_canonical_uuid(&supplied) {
                                 return Err(Error::InvalidParams(format!(
-                                    "Invalid 'commentId': {supplied}. Must be a valid UUID."
+                                    "Invalid 'commentId': {supplied}. Must be a canonical hyphenated UUID."
                                 )));
                             }
                             supplied
@@ -10914,26 +10942,50 @@ impl WorkspaceApi for Services {
                         None => uuid::Uuid::new_v4().to_string(),
                     };
                     let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                    // Self-heal phantom debris (Round 15): scrub UUID-format
+                    // markers whose id has no live comment row before
+                    // matching. The cleaned content persists only as part of
+                    // the add's atomic note rewrite below — a failed add
+                    // changes nothing (no separate rev bump).
+                    let peers = store
+                        .list_comments_in_workspace(&workspace_id, &note_id)
+                        .await?;
+                    note.content = note_ops::scrub_phantom_anchor_markers(
+                        &note.content,
+                        &live_comment_ids(&peers),
+                    );
                     let (from, to, line) = note_ops::find_and_anchor_text(
                         &note.content,
                         &search_context,
                         &comment_target,
                     )?;
-                    let anchored_text = note.content[from..to].to_string();
+                    // The span may overlap other comments' ranges and thus
+                    // contain their markers: the RAW span (markers intact, in
+                    // place) is embedded back between the new pair, while the
+                    // STORED text fields are stripped of all `<!--anchor:…-->`
+                    // substrings so raw marker text never leaks into the row.
+                    let anchored_span = note.content[from..to].to_string();
+                    let anchored_text = note_ops::strip_anchor_marker_text(&anchored_span);
                     // Capture the surrounding context BEFORE inserting the
                     // anchor markers so the stored context reflects the
                     // original text (parity with `extractAnchoredText` in
                     // `markdown-anchor-recovery.ts`). This is Audit D M1: the
                     // saved context lets a later note edit re-anchor a
                     // partial-marker survivor without needing note versions.
-                    let ctx_before = note_ops::context_before(&note.content, from);
-                    let ctx_after = note_ops::context_after(&note.content, to);
+                    // Markers are stripped from the FULL prefix/suffix before
+                    // the window is taken: a marker adjacent to `from`/`to`
+                    // would otherwise be clipped by the 50-char window and
+                    // its raw fragment survive the strip (PR #541 review).
+                    let clean_prefix = note_ops::strip_anchor_marker_text(&note.content[..from]);
+                    let ctx_before = note_ops::context_before(&clean_prefix, clean_prefix.len());
+                    let clean_suffix = note_ops::strip_anchor_marker_text(&note.content[to..]);
+                    let ctx_after = note_ops::context_after(&clean_suffix, 0);
                     note.content = format!(
                         "{}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{}",
                         &note.content[..from],
                         &note.content[to..],
                         id = comment_id,
-                        anchored = anchored_text,
+                        anchored = anchored_span,
                     );
                     note.updated_at = now_iso();
                     let now = now_iso();
