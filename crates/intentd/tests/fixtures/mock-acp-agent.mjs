@@ -641,6 +641,37 @@ if (treePidFile) {
   }
 }
 
+// Harness-wake e2e (monorepo#855): when MOCK_AGENT_WAKE_TRIGGER_FILE is set,
+// poll for the trigger file and — once it exists — emit one unsolicited
+// `session/update` agent_message_chunk per non-empty trigger-file line,
+// OUTSIDE any session/prompt. Deterministic stand-in for a provider harness
+// waking the child on its own (compaction notice, background task output):
+// the daemon must stream the burst as an implicit agent-initiated turn.
+// One-shot per process; the test controls timing by creating the file.
+const wakeTriggerFile = process.env.MOCK_AGENT_WAKE_TRIGGER_FILE;
+if (wakeTriggerFile) {
+  const poll = setInterval(() => {
+    let lines;
+    try {
+      lines = fs
+        .readFileSync(wakeTriggerFile, 'utf8')
+        .split('\n')
+        .filter((l) => l.trim().length > 0);
+    } catch {
+      return; // trigger not created yet
+    }
+    clearInterval(poll);
+    log(`wake trigger fired: emitting ${lines.length} unsolicited chunk(s)`);
+    for (const text of lines) {
+      note('session/update', {
+        sessionId: SESSION_ID,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+      });
+    }
+  }, 25);
+  poll.unref?.();
+}
+
 // Dead-child recovery e2e (monorepo#764): when MOCK_AGENT_PID_FILE is set,
 // append this spawn's pid (one line per process) so a test can SIGKILL the
 // child out-of-band while the agent is idle and later prove the daemon
