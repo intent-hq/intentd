@@ -42,13 +42,16 @@ pub fn local_stamp(t: OffsetDateTime, offset: UtcOffset) -> LocalStamp {
 }
 
 /// The daemon's current system UTC offset, used by the recorders to stamp
-/// `local_date` / `local_hour` at record time. Falls back to UTC when the
-/// local offset cannot be determined — notably the `time` crate's soundness
-/// guard, which refuses to read the environment-derived timezone once a
-/// Unix process is multi-threaded — in which case local stamps degrade to
-/// UTC wall-clock (the pre-D12 grouping behavior).
-pub fn recording_local_offset() -> UtcOffset {
-    UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC)
+/// `local_date` / `local_hour` at record time. `None` when the offset cannot
+/// be determined — notably the `time` crate's soundness guard, which on some
+/// Unix platforms (e.g. Linux) refuses to read the environment-derived
+/// timezone once the process is multi-threaded. Rows then persist NULL
+/// stamps and the read side falls back to shifting `bucket_utc` by the
+/// client's `tzOffsetMinutes` — exactly the pre-D12 grouping behavior. (A
+/// UTC fallback stamp would be worse: readers prefer any well-formed stamp,
+/// so it would silently pin those rows to UTC wall-clock.)
+pub fn recording_local_offset() -> Option<UtcOffset> {
+    UtcOffset::current_local_offset().ok()
 }
 
 /// Per-turn token delta between two cumulative end-of-turn snapshots: `next`
@@ -150,13 +153,16 @@ pub fn normalize_model_name(raw: &str) -> String {
 pub async fn record_session_started(store: &Store, raw_model: Option<&str>) {
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
-    let local = local_stamp(now, recording_local_offset());
+    let local = recording_local_offset().map(|o| local_stamp(now, o));
     let model = normalize_model_name(raw_model.unwrap_or(""));
     let delta = UsageStatsDelta {
         sessions_started: 1,
         ..Default::default()
     };
-    if let Err(e) = store.add_usage_stats(&bucket, &model, &local, &delta).await {
+    if let Err(e) = store
+        .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+        .await
+    {
         tracing::warn!(error = %e, "record session-start usage stats failed");
     }
 }
@@ -195,14 +201,17 @@ pub async fn record_lines_changed(
     };
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
-    let local = local_stamp(now, recording_local_offset());
+    let local = recording_local_offset().map(|o| local_stamp(now, o));
     let model = normalize_model_name(raw_model.as_deref().unwrap_or(""));
     let delta = UsageStatsDelta {
         lines_added,
         lines_deleted,
         ..Default::default()
     };
-    if let Err(e) = store.add_usage_stats(&bucket, &model, &local, &delta).await {
+    if let Err(e) = store
+        .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+        .await
+    {
         tracing::warn!(agent = %agent_id, error = %e, "record lines-changed usage stats failed");
     }
 }

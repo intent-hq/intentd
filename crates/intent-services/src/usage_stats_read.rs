@@ -80,7 +80,8 @@ fn parse_digits(s: &str, len: usize) -> Option<u32> {
 
 /// Parse a stored `local_date` (`"YYYY-MM-DD"`) into `(year, month)`; `None`
 /// for anything malformed, in which case the caller falls back to the UTC
-/// shift.
+/// shift. The day is range-checked only loosely (1–31, deliberately not
+/// calendar-validated) since only `(year, month)` are consumed.
 fn parse_local_date(s: &str) -> Option<(i32, u8)> {
     let mut it = s.split('-');
     let year = parse_digits(it.next()?, 4)? as i32;

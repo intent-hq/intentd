@@ -1514,13 +1514,16 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     use chrono::{Datelike, Timelike, Utc};
     let now = Utc::now();
     let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:00:00Z").to_string();
-    // UTC local stamps keep the tzOffsetMinutes:0 assertions below valid.
-    let stamp = |t: chrono::DateTime<Utc>| intent_store::LocalStamp {
+    let stamp = |t: chrono::DateTime<Utc>, hour: u8| intent_store::LocalStamp {
         date: t.format("%Y-%m-%d").to_string(),
-        hour: t.hour() as u8,
+        hour,
     };
     let bucket_now = bucket_key(now);
     let bucket_old = bucket_key(now - chrono::Duration::hours(48));
+    // Stamp the current bucket with a local hour that DIFFERS from its UTC
+    // hour (same date, so month filtering is unaffected): the month view
+    // must group by the recorded stamp while the 24h view ignores it (D12).
+    let divergent_hour = (now.hour() as u8 + 5) % 24;
     let delta = intent_store::UsageStatsDelta {
         input_tokens: 100,
         output_tokens: 40,
@@ -1533,14 +1536,20 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         lines_deleted: 3,
     };
     srv.store
-        .add_usage_stats(&bucket_now, "Opus 4.8", &stamp(now), &delta)
+        .add_usage_stats(
+            &bucket_now,
+            "Opus 4.8",
+            Some(&stamp(now, divergent_hour)),
+            &delta,
+        )
         .await
         .expect("seed current bucket");
+    let old = now - chrono::Duration::hours(48);
     srv.store
         .add_usage_stats(
             &bucket_old,
             "Sonnet 5",
-            &stamp(now - chrono::Duration::hours(48)),
+            Some(&stamp(old, old.hour() as u8)),
             &intent_store::UsageStatsDelta {
                 input_tokens: 7,
                 runs: 1,
@@ -1574,7 +1583,8 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(by_hour.len(), 24);
     // The seeded bucket occupies exactly one trailing-window slot (the newest
     // one, unless the wall-clock hour ticked mid-test), labelled with the
-    // bucket's UTC hour (tzOffsetMinutes is 0).
+    // bucket's UTC hour (tzOffsetMinutes is 0) — the divergent local stamp
+    // must not affect 24h slotting or labels.
     let seeded: Vec<&Value> = by_hour.iter().filter(|h| h["inputTokens"] == 100).collect();
     assert_eq!(seeded.len(), 1, "{resp}");
     assert_eq!(seeded[0]["hour"], u64::from(now.hour()));
@@ -1600,6 +1610,16 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .expect("Opus row in current month");
     assert_eq!(opus["inputTokens"], 100);
     assert_eq!(opus["runs"], 2);
+    // Month-view hour-of-day grouping follows the recorded local stamp, not
+    // the UTC bucket hour (D12).
+    let by_hour = resp["result"]["byHourOfDay"]
+        .as_array()
+        .expect("byHourOfDay");
+    assert_eq!(
+        by_hour[usize::from(divergent_hour)]["inputTokens"],
+        100,
+        "{resp}"
+    );
 
     // Malformed params surface as -32602 over the wire.
     let frame =

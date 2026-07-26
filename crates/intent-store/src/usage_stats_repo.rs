@@ -82,11 +82,13 @@ impl Store {
     /// layer stores what it is given. `local` stamps the row on INSERT only:
     /// the conflict-update deliberately leaves `local_date` / `local_hour`
     /// untouched, so an existing bucket keeps its first-writer's stamp.
+    /// `None` (local offset indeterminate at record time) persists NULLs,
+    /// which readers treat like pre-D12 rows.
     pub async fn add_usage_stats(
         &self,
         bucket_utc: &str,
         model: &str,
-        local: &LocalStamp,
+        local: Option<&LocalStamp>,
         delta: &UsageStatsDelta,
     ) -> Result<()> {
         sqlx::query(
@@ -108,8 +110,8 @@ impl Store {
         )
         .bind(bucket_utc)
         .bind(model)
-        .bind(&local.date)
-        .bind(i64::from(local.hour))
+        .bind(local.map(|l| l.date.as_str()))
+        .bind(local.map(|l| i64::from(l.hour)))
         .bind(delta.input_tokens as i64)
         .bind(delta.output_tokens as i64)
         .bind(delta.cache_read_tokens as i64)
@@ -215,7 +217,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", &local, &first)
+            .add_usage_stats(bucket, "Opus 4.8", Some(&local), &first)
             .await
             .expect("first add");
         let second = UsageStatsDelta {
@@ -226,7 +228,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", &local, &second)
+            .add_usage_stats(bucket, "Opus 4.8", Some(&local), &second)
             .await
             .expect("second add");
 
@@ -257,7 +259,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", &local, &third)
+            .add_usage_stats(bucket, "Opus 4.8", Some(&local), &third)
             .await
             .expect("third add");
         let rows = store.list_usage_stats_hourly().await.expect("list");
@@ -278,15 +280,15 @@ mod tests {
         };
         let local = stamp("2026-07-25", 8);
         store
-            .add_usage_stats("2026-07-25T15:00:00Z", "Sonnet 5", &local, &delta)
+            .add_usage_stats("2026-07-25T15:00:00Z", "Sonnet 5", Some(&local), &delta)
             .await
             .expect("add");
         store
-            .add_usage_stats("2026-07-25T14:00:00Z", "Sonnet 5", &local, &delta)
+            .add_usage_stats("2026-07-25T14:00:00Z", "Sonnet 5", Some(&local), &delta)
             .await
             .expect("add");
         store
-            .add_usage_stats("2026-07-25T14:00:00Z", "Opus 4.8", &local, &delta)
+            .add_usage_stats("2026-07-25T14:00:00Z", "Opus 4.8", Some(&local), &delta)
             .await
             .expect("add");
 
@@ -320,11 +322,11 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", &stamp("2026-11-01", 1), &delta)
+            .add_usage_stats(bucket, "Opus 4.8", Some(&stamp("2026-11-01", 1)), &delta)
             .await
             .expect("first add");
         store
-            .add_usage_stats(bucket, "Opus 4.8", &stamp("2026-11-01", 0), &delta)
+            .add_usage_stats(bucket, "Opus 4.8", Some(&stamp("2026-11-01", 0)), &delta)
             .await
             .expect("second add");
 
@@ -335,9 +337,10 @@ mod tests {
         assert_eq!(rows[0].local_hour, Some(1), "first-writer stamp wins");
     }
 
-    /// Rows lacking local columns read back as `None`, and out-of-range
-    /// `local_hour` values are defensively dropped to `None` instead of
-    /// leaking into the aggregation.
+    /// Rows lacking local columns read back as `None` — both pre-D12 rows
+    /// and rows written with `local: None` (offset indeterminate at record
+    /// time) — and out-of-range `local_hour` values are defensively dropped
+    /// to `None` instead of leaking into the aggregation.
     #[tokio::test]
     async fn null_and_out_of_range_local_columns_read_as_none() {
         let tmp = TempDb::new();
@@ -356,12 +359,27 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("insert out-of-range hour");
+        store
+            .add_usage_stats(
+                "2026-07-25T16:00:00Z",
+                "Opus 4.8",
+                None,
+                &UsageStatsDelta {
+                    input_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("insert unstamped row");
 
         let rows = store.list_usage_stats_hourly().await.expect("list");
         assert_eq!(rows[0].local_date, None);
         assert_eq!(rows[0].local_hour, None);
         assert_eq!(rows[1].local_date.as_deref(), Some("2026-07-25"));
         assert_eq!(rows[1].local_hour, None, "hour 99 must not surface");
+        assert_eq!(rows[2].local_date, None, "None writes NULL stamps");
+        assert_eq!(rows[2].local_hour, None);
+        assert_eq!(rows[2].input_tokens, 1);
     }
 
     /// The 0057 migration backfill stamps pre-D12 rows (NULL local columns)
@@ -388,7 +406,7 @@ mod tests {
             .add_usage_stats(
                 "2026-07-25T14:00:00Z",
                 "Opus 4.8",
-                &stamp("2026-07-26", 3),
+                Some(&stamp("2026-07-26", 3)),
                 &UsageStatsDelta::default(),
             )
             .await
