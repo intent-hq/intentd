@@ -106,21 +106,17 @@ const VARIANTS: &[(&str, &str)] = &[
     ("codex", "Codex"),
 ];
 
-/// Normalize a host-specific model id to one canonical display name, so the
-/// same model reached via different hosts (auggie / claude / pi / opencode)
-/// lands in one `usage_stats_hourly` row: strip provider path prefixes, find
-/// a known family token, and render `"{Family} {version}[ {Variant}]"` (e.g.
-/// `claude-opus-4-8`, `anthropic/claude-opus-4.8-20260115`, and `Opus 4.8`
-/// all → `"Opus 4.8"`). Unrecognized non-empty ids pass through unchanged
-/// (minus any path prefix); empty/blank → `"unknown"`.
-pub fn normalize_model_name(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return UNKNOWN_MODEL.to_string();
-    }
+/// Find a known model family in a raw id or display string and render it as
+/// `"{Family} {version}[ {Variant}]"`; `None` when no family token matches.
+/// This is the family-matching core of [`normalize_model_name`], exposed
+/// separately so the effective-model resolution (D13) can tell "resolved to a
+/// known family" apart from the raw passthrough — display strings like
+/// `"Opus 4.8 with 1M context · Best for everyday, complex tasks"` tokenize
+/// on spaces and resolve to `"Opus 4.8"`.
+pub fn known_family_model_name(raw: &str) -> Option<String> {
     // Path-style provider prefixes ("anthropic/claude-...") never carry model
     // identity — keep only the final segment.
-    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let base = raw.trim().rsplit('/').next().unwrap_or(raw);
     let lower = base.to_ascii_lowercase();
     let tokens: Vec<&str> = lower
         .split(['-', '_', ' ', ':', '@'])
@@ -139,22 +135,77 @@ pub fn normalize_model_name(raw: &str) -> String {
                     name.push_str(vd);
                 }
             }
-            return name;
+            return Some(name);
         }
     }
-    base.to_string()
+    None
+}
+
+/// Normalize a host-specific model id to one canonical display name, so the
+/// same model reached via different hosts (auggie / claude / pi / opencode)
+/// lands in one `usage_stats_hourly` row: strip provider path prefixes, find
+/// a known family token, and render `"{Family} {version}[ {Variant}]"` (e.g.
+/// `claude-opus-4-8`, `anthropic/claude-opus-4.8-20260115`, and `Opus 4.8`
+/// all → `"Opus 4.8"`). Unrecognized non-empty ids pass through unchanged
+/// (minus any path prefix); empty/blank → `"unknown"`.
+pub fn normalize_model_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return UNKNOWN_MODEL.to_string();
+    }
+    known_family_model_name(trimmed)
+        .unwrap_or_else(|| trimmed.rsplit('/').next().unwrap_or(trimmed).to_string())
+}
+
+/// Whether a stored session model is absent or a placeholder that names no
+/// real model: `None`, blank, or a bare/compound `default` sentinel
+/// (`"default"`, `"claude-code:default"`). Placeholder models trigger the
+/// session-open effective-model resolution (D13) and fall back to the
+/// provider id in usage-stats keys.
+pub(crate) fn is_placeholder_model(model: Option<&str>) -> bool {
+    let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return true;
+    };
+    let bare = m.split_once(':').map(|(_, b)| b).unwrap_or(m).trim();
+    bare.is_empty() || bare.eq_ignore_ascii_case("default")
+}
+
+/// The `usage_stats_hourly` model key for a session (D13 ladder): a real
+/// (non-placeholder) model normalizes via [`normalize_model_name`]; a
+/// placeholder/absent model falls back to `provider_id` — the session's
+/// *resolved* provider id (callers compute it with
+/// [`crate::agent_session::resolve_provider_id`] when the session row is
+/// readable, and pass `None` when even the provider is unknowable, e.g. the
+/// row read failed). `"unknown"` only on that unknowable tail.
+pub fn stats_model_key(raw_model: Option<&str>, provider_id: Option<&str>) -> String {
+    if !is_placeholder_model(raw_model) {
+        return normalize_model_name(raw_model.unwrap_or(""));
+    }
+    provider_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_ascii_lowercase())
+        .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
 }
 
 /// Record one agent-session start (D2: *sessions* = agent sessions) into the
 /// current UTC hour bucket of `usage_stats_hourly`, keyed by the session's
-/// normalized model (`"unknown"` when no model is resolved at creation time).
+/// [`stats_model_key`] (normalized model, falling back to the resolved
+/// provider id when no model is resolved at creation time — D13). `provider`
+/// is the session's raw `provider` field; the resolved id follows the spawn
+/// precedence (compound model prefix → provider field → default provider).
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
-pub async fn record_session_started(store: &Store, raw_model: Option<&str>) {
+pub async fn record_session_started(
+    store: &Store,
+    raw_model: Option<&str>,
+    provider: Option<&str>,
+) {
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let model = normalize_model_name(raw_model.unwrap_or(""));
+    let provider_id = crate::agent_session::resolve_provider_id(raw_model, provider);
+    let model = stats_model_key(raw_model, Some(&provider_id));
     let delta = UsageStatsDelta {
         sessions_started: 1,
         ..Default::default()
@@ -169,9 +220,11 @@ pub async fn record_session_started(store: &Store, raw_model: Option<&str>) {
 
 /// Record one lines-changed delta (D5: period-scoped true totals, accrued as
 /// attribution is recorded) into the current UTC hour bucket of
-/// `usage_stats_hourly`, keyed by the acting agent's normalized session model
-/// (`"unknown"` when the model cannot be resolved). Zero deltas and changes
-/// with no attributed agent (manual/user edits are not agentic activity) are
+/// `usage_stats_hourly`, keyed by the acting agent's [`stats_model_key`]
+/// (normalized session model, falling back to the session's resolved
+/// provider id when the model cannot be resolved; `"unknown"` only when the
+/// session row is unreadable — D13). Zero deltas and changes with no
+/// attributed agent (manual/user edits are not agentic activity) are
 /// skipped. Independent of `workspace_metrics` / `agent_metrics` by
 /// construction — clearing those (e.g. `metrics.clearAgentStats`) never
 /// touches `usage_stats_hourly`. Best-effort: errors are logged, never
@@ -189,20 +242,24 @@ pub async fn record_lines_changed(
     let Some(agent_id) = agent_id else {
         return;
     };
-    let raw_model = match store
+    let (raw_model, provider_id) = match store
         .get_agent_session_token_usage(workspace_id, &AgentId(agent_id.to_string()))
         .await
     {
-        Ok((model, _)) => model,
+        Ok((model, provider, _)) => {
+            let provider_id =
+                crate::agent_session::resolve_provider_id(model.as_deref(), provider.as_deref());
+            (model, Some(provider_id))
+        }
         Err(e) => {
             tracing::warn!(agent = %agent_id, error = %e, "read agent model for lines-changed stats failed");
-            None
+            (None, None)
         }
     };
     let now = OffsetDateTime::now_utc();
     let bucket = hour_bucket_utc(now);
     let local = recording_local_offset().map(|o| local_stamp(now, o));
-    let model = normalize_model_name(raw_model.as_deref().unwrap_or(""));
+    let model = stats_model_key(raw_model.as_deref(), provider_id.as_deref());
     let delta = UsageStatsDelta {
         lines_added,
         lines_deleted,
@@ -364,6 +421,58 @@ mod tests {
         // ...while the same model via different hosts still combines.
         assert_eq!(normalize_model_name("openai/gpt-4o"), "GPT 4o");
         assert_eq!(normalize_model_name("GPT-4o"), "GPT 4o");
+    }
+
+    #[test]
+    fn known_family_resolves_display_and_description_strings() {
+        // D13: the resolved display strings from a claude-agent-acp
+        // configOptions payload contain the family inside prose — space
+        // tokenization must find it.
+        assert_eq!(
+            known_family_model_name("Opus 4.8 with 1M context · Best for everyday, complex tasks"),
+            Some("Opus 4.8".to_string())
+        );
+        assert_eq!(
+            known_family_model_name("Sonnet 5 · Efficient for routine tasks"),
+            Some("Sonnet 5".to_string())
+        );
+        // No family token → None (unlike normalize_model_name, no passthrough).
+        assert_eq!(known_family_model_name("Default (recommended)"), None);
+        assert_eq!(known_family_model_name("my-custom-model"), None);
+    }
+
+    #[test]
+    fn placeholder_model_detection() {
+        assert!(is_placeholder_model(None));
+        assert!(is_placeholder_model(Some("")));
+        assert!(is_placeholder_model(Some("   ")));
+        assert!(is_placeholder_model(Some("default")));
+        assert!(is_placeholder_model(Some("Default")));
+        assert!(is_placeholder_model(Some("claude-code:default")));
+        assert!(is_placeholder_model(Some("claude-code:")));
+        assert!(!is_placeholder_model(Some("opus")));
+        assert!(!is_placeholder_model(Some("claude-code:opus[1m]")));
+        assert!(!is_placeholder_model(Some("claude-code:Opus 4.8")));
+    }
+
+    #[test]
+    fn stats_model_key_ladder_model_then_provider_then_unknown() {
+        // A real model normalizes as before.
+        assert_eq!(
+            stats_model_key(Some("claude-code:Opus 4.8"), Some("claude-code")),
+            "Opus 4.8"
+        );
+        assert_eq!(stats_model_key(Some("opus-4.8"), None), "Opus 4.8");
+        // Placeholder/absent model → resolved provider id.
+        assert_eq!(
+            stats_model_key(Some("claude-code:default"), Some("claude-code")),
+            "claude-code"
+        );
+        assert_eq!(stats_model_key(None, Some("Claude-Code")), "claude-code");
+        assert_eq!(stats_model_key(Some("default"), Some("codex")), "codex");
+        // "unknown" only when the provider is unknowable too.
+        assert_eq!(stats_model_key(None, None), UNKNOWN_MODEL);
+        assert_eq!(stats_model_key(Some("default"), Some("  ")), UNKNOWN_MODEL);
     }
 
     #[test]

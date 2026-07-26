@@ -282,3 +282,95 @@ fn claude_code_blank_prompt_still_injects_disallowed_tools() {
     // No systemPrompt key (blank filtered)
     assert!(meta_map.get("systemPrompt").is_none());
 }
+
+/// Parse `configOptions` JSON into the typed schema vec for the
+/// [`resolve_effective_model`] tests.
+fn config_options(v: serde_json::Value) -> Vec<intent_acp::session::SessionConfigOption> {
+    serde_json::from_value(v).expect("valid configOptions")
+}
+
+#[test]
+fn resolve_effective_model_from_claude_code_default() {
+    use super::resolve_effective_model;
+    // Canned from a live claude-agent-acp@0.60.0 session/new result: the
+    // default option's name carries no family; its description does.
+    let options = config_options(serde_json::json!([
+        { "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+          "currentValue": "acceptEdits",
+          "options": [ { "value": "acceptEdits", "name": "Accept Edits" } ] },
+        { "id": "model", "name": "Model", "description": "AI model to use",
+          "category": "model", "type": "select", "currentValue": "default",
+          "options": [
+            { "value": "default", "name": "Default (recommended)",
+              "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+            { "value": "sonnet", "name": "Sonnet",
+              "description": "Sonnet 5 · Efficient for routine tasks" }
+          ] }
+    ]));
+    assert_eq!(
+        resolve_effective_model(Some(&options)),
+        Some("Opus 4.8".to_string()),
+        "currentValue 'default' resolves via its option's description"
+    );
+}
+
+#[test]
+fn resolve_effective_model_prefers_name_then_description_then_value() {
+    use super::resolve_effective_model;
+    // A version-bearing family in the option NAME wins outright.
+    let options = config_options(serde_json::json!([
+        { "id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+          "options": [ { "value": "sonnet", "name": "Sonnet 5",
+                         "description": "Efficient for routine tasks" } ] }
+    ]));
+    assert_eq!(
+        resolve_effective_model(Some(&options)),
+        Some("Sonnet 5".to_string())
+    );
+    // A version-less name ("Opus") is skipped in favor of the description.
+    let options = config_options(serde_json::json!([
+        { "id": "model", "name": "Model", "type": "select", "currentValue": "opus[1m]",
+          "options": [ { "value": "opus[1m]", "name": "Opus",
+                         "description": "Opus 4.8 with 1M context" } ] }
+    ]));
+    assert_eq!(
+        resolve_effective_model(Some(&options)),
+        Some("Opus 4.8".to_string())
+    );
+    // No option entry for currentValue → the raw value itself is the last
+    // candidate (a real version-bearing model id resolves).
+    let options = config_options(serde_json::json!([
+        { "id": "model", "name": "Model", "type": "select",
+          "currentValue": "claude-haiku-4-5", "options": [] }
+    ]));
+    assert_eq!(
+        resolve_effective_model(Some(&options)),
+        Some("Haiku 4.5".to_string())
+    );
+}
+
+#[test]
+fn resolve_effective_model_none_when_unresolvable() {
+    use super::resolve_effective_model;
+    // No configOptions at all.
+    assert_eq!(resolve_effective_model(None), None);
+    assert_eq!(resolve_effective_model(Some(&[])), None);
+    // A model select whose strings carry no version-bearing family.
+    let options = config_options(serde_json::json!([
+        { "id": "model", "name": "Model", "type": "select", "currentValue": "default",
+          "options": [ { "value": "default", "name": "Default (recommended)",
+                         "description": "Best for everyday tasks" } ] }
+    ]));
+    assert_eq!(resolve_effective_model(Some(&options)), None);
+    // No id=="model" select, but a category=="model" sibling matches.
+    let options = config_options(serde_json::json!([
+        { "id": "primary-model", "name": "Model", "category": "model", "type": "select",
+          "currentValue": "x",
+          "options": [ { "value": "x", "name": "Gemini 2.5 Pro" } ] }
+    ]));
+    assert_eq!(
+        resolve_effective_model(Some(&options)),
+        Some("Gemini 2.5 Pro".to_string()),
+        "category fallback finds the model select"
+    );
+}

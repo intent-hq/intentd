@@ -462,23 +462,65 @@ impl Store {
         Ok(())
     }
 
-    /// Read one session's `model` and its persisted cumulative end-of-turn
-    /// `token_usage` snapshot (§5.23) in a single row read. This is the
-    /// pre-turn state the global usage-stats recorder diffs the new snapshot
-    /// against, so it MUST be read BEFORE
+    /// Guarded write of a session's effective model resolved at session open
+    /// (D13): sets `model` only while the stored value still equals
+    /// `expected_current` (the placeholder read before the ACP call — `None`
+    /// matches NULL), so a concurrent explicit `agent.setModel` is never
+    /// overwritten. Returns whether the write landed; `false` means the
+    /// guard failed (model changed concurrently or the row is absent), which
+    /// callers treat as a benign skip. Scoped to `workspace_id`
+    /// (defense-in-depth).
+    pub async fn set_agent_session_effective_model(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_current: Option<&str>,
+        effective: &str,
+    ) -> Result<bool> {
+        let res = match expected_current {
+            Some(current) => {
+                sqlx::query(
+                    "UPDATE agent_session SET model=? WHERE id=? AND workspace_id=? AND model=?",
+                )
+                .bind(effective)
+                .bind(&id.0)
+                .bind(&workspace_id.0)
+                .bind(current)
+                .execute(self.write_pool())
+                .await
+            }
+            None => sqlx::query(
+                "UPDATE agent_session SET model=? WHERE id=? AND workspace_id=? AND model IS NULL",
+            )
+            .bind(effective)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await,
+        }
+        .map_err(|e| Error::Internal(format!("set agent session effective model failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Read one session's `model`, `provider`, and its persisted cumulative
+    /// end-of-turn `token_usage` snapshot (§5.23) in a single row read. This
+    /// is the pre-turn state the global usage-stats recorder diffs the new
+    /// snapshot against, so it MUST be read BEFORE
     /// [`set_agent_session_token_usage`](Store::set_agent_session_token_usage)
     /// replaces the snapshot. The snapshot is scoped to the CURRENT ACP
     /// session (a recreate folds it into `token_usage_baseline` and clears
-    /// it), which is exactly the baseline a per-turn delta needs. Scoped to
-    /// `workspace_id` (defense-in-depth). `NotFound` if the session row is
-    /// absent or the workspace does not match.
+    /// it), which is exactly the baseline a per-turn delta needs. The
+    /// `provider` rides along as the stats model-key fallback for
+    /// placeholder/absent models (D13). Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session row is absent or the
+    /// workspace does not match.
     pub async fn get_agent_session_token_usage(
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
-    ) -> Result<(Option<String>, Option<TokenUsageTotals>)> {
+    ) -> Result<(Option<String>, Option<String>, Option<TokenUsageTotals>)> {
         let row = sqlx::query(
-            "SELECT model, token_usage FROM agent_session WHERE id=? AND workspace_id=?",
+            "SELECT model, provider, token_usage FROM agent_session WHERE id=? AND workspace_id=?",
         )
         .bind(&id.0)
         .bind(&workspace_id.0)
@@ -489,6 +531,7 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {id}")));
         };
         let model = row.get::<Option<String>, _>("model");
+        let provider = row.get::<Option<String>, _>("provider");
         let snapshot = row
             .get::<Option<String>, _>("token_usage")
             .map(|json| {
@@ -496,7 +539,7 @@ impl Store {
                     .map_err(|e| Error::Internal(format!("decode session token_usage failed: {e}")))
             })
             .transpose()?;
-        Ok((model, snapshot))
+        Ok((model, provider, snapshot))
     }
 
     /// Get lightweight usage data for all agents in a workspace: for each agent,
