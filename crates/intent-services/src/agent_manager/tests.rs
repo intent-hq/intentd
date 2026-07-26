@@ -3643,6 +3643,137 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
     assert!(!session.is_active, "is_active stays 0");
 }
 
+/// monorepo#840 quarantine gate: `send_message` to a poisoned session (Error
+/// + session-fatal provider block) parks the message in the queue —
+/// `queued: true, quarantined: true` — without claiming the slot, spawning a
+/// worker, or touching the Error status. `agent.retry` stays the redrive.
+#[tokio::test]
+async fn send_message_parks_message_for_poisoned_session() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-poison"), AgentId::from("a-poison"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "follow-up".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("quarantined send succeeds as a queue park");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(true), "message parked, not driven");
+    assert_eq!(result["quarantined"], json!(true));
+
+    assert!(!mgr.is_busy(&id), "no slot claim for a poisoned session");
+    assert!(
+        mgr.workers.lock().unwrap().is_empty(),
+        "no worker spawned for a poisoned session"
+    );
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "the message waits in the queue for agent.retry"
+    );
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::Error, "error status untouched");
+    assert!(!session.is_active, "is_active stays 0");
+}
+
+/// monorepo#840: an ORDINARY Error session (no fatal stop_reason, no streak)
+/// is NOT quarantined — `send_message` still redrives it (the documented
+/// fresh-message recovery path). Guard against over-blocking. Uses the
+/// `mock` provider without `MOCK_AGENT_SCRIPT_PATH` so the redriven spawn
+/// fails deterministically and the worker exits.
+#[tokio::test]
+async fn send_message_still_redrives_ordinary_error_session() {
+    let _env = EnvGuard::unset("MOCK_AGENT_SCRIPT_PATH");
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-plain-err"),
+        AgentId::from("a-plain-err"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some("connection reset by peer".into())),
+        )
+        .await
+        .expect("park session in ordinary error");
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "try again".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("ordinary-error send proceeds");
+    // Not quarantined: the send claimed the slot and drove the normal path
+    // (the spawn then fails terminally in the worker; what matters here is
+    // the gate did NOT park it).
+    assert!(result.get("quarantined").is_none(), "no quarantine flag");
+    assert_eq!(result["queued"], json!(false), "delivery drove a turn");
+
+    // Let the worker hit its terminal spawn failure and exit so the test
+    // leaves no dangling state.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker exits after the terminal spawn failure");
+
+    // Streak below threshold also stays open: two identical failures…
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    mgr.services.clear_failure_streak(&id);
+    mgr.services.record_terminal_failure(&id, "boom");
+    mgr.services.record_terminal_failure(&id, "boom");
+    assert!(
+        !mgr.services.session_poisoned(&session),
+        "below-threshold streak must not quarantine"
+    );
+}
+
 /// monorepo#564 regression: `send_message` to a nonexistent agent id (e.g. a
 /// truncated id) must fail closed with InvalidParams naming the id — NOT
 /// claim the slot, NOT queue a phantom message, NOT persist a transcript row.

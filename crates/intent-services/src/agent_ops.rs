@@ -1746,6 +1746,10 @@ impl Services {
             .lock()
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
+        // Registry hygiene (monorepo#840): drop the failure streak and any
+        // failure-wake dedup records for the deleted agent.
+        self.clear_failure_streak(&agent_id);
+        self.clear_failure_wake_dedup(&agent_id);
         if let Some(workspace_id) = session_workspace_id {
             crate::publish_event(
                 &self.event_bus,
@@ -4336,25 +4340,40 @@ impl Services {
         // B1 + B2: iterate assigned_agent_ids newest-first (Vec::push
         // append-order means newest is the tail). Probe each session:
         //   * NotFound / Deleted → stale, queue for cleanup.
+        //   * Poisoned (monorepo#840: Error + session-fatal provider block or
+        //     an identical-failure streak) → NOT resumable: waking it would
+        //     replay the provider-blocked turn ("start a new session" means a
+        //     fresh session). Queue for cleanup so a fresh agent is created,
+        //     keeping it as the inheritance source for specialist/model.
         //   * Otherwise → treat as resumable; the newest live session wins.
         // `inheritance_source` captures the newest **known** previous session
-        // (live or deleted) so the create branch can still inherit
+        // (live, poisoned, or deleted) so the create branch can still inherit
         // specialist/model when no live agent is available.
         let mut cleaned_up: Vec<AgentId> = Vec::new();
         let mut live_session: Option<AgentSession> = None;
         let mut inheritance_source: Option<AgentSession> = None;
         for candidate in task.assigned_agents.iter().rev().cloned() {
             match self.store.get_agent_session(&candidate).await {
-                Ok(session) if session.status != AgentStatus::Deleted => {
+                Ok(session)
+                    if session.status != AgentStatus::Deleted
+                        && !self.session_poisoned(&session) =>
+                {
                     if inheritance_source.is_none() {
                         inheritance_source = Some(session.clone());
                     }
                     live_session = Some(session);
                     break;
                 }
-                Ok(deleted_session) => {
+                Ok(unusable_session) => {
+                    if unusable_session.status != AgentStatus::Deleted {
+                        tracing::warn!(
+                            agent = %candidate,
+                            stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
+                            "wakeOrCreate skipping poisoned session; a fresh agent will be created (monorepo#840)"
+                        );
+                    }
                     if inheritance_source.is_none() {
-                        inheritance_source = Some(deleted_session);
+                        inheritance_source = Some(unusable_session);
                     }
                     cleaned_up.push(candidate);
                 }

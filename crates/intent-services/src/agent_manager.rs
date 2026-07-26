@@ -2740,7 +2740,37 @@ impl AgentManager {
         // monorepo#564: reject nonexistent targets BEFORE any state change —
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
-        self.services.require_agent_session(&agent_id).await?;
+        let session = self.services.require_agent_session(&agent_id).await?;
+        // Quarantine gate (monorepo#840): a provably-poisoned session (parked
+        // in Error with a session-fatal provider block, or a streak of
+        // identical terminal failures) must NOT be redriven by message
+        // delivery — every replay deterministically fails and spams failure
+        // events. Park the message in the queue instead; `agent.retry`
+        // (which clears the error + streak) redrives it deliberately. An
+        // ordinary Error session still redrives here (the documented "fresh
+        // agent.sendMessage" recovery path).
+        if self.services.session_poisoned(&session) {
+            tracing::warn!(
+                agent = %agent_id,
+                stop_reason = session.stop_reason.as_deref().unwrap_or(""),
+                "session is quarantined (poisoned); parking message in queue instead of driving a turn"
+            );
+            let (queued, position) = self.services.enqueue_message(
+                &agent_id,
+                content,
+                options.image_blocks.clone(),
+                options.file_blocks.clone(),
+                options.message_metadata.clone(),
+            );
+            let result = json!({
+                "success": true,
+                "queued": true,
+                "quarantined": true,
+                "queuedMessage": queued.to_value(position),
+            });
+            self.services.publish_queue_updated(&agent_id).await;
+            return Ok(result);
+        }
         if !self.try_begin(&agent_id, &workspace_id).await {
             let (queued, position) = self.services.enqueue_message(
                 &agent_id,
@@ -3365,6 +3395,11 @@ impl AgentManager {
 
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = &session.workspace_id;
+
+        // agent.retry is the deliberate quarantine escape hatch (monorepo#840):
+        // clear the identical-failure streak alongside the status/stop_reason
+        // so the redrive starts from a clean slate.
+        self.services.clear_failure_streak(&agent_id);
 
         // Empty queue → nothing will drive a `pending` status forward, so
         // clear the error to `idle` instead (idle is permitted iff no
@@ -4566,60 +4601,68 @@ async fn run_message_worker(
                 let prompt = mgr
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
-                if let Err(e) = mgr
+                match mgr
                     .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
                     .await
                 {
-                    if is_benign_turn_error(&e) {
-                        // Concurrent stop/cancel won the turn — not a failure.
-                        // Keep draining: any queued message re-spawns lazily.
-                        tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
-                    } else if !silent_redrive_used && pre_output_transport_failure(&e) {
-                        // Silent redrive (monorepo#764): the transport closed
-                        // before the turn streamed anything — the prompt
-                        // provably produced no output, so redrive it once on
-                        // a fresh child. `run_prompt_turn` suppressed the
-                        // terminal `agent:failed` + `agent:stream:end` pair
-                        // for this attempt, so nothing user-visible surfaced.
-                        // Tear down the dead child and loop back through
-                        // `retry_spawn` with the SAME content/options.
-                        silent_redrive_used = true;
-                        tracing::warn!(
-                            agent = %agent_id,
-                            error = %e,
-                            "transport closed before output — redriving the prompt once on a fresh child"
-                        );
-                        mgr.kill_child_only(&agent_id).await;
-                        continue 'outer;
-                    } else {
-                        // STAB-53: on a child-death failure, point at the
-                        // captured stderr file so the crash is diagnosable.
-                        match stderr_capture_hint(&mgr, &agent_id, &e) {
-                            Some(log) => tracing::warn!(
+                    Ok(_stop_reason) => {
+                        // A successful turn resets the identical-failure
+                        // streak (monorepo#840): the session is provably not
+                        // poisoned.
+                        mgr.services.clear_failure_streak(&agent_id);
+                    }
+                    Err(e) => {
+                        if is_benign_turn_error(&e) {
+                            // Concurrent stop/cancel won the turn — not a failure.
+                            // Keep draining: any queued message re-spawns lazily.
+                            tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
+                        } else if !silent_redrive_used && pre_output_transport_failure(&e) {
+                            // Silent redrive (monorepo#764): the transport closed
+                            // before the turn streamed anything — the prompt
+                            // provably produced no output, so redrive it once on
+                            // a fresh child. `run_prompt_turn` suppressed the
+                            // terminal `agent:failed` + `agent:stream:end` pair
+                            // for this attempt, so nothing user-visible surfaced.
+                            // Tear down the dead child and loop back through
+                            // `retry_spawn` with the SAME content/options.
+                            silent_redrive_used = true;
+                            tracing::warn!(
                                 agent = %agent_id,
                                 error = %e,
-                                "agent turn failed terminally (agent stderr captured at {})",
-                                log.display()
-                            ),
-                            None => {
-                                tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally")
+                                "transport closed before output — redriving the prompt once on a fresh child"
+                            );
+                            mgr.kill_child_only(&agent_id).await;
+                            continue 'outer;
+                        } else {
+                            // STAB-53: on a child-death failure, point at the
+                            // captured stderr file so the crash is diagnosable.
+                            match stderr_capture_hint(&mgr, &agent_id, &e) {
+                                Some(log) => tracing::warn!(
+                                    agent = %agent_id,
+                                    error = %e,
+                                    "agent turn failed terminally (agent stderr captured at {})",
+                                    log.display()
+                                ),
+                                None => {
+                                    tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally")
+                                }
                             }
+                            handle_terminal_turn_failure(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &content,
+                                &options,
+                                user_persisted,
+                                &e,
+                            )
+                            .await;
+                            // Release the in-flight slot without overwriting the
+                            // Error status just persisted, so `agent.retry` (or a
+                            // future message) can restart the worker.
+                            mgr.release_in_flight_slot(&agent_id).await;
+                            break 'outer;
                         }
-                        handle_terminal_turn_failure(
-                            &mgr,
-                            &agent_id,
-                            &workspace_id,
-                            &content,
-                            &options,
-                            user_persisted,
-                            &e,
-                        )
-                        .await;
-                        // Release the in-flight slot without overwriting the
-                        // Error status just persisted, so `agent.retry` (or a
-                        // future message) can restart the worker.
-                        mgr.release_in_flight_slot(&agent_id).await;
-                        break 'outer;
                     }
                 }
             }
@@ -5178,6 +5221,19 @@ async fn persist_error_and_requeue(
     persisted: bool,
     error_text: &str,
 ) {
+    // monorepo#840: record the identical-failure streak BEFORE persisting so
+    // `session_poisoned` sees a consistent (status, streak) pair as soon as
+    // the Error status lands.
+    let streak = mgr.services.record_terminal_failure(agent_id, error_text);
+    if streak >= crate::POISONED_FAILURE_STREAK_THRESHOLD
+        || crate::is_session_fatal_stop_reason(error_text)
+    {
+        tracing::warn!(
+            agent = %agent_id,
+            streak,
+            "session classified as poisoned; deliveries will park in the queue until agent.retry or a fresh agent (monorepo#840)"
+        );
+    }
     // Persist agent status as Error WITH stop_reason and emit agent:status-changed.
     // Durable-before-observable: the store write completes BEFORE the event is published,
     // so subscribers see the canonical field immediately via agent.get/getSession.
