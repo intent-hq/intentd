@@ -4723,6 +4723,27 @@ async fn resolve_spawn_defaults_to_default_provider_and_temp_cwd() {
     // provider_binary may or may not be resolved depending on what's installed
 }
 
+/// A persisted effective-model display name (D13, whitespace-bearing, e.g.
+/// `claude-code:Opus 4.8`) still selects the provider via its compound
+/// prefix but never reaches `SpawnOptions.model` — it is a stats/attribution
+/// value, not a spawnable model id; the spawn runs on the provider default.
+#[tokio::test]
+async fn resolve_spawn_drops_effective_display_name_model() {
+    if intent_providers::find_npx().is_none() {
+        eprintln!("skipping: npx not available on this host");
+        return;
+    }
+    let settings = intent_core::settings_file::SettingsFile::default();
+    let mut session = session_with_specialist(None);
+    session.model = Some("claude-code:Opus 4.8".to_string());
+    let resolved = resolve_spawn(&session, None, &settings, None).expect("resolves");
+    assert_eq!(resolved.provider.id, "claude-code", "prefix still wins");
+    assert!(
+        resolved.model.is_none(),
+        "display name must not become a spawn model id"
+    );
+}
+
 /// A compound `provider:model` id selects both the provider and the bare model
 /// id, without needing an explicit `provider` on the session. claude-code is
 /// npx-only, so a successful resolution always carries the pinned npx package
