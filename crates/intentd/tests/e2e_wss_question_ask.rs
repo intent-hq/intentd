@@ -271,8 +271,9 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Drain subscriber events until an `agent:stream:end` for `agent_id` arrives.
-async fn await_stream_end<S>(sub: &mut WebSocketStream<S>, agent_id: &str)
+/// Drain subscriber events until an `agent:stream:end` for `agent_id` arrives;
+/// returns the event's `data` payload so callers can assert its shape.
+async fn await_stream_end<S>(sub: &mut WebSocketStream<S>, agent_id: &str) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -280,7 +281,7 @@ where
         let frame = wss_event(sub, 30).await;
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:stream:end" && ev["data"]["agentId"].as_str() == Some(agent_id) {
-            return;
+            return ev["data"].clone();
         }
     }
     panic!("no agent:stream:end for {agent_id}");
@@ -495,7 +496,7 @@ async fn question_ask_round_trip_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_id).await;
+    let end_data = await_stream_end(&mut sub, &agent_id).await;
 
     // The persisted final assistant message must END with the two question
     // resource blocks (AtTurnEnd drain order == ask() call order).
@@ -577,6 +578,25 @@ async fn question_ask_round_trip_over_wss() {
         );
     }
 
+    // Live delivery (monorepo#732 fix wave): the terminal `agent:stream:end`
+    // frame itself must carry the drained trailing blocks as `trailingBlocks`
+    // (byte-identical to the persisted blocks, registration order) plus the
+    // turn's `messageId` — the FE finalizes the in-flight message from
+    // accumulated chunks at stream-end, so blocks appended only after the
+    // stream loop would otherwise never reach it live.
+    assert_eq!(
+        end_data["messageId"], assistant["id"],
+        "stream:end carries the turn's messageId: {end_data}"
+    );
+    let live_trailing = end_data["trailingBlocks"]
+        .as_array()
+        .expect("stream:end carries trailingBlocks when AtTurnEnd blocks were drained");
+    assert_eq!(
+        live_trailing.as_slice(),
+        trailing,
+        "trailingBlocks are byte-identical to the persisted trailing blocks"
+    );
+
     // ---- Turn 2: flattened Q:/A: answers delivered verbatim ----
     let sent2 = wss_rpc(
         &mut rpc,
@@ -586,7 +606,12 @@ async fn question_ask_round_trip_over_wss() {
     )
     .await;
     assert_eq!(sent2["success"], true, "answers sendMessage ok: {sent2}");
-    await_stream_end(&mut sub, &agent_id).await;
+    let end_data2 = await_stream_end(&mut sub, &agent_id).await;
+    // No attachments were registered on turn 2 — `trailingBlocks` is omitted.
+    assert!(
+        end_data2.get("trailingBlocks").is_none(),
+        "trailingBlocks omitted when no AtTurnEnd blocks were drained: {end_data2}"
+    );
 
     // The mock child logged the exact prompt text it received per turn: the
     // flattened answers must arrive VERBATIM as the tail of turn 2 (any

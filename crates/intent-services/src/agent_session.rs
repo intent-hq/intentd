@@ -1024,7 +1024,9 @@ impl Services {
         // on the error path too — the registry must not leak; the interrupt/
         // abort path (worker dropped) is covered by the next turn's drain +
         // the registry TTL.
-        for attachment in self.turn_attachments.finish_turn(agent_id) {
+        let drained_attachments = self.turn_attachments.finish_turn(agent_id);
+        let trailing_count = drained_attachments.len();
+        for attachment in drained_attachments {
             transcript.push_block(attachment.resource_item());
         }
         // Split the PromptOutcome into its stop reason and the optional
@@ -1038,6 +1040,14 @@ impl Services {
         // Accumulate the assistant message (one per turn) into the append-only log.
         let blocks = transcript.into_blocks();
         let last_response_summary = last_response_summary(&blocks);
+        // Snapshot the drained AtTurnEnd blocks AS PERSISTED (post id-stamping
+        // — the drain pushed them last, so they are the trailing slice) for
+        // the terminal `agent:stream:end` payload below: the FE finalizes the
+        // in-flight message from accumulated chunks at stream-end, so blocks
+        // appended only after the stream loop would never reach it live
+        // (monorepo#732 fix wave). Byte-identical to the persisted blocks.
+        let trailing_blocks = blocks[blocks.len() - trailing_count..].to_vec();
+        let message_persisted = !blocks.is_empty();
         // Silent-redrive eligibility (monorepo#764): the transport closed
         // before the turn streamed ANYTHING (no session/update applied, zero
         // transcript blocks) — the prompt provably never produced output, so
@@ -1125,14 +1135,22 @@ impl Services {
         // worker either redrives the prompt (the redriven attempt emits the
         // turn's terminal events) or, when the one-retry budget is spent,
         // emits the pair itself via the terminal-failure path.
+        //
+        // The payload carries `messageId` when the turn persisted an
+        // assistant message, and `trailingBlocks` (the drained AtTurnEnd
+        // blocks, byte-identical to the persisted trailing blocks, in
+        // registration order) when any were drained — omitted otherwise
+        // (monorepo#732 fix wave: live delivery of turn-end attachments).
         if !pre_output_transport_failure {
-            self.publish_agent_event(
-                workspace_id,
-                agent_id,
-                AGENT_STREAM_END,
-                json!({ "agentId": agent_id.0 }),
-            )
-            .await;
+            let mut end_data = json!({ "agentId": agent_id.0 });
+            if message_persisted {
+                end_data["messageId"] = json!(message_id);
+            }
+            if !trailing_blocks.is_empty() {
+                end_data["trailingBlocks"] = Value::Array(trailing_blocks);
+            }
+            self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
+                .await;
         }
         // Session-completion lifecycle signal, emitted AFTER the terminal
         // stream:end (the auto-subscription wake keys off this). A normal

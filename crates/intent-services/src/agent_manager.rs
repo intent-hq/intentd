@@ -2360,6 +2360,14 @@ impl AgentManager {
         // Unlike the normal-completion emit, the interrupt terminal carries
         // `stopReason: "interrupted"` (+ `messageId` when an interrupted row
         // was persisted) so clients can render the Stopped indicator live.
+        //
+        // Deliberately NO `trailingBlocks` here (monorepo#732): the interrupt
+        // flush persists only the streamed-so-far live-turn snapshot — the
+        // AtTurnEnd registry is NOT drained on this path (pending entries stay
+        // for the next turn's drain / registry TTL, per the §7.1 drain
+        // contract in `run_prompt_turn`), so there are no persisted trailing
+        // blocks for the event to mirror; carrying undrained entries would
+        // break the byte-identical persisted↔event invariant.
         if let Some(workspace_id) = workspace_id {
             let mut end_data = json!({
                 "agentId": agent_id.0,
