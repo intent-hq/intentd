@@ -5130,6 +5130,19 @@ async fn report_to_parent_delivers_for_delegated_caller() {
         wake_text.contains(&format!("Report: {report}")),
         "wake must contain the report: {wake_text}"
     );
+    // The wake's event_notification metadata carries the report under BOTH
+    // `completionReport` (canonical) and `report` (back-compat).
+    let metadata = parent_session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("wake message carries event_notification metadata");
+    assert_eq!(metadata["type"], json!("event_notification"));
+    assert_eq!(metadata["eventTypes"], json!(["agent:reportToParent"]));
+    let events = metadata["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["data"]["agentId"], json!(child.0));
+    assert_eq!(events[0]["data"]["completionReport"], json!(report));
+    assert_eq!(events[0]["data"]["report"], json!(report));
     let child_session = svc
         .store()
         .get_agent_session(&child)

@@ -2842,6 +2842,9 @@ impl Services {
                     "data": {
                         "agentId": caller.0,
                         "agentName": session.name.clone(),
+                        // `completionReport` is canonical; `report` is kept
+                        // for back-compat with older clients.
+                        "completionReport": report_text.clone(),
                         "report": report_text.clone(),
                     },
                     "actor": {

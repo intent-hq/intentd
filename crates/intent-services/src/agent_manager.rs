@@ -2370,6 +2370,9 @@ impl AgentManager {
                     data["agentName"] = json!(session.name);
                     data["isBackground"] = json!(session.is_background);
                     if let Some(ref report) = session.completion_report {
+                        // `completionReport` is canonical; `report` is kept
+                        // for back-compat with older clients.
+                        data["completionReport"] = json!(report);
                         data["report"] = json!(report);
                     }
                 }

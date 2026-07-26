@@ -5362,11 +5362,12 @@ fn failed_group_children(group: &agent_subscriptions::DelegationGroup) -> Vec<Ag
 /// Build a concise, human-readable wake string describing a child agent's
 /// completion for its parent. A minimal port of the TS formatEventNotification
 /// intent: it names the child, the completion kind, and any completion
-/// `report` (persisted by `agent.reportToParent` and forwarded on
-/// `agent:idle`) or `lastResponseSummary` / error carried on the event. A
-/// non-empty completion report wins over `lastResponseSummary` (SUB-2,
-/// mirroring `format_group_child_line`) so the single agent:idle-driven wake
-/// carries the child's `reportToParent` text end-to-end.
+/// report (persisted by `agent.reportToParent` and forwarded on `agent:idle`
+/// under `completionReport`, canonical, falling back to the legacy `report`
+/// key) or `lastResponseSummary` / error carried on the event. A non-empty
+/// completion report wins over `lastResponseSummary` (SUB-2, mirroring
+/// `format_group_child_line`) so the single agent:idle-driven wake carries
+/// the child's `reportToParent` text end-to-end.
 fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
@@ -5384,7 +5385,8 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
     let mut msg = format!("[WORKSPACE EVENTS] Child agent {label} {kind}.");
     if let Some(report) = event
         .data
-        .get("report")
+        .get("completionReport")
+        .or_else(|| event.data.get("report"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
     {
@@ -5410,7 +5412,8 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
 /// A compact sibling of [`format_completion_wake`] without the standalone
 /// `[WORKSPACE EVENTS]` framing, since the group header carries that. A
 /// non-empty `completion_report` (the child's persisted
-/// `metadata.completionReport`) wins over the event's `lastResponseSummary`,
+/// `metadata.completionReport`; when absent, the event's `completionReport`
+/// then legacy `report` key) wins over the event's `lastResponseSummary`,
 /// mirroring the TS event-notification formatter.
 pub(crate) fn format_group_child_line(
     child_id: &AgentId,
@@ -5431,7 +5434,16 @@ pub(crate) fn format_group_child_line(
         .map(|name| format!("{name} ({})", child_id.0))
         .unwrap_or_else(|| child_id.0.clone());
     let mut line = format!("- {label} {kind}.");
-    if let Some(report) = completion_report.filter(|r| !r.is_empty()) {
+    if let Some(report) = completion_report
+        .or_else(|| {
+            event
+                .data
+                .get("completionReport")
+                .or_else(|| event.data.get("report"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|r| !r.is_empty())
+    {
         line.push_str(&format!(" Report: {report}"));
     } else if let Some(summary) = event
         .data
