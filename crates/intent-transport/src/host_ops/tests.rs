@@ -115,6 +115,11 @@ fn expand_path_handles_tilde_root_and_subpath() {
     assert_eq!(expand_path("~", &home), home);
     assert_eq!(expand_path("~/projects", &home), home.join("projects"));
     assert_eq!(expand_path("/abs/path", &home), PathBuf::from("/abs/path"));
+    // Extra leading separators must stay under `home` (monorepo#832): before
+    // delegating to `intent_core::expand_tilde_with`, `~//tmp` joined the
+    // absolute `/tmp` and escaped `home` entirely.
+    assert_eq!(expand_path("~//tmp", &home), home.join("tmp"));
+    assert_eq!(expand_path("~//", &home), home);
 }
 
 #[test]
@@ -192,6 +197,22 @@ fn list_directory_with_expands_tilde_subpath() {
         sub.join("nested").to_string_lossy().into_owned()
     );
     assert_eq!(entries[0]["isDirectory"], true);
+}
+
+#[test]
+fn list_directory_with_keeps_double_slash_tilde_under_home() {
+    // Regression coverage for monorepo#832: `~//sub` must resolve under `home`
+    // like `~/sub` does — before delegating to the shared tilde helper it
+    // expanded to the absolute `//sub` and listed outside `home`.
+    let home = unique_temp_dir("ls-tilde-dslash");
+    let sub = home.join("sub");
+    std::fs::create_dir_all(sub.join("nested")).unwrap();
+    let v = list_directory_with(Some("~//sub"), &home).unwrap();
+    assert_eq!(v["path"], sub.to_string_lossy().into_owned());
+    assert_eq!(v["parent"], home.to_string_lossy().into_owned());
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "nested");
 }
 
 #[test]
