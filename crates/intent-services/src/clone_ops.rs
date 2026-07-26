@@ -143,6 +143,17 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     if m.contains("already exists and is not an empty directory") {
         return C::DestinationExistsNonEmpty;
     }
+    // Ordered before auth: an askpass exec failure drags the auth prose along
+    // with it ("could not read Username … terminal prompts disabled" follows
+    // once the helper fails to run), but the remedy is local — the helper
+    // script is missing/unreachable (e.g. macOS quarantine), not the
+    // credentials (monorepo#837).
+    if m.contains("ssh-askpass-intent")
+        || (m.contains("cannot exec") && m.contains("askpass"))
+        || (m.contains("app.asar") && m.contains("not a directory"))
+    {
+        return C::AskpassMissing;
+    }
     if m.contains("authentication failed")
         || m.contains("could not read username")
         || m.contains("could not read password")
@@ -194,12 +205,10 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     // not the user-supplied destination, so §9.1's "correct the path and
     // retry" remedy does not apply; it rides the clone-failed catch-all.
     //
-    // NOTE(§9.1 askpass-missing, monorepo#837): the documented
-    // `askpass-missing` shape ("… app.asar …: not a directory") has no arm
-    // here yet. When the `AskpassMissing` port lands it must be ordered
-    // ahead of BOTH the auth arm (§9.1 gives it precedence over
-    // auth-required) and this path arm (whose "not a directory" row would
-    // otherwise swallow its ENOTDIR spelling).
+    // The §9.1 `askpass-missing` shape ("… app.asar …: not a directory",
+    // monorepo#837) is handled by the `AskpassMissing` arm above, ordered
+    // ahead of both the auth arm and this path arm — its "not a directory"
+    // row must not swallow the askpass ENOTDIR spelling.
     if m.contains("is not a valid path")
         || m.contains("could not create work tree")
         || m.contains("could not create directory")
@@ -808,6 +817,30 @@ mod tests {
         }
     }
 
+    /// Askpass exec failures outrank auth-required even though git's stderr
+    /// carries the auth prose alongside them: the helper script is
+    /// missing/unreachable (e.g. macOS quarantine relocated the app bundle),
+    /// so the remedy is local — not credentials (monorepo#837).
+    #[test]
+    fn classify_clone_error_askpass_missing() {
+        use intent_core::CloneErrorCategory as C;
+        for msg in [
+            "fatal: cannot exec '/Users/x/Downloads/Intent.app/Contents/Resources/app.asar/resources/bin/ssh-askpass-intent.sh': Not a directory\nfatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: cannot exec ssh-askpass-intent.sh\nfatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: cannot exec '/usr/local/bin/my-askpass': No such file or directory\nfatal: could not read Password for 'https://github.com': terminal prompts disabled",
+            "sh: /Applications/Intent.app/Contents/Resources/app.asar/resources/bin/helper.sh: Not a directory",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::AskpassMissing, "msg: {msg}");
+        }
+        // Plain auth prose without any askpass signal stays auth-required.
+        assert_eq!(
+            classify_clone_error(
+                "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+            ),
+            C::AuthRequired
+        );
+    }
+
     #[test]
     fn classify_clone_error_network() {
         use intent_core::CloneErrorCategory as C;
@@ -901,16 +934,15 @@ mod tests {
             classify_clone_error("error: invalid path 'aux/config'"),
             C::Other
         );
-        // Pins today's classification of the §9.1 `askpass-missing` shape
-        // (monorepo#837): its ENOTDIR spelling currently hits this arm's
-        // "not a directory" row. The eventual `AskpassMissing` port must
-        // change this intentionally (ordered ahead of both the auth arm and
-        // this path arm), not silently.
+        // The §9.1 `askpass-missing` shape (monorepo#837): its ENOTDIR
+        // spelling previously rode this arm's "not a directory" row; the
+        // `AskpassMissing` arm is ordered ahead of both the auth arm and
+        // this path arm, so it now classifies askpass-missing.
         assert_eq!(
             classify_clone_error(
                 "error: cannot run /Applications/X.app/Contents/Resources/app.asar/bin/ssh-askpass-intent: Not a directory"
             ),
-            C::PathInvalid
+            C::AskpassMissing
         );
     }
 
