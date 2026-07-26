@@ -555,13 +555,17 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(idle.data["lastResponseSummary"], json!("Hello world"));
     // DELIV-1: `agent:idle` MUST carry `agentName` so subscribers don't fall
     // back to a generic label; `completion_report` is `None` on this session,
-    // so `report` is absent (only present when a delegated child called
-    // `agent.reportToParent`). `isBackground` rides along from the session
-    // row — `false` for this foreground session.
+    // so `completionReport` / `report` are absent (only present when a
+    // delegated child called `agent.reportToParent`). `isBackground` rides
+    // along from the session row — `false` for this foreground session.
     assert_eq!(idle.data["agentName"], json!("Builder"));
     assert_eq!(idle.data["isBackground"], json!(false));
     assert!(
         idle.data.get("report").is_none(),
+        "no completion_report was set on this session"
+    );
+    assert!(
+        idle.data.get("completionReport").is_none(),
         "no completion_report was set on this session"
     );
 
@@ -614,7 +618,8 @@ async fn prompt_turn_streams_events_and_accumulates() {
 
 /// DELIV-1: when the session carries a `completion_report` (persisted by
 /// `agent.reportToParent` on a delegated child), the terminal
-/// `agent:idle` payload includes it as `report` alongside the enriched
+/// `agent:idle` payload includes it under both `completionReport`
+/// (canonical) and `report` (back-compat) alongside the enriched
 /// `agentName`, so subscribers see the child's report without a
 /// follow-up `agent.get` round-trip.
 #[tokio::test]
@@ -666,6 +671,10 @@ async fn agent_idle_payload_carries_agent_name_and_completion_report() {
         .expect("agent:idle emitted");
     assert_eq!(idle.data["agentId"], json!("agent-1"));
     assert_eq!(idle.data["agentName"], json!("Builder"));
+    assert_eq!(
+        idle.data["completionReport"],
+        json!("wrote fix + tests, green")
+    );
     assert_eq!(idle.data["report"], json!("wrote fix + tests, green"));
 }
 

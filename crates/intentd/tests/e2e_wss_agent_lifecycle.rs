@@ -2722,6 +2722,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let mut child_id: Option<String> = None;
     let mut parent_idle_count = 0u32;
     let mut child_idle = false;
+    let mut child_idle_data: Option<serde_json::Value> = None;
     let mut parent_wake_ends = 0u32;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_idle) {
@@ -2750,6 +2751,7 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
         if let Some(cid) = child_id.as_deref() {
             if ev_agent == cid && ev_type == "agent:idle" {
                 child_idle = true;
+                child_idle_data = Some(ev["data"].clone());
             }
         }
         // Any parent stream:end after the first parent idle belongs to the
@@ -2760,6 +2762,19 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     }
     assert!(child_id.is_some(), "child agent id observed on the wire");
     assert!(child_idle, "child emitted agent:idle after reportToParent");
+    // The child's terminal `agent:idle` data carries the persisted report
+    // under BOTH `completionReport` (canonical) and `report` (back-compat).
+    let idle_data = child_idle_data.expect("child agent:idle data captured");
+    assert_eq!(
+        idle_data["completionReport"].as_str(),
+        Some(REPORT),
+        "child agent:idle carries completionReport: {idle_data}"
+    );
+    assert_eq!(
+        idle_data["report"].as_str(),
+        Some(REPORT),
+        "child agent:idle carries legacy report: {idle_data}"
+    );
     assert_eq!(
         parent_wake_ends, 1,
         "exactly one wake-turn stream:end on the parent (single wake driven by reportToParent, idle suppressed)"
