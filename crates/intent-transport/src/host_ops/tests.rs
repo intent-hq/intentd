@@ -183,6 +183,7 @@ fn list_directory_with_expands_tilde_subpath() {
     let v = list_directory_with(Some("~/sub"), &home).unwrap();
     assert_eq!(v["path"], sub.to_string_lossy().into_owned());
     assert_eq!(v["parent"], home.to_string_lossy().into_owned());
+    assert_eq!(v["home"], home.to_string_lossy().into_owned());
     let entries = v["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["name"], "nested");
@@ -190,6 +191,7 @@ fn list_directory_with_expands_tilde_subpath() {
         entries[0]["path"],
         sub.join("nested").to_string_lossy().into_owned()
     );
+    assert_eq!(entries[0]["isDirectory"], true);
 }
 
 #[test]
