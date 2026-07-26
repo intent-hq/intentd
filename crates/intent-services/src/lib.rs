@@ -5001,7 +5001,19 @@ async fn github_git_token(
     worktree: &std::path::Path,
 ) -> Option<String> {
     let origin = intent_git::remote::origin_url(worktree).ok().flatten()?;
-    if !intent_git::auth::is_https_github_url(&origin) {
+    github_git_token_for_url(registry, &origin).await
+}
+
+/// URL-parameterised sibling of [`github_git_token`] for callers that have no
+/// local checkout yet (the `git.clone` / `workspace.create` clone
+/// orchestration, monorepo#825): `Some` only when `url` is an HTTPS
+/// `github.com` remote and a token resolves per [`github_token_source`]. The
+/// token value is never logged.
+async fn github_git_token_for_url(
+    registry: Option<&SettingsRegistry>,
+    url: &str,
+) -> Option<String> {
+    if !intent_git::auth::is_https_github_url(url) {
         return None;
     }
     intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
@@ -7336,6 +7348,16 @@ impl WorkspaceApi for Services {
                                 });
                             }
                             let request_id = uuid::Uuid::new_v4().to_string();
+                            // Resolve a GitHub token for private HTTPS
+                            // github.com clones (monorepo#825). SSH and
+                            // non-GitHub URLs skip resolution entirely; the
+                            // value travels to the child via the environment
+                            // only and is never logged.
+                            let token = github_git_token_for_url(
+                                services.settings_registry.as_deref(),
+                                url,
+                            )
+                            .await;
                             // Clone failures are classified into a typed error
                             // carrying the sanitized stderr tail so clients can
                             // show the underlying cause (monorepo#826). The
@@ -7346,6 +7368,7 @@ impl WorkspaceApi for Services {
                                 workspace_id: Some(id.clone()),
                                 url: url.to_string(),
                                 target_path: target.clone(),
+                                token,
                                 bus: bus_ref,
                             })
                             .await
@@ -12424,12 +12447,17 @@ impl WorkspaceApi for Services {
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let bus = self.event_bus.clone();
+        let registry = self.settings_registry.clone();
         Box::pin(async move {
             if url.trim().is_empty() {
                 return Err(Error::InvalidParams("url is required".to_string()));
             }
             let target = clone_ops::resolve_target_path(&parent_dir, &url, target_name.as_deref())?;
             if clone_ops::target_exists(&target) {
+                // Stays -32603 per the documented git.clone contract
+                // (PROTOCOL §5.6); the §9.1 clone failure taxonomy (and its
+                // `workspace.create clone failed …` message shape) is scoped
+                // to the workspace.create orchestration.
                 return Err(Error::Internal(format!(
                     "target already exists: {}",
                     target.display()
@@ -12439,11 +12467,16 @@ impl WorkspaceApi for Services {
             let bus = bus.ok_or_else(|| {
                 Error::Internal("event bus not wired; git.clone requires streaming".to_string())
             })?;
+            // Resolve a GitHub token for private HTTPS github.com clones
+            // (monorepo#825): SSH / non-GitHub URLs skip resolution entirely;
+            // the value travels to the child via the environment only.
+            let token = github_git_token_for_url(registry.as_deref(), &url).await;
             clone_ops::spawn_clone(clone_ops::CloneJob {
                 request_id: request_id.clone(),
                 workspace_id: None,
                 url,
                 target_path: target.clone(),
+                token,
                 bus,
             });
             Ok(serde_json::json!({

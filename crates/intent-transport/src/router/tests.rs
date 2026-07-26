@@ -1963,6 +1963,59 @@ async fn workspace_create_base_ref_unresolvable_maps_to_minus_32602_with_data() 
 }
 
 #[tokio::test]
+async fn clone_failed_maps_to_structured_error_data() {
+    // A classified clone failure (clone failure taxonomy, PROTOCOL §9.1;
+    // monorepo#825/#826) carries the documented human message plus
+    // machine-readable `error.data = { code, detail }` so clients stop
+    // matching on prose. -32603 for remote failures, -32602 for the
+    // user-fixable destination-exists shape.
+    let rpc = super::domain_to_rpc(intent_core::Error::CloneFailed {
+        category: intent_core::CloneErrorCategory::AuthRequired,
+        detail: "git clone failed (exit status: 128): fatal: could not read Username \
+                 for 'https://github.com': terminal prompts disabled"
+            .to_string(),
+    });
+    assert_eq!(rpc.code, -32603);
+    assert!(
+        rpc.message
+            .starts_with("workspace.create clone failed (auth-required):"),
+        "documented message shape: {}",
+        rpc.message
+    );
+    let data = rpc.data.expect("structured data");
+    assert_eq!(data["code"], serde_json::json!("auth-required"));
+    assert!(
+        data["detail"]
+            .as_str()
+            .unwrap()
+            .contains("terminal prompts disabled"),
+        "detail carries the sanitized stderr tail: {data}"
+    );
+
+    let rpc = super::domain_to_rpc(intent_core::Error::CloneFailed {
+        category: intent_core::CloneErrorCategory::DestinationExistsNonEmpty,
+        detail: "fatal: destination path 'x' already exists and is not an empty directory."
+            .to_string(),
+    });
+    assert_eq!(rpc.code, -32602, "user-fixable shape is -32602");
+    assert_eq!(
+        rpc.data.expect("structured data")["code"],
+        serde_json::json!("destination-exists-non-empty")
+    );
+
+    // The additive monorepo#825 categories are environmental: -32603.
+    let rpc = super::domain_to_rpc(intent_core::Error::CloneFailed {
+        category: intent_core::CloneErrorCategory::RepoNotFound,
+        detail: "remote: Repository not found.".to_string(),
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.data.expect("structured data")["code"],
+        serde_json::json!("repo-not-found")
+    );
+}
+
+#[tokio::test]
 async fn expected_version_conflict_maps_to_minus_32005_with_data_current() {
     // A stale `expectedVersion` on `note.update` surfaces -32005 carrying the
     // current entity under `error.data.current` (PROTOCOL §4, §5.6).
