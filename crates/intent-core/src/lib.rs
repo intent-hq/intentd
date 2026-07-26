@@ -29,7 +29,7 @@ pub use agent_logs::{
 pub use chief_cwd::{chief_cwd_root, create_chief_cwd_dir, sweep_chief_cwd, CHIEF_CWD_DIR_NAME};
 pub use clock::{iso_from_unix_secs, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso};
 pub use config::Config;
-pub use error::{Error, Result};
+pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
 pub use ids::{AgentId, ClientId, NoteId, WorkspaceId, CHIEF_WORKSPACE_ID};
 pub use model::MAX_DELEGATION_DEPTH;

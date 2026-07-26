@@ -125,6 +125,50 @@ fn redact_credentials(text: &str) -> String {
     out
 }
 
+/// Classify a (already-redacted) clone failure message into a machine-readable
+/// [`CloneErrorCategory`] so `workspace.create` can surface a typed error
+/// instead of a bare "Internal error" (monorepo#826). Best-effort pattern
+/// match over git's stderr prose; anything unrecognized is `Other` — the
+/// sanitized detail still travels with the error either way.
+pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCategory {
+    use intent_core::CloneErrorCategory as C;
+    let m = detail.to_lowercase();
+    if m.contains("already exists and is not an empty directory") {
+        return C::DestinationExistsNonEmpty;
+    }
+    if m.contains("authentication failed")
+        || m.contains("could not read username")
+        || m.contains("could not read password")
+        || m.contains("terminal prompts disabled")
+        || m.contains("permission denied (publickey)")
+        || m.contains("invalid username or password")
+    {
+        return C::AuthRequired;
+    }
+    if m.contains("could not resolve host")
+        || m.contains("network is unreachable")
+        || m.contains("connection refused")
+        || m.contains("connection timed out")
+        || m.contains("operation timed out")
+        || m.contains("timed out")
+        || m.contains("could not connect to")
+        || m.contains("early eof")
+        || m.contains("remote end hung up unexpectedly")
+    {
+        return C::Network;
+    }
+    if m.contains("is not a valid path")
+        || m.contains("could not create work tree")
+        || m.contains("could not create directory")
+        || m.contains("permission denied")
+        || m.contains("read-only file system")
+        || m.contains("no such file or directory")
+    {
+        return C::PathInvalid;
+    }
+    C::Other
+}
+
 /// Streaming-clone request handed to [`run_clone`]. Held plain (not `Clone`)
 /// because it is consumed once by the spawned task.
 pub(crate) struct CloneJob {
@@ -584,6 +628,61 @@ mod tests {
     fn redact_credentials_passthrough_when_none() {
         let input = "fatal: repository not found";
         assert_eq!(redact_credentials(input), input);
+    }
+
+    #[test]
+    fn classify_clone_error_auth() {
+        use intent_core::CloneErrorCategory as C;
+        for msg in [
+            "fatal: Authentication failed for 'https://github.com/a/b.git/'",
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "git@github.com: Permission denied (publickey).",
+            "remote: Invalid username or password.",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::AuthRequired, "msg: {msg}");
+        }
+    }
+
+    #[test]
+    fn classify_clone_error_network() {
+        use intent_core::CloneErrorCategory as C;
+        for msg in [
+            "fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com",
+            "fatal: unable to access 'https://github.com/a/b.git/': Failed to connect to github.com port 443: Connection refused",
+            "git clone timed out",
+            "fatal: the remote end hung up unexpectedly",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::Network, "msg: {msg}");
+        }
+    }
+
+    #[test]
+    fn classify_clone_error_destination_and_path() {
+        use intent_core::CloneErrorCategory as C;
+        assert_eq!(
+            classify_clone_error(
+                "fatal: destination path 'x' already exists and is not an empty directory."
+            ),
+            C::DestinationExistsNonEmpty
+        );
+        assert_eq!(
+            classify_clone_error("fatal: could not create work tree dir 'x': Permission denied"),
+            C::PathInvalid
+        );
+        assert_eq!(
+            classify_clone_error("fatal: could not create directory '/nope/x'"),
+            C::PathInvalid
+        );
+    }
+
+    #[test]
+    fn classify_clone_error_fallback_other() {
+        use intent_core::CloneErrorCategory as C;
+        assert_eq!(
+            classify_clone_error("fatal: repository 'https://github.com/a/b.git/' not found"),
+            C::Other
+        );
+        assert_eq!(classify_clone_error(""), C::Other);
     }
 
     #[test]
