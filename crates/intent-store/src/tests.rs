@@ -942,6 +942,290 @@ async fn delete_note_versioned_hit_miss_and_absent() {
     }
 }
 
+/// A top-level, non-task, non-archived note in the pre-#110 stray-spec shape
+/// (adoption candidate when titled "Spec").
+fn stray_note(ws_id: &WorkspaceId, id: &str, title: &str) -> Note {
+    let ts = now_iso();
+    Note {
+        id: NoteId::from(id),
+        workspace_id: ws_id.clone(),
+        title: title.to_string(),
+        content: "# stray".to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    }
+}
+
+/// Prove no transaction was left open on the sole write-pool connection: with
+/// `max_connections=1` this acquires the SAME connection the previous call
+/// used, and a leaked open transaction would make `BEGIN IMMEDIATE` fail with
+/// "cannot start a transaction within a transaction".
+async fn assert_no_open_write_transaction(store: &Store, context: &str) {
+    let mut conn = store.write_pool().acquire().await.expect("acquire probe");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("transaction leaked after {context}: {e}"));
+    sqlx::query("COMMIT")
+        .execute(&mut *conn)
+        .await
+        .expect("commit probe txn");
+}
+
+/// Post-conversion to raw `BEGIN IMMEDIATE` (monorepo#796, mirroring the #783
+/// shape): the spec-already-exists early return writes nothing AND leaves no
+/// transaction open on the write-pool connection. (The third early-return
+/// path — `rows_affected != 1` on the id rewrite — is unreachable without an
+/// injection seam: the candidate SELECT and the UPDATE run inside one
+/// IMMEDIATE transaction, so no other writer can remove the row in between;
+/// the same guard-COMMIT covers it.)
+#[tokio::test]
+async fn adopt_stray_spec_when_spec_exists_leaves_no_open_transaction() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    store
+        .insert_note(&stray_note(&ws_id, "spec", "Spec"))
+        .await
+        .expect("insert real spec");
+    store
+        .insert_note(&stray_note(&ws_id, "stray-1", "Spec"))
+        .await
+        .expect("insert stray");
+
+    let adopted = store.adopt_stray_spec_note(&ws_id).await.expect("adopt");
+    assert!(adopted.is_none(), "must bail when spec already exists");
+
+    assert_no_open_write_transaction(&store, "spec-exists early return").await;
+
+    // The stray is untouched — no partial write escaped the transaction.
+    let stray = store
+        .get_note(&ws_id, &NoteId::from("stray-1"))
+        .await
+        .expect("stray still present");
+    assert!(!stray.is_pinned);
+    assert!(!stray.is_default);
+}
+
+/// The candidate-count early return (zero candidates, then ≥2 candidates)
+/// leaves no open transaction and no partial write (monorepo#796).
+#[tokio::test]
+async fn adopt_stray_spec_without_single_candidate_leaves_no_open_transaction() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    // Zero candidates.
+    let adopted = store.adopt_stray_spec_note(&ws_id).await.expect("adopt");
+    assert!(adopted.is_none(), "no candidate must adopt nothing");
+    assert_no_open_write_transaction(&store, "zero-candidate early return").await;
+
+    // ≥2 candidates (trim + case-insensitive title match).
+    store
+        .insert_note(&stray_note(&ws_id, "stray-1", "Spec"))
+        .await
+        .expect("insert stray 1");
+    store
+        .insert_note(&stray_note(&ws_id, "stray-2", "  spec  "))
+        .await
+        .expect("insert stray 2");
+    let adopted = store.adopt_stray_spec_note(&ws_id).await.expect("adopt");
+    assert!(adopted.is_none(), "ambiguous candidates must adopt nothing");
+    assert_no_open_write_transaction(&store, "ambiguous-candidate early return").await;
+
+    // Both strays untouched under their original ids.
+    for id in ["stray-1", "stray-2"] {
+        let n = store
+            .get_note(&ws_id, &NoteId::from(id))
+            .await
+            .expect("stray still present");
+        assert!(!n.is_pinned);
+        assert!(!n.is_default);
+    }
+}
+
+/// FK deferral under raw `BEGIN IMMEDIATE` (monorepo#796): an adoption whose
+/// stray carries dependents keyed by the composite `(note_id, workspace_id)`
+/// FKs — a child note, a version, line attribution, a comment — commits
+/// cleanly (the deferred check passes once the referenced key and its
+/// dependents are rewritten together) and leaves no open transaction.
+#[tokio::test]
+async fn adopt_stray_spec_with_dependents_commits_cleanly() {
+    use std::collections::BTreeMap;
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let stray = stray_note(&ws_id, "stray-1", "Spec");
+    store.insert_note(&stray).await.expect("insert stray");
+    let mut child = stray_note(&ws_id, "child-1", "Child");
+    child.parent_id = Some(stray.id.clone());
+    store.insert_note(&child).await.expect("insert child");
+
+    let author = NoteVersionAuthor {
+        id: "user".to_string(),
+        name: "User".to_string(),
+        author_type: "user".to_string(),
+    };
+    store
+        .append_note_version(&stray, &author, &stray.created_at)
+        .await
+        .expect("append version");
+
+    let mut attributions = BTreeMap::new();
+    attributions.insert(
+        "1".to_string(),
+        intent_core::LineAttributionInfo {
+            timestamp: 0,
+            author: None,
+        },
+    );
+    store
+        .upsert_note_line_attribution(&intent_core::LineAttributionData {
+            note_id: stray.id.clone(),
+            workspace_id: ws_id.clone(),
+            computed_at: stray.created_at.clone(),
+            attributions,
+        })
+        .await
+        .expect("upsert attribution");
+
+    let comment = Comment {
+        id: "c1".to_string(),
+        thread_id: "t1".to_string(),
+        note_id: Some(stray.id.clone()),
+        kind: CommentType::Comment,
+        content: "hi".to_string(),
+        author: "user".to_string(),
+        author_type: AuthorType::User,
+        status: CommentStatus::Open,
+        parent_id: None,
+        anchor: Some(CommentAnchor {
+            kind: CommentAnchorType::Range,
+            ..Default::default()
+        }),
+        anchor_text: None,
+        anchor_before: None,
+        anchor_after: None,
+        suggestion_original: None,
+        suggestion_proposed: None,
+        agent_id: None,
+        is_orphaned: None,
+        created_at: stray.created_at.clone(),
+        updated_at: stray.created_at.clone(),
+    };
+    store
+        .insert_comment(&ws_id, &comment)
+        .await
+        .expect("insert comment");
+
+    let adopted = store.adopt_stray_spec_note(&ws_id).await.expect("adopt");
+    assert_eq!(adopted, Some((stray.id.clone(), "Spec".to_string())));
+
+    assert_no_open_write_transaction(&store, "successful adoption").await;
+
+    let spec_id = NoteId::from("spec");
+    let spec = store.get_note(&ws_id, &spec_id).await.expect("spec");
+    assert!(spec.is_pinned);
+    assert!(spec.is_default);
+    assert!(spec.tags.iter().any(|t| t == "spec"));
+    let child_now = store
+        .get_note(&ws_id, &NoteId::from("child-1"))
+        .await
+        .expect("child");
+    assert_eq!(child_now.parent_id, Some(spec_id.clone()));
+    let versions = store
+        .list_note_versions(&ws_id, &spec_id)
+        .await
+        .expect("versions");
+    assert_eq!(versions.len(), 1);
+    let attr = store
+        .get_note_line_attribution(&ws_id, &spec_id)
+        .await
+        .expect("attribution");
+    assert!(attr.is_some());
+    let comments = store
+        .list_comments_in_workspace(&ws_id, &spec_id)
+        .await
+        .expect("comments");
+    assert_eq!(comments.len(), 1);
+}
+
+/// `PRAGMA defer_foreign_keys = ON` under raw `BEGIN IMMEDIATE` defers — but
+/// does not disable — FK enforcement: a genuinely broken composite FK passes
+/// at statement time and fails the COMMIT (monorepo#796).
+#[tokio::test]
+async fn deferred_fk_enforcement_still_fires_at_commit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+
+    let mut conn = store.write_pool().acquire().await.expect("acquire");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .expect("begin");
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .expect("defer FKs");
+    // Violates the composite FK on note_version — deferred, so the statement
+    // itself succeeds.
+    sqlx::query(
+        "INSERT INTO note_version (note_id, workspace_id, v, date, author_id, \
+         author_name, author_type, title, content) \
+         VALUES ('no-such-note', ?, 1, '2026-01-01', 'u', 'U', 'user', 't', 'c')",
+    )
+    .bind(&ws_id.0)
+    .execute(&mut *conn)
+    .await
+    .expect("deferred FK violation must not fail at statement time");
+    let commit = sqlx::query("COMMIT").execute(&mut *conn).await;
+    assert!(
+        commit.is_err(),
+        "deferred FK violation must fail the COMMIT"
+    );
+    // A failed deferred-FK COMMIT leaves the transaction active; close it.
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("rollback after failed commit");
+    drop(conn);
+
+    assert_no_open_write_transaction(&store, "failed deferred-FK commit").await;
+    let versions = store
+        .list_note_versions(&ws_id, &NoteId::from("no-such-note"))
+        .await
+        .expect("list versions");
+    assert!(versions.is_empty(), "violating row must not persist");
+}
+
 fn task_note(ws_id: &WorkspaceId, title: &str, task: Option<TaskMetadata>) -> Note {
     let ts = now_iso();
     Note {
