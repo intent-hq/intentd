@@ -513,7 +513,10 @@ impl Store {
     /// open. Unlike [`set_agent_session_effective_model`](Store::set_agent_session_effective_model)
     /// this never touches `model` — the raw option id keeps driving provider
     /// configuration (spawn flags / `session/set_config_option`); the
-    /// resolution is used ONLY for usage-stats attribution. Writes only
+    /// resolution is used ONLY for usage-stats attribution. `resolved` is
+    /// written as given, `None` included — an id that no longer resolves
+    /// must overwrite (not orphan) a previously persisted resolution, or a
+    /// stale display name would keep mis-attributing stats. Writes only
     /// while `model` still equals `expected_model` (the explicit id read
     /// before the ACP call), so a resolution is never attached to a model a
     /// concurrent `agent.setModel` changed. Returns whether the write
@@ -523,7 +526,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
         expected_model: &str,
-        resolved: &str,
+        resolved: Option<&str>,
     ) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE agent_session SET resolved_model=? WHERE id=? AND workspace_id=? AND model=?",
@@ -541,24 +544,22 @@ impl Store {
     /// Clear a session's resolved display model (D14). Called by
     /// `agent.setModel` when the stored model changes so a stale resolution
     /// never mis-attributes stats; the next session open re-resolves against
-    /// the new model. `NotFound` if the session row is absent or the
-    /// workspace does not match.
+    /// the new model. Idempotent: an absent row or an already-NULL column is
+    /// a no-op, not an error — the caller just updated the session, so
+    /// nothing actionable hides behind a zero row count.
     pub async fn clear_agent_session_resolved_model(
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
     ) -> Result<()> {
-        let res = sqlx::query(
-            "UPDATE agent_session SET resolved_model=NULL WHERE id=? AND workspace_id=?",
-        )
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("clear agent session resolved model failed: {e}")))?;
-        if res.rows_affected() == 0 {
-            return Err(Error::NotFound(format!("agent session {id}")));
-        }
+        sqlx::query("UPDATE agent_session SET resolved_model=NULL WHERE id=? AND workspace_id=?")
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("clear agent session resolved model failed: {e}"))
+            })?;
         Ok(())
     }
 

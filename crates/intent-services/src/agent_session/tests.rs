@@ -2034,9 +2034,11 @@ async fn open_session_resolves_explicit_bracketed_pick_display_model() {
 }
 
 /// D14: an explicit id with no matching option entry persists no resolution —
-/// stats fall back to normalizing the raw id.
+/// stats fall back to normalizing the raw id. A PREVIOUS resolution is
+/// overwritten (cleared), not orphaned: a stale display name from an older
+/// option list must not keep mis-attributing stats.
 #[tokio::test]
-async fn open_session_unmatched_explicit_pick_persists_no_resolution() {
+async fn open_session_unmatched_explicit_pick_clears_previous_resolution() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
     let mut session = new_session(&agent_id, &ws);
     session.id = AgentId::from("agent-d14-unmatched");
@@ -2045,6 +2047,18 @@ async fn open_session_unmatched_explicit_pick_persists_no_resolution() {
         .insert_agent_session(&session)
         .await
         .expect("insert");
+    // A resolution persisted by an earlier open against an older option list.
+    let landed = bus
+        .store()
+        .set_agent_session_resolved_model(
+            &ws,
+            &session.id,
+            "claude-code:claude-haiku-4-5",
+            Some("Haiku 4.5"),
+        )
+        .await
+        .expect("seed stale resolution");
+    assert!(landed);
     let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
     services
         .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
@@ -2056,7 +2070,7 @@ async fn open_session_unmatched_explicit_pick_persists_no_resolution() {
         .await
         .expect("read resolved model");
     assert_eq!(model.as_deref(), Some("claude-code:claude-haiku-4-5"));
-    assert_eq!(resolved, None);
+    assert_eq!(resolved, None, "stale resolution overwritten by None");
 }
 
 /// D13: a NULL stored model resolves too, persisting the compound id with

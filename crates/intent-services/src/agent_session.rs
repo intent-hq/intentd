@@ -815,10 +815,14 @@ impl Services {
     /// session-open `configOptions` and persist it to `resolved_model`. The
     /// bare id (compound `{provider}:` prefix stripped — stored explicit
     /// picks are compound, option values are bare) is matched against the
-    /// model select's option values; the store write is guarded on `model`
-    /// still equalling the pre-open stored value, so a resolution is never
-    /// attached to a model a concurrent `agent.setModel` changed. Best-effort:
-    /// failures are logged, never propagated.
+    /// model select's option values. The outcome is persisted EITHER way — a
+    /// `None` resolution overwrites (clears) any previously persisted
+    /// display name, so a resolution from an older option list can never go
+    /// stale and mis-attribute stats after the provider's catalog changes.
+    /// The store write is guarded on `model` still equalling the pre-open
+    /// stored value, so a resolution is never attached to a model a
+    /// concurrent `agent.setModel` changed. Best-effort: failures are
+    /// logged, never propagated.
     async fn persist_resolved_display_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -828,19 +832,17 @@ impl Services {
     ) {
         let Some(stored) = stored_model else { return };
         let (_, bare_id) = intent_providers::parse_compound_model_id(stored);
-        let Some(resolved) = resolve_explicit_display_model(&bare_id, config_options) else {
-            return;
-        };
+        let resolved = resolve_explicit_display_model(&bare_id, config_options);
         match self
             .store
-            .set_agent_session_resolved_model(workspace_id, agent_id, stored, &resolved)
+            .set_agent_session_resolved_model(workspace_id, agent_id, stored, resolved.as_deref())
             .await
         {
             Ok(true) => {
                 tracing::debug!(
                     agent = %agent_id,
                     model = %stored,
-                    resolved = %resolved,
+                    resolved = %resolved.as_deref().unwrap_or("<none>"),
                     "persisted resolved display model from configOptions"
                 );
             }
