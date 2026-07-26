@@ -2036,6 +2036,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.repoConfig.get" => {
+            let owner = require_str_param(params, "owner")?;
+            let repo = require_str_param(params, "repo")?;
+            let git_ref = opt_str(params, "ref");
+            let r = api
+                .github_repo_config_get(owner, repo, git_ref)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;

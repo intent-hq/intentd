@@ -910,6 +910,20 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(serde_json::json!({ "repo": { "owner": owner, "name": repo } })) })
     }
 
+    fn github_repo_config_get(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "config": { "branchPrefix": format!("{owner}/{repo}") },
+                "echoRef": git_ref,
+            }))
+        })
+    }
+
     fn github_branches_list(
         &self,
         owner: String,
@@ -3421,6 +3435,34 @@ async fn github_repos_get_requires_owner_and_repo() {
     .unwrap();
     assert_eq!(ok["result"]["repo"]["owner"], serde_json::json!("o"));
     assert_eq!(ok["result"]["repo"]["name"], serde_json::json!("r"));
+}
+
+#[tokio::test]
+async fn github_repo_config_get_requires_owner_and_repo_and_routes_ref() {
+    let missing_repo =
+        call(r#"{"jsonrpc":"2.0","id":1,"method":"github.repoConfig.get","params":{"owner":"o"}}"#)
+            .await
+            .unwrap();
+    assert_eq!(err_code(&missing_repo), -32602);
+
+    // `ref` is optional and omitted → forwarded as null.
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.repoConfig.get","params":{"owner":"o","repo":"r"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ok["result"]["config"]["branchPrefix"],
+        serde_json::json!("o/r")
+    );
+    assert_eq!(ok["result"]["echoRef"], Value::Null);
+
+    let with_ref = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"github.repoConfig.get","params":{"owner":"o","repo":"r","ref":"dev"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(with_ref["result"]["echoRef"], serde_json::json!("dev"));
 }
 
 #[tokio::test]

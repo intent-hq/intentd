@@ -16,6 +16,10 @@ const REPO_INTENT_DIR: &str = ".intent";
 /// Config file name within `.intent/` (FE `REPO_CONFIG_FILENAME`).
 const REPO_CONFIG_FILENAME: &str = "config.json";
 
+/// Repo-relative path of the config file (`.intent/config.json`), as sent to
+/// a forge contents API by `github.repoConfig.get`.
+pub const REPO_CONFIG_REL_PATH: &str = ".intent/config.json";
+
 /// Default `.gitignore` content for `.intent/` (FE `REPO_INTENT_GITIGNORE`).
 /// Excludes everything except `config.json` and the `.gitignore` itself.
 const REPO_INTENT_GITIGNORE: &str = "# Intent workspace config directory
@@ -41,43 +45,41 @@ pub async fn read_repo_config(repo_path: &Path) -> RepoConfig {
     let config_path = get_config_file_path(repo_path);
 
     match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => {
-            // Try to parse as JSON
-            match serde_json::from_str::<Value>(&content) {
-                Ok(value) => {
-                    // Validate it's an object (not an array or primitive)
-                    if !value.is_object() {
-                        tracing::warn!(
-                            "Invalid repo config format (not an object): {:?}",
-                            repo_path
-                        );
-                        return RepoConfig::default();
-                    }
-                    // Deserialize into RepoConfig
-                    match serde_json::from_value::<RepoConfig>(value) {
-                        Ok(config) => config,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to deserialize repo config at {:?}: {}",
-                                repo_path,
-                                e
-                            );
-                            RepoConfig::default()
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to parse repo config JSON at {:?}: {}", repo_path, e);
-                    RepoConfig::default()
-                }
-            }
-        }
+        Ok(content) => parse_repo_config_tolerant(&content, &format!("{repo_path:?}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // File doesn't exist — that's fine, return empty config
             RepoConfig::default()
         }
         Err(e) => {
             tracing::warn!("Failed to read repo config at {:?}: {}", repo_path, e);
+            RepoConfig::default()
+        }
+    }
+}
+
+/// Parse `config.json` text into a [`RepoConfig`] tolerantly: invalid JSON,
+/// non-object JSON, and schema mismatches all yield the empty default (never
+/// an error). `source` labels warn logs (a repo path or `owner/repo@ref`).
+/// Shared by the local read above and the remote `github.repoConfig.get`.
+pub fn parse_repo_config_tolerant(content: &str, source: &str) -> RepoConfig {
+    match serde_json::from_str::<Value>(content) {
+        Ok(value) => {
+            // Validate it's an object (not an array or primitive)
+            if !value.is_object() {
+                tracing::warn!("Invalid repo config format (not an object): {}", source);
+                return RepoConfig::default();
+            }
+            // Deserialize into RepoConfig
+            match serde_json::from_value::<RepoConfig>(value) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::warn!("Failed to deserialize repo config at {}: {}", source, e);
+                    RepoConfig::default()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse repo config JSON at {}: {}", source, e);
             RepoConfig::default()
         }
     }

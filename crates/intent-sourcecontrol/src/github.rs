@@ -421,6 +421,56 @@ fn map_list<T>(value: Value, f: impl Fn(Value) -> Result<T>) -> Result<Vec<T>> {
     items.into_iter().map(f).collect()
 }
 
+/// Decode a contents-API **file** payload (`GET /repos/{o}/{r}/contents/{path}`)
+/// into its UTF-8 text. GitHub returns `{ "type": "file", "encoding": "base64",
+/// "content": "<base64 wrapped at 60 cols>" }`; the wrap whitespace is stripped
+/// before decoding. Directory (array) payloads and non-base64 encodings are
+/// decode errors — the caller asked for one file's text.
+fn decode_contents_file(v: &Value) -> Result<String> {
+    use base64::Engine as _;
+    if v.is_array() {
+        return Err(Error::Decode(
+            "contents path is a directory, not a file".to_string(),
+        ));
+    }
+    let content = v
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Decode("contents payload missing string `content`".to_string()))?;
+    let encoding = v
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("base64");
+    if encoding != "base64" {
+        return Err(Error::Decode(format!(
+            "unsupported contents encoding {encoding:?}"
+        )));
+    }
+    let compact: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .map_err(|e| Error::Decode(format!("invalid base64 in contents payload: {e}")))?;
+    String::from_utf8(bytes)
+        .map_err(|e| Error::Decode(format!("contents payload is not UTF-8: {e}")))
+}
+
+/// Percent-encode a repo-relative path for use in a REST route, keeping `/`
+/// as the segment separator. Everything outside RFC 3986 unreserved
+/// (`A-Z a-z 0-9 - . _ ~`) is `%XX`-encoded byte-wise so paths with spaces,
+/// `#`, `?`, `%`, etc. cannot break or redirect the route.
+fn encode_path_segments(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Validate a GraphQL envelope and return its `data` object (parity with
 /// `validateGraphQLResponse` in `pr-comment.service.ts`).
 fn graphql_data(mut resp: Value) -> Result<Value> {
@@ -722,6 +772,28 @@ impl SourceControl for GitHubSourceControl {
             items: branches,
             next_cursor: rest_next_cursor(page_no, fetched, per_page),
         })
+    }
+
+    async fn get_file_content(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        git_ref: Option<&str>,
+    ) -> Result<Option<String>> {
+        let route = Self::repo_path(repo, &format!("/contents/{}", encode_path_segments(path)));
+        let params: Option<Vec<(&str, String)>> = git_ref.map(|r| vec![("ref", r.to_string())]);
+        let v: Value = match self.client.get(&route, params.as_ref()).await {
+            Ok(v) => v,
+            Err(e) => {
+                // 404 (file/repo/ref absent) is the graceful "no such file"
+                // outcome, not an error.
+                return match Error::from(e) {
+                    Error::NotFound(_) => Ok(None),
+                    other => Err(other),
+                };
+            }
+        };
+        decode_contents_file(&v).map(Some)
     }
 
     async fn create_pr(&self, repo: &RepoRef, input: NewPullRequest) -> Result<PullRequest> {
@@ -1634,6 +1706,81 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<PrInvolvement>(json!("involves")).unwrap(),
             PrInvolvement::Involves
+        );
+    }
+
+    #[test]
+    fn decodes_contents_file_payload() {
+        // "hello world\n" base64-encoded, wrapped the way GitHub wraps it.
+        let v = json!({
+            "type": "file",
+            "encoding": "base64",
+            "content": "aGVsbG8g\nd29ybGQK\n",
+        });
+        assert_eq!(decode_contents_file(&v).unwrap(), "hello world\n");
+    }
+
+    #[test]
+    fn decodes_contents_file_defaults_to_base64_encoding() {
+        let v = json!({ "content": "e30=" });
+        assert_eq!(decode_contents_file(&v).unwrap(), "{}");
+    }
+
+    #[test]
+    fn contents_directory_payload_is_decode_error() {
+        let v = json!([{ "type": "file", "name": "a.txt" }]);
+        let err = decode_contents_file(&v).unwrap_err();
+        assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn contents_missing_content_is_decode_error() {
+        let v = json!({ "type": "file", "encoding": "base64" });
+        assert!(matches!(
+            decode_contents_file(&v).unwrap_err(),
+            Error::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn contents_unsupported_encoding_is_decode_error() {
+        let v = json!({ "content": "abc", "encoding": "none" });
+        assert!(matches!(
+            decode_contents_file(&v).unwrap_err(),
+            Error::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn contents_invalid_base64_is_decode_error() {
+        let v = json!({ "content": "!!!not-base64!!!", "encoding": "base64" });
+        assert!(matches!(
+            decode_contents_file(&v).unwrap_err(),
+            Error::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn contents_non_utf8_is_decode_error() {
+        // 0xFF 0xFE is not valid UTF-8.
+        let v = json!({ "content": "//4=", "encoding": "base64" });
+        assert!(matches!(
+            decode_contents_file(&v).unwrap_err(),
+            Error::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn encodes_path_segments_for_contents_route() {
+        // Slashes stay as separators; unreserved chars pass through.
+        assert_eq!(
+            encode_path_segments(".intent/config.json"),
+            ".intent/config.json"
+        );
+        // Spaces, `#`, `?`, `%` cannot break or redirect the route.
+        assert_eq!(
+            encode_path_segments("dir name/f#1?x=2 50%.json"),
+            "dir%20name/f%231%3Fx%3D2%2050%25.json"
         );
     }
 }

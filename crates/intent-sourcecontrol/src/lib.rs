@@ -75,6 +75,18 @@ pub trait SourceControl: Send + Sync {
         page: PageParams,
     ) -> Result<Page<Branch>>;
 
+    /// Fetch one repository file's decoded UTF-8 text via the host's contents
+    /// API (`GET /repos/{owner}/{repo}/contents/{path}` on GitHub). A `None`
+    /// `git_ref` reads from the repo's default branch (the host's contents-API
+    /// default). Returns `Ok(None)` when the file does not exist at that ref.
+    /// Backs `github.repoConfig.get`.
+    async fn get_file_content(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        git_ref: Option<&str>,
+    ) -> Result<Option<String>>;
+
     // --- Pull/merge requests ---
 
     /// Open a new pull/merge request.

@@ -212,6 +212,14 @@ impl SourceControl for StubForge {
     ) -> ScResult<Page<Branch>> {
         unimplemented!()
     }
+    async fn get_file_content(
+        &self,
+        _: &RepoRef,
+        _: &str,
+        _: Option<&str>,
+    ) -> ScResult<Option<String>> {
+        unimplemented!()
+    }
     async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
         unimplemented!()
     }
