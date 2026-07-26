@@ -9095,3 +9095,257 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         "lastScanAt stamped by the live update: {read}"
     );
 }
+
+/// Title-preserving tool updates (the claude-code "Run" collapse): ACP
+/// `tool_call_update`s carry **only changed fields** — a richer title/input
+/// arrives on one update, later status-only updates carry no title at all.
+/// The daemon must treat the transcript block as the authoritative merged
+/// state: merge non-empty update fields into it, and backfill sparse event
+/// fields from it before publishing `agent:tool:call`, so neither the live
+/// `chat.subscribe` channel nor the persisted conversation ever regresses to
+/// the sparse first-sight title.
+///
+/// The mock echoes the exact three-step sequence via `rawUpdates`:
+/// `tool_call` (sparse title "Run") → `tool_call_update` (richer title +
+/// rawInput, no status) → `tool_call_update` (status-only `completed` with
+/// output — no title, no input). Asserts over the real wire:
+///  1. the status-only completed `agent:tool:call` still carries the richest
+///     title / a non-empty toolName (backfilled, not blanked);
+///  2. the LAST live `chat.subscribe` `tool_use` block keeps `name` and
+///     `input._acpTitle` equal to the richest title seen;
+///  3. the persisted block (`agent.getConversation`) is byte-identical to the
+///     live one (§7.1 parity), richer title included.
+#[tokio::test]
+async fn status_only_tool_update_preserves_richer_title_over_wss() {
+    let Some(script) = gate("WSS title-preserving tool-update E2E") else {
+        return;
+    };
+
+    const SPARSE_TITLE: &str = "Run";
+    const RICH_TITLE: &str = "Run: cargo test --workspace";
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({
+        "response": "title preserved",
+        "rawUpdates": [
+            { "sessionUpdate": "tool_call", "toolCallId": "tc_title",
+              "title": SPARSE_TITLE, "kind": "execute", "status": "in_progress" },
+            { "sessionUpdate": "tool_call_update", "toolCallId": "tc_title",
+              "title": RICH_TITLE,
+              "rawInput": { "command": "cargo test --workspace" } },
+            { "sessionUpdate": "tool_call_update", "toolCallId": "tc_title",
+              "status": "completed",
+              "rawOutput": { "output": "ok: 42 tests passed" } }
+        ]
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — agent:* events, to capture every agent:tool:call.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    // RPC conn — create the agent.
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Titler", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    // CHAT conn — subscribe BEFORE the turn so every stream delta is observed.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        20,
+        "chat.subscribe",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let snap = wss_push(&mut chat, 15).await;
+    assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "run the tests" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    // Collect the agent:tool:call events for the call until the terminal
+    // stream:end. Single total deadline (per-frame reads would reset on
+    // heartbeat Pings).
+    let tool_events = timeout(Duration::from_secs(30), async {
+        let mut events: Vec<Value> = Vec::new();
+        loop {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            match ev["type"].as_str() {
+                Some("agent:tool:call")
+                    if ev["data"]["toolCallId"].as_str() == Some("tc_title") =>
+                {
+                    events.push(ev["data"].clone());
+                }
+                Some("agent:stream:end") => return events,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn reached its terminal stream:end in time");
+    assert_eq!(
+        tool_events.len(),
+        3,
+        "one agent:tool:call per update: {tool_events:?}"
+    );
+    // First sight: the sparse title as sent.
+    assert_eq!(
+        tool_events[0]["title"], SPARSE_TITLE,
+        "first sight carries the sparse title: {:?}",
+        tool_events[0]
+    );
+    assert_eq!(tool_events[0]["status"], "started");
+    // The richer update carries its title verbatim.
+    assert_eq!(
+        tool_events[1]["title"], RICH_TITLE,
+        "richer update carries its title: {:?}",
+        tool_events[1]
+    );
+    // THE REGRESSION: the status-only completed update carries no title on
+    // the wire — the daemon must backfill the richest title/toolName from the
+    // transcript block instead of publishing empty strings.
+    assert_eq!(tool_events[2]["status"], "completed");
+    assert_eq!(
+        tool_events[2]["title"], RICH_TITLE,
+        "status-only completed update keeps the richest title (backfilled): {:?}",
+        tool_events[2]
+    );
+    assert!(
+        tool_events[2]["toolName"]
+            .as_str()
+            .is_some_and(|n| !n.trim().is_empty()),
+        "status-only completed update keeps a non-empty toolName: {:?}",
+        tool_events[2]
+    );
+
+    // Drain the chat channel to the terminal reconcile, tracking the LAST
+    // live `tool_use` block state — the block the FE would render after the
+    // final delta. Before the fix, the status-only update shipped a rebuilt
+    // block with `name: ""` and no `_acpTitle`, wiping the title live.
+    let mut last_tool_block: Option<Value> = None;
+    let terminal = timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = wss_push(&mut chat, 30).await;
+            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+            let delta = frame["params"]["delta"].clone();
+            let mut is_terminal = false;
+            for key in ["added", "updated"] {
+                for e in delta[key].as_array().into_iter().flatten() {
+                    if e["block"]["type"] == "tool_use" && e["block"]["toolCallId"] == "tc_title" {
+                        last_tool_block = Some(e["block"].clone());
+                    }
+                    if e.get("streamingComplete") == Some(&Value::Bool(true)) {
+                        is_terminal = true;
+                    }
+                }
+            }
+            if is_terminal {
+                return delta;
+            }
+        }
+    })
+    .await
+    .expect("terminal (streamingComplete) delta arrived");
+    let live_block = last_tool_block.expect("tool_use block reached the chat channel");
+    assert!(
+        !terminal["removedIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|id| id == &live_block["id"]),
+        "the tool_use block survives the reconcile: {terminal}"
+    );
+    assert_eq!(
+        live_block["input"]["_acpTitle"], RICH_TITLE,
+        "final live tool_use block keeps the richest title as _acpTitle: {live_block}"
+    );
+    assert!(
+        live_block["name"]
+            .as_str()
+            .is_some_and(|n| !n.trim().is_empty()),
+        "final live tool_use block keeps a non-empty name: {live_block}"
+    );
+    assert_eq!(
+        live_block["metadata"]["status"], "completed",
+        "final live tool_use block reached completed: {live_block}"
+    );
+
+    // The persisted transcript holds the SAME merged block — richer title
+    // included — byte-identical to the live one (§7.1 parity). Before the
+    // fix, `record_tool` only patched `metadata.status` on known ids, so the
+    // richer title never persisted and a reload regressed to bare "Run".
+    let conv = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = conv["messages"].as_array().expect("messages array");
+    let persisted_block = messages
+        .iter()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .find(|b| b["type"] == "tool_use" && b["toolCallId"] == "tc_title")
+        .expect("tool_use block persisted");
+    assert_eq!(
+        persisted_block["input"]["_acpTitle"], RICH_TITLE,
+        "persisted tool_use block keeps the richest title: {persisted_block}"
+    );
+    assert_eq!(
+        persisted_block, &live_block,
+        "live and persisted tool_use blocks agree byte-for-byte (§7.1)"
+    );
+}
