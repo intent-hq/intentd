@@ -16,6 +16,13 @@ pub fn expand_tilde_with(input: &str, home: &Path) -> PathBuf {
         return home.to_path_buf();
     }
     if let Some(rest) = input.strip_prefix("~/") {
+        // Trim any extra leading separators (`~//repo`): `Path::join` with an
+        // absolute right-hand side would replace `home` entirely, silently
+        // escaping it.
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            return home.to_path_buf();
+        }
         return home.join(rest);
     }
     PathBuf::from(input)
@@ -28,6 +35,17 @@ pub fn expand_tilde(input: &str) -> PathBuf {
     match env_home_dir() {
         Some(home) => expand_tilde_with(input, &home),
         None => PathBuf::from(input),
+    }
+}
+
+/// String-typed variant of [`expand_tilde`] for callers that persist the path
+/// as UTF-8 text. When the expanded path is not valid UTF-8 (a non-UTF-8
+/// `$HOME`), the input passes through unchanged rather than being lossily
+/// rewritten to a path that does not exist on disk.
+pub fn expand_tilde_string(input: &str) -> String {
+    match expand_tilde(input).to_str() {
+        Some(expanded) => expanded.to_owned(),
+        None => input.to_owned(),
     }
 }
 
@@ -98,6 +116,20 @@ mod tests {
     }
 
     #[test]
+    fn extra_leading_separators_stay_under_home() {
+        // `~//repo` must not escape `home`: a bare `Path::join("/repo")`
+        // would discard the left-hand side.
+        assert_eq!(
+            expand_tilde_with("~//repo", Path::new("/home/u")),
+            PathBuf::from("/home/u/repo")
+        );
+        assert_eq!(
+            expand_tilde_with("~//", Path::new("/home/u")),
+            PathBuf::from("/home/u")
+        );
+    }
+
+    #[test]
     fn env_variant_expands_against_process_home() {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             eprintln!("skipping env tilde test: HOME not set");
@@ -105,5 +137,15 @@ mod tests {
         };
         assert_eq!(expand_tilde("~/x"), home.join("x"));
         assert_eq!(expand_tilde("/abs/x"), PathBuf::from("/abs/x"));
+    }
+
+    #[test]
+    fn string_variant_expands_and_preserves_non_tilde() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            eprintln!("skipping string tilde test: HOME not set");
+            return;
+        };
+        assert_eq!(expand_tilde_string("~/x"), home.join("x").to_str().unwrap());
+        assert_eq!(expand_tilde_string("/abs/x"), "/abs/x");
     }
 }

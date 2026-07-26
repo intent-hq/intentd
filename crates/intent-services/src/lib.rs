@@ -7240,12 +7240,10 @@ impl WorkspaceApi for Services {
                     // persistence — git would otherwise treat the tilde as a
                     // literal `./~` directory (intent-hq/monorepo#822).
                     if let Some(p) = input.repository_path.as_deref() {
-                        input.repository_path =
-                            Some(intent_core::expand_tilde(p).to_string_lossy().into_owned());
+                        input.repository_path = Some(intent_core::expand_tilde_string(p));
                     }
                     if let Some(p) = input.clone_path.as_deref() {
-                        input.clone_path =
-                            Some(intent_core::expand_tilde(p).to_string_lossy().into_owned());
+                        input.clone_path = Some(intent_core::expand_tilde_string(p));
                     }
                     let workspaces_root =
                         workspaces_root.unwrap_or_else(default_workspaces_root);
