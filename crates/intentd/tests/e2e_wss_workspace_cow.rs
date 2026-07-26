@@ -8,10 +8,11 @@
 //!   source repo).
 //! - `workspace.cowIsolation` OFF keeps the linked-worktree path
 //!   (`checkoutMode: "worktree"`).
-//! - `workspace.cowIsolation` ON on a non-CoW filesystem fails the create
-//!   loudly (Unsupported error envelope, §9) — no silent worktree fallback.
+//! - `workspace.cowIsolation` ON on a non-CoW filesystem falls back to the
+//!   linked-worktree path (`checkoutMode: "worktree"`) — the setting is a
+//!   preference, not a guarantee.
 //! - `skipIsolation: true` wins over `workspace.cowIsolation` ON: direct
-//!   mode, no checkout provisioned at all (no probe, no fail-loud).
+//!   mode, no checkout provisioned at all (no probe, no fallback).
 //! - `agent.delegate` in a CoW workspace provisions a per-agent CoW sandbox
 //!   (`sandbox:created` event, `effectiveIsolation: "cow"`), and completion
 //!   merges the sandbox back into the workspace checkout (`sandbox:merged`
@@ -23,9 +24,9 @@
 //!
 //! Gated on `git` on PATH plus a CoW-capable filesystem via
 //! `intent_git::cow_probe` (APFS/Btrfs/XFS-reflink); skips cleanly
-//! elsewhere. The fail-loud scenario is inverse-gated (runs only where CoW
-//! is NOT supported, e.g. ext4 CI runners). The delegation scenario is
-//! additionally gated on `node` + the mock ACP agent fixture.
+//! elsewhere. The worktree-fallback scenario is inverse-gated (runs only
+//! where CoW is NOT supported, e.g. ext4 CI runners). The delegation
+//! scenario is additionally gated on `node` + the mock ACP agent fixture.
 
 #![cfg(unix)]
 
@@ -212,39 +213,6 @@ where
     }
 }
 
-/// Send one JSON-RPC frame and return the `error` member; panics on success.
-async fn wss_rpc_err<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
-        .await
-        .expect("send rpc frame");
-    loop {
-        let next = timeout(Duration::from_secs(20), ws.next())
-            .await
-            .expect("wss rpc timed out");
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["id"] == json!(id) {
-                    assert!(
-                        v.get("error").is_some(),
-                        "rpc {method} unexpectedly succeeded: {v}"
-                    );
-                    return v["error"].clone();
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => continue,
-            other => panic!("expected text frame, got {other:?}"),
-        }
-    }
-}
-
 /// Read one `events.event` notification from a subscriber connection (bounded).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
@@ -311,13 +279,13 @@ fn cow_gate(test: &str) -> bool {
     supported
 }
 
-/// Inverse gate: skip on CoW-capable filesystems (for the fail-loud scenario,
-/// which needs an environment where the daemon's probe reports Unsupported —
-/// e.g. ext4 CI runners).
+/// Inverse gate: skip on CoW-capable filesystems (for the worktree-fallback
+/// scenario, which needs an environment where the daemon's probe reports
+/// Unsupported — e.g. ext4 CI runners).
 fn no_cow_gate(test: &str) -> bool {
     let supported = cow_supported();
     if supported {
-        eprintln!("skipping {test}: filesystem supports CoW cloning (fail-loud not reachable)");
+        eprintln!("skipping {test}: filesystem supports CoW cloning (fallback not reachable)");
     }
     !supported
 }
@@ -811,54 +779,60 @@ async fn workspace_delete_removes_cow_clone_over_wss() {
     drop(daemon);
 }
 
-/// Scenario E — fail-loud: `workspace.cowIsolation` ON on a filesystem whose
-/// probe reports Unsupported fails `workspace.create` with an actionable
-/// error envelope (§9: `Unsupported` maps to -32603) instead of silently
-/// falling back to a worktree, and leaves no partial checkout under the
-/// workspaces root. Inverse-gated: runs only where CoW is NOT supported
-/// (e.g. ext4 CI runners); on APFS the daemon's probe would succeed.
+/// Scenario E — worktree fallback: `workspace.cowIsolation` ON on a
+/// filesystem whose probe reports Unsupported falls back to the
+/// linked-worktree path — the create succeeds with
+/// `checkoutMode: "worktree"` and a working linked-worktree checkout
+/// instead of failing with `-32603`. Inverse-gated: runs only where CoW is
+/// NOT supported (e.g. ext4 CI runners); on APFS the daemon's probe would
+/// succeed.
 #[tokio::test]
-async fn workspace_create_fails_loudly_when_cow_unsupported_over_wss() {
-    const TEST: &str = "workspace.create CoW fail-loud WSS e2e";
+async fn workspace_create_falls_back_to_worktree_when_cow_unsupported_over_wss() {
+    const TEST: &str = "workspace.create CoW worktree-fallback WSS e2e";
     if !git_gate(TEST) || !no_cow_gate(TEST) {
         return;
     }
     let root = scratch_dir("cownope");
     let (daemon, port, cfg) = boot(&root, &[]).await;
-    let (repo, _head_sha) = make_source_repo(&daemon.scratch);
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
 
     let mut ws = connect_ws(port, cfg).await;
     set_cow_isolation(&mut ws, 1, true).await;
 
-    let error = wss_rpc_err(
+    let result = wss_rpc(
         &mut ws,
         2,
         "workspace.create",
         json!({
-            "title": "CoW fail-loud E2E",
+            "title": "CoW fallback E2E",
             "repositoryPath": repo.to_string_lossy(),
             "repositoryName": "source-repo",
             "baseRef": "main",
-            "initialAgent": { "prompt": "fix the auth flow" },
             "idempotencyKey": Uuid::new_v4().to_string(),
         }),
     )
     .await;
-    assert_eq!(error["code"], json!(-32603), "Unsupported code: {error}");
-    let message = error["message"].as_str().expect("error message");
-    assert!(
-        message.contains("CoW isolation is enabled") && message.contains("workspace.cowIsolation"),
-        "actionable fail-loud message, got: {message}"
-    );
 
-    // No partial checkout left behind: the probe's `<root>/<wsId>` dir is
-    // removed on the failure path.
-    let leftovers: Vec<_> = std::fs::read_dir(&root)
-        .expect("read workspaces root")
-        .collect();
+    let workspace = &result["workspace"];
+    let id = workspace["id"].as_str().expect("workspace id");
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "unsupported probe falls back to a linked worktree: {workspace}"
+    );
+    let wt_path = workspace["worktreePath"].as_str().expect("worktreePath");
+    assert_eq!(
+        Path::new(wt_path),
+        root.join(id).join("source-repo"),
+        "checkout lives at <root>/<workspaceId>/<repo-slug>"
+    );
+    assert_eq!(workspace["baseCommitSha"], json!(head_sha));
+    // The fallback checkout is a real linked worktree registered against the
+    // source repo (unlike a standalone CoW clone).
+    let worktrees = run_git(&["worktree", "list", "--porcelain"], &repo);
     assert!(
-        leftovers.is_empty(),
-        "workspaces root must stay empty after a failed create: {leftovers:?}"
+        worktrees.contains(wt_path),
+        "fallback worktree registered in the source repo: {worktrees}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -867,8 +841,8 @@ async fn workspace_create_fails_loudly_when_cow_unsupported_over_wss() {
 
 /// Scenario F — `skipIsolation: true` wins over `workspace.cowIsolation` ON:
 /// the workspace is direct-mode (no worktree, no CoW clone, `checkoutMode`
-/// omitted) and the CoW probe never runs, so the create succeeds even where
-/// the fail-loud arm would otherwise fire. Runs on any filesystem.
+/// omitted) and the CoW probe never runs — no checkout of any kind is
+/// provisioned. Runs on any filesystem.
 #[tokio::test]
 async fn workspace_create_skip_isolation_wins_over_cow_isolation() {
     const TEST: &str = "workspace.create skipIsolation-over-CoW WSS e2e";
