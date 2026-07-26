@@ -58,6 +58,18 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
         },
+        // Classified clone/provisioning failure: human message carries the
+        // sanitized git stderr tail, `data.code` carries the machine-readable
+        // category so clients stop showing a bare "Internal error"
+        // (monorepo#826).
+        ref e @ Error::CloneFailed {
+            category,
+            ref detail,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": category.as_str(), "detail": detail })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),

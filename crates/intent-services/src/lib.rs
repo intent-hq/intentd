@@ -7319,17 +7319,28 @@ impl WorkspaceApi for Services {
                                     .map(|n| n.is_empty())
                                     .unwrap_or(true)
                             {
-                                return Err(Error::InvalidParams(
-                                    "clonePath must resolve to a non-empty target".to_string(),
-                                ));
+                                return Err(Error::CloneFailed {
+                                    category: intent_core::CloneErrorCategory::PathInvalid,
+                                    detail: "clonePath must resolve to a non-empty target"
+                                        .to_string(),
+                                });
                             }
-                            if clone_ops::target_exists(&target) {
-                                return Err(Error::Internal(format!(
-                                    "clone target already exists: {}",
-                                    target.display()
-                                )));
+                            if clone_ops::target_exists_non_empty(&target) {
+                                return Err(Error::CloneFailed {
+                                    category:
+                                        intent_core::CloneErrorCategory::DestinationExistsNonEmpty,
+                                    detail: format!(
+                                        "clone target already exists and is not empty: {}",
+                                        target.display()
+                                    ),
+                                });
                             }
                             let request_id = uuid::Uuid::new_v4().to_string();
+                            // Clone failures are classified into a typed error
+                            // carrying the sanitized stderr tail so clients can
+                            // show the underlying cause (monorepo#826). The
+                            // detail is already credential-redacted by
+                            // `run_clone`.
                             clone_ops::perform_clone(clone_ops::CloneJob {
                                 request_id,
                                 workspace_id: Some(id.clone()),
@@ -7338,8 +7349,9 @@ impl WorkspaceApi for Services {
                                 bus: bus_ref,
                             })
                             .await
-                            .map_err(|e| {
-                                Error::Internal(format!("workspace.create clone failed: {e}"))
+                            .map_err(|detail| Error::CloneFailed {
+                                category: clone_ops::classify_clone_error(&detail),
+                                detail,
                             })?;
                             input.repository_path =
                                 Some(target.to_string_lossy().to_string());

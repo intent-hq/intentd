@@ -42,6 +42,49 @@ pub enum Error {
     /// stop matching on prose (monorepo#761).
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
+
+    /// A `workspace.create` clone/provisioning step failed.
+    /// Carries a machine-readable category plus a sanitized human-readable
+    /// detail (git stderr tail with credentials redacted) so clients can show
+    /// the underlying cause instead of a bare "Internal error" and key
+    /// behavior off `error.data.code` (monorepo#826). User-fixable categories
+    /// (`PathInvalid`, `DestinationExistsNonEmpty`) surface as `-32602`;
+    /// environmental ones (`AuthRequired`, `Network`, `Other`) as `-32603`
+    /// with the detail preserved in the message.
+    #[error("workspace.create clone failed ({}): {detail}", category.as_str())]
+    CloneFailed {
+        category: CloneErrorCategory,
+        detail: String,
+    },
+}
+
+/// Machine-readable category for a failed clone/provisioning step, surfaced
+/// on the wire as `error.data.code` (PROTOCOL §9, monorepo#826).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneErrorCategory {
+    /// The clone destination path is missing, malformed, or not creatable.
+    PathInvalid,
+    /// The clone destination already exists (and is not an empty directory).
+    DestinationExistsNonEmpty,
+    /// The remote rejected the clone for lack of credentials.
+    AuthRequired,
+    /// The remote could not be reached (DNS, connect, timeout).
+    Network,
+    /// Any other clone failure; the detail still carries the stderr tail.
+    Other,
+}
+
+impl CloneErrorCategory {
+    /// Stable wire identifier for this category (`error.data.code`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CloneErrorCategory::PathInvalid => "path-invalid",
+            CloneErrorCategory::DestinationExistsNonEmpty => "destination-exists-non-empty",
+            CloneErrorCategory::AuthRequired => "auth-required",
+            CloneErrorCategory::Network => "network",
+            CloneErrorCategory::Other => "clone-failed",
+        }
+    }
 }
 
 impl Error {
@@ -52,6 +95,14 @@ impl Error {
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. } => -32602,
+            Error::CloneFailed { category, .. } => match category {
+                CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
+                    -32602
+                }
+                CloneErrorCategory::AuthRequired
+                | CloneErrorCategory::Network
+                | CloneErrorCategory::Other => -32603,
+            },
             Error::Internal(_) => -32603,
             Error::Conflict { .. } => -32005,
             Error::Unsupported(_) => -32603, // Map to internal error for now
