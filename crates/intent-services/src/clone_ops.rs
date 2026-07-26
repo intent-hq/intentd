@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use intent_core::events::{GIT_CLONE_DONE, GIT_CLONE_PROGRESS};
-use intent_core::{now_iso, Error, Result, WorkspaceId};
+use intent_core::{expand_tilde, now_iso, Error, Result, WorkspaceId};
 use intent_store::NewEvent;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -42,13 +42,15 @@ const GIT_LFS_SKIP_SMUDGE: &str = "1";
 
 /// Derive the on-disk `<parent_dir>/<target>` a clone would produce. When
 /// `target_name` is `None`, port `git`'s own basename-of-URL default (strip a
-/// trailing `.git`), rejecting anything that would escape `parent_dir`.
+/// trailing `.git`), rejecting anything that would escape `parent_dir`. A
+/// leading `~` / `~/` in `parent_dir` expands to `$HOME`
+/// (intent-hq/monorepo#822); `~user` forms pass through unchanged.
 pub(crate) fn resolve_target_path(
     parent_dir: &str,
     url: &str,
     target_name: Option<&str>,
 ) -> Result<PathBuf> {
-    let parent = PathBuf::from(parent_dir);
+    let parent = expand_tilde(parent_dir);
     if parent.as_os_str().is_empty() {
         return Err(Error::InvalidParams("parentDir is required".to_string()));
     }
@@ -551,6 +553,23 @@ mod tests {
     fn resolve_target_uses_default_when_missing() {
         let p = resolve_target_path("/tmp", "https://github.com/a/b.git", None).unwrap();
         assert_eq!(p, PathBuf::from("/tmp/b"));
+    }
+
+    #[test]
+    fn resolve_target_expands_tilde_parent() {
+        // Regression for intent-hq/monorepo#822: a leading `~/` in `parentDir`
+        // must resolve under `$HOME`, never reach git as a literal `./~` path.
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            eprintln!("skipping tilde expansion test: HOME not set");
+            return;
+        };
+        let p = resolve_target_path("~/clones", "https://x/y.git", Some("repo")).unwrap();
+        assert_eq!(p, home.join("clones").join("repo"));
+        let p = resolve_target_path("~", "https://x/y.git", Some("repo")).unwrap();
+        assert_eq!(p, home.join("repo"));
+        // `~user` forms pass through unchanged.
+        let p = resolve_target_path("~alice/clones", "https://x/y.git", Some("repo")).unwrap();
+        assert_eq!(p, PathBuf::from("~alice/clones/repo"));
     }
 
     #[test]
