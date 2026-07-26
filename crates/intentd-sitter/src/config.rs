@@ -68,7 +68,10 @@ pub fn load_channel(path: &Path) -> Option<Channel> {
         Ok(contents) => contents,
         Err(e) => {
             if e.kind() != io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), error = %e, "failed to read sitter config.toml; ignoring channel pin");
+                eprintln!(
+                    "intentd-sitter: failed to read {}: {e}; ignoring channel pin",
+                    path.display()
+                );
             }
             return None;
         }
@@ -76,7 +79,10 @@ pub fn load_channel(path: &Path) -> Option<Channel> {
     match toml::from_str::<ConfigFile>(&contents) {
         Ok(config) => config.channel,
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "invalid sitter config.toml; ignoring channel pin");
+            eprintln!(
+                "intentd-sitter: invalid {}: {e}; ignoring channel pin",
+                path.display()
+            );
             None
         }
     }

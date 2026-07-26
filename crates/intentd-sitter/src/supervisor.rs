@@ -31,9 +31,11 @@
 //! 7. SIGHUP (unix only, sent by `intentd restart`) stops the child
 //!    gracefully and respawns it on the current `state.json` version —
 //!    activating a prior `sitter channel --redownload` install — without
-//!    the sitter exiting. Serve mode advertises itself for this via
-//!    `<data_dir>/sitter/sitter.pid`, written before the supervision loop
-//!    and removed on exit
+//!    the sitter exiting. A SIGHUP that lands during a crash-backoff sleep
+//!    has the same semantics: it cuts the wait short, re-resolves the
+//!    version from `state.json`, and resets the backoff. Serve mode
+//!    advertises itself for this via `<data_dir>/sitter/sitter.pid`,
+//!    written before the supervision loop and removed on exit
 //!
 //! When the startup channel came from `config.toml` or the stable default
 //! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
@@ -177,8 +179,10 @@ pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
 }
 
 /// Pidfile guard: writes the sitter's own pid on creation and removes the
-/// file on drop. Serve mode only — `intentd restart` reads it to find the
-/// supervising sitter.
+/// file on drop — but only when it still holds this process's pid, so a
+/// later serve sitter's entry (last writer wins) is never deleted by an
+/// earlier one exiting. Serve mode only — `intentd restart` reads it to
+/// find the supervising sitter.
 #[cfg(unix)]
 struct PidFile {
     path: std::path::PathBuf,
@@ -189,6 +193,14 @@ impl PidFile {
     fn create(path: &Path) -> Option<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(pid) = read_live_pid(path) {
+            eprintln!(
+                "intentd-sitter: pidfile {} already names live pid {pid}; another \
+                 serve sitter appears to be running (overwriting — `intentd restart` \
+                 will target this sitter)",
+                path.display()
+            );
         }
         match std::fs::write(path, format!("{}\n", std::process::id())) {
             Ok(()) => Some(Self {
@@ -209,7 +221,13 @@ impl PidFile {
 #[cfg(unix)]
 impl Drop for PidFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove the file when it still holds our pid: another serve
+        // sitter may have overwritten it, and deleting its entry would
+        // break `intentd restart` for that live sitter.
+        let ours = std::process::id().to_string();
+        if std::fs::read_to_string(&self.path).is_ok_and(|s| s.trim() == ours) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -386,8 +404,14 @@ impl Supervisor {
                         return 1;
                     }
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
-                        Some(code) => return code,
-                        None => continue,
+                        BackoffOutcome::Shutdown(code) => return code,
+                        #[cfg(unix)]
+                        BackoffOutcome::RestartRequested => {
+                            self.refresh_version_from_state(&mut current_version);
+                            backoff = self.config.backoff_initial;
+                            continue;
+                        }
+                        BackoffOutcome::Elapsed => continue,
                     }
                 }
             };
@@ -417,10 +441,16 @@ impl Supervisor {
                         if spawned_at.elapsed() >= self.config.backoff_reset_after {
                             backoff = self.config.backoff_initial;
                         }
-                        if let Some(code) = self.backoff_sleep(&mut backoff, &mut signals).await {
-                            return code;
+                        match self.backoff_sleep(&mut backoff, &mut signals).await {
+                            BackoffOutcome::Shutdown(code) => return code,
+                            #[cfg(unix)]
+                            BackoffOutcome::RestartRequested => {
+                                self.refresh_version_from_state(&mut current_version);
+                                backoff = self.config.backoff_initial;
+                            }
+                            BackoffOutcome::Elapsed => {}
                         }
-                        break; // respawn the same version
+                        break; // respawn (possibly a new version after SIGHUP)
                     }
                     _ = tokio::time::sleep_until(next_check_at), if supervised => {
                         match self.check().await {
@@ -460,17 +490,7 @@ impl Supervisor {
                                 }
                                 eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
                                 self.graceful_stop(&mut child).await;
-                                let state = state::load(&self.paths.state_path);
-                                match state
-                                    .current_version
-                                    .filter(|v| self.paths.daemon_binary(v).exists())
-                                {
-                                    Some(version) => current_version = version,
-                                    None => eprintln!(
-                                        "intentd-sitter: state.json names no installed version; \
-                                         respawning intentd {current_version}"
-                                    ),
-                                }
+                                self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
                                 break; // respawn (possibly a new version)
                             }
@@ -524,20 +544,41 @@ impl Supervisor {
         Instant::now() + delay
     }
 
-    /// Sleep the current backoff delay (doubling it, capped, for next time).
-    /// Returns `Some(exit_code)` when a shutdown signal arrives mid-sleep;
-    /// a restart request (SIGHUP) just cuts the wait short so the caller
-    /// respawns immediately.
-    async fn backoff_sleep(&self, backoff: &mut Duration, signals: &mut Signals) -> Option<i32> {
+    /// Re-resolve the version to respawn from `state.json` (the SIGHUP
+    /// semantics): picks up whatever `sitter channel --redownload`
+    /// force-installed, keeping the current version when `state.json`
+    /// names nothing installed.
+    fn refresh_version_from_state(&self, current_version: &mut String) {
+        let state = state::load(&self.paths.state_path);
+        match state
+            .current_version
+            .filter(|v| self.paths.daemon_binary(v).exists())
+        {
+            Some(version) => *current_version = version,
+            None => eprintln!(
+                "intentd-sitter: state.json names no installed version; \
+                 respawning intentd {current_version}"
+            ),
+        }
+    }
+
+    /// Sleep the current backoff delay (doubling it, capped, for next
+    /// time), reporting how the sleep ended so the caller can exit on a
+    /// shutdown signal or re-resolve the version from `state.json` (and
+    /// reset the backoff) on a restart request (SIGHUP).
+    async fn backoff_sleep(&self, backoff: &mut Duration, signals: &mut Signals) -> BackoffOutcome {
         let delay = *backoff;
         *backoff = backoff.saturating_mul(2).min(self.config.backoff_cap);
         eprintln!("intentd-sitter: respawning intentd in {delay:?}");
         tokio::select! {
-            _ = tokio::time::sleep(delay) => None,
+            _ = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
             event = signals.recv() => match event {
-                SignalEvent::Shutdown(signal) => Some(128 + signal),
+                SignalEvent::Shutdown(signal) => BackoffOutcome::Shutdown(128 + signal),
                 #[cfg(unix)]
-                SignalEvent::Restart => None,
+                SignalEvent::Restart => {
+                    eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                    BackoffOutcome::RestartRequested
+                }
             },
         }
     }
@@ -566,6 +607,19 @@ impl Supervisor {
             let _ = child.kill().await;
         }
     }
+}
+
+/// How a crash-backoff sleep ([`Supervisor::backoff_sleep`]) ended.
+enum BackoffOutcome {
+    /// The full delay elapsed; respawn the current version.
+    Elapsed,
+    /// A restart request (SIGHUP) cut the wait short; the caller must
+    /// re-resolve the version from `state.json` and reset the backoff
+    /// before respawning.
+    #[cfg(unix)]
+    RestartRequested,
+    /// A shutdown signal arrived; exit with this code.
+    Shutdown(i32),
 }
 
 /// What a received signal asks the sitter to do.
@@ -824,6 +878,23 @@ mod tests {
         );
         drop(guard);
         assert!(!path.exists(), "pidfile must be removed on drop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_drop_leaves_another_sitters_pid_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let guard = PidFile::create(&path).expect("pidfile created");
+        // A later serve sitter overwrites the pidfile (last writer wins);
+        // this guard's drop must not delete that sitter's entry.
+        std::fs::write(&path, "999999\n").unwrap();
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "999999",
+            "drop must leave a pidfile it no longer owns in place"
+        );
     }
 
     #[cfg(unix)]

@@ -127,6 +127,10 @@ fn run_channel_command(
             }
         };
         match updater.force_install(channel) {
+            // `AlreadyCurrent` is defensive/unreachable here: force_install
+            // bypasses the newer-only comparison and always reinstalls, but
+            // the arm keeps the match exhaustive (and prints something
+            // sensible) if updater internals ever change.
             Ok(
                 UpdateOutcome::Installed { version, .. }
                 | UpdateOutcome::AlreadyCurrent { version },

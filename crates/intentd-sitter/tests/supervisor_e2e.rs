@@ -580,6 +580,91 @@ fn crash_respawn_backs_off_exponentially() {
 }
 
 #[test]
+fn sighup_during_crash_backoff_respawns_the_state_json_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // 0.1.0 crash-loops; a 30s backoff (never elapsing within the test)
+    // guarantees the SIGHUP below lands during the backoff sleep.
+    preinstall(&paths, "0.1.0", &crash_script(7));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(CHANNEL_ENV)
+        .env(BACKOFF_INITIAL_ENV, "30000")
+        .env(BACKOFF_CAP_ENV, "30000")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    let stderr = stderr_path(dir.path());
+    wait_until(
+        "the crashed daemon to enter backoff",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&log_path).contains("run")
+                && read_or_empty(&stderr).contains("respawning intentd in")
+        },
+    );
+
+    // The recovery a crash-looping user reaches for: force-install a fixed
+    // 0.2.0 (`sitter channel beta --redownload`), then `intentd restart`
+    // (SIGHUP) while the sitter is still deep in its backoff sleep.
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    let output = run_one_shot(
+        dir.path(),
+        &base_url,
+        &["sitter", "channel", "beta", "--redownload"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+
+    send_signal(&sitter, "HUP");
+    // Well under the 30s backoff: the SIGHUP must cut the sleep short AND
+    // re-resolve the version from state.json, not respawn crashing 0.1.0.
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the restart"
+    );
+    let runs = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 1, "crashing 0.1.0 must not have been respawned");
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+}
+
+#[test]
 fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
