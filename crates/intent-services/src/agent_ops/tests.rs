@@ -10096,3 +10096,441 @@ async fn resume_interrupted_marker_is_idempotent_on_retry() {
         "retry still delivers the continuation"
     );
 }
+
+/// monorepo#840 classifier: provider safety blocks and imperative "start a
+/// new session" directives are session-fatal; ordinary/transient errors —
+/// including failures to START a session and echoed model text that merely
+/// contains "blocked"/"safety" — stay retryable.
+#[test]
+fn session_fatal_stop_reason_classifier() {
+    use crate::is_session_fatal_stop_reason;
+    assert!(is_session_fatal_stop_reason(
+        "The model provider blocked this response for safety reasons. Please start a new session"
+    ));
+    // Wrapping prefixes and partial phrasings still classify.
+    assert!(is_session_fatal_stop_reason(
+        "session/prompt failed: The model provider blocked this response for safety reasons."
+    ));
+    assert!(is_session_fatal_stop_reason(
+        "Response BLOCKED For Safety Reasons"
+    ));
+    assert!(is_session_fatal_stop_reason(
+        "please start a new session to continue"
+    ));
+    assert!(is_session_fatal_stop_reason(
+        "start a new session to continue this conversation"
+    ));
+    // Ordinary errors are NOT session-fatal.
+    assert!(!is_session_fatal_stop_reason("connection reset by peer"));
+    assert!(!is_session_fatal_stop_reason(
+        "session/prompt failed: provider overloaded"
+    ));
+    // A failure to START a session is transient, not a directive.
+    assert!(!is_session_fatal_stop_reason(
+        "could not start a new session: connection refused"
+    ));
+    // Bare word co-occurrence (e.g. echoed model output) does not classify.
+    assert!(!is_session_fatal_stop_reason(
+        "tool output blocked by firewall; safety checks passed"
+    ));
+    assert!(!is_session_fatal_stop_reason(""));
+}
+
+/// monorepo#840: `session_poisoned` requires `Error` status AND either a
+/// session-fatal `stop_reason` or a streak of identical terminal failures;
+/// a different error resets the streak and `clear_failure_streak` (turn
+/// success / `agent.retry` / delete) un-poisons.
+#[tokio::test]
+async fn session_poisoned_requires_error_status_and_fatal_reason_or_streak() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Poisoned").await;
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+
+    // Fatal reason but non-Error status → not poisoned (status gate).
+    session.status = intent_core::AgentStatus::Active;
+    session.stop_reason =
+        Some("The model provider blocked this response for safety reasons".into());
+    assert!(!svc.session_poisoned(&session), "Active is never poisoned");
+
+    // Error + fatal reason → poisoned.
+    session.status = intent_core::AgentStatus::Error;
+    assert!(svc.session_poisoned(&session), "Error + provider block");
+
+    // Error + ordinary reason, no streak → not poisoned (still retryable).
+    session.stop_reason = Some("connection reset by peer".into());
+    assert!(!svc.session_poisoned(&session), "ordinary error, no streak");
+
+    // Identical-failure streak: the SAME error at the threshold poisons.
+    assert_eq!(svc.record_terminal_failure(&id, "boom"), 1);
+    assert_eq!(svc.record_terminal_failure(&id, "boom"), 2);
+    assert!(!svc.session_poisoned(&session), "below streak threshold");
+    assert_eq!(svc.record_terminal_failure(&id, "boom"), 3);
+    assert!(svc.session_poisoned(&session), "streak threshold reached");
+
+    // A DIFFERENT error resets the streak to 1.
+    assert_eq!(svc.record_terminal_failure(&id, "other"), 1);
+    assert!(!svc.session_poisoned(&session), "different error resets");
+
+    // Back to threshold, then clear (the retry/success path) un-poisons.
+    svc.record_terminal_failure(&id, "other");
+    svc.record_terminal_failure(&id, "other");
+    assert!(svc.session_poisoned(&session));
+    svc.clear_failure_streak(&id);
+    assert!(!svc.session_poisoned(&session), "cleared streak un-poisons");
+}
+
+/// monorepo#840: `wakeOrCreate` must NOT wake a poisoned session (Error +
+/// session-fatal provider block) — it is cleaned off the task and a fresh
+/// agent is created, inheriting specialist from the poisoned source.
+#[tokio::test]
+async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Poison").await;
+    let prev = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("prev".into()),
+            Some("gpt-4".into()),
+            Some("implementor".into()),
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create prev");
+    let prev_id = prev["agent"]["id"].as_str().unwrap().to_string();
+    svc.assign_agent(ws.clone(), note_id.clone(), prev_id.clone())
+        .await
+        .expect("assign prev");
+    // Park the session poisoned: Error + session-fatal provider block.
+    svc.store()
+        .set_agent_session_status(
+            &ws,
+            &AgentId::from(prev_id.as_str()),
+            intent_core::AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "session/prompt failed: The model provider blocked this response for safety \
+                 reasons. Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park poisoned");
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "go".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], true, "fresh agent, not a wake");
+    assert_eq!(resp["action"], "created_new");
+    let new_id = resp["agentId"].as_str().unwrap().to_string();
+    assert_ne!(new_id, prev_id, "poisoned session must not be reused");
+    assert_eq!(
+        resp["cleanedUpAgentIds"],
+        json!([AgentId::from(prev_id.as_str())]),
+        "poisoned assignment reported as cleaned up"
+    );
+    // The fresh session inherits specialist from the poisoned source.
+    let session = svc
+        .store()
+        .get_agent_session(&AgentId::from(new_id.as_str()))
+        .await
+        .expect("new session");
+    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    // The poisoned id is stripped from the task's assigned_agent_ids.
+    let note = svc.get_note(ws, note_id).await.expect("note");
+    let task = note.metadata.task.expect("task");
+    assert!(task
+        .assigned_agent_ids
+        .iter()
+        .all(|a| a.as_str() != prev_id));
+}
+
+/// monorepo#840: a streak of identical terminal failures (no recognized
+/// provider block in the `stop_reason`) also makes the session non-resumable
+/// for `wakeOrCreate`.
+#[tokio::test]
+async fn wake_or_create_skips_streak_poisoned_session() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Streak").await;
+    let prev = create_agent(&svc, &ws, "prev").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), prev.0.clone())
+        .await
+        .expect("assign prev");
+    svc.store()
+        .set_agent_session_status(
+            &ws,
+            &prev,
+            intent_core::AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some("spawn failed: exit 1".into())),
+        )
+        .await
+        .expect("park errored");
+    for _ in 0..3 {
+        svc.record_terminal_failure(&prev, "spawn failed: exit 1");
+    }
+
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), wake_input(None))
+        .await
+        .expect("wake");
+    assert_eq!(resp["created"], true, "streak-poisoned session skipped");
+    assert_eq!(resp["action"], "created_new");
+    assert_ne!(resp["agentId"].as_str().unwrap(), prev.0.as_str());
+    assert_eq!(resp["cleanedUpAgentIds"], json!([prev.clone()]));
+}
+
+/// monorepo#840 failure-wake dedup: a repeated `agent:failed` with the SAME
+/// error text is suppressed for a parent that already received it; a
+/// different error delivers, and a non-failure completion clears the dedup
+/// so a later identical failure delivers again.
+#[tokio::test]
+async fn repeated_identical_failure_wake_is_deduped_per_parent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    // Non-oneShot watch: it survives deliveries, so only the dedup gate
+    // (not watch removal) can suppress the repeats.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        false,
+        None,
+    )
+    .expect("register watch");
+    let parent_message_count = |svc: &Services, parent: &AgentId| {
+        let svc = svc.clone();
+        let parent = parent.clone();
+        async move {
+            svc.store()
+                .get_agent_session(&parent)
+                .await
+                .expect("parent session")
+                .messages
+                .len()
+        }
+    };
+    let failed = |err: &str| {
+        completion_event(
+            &ws,
+            AGENT_FAILED,
+            &child,
+            json!({ "agentId": child.0, "error": err }),
+        )
+    };
+
+    // First failure delivers.
+    svc.handle_completion_event(&failed("boom")).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+
+    // The SAME error again is suppressed; the watch stays in place.
+    svc.handle_completion_event(&failed("boom")).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        1,
+        "identical repeat failure suppressed"
+    );
+    assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+
+    // A DIFFERENT error delivers.
+    svc.handle_completion_event(&failed("bang")).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "changed error delivers"
+    );
+
+    // A non-failure completion clears the dedup (and itself delivers)…
+    let idle = completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "recovered" }),
+    );
+    svc.handle_completion_event(&idle).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 3);
+
+    // …so a later identical failure is a fresh signal and delivers again.
+    svc.handle_completion_event(&failed("bang")).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        4,
+        "post-recovery failure delivers despite matching the old text"
+    );
+}
+
+/// monorepo#840 (PR #573 review): grouped (`after_all`) watches BYPASS the
+/// failure-wake dedup gate — a suppressed completion would never reach
+/// `record_group_child_completion` and the group would hang forever. A prior
+/// identical failure delivered through an ungrouped watch must not stop the
+/// group from recording the child and settling.
+#[tokio::test]
+async fn grouped_watch_bypasses_failure_wake_dedup() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let failed = || {
+        completion_event(
+            &ws,
+            AGENT_FAILED,
+            &child,
+            json!({ "agentId": child.0, "error": "boom" }),
+        )
+    };
+
+    // First failure through an ungrouped watch: delivered + dedup recorded.
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        false,
+        None,
+    )
+    .expect("register ungrouped watch");
+    svc.handle_completion_event(&failed()).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert!(svc.failure_wake_is_duplicate(&parent, &child, "boom"));
+
+    // The child is then enrolled in an after_all group with the SAME parent.
+    // (Registering the group watch clears the pair's dedup — defeat that by
+    // re-recording, to isolate the group-path bypass.)
+    let gid = svc.get_or_create_delegation_group(&ws, &parent);
+    svc.enroll_child_in_group(&gid, &child);
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        false,
+        Some(gid.clone()),
+    )
+    .expect("register grouped watch");
+    svc.record_failure_wake(&parent, &child, "boom");
+
+    // Same error again: the group must still record the completion (and the
+    // STAB-160 immediate grouped-failure wake still delivers).
+    svc.handle_completion_event(&failed()).await;
+    let group = svc
+        .delegation_group_for_parent(&parent)
+        .expect("group still open (unsealed)");
+    assert!(
+        group.completed_agent_ids.contains(&child),
+        "group accounting saw the deduped failure"
+    );
+
+    // Sealing via parent idle settles the group — no hang.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &parent,
+        json!({ "agentId": parent.0 }),
+    ))
+    .await;
+    assert!(
+        svc.delegation_group_for_parent(&parent).is_none(),
+        "group settled and was removed"
+    );
+}
+
+/// monorepo#840 (PR #573 review): registering a completion watch clears the
+/// pair's dedup record — a fresh watch expresses fresh interest, so a
+/// post-registration failure with the SAME error text still delivers. Also
+/// covers the empty-error rule: an empty error never dedups or records.
+#[tokio::test]
+async fn watch_registration_resets_failure_wake_dedup_for_pair() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let failed = |err: &str| {
+        completion_event(
+            &ws,
+            AGENT_FAILED,
+            &child,
+            json!({ "agentId": child.0, "error": err }),
+        )
+    };
+    let register = |svc: &Services| {
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register oneShot watch")
+    };
+
+    // First failure fires (and consumes) a oneShot watch; dedup recorded.
+    register(&svc);
+    svc.handle_completion_event(&failed("boom")).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 1);
+    assert!(svc.failure_wake_is_duplicate(&parent, &child, "boom"));
+
+    // Re-registering (retry/re-delegation) clears the pair: the identical
+    // failure is fresh information for the new watch and delivers.
+    register(&svc);
+    assert!(
+        !svc.failure_wake_is_duplicate(&parent, &child, "boom"),
+        "registration cleared the pair's dedup record"
+    );
+    svc.handle_completion_event(&failed("boom")).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        2,
+        "same-text failure delivers to the fresh watch"
+    );
+
+    // Empty error text is never deduped nor recorded.
+    register(&svc);
+    svc.handle_completion_event(&failed("")).await;
+    assert_eq!(parent_message_count(&svc, &parent).await, 3);
+    register(&svc);
+    svc.handle_completion_event(&failed("")).await;
+    assert_eq!(
+        parent_message_count(&svc, &parent).await,
+        4,
+        "two failures with omitted/empty error must not suppress each other"
+    );
+}
+
+/// monorepo#840 (PR #573 review): `agent.delete` clears failure-wake dedup
+/// records naming the deleted agent in EITHER role, so (deleted_parent,
+/// child) entries don't leak; and `agent.retry`'s dedup clear is exercised
+/// via the helper (`clear_failure_wake_dedup`) semantics.
+#[tokio::test]
+async fn delete_clears_failure_wake_dedup_in_both_roles() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let other = create_agent(&svc, &ws, "Other").await;
+    svc.record_failure_wake(&parent, &child, "boom");
+    svc.record_failure_wake(&child, &other, "bang");
+    assert!(svc.failure_wake_is_duplicate(&parent, &child, "boom"));
+    assert!(svc.failure_wake_is_duplicate(&child, &other, "bang"));
+
+    // Deleting `child` sweeps entries where it was the child AND the parent.
+    svc.agent_delete_op(child.clone(), None)
+        .await
+        .expect("delete child");
+    assert!(
+        !svc.failure_wake_is_duplicate(&parent, &child, "boom"),
+        "child-role entry swept"
+    );
+    assert!(
+        !svc.failure_wake_is_duplicate(&child, &other, "bang"),
+        "parent-role entry swept"
+    );
+}

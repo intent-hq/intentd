@@ -245,6 +245,11 @@ impl Services {
             .expect("agent subscription registry poisoned")
             .subscriptions
             .push(watch.clone());
+        // monorepo#840: a fresh watch expresses fresh interest — drop any
+        // stale failure-wake dedup record for this pair so the next failure
+        // (even with unchanged error text) reaches the new watcher. Dedup
+        // then only suppresses replays BETWEEN registrations.
+        self.clear_failure_wake_dedup_pair(&watch.parent_agent_id, &watch.child_agent_id);
         Ok(watch)
     }
 

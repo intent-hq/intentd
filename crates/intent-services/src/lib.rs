@@ -206,6 +206,25 @@ pub struct Services {
     /// group fan-in (AS-4) consume it later. Shared across clones like the
     /// other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
+    /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
+    /// `agent_id → (last error text, consecutive count)`. Incremented by the
+    /// terminal-failure handler when the same error text repeats back-to-back,
+    /// reset on a different error, cleared on a successful turn or
+    /// `agent.retry`. Feeds [`Services::session_poisoned`]: a session whose
+    /// last N turns died with the SAME terminal error is provably poisoned
+    /// even when the error text is not a recognized provider block. In-memory
+    /// only — a daemon restart forgets the streak (the provider-block
+    /// classifier still applies via the persisted `stop_reason`).
+    agent_failure_streaks: Arc<Mutex<HashMap<AgentId, (String, u32)>>>,
+    /// Last `agent:failed` wake delivered per `(parent, child)` pair
+    /// (monorepo#840): the error text of the most recent failure wake. A
+    /// repeated child failure with an UNCHANGED error is suppressed (the
+    /// parent already knows), while a different error — or any non-failure
+    /// completion, which clears the child's entries — delivers normally.
+    /// Bounds duplicate failure fan-out when a poisoned child's turn is
+    /// replayed. In-memory only, like the completion-watch registry's
+    /// live delivery state.
+    failure_wake_dedup: Arc<Mutex<HashMap<(AgentId, AgentId), String>>>,
     /// Back-reference to the runtime [`AgentManager`] so the `agent.*` RPC
     /// handlers drive the real spawn/turn/MCP loop (§6.8). Held as a [`Weak`] to
     /// break the `AgentManager → Services` ownership cycle; the composition root
@@ -437,6 +456,8 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
+            agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
+            failure_wake_dedup: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
             linear_engine: None,
@@ -2149,6 +2170,152 @@ impl Services {
         }
     }
 
+    /// Record a terminal turn/spawn failure for the consecutive-identical
+    /// streak (monorepo#840). The SAME error text back-to-back increments the
+    /// streak; a different error resets it to 1. Returns the updated count.
+    pub(crate) fn record_terminal_failure(&self, agent_id: &AgentId, error_text: &str) -> u32 {
+        let mut guard = self
+            .agent_failure_streaks
+            .lock()
+            .expect("agent failure streak registry poisoned");
+        let entry = guard
+            .entry(agent_id.clone())
+            .or_insert_with(|| (error_text.to_string(), 0));
+        if entry.0 == error_text {
+            entry.1 += 1;
+        } else {
+            *entry = (error_text.to_string(), 1);
+        }
+        entry.1
+    }
+
+    /// Clear the terminal-failure streak for `agent_id` — called when a turn
+    /// completes successfully, on `agent.retry` (the deliberate redrive escape
+    /// hatch), and on agent delete (registry hygiene).
+    pub(crate) fn clear_failure_streak(&self, agent_id: &AgentId) {
+        self.agent_failure_streaks
+            .lock()
+            .expect("agent failure streak registry poisoned")
+            .remove(agent_id);
+    }
+
+    /// The consecutive-identical-terminal-failure count for `agent_id` (0 when
+    /// no streak is recorded).
+    fn failure_streak_count(&self, agent_id: &AgentId) -> u32 {
+        self.agent_failure_streaks
+            .lock()
+            .expect("agent failure streak registry poisoned")
+            .get(agent_id)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    /// Whether `session` is provably poisoned (monorepo#840): parked in
+    /// `Error` with either a session-fatal provider-block `stop_reason`
+    /// (redriving the same context is guaranteed to fail — the provider said
+    /// "start a new session") or a streak of
+    /// [`POISONED_FAILURE_STREAK_THRESHOLD`] consecutive identical terminal
+    /// failures. A poisoned session is quarantined: message deliveries park
+    /// in its queue instead of driving turns, and `agent.wakeOrCreate`
+    /// spawns a fresh agent instead of waking it. `agent.retry` remains the
+    /// escape hatch (it clears the Error status, the `stop_reason`, and the
+    /// streak before redriving).
+    pub(crate) fn session_poisoned(&self, session: &AgentSession) -> bool {
+        if session.status != intent_core::AgentStatus::Error {
+            return false;
+        }
+        if session
+            .stop_reason
+            .as_deref()
+            .is_some_and(is_session_fatal_stop_reason)
+        {
+            return true;
+        }
+        self.failure_streak_count(&session.id) >= POISONED_FAILURE_STREAK_THRESHOLD
+    }
+
+    /// Whether an `agent:failed` wake for `(parent, child)` carrying
+    /// `error_text` is a duplicate of the failure wake the parent already
+    /// received (monorepo#840 dedup). Read-only: the pair is recorded by
+    /// [`Services::record_failure_wake`] only AFTER a successful delivery,
+    /// so a failed `deliver_parent_wake` does not poison the dedup state and
+    /// suppress the next attempt. An empty `error_text` never dedups — two
+    /// distinct failures whose emitters omitted `data.error` must not
+    /// suppress each other. Cleared by
+    /// [`Services::clear_failure_wake_dedup`] on a non-failure completion so
+    /// a later genuine failure delivers again.
+    pub(crate) fn failure_wake_is_duplicate(
+        &self,
+        parent_id: &AgentId,
+        child_id: &AgentId,
+        error_text: &str,
+    ) -> bool {
+        if error_text.is_empty() {
+            return false;
+        }
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .get(&(parent_id.clone(), child_id.clone()))
+            .is_some_and(|last| last == error_text)
+    }
+
+    /// Record a successfully delivered `agent:failed` wake for
+    /// `(parent, child)` so an identical replay is suppressed by
+    /// [`Services::failure_wake_is_duplicate`]. Empty error text is never
+    /// recorded (it never dedups either).
+    pub(crate) fn record_failure_wake(
+        &self,
+        parent_id: &AgentId,
+        child_id: &AgentId,
+        error_text: &str,
+    ) {
+        if error_text.is_empty() {
+            return;
+        }
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .insert(
+                (parent_id.clone(), child_id.clone()),
+                error_text.to_string(),
+            );
+    }
+
+    /// Drop every failure-wake dedup record for `child_id` — called on the
+    /// child's non-failure completions (`agent:idle` / `agent:deleted`) and
+    /// on `agent.retry` (the deliberate escape hatch: a post-retry failure
+    /// with the same text is new information) so the pair starts fresh for
+    /// future failures.
+    pub(crate) fn clear_failure_wake_dedup(&self, child_id: &AgentId) {
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .retain(|(_, child), _| child != child_id);
+    }
+
+    /// Drop every failure-wake dedup record naming `agent_id` in EITHER role
+    /// — called on `agent.delete` so entries where the deleted agent was the
+    /// parent don't accumulate for the daemon's lifetime.
+    pub(crate) fn clear_failure_wake_dedup_all_roles(&self, agent_id: &AgentId) {
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .retain(|(parent, child), _| parent != agent_id && child != agent_id);
+    }
+
+    /// Drop the failure-wake dedup record for one `(parent, child)` pair —
+    /// called when a completion watch for that pair is registered: a fresh
+    /// watch expresses fresh interest, so dedup only suppresses replays
+    /// BETWEEN registrations (the poisoned-replay spam monorepo#840
+    /// targets), never a failure a newly registered watcher is waiting on.
+    pub(crate) fn clear_failure_wake_dedup_pair(&self, parent_id: &AgentId, child_id: &AgentId) {
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .remove(&(parent_id.clone(), child_id.clone()));
+    }
+
     /// Wake every parent whose oneShot watch matches child_id, then drop that
     /// watch. group_id = Some watches defer to the AS-4 delegation-group fan-in
     /// and are left untouched. A single failed delivery is logged and skipped so
@@ -2159,7 +2326,31 @@ impl Services {
     /// Every wake is delivered in the watch's `parent_workspace_id` — the
     /// parent's home workspace — which equals the child's workspace for
     /// same-workspace delegation and `__chief__` for chief parents.
+    ///
+    /// Failure dedup (monorepo#840): a repeated `agent:failed` whose error
+    /// text is unchanged since the last failure wake delivered to the same
+    /// parent is suppressed — a poisoned child whose turn is replayed must
+    /// not spam the parent with identical failure notifications. The gate is
+    /// checked only on the ungrouped immediate path (grouped watches bypass
+    /// it entirely: group settlement accounting must see every completion or
+    /// an `after_all` batch can hang forever), and the pair is recorded only
+    /// AFTER a successful delivery so a failed wake never suppresses the
+    /// retry. Suppressed deliveries leave the watch in place (it still fires
+    /// on a different error or a non-failure completion); non-failure
+    /// completions clear the child's dedup records, and registering a new
+    /// watch clears its own (parent, child) pair.
     pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
+        if event.event_type != AGENT_FAILED {
+            self.clear_failure_wake_dedup(child_id);
+        }
+        let failure_error_text = (event.event_type == AGENT_FAILED).then(|| {
+            event
+                .data
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        });
         for watch in self.find_watches_for_child(child_id) {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
@@ -2231,6 +2422,21 @@ impl Services {
                 }
                 continue;
             }
+            // monorepo#840: suppress a repeated identical failure wake to the
+            // same parent. Checked BEFORE the oneShot removal so a suppressed
+            // delivery leaves the watch in place for a future distinct signal.
+            // Grouped watches never reach here (the group branch above owns
+            // them), so group settlement accounting is unaffected.
+            if let Some(err) = failure_error_text.as_deref() {
+                if self.failure_wake_is_duplicate(&watch.parent_agent_id, child_id, err) {
+                    tracing::debug!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        "skipping duplicate agent:failed wake — same error already delivered"
+                    );
+                    continue;
+                }
+            }
             // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
@@ -2267,6 +2473,12 @@ impl Services {
                     "failed to deliver completion wake to parent"
                 );
                 continue;
+            }
+            // monorepo#840: record the delivered failure only AFTER the wake
+            // succeeded, so a failed delivery never suppresses the next
+            // identical failure the parent has yet to hear about.
+            if let Some(err) = failure_error_text.as_deref() {
+                self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
             if watch.one_shot {
                 self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
@@ -5369,6 +5581,34 @@ fn failed_group_children(group: &agent_subscriptions::DelegationGroup) -> Vec<Ag
         .map(AgentId::from)
         .filter(|id| !group.deleted_agent_ids.contains(id))
         .collect()
+}
+
+/// Consecutive identical terminal failures at which a session is considered
+/// poisoned even when the error text is not a recognized provider block
+/// (monorepo#840): the same turn dying the same way N times in a row is
+/// evidence that redriving it cannot succeed.
+pub(crate) const POISONED_FAILURE_STREAK_THRESHOLD: u32 = 3;
+
+/// Classify a persisted `stop_reason` as session-fatal (monorepo#840): the
+/// provider rejected the SESSION (not just the turn), so replaying the same
+/// context is guaranteed to fail and the only recovery is a fresh session.
+/// The canonical shape is the provider safety block ("The model provider
+/// blocked this response for safety reasons. Please start a new session");
+/// the match is substring-based on its load-bearing fragments so wrapping
+/// prefixes (`session/prompt failed: …`) still classify, but each fragment
+/// is anchored on multi-word phrasing: "blocked … for safety reasons" (not
+/// the bare words, which can co-occur in echoed model output) and the
+/// imperative "please start a new session" / "start a new session to
+/// continue" (not the bare "start a new session", which also appears in
+/// transient failure-to-START errors like "could not start a new session:
+/// connection refused"). Deliberately narrow — an unrecognized error stays
+/// retryable and is only escalated by the identical-failure streak.
+pub(crate) fn is_session_fatal_stop_reason(stop_reason: &str) -> bool {
+    let lower = stop_reason.to_ascii_lowercase();
+    let provider_block = lower.contains("blocked") && lower.contains("for safety reasons");
+    provider_block
+        || lower.contains("please start a new session")
+        || lower.contains("start a new session to continue")
 }
 
 /// Build a concise, human-readable wake string describing a child agent's

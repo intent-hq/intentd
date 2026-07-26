@@ -593,3 +593,180 @@ async fn failed_prompt_turn_preserves_partial_transcript_over_wss() {
         "exactly one user row after retry (no duplicate): {final_convo}"
     );
 }
+
+/// monorepo#840: a session-fatal provider block ("blocked … for safety
+/// reasons. Please start a new session") poisons the session — a follow-up
+/// `agent.sendMessage` must NOT redrive the blocked turn. The JSON-RPC
+/// result carries the quarantine envelope (`success: true, queued: true,
+/// quarantined: true, queuedMessage`), the message parks in the queue behind
+/// the requeued failure, the session stays in `error`, and no second
+/// `agent:failed` replay hits the event stream.
+#[tokio::test]
+async fn poisoned_session_quarantines_send_message_over_wss() {
+    let Some(script) = gate("WSS poisoned-session quarantine E2E") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Every prompt fails with the canonical provider safety block (no
+    // attempt gating): the session is poisoned by the fatal stop_reason.
+    let behavior = json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": "The model provider blocked this response for safety reasons. \
+                        Please start a new session",
+        },
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-POISON", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "blocked prompt" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "first sendMessage ok: {sent}");
+
+    // Wait for the terminal failure to persist (status-changed(error) is
+    // emitted AFTER the persist).
+    let mut saw_status_error = false;
+    for _ in 0..200 {
+        let frame = wss_event(&mut sub, 30).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && event["type"] == "agent:status-changed"
+            && event["data"]["status"] == "error"
+        {
+            saw_status_error = true;
+            break;
+        }
+    }
+    assert!(saw_status_error, "agent parked in error after the block");
+
+    // The follow-up delivery hits the quarantine gate: the wire result
+    // carries the full quarantine envelope instead of driving a turn.
+    let followup = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "follow-up" }),
+    )
+    .await;
+    assert_eq!(followup["success"], true, "quarantined send: {followup}");
+    assert_eq!(followup["queued"], true, "message parked: {followup}");
+    assert_eq!(
+        followup["quarantined"], true,
+        "result carries the quarantine flag: {followup}"
+    );
+    assert!(
+        followup["queuedMessage"]["id"].is_string(),
+        "queuedMessage envelope present: {followup}"
+    );
+
+    // Queue holds the requeued failure plus the parked follow-up.
+    let queue = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let queued = queue["queue"].as_array().expect("queue array");
+    assert_eq!(
+        queued.len(),
+        2,
+        "requeued failure + parked follow-up: {queue}"
+    );
+    assert_eq!(queued[0]["content"], "blocked prompt");
+    assert_eq!(queued[1]["content"], "follow-up");
+
+    // The session stays parked in error with the fatal stopReason — the
+    // quarantined send did not clear or redrive anything.
+    let session = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        session["session"]["status"], "error",
+        "quarantined session stays in error"
+    );
+    let stop_reason = session["session"]["stopReason"]
+        .as_str()
+        .expect("stopReason present");
+    assert!(
+        stop_reason.contains("blocked") && stop_reason.contains("for safety reasons"),
+        "stopReason carries the provider block, got: {stop_reason}"
+    );
+
+    // No agent:failed replay reached the stream after the quarantined send —
+    // the gate parked the message without spawning a worker. Drain the
+    // subscription briefly; any agent:failed for this agent is a regression.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Some(Ok(Message::Text(text)))) = timeout(remaining, sub.next()).await else {
+            break;
+        };
+        let frame: Value = serde_json::from_str(&text).unwrap_or_default();
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"].as_str() == Some(agent_id.as_str()) {
+            assert_ne!(
+                event["type"], "agent:failed",
+                "quarantined send must not replay the blocked turn: {frame}"
+            );
+        }
+    }
+}
