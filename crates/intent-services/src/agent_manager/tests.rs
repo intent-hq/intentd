@@ -6153,3 +6153,345 @@ mod stale_redrive_tests {
         assert_eq!(text, "fresh work", "fresh content is not annotated");
     }
 }
+
+#[cfg(test)]
+mod harness_wake_tests {
+    //! Implicit agent-initiated turns for out-of-turn `session/update`s
+    //! (monorepo#855): the idle-listener tick opens a harness-wake turn,
+    //! streams via the standard router, finalizes on quiescence, and
+    //! coexists with racing prompt sends and the resume-replay gate.
+
+    use super::*;
+
+    /// A passive handle plus the notification sender that feeds its receiver,
+    /// standing in for the child's out-of-turn `session/update` stream.
+    fn wake_handle() -> (AgentHandle, mpsc::UnboundedSender<IncomingNotification>) {
+        let (client_w, _agent_r) = tokio::io::duplex(1024);
+        let (_agent_w, client_r) = tokio::io::duplex(1024);
+        let (note_tx, note_rx) = mpsc::unbounded_channel();
+        let connection = Arc::new(Connection::new(
+            client_w,
+            client_r,
+            None,
+            ConnectionHooks::default(),
+        ));
+        let handle = AgentHandle {
+            connection,
+            notifications: Arc::new(TokioMutex::new(note_rx)),
+            serve_task: tokio::spawn(async {}),
+            _child: None,
+            child_pid: None,
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: None,
+            spawned_provider: "auggie".to_string(),
+            wake_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            wake_listener: None,
+        };
+        (handle, note_tx)
+    }
+
+    fn chunk_note(text: &str) -> IncomingNotification {
+        IncomingNotification {
+            method: "session/update".to_string(),
+            params: json!({
+                "sessionId": "acp-wake",
+                "update": { "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text } }
+            }),
+        }
+    }
+
+    /// An update variant with no canonical event mapping (dropped by the
+    /// router in prompt turns; must not open an implicit turn).
+    fn unmappable_note() -> IncomingNotification {
+        IncomingNotification {
+            method: "session/update".to_string(),
+            params: json!({
+                "sessionId": "acp-wake",
+                "update": { "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "thinking" } }
+            }),
+        }
+    }
+
+    async fn wake_setup() -> (
+        TempDb,
+        Arc<AgentManager>,
+        EventBus,
+        AgentId,
+        WorkspaceId,
+        mpsc::UnboundedSender<IncomingNotification>,
+    ) {
+        let (tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("agent-wake"));
+        seed_agent(&mgr, &ws, &id).await;
+        let (handle, note_tx) = wake_handle();
+        mgr.handles.lock().unwrap().insert(id.clone(), handle);
+        mgr.registry.register(id.clone(), mgr.make_kill(id.clone()));
+        (tmp, mgr, bus, id, ws, note_tx)
+    }
+
+    /// Collect bus events until `pred` matches or the timeout elapses.
+    async fn collect_until(
+        sub: &mut crate::events::Subscription,
+        pred: impl Fn(&[intent_core::Event]) -> bool,
+    ) -> Vec<intent_core::Event> {
+        let mut seen: Vec<intent_core::Event> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !pred(&seen) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match timeout(remaining, sub.recv()).await {
+                Ok(Some(batch)) => seen.extend(batch),
+                _ => break,
+            }
+        }
+        seen
+    }
+
+    /// Out-of-turn chunk burst → one implicit turn: `agent:stream:start`
+    /// (reason `harness-wake`), streamed chunks, quiescence finalize with a
+    /// persisted assistant row, one `agent:stream:end` carrying the
+    /// `messageId`, and `agent:idle` (reason `harness_wake_complete`).
+    #[tokio::test]
+    async fn out_of_turn_burst_streams_as_implicit_turn() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(chunk_note("Hello ")).unwrap();
+        note_tx.send(chunk_note("world")).unwrap();
+        assert!(
+            mgr.wake_listener_tick(&id, &ws).await,
+            "handle alive → listener keeps running"
+        );
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:idle")
+        })
+        .await;
+        let start = events
+            .iter()
+            .find(|e| e.event_type == "agent:stream:start")
+            .expect("implicit turn emits stream:start");
+        assert_eq!(start.data["agentId"], json!(id.0));
+        assert_eq!(start.data["reason"], json!("harness-wake"));
+        let message_id = start.data["messageId"].as_str().expect("messageId minted");
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "agent:stream:end")
+            .collect();
+        assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
+        assert_eq!(ends[0].data["messageId"], json!(message_id));
+        let idle = events
+            .iter()
+            .find(|e| e.event_type == "agent:idle")
+            .expect("agent:idle after finalize");
+        assert_eq!(idle.data["reason"], json!("harness_wake_complete"));
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "one assistant row persisted");
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].id, message_id);
+        assert_eq!(messages[0].content[0]["text"], json!("Hello world"));
+        assert!(
+            !mgr.is_busy(&id),
+            "single-flight slot released after finalize"
+        );
+        assert!(
+            mgr.services.live_turn(&id).is_none(),
+            "live-turn slot cleared"
+        );
+    }
+
+    /// A burst with no mappable update opens no turn: no events, no rows,
+    /// slot untouched.
+    #[tokio::test]
+    async fn unmappable_burst_opens_no_turn() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(unmappable_note()).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+
+        assert!(
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
+            "no events published for an unmappable burst"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no assistant row persisted"
+        );
+        assert!(!mgr.is_busy(&id), "slot never claimed");
+    }
+
+    /// A raised wake gate (resume-replay in flight) pauses the listener: the
+    /// buffered notification is left untouched for the replay drain, and the
+    /// tick opens nothing. Lowering the gate re-enables the listener.
+    #[tokio::test]
+    async fn wake_gate_pauses_listener_for_replay_drain() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let gate = {
+            let map = mgr.handles.lock().unwrap();
+            map.get(&id).unwrap().wake_gate.clone()
+        };
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        gate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        note_tx.send(chunk_note("replay")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        assert!(
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
+            "gated tick consumes nothing and emits nothing"
+        );
+
+        // The replay drain (resume path) still sees the buffered burst.
+        let notes = {
+            let map = mgr.handles.lock().unwrap();
+            map.get(&id).unwrap().notifications.clone()
+        };
+        {
+            let mut guard = notes.lock().await;
+            Services::drain_replay_notifications(&mut guard).await;
+            assert!(guard.try_recv().is_err(), "replay burst drained");
+        }
+        gate.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Gate lowered → a later out-of-turn burst opens a turn normally.
+        note_tx.send(chunk_note("live")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "post-gate burst persisted");
+        assert_eq!(messages[0].content[0]["text"], json!("live"));
+    }
+
+    /// The listener never consumes while a prompt turn owns the slot, and its
+    /// tick reports the listener done once the handle is gone (stop path).
+    #[tokio::test]
+    async fn tick_skips_while_busy_and_exits_without_handle() {
+        let (_tmp, mgr, _bus, id, ws, note_tx) = wake_setup().await;
+
+        assert!(mgr.try_begin(&id, &ws).await, "claim slot as a prompt turn");
+        note_tx.send(chunk_note("mid-prompt")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        {
+            let notes = {
+                let map = mgr.handles.lock().unwrap();
+                map.get(&id).unwrap().notifications.clone()
+            };
+            let mut guard = notes.try_lock().expect("receiver not held");
+            let buffered = guard.try_recv();
+            assert!(
+                buffered.is_ok(),
+                "busy tick leaves the notification for the prompt turn"
+            );
+        }
+        mgr.end_turn(&id).await;
+
+        assert!(mgr.stop(&id).await, "stop removes the handle");
+        assert!(
+            !mgr.wake_listener_tick(&id, &ws).await,
+            "tick reports listener shutdown once the handle is gone"
+        );
+    }
+
+    /// A user send racing an active wake turn queues (slot is claimed) and
+    /// the wake turn finalizes promptly — stream:end fires and the queued
+    /// user row is persisted by the drain kick afterwards.
+    #[tokio::test]
+    async fn racing_send_queues_and_streams_after_wake_finalizes() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(chunk_note("wake output")).unwrap();
+        let tick_mgr = mgr.clone();
+        let (tick_id, tick_ws) = (id.clone(), ws.clone());
+        let tick =
+            tokio::spawn(async move { tick_mgr.wake_listener_tick(&tick_id, &tick_ws).await });
+
+        // Wait until the implicit turn is live (stream:start observed).
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:start")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:stream:start"),
+            "wake turn opened"
+        );
+        assert!(mgr.is_busy(&id), "wake turn holds the single-flight slot");
+
+        // The racing user send goes to the queue (slot busy), which also
+        // preempts the settle window — the wake turn finalizes first.
+        mgr.services
+            .enqueue_message(&id, "racing user message".to_string(), None, None, None);
+        assert!(mgr.services.has_ready_to_send(&id));
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:stream:end"),
+            "wake turn finalized after the racing send"
+        );
+        assert!(
+            !events.iter().any(|e| e.event_type == "agent:idle"),
+            "idle suppressed — ready-to-send queue non-empty"
+        );
+        timeout(Duration::from_secs(5), tick)
+            .await
+            .expect("tick completes")
+            .expect("tick task");
+
+        // The wake turn's assistant row landed, and the drain kick persisted
+        // the queued user row before spawning the follow-up prompt worker.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let messages = mgr
+                .services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap();
+            let wake_row = messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content[0]["text"] == json!("wake output"));
+            let user_row = messages
+                .iter()
+                .any(|m| m.role == "user" && m.content[0]["text"] == json!("racing user message"));
+            if wake_row && user_row {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "wake assistant row + drained user row persisted (got: {messages:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
