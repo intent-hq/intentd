@@ -1,0 +1,12 @@
+-- Display identity of an EXPLICITLY selected session model (D14). Additive
+-- only: a nullable TEXT column holding the display model resolved at session
+-- open by matching the stored explicit option id (e.g.
+-- `claude-fable-5[1m]`) against the provider's `configOptions[id="model"]`
+-- option values — the same option list the D13 placeholder resolution uses.
+-- Used ONLY for usage-stats attribution (`stats_model_key`); the raw id in
+-- `model` keeps driving provider configuration (spawn flags /
+-- `session/set_config_option`) and is never rewritten by this path. NULL when
+-- the stored model is a placeholder (D13 rewrites `model` itself), when
+-- nothing resolves, or after `agent.setModel` changes the model (the stale
+-- resolution is cleared and re-resolved at the next session open).
+ALTER TABLE agent_session ADD COLUMN resolved_model TEXT;

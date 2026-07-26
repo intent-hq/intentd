@@ -1833,6 +1833,50 @@ async fn rename_and_set_model_persist() {
     assert_eq!(got.model.as_deref(), Some("auggie:opus4.7"));
 }
 
+/// `agent.setModel` clears any persisted resolved display model (D14): the
+/// resolution belongs to the OLD model id; the next session open re-resolves
+/// against the new one.
+#[tokio::test]
+async fn set_model_clears_resolved_display_model() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("D14".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let landed = svc
+        .store()
+        .set_agent_session_resolved_model(&ws, &id, "auggie:sonnet4.5", Some("Sonnet 4.5"))
+        .await
+        .expect("seed resolved model");
+    assert!(landed);
+    let (_, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read");
+    assert_eq!(resolved.as_deref(), Some("Sonnet 4.5"));
+    svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into())
+        .await
+        .expect("setModel");
+    let (model, resolved, _, _) = svc
+        .store()
+        .get_agent_session_token_usage(&ws, &id)
+        .await
+        .expect("read after");
+    assert_eq!(model.as_deref(), Some("auggie:opus4.7"));
+    assert_eq!(resolved, None, "stale resolution cleared by setModel");
+}
+
 /// `agent.setModel` reconciles session.provider when the new model is a
 /// compound id whose provider differs from the current session provider.
 /// This ensures cross-provider model switches spawn the new provider's binary.

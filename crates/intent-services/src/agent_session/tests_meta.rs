@@ -374,3 +374,46 @@ fn resolve_effective_model_none_when_unresolvable() {
         "category fallback finds the model select"
     );
 }
+
+/// A model select shaped like a live claude-agent-acp option list carrying
+/// bracketed explicit ids (D14).
+fn explicit_pick_options() -> Vec<intent_acp::session::SessionConfigOption> {
+    config_options(serde_json::json!([
+        { "id": "model", "name": "Model", "description": "AI model to use",
+          "category": "model", "type": "select", "currentValue": "default",
+          "options": [
+            { "value": "default", "name": "Default (recommended)",
+              "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+            { "value": "claude-fable-5[1m]", "name": "Fable",
+              "description": "Fable 5 with 1M context · Powerful model for complex work" },
+            { "value": "sonnet", "name": "Sonnet",
+              "description": "Sonnet 5 · Efficient for routine tasks" }
+          ] }
+    ]))
+}
+
+#[test]
+fn resolve_explicit_display_model_matches_option_by_value() {
+    use super::resolve_explicit_display_model;
+    let options = explicit_pick_options();
+    // The bare explicit id matches its option entry; the version-less name
+    // ("Fable") is skipped in favor of the version-bearing description.
+    assert_eq!(
+        resolve_explicit_display_model("claude-fable-5[1m]", Some(&options)),
+        Some("Fable 5".to_string())
+    );
+    // The name itself resolves when it carries a version... via description
+    // here for "sonnet" (name "Sonnet" is version-less).
+    assert_eq!(
+        resolve_explicit_display_model("sonnet", Some(&options)),
+        Some("Sonnet 5".to_string())
+    );
+    // currentValue ("default") plays no part: an id with no option entry
+    // resolves to None even though the select's currentValue would.
+    assert_eq!(
+        resolve_explicit_display_model("claude-haiku-4-5", Some(&options)),
+        None,
+        "unmatched id must not fall back to currentValue or the raw id"
+    );
+    assert_eq!(resolve_explicit_display_model("sonnet", None), None);
+}

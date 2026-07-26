@@ -466,35 +466,82 @@ pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -
 /// sibling versions and, persisted, are indistinguishable from real option
 /// ids in the post-session model-application gate.
 fn resolve_effective_model(config_options: Option<&[SessionConfigOption]>) -> Option<String> {
-    let options = config_options?;
-    let select_by = |pred: &dyn Fn(&SessionConfigOption) -> bool| {
-        options.iter().find_map(|o| match &o.kind {
-            SessionConfigKind::Select(s) if pred(o) => Some(s),
-            _ => None,
-        })
-    };
-    let select = select_by(&|o| o.id.0.as_ref() == "model").or_else(|| {
-        select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model)))
-    })?;
+    let select = model_select(config_options?)?;
     let current = select.current_value.0.as_ref();
-    let entry = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(opts) => {
-            opts.iter().find(|e| e.value.0.as_ref() == current)
-        }
-        SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|g| g.options.iter())
-            .find(|e| e.value.0.as_ref() == current),
-        _ => None,
-    };
     let mut candidates: Vec<&str> = Vec::new();
-    if let Some(entry) = entry {
+    if let Some(entry) = select_entry(select, current) {
         candidates.push(entry.name.as_str());
         if let Some(desc) = entry.description.as_deref() {
             candidates.push(desc);
         }
     }
     candidates.push(current);
+    version_bearing_display(candidates)
+}
+
+/// Resolve the display identity of an EXPLICITLY selected model id against
+/// the same `configOptions[id="model"]` option list the default path uses
+/// (D14): match the stored bare id (compound prefix stripped) against an
+/// option's `value` and derive a version-bearing family display from that
+/// entry's name/description (e.g. `claude-fable-5[1m]` → name "Fable" is
+/// version-less, description "Fable 5 with 1M context · …" → `"Fable 5"`).
+/// The select's `currentValue` is deliberately ignored — at `session/new`
+/// time it may still be the provider default; the post-session
+/// `session/set_config_option` applies the stored id only afterwards. Unlike
+/// D13 the raw id is NOT a candidate: `normalize_model_name` already covers
+/// ids that carry their own family+version at stats time, so the persisted
+/// resolution is reserved for identities only the option list knows. `None`
+/// when no option matches or nothing version-bearing resolves.
+fn resolve_explicit_display_model(
+    bare_id: &str,
+    config_options: Option<&[SessionConfigOption]>,
+) -> Option<String> {
+    let select = model_select(config_options?)?;
+    let entry = select_entry(select, bare_id)?;
+    let mut candidates: Vec<&str> = vec![entry.name.as_str()];
+    if let Some(desc) = entry.description.as_deref() {
+        candidates.push(desc);
+    }
+    version_bearing_display(candidates)
+}
+
+/// The model select of a `session/new` / `session/load` response's
+/// `configOptions`: `id == "model"` wins, `category == "model"` is the
+/// fallback (shared by the D13 default and D14 explicit resolutions).
+fn model_select(options: &[SessionConfigOption]) -> Option<&session::SessionConfigSelect> {
+    let select_by = |pred: &dyn Fn(&SessionConfigOption) -> bool| {
+        options.iter().find_map(|o| match &o.kind {
+            SessionConfigKind::Select(s) if pred(o) => Some(s),
+            _ => None,
+        })
+    };
+    select_by(&|o| o.id.0.as_ref() == "model")
+        .or_else(|| select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model))))
+}
+
+/// Find a select's option entry by `value`, looking through groups when the
+/// options are grouped.
+fn select_entry<'a>(
+    select: &'a session::SessionConfigSelect,
+    value: &str,
+) -> Option<&'a session::SessionConfigSelectOption> {
+    match &select.options {
+        SessionConfigSelectOptions::Ungrouped(opts) => {
+            opts.iter().find(|e| e.value.0.as_ref() == value)
+        }
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| g.options.iter())
+            .find(|e| e.value.0.as_ref() == value),
+        _ => None,
+    }
+}
+
+/// First candidate that resolves to a known model family WITH a version
+/// (bare "Opus" is rejected — it would merge sibling versions and, persisted,
+/// is indistinguishable from a real option id in the post-session
+/// model-application gate).
+fn version_bearing_display<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Option<String> {
     candidates
         .into_iter()
         .filter_map(usage_stats::known_family_model_name)
@@ -710,8 +757,18 @@ impl Services {
     /// the stored model was NULL and the `provider` field is empty. Returns
     /// the *bare* effective model when the write landed — the value
     /// `resolve_spawn` will yield next, which the manager syncs onto the
-    /// live handle's `spawned_model`. Best-effort: failures are logged,
-    /// never propagated — model resolution must not fail session open.
+    /// live handle's `spawned_model`.
+    ///
+    /// A NON-placeholder (explicitly selected) model takes the D14 branch
+    /// instead: the stored id is never rewritten (it keeps driving provider
+    /// configuration — spawn flags / `session/set_config_option`); its
+    /// display identity is resolved against the same option list via
+    /// [`resolve_explicit_display_model`] and persisted to the separate
+    /// `resolved_model` column, used only for usage-stats attribution. That
+    /// branch returns `None` — `resolve_spawn` is unaffected.
+    ///
+    /// Best-effort: failures are logged, never propagated — model resolution
+    /// must not fail session open.
     async fn persist_effective_model(
         &self,
         workspace_id: &WorkspaceId,
@@ -721,6 +778,13 @@ impl Services {
         config_options: Option<&[SessionConfigOption]>,
     ) -> Option<String> {
         if !usage_stats::is_placeholder_model(stored_model) {
+            self.persist_resolved_display_model(
+                workspace_id,
+                agent_id,
+                stored_model,
+                config_options,
+            )
+            .await;
             return None;
         }
         let effective = resolve_effective_model(config_options)?;
@@ -742,6 +806,49 @@ impl Services {
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "persist effective session model failed");
                 None
+            }
+        }
+    }
+
+    /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
+    /// resolve an EXPLICITLY selected model id's display identity against the
+    /// session-open `configOptions` and persist it to `resolved_model`. The
+    /// bare id (compound `{provider}:` prefix stripped — stored explicit
+    /// picks are compound, option values are bare) is matched against the
+    /// model select's option values. The outcome is persisted EITHER way — a
+    /// `None` resolution overwrites (clears) any previously persisted
+    /// display name, so a resolution from an older option list can never go
+    /// stale and mis-attribute stats after the provider's catalog changes.
+    /// The store write is guarded on `model` still equalling the pre-open
+    /// stored value, so a resolution is never attached to a model a
+    /// concurrent `agent.setModel` changed. Best-effort: failures are
+    /// logged, never propagated.
+    async fn persist_resolved_display_model(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        stored_model: Option<&str>,
+        config_options: Option<&[SessionConfigOption]>,
+    ) {
+        let Some(stored) = stored_model else { return };
+        let (_, bare_id) = intent_providers::parse_compound_model_id(stored);
+        let resolved = resolve_explicit_display_model(&bare_id, config_options);
+        match self
+            .store
+            .set_agent_session_resolved_model(workspace_id, agent_id, stored, resolved.as_deref())
+            .await
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    model = %stored,
+                    resolved = %resolved.as_deref().unwrap_or("<none>"),
+                    "persisted resolved display model from configOptions"
+                );
+            }
+            Ok(false) => {} // lost to a concurrent explicit model change
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "persist resolved display model failed");
             }
         }
     }
@@ -1306,17 +1413,17 @@ impl Services {
         if usage.is_none() && !run_completed {
             return; // failed turn without a usage report — nothing to record
         }
-        let (model, provider, prev, prev_readable) = match self
+        let (model, resolved_model, provider, prev, prev_readable) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((model, provider, prev)) => (model, provider, prev, true),
+            Ok((model, resolved, provider, prev)) => (model, resolved, provider, prev, true),
             Err(e) => {
                 // Without the previous snapshot the delta would re-count the
                 // session's full history — drop the token part, keep the run.
                 tracing::warn!(agent = %agent_id, error = %e, "read prev token usage for stats failed");
-                (None, None, None, false)
+                (None, None, None, None, false)
             }
         };
         let tokens = match usage {
@@ -1344,7 +1451,11 @@ impl Services {
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         let provider_id =
             prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref()));
-        let model = usage_stats::stats_model_key(model.as_deref(), provider_id.as_deref());
+        let model = usage_stats::stats_model_key(
+            model.as_deref(),
+            resolved_model.as_deref(),
+            provider_id.as_deref(),
+        );
         if let Err(e) = self
             .store
             .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
