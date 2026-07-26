@@ -186,10 +186,21 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     // destination failures via `die_errno` prefixes ("could not create
     // leading directories of '…': <errno>") whose errno suffix varies, so
     // match the prefixes errno-agnostically alongside the common errno
-    // spellings (ENOENT/EACCES/EROFS/ENOTDIR/ENAMETOOLONG) and checkout's
-    // `invalid path '…'`.
+    // spellings (ENOENT/EACCES/EROFS/ENOTDIR/ENAMETOOLONG).
+    //
+    // Checkout-time `error: invalid path '…'` is deliberately NOT matched:
+    // it is caused by repository content (git's verify_path /
+    // core.protectNTFS / core.protectHFS rejecting a tracked filename),
+    // not the user-supplied destination, so §9.1's "correct the path and
+    // retry" remedy does not apply; it rides the clone-failed catch-all.
+    //
+    // NOTE(§9.1 askpass-missing, monorepo#837): the documented
+    // `askpass-missing` shape ("… app.asar …: not a directory") has no arm
+    // here yet. When the `AskpassMissing` port lands it must be ordered
+    // ahead of BOTH the auth arm (§9.1 gives it precedence over
+    // auth-required) and this path arm (whose "not a directory" row would
+    // otherwise swallow its ENOTDIR spelling).
     if m.contains("is not a valid path")
-        || m.contains("invalid path")
         || m.contains("could not create work tree")
         || m.contains("could not create directory")
         || m.contains("could not create leading directories")
@@ -873,8 +884,6 @@ mod tests {
             "fatal: could not create work tree dir 'repo': No such file or directory",
             // Local filesystem denial on the destination.
             "fatal: could not create work tree dir '/usr/local/repo': Permission denied",
-            // Checkout-time invalid pathname.
-            "error: invalid path 'aux/config'",
         ] {
             assert_eq!(classify_clone_error(msg), C::PathInvalid, "msg: {msg}");
         }
@@ -883,6 +892,25 @@ mod tests {
         assert_eq!(
             classify_clone_error("git@host: Permission denied (publickey,password)."),
             C::AuthRequired
+        );
+        // Checkout-time `invalid path` is repository-content-caused (git's
+        // verify_path rejecting a tracked filename), not a destination
+        // failure — §9.1's "correct the path and retry" doesn't apply, so it
+        // stays on the clone-failed catch-all.
+        assert_eq!(
+            classify_clone_error("error: invalid path 'aux/config'"),
+            C::Other
+        );
+        // Pins today's classification of the §9.1 `askpass-missing` shape
+        // (monorepo#837): its ENOTDIR spelling currently hits this arm's
+        // "not a directory" row. The eventual `AskpassMissing` port must
+        // change this intentionally (ordered ahead of both the auth arm and
+        // this path arm), not silently.
+        assert_eq!(
+            classify_clone_error(
+                "error: cannot run /Applications/X.app/Contents/Resources/app.asar/bin/ssh-askpass-intent: Not a directory"
+            ),
+            C::PathInvalid
         );
     }
 
