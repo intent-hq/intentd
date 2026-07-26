@@ -866,6 +866,199 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     );
 }
 
+/// A prompt turn that streams a sparse `tool_call` (short title, no input),
+/// then a `tool_call_update` carrying the richer title + input, then a
+/// status-only completing update — the Claude shape that collapsed rows to a
+/// bare "Run" (title arrives on an update, later updates are status-only).
+fn prompt_updates_sparse_then_richer_title() -> Vec<String> {
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "Run", "kind": "execute", "status": "in_progress" }
+        }
+    })
+    .to_string();
+    let richer = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "title": "Run: cargo test --all",
+                "rawInput": { "command": "cargo test --all" } }
+        }
+    })
+    .to_string();
+    let tool_done = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawOutput": { "summary": "ok" } }
+        }
+    })
+    .to_string();
+    vec![tool_call, richer, tool_done]
+}
+
+/// Rebuild the `tool_use` block from an `agent:tool:call` event exactly the
+/// way `tool_delta` does (§7.1 shared factory) so tests can assert the live
+/// delta stays byte-identical to the persisted block.
+fn rebuild_block_from_event(data: &Value) -> Value {
+    crate::tool_block::build_tool_use_block(
+        data["blockId"].as_str().expect("blockId"),
+        data["toolName"].as_str().expect("toolName"),
+        data["title"].as_str().expect("title"),
+        data["input"].clone(),
+        data["toolCallId"].as_str().expect("toolCallId"),
+        data["toolKind"].as_str().expect("toolKind"),
+        data["status"].as_str().expect("status"),
+    )
+}
+
+/// A status-only `tool_call_update` after a titled `tool_call` must not wipe
+/// the tool name/title/input: the persisted block keeps them, and the
+/// published `agent:tool:call` event carries the MERGED fields (backfilled
+/// from the transcript block) so `tool_delta`'s rebuilt block stays
+/// byte-identical to the persisted one (§7.1).
+#[tokio::test]
+async fn status_only_update_keeps_title_name_and_input_on_event() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_with_tool_result());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    // status, chunk, tool_call, tool_call_update, stream:end, idle.
+    let mut events = Vec::new();
+    while events.len() < 6 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:tool:call")
+        .collect();
+    assert_eq!(tool_events.len(), 2);
+
+    // The status-only completing update is sparse on the wire (no title, no
+    // input) — the published event must backfill the merged fields from the
+    // transcript block instead of shipping empties that wipe the row live.
+    let update = &tool_events[1].data;
+    assert_eq!(update["toolName"], json!("Run tests"));
+    assert_eq!(update["title"], json!("Run tests"));
+    assert_eq!(update["toolKind"], json!("terminal"));
+    assert_eq!(
+        update["input"],
+        json!({ "path": ".", "_acpTitle": "Run tests" })
+    );
+    assert_eq!(update["status"], json!("completed"));
+
+    // Byte-identical invariant: rebuilding the block from the event the way
+    // `tool_delta` does yields exactly the persisted block.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    let persisted = &messages[0].content[1];
+    assert_eq!(persisted["type"], json!("tool_use"));
+    assert_eq!(&rebuild_block_from_event(update), persisted);
+}
+
+/// A richer title/input arriving on a later `tool_call_update` must be
+/// persisted into the existing `tool_use` block (not just the first-sight
+/// sparse title), and subsequent status-only updates must not undo it.
+#[tokio::test]
+async fn richer_title_update_is_merged_into_block_and_event() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent) = connect_with(prompt_updates_sparse_then_richer_title());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("go")],
+        )
+        .await
+        .expect("turn completes");
+
+    // status, tool_call, richer update, completing update, stream:end, idle.
+    let mut events = Vec::new();
+    while events.len() < 6 {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let tool_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:tool:call")
+        .collect();
+    assert_eq!(tool_events.len(), 3);
+
+    // The persisted block carries the RICHER title/input from the mid-flight
+    // update, with the completing status patched on top.
+    let messages = bus
+        .store()
+        .get_agent_messages(&agent_id, None)
+        .await
+        .expect("read messages");
+    assert_eq!(messages.len(), 1);
+    let mid = &messages[0].id;
+    assert_eq!(
+        messages[0].content,
+        json!([
+            { "type": "tool_use", "id": format!("{mid}:0"), "name": "Run",
+              "input": { "command": "cargo test --all",
+                         "_acpTitle": "Run: cargo test --all" },
+              "toolCallId": "t1",
+              "metadata": { "toolKind": "terminal", "status": "completed" } },
+            { "type": "tool_result", "id": format!("{mid}:1"), "tool_use_id": "t1",
+              "output": { "summary": "ok" }, "is_error": false },
+        ])
+    );
+
+    // The richer-update event carries the merged title/input; the final
+    // status-only event keeps them (backfilled from the block).
+    let richer = &tool_events[1].data;
+    assert_eq!(richer["title"], json!("Run: cargo test --all"));
+    assert_eq!(richer["toolName"], json!("Run"));
+    assert_eq!(richer["toolKind"], json!("terminal"));
+    assert_eq!(
+        richer["input"],
+        json!({ "command": "cargo test --all", "_acpTitle": "Run: cargo test --all" })
+    );
+    let done = &tool_events[2].data;
+    assert_eq!(done["title"], json!("Run: cargo test --all"));
+    assert_eq!(done["toolName"], json!("Run"));
+    assert_eq!(done["toolKind"], json!("terminal"));
+    assert_eq!(done["status"], json!("completed"));
+    assert_eq!(&rebuild_block_from_event(done), &messages[0].content[0]);
+}
+
 /// A tool completing with a proposal-MIME resource item in its output array
 /// persists the `tool_result` (output unchanged) AND a standalone
 /// proposal-resource block right after it (§7.1).
