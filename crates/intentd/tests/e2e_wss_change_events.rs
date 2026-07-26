@@ -355,6 +355,29 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
             "changes": { "title": "Renamed", "tags": ["a", "b"], "skipIsolation": true },
         })
     );
+
+    // Second round-trip with the canonical `skipIsolation` request name so
+    // both wire spellings are proven end-to-end over WSS.
+    let update = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.update",
+        json!({ "workspaceId": ws_id, "skipIsolation": false }),
+    )
+    .await;
+    assert_eq!(
+        update["workspace"]["skipWorktree"],
+        json!(false),
+        "canonical skipIsolation applies to the persisted skipWorktree field: {update}"
+    );
+    let evt = next_event(&mut sub, &["workspace:updated"], 10).await;
+    assert_eq!(
+        evt["data"],
+        json!({
+            "workspaceId": ws_id,
+            "changes": { "skipIsolation": false },
+        })
+    );
 }
 
 /// End-to-end: `workspace.delete` over WSS publishes `workspace:deleted` with
