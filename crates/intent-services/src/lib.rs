@@ -7853,9 +7853,23 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
-                                let repo = repo_dir.clone();
-                                let wt = wt_path.clone();
-                                let mode = if cow_isolation {
+                                let mut mode = if cow_isolation
+                                    && repo_dir.join(".git").is_file()
+                                {
+                                    // A linked worktree's `.git` is a gitfile
+                                    // pointing into the original repository's
+                                    // `.git/worktrees/<name>`: CoW-cloning it
+                                    // would give the clone a `.git` that still
+                                    // points at the ORIGINAL repo, so the
+                                    // branch switch + hard reset would rewrite
+                                    // the user's source checkout. Provision a
+                                    // linked worktree instead.
+                                    tracing::warn!(
+                                        repository_path = %repo_dir.display(),
+                                        "workspace.create: repositoryPath has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
+                                    );
+                                    intent_core::CheckoutMode::Worktree
+                                } else if cow_isolation {
                                     // CoW probe: repo dir → `<root>/<wsId>` (the
                                     // clone's parent). The repository can live on
                                     // any filesystem and reflinks cannot cross
@@ -7903,39 +7917,102 @@ impl WorkspaceApi for Services {
                                 } else {
                                     intent_core::CheckoutMode::Worktree
                                 };
-                                let sha = match worktree_locks
-                                    .with_lock(&repo_dir, move || async move {
-                                        tokio::task::spawn_blocking(move || match mode {
-                                            intent_core::CheckoutMode::Cow => {
-                                                intent_git::cow_checkout::provision_cow_checkout(
-                                                    &repo,
-                                                    &wt,
-                                                    &branch,
-                                                    base_ref.as_deref(),
-                                                    &remote,
-                                                )
-                                            }
-                                            intent_core::CheckoutMode::Worktree => {
-                                                intent_git::worktree::provision_worktree(
-                                                    &repo,
-                                                    &name,
-                                                    &wt,
-                                                    &branch,
-                                                    base_ref.as_deref(),
-                                                    &remote,
-                                                )
-                                            }
-                                        })
-                                        .await
-                                        .map_err(|e| {
-                                            Error::Internal(format!(
-                                                "checkout provisioning task failed: {e}"
-                                            ))
-                                        })?
-                                    })
-                                    .await
-                                {
+                                let provision = |mode: intent_core::CheckoutMode| {
+                                    let name = name.clone();
+                                    let branch = branch.clone();
+                                    let base_ref = base_ref.clone();
+                                    let remote = remote.clone();
+                                    let repo = repo_dir.clone();
+                                    let wt = wt_path.clone();
+                                    let locks = worktree_locks.clone();
+                                    let lock_key = repo_dir.clone();
+                                    async move {
+                                        locks
+                                            .with_lock(&lock_key, move || async move {
+                                                tokio::task::spawn_blocking(move || match mode {
+                                                    intent_core::CheckoutMode::Cow => {
+                                                        intent_git::cow_checkout::provision_cow_checkout(
+                                                            &repo,
+                                                            &wt,
+                                                            &branch,
+                                                            base_ref.as_deref(),
+                                                            &remote,
+                                                        )
+                                                    }
+                                                    intent_core::CheckoutMode::Worktree => {
+                                                        intent_git::worktree::provision_worktree(
+                                                            &repo,
+                                                            &name,
+                                                            &wt,
+                                                            &branch,
+                                                            base_ref.as_deref(),
+                                                            &remote,
+                                                        )
+                                                    }
+                                                })
+                                                .await
+                                                .map_err(|e| {
+                                                    Error::Internal(format!(
+                                                        "checkout provisioning task failed: {e}"
+                                                    ))
+                                                })?
+                                            })
+                                            .await
+                                    }
+                                };
+                                let sha = match provision(mode).await {
                                     Ok(sha) => sha,
+                                    Err(Error::Unsupported(reason))
+                                        if mode == intent_core::CheckoutMode::Cow =>
+                                    {
+                                        // Safety net: the pre-provisioning
+                                        // probe passed but the clone itself
+                                        // was still unsupported. Retry as a
+                                        // linked worktree instead of failing
+                                        // the create; the #774 empty-dir
+                                        // cleanup runs between attempts.
+                                        tracing::warn!(
+                                            repository_path = %repo_dir.display(),
+                                            reason = %reason,
+                                            "workspace.create: CoW checkout provisioning unsupported despite a passing probe; retrying as a linked worktree"
+                                        );
+                                        remove_workspace_dir_if_empty(&ws_dir);
+                                        mode = intent_core::CheckoutMode::Worktree;
+                                        match provision(mode).await {
+                                            Ok(sha) => sha,
+                                            Err(e) => {
+                                                // `provision_worktree` creates
+                                                // the branch before `git
+                                                // worktree add`; on partial
+                                                // failure the branch may exist
+                                                // in the SOURCE repo with no
+                                                // workspace row to clean it up
+                                                // later. Best-effort delete it.
+                                                let cleanup_repo = repo_dir.clone();
+                                                let cleanup_branch = branch.clone();
+                                                let cleanup = worktree_locks
+                                                    .with_lock(&repo_dir, move || async move {
+                                                        tokio::task::spawn_blocking(move || {
+                                                            intent_git::branches::delete_local_branch(
+                                                                &cleanup_repo,
+                                                                &cleanup_branch,
+                                                            )
+                                                        })
+                                                        .await
+                                                    })
+                                                    .await;
+                                                if let Ok(Err(cleanup_err)) = cleanup {
+                                                    tracing::debug!(
+                                                        branch = %branch,
+                                                        error = %cleanup_err,
+                                                        "workspace.create: best-effort branch cleanup did not delete branch (may not have been created)"
+                                                    );
+                                                }
+                                                remove_workspace_dir_if_empty(&ws_dir);
+                                                return Err(e);
+                                            }
+                                        }
+                                    }
                                     Err(e) => {
                                         // `provision_cow_checkout` already
                                         // removed the failed clone; also drop
@@ -9123,7 +9200,20 @@ impl WorkspaceApi for Services {
                         known_repo_name(ws.repository_name.as_deref(), &repo_dir.to_string_lossy());
                     let ws_dir = workspaces_root.join(&ws.id.0);
                     let wt_path = ws_dir.join(worktree_folder_slug(&repo_name));
-                    let mode = if cow_isolation {
+                    let mode = if cow_isolation && repo_dir.join(".git").is_file() {
+                        // A linked worktree's `.git` is a gitfile pointing
+                        // into the original repository's
+                        // `.git/worktrees/<name>`: CoW-cloning it would give
+                        // the clone a `.git` that still points at the
+                        // ORIGINAL repo, so the branch switch + hard reset
+                        // would rewrite the user's source checkout. Provision
+                        // a linked worktree instead.
+                        tracing::warn!(
+                            repository_path = %repo_dir.display(),
+                            "workspace.duplicate: repositoryPath has a gitfile .git (linked worktree or submodule checkout); CoW-cloning it would corrupt the source checkout — provisioning a linked worktree instead"
+                        );
+                        intent_core::CheckoutMode::Worktree
+                    } else if cow_isolation {
                         // CoW probe: repo dir → `<root>/<wsId>` (the clone's
                         // parent). Same fallback semantics as create: the
                         // repository can live on any filesystem and reflinks
@@ -9197,35 +9287,65 @@ impl WorkspaceApi for Services {
                     ws.branch = branch.clone();
                     let name = ws.id.0.clone();
                     let base_ref = ws.base_ref.clone();
-                    let repo = repo_dir.clone();
-                    let wt = wt_path.clone();
-                    let provision_branch = branch.clone();
-                    let sha_result = worktree_locks
-                        .with_lock(&repo_dir, move || async move {
-                            tokio::task::spawn_blocking(move || match mode {
-                                intent_core::CheckoutMode::Cow => {
-                                    intent_git::cow_checkout::provision_cow_checkout(
-                                        &repo,
-                                        &wt,
-                                        &provision_branch,
-                                        base_ref.as_deref(),
-                                        "origin",
-                                    )
-                                }
-                                intent_core::CheckoutMode::Worktree => {
-                                    intent_git::worktree::provision_worktree(
-                                        &repo,
-                                        &name,
-                                        &wt,
-                                        &provision_branch,
-                                        base_ref.as_deref(),
-                                        "origin",
-                                    )
-                                }
-                            })
-                            .await
-                        })
-                        .await;
+                    let provision = |mode: intent_core::CheckoutMode| {
+                        let name = name.clone();
+                        let base_ref = base_ref.clone();
+                        let repo = repo_dir.clone();
+                        let wt = wt_path.clone();
+                        let provision_branch = branch.clone();
+                        let locks = worktree_locks.clone();
+                        let lock_key = repo_dir.clone();
+                        async move {
+                            locks
+                                .with_lock(&lock_key, move || async move {
+                                    tokio::task::spawn_blocking(move || match mode {
+                                        intent_core::CheckoutMode::Cow => {
+                                            intent_git::cow_checkout::provision_cow_checkout(
+                                                &repo,
+                                                &wt,
+                                                &provision_branch,
+                                                base_ref.as_deref(),
+                                                "origin",
+                                            )
+                                        }
+                                        intent_core::CheckoutMode::Worktree => {
+                                            intent_git::worktree::provision_worktree(
+                                                &repo,
+                                                &name,
+                                                &wt,
+                                                &provision_branch,
+                                                base_ref.as_deref(),
+                                                "origin",
+                                            )
+                                        }
+                                    })
+                                    .await
+                                })
+                                .await
+                        }
+                    };
+                    let sha_result = provision(mode).await;
+                    let (mode, sha_result) = match sha_result {
+                        Ok(Err(Error::Unsupported(reason)))
+                            if mode == intent_core::CheckoutMode::Cow =>
+                        {
+                            // Safety net (create parity): the pre-provisioning
+                            // probe passed but the clone itself was still
+                            // unsupported. Retry as a linked worktree; the
+                            // #774 empty-dir cleanup runs between attempts.
+                            tracing::warn!(
+                                repository_path = %repo_dir.display(),
+                                reason = %reason,
+                                "workspace.duplicate: CoW checkout provisioning unsupported despite a passing probe; retrying as a linked worktree"
+                            );
+                            remove_workspace_dir_if_empty(&ws_dir);
+                            (
+                                intent_core::CheckoutMode::Worktree,
+                                provision(intent_core::CheckoutMode::Worktree).await,
+                            )
+                        }
+                        other => (mode, other),
+                    };
                     // `provision_worktree` creates (or reuses) the branch
                     // before `git worktree add`; on partial failure the branch
                     // may exist without a worktree tracking it, and

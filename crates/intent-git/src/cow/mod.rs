@@ -19,12 +19,22 @@ fn get_cache() -> &'static Mutex<HashMap<(u64, u64), CowSupport>> {
     PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(unix)]
+mod best_effort;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+/// Test hook: force `cow_clone` to fail with `Error::Unsupported` when the
+/// source path contains this substring. Lets tests exercise the
+/// clone-fails-after-probe-passes fallback paths, which the best-effort walk
+/// otherwise makes hard to trigger naturally. NOTE: this seam is compiled
+/// into release binaries too (release-mode e2e runs need it); it is inert
+/// unless the namespaced env var is set.
+pub const TEST_COW_CLONE_UNSUPPORTED_PATH_ENV: &str = "INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH";
 
 /// CoW support result for a (src, dst) directory pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,12 +110,19 @@ fn get_volume_pair(_src: &Path, _dst: &Path) -> Option<(u64, u64)> {
 
 /// Clone a directory tree from `src` to `dst` using CoW.
 ///
-/// - macOS: `copyfile(3)` with `COPYFILE_CLONE|COPYFILE_RECURSIVE`
-/// - Linux: tree walk + per-file `FICLONE` ioctl
+/// - macOS: `copyfile(3)` with `COPYFILE_CLONE|COPYFILE_RECURSIVE`, falling
+///   back to a best-effort per-entry walk when the whole-tree clone fails as
+///   unsupported (e.g. the tree contains sockets/FIFOs)
+/// - Linux: best-effort tree walk + per-file `FICLONE` ioctl
 /// - Windows: ReFS block cloning via `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
 ///
+/// The Unix walk skips genuinely non-clonable entries (sockets/FIFOs/device
+/// nodes, nested mounts, per-entry unsupported errnos) with logging instead
+/// of failing the clone; real I/O errors on regular files still fail.
+///
 /// `dst` must not exist. Never falls back to a byte copy — returns
-/// `Error::Unsupported` if CoW is unavailable.
+/// `Error::Unsupported` if CoW is unavailable. On failure, a partially
+/// cloned `dst` is removed best-effort (safe: `dst` did not exist on entry).
 ///
 /// # Errors
 /// - `Error::Unsupported` if CoW is not available for this (src, dst) pair
@@ -124,20 +141,34 @@ pub fn cow_clone(src: &Path, dst: &Path) -> Result<()> {
             dst.display()
         )));
     }
+    if let Ok(needle) = std::env::var(TEST_COW_CLONE_UNSUPPORTED_PATH_ENV) {
+        if !needle.is_empty() && src.to_string_lossy().contains(&needle) {
+            return Err(Error::Unsupported(
+                "CoW cloning not supported (test hook)".to_string(),
+            ));
+        }
+    }
 
     #[cfg(target_os = "macos")]
-    return macos::clone(src, dst);
+    let result = macos::clone(src, dst);
     #[cfg(target_os = "linux")]
-    return linux::clone(src, dst);
+    let result = linux::clone(src, dst);
     #[cfg(target_os = "windows")]
-    return windows::clone(src, dst);
+    let result = windows::clone(src, dst);
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
+    let result: Result<()> = {
         let _ = (src, dst);
         Err(Error::Unsupported(
             "CoW cloning is not supported on this platform".to_string(),
         ))
+    };
+
+    if result.is_err() && dst.exists() {
+        // `dst` did not exist on entry, so anything present is a partial
+        // clone; remove it so fallback provisioning finds a clean path.
+        let _ = std::fs::remove_dir_all(dst);
     }
+    result
 }
 
 #[cfg(test)]
@@ -243,6 +274,62 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(&probe_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cow_clone_skips_sockets_and_fifos() {
+        use std::os::unix::net::UnixListener;
+
+        let tmpdir = std::env::temp_dir();
+        let src = tmpdir.join("cow_clone_special_src");
+        let dst = tmpdir.join("cow_clone_special_dst");
+
+        // Clean up from any previous run
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
+
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("regular.txt"), b"data").unwrap();
+        fs::write(src.join("sub/nested.txt"), b"nested").unwrap();
+
+        // A live Unix socket (e.g. a dev server's IPC socket left in the tree).
+        let sock_path = src.join("sub/live.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        assert!(sock_path.exists());
+
+        // A FIFO.
+        let fifo_path = src.join("pipe.fifo");
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+
+        // Probe between test-unique dirs (same volume as the clone) so the
+        // probe's fixed temp filename cannot race parallel tests probing the
+        // shared tmpdir.
+        let probe_dst = tmpdir.join("cow_clone_special_probe");
+        fs::create_dir_all(&probe_dst).unwrap();
+        let probe = cow_probe(&src, &probe_dst).unwrap();
+        let _ = fs::remove_dir_all(&probe_dst);
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping special-file test: CoW not supported on this filesystem");
+            let _ = fs::remove_dir_all(&src);
+            return;
+        }
+
+        // The clone must succeed, carrying the regular files and skipping
+        // the socket and FIFO instead of failing the whole clone.
+        cow_clone(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("regular.txt")).unwrap(), "data");
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/nested.txt")).unwrap(),
+            "nested"
+        );
+        assert!(!dst.join("sub/live.sock").exists());
+        assert!(!dst.join("pipe.fifo").exists());
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dst);
     }
 
     #[cfg(target_os = "linux")]

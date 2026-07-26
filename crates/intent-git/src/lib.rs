@@ -12,7 +12,7 @@ pub use intent_core::{
     GitMergeConflicts, GitPullResult, GitStatus, Result,
 };
 
-pub use cow::{cow_clone, cow_probe, CowSupport};
+pub use cow::{cow_clone, cow_probe, CowSupport, TEST_COW_CLONE_UNSUPPORTED_PATH_ENV};
 
 pub mod auth;
 pub mod branches;

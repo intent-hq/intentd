@@ -528,6 +528,132 @@ async fn workspace_create_defaults_to_worktree_when_cow_isolation_off() {
     drop(daemon);
 }
 
+/// Scenario B2 — mid-flight CoW failure safety net: `workspace.cowIsolation`
+/// ON and the probe passes, but the clone itself fails as unsupported (forced
+/// via the `INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH` daemon seam, standing
+/// in for e.g. a live socket tree the probe's tiny temp file cannot see).
+/// `workspace.create` must transparently fall back to a linked worktree
+/// instead of failing.
+#[tokio::test]
+async fn workspace_create_falls_back_to_worktree_when_clone_fails_midflight() {
+    const TEST: &str = "workspace.create CoW mid-flight fallback WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("cowmidroot");
+    let (daemon, port, cfg) = boot(
+        &root,
+        &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
+    )
+    .await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut ws, 1, true).await;
+
+    let result = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "CoW mid-flight fallback E2E",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+
+    let workspace = &result["workspace"];
+    let wt = workspace["worktreePath"].as_str().expect("worktreePath");
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "clone-time Unsupported ⇒ transparent worktree fallback: {workspace}"
+    );
+    let wt_path = PathBuf::from(wt);
+    assert!(wt_path.join("README.md").exists(), "checkout populated");
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+    assert!(
+        wt_path.join(".git").is_file(),
+        "fallback checkout is a linked worktree (gitfile .git)"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario B3 — `repositoryPath` is itself a linked git worktree: CoW-cloning
+/// it would give the clone a gitfile `.git` still pointing at the ORIGINAL
+/// repo (the branch switch + reset would rewrite the user's source checkout),
+/// so `workspace.create` with `workspace.cowIsolation` ON must route it to
+/// linked-worktree provisioning and leave the source checkout untouched.
+#[tokio::test]
+async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
+    const TEST: &str = "workspace.create linked-worktree source WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("cowwtroot");
+    let (daemon, port, cfg) = boot(&root, &[]).await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    // The user's checkout is a linked worktree of the main repo.
+    let user_wt = daemon.scratch.join("user-worktree");
+    run_git(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "user-branch",
+            user_wt.to_str().unwrap(),
+            "main",
+        ],
+        &repo,
+    );
+    assert!(user_wt.join(".git").is_file(), "user checkout is a gitfile");
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut ws, 1, true).await;
+
+    let result = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "Linked worktree source E2E",
+            "repositoryPath": user_wt.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "user-branch",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+
+    let workspace = &result["workspace"];
+    let wt = workspace["worktreePath"].as_str().expect("worktreePath");
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "linked-worktree source ⇒ worktree mode even with cowIsolation on: {workspace}"
+    );
+    let wt_path = PathBuf::from(wt);
+    assert!(wt_path.join("README.md").exists(), "checkout populated");
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
+    // The user's source worktree is untouched: still on its own branch.
+    assert_eq!(
+        run_git(&["rev-parse", "--abbrev-ref", "HEAD"], &user_wt),
+        "user-branch",
+        "source checkout is not rewritten"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
 /// Scenario C — `agent.delegate` in a CoW workspace: the delegated agent gets
 /// its own per-agent CoW sandbox (`sandbox:created` event with the §5.5
 /// payload, `effectiveIsolation: "cow"` in the delegate result), and when the
@@ -989,6 +1115,78 @@ async fn workspace_duplicate_provisions_cow_clone_over_wss() {
         src_branches.is_empty(),
         "duplicate branch must not leak into the source repo: {src_branches}"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+    drop(daemon);
+}
+
+/// Scenario E2 — `workspace.duplicate` mid-flight CoW failure safety net:
+/// with the clone forced to fail as unsupported (same seam as Scenario B2),
+/// both the create and the duplicate must transparently fall back to a linked
+/// worktree instead of failing — exercising the duplicate path's
+/// `Ok(Err(Unsupported))` retry arm.
+#[tokio::test]
+async fn workspace_duplicate_falls_back_to_worktree_when_clone_fails_midflight() {
+    const TEST: &str = "workspace.duplicate CoW mid-flight fallback WSS e2e";
+    if !git_gate(TEST) || !cow_gate(TEST) {
+        return;
+    }
+    let root = scratch_dir("cowdupmid");
+    let (daemon, port, cfg) = boot(
+        &root,
+        &[("INTENT_GIT_TEST_COW_CLONE_UNSUPPORTED_PATH", "source-repo")],
+    )
+    .await;
+    let (repo, head_sha) = make_source_repo(&daemon.scratch);
+
+    let mut ws = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut ws, 1, true).await;
+
+    let created = wss_rpc(
+        &mut ws,
+        2,
+        "workspace.create",
+        json!({
+            "title": "CoW Dup Mid-flight Source",
+            "repositoryPath": repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "initialAgent": { "prompt": "fix the auth flow" },
+            "idempotencyKey": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    let source_id = created["workspace"]["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        created["workspace"]["checkoutMode"],
+        json!("worktree"),
+        "create falls back mid-flight: {created}"
+    );
+
+    let dup = wss_rpc(
+        &mut ws,
+        3,
+        "workspace.duplicate",
+        json!({ "workspaceId": source_id }),
+    )
+    .await;
+    let workspace = &dup["workspace"];
+    assert_eq!(
+        workspace["checkoutMode"],
+        json!("worktree"),
+        "duplicate falls back mid-flight instead of failing: {workspace}"
+    );
+    let wt = workspace["worktreePath"].as_str().expect("worktreePath");
+    let wt_path = PathBuf::from(wt);
+    assert!(
+        wt_path.join("README.md").exists(),
+        "duplicate checkout populated"
+    );
+    assert!(
+        wt_path.join(".git").is_file(),
+        "duplicate fallback is a linked worktree (gitfile .git)"
+    );
+    assert_eq!(run_git(&["rev-parse", "HEAD"], &wt_path), head_sha);
 
     let _ = std::fs::remove_dir_all(&root);
     drop(daemon);

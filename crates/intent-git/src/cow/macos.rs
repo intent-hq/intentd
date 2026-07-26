@@ -240,6 +240,37 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
 }
 
 pub fn clone(src: &Path, dst: &Path) -> Result<()> {
+    match clone_tree_fast(src, dst) {
+        // The whole-tree clonefile fails with ENOTSUP when the tree contains
+        // entries a reflink cannot carry (e.g. a live Unix socket or FIFO),
+        // even though the volume pair supports cloning. Retry with the
+        // best-effort per-entry walk, which skips only genuinely
+        // non-clonable entries.
+        Err(Error::Unsupported(reason)) if src.is_dir() => {
+            tracing::debug!(
+                src = %src.display(),
+                %reason,
+                "cow_clone: whole-tree clonefile unsupported; retrying with best-effort per-entry clone"
+            );
+            if dst.exists() {
+                // A failed recursive copyfile leaves a partial destination
+                // tree behind; clear it before the walk. If the cleanup
+                // fails the walk would die on EEXIST and obscure the real
+                // failure, so surface the cleanup error directly.
+                std::fs::remove_dir_all(dst).map_err(|e| {
+                    Error::Internal(format!(
+                        "cannot remove partial clone before best-effort retry: {e}"
+                    ))
+                })?;
+            }
+            super::best_effort::clone_tree(src, dst, clone_file)
+        }
+        other => other,
+    }
+}
+
+/// Fast path: clone the whole tree with a single recursive copyfile(3).
+fn clone_tree_fast(src: &Path, dst: &Path) -> Result<()> {
     let src_cstr = CString::new(src.as_os_str().as_bytes())
         .map_err(|e| Error::Internal(format!("invalid src path: {e}")))?;
     let dst_cstr = CString::new(dst.as_os_str().as_bytes())
