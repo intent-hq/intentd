@@ -6494,4 +6494,65 @@ mod harness_wake_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// The wake tick's race-loss path (a send claimed the slot between the
+    /// busy check and `try_begin`) drives the already-consumed notification
+    /// with a ZERO settle window: the implicit turn streams it, finalizes
+    /// immediately without draining further, and leaves later buffered
+    /// notifications untouched for the slot-owning prompt turn. No
+    /// `agent:idle` is emitted — that duty stays with the slot's owner.
+    #[tokio::test]
+    async fn zero_settle_wake_turn_finalizes_immediately_leaving_buffer() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(chunk_note("pre-race output")).unwrap();
+        note_tx.send(chunk_note("later burst")).unwrap();
+        let notes = {
+            let map = mgr.handles.lock().unwrap();
+            map.get(&id).unwrap().notifications.clone()
+        };
+        let persisted_id = {
+            let mut guard = notes.lock().await;
+            let first = guard.try_recv().expect("first buffered note");
+            let persisted_id = mgr
+                .services
+                .run_harness_wake_turn(&mut guard, first, &id, &ws, Duration::ZERO)
+                .await;
+            assert!(
+                guard.try_recv().is_ok(),
+                "zero-settle turn leaves the later note buffered for the slot owner"
+            );
+            persisted_id.expect("assistant row persisted")
+        };
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        let start = events
+            .iter()
+            .find(|e| e.event_type == "agent:stream:start")
+            .expect("implicit turn emits stream:start");
+        assert_eq!(start.data["reason"], json!("harness-wake"));
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "agent:stream:end")
+            .collect();
+        assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
+        assert_eq!(ends[0].data["messageId"], json!(persisted_id));
+        assert!(
+            !events.iter().any(|e| e.event_type == "agent:idle"),
+            "idle emit left to the slot's owner"
+        );
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "only the consumed note persisted");
+        assert_eq!(messages[0].content[0]["text"], json!("pre-race output"));
+    }
 }

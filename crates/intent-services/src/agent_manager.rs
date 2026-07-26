@@ -3499,22 +3499,28 @@ impl AgentManager {
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues
         // instead of interleaving. On the rare loss (a send claimed the slot
-        // between the busy check and here), still drive the turn while
-        // holding the receiver lock — the prompt worker blocks on it, and the
-        // ready-to-send check inside the turn finalizes promptly — but leave
-        // slot release and the idle emit to the slot's owner.
+        // between the busy check and here), the first notification is already
+        // consumed, so still stream it as an implicit turn — but with a ZERO
+        // settle window, handing the receiver straight back to the blocked
+        // prompt worker — and leave every slot-owner duty (registry
+        // active/idle marks, slot release, idle emit, queue drain) to the
+        // prompt turn that won the slot: marking idle here would flag the
+        // process eviction-eligible (and pop a spawn waiter) mid-prompt-turn.
         let claimed = self.try_begin(agent_id, workspace_id).await;
-        self.registry.mark_active(agent_id);
+        let settle = if claimed {
+            HARNESS_WAKE_SETTLE
+        } else {
+            Duration::ZERO
+        };
+        if claimed {
+            self.registry.mark_active(agent_id);
+        }
         self.services
-            .run_harness_wake_turn(
-                &mut guard,
-                first,
-                agent_id,
-                workspace_id,
-                HARNESS_WAKE_SETTLE,
-            )
+            .run_harness_wake_turn(&mut guard, first, agent_id, workspace_id, settle)
             .await;
-        self.registry.mark_idle(agent_id);
+        if claimed {
+            self.registry.mark_idle(agent_id);
+        }
         drop(guard);
         if claimed {
             self.end_turn(agent_id).await;
