@@ -102,12 +102,24 @@ where
 /// replacement on demand.
 ///
 /// Takes the connection by value: the transaction is over either way, and
-/// the detach path consumes it. Implementation detail of
+/// the detach path consumes it. Emits a `tracing::warn!` when the
+/// detach+close path fires so the poisoned-connection event is observable
+/// in logs (monorepo#711). Implementation detail of
 /// [`commit_with_rollback_guard`] — call that instead (monorepo#716).
 async fn rollback_or_poison(mut conn: sqlx::pool::PoolConnection<sqlx::Sqlite>) {
     use sqlx::Connection;
-    if sqlx::query("ROLLBACK").execute(&mut *conn).await.is_err() {
-        let _ = conn.detach().close().await;
+    if let Err(rollback_err) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
+        match conn.detach().close().await {
+            Ok(()) => tracing::warn!(
+                rollback_error = %rollback_err,
+                "ROLLBACK failed; detached and closed the potentially poisoned write-pool connection"
+            ),
+            Err(close_err) => tracing::warn!(
+                rollback_error = %rollback_err,
+                close_error = %close_err,
+                "ROLLBACK failed; detached the potentially poisoned write-pool connection but close also failed"
+            ),
+        }
     }
 }
 
