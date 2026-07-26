@@ -140,7 +140,9 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
         || m.contains("could not read username")
         || m.contains("could not read password")
         || m.contains("terminal prompts disabled")
-        || m.contains("permission denied (publickey)")
+        // No closing paren: sshd emits multi-method forms like
+        // `Permission denied (publickey,password).` on non-GitHub hosts.
+        || m.contains("permission denied (publickey")
         || m.contains("invalid username or password")
     {
         return C::AuthRequired;
@@ -148,8 +150,7 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     if m.contains("could not resolve host")
         || m.contains("network is unreachable")
         || m.contains("connection refused")
-        || m.contains("connection timed out")
-        || m.contains("operation timed out")
+        || m.contains("connection reset")
         || m.contains("timed out")
         || m.contains("could not connect to")
         || m.contains("early eof")
@@ -556,6 +557,21 @@ pub(crate) fn target_exists(target_path: &Path) -> bool {
     target_path.exists()
 }
 
+/// Whether `path` exists as something a clone cannot target: a file, or a
+/// directory with at least one entry. An existing *empty* directory is fine —
+/// `git clone` accepts it — so `workspace.create` only rejects when this
+/// returns true (`destination-exists-non-empty`, monorepo#826).
+pub(crate) fn target_exists_non_empty(target_path: &Path) -> bool {
+    if !target_path.exists() {
+        return false;
+    }
+    match std::fs::read_dir(target_path) {
+        Ok(mut entries) => entries.next().is_some(),
+        // Not a directory (or unreadable): the clone cannot use it either way.
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +653,8 @@ mod tests {
             "fatal: Authentication failed for 'https://github.com/a/b.git/'",
             "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
             "git@github.com: Permission denied (publickey).",
+            "git@host: Permission denied (publickey,password).",
+            "git@host: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).",
             "remote: Invalid username or password.",
         ] {
             assert_eq!(classify_clone_error(msg), C::AuthRequired, "msg: {msg}");
@@ -649,11 +667,38 @@ mod tests {
         for msg in [
             "fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com",
             "fatal: unable to access 'https://github.com/a/b.git/': Failed to connect to github.com port 443: Connection refused",
+            "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
             "git clone timed out",
             "fatal: the remote end hung up unexpectedly",
         ] {
             assert_eq!(classify_clone_error(msg), C::Network, "msg: {msg}");
         }
+    }
+
+    #[test]
+    fn target_exists_non_empty_semantics() {
+        let base = std::env::temp_dir().join(format!(
+            "clone-target-check-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        assert!(!target_exists_non_empty(&base.join("missing")));
+
+        let empty = base.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(!target_exists_non_empty(&empty));
+
+        let occupied = base.join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("keep.txt"), "x").unwrap();
+        assert!(target_exists_non_empty(&occupied));
+
+        let file = base.join("plain-file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(target_exists_non_empty(&file));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

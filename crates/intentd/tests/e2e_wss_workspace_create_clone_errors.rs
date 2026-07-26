@@ -222,6 +222,8 @@ async fn workspace_create_existing_clone_target_returns_destination_exists() {
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&occupied).unwrap();
+    // Drop guard so a failing assertion below cannot leak the dir in /tmp.
+    let _occupied_guard = TempDir(occupied.clone());
     std::fs::write(occupied.join("keep.txt"), "occupied").unwrap();
 
     let resp = wss_rpc_raw(
@@ -245,6 +247,4 @@ async fn workspace_create_existing_clone_target_returns_destination_exists() {
         json!("destination-exists-non-empty"),
         "expected data.code destination-exists-non-empty, got: {resp}"
     );
-
-    let _ = std::fs::remove_dir_all(&occupied);
 }

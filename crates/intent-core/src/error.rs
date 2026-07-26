@@ -43,7 +43,7 @@ pub enum Error {
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
 
-    /// A `workspace.create` (or `git.clone`) clone/provisioning step failed.
+    /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
     /// detail (git stderr tail with credentials redacted) so clients can show
     /// the underlying cause instead of a bare "Internal error" and key

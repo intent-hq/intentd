@@ -7325,12 +7325,12 @@ impl WorkspaceApi for Services {
                                         .to_string(),
                                 });
                             }
-                            if clone_ops::target_exists(&target) {
+                            if clone_ops::target_exists_non_empty(&target) {
                                 return Err(Error::CloneFailed {
                                     category:
                                         intent_core::CloneErrorCategory::DestinationExistsNonEmpty,
                                     detail: format!(
-                                        "clone target already exists: {}",
+                                        "clone target already exists and is not empty: {}",
                                         target.display()
                                     ),
                                 });
