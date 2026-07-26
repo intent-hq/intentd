@@ -1514,6 +1514,11 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     use chrono::{Datelike, Timelike, Utc};
     let now = Utc::now();
     let bucket_key = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:00:00Z").to_string();
+    // UTC local stamps keep the tzOffsetMinutes:0 assertions below valid.
+    let stamp = |t: chrono::DateTime<Utc>| intent_store::LocalStamp {
+        date: t.format("%Y-%m-%d").to_string(),
+        hour: t.hour() as u8,
+    };
     let bucket_now = bucket_key(now);
     let bucket_old = bucket_key(now - chrono::Duration::hours(48));
     let delta = intent_store::UsageStatsDelta {
@@ -1528,13 +1533,14 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         lines_deleted: 3,
     };
     srv.store
-        .add_usage_stats(&bucket_now, "Opus 4.8", &delta)
+        .add_usage_stats(&bucket_now, "Opus 4.8", &stamp(now), &delta)
         .await
         .expect("seed current bucket");
     srv.store
         .add_usage_stats(
             &bucket_old,
             "Sonnet 5",
+            &stamp(now - chrono::Duration::hours(48)),
             &intent_store::UsageStatsDelta {
                 input_tokens: 7,
                 runs: 1,

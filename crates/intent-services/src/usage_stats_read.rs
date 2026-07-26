@@ -2,12 +2,16 @@
 //! agentic usage-stats cards). Everything here is pure and unit-testable
 //! without a store; the recording side lives in `usage_stats.rs`.
 //!
-//! Buckets are stored as UTC hour floors. For month/year periods they are
-//! shifted by the client's `tzOffsetMinutes` (minutes east of UTC) before
-//! period filtering and hour-of-day / month grouping, so results reflect the
-//! client's local time (D8). The `24h` period (D11) is an absolute rolling
-//! window — the trailing 24 hourly UTC buckets ending at the current hour —
-//! with only the per-bucket hour labels rendered in local time.
+//! Buckets are stored as UTC hour floors alongside a local wall-clock stamp
+//! (`local_date` / `local_hour`) captured at record time (D12). For
+//! month/year periods, filtering and hour-of-day / month grouping follow
+//! that stamp, so "1pm" means 1pm on the daemon's machine when the activity
+//! happened — immune to later DST transitions or timezone moves. Rows
+//! lacking a stamp (pre-D12) defensively fall back to shifting `bucket_utc`
+//! by the client's `tzOffsetMinutes` (minutes east of UTC). The `24h` period
+//! (D11) is an absolute rolling window — the trailing 24 hourly UTC buckets
+//! ending at the current hour — with only the per-bucket hour labels
+//! rendered via `tzOffsetMinutes`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,6 +78,34 @@ fn parse_digits(s: &str, len: usize) -> Option<u32> {
         .flatten()
 }
 
+/// Parse a stored `local_date` (`"YYYY-MM-DD"`) into `(year, month)`; `None`
+/// for anything malformed, in which case the caller falls back to the UTC
+/// shift.
+fn parse_local_date(s: &str) -> Option<(i32, u8)> {
+    let mut it = s.split('-');
+    let year = parse_digits(it.next()?, 4)? as i32;
+    let month = parse_digits(it.next()?, 2)?;
+    let day = parse_digits(it.next()?, 2)?;
+    (it.next().is_none() && (1..=12).contains(&month) && (1..=31).contains(&day))
+        .then_some((year, month as u8))
+}
+
+/// Per-row local wall-clock parts `(year, month, hour_of_day)` used for
+/// month/year period filtering and grouping: the recorded stamp when present
+/// and well-formed (D12), otherwise the UTC bucket shifted by the client
+/// offset (defensive fallback for pre-D12 rows).
+fn local_parts(row: &UsageStatsRow, utc: OffsetDateTime, tz: time::UtcOffset) -> (i32, u8, u8) {
+    if let (Some(date), Some(hour)) = (row.local_date.as_deref(), row.local_hour) {
+        if let Some((year, month)) = parse_local_date(date) {
+            if hour < 24 {
+                return (year, month, hour);
+            }
+        }
+    }
+    let local = utc.to_offset(tz);
+    (local.year(), u8::from(local.month()), local.hour())
+}
+
 /// The 4 separate token counters (D6) for one aggregation cell.
 #[derive(Debug, Default, Clone, Copy)]
 struct TokenCell {
@@ -114,9 +146,12 @@ fn floor_to_hour(t: OffsetDateTime) -> OffsetDateTime {
 }
 
 /// Aggregate `usage_stats_hourly` rows into the `stats.getUsage` result for
-/// one period. `tz_offset_minutes` is the client's offset east of UTC (must
-/// be a plausible UTC offset, ±14h); `now_utc` anchors the 24h rolling window
-/// (injected for testability). Rows with malformed bucket keys are skipped.
+/// one period. Month/year filtering and grouping follow each row's recorded
+/// local wall-clock stamp (D12), falling back to the `tz_offset_minutes`
+/// shift for unstamped rows; `tz_offset_minutes` is the client's offset east
+/// of UTC (must be a plausible UTC offset, ±14h) and also labels the 24h
+/// buckets; `now_utc` anchors the 24h rolling window (injected for
+/// testability). Rows with malformed bucket keys are skipped.
 ///
 /// Result shape (all periods): `totals` (4 counters), `runs`, `sessions`,
 /// `longestRunMs`, `linesAdded`, `linesDeleted`, `byModel` (sorted desc by
@@ -158,20 +193,16 @@ pub fn aggregate_usage(
         let Ok(utc) = OffsetDateTime::parse(&row.bucket_utc, &Rfc3339) else {
             continue; // defensive: never fail the whole read on one bad key
         };
-        let local = utc.to_offset(tz);
-        months.insert(format!(
-            "{:04}-{:02}",
-            local.year(),
-            u8::from(local.month())
-        ));
-        years.insert(format!("{:04}", local.year()));
+        let (local_year, local_month, local_hour) = local_parts(row, utc, tz);
+        months.insert(format!("{local_year:04}-{local_month:02}"));
+        years.insert(format!("{local_year:04}"));
 
         // byMonth covers the period's whole local year, independent of the
         // (possibly narrower) month filter; 24h has no month card.
         match period {
             UsagePeriod::Month { year, .. } | UsagePeriod::Year { year } => {
-                if local.year() == year {
-                    by_month[usize::from(u8::from(local.month())) - 1].add(row);
+                if local_year == year {
+                    by_month[usize::from(local_month) - 1].add(row);
                 }
             }
             UsagePeriod::Last24h => {}
@@ -179,10 +210,10 @@ pub fn aggregate_usage(
 
         let (in_period, hour_slot) = match period {
             UsagePeriod::Month { year, month } => (
-                local.year() == year && u8::from(local.month()) == month,
-                usize::from(local.hour()),
+                local_year == year && local_month == month,
+                usize::from(local_hour),
             ),
-            UsagePeriod::Year { year } => (local.year() == year, usize::from(local.hour())),
+            UsagePeriod::Year { year } => (local_year == year, usize::from(local_hour)),
             UsagePeriod::Last24h => {
                 if utc < window_start || utc > window_end {
                     (false, 0)
@@ -484,5 +515,122 @@ mod tests {
         ];
         let v = aggregate_usage(&rows, UsagePeriod::Last24h, 0, now).unwrap();
         assert_eq!(v["totals"]["inputTokens"], 5);
+    }
+
+    fn stamped(
+        bucket: &str,
+        model: &str,
+        input: u64,
+        local_date: &str,
+        local_hour: u8,
+    ) -> UsageStatsRow {
+        UsageStatsRow {
+            local_date: Some(local_date.to_string()),
+            local_hour: Some(local_hour),
+            ..row(bucket, model, input, 0)
+        }
+    }
+
+    #[test]
+    fn dst_fold_groups_rows_by_recorded_local_hour() {
+        // US fall-back 2026-11-01: 01:xx EDT (UTC-4) is bucket 05:00Z, and
+        // one hour later 01:xx EST (UTC-5) is bucket 06:00Z — two different
+        // UTC buckets recorded at the SAME local wall-clock hour. Grouping
+        // must follow the recorded stamp, not the client's current offset
+        // (which would put the EDT row at local hour 0).
+        let now = parse("2026-11-15T10:00:00Z");
+        let rows = vec![
+            stamped("2026-11-01T05:00:00Z", "Opus 4.8", 10, "2026-11-01", 1),
+            stamped("2026-11-01T06:00:00Z", "Opus 4.8", 20, "2026-11-01", 1),
+        ];
+        let november = UsagePeriod::Month {
+            year: 2026,
+            month: 11,
+        };
+        let v = aggregate_usage(&rows, november, -300, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 30);
+        assert_eq!(v["byHourOfDay"][1]["inputTokens"], 30, "both at local 1am");
+        assert_eq!(v["byHourOfDay"][0]["inputTokens"], 0);
+        assert_eq!(v["availablePeriods"]["months"], json!(["2026-11"]));
+    }
+
+    #[test]
+    fn recorded_stamp_drives_period_filter_by_month_and_available_periods() {
+        // Recorded at 01:00 local Jan 1 2027 (+02:00 daemon), bucket still
+        // Dec 31 2026 UTC: the stamp — not the client's tzOffsetMinutes of
+        // 0 — must place the row in 2027 / January everywhere.
+        let now = parse("2027-01-15T10:00:00Z");
+        let rows = vec![stamped(
+            "2026-12-31T23:00:00Z",
+            "Opus 4.8",
+            7,
+            "2027-01-01",
+            1,
+        )];
+        let v = aggregate_usage(&rows, UsagePeriod::Year { year: 2027 }, 0, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 7);
+        assert_eq!(v["byMonth"][0]["inputTokens"], 7, "January of local year");
+        assert_eq!(v["byHourOfDay"][1]["inputTokens"], 7);
+        assert_eq!(v["availablePeriods"]["months"], json!(["2027-01"]));
+        assert_eq!(v["availablePeriods"]["years"], json!(["2027"]));
+
+        // …and the UTC-keyed 2026 view no longer sees it.
+        let v = aggregate_usage(&rows, UsagePeriod::Year { year: 2026 }, 0, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 0);
+    }
+
+    #[test]
+    fn rows_without_or_with_malformed_stamp_fall_back_to_tz_shift() {
+        let now = parse("2026-07-25T10:00:00Z");
+        let mut half_stamped = row("2026-07-20T10:00:00Z", "Opus 4.8", 3, 0);
+        half_stamped.local_date = Some("2026-07-20".into()); // hour missing
+        let rows = vec![
+            // Stamped row: grouped by its stamp.
+            stamped("2026-06-30T23:00:00Z", "Opus 4.8", 1, "2026-07-01", 1),
+            // Pre-D12 row (NULL stamp): +120 shift → July 1, local hour 0.
+            row("2026-06-30T22:00:00Z", "Opus 4.8", 2, 0),
+            // Half/malformed stamps: full fallback → local hour 12.
+            half_stamped,
+            stamped("2026-07-15T10:00:00Z", "Opus 4.8", 4, "garbage", 9),
+        ];
+        let july = UsagePeriod::Month {
+            year: 2026,
+            month: 7,
+        };
+        let v = aggregate_usage(&rows, july, 120, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 10, "all four rows in July");
+        assert_eq!(v["byHourOfDay"][1]["inputTokens"], 1, "stamped");
+        assert_eq!(v["byHourOfDay"][0]["inputTokens"], 2, "NULL fallback");
+        assert_eq!(v["byHourOfDay"][12]["inputTokens"], 7, "fallback shift");
+        assert_eq!(
+            v["byHourOfDay"][9]["inputTokens"], 0,
+            "garbage date ignored"
+        );
+        assert_eq!(v["availablePeriods"]["months"], json!(["2026-07"]));
+    }
+
+    #[test]
+    fn last_24h_window_ignores_local_stamps() {
+        // The 24h rolling window stays UTC-keyed with tzOffsetMinutes-only
+        // hour labels: adversarial stamps must change neither slotting,
+        // labels, nor window membership.
+        let now = parse("2026-07-25T15:37:12Z");
+        let rows = vec![
+            stamped("2026-07-24T15:00:00Z", "Opus 4.8", 111, "2026-07-25", 5), // still too old
+            stamped("2026-07-24T16:00:00Z", "Opus 4.8", 1, "2026-01-01", 5),   // still slot 0
+            stamped("2026-07-25T15:00:00Z", "Opus 4.8", 4, "2026-01-01", 5),   // still slot 23
+        ];
+        let v = aggregate_usage(&rows, UsagePeriod::Last24h, 60, now).unwrap();
+        assert_eq!(v["totals"]["inputTokens"], 5);
+        assert_eq!(v["byHourOfDay"][0]["inputTokens"], 1);
+        assert_eq!(v["byHourOfDay"][0]["hour"], 17, "label from tz offset");
+        assert_eq!(v["byHourOfDay"][23]["inputTokens"], 4);
+        assert_eq!(v["byHourOfDay"][23]["hour"], 16);
+        // byMonth stays zeroed for 24h regardless of stamps.
+        assert!(v["byMonth"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["inputTokens"] == 0));
     }
 }
