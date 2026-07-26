@@ -18,6 +18,7 @@ pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
 pub mod slug;
+pub mod tilde;
 pub mod traits;
 pub mod turn_attachments;
 
@@ -67,6 +68,7 @@ pub use server_control::ServerControl;
 pub use settings_file::{
     LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE, LEGACY_SETTINGS_PATHS,
 };
+pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
     RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
