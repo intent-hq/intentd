@@ -2769,6 +2769,19 @@ impl AgentManager {
                 "queuedMessage": queued.to_value(position),
             });
             self.services.publish_queue_updated(&agent_id).await;
+            // Close the check-then-park race: a concurrent `agent.retry` may
+            // have cleared the Error + streak and finished its drain between
+            // the `session` snapshot above and the enqueue — leaving the
+            // parked message with no drainer. Re-poll and kick the drain if
+            // the session is no longer poisoned; the STAB-52 Error gate in
+            // `try_drain_queue` makes this a no-op while still quarantined.
+            if let Ok(current) = self.services.store.get_agent_session(&agent_id).await {
+                if !self.services.session_poisoned(&current) {
+                    self.clone()
+                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        .await;
+                }
+            }
             return Ok(result);
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
@@ -3398,8 +3411,11 @@ impl AgentManager {
 
         // agent.retry is the deliberate quarantine escape hatch (monorepo#840):
         // clear the identical-failure streak alongside the status/stop_reason
-        // so the redrive starts from a clean slate.
+        // so the redrive starts from a clean slate — and the failure-wake
+        // dedup records too, so a post-retry failure with the SAME error text
+        // (new information the retrying party is waiting on) still delivers.
         self.services.clear_failure_streak(&agent_id);
+        self.services.clear_failure_wake_dedup(&agent_id);
 
         // Empty queue → nothing will drive a `pending` status forward, so
         // clear the error to `idle` instead (idle is permitted iff no

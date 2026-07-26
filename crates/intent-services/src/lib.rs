@@ -2235,39 +2235,85 @@ impl Services {
     }
 
     /// Whether an `agent:failed` wake for `(parent, child)` carrying
-    /// `error_text` should be delivered (monorepo#840 dedup): `true` — and
-    /// the pair is recorded — when no failure wake was delivered yet or the
-    /// error text changed; `false` when the parent already received this
-    /// exact failure. Cleared by [`Services::clear_failure_wake_dedup`] on a
-    /// non-failure completion so a later genuine failure delivers again.
-    pub(crate) fn should_deliver_failure_wake(
+    /// `error_text` is a duplicate of the failure wake the parent already
+    /// received (monorepo#840 dedup). Read-only: the pair is recorded by
+    /// [`Services::record_failure_wake`] only AFTER a successful delivery,
+    /// so a failed `deliver_parent_wake` does not poison the dedup state and
+    /// suppress the next attempt. An empty `error_text` never dedups — two
+    /// distinct failures whose emitters omitted `data.error` must not
+    /// suppress each other. Cleared by
+    /// [`Services::clear_failure_wake_dedup`] on a non-failure completion so
+    /// a later genuine failure delivers again.
+    pub(crate) fn failure_wake_is_duplicate(
         &self,
         parent_id: &AgentId,
         child_id: &AgentId,
         error_text: &str,
     ) -> bool {
-        let mut guard = self
-            .failure_wake_dedup
-            .lock()
-            .expect("failure wake dedup registry poisoned");
-        let key = (parent_id.clone(), child_id.clone());
-        match guard.get(&key) {
-            Some(last) if last == error_text => false,
-            _ => {
-                guard.insert(key, error_text.to_string());
-                true
-            }
+        if error_text.is_empty() {
+            return false;
         }
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .get(&(parent_id.clone(), child_id.clone()))
+            .is_some_and(|last| last == error_text)
+    }
+
+    /// Record a successfully delivered `agent:failed` wake for
+    /// `(parent, child)` so an identical replay is suppressed by
+    /// [`Services::failure_wake_is_duplicate`]. Empty error text is never
+    /// recorded (it never dedups either).
+    pub(crate) fn record_failure_wake(
+        &self,
+        parent_id: &AgentId,
+        child_id: &AgentId,
+        error_text: &str,
+    ) {
+        if error_text.is_empty() {
+            return;
+        }
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .insert(
+                (parent_id.clone(), child_id.clone()),
+                error_text.to_string(),
+            );
     }
 
     /// Drop every failure-wake dedup record for `child_id` — called on the
-    /// child's non-failure completions (`agent:idle` / `agent:deleted`) so
-    /// the pair starts fresh for future failures.
+    /// child's non-failure completions (`agent:idle` / `agent:deleted`) and
+    /// on `agent.retry` (the deliberate escape hatch: a post-retry failure
+    /// with the same text is new information) so the pair starts fresh for
+    /// future failures.
     pub(crate) fn clear_failure_wake_dedup(&self, child_id: &AgentId) {
         self.failure_wake_dedup
             .lock()
             .expect("failure wake dedup registry poisoned")
             .retain(|(_, child), _| child != child_id);
+    }
+
+    /// Drop every failure-wake dedup record naming `agent_id` in EITHER role
+    /// — called on `agent.delete` so entries where the deleted agent was the
+    /// parent don't accumulate for the daemon's lifetime.
+    pub(crate) fn clear_failure_wake_dedup_all_roles(&self, agent_id: &AgentId) {
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .retain(|(parent, child), _| parent != agent_id && child != agent_id);
+    }
+
+    /// Drop the failure-wake dedup record for one `(parent, child)` pair —
+    /// called when a completion watch for that pair is registered: a fresh
+    /// watch expresses fresh interest, so dedup only suppresses replays
+    /// BETWEEN registrations (the poisoned-replay spam monorepo#840
+    /// targets), never a failure a newly registered watcher is waiting on.
+    pub(crate) fn clear_failure_wake_dedup_pair(&self, parent_id: &AgentId, child_id: &AgentId) {
+        self.failure_wake_dedup
+            .lock()
+            .expect("failure wake dedup registry poisoned")
+            .remove(&(parent_id.clone(), child_id.clone()));
     }
 
     /// Wake every parent whose oneShot watch matches child_id, then drop that
@@ -2284,10 +2330,15 @@ impl Services {
     /// Failure dedup (monorepo#840): a repeated `agent:failed` whose error
     /// text is unchanged since the last failure wake delivered to the same
     /// parent is suppressed — a poisoned child whose turn is replayed must
-    /// not spam the parent with identical failure notifications. Suppressed
-    /// deliveries leave the watch in place (it still fires on a different
-    /// error or a non-failure completion); non-failure completions clear the
-    /// child's dedup records.
+    /// not spam the parent with identical failure notifications. The gate is
+    /// checked only on the ungrouped immediate path (grouped watches bypass
+    /// it entirely: group settlement accounting must see every completion or
+    /// an `after_all` batch can hang forever), and the pair is recorded only
+    /// AFTER a successful delivery so a failed wake never suppresses the
+    /// retry. Suppressed deliveries leave the watch in place (it still fires
+    /// on a different error or a non-failure completion); non-failure
+    /// completions clear the child's dedup records, and registering a new
+    /// watch clears its own (parent, child) pair.
     pub(crate) async fn deliver_completion_to_watches(&self, child_id: &AgentId, event: &Event) {
         if event.event_type != AGENT_FAILED {
             self.clear_failure_wake_dedup(child_id);
@@ -2302,19 +2353,6 @@ impl Services {
         });
         for watch in self.find_watches_for_child(child_id) {
             let parent_ws = watch.parent_workspace_id.clone();
-            // monorepo#840: suppress a repeated identical failure wake to the
-            // same parent. Checked BEFORE the oneShot removal so a suppressed
-            // delivery leaves the watch in place for a future distinct signal.
-            if let Some(err) = failure_error_text.as_deref() {
-                if !self.should_deliver_failure_wake(&watch.parent_agent_id, child_id, err) {
-                    tracing::debug!(
-                        child = %child_id.0,
-                        parent = %watch.parent_agent_id.0,
-                        "skipping duplicate agent:failed wake — same error already delivered"
-                    );
-                    continue;
-                }
-            }
             if let Some(gid) = watch.group_id.clone() {
                 // Route the child's completion into the parent's after_all
                 // delegation group instead of waking immediately. The group's own
@@ -2384,6 +2422,21 @@ impl Services {
                 }
                 continue;
             }
+            // monorepo#840: suppress a repeated identical failure wake to the
+            // same parent. Checked BEFORE the oneShot removal so a suppressed
+            // delivery leaves the watch in place for a future distinct signal.
+            // Grouped watches never reach here (the group branch above owns
+            // them), so group settlement accounting is unaffected.
+            if let Some(err) = failure_error_text.as_deref() {
+                if self.failure_wake_is_duplicate(&watch.parent_agent_id, child_id, err) {
+                    tracing::debug!(
+                        child = %child_id.0,
+                        parent = %watch.parent_agent_id.0,
+                        "skipping duplicate agent:failed wake — same error already delivered"
+                    );
+                    continue;
+                }
+            }
             // Wave B (STAB-18 fix): remove oneShot watch BEFORE delivery so a
             // reprocessed event or reentrant loop cannot deliver the same
             // completion twice. The watch is atomically removed from the registry;
@@ -2420,6 +2473,12 @@ impl Services {
                     "failed to deliver completion wake to parent"
                 );
                 continue;
+            }
+            // monorepo#840: record the delivered failure only AFTER the wake
+            // succeeded, so a failed delivery never suppresses the next
+            // identical failure the parent has yet to hear about.
+            if let Some(err) = failure_error_text.as_deref() {
+                self.record_failure_wake(&watch.parent_agent_id, child_id, err);
             }
             if watch.one_shot {
                 self.publish_subscriptions_changed(&parent_ws, &watch.parent_agent_id)
@@ -5535,14 +5594,21 @@ pub(crate) const POISONED_FAILURE_STREAK_THRESHOLD: u32 = 3;
 /// context is guaranteed to fail and the only recovery is a fresh session.
 /// The canonical shape is the provider safety block ("The model provider
 /// blocked this response for safety reasons. Please start a new session");
-/// the match is substring-based on its two load-bearing fragments so
-/// wrapping prefixes (`session/prompt failed: …`) and minor provider
-/// re-phrasings still classify. Deliberately narrow — an unrecognized error
-/// stays retryable and is only escalated by the identical-failure streak.
+/// the match is substring-based on its load-bearing fragments so wrapping
+/// prefixes (`session/prompt failed: …`) still classify, but each fragment
+/// is anchored on multi-word phrasing: "blocked … for safety reasons" (not
+/// the bare words, which can co-occur in echoed model output) and the
+/// imperative "please start a new session" / "start a new session to
+/// continue" (not the bare "start a new session", which also appears in
+/// transient failure-to-START errors like "could not start a new session:
+/// connection refused"). Deliberately narrow — an unrecognized error stays
+/// retryable and is only escalated by the identical-failure streak.
 pub(crate) fn is_session_fatal_stop_reason(stop_reason: &str) -> bool {
     let lower = stop_reason.to_ascii_lowercase();
-    let provider_block = lower.contains("blocked") && lower.contains("safety");
-    provider_block || lower.contains("start a new session")
+    let provider_block = lower.contains("blocked") && lower.contains("for safety reasons");
+    provider_block
+        || lower.contains("please start a new session")
+        || lower.contains("start a new session to continue")
 }
 
 /// Build a concise, human-readable wake string describing a child agent's

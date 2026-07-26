@@ -1747,9 +1747,12 @@ impl Services {
             .expect("agent queue registry poisoned")
             .remove(&agent_id);
         // Registry hygiene (monorepo#840): drop the failure streak and any
-        // failure-wake dedup records for the deleted agent.
+        // failure-wake dedup records naming the deleted agent as parent OR
+        // child — delegation churns short-lived agents in both roles, so a
+        // child-only sweep would leak (deleted_parent, child) entries for the
+        // daemon's lifetime.
         self.clear_failure_streak(&agent_id);
-        self.clear_failure_wake_dedup(&agent_id);
+        self.clear_failure_wake_dedup_all_roles(&agent_id);
         if let Some(workspace_id) = session_workspace_id {
             crate::publish_event(
                 &self.event_bus,
