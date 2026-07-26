@@ -1,11 +1,15 @@
-//! WSS end-to-end for the free-text `query` on `github.pulls.search` /
-//! `github.issues.search` (PROTOCOL §5.27): the wire `query` must reach the
-//! engine as `PrQuery.search` / `IssueQuery.search` (trimmed, blanks dropped),
-//! the `nextToken` cursor must round-trip onto the engine cursor, and the
-//! no-query call must keep the pre-existing listing behavior (`search: None`).
-//! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
-//! self-signed fingerprint (the production transport path) with a recording
-//! stub forge injected via `with_source_control`.
+//! WSS end-to-end for `github.repoConfig.get` (PROTOCOL §5.27): fetching a
+//! remote repository's `.intent/config.json` through the contents API without
+//! a clone. Asserts the request params (`owner`, `repo`, optional `ref`)
+//! reach the engine as a `.intent/config.json` content fetch, that the
+//! response carries `{ config, exists }` with camelCase fields + unknown keys
+//! preserved, and that the tolerant semantics hold on the wire: a missing
+//! file yields `{ config: null, exists: false }`, invalid JSON folds to
+//! `{ config: {}, exists: true }` (never an error), and missing
+//! `owner`/`repo` fail with `-32602`. Drives a real [`WsApiServer`] over TLS
+//! with bearer-token auth and a pinned self-signed fingerprint (the
+//! production transport path) with a recording stub forge injected via
+//! `with_source_control`.
 
 #![cfg(unix)]
 
@@ -21,9 +25,9 @@ use intent_core::{Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, CheckRun, Comment, CommentAnchor, Issue, IssueQuery, MergeMethod,
-    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrInvolvement,
-    PrPatch, PrQuery, PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review,
-    ReviewComment, ReviewThread, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
+    MergeOptions, MergeOutcome, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
+    PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewThread,
+    ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 use intent_store::Store;
 use intent_transport::{
@@ -141,43 +145,16 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-fn sample_pr() -> PullRequest {
-    PullRequest {
-        number: 42,
-        url: "https://github.com/o/r/pull/42".into(),
-        title: "Add thing".into(),
-        body: None,
-        state: PrState::Open,
-        draft: false,
-        source_branch: "feature".into(),
-        target_branch: "main".into(),
-        author: "octocat".into(),
-        mergeable: Some(true),
-        mergeable_state: Some("clean".into()),
-        head_sha: Some("deadbeef".into()),
-        created_at: String::new(),
-        updated_at: String::new(),
-    }
-}
-
-fn sample_issue() -> Issue {
-    Issue {
-        number: 11,
-        title: "Login bug".into(),
-        body: None,
-        state: "open".into(),
-        url: "https://github.com/o/r/issues/11".into(),
-    }
-}
-
-/// Recording stub forge: captures the [`PrQuery`] / [`IssueQuery`] the
-/// services layer hands to the engine so tests can assert the wire `query` /
-/// `nextToken` landed on `search` / `cursor`, and returns one PR / issue with
-/// a fixed `next_cursor` (`"2"`) so `nextToken` round-trips on the response.
+/// Recording stub forge: captures the `(repo, path, ref)` triple the services
+/// layer hands to `get_file_content` so tests can assert the wire params
+/// landed on the engine call, and returns the configured `file_content`
+/// (`None` → absent file).
 #[derive(Default)]
 struct RecordingForge {
-    pr_queries: Mutex<Vec<PrQuery>>,
-    issue_queries: Mutex<Vec<IssueQuery>>,
+    /// `(owner/name, path, ref)` per `get_file_content` call.
+    content_calls: Mutex<Vec<(String, String, Option<String>)>>,
+    /// What `get_file_content` returns (`None` → the file is absent).
+    file_content: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -220,11 +197,16 @@ impl SourceControl for RecordingForge {
     }
     async fn get_file_content(
         &self,
-        _: &RepoRef,
-        _: &str,
-        _: Option<&str>,
+        repo: &RepoRef,
+        path: &str,
+        git_ref: Option<&str>,
     ) -> ScResult<Option<String>> {
-        unimplemented!()
+        self.content_calls.lock().unwrap().push((
+            format!("{}/{}", repo.owner, repo.name),
+            path.to_string(),
+            git_ref.map(str::to_string),
+        ));
+        Ok(self.file_content.lock().unwrap().clone())
     }
     async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
         unimplemented!()
@@ -232,12 +214,8 @@ impl SourceControl for RecordingForge {
     async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
         unimplemented!()
     }
-    async fn list_prs(&self, _: &RepoRef, query: PrQuery) -> ScResult<Page<PullRequest>> {
-        self.pr_queries.lock().unwrap().push(query);
-        Ok(Page {
-            items: vec![sample_pr()],
-            next_cursor: Some("2".into()),
-        })
+    async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
+        unimplemented!()
     }
     async fn update_pr(&self, _: &RepoRef, _: u64, _: PrPatch) -> ScResult<PullRequest> {
         unimplemented!()
@@ -321,12 +299,8 @@ impl SourceControl for RecordingForge {
     async fn get_issue(&self, _: &RepoRef, _: u64) -> ScResult<Issue> {
         unimplemented!()
     }
-    async fn list_issues(&self, _: &RepoRef, query: IssueQuery) -> ScResult<Page<Issue>> {
-        self.issue_queries.lock().unwrap().push(query);
-        Ok(Page {
-            items: vec![sample_issue()],
-            next_cursor: Some("2".into()),
-        })
+    async fn list_issues(&self, _: &RepoRef, _: IssueQuery) -> ScResult<Page<Issue>> {
+        unimplemented!()
     }
 }
 
@@ -342,7 +316,7 @@ struct Fixture {
 /// stub forge.
 async fn boot() -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-gh-search-{}", &short[..8]));
+    let dir = std::env::temp_dir().join(format!("intentd-gh-repocfg-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
@@ -417,170 +391,98 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
     v["result"].clone()
 }
 
-/// The opaque wire `nextToken` for an engine page cursor: no-pad base64 of
-/// `{"c":"<cursor>"}` (mirrors the services-layer encoding).
-fn wire_next_token(cursor: &str) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .encode(serde_json::to_vec(&json!({ "c": cursor })).unwrap())
-}
-
-/// `github.pulls.search` with a free-text `query`: the trimmed text reaches
-/// the engine as `PrQuery.search`, the involvement filter still parses, the
-/// `nextToken` decodes onto the engine cursor, and the response carries the
-/// PR page plus an encoded `nextToken` for the engine's `next_cursor`.
+/// A present remote `.intent/config.json`: the wire params land on the engine
+/// content fetch (`.intent/config.json` at the requested ref) and the response
+/// is `{ config, exists: true }` with camelCase fields and unknown keys
+/// preserved.
 #[tokio::test]
-async fn pulls_search_forwards_query_and_cursor() {
+async fn repo_config_get_returns_parsed_remote_config() {
     let fx = boot().await;
+    *fx.forge.file_content.lock().unwrap() = Some(
+        r#"{ "branchPrefix": "feat/", "setupScript": "pnpm install", "customKey": 42 }"#.into(),
+    );
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
     let r = wss_rpc(
         &mut ws,
         1,
-        "github.pulls.search",
-        json!({
-            "owner": "o", "repo": "r", "filter": "created", "state": "open",
-            "query": "  panic on save  ", "limit": 10,
-            "nextToken": wire_next_token("3"),
-        }),
+        "github.repoConfig.get",
+        json!({ "owner": "octocat", "repo": "hello", "ref": "main" }),
     )
     .await;
-    assert_eq!(r["pulls"][0]["number"], 42);
-    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+    assert_eq!(r["config"]["branchPrefix"], "feat/");
+    assert_eq!(r["config"]["setupScript"], "pnpm install");
+    // Unknown keys round-trip (RepoConfig `extra` flatten).
+    assert_eq!(r["config"]["customKey"], 42);
+    assert_eq!(r["exists"], true);
 
-    let queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(queries.len(), 1);
-    let q = &queries[0];
-    assert_eq!(q.search.as_deref(), Some("panic on save"));
-    assert_eq!(q.state, Some(PrState::Open));
-    assert!(q.involvement.is_some());
-    assert_eq!(q.limit, Some(10));
-    assert_eq!(q.cursor.as_deref(), Some("3"));
+    let calls = fx.forge.content_calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[(
+            "octocat/hello".to_string(),
+            ".intent/config.json".to_string(),
+            Some("main".to_string()),
+        )]
+    );
 }
 
-/// `github.issues.search` with a free-text `query`: the trimmed text reaches
-/// the engine as `IssueQuery.search` with the state filter intact, and the
-/// cursor round-trips both ways.
+/// Tolerant semantics on the wire: a missing file yields
+/// `{ config: null, exists: false }`, invalid JSON folds to
+/// `{ config: {}, exists: true }` (never an error), and an omitted `ref`
+/// reaches the engine as `None` (default-branch read).
 #[tokio::test]
-async fn issues_search_forwards_query_and_cursor() {
+async fn repo_config_get_missing_or_invalid_yields_empty_config() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
+    // Absent file (engine returns None), no ref param.
     let r = wss_rpc(
         &mut ws,
         1,
-        "github.issues.search",
-        json!({
-            "owner": "o", "repo": "r", "state": "closed",
-            "query": "  login bug  ",
-            "nextToken": wire_next_token("5"),
-        }),
+        "github.repoConfig.get",
+        json!({ "owner": "octocat", "repo": "hello" }),
     )
     .await;
-    assert_eq!(r["issues"][0]["number"], 11);
-    assert_eq!(r["issues"][0]["owner"], "o");
-    assert_eq!(r["issues"][0]["repo"], "r");
-    // The response token encodes the engine's returned next_cursor ("2"),
-    // not an echo of the request token (cursor "5").
-    assert_eq!(r["nextToken"], json!(wire_next_token("2")));
+    assert_eq!(r["config"], Value::Null);
+    assert_eq!(r["exists"], false);
 
-    let queries = fx.forge.issue_queries.lock().unwrap();
-    assert_eq!(queries.len(), 1);
-    let q = &queries[0];
-    assert_eq!(q.search.as_deref(), Some("login bug"));
-    assert_eq!(q.state.as_deref(), Some("closed"));
-    assert_eq!(q.cursor.as_deref(), Some("5"));
-}
-
-/// Without a `query` (or with a blank one) the engine sees `search: None` —
-/// the pre-existing listing behavior is unchanged.
-#[tokio::test]
-async fn search_without_query_leaves_listing_unchanged() {
-    let fx = boot().await;
-    let mut ws = connect(fx.port, fx.cfg.clone()).await;
-
-    let r = wss_rpc(
-        &mut ws,
-        1,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r" }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["number"], 11);
-
+    // Invalid JSON in the fetched file.
+    *fx.forge.file_content.lock().unwrap() = Some("{ not json".into());
     let r2 = wss_rpc(
         &mut ws,
         2,
-        "github.pulls.search",
-        json!({ "owner": "o", "repo": "r", "query": "   " }),
+        "github.repoConfig.get",
+        json!({ "owner": "octocat", "repo": "hello" }),
     )
     .await;
-    assert_eq!(r2["pulls"][0]["number"], 42);
+    assert_eq!(r2["config"], json!({}));
+    assert_eq!(r2["exists"], true);
 
-    let issue_queries = fx.forge.issue_queries.lock().unwrap();
-    assert_eq!(issue_queries.len(), 1);
-    assert_eq!(issue_queries[0].search, None);
-    assert_eq!(issue_queries[0].state.as_deref(), Some("open"));
-
-    let pr_queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(pr_queries.len(), 1);
-    assert_eq!(pr_queries[0].search, None);
-    assert_eq!(pr_queries[0].involvement, None);
+    let calls = fx.forge.content_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].2, None, "omitted ref reaches the engine as None");
 }
 
-/// `github.issues.search` rejects the PR-only `review-requested` filter with
-/// the wire `-32603 "Internal error"` envelope whose `data` lists the issues
-/// filter set from PROTOCOL §5 (`all, assigned, created, involves`) and never
-/// reaches the engine, while `github.pulls.search` continues to accept
-/// `review-requested` (monorepo#551).
+/// Missing required params fail with the JSON-RPC `-32602` invalid-params
+/// envelope and never reach the engine.
 #[tokio::test]
-async fn issues_search_rejects_pr_only_review_requested_filter() {
+async fn repo_config_get_requires_owner_and_repo() {
     let fx = boot().await;
     let mut ws = connect(fx.port, fx.cfg.clone()).await;
 
     let env = wss_rpc_envelope(
         &mut ws,
         1,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
+        "github.repoConfig.get",
+        json!({ "owner": "octocat" }),
     )
     .await;
-    assert!(
-        env.get("result").is_none(),
-        "expected error envelope: {env}"
-    );
-    assert_eq!(env["error"]["code"], json!(-32603));
-    assert_eq!(env["error"]["message"], json!("Internal error"));
-    let data = env["error"]["data"].as_str().unwrap();
-    assert!(
-        data.contains("all, assigned, created, involves"),
-        "error data must list the issues filter set: {data}"
-    );
-    assert!(fx.forge.issue_queries.lock().unwrap().is_empty());
+    assert!(env.get("result").is_none(), "expected error: {env}");
+    assert_eq!(env["error"]["code"], json!(-32602));
 
-    // Valid issue filters still pass through unchanged.
-    let r = wss_rpc(
-        &mut ws,
-        2,
-        "github.issues.search",
-        json!({ "owner": "o", "repo": "r", "filter": "involves" }),
-    )
-    .await;
-    assert_eq!(r["issues"][0]["number"], 11);
+    let env2 = wss_rpc_envelope(&mut ws, 2, "github.repoConfig.get", json!({ "repo": "r" })).await;
+    assert_eq!(env2["error"]["code"], json!(-32602));
 
-    // The PR search keeps its wider filter set.
-    let r2 = wss_rpc(
-        &mut ws,
-        3,
-        "github.pulls.search",
-        json!({ "owner": "o", "repo": "r", "filter": "review-requested" }),
-    )
-    .await;
-    assert_eq!(r2["pulls"][0]["number"], 42);
-    let pr_queries = fx.forge.pr_queries.lock().unwrap();
-    assert_eq!(pr_queries.len(), 1);
-    assert_eq!(
-        pr_queries[0].involvement,
-        Some(PrInvolvement::ReviewRequested)
-    );
+    assert!(fx.forge.content_calls.lock().unwrap().is_empty());
 }

@@ -5929,6 +5929,13 @@ mod pr {
         /// all-true), exercising the `pr.capabilities` surface + runtime
         /// gating of `pr.merge` / `pr.createReview` / `pr.listCheckRuns`.
         capabilities: Option<ScCapabilities>,
+        /// What `get_file_content` returns for any path (`None` → the file is
+        /// absent at that ref), exercising `github.repoConfig.get`.
+        file_content: Option<String>,
+        /// When true, `get_file_content` fails with a decode error (mis-shaped
+        /// contents payload: directory, non-base64/non-UTF-8), exercising the
+        /// tolerant fold of `github.repoConfig.get`.
+        file_content_decode_error: bool,
         head_seq: AtomicU64,
         /// Notified on the first `get_pr` call — the point at which
         /// `pr.waitForChanges` has finished its one SQLite read and is past it.
@@ -6063,6 +6070,19 @@ mod pr {
                 ],
                 next_cursor: None,
             })
+        }
+        async fn get_file_content(
+            &self,
+            _: &RepoRef,
+            _: &str,
+            _: Option<&str>,
+        ) -> ScResult<Option<String>> {
+            if self.file_content_decode_error {
+                return Err(intent_sourcecontrol::Error::Decode(
+                    "contents path is a directory, not a file".into(),
+                ));
+            }
+            Ok(self.file_content.clone())
         }
         async fn create_pr(&self, _: &RepoRef, input: NewPullRequest) -> ScResult<PullRequest> {
             Ok(PullRequest {
@@ -6480,6 +6500,66 @@ mod pr {
             .expect("branches");
         assert_eq!(v["branches"], serde_json::json!(["main", "dev"]));
         assert_eq!(v["nextToken"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn github_repo_config_get_parses_remote_config() {
+        let forge = StubForge {
+            file_content: Some(r#"{ "branchPrefix": "feat/", "customKey": "kept" }"#.to_string()),
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_repo_config_get("octocat".into(), "hello".into(), Some("main".into()))
+            .await
+            .expect("config");
+        assert_eq!(v["config"]["branchPrefix"], "feat/");
+        // Unknown keys round-trip on the wire (RepoConfig `extra` flatten).
+        assert_eq!(v["config"]["customKey"], "kept");
+        assert_eq!(v["exists"], true);
+    }
+
+    #[tokio::test]
+    async fn github_repo_config_get_missing_file_yields_null_config() {
+        let (_t, svc) = github_svc().await;
+        let v = svc
+            .github_repo_config_get("octocat".into(), "hello".into(), None)
+            .await
+            .expect("config");
+        assert_eq!(v["config"], serde_json::Value::Null);
+        assert_eq!(v["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn github_repo_config_get_invalid_json_yields_empty_config() {
+        let forge = StubForge {
+            file_content: Some("{ not json".to_string()),
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_repo_config_get("octocat".into(), "hello".into(), None)
+            .await
+            .expect("config");
+        assert_eq!(v["config"], serde_json::json!({}));
+        assert_eq!(v["exists"], true);
+    }
+
+    #[tokio::test]
+    async fn github_repo_config_get_decode_error_folds_to_empty_config() {
+        // A mis-shaped contents payload (directory / non-base64 / non-UTF-8)
+        // is "present but invalid": tolerant fold, never an RPC error.
+        let forge = StubForge {
+            file_content_decode_error: true,
+            ..Default::default()
+        };
+        let (_t, svc, _ws) = setup_with(forge, false).await;
+        let v = svc
+            .github_repo_config_get("octocat".into(), "hello".into(), None)
+            .await
+            .expect("config");
+        assert_eq!(v["config"], serde_json::json!({}));
+        assert_eq!(v["exists"], true);
     }
 
     #[tokio::test]

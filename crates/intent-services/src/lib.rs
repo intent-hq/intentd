@@ -15011,6 +15011,59 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn github_repo_config_get(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
+            let source = format!(
+                "{}/{}@{}",
+                owner,
+                repo,
+                git_ref.as_deref().unwrap_or("default")
+            );
+            // Missing file → { config: null, exists: false }. A present entry
+            // parses tolerantly like the local `repoConfig.get`: invalid JSON,
+            // non-object root, and mis-shaped contents payloads (directory,
+            // non-base64/non-UTF-8 content) all fold to the empty config with
+            // exists: true — never an error. Transport/auth failures still
+            // surface like the other `github.*` methods.
+            let content = match sc
+                .get_file_content(
+                    &repo_ref,
+                    repo_config::REPO_CONFIG_REL_PATH,
+                    git_ref.as_deref(),
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(intent_sourcecontrol::Error::Decode(msg)) => {
+                    tracing::warn!("Mis-shaped remote repo config at {}: {}", source, msg);
+                    return Ok(serde_json::json!({
+                        "config": intent_core::RepoConfig::default(),
+                        "exists": true,
+                    }));
+                }
+                Err(e) => return Err(pr_ops::map_sc_err(e)),
+            };
+            match content {
+                Some(text) => {
+                    let config = repo_config::parse_repo_config_tolerant(&text, &source);
+                    Ok(serde_json::json!({ "config": config, "exists": true }))
+                }
+                None => Ok(serde_json::json!({
+                    "config": serde_json::Value::Null,
+                    "exists": false,
+                })),
+            }
+        })
+    }
+
     fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         let injected = self.source_control.clone();
         let state = self.github_auth_flow.clone();

@@ -3127,6 +3127,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `github.repoConfig.get`: a remote repository's `.intent/config.json`
+    /// fetched via the contents API (no clone) → `{ config, exists }`. A
+    /// missing file yields `{ config: null, exists: false }`; a present but
+    /// invalid file folds tolerantly to `{ config: {}, exists: true }`
+    /// (mirrors the local `repoConfig.get` parse semantics).
+    fn github_repo_config_get(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (owner, repo, git_ref);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::github_repo_config_get not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `github.pulls.updateBranch`:
     /// `PUT /repos/{owner}/{repo}/pulls/{number}/update-branch` → `{ message, url? }`.
     fn github_pulls_update_branch(
