@@ -144,6 +144,13 @@ fn redact_credentials(text: &str) -> String {
 /// `git@` of scp-like remotes — because a mangled username in an error
 /// message is harmless while a leaked password or token is not, and tokens
 /// often travel as the username with no `:pass` (e.g. `ghp_…@github.com`).
+///
+/// Known best-effort limitation: `'`/`"` sit in the delimiter set to bound
+/// quoted contexts, yet RFC 3986 permits them (sub-delims) unencoded in
+/// userinfo — a bare `user:pa'ss@host` fragment therefore masks only from
+/// the quote onward. The `://`-anchored first pass fully handles the quoted
+/// URLs git actually emits, and the line-boundary tail trim makes bare
+/// fragments rare, so this trade-off is deliberate.
 fn redact_bare_userinfo(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -549,10 +556,12 @@ where
 /// cutting only at a line boundary: a byte-offset cut can split a URL's
 /// scheme, leaving a bare `user:pass@host` fragment the `://`-anchored pass
 /// of [`redact_credentials`] cannot find (monorepo#836). The partially-cut
-/// line is dropped whole — up to the next `\n`/`\r`. If a single line
-/// exceeds the cap we fall back to a char-boundary byte cut (never dropping
-/// the message entirely); the scheme-less redaction pass covers any token
-/// that cut can split.
+/// line is dropped whole — up to the next `\n`/`\r`. When a single line
+/// exceeds the cap the boundary cut would keep nothing but its trailing
+/// delimiter (the reader includes `\n`/`\r` in each chunk), so any cut that
+/// keeps only whitespace falls back to a char-boundary byte cut instead —
+/// never dropping the message entirely; the scheme-less redaction pass
+/// covers any token that byte cut can split.
 fn trim_tail(tail: &mut String) {
     if tail.len() <= STDERR_TAIL_MAX {
         return;
@@ -562,6 +571,7 @@ fn trim_tail(tail: &mut String) {
         .iter()
         .position(|&b| b == b'\n' || b == b'\r')
         .map(|i| drop_to + i + 1)
+        .filter(|&cut| !tail[cut..].trim().is_empty())
         .unwrap_or_else(|| {
             let mut cut = drop_to;
             while !tail.is_char_boundary(cut) {
@@ -891,11 +901,26 @@ mod tests {
     fn trim_tail_oversized_single_line_falls_back_to_byte_cut() {
         // One giant line with no boundary: keep the last ~4KiB rather than
         // dropping the message; multi-byte chars never split (no panic).
-        let mut tail = format!("x{}", "é".repeat(3000)); // 6001 bytes, cut lands mid-char
+        // 6000 bytes of 3-byte chars: drop_to = 1904, 1904 % 3 == 2 → the
+        // raw offset lands mid-char and the boundary-advance loop must run.
+        let mut tail = "€".repeat(2000);
         trim_tail(&mut tail);
         assert!(tail.len() <= STDERR_TAIL_MAX);
         assert!(!tail.is_empty());
-        assert!(tail.chars().all(|c| c == 'é'));
+        assert!(tail.chars().all(|c| c == '€'));
+    }
+
+    #[test]
+    fn trim_tail_keeps_newline_terminated_oversized_line() {
+        // Regression: `read_until_any` includes the delimiter, so a single
+        // oversized line usually ends with `\n` — the boundary cut would
+        // keep only that whitespace and drop the message entirely.
+        let mut tail = format!("fatal: {}\n", "z".repeat(5000));
+        trim_tail(&mut tail);
+        assert!(tail.len() <= STDERR_TAIL_MAX);
+        assert!(!tail.trim().is_empty(), "message must survive: {tail:?}");
+        assert!(tail.trim_end().chars().all(|c| c == 'z'));
+        assert!(tail.ends_with('\n'));
     }
 
     #[test]
