@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use intent_core::{
-    new_attachment_id, AgentId, AttachmentPolicy, TurnAttachment, WorkspaceApi, WorkspaceId,
-    ATTACHMENT_ID_KEY,
+    new_attachment_id, AgentId, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
+    WorkspaceApi, WorkspaceId, ATTACHMENT_ID_KEY,
 };
 use intent_js::{eval as js_eval, BoxFuture, EvalOptions, HostFn, JsError};
 use serde_json::{json, Value};
@@ -38,6 +38,7 @@ impl WorkspaceMcpServer {
             self.api.clone(),
             self.workspace_id.clone(),
             self.caller_agent_id.clone(),
+            self.turn_attachments.clone(),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
@@ -193,17 +194,22 @@ fn stamp_attachment_id(text: &str, nonce: &str, pretty: bool) -> Option<String> 
 /// is forwarded to bindings that attribute their calls back to the spawning
 /// agent (e.g. `workspace.setAgentName`, `git.commit`, `git.agentCommit`,
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods).
+/// `turn_attachments` is forwarded to bindings that register attachments
+/// mid-dispatch (`ws.app.question.ask`).
 fn make_workspace_host(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
+    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
 ) -> HostFn {
     Arc::new(move |arg| {
         let api = api.clone();
         let workspace_id = workspace_id.clone();
         let caller = caller_agent_id.clone();
-        Box::pin(async move { workspace_host_dispatch(api, workspace_id, caller, arg).await })
-            as BoxFuture<'static, std::result::Result<Value, String>>
+        let registry = turn_attachments.clone();
+        Box::pin(
+            async move { workspace_host_dispatch(api, workspace_id, caller, registry, arg).await },
+        ) as BoxFuture<'static, std::result::Result<Value, String>>
     })
 }
 
@@ -214,6 +220,7 @@ async fn workspace_host_dispatch(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     caller_agent_id: Option<AgentId>,
+    turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     arg: Value,
 ) -> std::result::Result<Value, String> {
     let method = arg
@@ -221,8 +228,15 @@ async fn workspace_host_dispatch(
         .and_then(Value::as_str)
         .ok_or_else(|| "host: `method` is required".to_string())?;
     let args = arg.get("args").cloned().unwrap_or(Value::Null);
-    if let Some(v) =
-        super::bindings::try_dispatch(&api, &workspace_id, &caller_agent_id, method, &args).await?
+    if let Some(v) = super::bindings::try_dispatch(
+        &api,
+        &workspace_id,
+        &caller_agent_id,
+        turn_attachments.as_ref(),
+        method,
+        &args,
+    )
+    .await?
     {
         return Ok(v);
     }

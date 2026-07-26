@@ -70,10 +70,10 @@ pub fn all_tools(is_chief: bool) -> &'static [ToolDef] {
 /// `workspace-js-api-tool.ts`, restricted to the surface actually bound in
 /// `super::bindings::*`. Exclusions vs the reference:
 ///
-/// * The entire `ws.app.*` namespace (chief-workspace app APIs) is only
-///   advertised to chief-workspace agents via [`WORKSPACE_API_DESCRIPTION_CHIEF`].
-///   Non-chief agents see [`WORKSPACE_API_DESCRIPTION`] which contains no
-///   `ws.app.*` references at all.
+/// * The `ws.app.*` namespace (chief-workspace app APIs) is only advertised
+///   to chief-workspace agents via [`WORKSPACE_API_DESCRIPTION_CHIEF`] —
+///   with ONE exception: `ws.app.question.ask` is un-gated (any agent may
+///   ask the user structured questions), so both descriptions advertise it.
 /// * `ws.workspace.context`, `ws.workspace.timeline`,
 ///   `ws.workspace.referenceDocs`, `ws.workspace.emitNotification` — deferred
 ///   per the WSAPI-5 report; the bindings surface a clear
@@ -106,6 +106,8 @@ API:
   ws.workspace.setAgentName(name) → { ok, name }  // Rename the current agent session. Call this early in your first response and use a short 1-5 word task-focused name.
   ws.workspace.archive() → { ok, status, archivedAt }  // Archive the current workspace. ONLY call this on explicit user request (same convention as user-requested commits). Refuses if other agents are running or queued (no override); unavailable in the chief-of-staff workspace.
   ws.workspace.unarchive() → { ok, status }  // Unarchive the current workspace. ONLY call this on explicit user request. Unavailable in the chief-of-staff workspace.
+
+  ws.app.question.ask({ question, header, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. Call once per question (aim for at most ~4 questions per turn); `header` is a short topic label; `options` is 2-4 choices [{ label, description? }] — at least 2 required; do NOT add an "Other" option, a free-form answer is always offered automatically; `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
 
   ws.note.read(id) → { id, title, content, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. Content has line numbers like `   1 | text`.
   ws.note.create(title, content, tags?) → { id, title, tags, link, markdownLink }  // Create a new note and return canonical `intent://local/{workspaceId}/note/{noteId}` links. Share `markdownLink` with users so they can open the note. DO NOT use this for the spec: the spec already exists as note ID `spec`; edit or add to it instead.
@@ -271,6 +273,7 @@ API:
     Safe usage: list first, then read only the relevant thread slices with `lastN` or `startTurn`/`endTurn`; keep `includeToolCalls` false unless the user explicitly needs raw tool-call details.
   ws.app.agents.waitFor({ agentIds, waitMode? }) → { ok, waitMode, results }  // Chief workspace only. Register to be woken when existing agents (in any workspace) complete — the subscription side of `agent.delegate` without creating agents. `waitMode`: `"immediate"` (default) wakes you as each agent completes; `"after_all"` delivers one aggregated wake once all of them settle. Each result is { agentId, agentName, workspaceId, subscriptionId, groupId }.
   ws.app.proposal.show(proposal) → ProposalCard  // Chief workspace only. Render an app-level proposal card in chat.
+  ws.app.question.ask({ question, header, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. Call once per question (aim for at most ~4 questions per turn); `header` is a short topic label; `options` is 2-4 choices [{ label, description? }] — at least 2 required; do NOT add an "Other" option, a free-form answer is always offered automatically; `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
   ws.app.settings.list({ includeValues?, category? }?) → settings[]  // List schema-backed persisted user settings, optionally with current values.
   ws.app.settings.get(path) → setting  // Read a persisted user setting by schema path; sensitive values are redacted.
   ws.app.settings.propose(changes[] | { changes }) → ProposalCard  // Preview settings changes with a diff; never auto-applies.
@@ -468,6 +471,7 @@ mod tests {
     const BINDINGS_TERMINAL: &str = include_str!("bindings/terminal.rs");
     const BINDINGS_FILE: &str = include_str!("bindings/file.rs");
     const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
+    const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
     const BINDINGS_APP_AGENTS: &str = include_str!("bindings/app/agents.rs");
     const BINDINGS_APP_SETTINGS: &str = include_str!("bindings/app/settings.rs");
     const BINDINGS_APP_SPECIALISTS: &str = include_str!("bindings/app/specialists.rs");
@@ -502,6 +506,7 @@ mod tests {
     fn nested_namespace_bindings(full_ns: &str) -> Option<&'static str> {
         match full_ns {
             "app.proposal" => Some(BINDINGS_APP_PROPOSAL),
+            "app.question" => Some(BINDINGS_APP_QUESTION),
             "app.agents" => Some(BINDINGS_APP_AGENTS),
             "app.settings" => Some(BINDINGS_APP_SETTINGS),
             "app.specialists" => Some(BINDINGS_APP_SPECIALISTS),
@@ -600,11 +605,16 @@ mod tests {
     fn description_only_names_bound_methods() {
         let deferred = deferred();
 
-        // Test base (non-chief) description: must NOT advertise ws.app.* (except proposal)
-        assert!(
-            !WORKSPACE_API_DESCRIPTION.contains("ws.app."),
-            "base description must not advertise ws.app.* methods"
-        );
+        // Test base (non-chief) description: must NOT advertise ws.app.*
+        // except ws.app.question, the one un-gated app namespace (available
+        // to every workspace agent).
+        for (ns, method) in extract_ws_methods(WORKSPACE_API_DESCRIPTION) {
+            assert!(
+                !ns.starts_with("app.") || ns == "app.question",
+                "base description must not advertise ws.{ns}.{method} — only \
+                 ws.app.question.* is un-gated"
+            );
+        }
 
         for (ns, method) in extract_ws_methods(WORKSPACE_API_DESCRIPTION) {
             assert!(
