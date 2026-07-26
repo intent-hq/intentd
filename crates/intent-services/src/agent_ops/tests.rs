@@ -1987,9 +1987,9 @@ async fn create_rejects_unknown_provider() {
 
 /// `agent.create` records one `sessions_started` tick into the global
 /// `usage_stats_hourly` store (D2: *sessions* = agent sessions) under the
-/// session's normalized model, with the `"unknown"` fallback when no model is
-/// resolved at creation time. Only the session counter accrues — no
-/// tokens/runs/lines.
+/// session's normalized model, falling back to the resolved provider id when
+/// no model is resolved at creation time (D13). Only the session counter
+/// accrues — no tokens/runs/lines.
 #[tokio::test]
 async fn create_records_session_started_usage_stats() {
     let (_t, svc, ws) = setup().await;
@@ -2006,7 +2006,8 @@ async fn create_records_session_started_usage_stats() {
     )
     .await
     .expect("create with model");
-    // No model param and no configured defaults → "unknown".
+    // No model param and no configured defaults → the resolved provider id
+    // (the default provider here), not "unknown" (D13).
     svc.agent_create_op(
         ws.clone(),
         Some("NoModel".into()),
@@ -2032,7 +2033,8 @@ async fn create_records_session_started_usage_stats() {
             .sum()
     };
     assert_eq!(sessions_for("Opus 4.8"), 1);
-    assert_eq!(sessions_for("unknown"), 1);
+    assert_eq!(sessions_for(intent_providers::default_provider_id()), 1);
+    assert_eq!(sessions_for("unknown"), 0);
     assert!(
         rows.iter().all(|r| r.bucket_utc.ends_with(":00:00Z")),
         "buckets are UTC hour floors: {rows:?}"

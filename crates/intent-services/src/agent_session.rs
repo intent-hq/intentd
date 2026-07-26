@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use intent_acp::session::{
     self, ContentBlock, InitializeResponse, MappedToolCall, MappedUpdate, McpServer, Meta,
-    SessionModeState, StopReason,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionModeState, StopReason,
 };
 use intent_acp::{AcpError, Connection, IncomingNotification};
 use intent_core::events::{
@@ -78,6 +79,13 @@ pub struct AcpSessionOpened {
     /// recreate won the CAS (the modes we captured belong to the wrong
     /// session).
     pub modes: Option<SessionModeState>,
+    /// The bare effective model resolved from the response's
+    /// `configOptions[id="model"]` and persisted onto `agent_session.model`
+    /// (D13), when the stored model was a placeholder and the resolution +
+    /// guarded write both succeeded. The manager syncs the live handle's
+    /// `spawned_model` to this value so the next `ensure_started` does not
+    /// misread the persisted effective model as an `agent.setModel` change.
+    pub effective_model: Option<String>,
 }
 
 /// Accumulates streamed assistant content into one transcript message per turn,
@@ -445,6 +453,54 @@ pub(crate) fn resolve_provider_id(model: Option<&str>, provider: Option<&str>) -
         .unwrap_or_else(|| intent_providers::default_provider_id().to_string())
 }
 
+/// Resolve the effective model a provider is actually running from the
+/// `configOptions` of a `session/new` / `session/load` response (D13): the
+/// select option with `id == "model"` (falling back to `category == "model"`)
+/// carries `currentValue`; map it to its option entry and find a known model
+/// family in the entry's name or description — the first version-bearing
+/// match wins (e.g. currentValue `"default"` → name "Default (recommended)" /
+/// description "Opus 4.8 with 1M context · …" → `"Opus 4.8"`), with the raw
+/// `currentValue` id itself as the last candidate. `None` when the response
+/// has no model select or nothing resolves to a known family with a version —
+/// version-less matches (bare "Opus") are rejected because they would merge
+/// sibling versions and, persisted, are indistinguishable from real option
+/// ids in the post-session model-application gate.
+fn resolve_effective_model(config_options: Option<&[SessionConfigOption]>) -> Option<String> {
+    let options = config_options?;
+    let select_by = |pred: &dyn Fn(&SessionConfigOption) -> bool| {
+        options.iter().find_map(|o| match &o.kind {
+            SessionConfigKind::Select(s) if pred(o) => Some(s),
+            _ => None,
+        })
+    };
+    let select = select_by(&|o| o.id.0.as_ref() == "model").or_else(|| {
+        select_by(&|o| matches!(o.category, Some(SessionConfigOptionCategory::Model)))
+    })?;
+    let current = select.current_value.0.as_ref();
+    let entry = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(opts) => {
+            opts.iter().find(|e| e.value.0.as_ref() == current)
+        }
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| g.options.iter())
+            .find(|e| e.value.0.as_ref() == current),
+        _ => None,
+    };
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(entry) = entry {
+        candidates.push(entry.name.as_str());
+        if let Some(desc) = entry.description.as_deref() {
+            candidates.push(desc);
+        }
+    }
+    candidates.push(current);
+    candidates
+        .into_iter()
+        .filter_map(usage_stats::known_family_model_name)
+        .find(|name| name.chars().any(|c| c.is_ascii_digit()))
+}
+
 /// Build provider-specific `_meta` for `session/new` and `session/load` from the
 /// assembled system prompt (§18.1). Returns `None` for providers that do not use
 /// `_meta` injection (auggie, codex, droid, opencode, cortex, pi, grok, mock
@@ -643,6 +699,53 @@ impl Services {
         }
     }
 
+    /// Persist the effective model resolved from a session-open response's
+    /// `configOptions` (D13): only when the stored model is a placeholder
+    /// (NULL / blank / `default` sentinel — an explicitly user-selected model
+    /// is NEVER overwritten), and only while it still is at write time (the
+    /// store's guarded CAS write loses benignly to a concurrent
+    /// `agent.setModel`). Always persisted as the compound
+    /// `{provider_id}:{effective}` (e.g. `claude-code:Opus 4.8`) so
+    /// [`resolve_provider_id`] keeps resolving the same provider even when
+    /// the stored model was NULL and the `provider` field is empty. Returns
+    /// the *bare* effective model when the write landed — the value
+    /// `resolve_spawn` will yield next, which the manager syncs onto the
+    /// live handle's `spawned_model`. Best-effort: failures are logged,
+    /// never propagated — model resolution must not fail session open.
+    async fn persist_effective_model(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        provider_id: &str,
+        stored_model: Option<&str>,
+        config_options: Option<&[SessionConfigOption]>,
+    ) -> Option<String> {
+        if !usage_stats::is_placeholder_model(stored_model) {
+            return None;
+        }
+        let effective = resolve_effective_model(config_options)?;
+        let persisted = format!("{provider_id}:{effective}");
+        match self
+            .store
+            .set_agent_session_effective_model(workspace_id, agent_id, stored_model, &persisted)
+            .await
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    agent = %agent_id,
+                    model = %persisted,
+                    "persisted effective session model from configOptions"
+                );
+                Some(effective)
+            }
+            Ok(false) => None, // lost to a concurrent explicit model change
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "persist effective session model failed");
+                None
+            }
+        }
+    }
+
     /// Open a new ACP session and persist its id as `AgentSession.acpSessionId`
     /// (write-once, for later resume) (§6.5). Returns the fresh id plus the
     /// modes the provider advertised in `session/new` (used by the caller to
@@ -679,9 +782,19 @@ impl Services {
         self.store
             .set_acp_session_id(&workspace_id, agent_id, &acp_session_id)
             .await?;
+        let effective_model = self
+            .persist_effective_model(
+                &workspace_id,
+                agent_id,
+                &provider_id,
+                stored.model.as_deref(),
+                resp.config_options.as_deref(),
+            )
+            .await;
         Ok(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
+            effective_model,
         })
     }
 
@@ -730,14 +843,25 @@ impl Services {
             .await?;
         // On CAS loss the canonical id belongs to a session we did not open;
         // our modes are meaningless for it and would target the wrong sid.
-        let modes = if canonical == new_acp_session_id {
-            resp.modes
+        // The effective-model resolution is skipped for the same reason.
+        let (modes, effective_model) = if canonical == new_acp_session_id {
+            let effective_model = self
+                .persist_effective_model(
+                    &workspace_id,
+                    agent_id,
+                    &provider_id,
+                    stored.model.as_deref(),
+                    resp.config_options.as_deref(),
+                )
+                .await;
+            (resp.modes, effective_model)
         } else {
-            None
+            (None, None)
         };
         Ok(AcpSessionOpened {
             session_id: canonical,
             modes,
+            effective_model,
         })
     }
 
@@ -776,9 +900,19 @@ impl Services {
         let resp = session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
             .await
             .map_err(|e| Error::Internal(format!("session/load failed: {e}")))?;
+        let effective_model = self
+            .persist_effective_model(
+                &workspace_id,
+                agent_id,
+                &provider_id,
+                stored.model.as_deref(),
+                resp.config_options.as_deref(),
+            )
+            .await;
         Ok(Some(AcpSessionOpened {
             session_id: acp_session_id,
             modes: resp.modes,
+            effective_model,
         }))
     }
 
@@ -1129,8 +1263,10 @@ impl Services {
     /// per counter — plus, for completed turns only (agent runs = completed
     /// prompt turns), a `runs` increment and the turn's wall-clock duration
     /// folded into the bucket's `longest_run_ms` MAX. Counters land in the
-    /// current UTC hour bucket keyed by the session's normalized model name
-    /// (`"unknown"` fallback), with no workspace dimension, stamped with the
+    /// current UTC hour bucket keyed by the session's stats model key —
+    /// normalized model name, falling back to the provider id for
+    /// placeholder/absent models, `"unknown"` only when the provider is
+    /// unknowable too (D13) — with no workspace dimension, stamped with the
     /// daemon's local wall-clock (D12). MUST run BEFORE
     /// `persist_turn_token_usage` replaces the session snapshot the delta is
     /// computed against — the per-agent chained bookkeeping task spawned in
@@ -1148,17 +1284,17 @@ impl Services {
         if usage.is_none() && !run_completed {
             return; // failed turn without a usage report — nothing to record
         }
-        let (model, prev, prev_readable) = match self
+        let (model, provider, prev, prev_readable) = match self
             .store
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((model, prev)) => (model, prev, true),
+            Ok((model, provider, prev)) => (model, provider, prev, true),
             Err(e) => {
                 // Without the previous snapshot the delta would re-count the
                 // session's full history — drop the token part, keep the run.
                 tracing::warn!(agent = %agent_id, error = %e, "read prev token usage for stats failed");
-                (None, None, false)
+                (None, None, None, false)
             }
         };
         let tokens = match usage {
@@ -1184,7 +1320,9 @@ impl Services {
         let now = time::OffsetDateTime::now_utc();
         let bucket = usage_stats::hour_bucket_utc(now);
         let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
-        let model = usage_stats::normalize_model_name(model.as_deref().unwrap_or(""));
+        let provider_id =
+            prev_readable.then(|| resolve_provider_id(model.as_deref(), provider.as_deref()));
+        let model = usage_stats::stats_model_key(model.as_deref(), provider_id.as_deref());
         if let Err(e) = self
             .store
             .add_usage_stats(&bucket, &model, local.as_ref(), &delta)

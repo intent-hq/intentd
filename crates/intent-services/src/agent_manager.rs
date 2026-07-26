@@ -1653,6 +1653,7 @@ impl AgentManager {
                     stored_model.as_deref(),
                 )
                 .await;
+                self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
                 return Ok(opened.session_id);
             }
             Ok(None) => {}
@@ -1697,6 +1698,7 @@ impl AgentManager {
                 stored_model.as_deref(),
             )
             .await;
+            self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
             return Ok(opened.session_id);
         }
 
@@ -1721,7 +1723,28 @@ impl AgentManager {
             stored_model.as_deref(),
         )
         .await;
+        self.sync_spawned_model(agent_id, opened.effective_model.as_deref());
         Ok(opened.session_id)
+    }
+
+    /// Sync the live handle's `spawned_model` to what `resolve_spawn` will
+    /// yield now that the session open persisted an effective model (D13):
+    /// otherwise the next `ensure_started` would see a model "change"
+    /// (placeholder → effective) that no `agent.setModel` requested and
+    /// pointlessly respawn the child. The stored value mirrors
+    /// `resolve_spawn`'s bare-model filter — an effective display name
+    /// always carries whitespace ("Opus 4.8"), which `resolve_spawn` drops
+    /// to `None` (spawn on the provider default, exactly what the
+    /// placeholder resolved from). No-op when nothing was persisted or the
+    /// handle is gone.
+    fn sync_spawned_model(&self, agent_id: &AgentId, effective_model: Option<&str>) {
+        let Some(effective) = effective_model else {
+            return;
+        };
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.spawned_model = Some(effective.to_string())
+                .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
+        }
     }
 
     /// Best-effort post-session model application, gated per provider
@@ -1826,6 +1849,10 @@ impl AgentManager {
     /// provider prefix does not match the running provider (a stale id from a
     /// pre-spawn provider switch must not be sent). Bare ids are treated as
     /// provider-local; compound ids are stripped to their bare part.
+    /// Whitespace-bearing ids are also `None`: real provider option ids never
+    /// contain spaces, so a display name persisted by the effective-model
+    /// resolution (D13, e.g. `claude-code:Opus 4.8`) must not be sent back as
+    /// a `session/set_model` / `session/set_config_option` value.
     fn provider_local_model_target<'m>(
         provider: &ProviderConfig,
         stored_model: Option<&'m str>,
@@ -1836,7 +1863,10 @@ impl AgentManager {
             Some(_) => return None,
             None => model,
         };
-        if model_id.is_empty() || model_id == "default" {
+        if model_id.is_empty()
+            || model_id.eq_ignore_ascii_case("default")
+            || model_id.contains(char::is_whitespace)
+        {
             return None;
         }
         Some(model_id)
@@ -4246,11 +4276,17 @@ fn resolve_spawn(
     chief_cwd_root: Option<&Path>,
 ) -> Result<ResolvedSpawn> {
     let provider_id = session_provider_id(session);
+    // Whitespace-bearing bare ids are persisted effective-model display names
+    // (D13, e.g. `claude-code:Opus 4.8`) — stats/attribution values, not
+    // spawnable model ids. They must not reach `SpawnOptions.model` (CLI
+    // `--model` flags, codex config args, opencode env config); dropping them
+    // spawns on the provider default, exactly what the placeholder resolved
+    // from.
     let model = session
         .model
         .as_ref()
         .map(|m| intent_providers::parse_compound_model_id(m).1)
-        .filter(|m| !m.is_empty());
+        .filter(|m| !m.is_empty() && !m.contains(char::is_whitespace));
     // Chief has no worktree/repo on disk, so its children spawn in the
     // dedicated, daemon-owned, empty `<data_dir>/chief-cwd` directory
     // (STAB-50): providers that index their cwd (auggie with
@@ -5943,6 +5979,16 @@ mod role_reminder_tests {
         // switch) must not be sent to claude-code.
         assert_eq!(
             AgentManager::config_option_model_target(claude, Some("grok:grok-4.5")),
+            None
+        );
+        // A persisted effective-model display name (D13, contains spaces) is
+        // not a real option id and must not be sent back to the provider.
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("claude-code:Opus 4.8")),
+            None
+        );
+        assert_eq!(
+            AgentManager::config_option_model_target(claude, Some("Opus 4.8")),
             None
         );
     }

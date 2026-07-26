@@ -1587,9 +1587,16 @@ impl Services {
         };
         self.store.insert_agent_session(&session).await?;
         // Global usage-stats (D2): count this session start in the current UTC
-        // hour bucket under the session's normalized model ("unknown" when no
-        // model is resolved yet). Best-effort — never fails agent.create.
-        crate::usage_stats::record_session_started(&self.store, session.model.as_deref()).await;
+        // hour bucket under the session's stats model key (normalized model,
+        // falling back to the provider id when no model is resolved yet;
+        // "unknown" only when the provider is unknowable too — D13).
+        // Best-effort — never fails agent.create.
+        crate::usage_stats::record_session_started(
+            &self.store,
+            session.model.as_deref(),
+            session.provider.as_deref(),
+        )
+        .await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             &session.id,

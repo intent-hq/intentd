@@ -360,6 +360,68 @@ fn connect_with_prompt_result(
     (conn, note_rx, agent)
 }
 
+/// Mock agent whose `session/new` / `session/load` responses carry a
+/// caller-supplied payload (e.g. `configOptions` for the D13 effective-model
+/// resolution); other methods answer like the standard mock.
+fn spawn_mock_agent_with_session_result<R, W>(
+    read: R,
+    write: W,
+    session_result: Value,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        let mut write = write;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).expect("valid JSON");
+            let (Some(id), Some(method)) =
+                (value.get("id"), value.get("method").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            let result = match method {
+                "initialize" => {
+                    json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
+                }
+                "session/new" | "session/load" => session_result.clone(),
+                _ => json!({}),
+            };
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            write
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    })
+}
+
+/// [`connect`] against a mock whose session-open responses carry `result`.
+fn connect_with_session_result(
+    result: Value,
+) -> (
+    Connection,
+    mpsc::UnboundedReceiver<IncomingNotification>,
+    JoinHandle<()>,
+) {
+    let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+    let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+    let agent = spawn_mock_agent_with_session_result(c2a_agent, a2c_agent, result);
+    let (note_tx, note_rx) = mpsc::unbounded_channel();
+    let hooks = ConnectionHooks {
+        notifications: Some(note_tx),
+        ..ConnectionHooks::default()
+    };
+    let conn = Connection::new(c2a_client, a2c_client, None, hooks);
+    (conn, note_rx, agent)
+}
+
 async fn setup() -> (TempDb, Services, EventBus, AgentId, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -1824,7 +1886,7 @@ async fn detached_bookkeeping_chains_per_agent_across_turns() {
     handle.await.expect("bookkeeping task completes");
 
     // The turn's newer snapshot survives — the late predecessor did not win.
-    let (_model, snapshot) = bus
+    let (_model, _provider, snapshot) = bus
         .store()
         .get_agent_session_token_usage(&workspace_id, &agent_id)
         .await
@@ -1840,4 +1902,153 @@ async fn detached_bookkeeping_chains_per_agent_across_turns() {
         .expect("stats rows");
     let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
     assert_eq!(input, 30);
+}
+
+/// A `session/new` result canned from a live claude-agent-acp@0.60.0 session:
+/// the model select's `currentValue` is the `default` placeholder whose
+/// option entry carries the real family in its description.
+fn claude_code_session_result() -> Value {
+    json!({
+        "sessionId": ACP_SID,
+        "modes": { "currentModeId": "acceptEdits", "availableModes": [] },
+        "configOptions": [
+            { "id": "mode", "name": "Mode", "category": "mode", "type": "select",
+              "currentValue": "acceptEdits",
+              "options": [ { "value": "auto", "name": "Auto" },
+                           { "value": "acceptEdits", "name": "Accept Edits" } ] },
+            { "id": "model", "name": "Model", "description": "AI model to use",
+              "category": "model", "type": "select", "currentValue": "default",
+              "options": [
+                { "value": "default", "name": "Default (recommended)",
+                  "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "opus[1m]", "name": "Opus",
+                  "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "sonnet", "name": "Sonnet",
+                  "description": "Sonnet 5 · Efficient for routine tasks" }
+              ] }
+        ]
+    })
+}
+
+/// D13: opening a session with a placeholder stored model resolves the
+/// effective model from the `session/new` response's
+/// `configOptions[id="model"]` (currentValue `"default"` → its option's
+/// description "Opus 4.8 with 1M context · …" → "Opus 4.8") and persists it
+/// compound (`claude-code:Opus 4.8`) on `agent_session.model`.
+#[tokio::test]
+async fn open_session_resolves_and_persists_effective_model() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d13");
+    session.model = Some("claude-code:default".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(
+        stored.model.as_deref(),
+        Some("claude-code:Opus 4.8"),
+        "placeholder model replaced by the resolved effective model (compound)"
+    );
+}
+
+/// D13: an explicitly selected (non-placeholder) stored model is NEVER
+/// overwritten by the session-open resolution.
+#[tokio::test]
+async fn open_session_never_overwrites_explicit_model() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d13-explicit");
+    session.model = Some("claude-code:sonnet".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert!(opened.effective_model.is_none());
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(
+        stored.model.as_deref(),
+        Some("claude-code:sonnet"),
+        "explicit model untouched"
+    );
+}
+
+/// D13: a NULL stored model resolves too, persisting the compound id with
+/// the session's resolved provider so `resolve_provider_id` keeps working.
+#[tokio::test]
+async fn open_session_resolves_effective_model_for_null_model() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d13-null");
+    session.provider = Some("claude-code".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.model.as_deref(), Some("claude-code:Opus 4.8"));
+}
+
+/// D13: a response without a resolvable model select (e.g. the plain mock's
+/// bare `{ sessionId }`) leaves the placeholder model untouched.
+#[tokio::test]
+async fn open_session_without_config_options_keeps_placeholder() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d13-none");
+    session.model = Some("claude-code:default".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect();
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert!(opened.effective_model.is_none());
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.model.as_deref(), Some("claude-code:default"));
+}
+
+/// D13: `session/load` (resume) resolves the effective model the same way as
+/// `session/new`.
+#[tokio::test]
+async fn resume_session_resolves_and_persists_effective_model() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d13-resume");
+    session.model = Some("claude-code:default".to_string());
+    session.acp_session_id = Some(ACP_SID.to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("resume")
+        .expect("resume yields opened session");
+    assert_eq!(opened.effective_model.as_deref(), Some("Opus 4.8"));
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(stored.model.as_deref(), Some("claude-code:Opus 4.8"));
 }
