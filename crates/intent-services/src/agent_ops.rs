@@ -4368,6 +4368,11 @@ impl Services {
         //     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
         //     cleanup-only behavior.
         //   * Otherwise → treat as resumable; the newest live session wins.
+        // Once the newest live session is found, older candidates are left
+        // untouched EXCEPT poisoned ones: a failed queue migration keeps the
+        // poisoned assignment in place (now older than the live winner), so
+        // the scan keeps probing for poisoned ids to retry the migration + GC
+        // on this wake (monorepo#847).
         // `inheritance_source` captures the newest **known** previous session
         // (live, poisoned, or deleted) so the create branch can still inherit
         // specialist/model when no live agent is available.
@@ -4376,6 +4381,20 @@ impl Services {
         let mut live_session: Option<AgentSession> = None;
         let mut inheritance_source: Option<AgentSession> = None;
         for candidate in task.assigned_agents.iter().rev().cloned() {
+            if live_session.is_some() {
+                match self.store.get_agent_session(&candidate).await {
+                    Ok(session)
+                        if session.status != AgentStatus::Deleted
+                            && self.session_poisoned(&session) =>
+                    {
+                        poisoned.push(candidate.clone());
+                        cleaned_up.push(candidate);
+                    }
+                    Ok(_) | Err(Error::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
             match self.store.get_agent_session(&candidate).await {
                 Ok(session)
                     if session.status != AgentStatus::Deleted
@@ -4385,7 +4404,6 @@ impl Services {
                         inheritance_source = Some(session.clone());
                     }
                     live_session = Some(session);
-                    break;
                 }
                 Ok(unusable_session) => {
                     if unusable_session.status != AgentStatus::Deleted {
@@ -4423,8 +4441,12 @@ impl Services {
             // mid-migration, sidestepping the helper's theoretical
             // failure-path duplicate (the rollback restore racing a
             // concurrent dequeue of an already-migrated entry).
-            self.migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
+            let failed = self
+                .migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
                 .await;
+            // Failed migrations stay assigned (and out of the response's
+            // `cleanedUpAgentIds`) so the next wakeOrCreate retries them.
+            cleaned_up.retain(|id| !failed.contains(id));
             let result = self
                 .deliver_wake_message(
                     &workspace_id,
@@ -4585,10 +4607,18 @@ impl Services {
             return Ok(response);
         }
 
-        // Create branch: no live session. Purge stale assignments first so the
-        // subsequent `assign_agent` starts from a clean list, then build the
-        // rich create payload.
-        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &cleaned_up)
+        // Create branch: no live session. Purge stale (NotFound / soft-
+        // deleted) assignments first so the subsequent `assign_agent` starts
+        // from a clean list, then build the rich create payload. Poisoned ids
+        // are deliberately NOT purged yet: their assignment must survive a
+        // failed queue migration below so the next wakeOrCreate can retry it;
+        // they are purged after a successful migration instead.
+        let stale_now: Vec<AgentId> = cleaned_up
+            .iter()
+            .filter(|id| !poisoned.contains(id))
+            .cloned()
+            .collect();
+        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &stale_now)
             .await?;
         let create_opts = input.create.clone().unwrap_or_default();
 
@@ -4671,8 +4701,20 @@ impl Services {
         // Specialist/model inheritance was resolved from `inheritance_source`
         // (an owned clone captured in the candidate loop) above, before this
         // GC hard-deletes the poisoned session row.
-        self.migrate_poisoned_queues_to(&poisoned, &agent, &workspace_id)
+        let failed = self
+            .migrate_poisoned_queues_to(&poisoned, &agent, &workspace_id)
             .await;
+        // Successfully migrated poisoned ids can now be purged from the
+        // task's assignments; failed ones stay assigned (and out of the
+        // response's `cleanedUpAgentIds`) so the next wakeOrCreate retries.
+        cleaned_up.retain(|id| !failed.contains(id));
+        let migrated: Vec<AgentId> = poisoned
+            .iter()
+            .filter(|id| !failed.contains(id))
+            .cloned()
+            .collect();
+        self.remove_agent_ids_from_workspace_tasks(&workspace_id, &migrated)
+            .await?;
         let result = self
             .deliver_wake_message(
                 &workspace_id,
@@ -5221,13 +5263,19 @@ impl Services {
     /// target and GC the dead session. Failures are non-fatal to the wake —
     /// the helper's error path already rolled back the in-memory drain and
     /// skipped GC, leaving the messages durable on exactly one queue (the
-    /// poisoned one) so a later wake can retry; log WARN and continue.
+    /// poisoned one); log WARN and continue. Returns the ids whose migration
+    /// FAILED: callers must keep those out of the `cleanedUpAgentIds`
+    /// task-assignment purge (and out of the response field) so the poisoned
+    /// session stays assigned and the next `agent.wakeOrCreate` retries the
+    /// migration — otherwise the parked messages would be durable but
+    /// permanently stranded on a session no wake can discover.
     async fn migrate_poisoned_queues_to(
         &self,
         poisoned: &[AgentId],
         target: &AgentId,
         workspace_id: &WorkspaceId,
-    ) {
+    ) -> Vec<AgentId> {
+        let mut failed = Vec::new();
         for poisoned_id in poisoned {
             if let Err(e) = self
                 .migrate_queue_and_gc_poisoned_session(poisoned_id, target, workspace_id)
@@ -5240,8 +5288,10 @@ impl Services {
                     "wakeOrCreate: poisoned-session queue migration/GC failed; \
                      continuing with the wake (monorepo#847)"
                 );
+                failed.push(poisoned_id.clone());
             }
         }
+        failed
     }
 
     /// Migrate a poisoned session's parked queue onto a replacement agent,
@@ -5290,13 +5340,26 @@ impl Services {
         if &target.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("agent session {target_id}")));
         }
-        if let Ok(poisoned) = self.store.get_agent_session(poisoned_id).await {
-            if &poisoned.workspace_id != workspace_id {
-                return Err(Error::NotFound(format!("agent session {poisoned_id}")));
+        match self.store.get_agent_session(poisoned_id).await {
+            Ok(poisoned) => {
+                if &poisoned.workspace_id != workspace_id {
+                    return Err(Error::NotFound(format!("agent session {poisoned_id}")));
+                }
             }
+            // A missing poisoned session is the idempotent no-op case; any
+            // other store error fails closed BEFORE draining, mirroring the
+            // target guard above.
+            Err(Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
         }
         // Drain in-memory, keeping the original entries for rollback should
-        // the durable move fail below.
+        // the durable move fail below. The append onto the target happens
+        // OUTSIDE the persist gate: a concurrent enqueue to the target in the
+        // window before the move commits can write-through a snapshot that
+        // already carries the migrated ids while the poisoned rows still
+        // exist — a global-PK conflict that fails that best-effort
+        // write-through with a benign WARN (the move right below commits the
+        // correct snapshot).
         let drained: Vec<QueuedMessage> = {
             let mut guard = self
                 .agent_queues
@@ -5334,7 +5397,11 @@ impl Services {
             if let Err(e) = moved {
                 // Roll back the in-memory drain and skip GC: the messages
                 // remain durable on the poisoned queue (rows untouched) and
-                // in its in-memory queue, so the caller can retry.
+                // in its in-memory queue, so the caller can retry. The
+                // restore SPLICES the drained entries back at the front of
+                // any existing entry rather than overwriting it — a
+                // quarantined send racing this window may have re-created
+                // the poisoned entry with new messages, which must survive.
                 let migrated_ids: HashSet<&str> = drained.iter().map(|m| m.id.as_str()).collect();
                 let mut guard = self
                     .agent_queues
@@ -5343,7 +5410,10 @@ impl Services {
                 if let Some(queue) = guard.get_mut(target_id) {
                     queue.retain(|m| !migrated_ids.contains(m.id.as_str()));
                 }
-                guard.insert(poisoned_id.clone(), drained);
+                guard
+                    .entry(poisoned_id.clone())
+                    .or_default()
+                    .splice(0..0, drained);
                 return Err(e);
             }
             let queue = self.queue_snapshot(target_id);

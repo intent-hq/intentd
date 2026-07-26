@@ -10740,7 +10740,10 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
 
 /// monorepo#847: a failed queue migration is non-fatal — the wake still
 /// succeeds (`created_new`), GC is skipped, and the parked messages stay
-/// durable on the poisoned queue for a later retry.
+/// durable on the poisoned queue. The failed id is kept OUT of
+/// `cleanedUpAgentIds` (and its task assignment survives) so the next
+/// `agent.wakeOrCreate` actually retries — and succeeds once the store
+/// recovers.
 #[tokio::test]
 async fn wake_or_create_survives_failed_queue_migration() {
     let (_t, svc, ws) = setup().await;
@@ -10762,7 +10765,7 @@ async fn wake_or_create_survives_failed_queue_migration() {
         .await
         .expect("hide table");
     let resp = svc
-        .agent_wake_or_create_op(ws.clone(), note_id, "go".into(), wake_input(None))
+        .agent_wake_or_create_op(ws.clone(), note_id.clone(), "go".into(), wake_input(None))
         .await
         .expect("wake must survive the failed migration");
     sqlx::query("ALTER TABLE agent_queue_hidden RENAME TO agent_queue")
@@ -10772,7 +10775,10 @@ async fn wake_or_create_survives_failed_queue_migration() {
 
     assert_eq!(resp["created"], true);
     assert_eq!(resp["action"], "created_new");
-    assert_eq!(resp["cleanedUpAgentIds"], json!([prev.clone()]));
+    assert!(
+        resp.get("cleanedUpAgentIds").is_none(),
+        "a failed migration must not report the poisoned id as cleaned up"
+    );
 
     // GC skipped and the drain rolled back: the messages stay durable (and
     // in memory) on the poisoned queue; nothing leaked onto the new agent.
@@ -10780,14 +10786,43 @@ async fn wake_or_create_survives_failed_queue_migration() {
     assert!(svc.dequeue_message(&new_id).is_none());
     assert!(svc.store().get_agent_session(&prev).await.is_ok());
     assert_eq!(persisted_queue(&svc, &prev).await.len(), 1);
-    let guard = svc.agent_queues.lock().unwrap();
-    let parked = guard.get(&prev).expect("still parked");
-    assert_eq!(parked.len(), 1);
-    assert_eq!(parked[0].id, "m-0");
+    {
+        let guard = svc.agent_queues.lock().unwrap();
+        let parked = guard.get(&prev).expect("still parked");
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].id, "m-0");
+        assert!(
+            parked[0].editing,
+            "rollback must restore the original entry"
+        );
+    }
+    // The poisoned assignment survived the failed migration…
+    let task = svc
+        .get_my_task(ws.clone(), note_id.clone())
+        .await
+        .expect("task");
     assert!(
-        parked[0].editing,
-        "rollback must restore the original entry"
+        task.assigned_agents.contains(&prev),
+        "failed migration must keep the poisoned assignment for retry"
     );
+
+    // …so a second wakeOrCreate (store recovered) retries and completes the
+    // hand-off: messages land on the woken agent, the poisoned session is
+    // GC'd, and cleanedUpAgentIds reports it this time.
+    let resp2 = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "again".into(), wake_input(None))
+        .await
+        .expect("retry wake");
+    assert_eq!(resp2["created"], false);
+    assert_eq!(resp2["cleanedUpAgentIds"], json!([prev.clone()]));
+    assert!(matches!(
+        svc.store().get_agent_session(&prev).await,
+        Err(Error::NotFound(_))
+    ));
+    let guard = svc.agent_queues.lock().unwrap();
+    assert!(guard.get(&prev).is_none());
+    let migrated = guard.get(&new_id).expect("migrated queue");
+    assert!(migrated.iter().any(|m| m.id == "m-0"));
 }
 
 /// monorepo#840 failure-wake dedup: a repeated `agent:failed` with the SAME
