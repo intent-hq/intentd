@@ -128,29 +128,68 @@ tar -xJf intentd-aarch64-apple-darwin.tar.xz
 
 ### Channels
 
-The sitter follows the **stable** channel by default. To follow beta, pass
+The sitter follows the **stable** channel by default. To durably switch a machine to
+beta (or back), use the sitter-owned `intentd sitter channel` command:
+
+```sh
+intentd sitter channel        # print the effective channel and its origin, e.g. "beta (from config)"
+intentd sitter channel beta   # pin beta in <data-dir>/sitter/config.toml
+intentd sitter channel beta --redownload && intentd restart   # switch and activate now
+```
+
+- **Setting a channel** writes the pin to `<data-dir>/sitter/config.toml`
+  (user-editable; unlike `state.json`, never rewritten by the updater). Services
+  started via `brew services` or the .deb's systemd user unit pass no channel flag or
+  env, so they follow the pin — no formula or unit edits needed. A running service
+  picks a new pin up at its next periodic update check; `intentd restart` applies it
+  immediately.
+- **`--redownload`** (set form only) additionally fetches the new channel's manifest
+  right away and force-installs its version, **bypassing the newer-only comparison** —
+  this is the explicit downgrade path for beta → stable. It never touches the running
+  daemon; the new binary becomes active only after a restart. If the install fails,
+  the command exits non-zero but the channel pin is still written.
+- **`intentd restart`** restarts the supervised daemon in place — the sitter and the
+  service manager stay put. It signals (SIGHUP) the serve-mode sitter found via
+  `<data-dir>/sitter/sitter.pid`; the sitter gracefully stops the daemon and respawns
+  it on the currently installed version and channel pin. Unix only — on Windows,
+  restart the service instead. With no running supervised `serve`, it exits non-zero
+  with guidance to start the service first.
+
+Per-launch overrides still work and take precedence over the pin — pass
 `--sitter-channel beta` or set `INTENTD_CHANNEL=beta`:
 
 ```sh
 intentd --sitter-channel beta serve
 ```
 
-`--sitter-*` flags belong to the sitter and are stripped before forwarding; everything
-else (e.g. `serve`, `--resume-all`, `--version`) goes to the daemon verbatim.
+Effective-channel precedence: `--sitter-channel` flag > `INTENTD_CHANNEL` env >
+`sitter/config.toml` > stable default. A flag/env selection stays pinned for that
+process's lifetime (its periodic checks do not re-read the config file).
+
+`--sitter-*` flags and the intercepted `sitter` / `restart` commands belong to the
+sitter and are never forwarded; everything else (e.g. `serve`, `--resume-all`,
+`--version`) goes to the daemon verbatim. A leading `--` forwards even those
+literally (`intentd -- restart` sends `restart` to the daemon).
 
 ### How updates work
 
 - On `intentd serve` the sitter checks the channel manifest at startup and then on a
   randomized 12–24 h cadence; when a newer daemon version lands it downloads,
   sha256-verifies, and installs it atomically, then restarts the daemon on the new
-  version.
+  version. Unless the channel was pinned by flag/env at launch, each check re-reads
+  the `config.toml` pin first, so `intentd sitter channel` takes effect on a running
+  service without a restart.
+- Automatic checks are strictly **newer-only** — they never downgrade. The only
+  downgrade path is an explicit `intentd sitter channel <channel> --redownload`
+  (see [Channels](#channels)).
 - One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
   install updates: they run the already-installed daemon directly. If no daemon is
   installed yet, they fail fast with guidance to start it first (`intentd serve` or
   `brew services start intentd`) so it gets installed.
 - Sitter state lives under `<data-dir>/sitter/` (`versions/<version>/intentd`,
-  `state.json`, `tmp/`). The current and previous daemon versions are kept; older ones
-  are pruned.
+  `state.json`, `config.toml` — the channel pin, `sitter.pid` — the serve-mode
+  sitter's pid while it runs, `tmp/`). The current and previous daemon versions are
+  kept; older ones are pruned.
 - If a `serve` update check fails (e.g. offline), the sitter falls back to the last
   installed daemon; only a first `serve` with nothing installed and no network exits
   with an error.
