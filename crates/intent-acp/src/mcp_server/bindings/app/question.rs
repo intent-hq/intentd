@@ -14,7 +14,12 @@
 //! Hard validation only (missing/empty `question`/`header`, missing
 //! `options`, fewer than 2 options, an option with an empty `label`). The
 //! ~4-questions-per-turn and 2–4-options guidance lives in the tool
-//! description as advice to the model and is never enforced.
+//! description as advice to the model and is never enforced. One consequence
+//! of the un-capped per-turn count: [`TurnAttachmentRegistry`] holds at most
+//! `MAX_PER_AGENT` (32) attachments per agent and silently evicts the oldest
+//! on overflow, so an agent that asks more than 32 questions in a single turn
+//! still gets `{ ok: true }` for every call but the earliest questions are
+//! dropped from the turn-end drain.
 
 use std::sync::Arc;
 
@@ -74,7 +79,7 @@ fn ask(
     let name = payload
         .get("header")
         .and_then(Value::as_str)
-        .unwrap_or("Question")
+        .expect("validate_question guarantees a non-empty `header`")
         .to_string();
     let text = serde_json::to_string(&Value::Object(payload))
         .map_err(|e| format!("failed to serialize question payload: {e}"))?;

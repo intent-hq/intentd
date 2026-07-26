@@ -597,6 +597,24 @@ mod tests {
         out
     }
 
+    // The un-gated `ws.app.question.ask` doc line appears verbatim in BOTH
+    // the base and chief descriptions; if one copy is edited without the
+    // other, chief and non-chief agents would receive divergent guidance.
+    #[test]
+    fn question_ask_description_line_is_identical_in_both_variants() {
+        let line_in = |desc: &str| -> String {
+            desc.lines()
+                .find(|l| l.trim_start().starts_with("ws.app.question.ask("))
+                .expect("description advertises ws.app.question.ask")
+                .to_string()
+        };
+        assert_eq!(
+            line_in(WORKSPACE_API_DESCRIPTION),
+            line_in(WORKSPACE_API_DESCRIPTION_CHIEF),
+            "the ws.app.question.ask doc line drifted between the base and chief descriptions"
+        );
+    }
+
     // Every method reference in the tool description must correspond to a
     // real top-level dispatch arm in the matching bindings module — and must
     // NOT be one of the deferred "not yet available" arms. Guards against
