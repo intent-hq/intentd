@@ -10072,6 +10072,174 @@ async fn rehydrate_preserves_live_map() {
     assert_eq!(queue[0]["content"], "live");
 }
 
+// ── Poisoned-session queue migration + GC (monorepo#847) ───────────────────
+
+/// Build a parked queue entry with every flag/field set, so the migration's
+/// resets and preservations are both observable.
+fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
+    crate::agent_ops::QueuedMessage {
+        id: id.to_string(),
+        content: content.to_string(),
+        image_blocks: Some(json!([{ "type": "image", "data": id }])),
+        file_blocks: Some(json!([{ "type": "file", "name": format!("{id}.txt") }])),
+        queued_at: format!("2026-07-26T00:00:0{}Z", id.len() % 10),
+        editing: true,
+        persisted: true,
+        requeued_after_failure: true,
+        message_metadata: Some(json!({ "source": "event_notification", "of": id })),
+    }
+}
+
+#[tokio::test]
+async fn migrate_queue_preserves_order_resets_flags_and_gcs_poisoned() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let poisoned = create_agent(&svc, &ws, "Poisoned").await;
+    let target = create_agent(&svc, &ws, "Fresh").await;
+
+    // Park three flagged entries on the poisoned session and write them
+    // through, so both the in-memory drain and the persisted-row cleanup
+    // are exercised. Give the poisoned session a failure streak too — the
+    // GC must clear it via the delete path's registry hygiene.
+    let entries = vec![
+        parked_entry("m-0", "first"),
+        parked_entry("m-11", "second"),
+        parked_entry("m-222", "third"),
+    ];
+    svc.agent_queues
+        .lock()
+        .unwrap()
+        .insert(poisoned.clone(), entries.clone());
+    svc.persist_queue_snapshot(&poisoned).await;
+    assert_eq!(persisted_queue(&svc, &poisoned).await.len(), 3);
+    svc.record_terminal_failure(&poisoned, "boom");
+
+    let mut deleted_sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_DELETED.to_string()],
+        ..Default::default()
+    });
+    let mut queue_sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let migrated = svc
+        .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
+        .await
+        .expect("migrate");
+    assert_eq!(migrated, 3);
+
+    // Order preserved, flags reset, payload fields carried over verbatim.
+    for expected in &entries {
+        let moved = svc.dequeue_message(&target).expect("migrated entry");
+        assert_eq!(moved.id, expected.id);
+        assert_eq!(moved.content, expected.content);
+        assert_eq!(moved.queued_at, expected.queued_at);
+        assert_eq!(moved.image_blocks, expected.image_blocks);
+        assert_eq!(moved.file_blocks, expected.file_blocks);
+        assert_eq!(moved.message_metadata, expected.message_metadata);
+        assert!(!moved.editing, "{}: editing must reset", moved.id);
+        assert!(!moved.persisted, "{}: persisted must reset", moved.id);
+        assert!(
+            !moved.requeued_after_failure,
+            "{}: requeuedAfterFailure must reset",
+            moved.id
+        );
+    }
+    assert!(svc.dequeue_message(&target).is_none());
+
+    // The poisoned session is hard-deleted (store row + failure streak) and
+    // its persisted queue rows cascaded away, while the target's snapshot
+    // was written through with the reset flags — nothing rehydrates for the
+    // dead agent at the next startup.
+    assert!(matches!(
+        svc.store().get_agent_session(&poisoned).await,
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(svc.record_terminal_failure(&poisoned, "boom"), 1);
+    assert!(persisted_queue(&svc, &poisoned).await.is_empty());
+    let target_rows = persisted_queue(&svc, &target).await;
+    assert_eq!(target_rows.len(), 3);
+    assert_eq!(target_rows[0]["id"], "m-0");
+    assert_eq!(target_rows[1]["id"], "m-11");
+    assert_eq!(target_rows[2]["id"], "m-222");
+    assert_eq!(target_rows[0]["persisted"], json!(false));
+    assert_eq!(target_rows[0]["requeuedAfterFailure"], json!(false));
+    assert_eq!(target_rows[0]["editing"], json!(false));
+
+    // agent:queue:updated names the TARGET with the migrated snapshot;
+    // agent:deleted names the poisoned session.
+    let batch = timeout(Duration::from_secs(2), queue_sub.recv())
+        .await
+        .expect("queue event timed out")
+        .expect("subscription closed");
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(target.0.as_str()));
+    assert_eq!(batch[0].data["queue"].as_array().unwrap().len(), 3);
+    let batch = timeout(Duration::from_secs(2), deleted_sub.recv())
+        .await
+        .expect("deleted event timed out")
+        .expect("subscription closed");
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(poisoned.0.as_str()));
+}
+
+#[tokio::test]
+async fn migrate_queue_empty_queue_still_gcs_poisoned_session() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let poisoned = create_agent(&svc, &ws, "EmptyPoisoned").await;
+    let target = create_agent(&svc, &ws, "Fresh").await;
+    let mut queue_sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let migrated = svc
+        .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
+        .await
+        .expect("migrate empty");
+    assert_eq!(migrated, 0);
+    assert!(matches!(
+        svc.store().get_agent_session(&poisoned).await,
+        Err(Error::NotFound(_))
+    ));
+    // No entries moved → no agent:queue:updated noise for the target.
+    assert!(
+        timeout(Duration::from_millis(300), queue_sub.recv())
+            .await
+            .is_err(),
+        "expected no queue event for an empty migration"
+    );
+}
+
+#[tokio::test]
+async fn migrate_queue_missing_poisoned_session_is_idempotent() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Fresh").await;
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+
+    let migrated = svc
+        .migrate_queue_and_gc_poisoned_session(&missing, &target, &ws)
+        .await
+        .expect("idempotent migrate");
+    assert_eq!(migrated, 0);
+    assert!(svc.dequeue_message(&target).is_none());
+}
+
+#[tokio::test]
+async fn migrate_queue_rejects_unknown_target_without_draining() {
+    let (_t, svc, ws) = setup().await;
+    let poisoned = create_agent(&svc, &ws, "Poisoned").await;
+    svc.enqueue_message(&poisoned, "parked".into(), None, None, None);
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+
+    let err = svc
+        .migrate_queue_and_gc_poisoned_session(&poisoned, &missing, &ws)
+        .await
+        .expect_err("unknown target must fail closed");
+    assert!(matches!(err, Error::InvalidParams(_)));
+    // Nothing was drained or deleted: the parked message and session survive.
+    assert!(svc.store().get_agent_session(&poisoned).await.is_ok());
+    assert!(svc.dequeue_message(&poisoned).is_some());
+}
+
 /// Resume appends the system interruption marker before the continuation, and
 /// the append is idempotent on retry: when a prior resume attempt already left
 /// the marker as the transcript tail (continuation delivery failed, row reset

@@ -5170,6 +5170,94 @@ impl Services {
         };
         crate::publish_event(&self.event_bus, event).await;
     }
+
+    /// Migrate a poisoned session's parked queue onto a replacement agent,
+    /// then GC the poisoned session via the hard-delete path (monorepo#847).
+    ///
+    /// The in-memory `agent_queues` entry is authoritative — startup
+    /// rehydration populates the map before RPCs are served, so persisted
+    /// rows never hold entries the map lacks. Entries move in order onto the
+    /// TAIL of the target's queue with per-entry flags reset: `editing =
+    /// false` (the editing client's hold dies with the old session),
+    /// `persisted = false` (the old transcript row dies with the old session
+    /// — the drain must re-persist into the NEW agent's transcript), and
+    /// `requeued_after_failure = false` (the failure belonged to the old
+    /// session). `id`, `content`, `queued_at`, `image_blocks`, `file_blocks`
+    /// and `message_metadata` are preserved.
+    ///
+    /// When entries moved, the target's queue snapshot is write-through
+    /// persisted and `agent:queue:updated` published (both via
+    /// [`Services::publish_queue_updated_for`]). The poisoned session is then
+    /// hard-deleted through [`Services::agent_delete_op`], which emits
+    /// `agent:deleted`, drops the (now empty) in-memory queue entry, and
+    /// clears the failure streak + failure-wake dedup records; the persisted
+    /// `agent_queue` rows cascade with the `agent_session` row (`ON DELETE
+    /// CASCADE`, migration 0046) so nothing rehydrates at the next startup.
+    /// No-op safe: an empty (or absent) queue still GCs the session, and a
+    /// missing poisoned session stays idempotent (the delete succeeds
+    /// quietly). Returns the number of migrated messages.
+    // TODO(monorepo#847): drop the allow once `agent_wake_or_create_op`
+    // wires this in (follow-up change on this branch).
+    #[allow(dead_code)]
+    pub(crate) async fn migrate_queue_and_gc_poisoned_session(
+        &self,
+        poisoned_id: &AgentId,
+        target_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> Result<usize> {
+        // Fail closed BEFORE draining: a bad replacement target (or a
+        // cross-workspace id) must not receive messages no live session in
+        // this workspace will ever drain.
+        let target = self.require_agent_session(target_id).await?;
+        if &target.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {target_id}")));
+        }
+        if let Ok(poisoned) = self.store.get_agent_session(poisoned_id).await {
+            if &poisoned.workspace_id != workspace_id {
+                return Err(Error::NotFound(format!("agent session {poisoned_id}")));
+            }
+        }
+        let migrated = {
+            let mut guard = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let drained = guard.remove(poisoned_id).unwrap_or_default();
+            let count = drained.len();
+            if count > 0 {
+                let queue = guard.entry(target_id.clone()).or_default();
+                for mut message in drained {
+                    message.editing = false;
+                    message.persisted = false;
+                    message.requeued_after_failure = false;
+                    queue.push(message);
+                }
+            }
+            count
+        };
+        if migrated > 0 {
+            // The migrated entries keep their ids and `agent_queue.id` is a
+            // GLOBAL primary key, so the poisoned agent's stale persisted
+            // rows must be cleared BEFORE the target's write-through — the
+            // session delete below would cascade them anyway, but too late
+            // for the insert. Best-effort like every write-through: the
+            // in-memory queue stays authoritative and the delete's cascade
+            // still unblocks the next re-persist.
+            if let Err(e) = self.store.delete_agent_queue(poisoned_id).await {
+                tracing::warn!(
+                    agent = %poisoned_id,
+                    error = %e,
+                    "clearing poisoned agent's persisted queue rows failed"
+                );
+            }
+            let queue = self.queue_snapshot(target_id);
+            self.publish_queue_updated_for(target_id, workspace_id, queue)
+                .await;
+        }
+        self.agent_delete_op(poisoned_id.clone(), Some(workspace_id.clone()))
+            .await?;
+        Ok(migrated)
+    }
 }
 
 /// Join all text blocks of the most-recent assistant message (the summary's
