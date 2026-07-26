@@ -319,13 +319,20 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Drive workspace.update over a separate WSS RPC connection.
+    // Drive workspace.update over a separate WSS RPC connection. The skip
+    // toggle is sent under the deprecated `skipWorktree` alias to prove the
+    // update-side rename (§5.1) still honors it on the wire.
     let mut rpc = connect_ws(port, cfg.clone()).await;
     wss_rpc(
         &mut rpc,
         2,
         "workspace.update",
-        json!({ "workspaceId": ws_id, "title": "Renamed", "tags": ["a", "b"] }),
+        json!({
+            "workspaceId": ws_id,
+            "title": "Renamed",
+            "tags": ["a", "b"],
+            "skipWorktree": true,
+        }),
     )
     .await;
 
@@ -339,11 +346,13 @@ async fn workspace_update_emits_workspace_updated_over_wss() {
     );
     // `changes` is the applied delta only; `skip_serializing_if = "Option::is_none"`
     // keeps un-supplied fields out of the payload (reference-parity emitter).
+    // The skip toggle round-trips under its canonical `skipIsolation` name
+    // even when the request used the deprecated alias.
     assert_eq!(
         evt["data"],
         json!({
             "workspaceId": ws_id,
-            "changes": { "title": "Renamed", "tags": ["a", "b"] },
+            "changes": { "title": "Renamed", "tags": ["a", "b"], "skipIsolation": true },
         })
     );
 }

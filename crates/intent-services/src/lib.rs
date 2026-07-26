@@ -8104,7 +8104,7 @@ impl WorkspaceApi for Services {
             if let Some(v) = update.scope {
                 ws.scope = Some(v);
             }
-            if let Some(v) = update.skip_worktree {
+            if let Some(v) = update.skip_isolation {
                 ws.skip_worktree = v;
             }
             if let Some(v) = update.setup_script {

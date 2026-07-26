@@ -652,8 +652,14 @@ pub struct WorkspaceUpdate {
     pub worktree_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_worktree: Option<bool>,
+    /// Toggle direct mode (no isolated checkout). Canonical wire name is
+    /// `skipIsolation`; `skipWorktree` is the deprecated pre-CoW alias —
+    /// matches [`WorkspaceCreate::skip_isolation`]. Serializes as
+    /// `skipIsolation` in the `workspace:updated { changes }` delta. The
+    /// persisted column keeps its historical `skip_worktree` name
+    /// (`Workspace.skipWorktree`) — no DB migration.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "skipWorktree")]
+    pub skip_isolation: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3477,5 +3483,34 @@ mod tests {
 
         let absent: WorkspaceCreate = serde_json::from_value(json!({})).unwrap();
         assert_eq!(absent.skip_isolation, None);
+    }
+
+    #[test]
+    fn workspace_update_skip_isolation_accepts_new_wire_name() {
+        // PROTOCOL §5.1: `skipIsolation` is the canonical `workspace.update`
+        // param, mirroring the create-side rename.
+        let update: WorkspaceUpdate =
+            serde_json::from_value(json!({ "skipIsolation": true })).unwrap();
+        assert_eq!(update.skip_isolation, Some(true));
+
+        // Serialization (the `workspace:updated { changes }` delta) emits the
+        // canonical name and omits the field when absent.
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(v["skipIsolation"], json!(true));
+        assert!(v.get("skipWorktree").is_none());
+
+        let absent: WorkspaceUpdate = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(absent.skip_isolation, None);
+        let v = serde_json::to_value(&absent).unwrap();
+        assert!(v.get("skipIsolation").is_none());
+    }
+
+    #[test]
+    fn workspace_update_skip_isolation_accepts_deprecated_alias() {
+        // The deprecated pre-CoW `skipWorktree` alias still deserializes into
+        // the canonical field (either set ⇒ same skip behavior).
+        let update: WorkspaceUpdate =
+            serde_json::from_value(json!({ "skipWorktree": false })).unwrap();
+        assert_eq!(update.skip_isolation, Some(false));
     }
 }
