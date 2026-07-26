@@ -28,7 +28,25 @@ pub(crate) const MAX_CREDENTIAL_ATTEMPTS: u32 = 3;
 
 /// Username GitHub expects when a token is presented as an HTTPS basic-auth
 /// password (OAuth / device-flow / installation tokens alike).
-pub(crate) const TOKEN_USERNAME: &str = "x-access-token";
+pub const TOKEN_USERNAME: &str = "x-access-token";
+
+/// Environment variable carrying the caller-resolved GitHub token into a
+/// shelled-out git child's credential helper (see [`token_helper_config`]).
+/// The value never appears on the command line.
+pub const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
+
+/// The `git -c` config entry offering the resolved token as a github.com-scoped
+/// credential helper, shared by the shell-git paths (`fetch`, and the
+/// `intent-services` clone pipeline). Note the `{{`/`}}`/`{TOKEN_ENV}` are
+/// **Rust** `format!` escapes and interpolation — the shell sees a plain
+/// `"$INTENT_GIT_GITHUB_TOKEN"` expansion (no token bytes in the string
+/// itself). `|| exit 0` keeps the helper silent-but-successful for the
+/// `store`/`erase` ops git may also invoke.
+pub fn token_helper_config() -> String {
+    format!(
+        "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username={TOKEN_USERNAME}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
+    )
+}
 
 /// Whether `url` is an HTTPS remote on `github.com` (the only host the
 /// resolved-token fallback applies to). Handles optional userinfo and port in
@@ -53,7 +71,7 @@ pub fn is_https_github_url(url: &str) -> bool {
 /// (control characters — `\n`/`\r`/`\0` and friends — would corrupt either).
 /// `None`/empty/invalid all normalize to `None` so every consumer applies the
 /// same "no usable token" rule. The token value is never logged.
-pub(crate) fn usable_token(token: Option<&str>) -> Option<&str> {
+pub fn usable_token(token: Option<&str>) -> Option<&str> {
     let token = token?.trim();
     if token.is_empty() || token.chars().any(|c| c.is_control()) {
         return None;

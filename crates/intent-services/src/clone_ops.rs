@@ -11,13 +11,20 @@
 //! The URL is used at spawn time only; if the child fails, its stderr is
 //! stripped of any `user:pass@` credential fragment before being surfaced in
 //! the terminal `git:clone:done { error }` frame.
+//!
+//! A caller-resolved GitHub token (if any) is offered to the child as a
+//! `credential.https://github.com.helper` scoped to github.com only, appended
+//! after any configured helpers so existing setups keep winning. The token
+//! value travels via an environment variable — never argv, so it cannot leak
+//! through process listings or error messages (monorepo#825; same pattern as
+//! `intent_git::fetch`).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use intent_core::events::{GIT_CLONE_DONE, GIT_CLONE_PROGRESS};
-use intent_core::{expand_tilde, now_iso, Error, Result, WorkspaceId};
+use intent_core::{expand_tilde, now_iso, CloneErrorCategory, Error, Result, WorkspaceId};
 use intent_store::NewEvent;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -144,8 +151,25 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
         // `Permission denied (publickey,password).` on non-GitHub hosts.
         || m.contains("permission denied (publickey")
         || m.contains("invalid username or password")
+        // GitLab's credential rejection ("remote: HTTP Basic: Access denied.
+        // The provided password or token is incorrect…") carries no
+        // "authentication failed" prose; match it here so it does not fall
+        // through to the access-denied row — the remedy is credentials.
+        || m.contains("http basic: access denied")
     {
         return C::AuthRequired;
+    }
+    // Ordered after auth: GitHub answers 404/"Repository not found" for
+    // private repositories the presented credentials cannot see, but the
+    // agreed taxonomy still spells that `repo-not-found` (monorepo#825).
+    if m.contains("repository not found")
+        || m.contains("returned error: 404")
+        || m.contains("404: not found")
+    {
+        return C::RepoNotFound;
+    }
+    if m.contains("returned error: 403") || m.contains("access denied") {
+        return C::AccessDenied;
     }
     if m.contains("could not resolve host")
         || m.contains("network is unreachable")
@@ -180,6 +204,11 @@ pub(crate) struct CloneJob {
     pub workspace_id: Option<WorkspaceId>,
     pub url: String,
     pub target_path: PathBuf,
+    /// Caller-resolved GitHub token offered to the child git as a
+    /// github.com-scoped credential helper (monorepo#825). `None` for SSH /
+    /// non-GitHub URLs or when no token resolves; the value travels via the
+    /// environment only — never argv, never logged.
+    pub token: Option<String>,
     pub bus: EventBus,
 }
 
@@ -201,16 +230,66 @@ pub(crate) fn spawn_clone(job: CloneJob) {
 /// promoting it to `repositoryPath`. The terminal `git:clone:done` frame is
 /// still published, so remote clients observe the same event flow as
 /// `git.clone`.
-pub(crate) async fn perform_clone(job: CloneJob) -> std::result::Result<(), String> {
+pub(crate) async fn perform_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     run_clone(job).await
 }
 
-async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
+/// A failed clone with its classification already decided by [`run_clone`],
+/// so the JSON-RPC surface (`workspace.create`) and the streamed
+/// `git:clone:done` frame share one classification decision. `category` is
+/// `None` for failures that were deliberately not classified (spawn / wait
+/// errors — environmental, not git stderr); callers map that to the
+/// `clone-failed` catch-all (PROTOCOL §9.1).
+pub(crate) struct CloneFailure {
+    pub category: Option<CloneErrorCategory>,
+    /// Human-readable cause, already credential-redacted.
+    pub detail: String,
+}
+
+/// The machine-readable `errorCode` for a `git:clone:done` frame: the
+/// classified category, or `None` when classification fell through to the
+/// catch-all — the event omits the key for unclassified failures so existing
+/// consumers of the `error` prose are unaffected (§6.5, monorepo#825).
+fn classified(detail: &str) -> Option<CloneErrorCategory> {
+    match classify_clone_error(detail) {
+        CloneErrorCategory::Other => None,
+        c => Some(c),
+    }
+}
+
+/// Build the `git clone` command: argv, credential-helper config, and
+/// environment. Factored out of [`run_clone`] so tests can assert the
+/// secret-safety invariants directly — the token (when usable) is offered via
+/// a github.com-scoped `-c credential.…helper` whose config string carries no
+/// token bytes, with the value travelling through [`intent_git::auth::TOKEN_ENV`]
+/// only (monorepo#825).
+fn build_clone_command(url: &str, target_path: &Path, token: Option<&str>) -> Command {
+    let mut cmd = Command::new("git");
+    // Offer the resolved token as an extra credential helper scoped to
+    // github.com HTTPS only, appended after any configured helpers so an
+    // existing credential setup still wins (same chain as
+    // `intent_git::fetch`). The helper reads the secret from the environment
+    // — the argv below carries no token bytes.
+    if let Some(token) = intent_git::auth::usable_token(token) {
+        cmd.arg("-c").arg(intent_git::auth::token_helper_config());
+        cmd.env(intent_git::auth::TOKEN_ENV, token);
+    }
+    cmd.arg("clone")
+        .arg("--progress")
+        .arg(url)
+        .arg(target_path)
+        .env("GIT_LFS_SKIP_SMUDGE", GIT_LFS_SKIP_SMUDGE)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     let CloneJob {
         request_id,
         workspace_id,
         url,
         target_path,
+        token,
         bus,
     } = job;
     let ws = workspace_id.unwrap_or_else(|| WorkspaceId::from_string(String::new()));
@@ -231,26 +310,33 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
         }
     }
 
-    let mut cmd = Command::new("git");
-    cmd.arg("clone")
-        .arg("--progress")
-        .arg(&url)
-        .arg(&target_path)
-        .env("GIT_LFS_SKIP_SMUDGE", GIT_LFS_SKIP_SMUDGE)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+    let mut cmd = build_clone_command(&url, &target_path, token.as_deref());
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
 
+    // Spawn / wait errors are deliberately NOT run through the stderr
+    // classifier: "git spawn failed: No such file or directory" is an
+    // environmental failure, not the user-fixable `path-invalid` the prose
+    // would match. Both surfaces (the `git:clone:done` frame and the
+    // JSON-RPC error) share the `None` decision made here.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("git spawn failed: {e}");
-            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
-            return Err(msg);
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some(&msg), None),
+            )
+            .await;
+            return Err(CloneFailure {
+                category: None,
+                detail: msg,
+            });
         }
     };
     let stderr = match child.stderr.take() {
@@ -258,8 +344,16 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
         None => {
             let _ = child.kill().await;
             let msg = "git stderr not piped".to_string();
-            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
-            return Err(msg);
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some(&msg), None),
+            )
+            .await;
+            return Err(CloneFailure {
+                category: None,
+                detail: msg,
+            });
         }
     };
 
@@ -284,7 +378,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
                 progress_event(&ws, &request_id, "complete", 100, "Clone complete!"),
             )
             .await;
-            publish(&bus, &ws, done_event(&ws, &request_id, true, None)).await;
+            publish(&bus, &ws, done_event(&ws, &request_id, true, None, None)).await;
             Ok(())
         }
         Ok(Ok(status)) => {
@@ -293,24 +387,47 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
                 _ => format!("git clone failed ({})", status),
             };
             let redacted = redact_credentials(&msg);
+            let category = classified(&redacted);
             publish(
                 &bus,
                 &ws,
-                done_event(&ws, &request_id, false, Some(&redacted)),
+                done_event(&ws, &request_id, false, Some(&redacted), category),
             )
             .await;
-            Err(redacted)
+            Err(CloneFailure {
+                category,
+                detail: redacted,
+            })
         }
         Ok(Err(e)) => {
             let msg = format!("git wait failed: {e}");
-            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
-            Err(msg)
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some(&msg), None),
+            )
+            .await;
+            Err(CloneFailure {
+                category: None,
+                detail: msg,
+            })
         }
         Err(_) => {
             reap_child_group(&mut child).await;
+            // The daemon's own clone timeout is a `network`-category failure
+            // per the clone failure taxonomy (PROTOCOL §9.1).
             let msg = "git clone timed out".to_string();
-            publish(&bus, &ws, done_event(&ws, &request_id, false, Some(&msg))).await;
-            Err(msg)
+            let category = classified(&msg);
+            publish(
+                &bus,
+                &ws,
+                done_event(&ws, &request_id, false, Some(&msg), category),
+            )
+            .await;
+            Err(CloneFailure {
+                category,
+                detail: msg,
+            })
         }
     }
 }
@@ -524,12 +641,21 @@ fn done_event(
     request_id: &str,
     ok: bool,
     error: Option<&str>,
+    error_code: Option<CloneErrorCategory>,
 ) -> NewEvent {
     let mut data = json!({ "requestId": request_id, "ok": ok });
     if let Some(err) = error {
         data.as_object_mut()
             .unwrap()
             .insert("error".to_string(), json!(err));
+    }
+    // Machine-readable failure category (monorepo#825/#826): present only on
+    // classified failures so existing consumers of the `error` prose are
+    // unaffected.
+    if let Some(code) = error_code {
+        data.as_object_mut()
+            .unwrap()
+            .insert("errorCode".to_string(), json!(code.as_str()));
     }
     NewEvent {
         workspace_id: workspace_id.clone(),
@@ -728,6 +854,152 @@ mod tests {
             C::Other
         );
         assert_eq!(classify_clone_error(""), C::Other);
+    }
+
+    /// The additive `repo-not-found` / `access-denied` categories
+    /// (monorepo#825): per the agreed taxonomy, GitHub's
+    /// "Repository not found" is `repo-not-found` — NOT `auth-required` —
+    /// even though GitHub answers it for private repos the presented token
+    /// cannot see. Auth-shaped prose still wins when both appear.
+    #[test]
+    fn classify_clone_error_repo_not_found_and_access_denied() {
+        use intent_core::CloneErrorCategory as C;
+        for msg in [
+            "remote: Repository not found.",
+            "fatal: repository 'https://github.com/a/b.git/' not found. remote: Repository not found.",
+            "The requested URL returned error: 404",
+            "fatal: remote error: 404: Not Found",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::RepoNotFound, "msg: {msg}");
+        }
+        for msg in [
+            "The requested URL returned error: 403",
+            "remote: Access denied to repository.",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::AccessDenied, "msg: {msg}");
+        }
+        // Auth prose outranks the access-denied row when both appear.
+        assert_eq!(
+            classify_clone_error("remote: HTTP Basic: Access denied. Authentication failed"),
+            C::AuthRequired
+        );
+        // GitLab's credential rejection carries no "authentication failed"
+        // prose but is still an auth failure — the remedy is credentials.
+        assert_eq!(
+            classify_clone_error(
+                "remote: HTTP Basic: Access denied. The provided password or token \
+                 is incorrect or your account has 2FA enabled"
+            ),
+            C::AuthRequired
+        );
+        // Wire spellings match the clone failure taxonomy (PROTOCOL §9.1).
+        assert_eq!(C::RepoNotFound.as_str(), "repo-not-found");
+        assert_eq!(C::AccessDenied.as_str(), "access-denied");
+    }
+
+    /// Regression for monorepo#825: a usable token is offered to the clone
+    /// child via the env-backed github.com-scoped credential helper — the
+    /// token bytes never appear in argv (process listings / logs), only in
+    /// the child environment under `TOKEN_ENV`.
+    #[test]
+    fn build_clone_command_injects_token_via_env_not_argv() {
+        let token = "ghp_secret1234567890";
+        let cmd = build_clone_command(
+            "https://github.com/acme/private.git",
+            Path::new("/tmp/x"),
+            Some(token),
+        );
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.iter().all(|a| !a.contains(token)),
+            "token must never appear in argv: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("credential.https://github.com.helper=")),
+            "credential helper config present: {args:?}"
+        );
+        let env: Vec<(String, Option<String>)> = std_cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == intent_git::auth::TOKEN_ENV && v.as_deref() == Some(token)),
+            "token travels via {} only",
+            intent_git::auth::TOKEN_ENV
+        );
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "GIT_TERMINAL_PROMPT" && v.as_deref() == Some("0")),
+            "terminal prompts stay disabled"
+        );
+    }
+
+    /// No token (or an unusable one) leaves the command untouched: no helper
+    /// config in argv, no token env var.
+    #[test]
+    fn build_clone_command_without_token_adds_no_helper() {
+        for token in [None, Some(""), Some("  "), Some("bad\ntoken")] {
+            let cmd = build_clone_command(
+                "https://github.com/acme/repo.git",
+                Path::new("/tmp/x"),
+                token,
+            );
+            let std_cmd = cmd.as_std();
+            let args: Vec<String> = std_cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            assert!(
+                args.iter().all(|a| !a.contains("credential.")),
+                "no helper config without a usable token: {args:?}"
+            );
+            assert!(
+                std_cmd
+                    .get_envs()
+                    .all(|(k, _)| k.to_string_lossy() != intent_git::auth::TOKEN_ENV),
+                "no token env var without a usable token"
+            );
+        }
+    }
+
+    /// `git:clone:done` carries `errorCode` only for classified failures —
+    /// success and unclassified (`Other`) frames omit the key entirely
+    /// (§6.5).
+    #[test]
+    fn done_event_carries_error_code_only_when_classified() {
+        use intent_core::CloneErrorCategory as C;
+        let ws = WorkspaceId::from_string(String::new());
+        let ev = done_event(
+            &ws,
+            "r1",
+            false,
+            Some("terminal prompts disabled"),
+            classified("terminal prompts disabled"),
+        );
+        assert_eq!(ev.data["errorCode"], json!("auth-required"));
+        let ev = done_event(
+            &ws,
+            "r2",
+            false,
+            Some("weird failure"),
+            classified("weird failure"),
+        );
+        assert!(ev.data.get("errorCode").is_none());
+        let ev = done_event(&ws, "r3", true, None, None);
+        assert!(ev.data.get("errorCode").is_none());
+        // The daemon's own timeout message classifies as `network`.
+        assert_eq!(classified("git clone timed out"), Some(C::Network));
     }
 
     #[test]

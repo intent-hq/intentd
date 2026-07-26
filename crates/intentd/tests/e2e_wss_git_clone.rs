@@ -456,6 +456,231 @@ async fn git_clone_failure_emits_done_ok_false_over_wss() {
     );
 }
 
+/// Like [`wss_rpc`] but returns the full response frame without asserting
+/// success — for tests that assert the JSON-RPC `error` shape.
+async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// The stored GitHub token used by the credential-injection e2es. Never a
+/// real credential — asserted absent from argv and every wire frame.
+const E2E_TOKEN: &str = "e2e-825-stored-token-value";
+
+/// Materialise a stub `git` in `dir` that records its argv and the
+/// `INTENT_GIT_GITHUB_TOKEN` env var to capture files, then fails with the
+/// auth-shaped stderr `GIT_TERMINAL_PROMPT=0` produces for a private HTTPS
+/// repo. Returns the PATH value (stub dir first) for the daemon.
+fn make_stub_git(dir: &Path, capture: &Path) -> String {
+    std::fs::create_dir_all(dir).expect("mkdir stub dir");
+    let script = format!(
+        "#!/bin/sh\n\
+         for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{capture}.argv\"\n\
+         printf '%s' \"${{INTENT_GIT_GITHUB_TOKEN-}}\" > \"{capture}.token\"\n\
+         echo \"fatal: could not read Username for 'https://github.com': terminal prompts disabled\" >&2\n\
+         exit 128\n",
+        capture = capture.display()
+    );
+    let stub = dir.join("git");
+    std::fs::write(&stub, script).expect("write stub git");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// Seed a secrets file carrying the stored GitHub token and boot a daemon
+/// whose `git` is the capturing stub (monorepo#825 regression harness).
+async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
+    let data_dir = scratch_dir("data");
+    let scratch = scratch_dir("scratch");
+    let secrets = data_dir.join("secrets.json");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(
+        &secrets,
+        format!("{{\"sourceControl.github.token\":\"{E2E_TOKEN}\"}}"),
+    )
+    .unwrap();
+    let capture = scratch.join("git-capture");
+    let path = make_stub_git(&scratch.join("stub-bin"), &capture);
+    let secrets_str = secrets.to_string_lossy().to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_str),
+        ("PATH", &path),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+        scratch,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    (daemon, port, client_config(&fingerprint), capture)
+}
+
+/// Regression for monorepo#825 (credential injection): a `git.clone` of a
+/// private HTTPS github.com repo offers the stored token to the child git via
+/// the env-backed credential helper — the helper `-c` config is in argv, the
+/// token bytes are NOT (env only) — and the auth-shaped failure is classified
+/// as `errorCode: "auth-required"` on `git:clone:done` with no token leaking
+/// into any wire frame.
+#[tokio::test]
+async fn git_clone_injects_stored_token_and_classifies_auth_failure() {
+    let (daemon, port, cfg, capture) = boot_with_stub_git().await;
+    let parent_dir = daemon.scratch.join("out-auth");
+    std::fs::create_dir_all(&parent_dir).unwrap();
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let _ = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["git:clone:progress", "git:clone:done"] }),
+    )
+    .await;
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let request_id = "clone-auth-1";
+    let ack = wss_rpc(
+        &mut rpc,
+        2,
+        "git.clone",
+        json!({
+            "url": "https://github.com/acme/private-repo.git",
+            "parentDir": parent_dir.to_string_lossy(),
+            "targetName": "private-repo",
+            "requestId": request_id,
+        }),
+    )
+    .await;
+    assert_eq!(ack["requestId"], json!(request_id));
+
+    let events = drain_events(&mut sub, request_id, 30).await;
+    let done = events
+        .iter()
+        .find(|e| e["type"] == json!("git:clone:done"))
+        .cloned()
+        .expect("terminal git:clone:done event");
+    assert_eq!(done["data"]["ok"], json!(false), "done ok=false: {done}");
+    assert_eq!(
+        done["data"]["errorCode"],
+        json!("auth-required"),
+        "auth-shaped stderr is classified: {done}"
+    );
+    assert!(
+        done["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("terminal prompts disabled"),
+        "human-readable detail preserved: {done}"
+    );
+    // The token never crosses the wire in any frame.
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(
+        !serialized.contains(E2E_TOKEN),
+        "token must not leak onto the wire: {serialized}"
+    );
+
+    // The stub captured the spawn: helper config in argv, token in env only.
+    let argv =
+        std::fs::read_to_string(capture.with_extension("argv")).expect("stub git captured argv");
+    assert!(
+        argv.contains("credential.https://github.com.helper="),
+        "credential helper offered to child git: {argv}"
+    );
+    assert!(
+        !argv.contains(E2E_TOKEN),
+        "token must never appear in argv: {argv}"
+    );
+    let token = std::fs::read_to_string(capture.with_extension("token"))
+        .expect("stub git captured token env");
+    assert_eq!(
+        token, E2E_TOKEN,
+        "stored token travels via INTENT_GIT_GITHUB_TOKEN"
+    );
+}
+
+/// Regression for monorepo#825 (error classification): a `workspace.create`
+/// whose `githubUrl` clone fails auth-shaped surfaces a structured JSON-RPC
+/// error — `-32603` with `error.data = { code: "auth-required", detail }` —
+/// instead of an opaque Internal error, and the token never leaks into the
+/// response.
+#[tokio::test]
+async fn workspace_create_clone_auth_failure_maps_to_structured_error() {
+    let (daemon, port, cfg, _capture) = boot_with_stub_git().await;
+    let clone_path = daemon.scratch.join("ws-auth").join("repo");
+
+    let mut rpc = connect_ws(port, cfg).await;
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        3,
+        "workspace.create",
+        json!({
+            "title": "Private clone",
+            "githubUrl": "https://github.com/acme/private-repo.git",
+            "clonePath": clone_path.to_string_lossy(),
+        }),
+    )
+    .await;
+    let err = &resp["error"];
+    assert_eq!(err["code"], json!(-32603), "clone failure code: {resp}");
+    assert_eq!(
+        err["data"]["code"],
+        json!("auth-required"),
+        "machine-readable category: {resp}"
+    );
+    assert!(
+        err["data"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("terminal prompts disabled"),
+        "sanitized detail preserved: {resp}"
+    );
+    let serialized = resp.to_string();
+    assert!(
+        !serialized.contains(E2E_TOKEN),
+        "token must not leak into the error: {serialized}"
+    );
+}
+
 /// Missing required params → -32602.
 #[tokio::test]
 async fn git_clone_missing_params_rejected_over_wss() {

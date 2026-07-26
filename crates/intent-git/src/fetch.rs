@@ -33,22 +33,7 @@ const SHELL_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
 /// stays negligible for a long-running remote.
 const SHELL_FETCH_POLL: Duration = Duration::from_millis(50);
 
-/// Environment variable carrying the caller-resolved GitHub token into the
-/// child git's credential helper. The value never appears on the command line.
-const TOKEN_ENV: &str = "INTENT_GIT_GITHUB_TOKEN";
-
-/// The `git -c` config entry offering the resolved token as a github.com-scoped
-/// credential helper. Note the `{{`/`}}`/`{TOKEN_ENV}` are **Rust** `format!`
-/// escapes and interpolation — the shell sees a plain
-/// `"$INTENT_GIT_GITHUB_TOKEN"` expansion (no token bytes in the string
-/// itself). `|| exit 0` keeps the helper silent-but-successful for the
-/// `store`/`erase` ops git may also invoke.
-fn token_helper_config() -> String {
-    let username = crate::auth::TOKEN_USERNAME;
-    format!(
-        "credential.https://github.com.helper=!f() {{ test \"$1\" = get || exit 0; printf 'username={username}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
-    )
-}
+use crate::auth::{token_helper_config, TOKEN_ENV};
 
 /// Fetch a single `branch` from `remote` (typically `origin`), updating the local
 /// remote-tracking ref `refs/remotes/<remote>/<branch>`. `token` is an optional
