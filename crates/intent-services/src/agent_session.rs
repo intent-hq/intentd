@@ -1097,7 +1097,8 @@ impl Services {
     /// prompt turns), a `runs` increment and the turn's wall-clock duration
     /// folded into the bucket's `longest_run_ms` MAX. Counters land in the
     /// current UTC hour bucket keyed by the session's normalized model name
-    /// (`"unknown"` fallback), with no workspace dimension. MUST run BEFORE
+    /// (`"unknown"` fallback), with no workspace dimension, stamped with the
+    /// daemon's local wall-clock (D12). MUST run BEFORE
     /// `persist_turn_token_usage` replaces the session snapshot the delta is
     /// computed against — the per-agent chained bookkeeping task spawned in
     /// [`run_prompt_turn`](Self::run_prompt_turn) calls the two in that
@@ -1147,9 +1148,15 @@ impl Services {
             },
             ..Default::default()
         };
-        let bucket = usage_stats::hour_bucket_utc(time::OffsetDateTime::now_utc());
+        let now = time::OffsetDateTime::now_utc();
+        let bucket = usage_stats::hour_bucket_utc(now);
+        let local = usage_stats::recording_local_offset().map(|o| usage_stats::local_stamp(now, o));
         let model = usage_stats::normalize_model_name(model.as_deref().unwrap_or(""));
-        if let Err(e) = self.store.add_usage_stats(&bucket, &model, &delta).await {
+        if let Err(e) = self
+            .store
+            .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+            .await
+        {
             tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
         }
     }

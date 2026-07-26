@@ -11,16 +11,17 @@
 //! normalized model).
 
 use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
-use intent_store::{Store, UsageStatsDelta};
-use time::OffsetDateTime;
+use intent_store::{LocalStamp, Store, UsageStatsDelta};
+use time::{OffsetDateTime, UtcOffset};
 
 use crate::token_usage::UNKNOWN_MODEL;
 
 /// Floor `t` to its UTC hour and render the bucket key used by
 /// `usage_stats_hourly.bucket_utc`: `"YYYY-MM-DDTHH:00:00Z"`. Buckets are
-/// stored in UTC; any local-time rendering happens client-side.
+/// stored in UTC; local wall-clock grouping uses the [`LocalStamp`] recorded
+/// next to the bucket (D12).
 pub fn hour_bucket_utc(t: OffsetDateTime) -> String {
-    let t = t.to_offset(time::UtcOffset::UTC);
+    let t = t.to_offset(UtcOffset::UTC);
     format!(
         "{:04}-{:02}-{:02}T{:02}:00:00Z",
         t.year(),
@@ -28,6 +29,29 @@ pub fn hour_bucket_utc(t: OffsetDateTime) -> String {
         t.day(),
         t.hour()
     )
+}
+
+/// Render the local wall-clock stamp persisted next to a UTC bucket (D12):
+/// `t` under `offset` as a calendar date (`"YYYY-MM-DD"`) plus hour-of-day.
+pub fn local_stamp(t: OffsetDateTime, offset: UtcOffset) -> LocalStamp {
+    let l = t.to_offset(offset);
+    LocalStamp {
+        date: format!("{:04}-{:02}-{:02}", l.year(), u8::from(l.month()), l.day()),
+        hour: l.hour(),
+    }
+}
+
+/// The daemon's current system UTC offset, used by the recorders to stamp
+/// `local_date` / `local_hour` at record time. `None` when the offset cannot
+/// be determined — notably the `time` crate's soundness guard, which on some
+/// Unix platforms (e.g. Linux) refuses to read the environment-derived
+/// timezone once the process is multi-threaded. Rows then persist NULL
+/// stamps and the read side falls back to shifting `bucket_utc` by the
+/// client's `tzOffsetMinutes` — exactly the pre-D12 grouping behavior. (A
+/// UTC fallback stamp would be worse: readers prefer any well-formed stamp,
+/// so it would silently pin those rows to UTC wall-clock.)
+pub fn recording_local_offset() -> Option<UtcOffset> {
+    UtcOffset::current_local_offset().ok()
 }
 
 /// Per-turn token delta between two cumulative end-of-turn snapshots: `next`
@@ -127,13 +151,18 @@ pub fn normalize_model_name(raw: &str) -> String {
 /// Best-effort: errors are logged, never propagated — stats bookkeeping must
 /// not fail `agent.create`.
 pub async fn record_session_started(store: &Store, raw_model: Option<&str>) {
-    let bucket = hour_bucket_utc(OffsetDateTime::now_utc());
+    let now = OffsetDateTime::now_utc();
+    let bucket = hour_bucket_utc(now);
+    let local = recording_local_offset().map(|o| local_stamp(now, o));
     let model = normalize_model_name(raw_model.unwrap_or(""));
     let delta = UsageStatsDelta {
         sessions_started: 1,
         ..Default::default()
     };
-    if let Err(e) = store.add_usage_stats(&bucket, &model, &delta).await {
+    if let Err(e) = store
+        .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+        .await
+    {
         tracing::warn!(error = %e, "record session-start usage stats failed");
     }
 }
@@ -170,14 +199,19 @@ pub async fn record_lines_changed(
             None
         }
     };
-    let bucket = hour_bucket_utc(OffsetDateTime::now_utc());
+    let now = OffsetDateTime::now_utc();
+    let bucket = hour_bucket_utc(now);
+    let local = recording_local_offset().map(|o| local_stamp(now, o));
     let model = normalize_model_name(raw_model.as_deref().unwrap_or(""));
     let delta = UsageStatsDelta {
         lines_added,
         lines_deleted,
         ..Default::default()
     };
-    if let Err(e) = store.add_usage_stats(&bucket, &model, &delta).await {
+    if let Err(e) = store
+        .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+        .await
+    {
         tracing::warn!(agent = %agent_id, error = %e, "record lines-changed usage stats failed");
     }
 }
@@ -239,6 +273,37 @@ mod tests {
         // Non-UTC offsets convert to UTC before flooring.
         let t = parse("2026-01-01T00:30:00-05:00");
         assert_eq!(hour_bucket_utc(t), "2026-01-01T05:00:00Z");
+    }
+
+    #[test]
+    fn local_stamp_renders_wall_clock_date_and_hour() {
+        let t = parse("2026-12-31T23:30:00Z");
+        // A positive offset rolls the date forward past midnight…
+        let plus2 = UtcOffset::from_hms(2, 0, 0).unwrap();
+        assert_eq!(
+            local_stamp(t, plus2),
+            LocalStamp {
+                date: "2027-01-01".into(),
+                hour: 1
+            }
+        );
+        // …a negative offset stays on the previous local day…
+        let minus5 = UtcOffset::from_hms(-5, 0, 0).unwrap();
+        assert_eq!(
+            local_stamp(t, minus5),
+            LocalStamp {
+                date: "2026-12-31".into(),
+                hour: 18
+            }
+        );
+        // …and the UTC fallback stamps UTC wall-clock.
+        assert_eq!(
+            local_stamp(t, UtcOffset::UTC),
+            LocalStamp {
+                date: "2026-12-31".into(),
+                hour: 23
+            }
+        );
     }
 
     #[test]
