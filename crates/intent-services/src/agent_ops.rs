@@ -4363,11 +4363,16 @@ impl Services {
         //     replay the provider-blocked turn ("start a new session" means a
         //     fresh session). Queue for cleanup so a fresh agent is created,
         //     keeping it as the inheritance source for specialist/model.
+        //     Poisoned ids are ALSO tracked separately: their parked queues
+        //     are migrated onto the wake/create target and the dead session
+        //     is GC'd (monorepo#847). NotFound / soft-Deleted ids keep the
+        //     cleanup-only behavior.
         //   * Otherwise → treat as resumable; the newest live session wins.
         // `inheritance_source` captures the newest **known** previous session
         // (live, poisoned, or deleted) so the create branch can still inherit
         // specialist/model when no live agent is available.
         let mut cleaned_up: Vec<AgentId> = Vec::new();
+        let mut poisoned: Vec<AgentId> = Vec::new();
         let mut live_session: Option<AgentSession> = None;
         let mut inheritance_source: Option<AgentSession> = None;
         for candidate in task.assigned_agents.iter().rev().cloned() {
@@ -4389,6 +4394,7 @@ impl Services {
                             stop_reason = unusable_session.stop_reason.as_deref().unwrap_or(""),
                             "wakeOrCreate skipping poisoned session; a fresh agent will be created (monorepo#840)"
                         );
+                        poisoned.push(candidate.clone());
                     }
                     if inheritance_source.is_none() {
                         inheritance_source = Some(unusable_session);
@@ -4409,6 +4415,16 @@ impl Services {
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_default();
+            // monorepo#847: migrate poisoned siblings' parked queues onto the
+            // live target BEFORE the wake delivery below can claim a turn
+            // (its turn-end drain consumes the target queue) and before the
+            // explicit `try_drain_queue` kick. Migrating first means this
+            // call starts no consumer that could dequeue from the target
+            // mid-migration, sidestepping the helper's theoretical
+            // failure-path duplicate (the rollback restore racing a
+            // concurrent dequeue of an already-migrated entry).
+            self.migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
+                .await;
             let result = self
                 .deliver_wake_message(
                     &workspace_id,
@@ -4647,6 +4663,15 @@ impl Services {
         let agent = AgentId::from(agent_id_str.as_str());
         let _ = self
             .assign_agent(workspace_id.clone(), task_note_id, agent_id_str)
+            .await;
+        // monorepo#847: same ordering contract as the wake branch — migrate
+        // the poisoned siblings' parked queues BEFORE `deliver_wake_message`
+        // spawns the fresh agent's first turn, so no drain races the
+        // migration and the migrated messages are picked up at turn end.
+        // Specialist/model inheritance was resolved from `inheritance_source`
+        // (an owned clone captured in the candidate loop) above, before this
+        // GC hard-deletes the poisoned session row.
+        self.migrate_poisoned_queues_to(&poisoned, &agent, &workspace_id)
             .await;
         let result = self
             .deliver_wake_message(
@@ -5190,6 +5215,35 @@ impl Services {
         crate::publish_event(&self.event_bus, event).await;
     }
 
+    /// `agent.wakeOrCreate` wiring for
+    /// [`Services::migrate_queue_and_gc_poisoned_session`] (monorepo#847):
+    /// migrate each poisoned sibling's parked queue onto the wake/create
+    /// target and GC the dead session. Failures are non-fatal to the wake —
+    /// the helper's error path already rolled back the in-memory drain and
+    /// skipped GC, leaving the messages durable on exactly one queue (the
+    /// poisoned one) so a later wake can retry; log WARN and continue.
+    async fn migrate_poisoned_queues_to(
+        &self,
+        poisoned: &[AgentId],
+        target: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        for poisoned_id in poisoned {
+            if let Err(e) = self
+                .migrate_queue_and_gc_poisoned_session(poisoned_id, target, workspace_id)
+                .await
+            {
+                tracing::warn!(
+                    poisoned = %poisoned_id,
+                    target = %target,
+                    error = %e,
+                    "wakeOrCreate: poisoned-session queue migration/GC failed; \
+                     continuing with the wake (monorepo#847)"
+                );
+            }
+        }
+    }
+
     /// Migrate a poisoned session's parked queue onto a replacement agent,
     /// then GC the poisoned session via the hard-delete path (monorepo#847).
     ///
@@ -5223,9 +5277,6 @@ impl Services {
     /// migrated messages.
     ///
     /// [`Store::move_agent_queue`]: intent_store::Store::move_agent_queue
-    // TODO(monorepo#847): drop the allow once `agent_wake_or_create_op`
-    // wires this in (follow-up change on this branch).
-    #[allow(dead_code)]
     pub(crate) async fn migrate_queue_and_gc_poisoned_session(
         &self,
         poisoned_id: &AgentId,
