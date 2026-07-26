@@ -3461,12 +3461,13 @@ impl AgentManager {
     }
 
     /// One idle-listener poll: consume an out-of-turn `session/update` (if
-    /// any) into an implicit harness-wake turn. Returns `false` when the
-    /// agent's handle is gone (the listener exits). Skips the tick — leaving
-    /// buffered notifications untouched — while the wake gate is raised
-    /// (`start_session` resume-replay in flight), while a prompt turn owns
-    /// the single-flight slot, or when the receiver is locked by another
-    /// consumer.
+    /// any) into an implicit harness-wake turn, driven by a task registered
+    /// in `workers` so the interrupt/stop abort paths apply to it. Returns
+    /// `false` when the agent's handle is gone (the listener exits). Skips
+    /// the tick — leaving buffered notifications untouched — while the wake
+    /// gate is raised (`start_session` resume-replay in flight), while a
+    /// prompt turn owns the single-flight slot, or when the receiver is
+    /// locked by another consumer.
     async fn wake_listener_tick(
         self: &Arc<Self>,
         agent_id: &AgentId,
@@ -3485,17 +3486,29 @@ impl AgentManager {
         if self.busy.lock().unwrap().contains(agent_id) {
             return true;
         }
-        let Ok(mut guard) = notes.try_lock() else {
+        // Owned lock so the claimed path below can move the receiver guard
+        // into the spawned drive task with no unlock/relock gap another
+        // consumer could slip into.
+        let Ok(mut guard) = notes.try_lock_owned() else {
             return true;
         };
         let Ok(first) = guard.try_recv() else {
             return true;
         };
-        // Only a mappable `session/update` opens a turn; anything else is
-        // dropped — the same net effect as the prompt path, where
-        // `route_notification` ignores unmappable notifications.
-        if intent_acp::session::map_notification(&first).is_none() {
-            return true;
+        // Only a `session/update` that materializes transcript content opens
+        // a turn: a chunk, or a tool call with a derivable name. Everything
+        // else is dropped — unmappable variants for parity with the prompt
+        // path (`route_notification` ignores them), and name-less tool-call
+        // first-sights because the fresh wake transcript's `record_tool`
+        // drops them anyway (the STAB-124 late `tool_call_update` echoes
+        // that outlast the interrupt drain window): opening on one would
+        // emit a phantom `stream:start`/`stream:end` pair with no content
+        // and pin the busy slot for the settle window.
+        match intent_acp::session::map_notification(&first) {
+            Some(intent_acp::session::MappedUpdate::Chunk { .. }) => {}
+            Some(intent_acp::session::MappedUpdate::ToolCall(ref tc))
+                if !tc.tool_name.trim().is_empty() => {}
+            _ => return true,
         }
         // Claim the single-flight slot so a racing `agent.sendMessage` queues
         // instead of interleaving. On the rare loss (a send claimed the slot
@@ -3506,36 +3519,43 @@ impl AgentManager {
         // active/idle marks, slot release, idle emit, queue drain) to the
         // prompt turn that won the slot: marking idle here would flag the
         // process eviction-eligible (and pop a spawn waiter) mid-prompt-turn.
-        let claimed = self.try_begin(agent_id, workspace_id).await;
-        let settle = if claimed {
-            HARNESS_WAKE_SETTLE
-        } else {
-            Duration::ZERO
-        };
-        if claimed {
-            self.registry.mark_active(agent_id);
-        }
-        self.services
-            .run_harness_wake_turn(&mut guard, first, agent_id, workspace_id, settle)
-            .await;
-        if claimed {
-            self.registry.mark_idle(agent_id);
-        }
-        drop(guard);
-        if claimed {
-            self.end_turn(agent_id).await;
+        if !self.try_begin(agent_id, workspace_id).await {
             self.services
-                .publish_harness_wake_idle(agent_id, workspace_id)
+                .run_harness_wake_turn(&mut guard, first, agent_id, workspace_id, Duration::ZERO)
                 .await;
+            return true;
+        }
+        self.registry.mark_active(agent_id);
+        // Drive the turn in its own task registered in `workers`, so
+        // `interrupt` / `interrupt_send_message` / `stop` abort an open wake
+        // turn with the same snapshot→abort→flush semantics as a prompt turn
+        // (the abort drops the receiver guard + LiveTurnGuard; the interrupt
+        // path then flushes the partial row, releases the slot, and emits
+        // the terminal `stream:end`). The busy slot stays held until this
+        // task's own `end_turn`, so subsequent listener ticks skip while the
+        // turn is open.
+        let mgr = self.clone();
+        let (id, ws) = (agent_id.clone(), workspace_id.clone());
+        let drive = tokio::spawn(async move {
+            mgr.services
+                .run_harness_wake_turn(&mut guard, first, &id, &ws, HARNESS_WAKE_SETTLE)
+                .await;
+            mgr.registry.mark_idle(&id);
+            drop(guard);
+            // Deregister BEFORE releasing the slot: while the slot is held
+            // no concurrent send can spawn (and register) a prompt worker,
+            // so this provably removes only this task's own entry.
+            mgr.clear_worker(&id);
+            mgr.end_turn(&id).await;
+            mgr.services.publish_harness_wake_idle(&id, &ws).await;
             // A user send that raced in queued behind this turn's slot; with
             // the slot released, kick the self-drain so it streams now
             // (handoff: the drained prompt turn locks the receiver next).
-            if self.services.has_ready_to_send(agent_id) {
-                self.clone()
-                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                    .await;
+            if mgr.services.has_ready_to_send(&id) {
+                mgr.clone().try_drain_queue(id, ws).await;
             }
-        }
+        });
+        self.workers.lock().unwrap().insert(agent_id.clone(), drive);
         true
     }
 

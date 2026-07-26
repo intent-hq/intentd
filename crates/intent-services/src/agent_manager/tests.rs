@@ -6218,6 +6218,21 @@ mod harness_wake_tests {
         }
     }
 
+    /// A title-less `tool_call_update` first-sight — the STAB-124 late echo a
+    /// cancelled child emits after the interrupt drain window. Mappable, but
+    /// name-less: the transcript's `record_tool` drops it, so it must not
+    /// open a phantom implicit turn.
+    fn titleless_tool_update_note() -> IncomingNotification {
+        IncomingNotification {
+            method: "session/update".to_string(),
+            params: json!({
+                "sessionId": "acp-wake",
+                "update": { "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc_stale", "status": "failed" }
+            }),
+        }
+    }
+
     async fn wake_setup() -> (
         TempDb,
         Arc<AgentManager>,
@@ -6343,6 +6358,117 @@ mod harness_wake_tests {
         assert!(!mgr.is_busy(&id), "slot never claimed");
     }
 
+    /// A title-less `tool_call_update` first-sight (STAB-124 late echo) maps
+    /// to `MappedUpdate::ToolCall` but produces no transcript content, so it
+    /// must not open a phantom turn: no `stream:start`/`stream:end` pair, no
+    /// rows, slot untouched.
+    #[tokio::test]
+    async fn titleless_tool_update_opens_no_phantom_turn() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(titleless_tool_update_note()).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+
+        assert!(
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
+            "no events published for a name-less tool-call first-sight"
+        );
+        assert!(
+            mgr.services
+                .store
+                .get_agent_messages(&id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no assistant row persisted"
+        );
+        assert!(!mgr.is_busy(&id), "slot never claimed");
+    }
+
+    /// `interrupt` aborts an open wake turn like a prompt turn: the drive
+    /// task registered in `workers` is aborted, the streamed-so-far content
+    /// is flushed as an interrupted row, the slot is released, and the single
+    /// terminal `agent:stream:end` carries `stopReason: "interrupted"` — no
+    /// duplicate finalize from the aborted wake turn.
+    #[tokio::test]
+    async fn interrupt_aborts_open_wake_turn() {
+        let (_tmp, mgr, bus, id, ws, note_tx) = wake_setup().await;
+        mgr.services
+            .store
+            .set_acp_session_id(&ws, &id, "acp-wake")
+            .await
+            .unwrap();
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        note_tx.send(chunk_note("partial wake output")).unwrap();
+        assert!(mgr.wake_listener_tick(&id, &ws).await);
+        assert!(
+            mgr.workers.lock().unwrap().contains_key(&id),
+            "wake-turn drive registered in workers"
+        );
+
+        // Wait until the chunk is routed (live-turn slot has content), then
+        // interrupt mid-settle-window.
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:chunk")
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| e.event_type == "agent:stream:chunk"),
+            "wake turn streamed the chunk"
+        );
+        assert!(mgr.interrupt(&id).await, "interrupt found the agent");
+
+        let events = collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
+        let ends: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "agent:stream:end")
+            .collect();
+        assert_eq!(ends.len(), 1, "exactly one terminal stream:end");
+        assert_eq!(ends[0].data["stopReason"], json!("interrupted"));
+        let message_id = ends[0].data["messageId"]
+            .as_str()
+            .expect("interrupt flush persisted the partial row");
+
+        // Give the aborted drive task time to have emitted a duplicate
+        // finalize if the abort had not landed (its settle window elapses).
+        tokio::time::sleep(crate::agent_manager::HARNESS_WAKE_SETTLE + Duration::from_millis(100))
+            .await;
+        let mut late: Vec<intent_core::Event> = Vec::new();
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+            late.extend(batch);
+        }
+        assert!(
+            !late.iter().any(|e| e.event_type == "agent:stream:end"),
+            "no duplicate stream:end from the aborted wake turn (got: {late:?})"
+        );
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "one interrupted assistant row");
+        assert_eq!(messages[0].id, message_id);
+        assert_eq!(messages[0].content[0]["text"], json!("partial wake output"));
+        assert!(!mgr.is_busy(&id), "interrupt released the slot");
+        assert!(
+            mgr.workers.lock().unwrap().get(&id).is_none(),
+            "aborted drive deregistered from workers"
+        );
+        assert!(
+            mgr.services.live_turn(&id).is_none(),
+            "live-turn slot cleared by the interrupt flush"
+        );
+    }
+
     /// A raised wake gate (resume-replay in flight) pauses the listener: the
     /// buffered notification is left untouched for the replay drain, and the
     /// tick opens nothing. Lowering the gate re-enables the listener.
@@ -6377,9 +6503,14 @@ mod harness_wake_tests {
         }
         gate.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
-        // Gate lowered → a later out-of-turn burst opens a turn normally.
+        // Gate lowered → a later out-of-turn burst opens a turn normally
+        // (the tick spawns the drive task; wait for its finalize).
         note_tx.send(chunk_note("live")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
+        collect_until(&mut sub, |seen| {
+            seen.iter().any(|e| e.event_type == "agent:stream:end")
+        })
+        .await;
         let messages = mgr
             .services
             .store

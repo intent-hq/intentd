@@ -1358,9 +1358,12 @@ impl Services {
     /// is the notification that woke the idle listener; further updates are
     /// drained from `notifications` until the settle window (`settle`) elapses
     /// with no traffic — quiescence finalizes the turn. There is no
-    /// `session/prompt` in flight, so quiescence is the only normal exit; a
-    /// preempting prompt turn aborts the driving worker instead (the
-    /// interrupt/abort flush semantics then apply, same as a prompt turn).
+    /// `session/prompt` in flight, so the normal exits are quiescence and a
+    /// user send racing in (a ready-to-send message breaks the drain early so
+    /// the queued prompt turn starts promptly). An `interrupt` /
+    /// `interrupt_send_message` / `stop` instead aborts the drive task the
+    /// caller registered in `AgentManager::workers`, so the interrupt
+    /// snapshot→abort→flush semantics apply, same as a prompt turn.
     ///
     /// Emits `agent:stream:start` `{ agentId, messageId, reason: "harness-wake" }`
     /// before routing, streams via the same [`route_notification`] path
