@@ -676,6 +676,18 @@ async fn prompt_turn_streams_events_and_accumulates() {
     assert_eq!(tool.data["blockId"], json!(format!("{mid}:1")));
     assert_eq!(tool.data["blockIndex"], json!(1));
     assert_eq!(tool.data["messageId"], json!(mid));
+
+    // The terminal stream:end carries the turn's messageId; `trailingBlocks`
+    // is omitted when no AtTurnEnd attachments were drained (monorepo#732).
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .unwrap();
+    assert_eq!(end.data["messageId"], json!(mid));
+    assert!(
+        end.data.get("trailingBlocks").is_none(),
+        "trailingBlocks omitted on a turn without AtTurnEnd attachments"
+    );
 }
 
 /// DELIV-1: when the session carries a `completion_report` (persisted by
@@ -1341,11 +1353,14 @@ async fn registered_attachment_survives_garbled_tool_echo() {
 /// §7.1 `AtTurnEnd` policy: attachments registered with the turn-end policy
 /// are appended as trailing resource blocks when the turn finalizes, and
 /// unclaimed `AtToolResult` leftovers are dropped (not attached, not leaked
-/// to a later turn).
+/// to a later turn). The terminal `agent:stream:end` carries the drained
+/// blocks live as `trailingBlocks` — byte-identical to the persisted blocks —
+/// plus the turn's `messageId` (monorepo#732 fix wave).
 #[tokio::test]
 async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let (conn, mut note_rx, _agent) = connect_with(prompt_updates());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
     let registry = services.turn_attachments();
     registry.register(
         &agent_id,
@@ -1390,6 +1405,28 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
     );
     // Registry fully drained — nothing leaks into a later turn.
     assert!(registry.finish_turn(&agent_id).is_empty());
+
+    // The terminal stream:end delivers the drained blocks LIVE: the FE
+    // finalizes the in-flight message from accumulated chunks at stream-end,
+    // so blocks appended only after the stream loop would otherwise never
+    // reach it without a refetch.
+    let mut end_event = None;
+    while end_event.is_none() {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        end_event = batch
+            .into_iter()
+            .find(|e| e.event_type == "agent:stream:end");
+    }
+    let end = end_event.unwrap();
+    assert_eq!(end.data["messageId"], json!(messages[0].id));
+    assert_eq!(
+        end.data["trailingBlocks"],
+        json!([last.clone()]),
+        "trailingBlocks are byte-identical to the persisted trailing blocks"
+    );
 }
 
 /// STAB-124 regression: a stale `tool_call_update` for a toolCallId this turn
