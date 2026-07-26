@@ -1886,7 +1886,7 @@ async fn detached_bookkeeping_chains_per_agent_across_turns() {
     handle.await.expect("bookkeeping task completes");
 
     // The turn's newer snapshot survives — the late predecessor did not win.
-    let (_model, _provider, snapshot) = bus
+    let (_model, _resolved, _provider, snapshot) = bus
         .store()
         .get_agent_session_token_usage(&workspace_id, &agent_id)
         .await
@@ -1923,6 +1923,8 @@ fn claude_code_session_result() -> Value {
                   "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
                 { "value": "opus[1m]", "name": "Opus",
                   "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks" },
+                { "value": "claude-fable-5[1m]", "name": "Fable",
+                  "description": "Fable 5 with 1M context · Powerful model for complex work" },
                 { "value": "sonnet", "name": "Sonnet",
                   "description": "Sonnet 5 · Efficient for routine tasks" }
               ] }
@@ -1960,7 +1962,9 @@ async fn open_session_resolves_and_persists_effective_model() {
 }
 
 /// D13: an explicitly selected (non-placeholder) stored model is NEVER
-/// overwritten by the session-open resolution.
+/// overwritten by the session-open resolution. D14: its display identity IS
+/// resolved from the same option list into the separate `resolved_model`
+/// column (raw id `sonnet` → option description "Sonnet 5 · …" → "Sonnet 5").
 #[tokio::test]
 async fn open_session_never_overwrites_explicit_model() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
@@ -1983,6 +1987,76 @@ async fn open_session_never_overwrites_explicit_model() {
         Some("claude-code:sonnet"),
         "explicit model untouched"
     );
+    let (_, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(
+        resolved.as_deref(),
+        Some("Sonnet 5"),
+        "explicit pick's display identity persisted separately (D14)"
+    );
+}
+
+/// D14: a bracketed explicit pick (`claude-code:claude-fable-5[1m]`) resolves
+/// its display identity ("Fable 5") from the matching option entry — the
+/// version-less name "Fable" is skipped for the version-bearing description —
+/// while the raw stored id keeps driving provider configuration.
+#[tokio::test]
+async fn open_session_resolves_explicit_bracketed_pick_display_model() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d14-fable");
+    session.model = Some("claude-code:claude-fable-5[1m]".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    let opened = services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    assert!(opened.effective_model.is_none(), "D13 branch not taken");
+    let stored = bus.store().get_agent_session(&session.id).await.unwrap();
+    assert_eq!(
+        stored.model.as_deref(),
+        Some("claude-code:claude-fable-5[1m]"),
+        "raw explicit id untouched — still drives provider configuration"
+    );
+    let (_, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(resolved.as_deref(), Some("Fable 5"));
+}
+
+/// D14: an explicit id with no matching option entry persists no resolution —
+/// stats fall back to normalizing the raw id.
+#[tokio::test]
+async fn open_session_unmatched_explicit_pick_persists_no_resolution() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let mut session = new_session(&agent_id, &ws);
+    session.id = AgentId::from("agent-d14-unmatched");
+    session.model = Some("claude-code:claude-haiku-4-5".to_string());
+    bus.store()
+        .insert_agent_session(&session)
+        .await
+        .expect("insert");
+    let (conn, _rx, _agent) = connect_with_session_result(claude_code_session_result());
+    services
+        .open_acp_session(&conn, &session.id, "/tmp/ws", Vec::new())
+        .await
+        .expect("open session");
+    let (model, resolved, _, _) = bus
+        .store()
+        .get_agent_session_token_usage(&ws, &session.id)
+        .await
+        .expect("read resolved model");
+    assert_eq!(model.as_deref(), Some("claude-code:claude-haiku-4-5"));
+    assert_eq!(resolved, None);
 }
 
 /// D13: a NULL stored model resolves too, persisting the compound id with

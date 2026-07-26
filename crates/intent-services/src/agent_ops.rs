@@ -1696,6 +1696,17 @@ impl Services {
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        // The stored model changed, so any persisted display resolution (D14)
+        // now names the wrong model — clear it; the next session open
+        // re-resolves against the new id. Best-effort: the setModel itself
+        // already landed.
+        if let Err(e) = self
+            .store
+            .clear_agent_session_resolved_model(&workspace_id, &agent_id)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
+        }
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,

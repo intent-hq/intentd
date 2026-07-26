@@ -44,8 +44,9 @@ use crate::IncomingNotification;
 // directly (§3.2 keeps that crate an `intent-acp` implementation detail).
 pub use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeResponse, LoadSessionResponse, McpServer, Meta, NewSessionResponse,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionMode, SessionModeState, SessionUpdate, StopReason, Usage,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionMode, SessionModeState,
+    SessionUpdate, StopReason, Usage,
 };
 
 /// Timeout for session setup requests (`session/new`, `session/load`). Generous
