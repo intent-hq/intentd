@@ -2,6 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
+<<<<<<< Updated upstream
+=======
+## [0.2.8] - 2026-07-26
+
+### 🚀 Features
+
+- Structured error.data for unresolvable base ref (monorepo#761) ([#525](https://github.com/intent-hq/intentd/pull/525))
+- Local wall-clock bucketing for usage stats (D12) ([#544](https://github.com/intent-hq/intentd/pull/544))
+- System.capabilities RPC exposing machine-level cowSupported (protocol 2.3) ([#549](https://github.com/intent-hq/intentd/pull/549))
+
+### 🐛 Bug Fixes
+
+- Include archived workspaces in the workspace.subscribe snapshot
+- Detect dead ACP child processes and recover transparently ([#764](https://github.com/intent-hq/intentd/pull/764)) ([#523](https://github.com/intent-hq/intentd/pull/523))
+- Rename skipWorktree -> skipIsolation in workspace.update params ([#533](https://github.com/intent-hq/intentd/pull/533))
+- CowSupported probe default-root fallback + CoW-to-worktree creation fallback ([#540](https://github.com/intent-hq/intentd/pull/540))
+- Scrub phantom anchor markers and support overlapping comment ranges ([#541](https://github.com/intent-hq/intentd/pull/541))
+- Emit completionReport alongside report on wake/idle payloads ([#548](https://github.com/intent-hq/intentd/pull/548))
+
+
+## [0.2.7] - 2026-07-25
+
+### 🚀 Features
+
+- BaseRef-aware PR-workspace matching (intent-hq/monorepo#459)
+- Add hidden flag to specialist definitions ([#471](https://github.com/intent-hq/intentd/pull/471))
+- Turn-attachment registry for deterministic resource-block attach ([#482](https://github.com/intent-hq/intentd/pull/482))
+- Carry stopReason and messageId on interrupt agent:stream:end ([#492](https://github.com/intent-hq/intentd/pull/492))
+- Capture live token usage from ACP turn end ([#485](https://github.com/intent-hq/intentd/pull/485))
+- Expose workspace archive/unarchive on the agent MCP bridge ([#733](https://github.com/intent-hq/intentd/pull/733)) ([#499](https://github.com/intent-hq/intentd/pull/499))
+- Make comment.respond reply-anchoring contract explicit (monorepo#729) ([#496](https://github.com/intent-hq/intentd/pull/496))
+- Carry isBackground on agent:idle payload ([#501](https://github.com/intent-hq/intentd/pull/501))
+- Opt-in CoW workspace provisioning (cowIsolation checkouts, checkoutMode, sandboxes) ([#507](https://github.com/intent-hq/intentd/pull/507))
+- Comment.add accepts optional client-supplied commentId ([#514](https://github.com/intent-hq/intentd/pull/514))
+
+### 🐛 Bug Fixes
+
+- Comment.getThread/resolveThread/list caller-input errors return -32602 (intent-hq/monorepo#649)
+- *(test)* Scale fixed 5s daemon-read timeouts by the shared test budget (intent-hq/monorepo#615) ([#457](https://github.com/intent-hq/intentd/pull/457))
+- Reject review-requested filter on github.issues.search (intent-hq/monorepo#551) ([#462](https://github.com/intent-hq/intentd/pull/462))
+- Include script:output in ephemeral event retention sweep (monorepo#620) ([#432](https://github.com/intent-hq/intentd/pull/432))
+- Inherit hidden flag across specialist tiers ([#480](https://github.com/intent-hq/intentd/pull/480))
+- Use UTF-16 offset kind and recover poisoned CRDT sessions mutex (monorepo#721) ([#487](https://github.com/intent-hq/intentd/pull/487))
+- Route line-attribution:updated through the transient publish path (monorepo#720) ([#488](https://github.com/intent-hq/intentd/pull/488))
+- Auto-activate incremental auto_vacuum at daemon startup (monorepo#720) ([#500](https://github.com/intent-hq/intentd/pull/500))
+- Emit full applied delta on workspace archive/unarchive ([#508](https://github.com/intent-hq/intentd/pull/508))
+- Statically link vendored OpenSSL on macOS so packaged intentd runs without Homebrew (intent-hq/monorepo#776)
+
+### ⚡ Performance
+
+- Relax sweep cadences and pause between workspaces (monorepo#703) ([#465](https://github.com/intent-hq/intentd/pull/465))
+
+### 🧪 Testing
+
+- Deflake queue-drain event-order race in e2e_wss_agent_lifecycle (monorepo#456) ([#459](https://github.com/intent-hq/intentd/pull/459))
+
+
+>>>>>>> Stashed changes
 ## [0.2.6] - 2026-07-24
 
 ### 🚀 Features
