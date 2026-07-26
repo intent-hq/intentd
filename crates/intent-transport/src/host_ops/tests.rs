@@ -173,6 +173,28 @@ fn list_directory_with_expands_tilde() {
 }
 
 #[test]
+fn list_directory_with_expands_tilde_subpath() {
+    // Regression coverage for monorepo#824: a typed `~/sub` path must resolve
+    // under `home`, and the returned `path`/`parent` must be fully expanded so
+    // the FE picker can navigate from the listing.
+    let home = unique_temp_dir("ls-tilde-sub");
+    let sub = home.join("sub");
+    std::fs::create_dir_all(sub.join("nested")).unwrap();
+    let v = list_directory_with(Some("~/sub"), &home).unwrap();
+    assert_eq!(v["path"], sub.to_string_lossy().into_owned());
+    assert_eq!(v["parent"], home.to_string_lossy().into_owned());
+    assert_eq!(v["home"], home.to_string_lossy().into_owned());
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "nested");
+    assert_eq!(
+        entries[0]["path"],
+        sub.join("nested").to_string_lossy().into_owned()
+    );
+    assert_eq!(entries[0]["isDirectory"], true);
+}
+
+#[test]
 fn list_directory_with_returns_error_for_missing_path() {
     let home = unique_temp_dir("ls-missing");
     let missing = home.join("nope");
