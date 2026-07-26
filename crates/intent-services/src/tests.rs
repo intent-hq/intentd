@@ -2369,13 +2369,22 @@ async fn comment_add_overlapping_ranges_interleave_and_survive_roundtrip() {
     let note = svc.get_note(ws.clone(), id.clone()).await.expect("get");
     assert_eq!(note.content, interleaved);
 
-    // Stored rows: healthy, and no raw marker text in anchorText/context.
+    // Stored rows: healthy, and no raw marker text — not even clipped
+    // fragments — in anchorText/context. c1's start marker sits immediately
+    // before c2's span, exactly the adjacency that used to leak a clipped
+    // marker tail into `anchor_before` (PR #541 review).
     let row2 = fetch_comment_by_id(&svc, &ws, &id, &c2.comment_id).await;
     assert_ne!(row2.is_orphaned, Some(true));
     assert_eq!(row2.anchor_text.as_deref(), Some("beta gamma"));
     let ctx = row2.anchor_context.expect("context persisted");
-    assert!(!ctx.before.contains("<!--"), "before: {:?}", ctx.before);
-    assert!(!ctx.after.contains("<!--"), "after: {:?}", ctx.after);
+    for (label, s) in [("before", &ctx.before), ("after", &ctx.after)] {
+        assert!(!s.contains("<!--"), "{label}: {s:?}");
+        assert!(!s.contains(":start-->"), "{label}: {s:?}");
+        assert!(!s.contains(":end-->"), "{label}: {s:?}");
+        assert!(!s.contains(&c1.comment_id), "{label}: {s:?}");
+    }
+    assert_eq!(ctx.before, "alpha ");
+    assert_eq!(ctx.after, " delta");
 
     // Round-trip: a note edit runs the reanchor + scrub pass; the interleaved
     // pairs are live and must survive verbatim, both comments staying healthy.
@@ -2396,6 +2405,28 @@ async fn comment_add_overlapping_ranges_interleave_and_survive_roundtrip() {
         let row = fetch_comment_by_id(&svc, &ws, &id, cid).await;
         assert_ne!(row.is_orphaned, Some(true), "{cid} must stay healthy");
     }
+
+    // Other adjacency: a marker starting exactly at `to` (c1's end marker
+    // sits right after "beta") must not leak into `anchor_after` either.
+    let c3 = svc
+        .comment_add(
+            ws.clone(),
+            id.clone(),
+            "alpha beta gamma".into(),
+            "beta".into(),
+            "third".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("third add");
+    let row3 = fetch_comment_by_id(&svc, &ws, &id, &c3.comment_id).await;
+    let ctx3 = row3.anchor_context.expect("context persisted");
+    assert_eq!(ctx3.before, "alpha ");
+    assert_eq!(ctx3.after, " gamma DELTA");
 }
 
 /// Round 15: documentation-literal marker text (non-UUID id) is ordinary user

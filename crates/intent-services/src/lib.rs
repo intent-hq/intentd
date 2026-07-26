@@ -10898,11 +10898,16 @@ impl WorkspaceApi for Services {
                     // Validated inside the idempotency scope so a replayed key
                     // still returns the cached result before these checks fire.
                     let client_supplied_id = comment_id.is_some();
+                    // Canonical hyphenated form required (not just any
+                    // `Uuid::parse_str`-accepted spelling): the phantom scrub
+                    // in `note_ops` only recognizes canonical ids inside
+                    // markers, so a looser form here would mint markers the
+                    // reanchor pass can never classify or clean up.
                     let comment_id = match comment_id {
                         Some(supplied) => {
-                            if uuid::Uuid::parse_str(&supplied).is_err() {
+                            if !note_ops::is_canonical_uuid(&supplied) {
                                 return Err(Error::InvalidParams(format!(
-                                    "Invalid 'commentId': {supplied}. Must be a valid UUID."
+                                    "Invalid 'commentId': {supplied}. Must be a canonical hyphenated UUID."
                                 )));
                             }
                             supplied
@@ -10940,13 +10945,14 @@ impl WorkspaceApi for Services {
                     // `markdown-anchor-recovery.ts`). This is Audit D M1: the
                     // saved context lets a later note edit re-anchor a
                     // partial-marker survivor without needing note versions.
-                    let ctx_before = note_ops::strip_anchor_marker_text(
-                        &note_ops::context_before(&note.content, from),
-                    );
-                    let ctx_after = note_ops::strip_anchor_marker_text(&note_ops::context_after(
-                        &note.content,
-                        to,
-                    ));
+                    // Markers are stripped from the FULL prefix/suffix before
+                    // the window is taken: a marker adjacent to `from`/`to`
+                    // would otherwise be clipped by the 50-char window and
+                    // its raw fragment survive the strip (PR #541 review).
+                    let clean_prefix = note_ops::strip_anchor_marker_text(&note.content[..from]);
+                    let ctx_before = note_ops::context_before(&clean_prefix, clean_prefix.len());
+                    let clean_suffix = note_ops::strip_anchor_marker_text(&note.content[to..]);
+                    let ctx_after = note_ops::context_after(&clean_suffix, 0);
                     note.content = format!(
                         "{}<!--anchor:{id}:start-->{anchored}<!--anchor:{id}:end-->{}",
                         &note.content[..from],

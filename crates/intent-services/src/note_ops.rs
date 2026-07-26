@@ -979,9 +979,10 @@ const ANCHOR_MARKER_PREFIX: &str = "<!--anchor:";
 
 /// True when `id` is a canonical hyphenated UUID (`8-4-4-4-12` hex digits).
 /// Real anchor markers always carry a UUID id (`comment.add` mints v4 UUIDs
-/// and validates client-supplied ids); anything else — e.g. the literal
-/// `{id}` in documentation examples — is ordinary user content.
-fn is_uuid_id(id: &str) -> bool {
+/// and validates client-supplied ids against this same canonical form);
+/// anything else — e.g. the literal `{id}` in documentation examples — is
+/// ordinary user content.
+pub fn is_canonical_uuid(id: &str) -> bool {
     let b = id.as_bytes();
     if b.len() != 36 {
         return false;
@@ -1000,7 +1001,7 @@ fn parse_uuid_anchor_marker(rest: &str) -> Option<(&str, usize)> {
     let after = rest.strip_prefix(ANCHOR_MARKER_PREFIX)?;
     let colon = after.find(':')?;
     let id = &after[..colon];
-    if !is_uuid_id(id) {
+    if !is_canonical_uuid(id) {
         return None;
     }
     let tail = &after[colon + 1..];
@@ -1016,6 +1017,12 @@ fn parse_uuid_anchor_marker(rest: &str) -> Option<(&str, usize)> {
 /// comments' markers: raw marker text must never leak into comment rows.
 /// Runs to a fixpoint so removals that concatenate into new marker text are
 /// also caught.
+///
+/// Removal is greedy from `<!--anchor:` to the NEXT `-->` anywhere in the
+/// string — deliberately looser than [`parse_uuid_anchor_marker`]: an
+/// unterminated lookalike followed by a real marker is one HTML comment in
+/// rendered markdown, so the whole run (including text between them) is
+/// dropped, matching what a renderer would hide.
 pub fn strip_anchor_marker_text(s: &str) -> String {
     let mut cur = s.to_string();
     loop {
