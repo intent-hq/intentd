@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 rand = "0.9.5"
 tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

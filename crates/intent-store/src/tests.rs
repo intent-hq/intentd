@@ -737,6 +737,99 @@ async fn append_note_version_detaches_conn_on_failed_body_error_rollback() {
     assert_eq!(v, 1);
 }
 
+/// Captures WARN-level tracing events as flat `field=value` strings so tests
+/// can assert on the poisoned-connection event (monorepo#711) without a
+/// `tracing-subscriber` dev-dependency.
+struct WarnCapture {
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor<'a>(&'a mut String);
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{}={:?} ", field.name(), value);
+            }
+        }
+        let mut line = String::new();
+        event.record(&mut Visitor(&mut line));
+        self.events.lock().unwrap().push(line);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Regression for monorepo#711: when the detach+close path of
+/// `rollback_or_poison` fires (failed ROLLBACK after a failed body, per the
+/// #680 repro above), it must emit a WARN-level tracing event carrying the
+/// ROLLBACK error instead of dropping it silently.
+#[tokio::test]
+async fn rollback_or_poison_emits_warn_on_detach() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let note = task_note(&ws_id, "Note", None);
+    store.insert_note(&note).await.expect("insert note");
+    let author = NoteVersionAuthor {
+        id: "system".to_string(),
+        name: "intentd".to_string(),
+        author_type: "system".to_string(),
+    };
+    let ts = now_iso();
+
+    // Arm the trap: the version INSERT fails its own statement and rolls
+    // the whole transaction back, so the explicit ROLLBACK finds none open.
+    sqlx::query(
+        "CREATE TRIGGER rollback_trap AFTER INSERT ON note_version BEGIN
+             SELECT RAISE(ROLLBACK, 'rollback trap');
+         END",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("create trap trigger");
+
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(WarnCapture {
+        events: captured.clone(),
+    });
+    store
+        .append_note_version(&note, &author, &ts)
+        .await
+        .expect_err("INSERT must fail on the rollback trigger");
+    drop(_guard);
+
+    // The detach path fired (pool size dropped to 0) and emitted a WARN
+    // event carrying the ROLLBACK error text.
+    assert_eq!(store.write_pool().size(), 0);
+    let events = captured.lock().unwrap();
+    let warn = events
+        .iter()
+        .find(|e| e.contains("rollback_error="))
+        .unwrap_or_else(|| panic!("no poisoned-connection WARN captured; got: {events:?}"));
+    assert!(
+        warn.contains("cannot rollback"),
+        "WARN must include the ROLLBACK error, got: {warn}"
+    );
+    assert!(
+        warn.contains("ROLLBACK failed"),
+        "WARN must describe the detach+close path, got: {warn}"
+    );
+}
+
 #[tokio::test]
 async fn note_rev_increments_on_update() {
     let tmp = TempDb::new();
