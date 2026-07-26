@@ -13,6 +13,7 @@
 //! sitter/
 //! ├── versions/<version>/intentd[.exe]   # installed daemon binaries
 //! ├── tmp/                               # in-flight downloads/extractions
+//! ├── config.toml                        # user-editable channel pin
 //! └── state.json                         # persisted sitter state
 //! ```
 
@@ -47,6 +48,8 @@ pub struct SitterPaths {
     pub tmp_dir: PathBuf,
     /// `<sitter_dir>/state.json`.
     pub state_path: PathBuf,
+    /// `<sitter_dir>/config.toml` — user-editable channel pin.
+    pub config_path: PathBuf,
 }
 
 impl SitterPaths {
@@ -76,6 +79,7 @@ impl SitterPaths {
             versions_dir: sitter_dir.join("versions"),
             tmp_dir: sitter_dir.join("tmp"),
             state_path: sitter_dir.join("state.json"),
+            config_path: sitter_dir.join("config.toml"),
             sitter_dir,
         }
     }

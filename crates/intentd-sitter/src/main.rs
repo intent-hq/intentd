@@ -8,6 +8,7 @@
 //! no updater activity.
 
 use intentd_sitter::cli::{self, SitterArgs};
+use intentd_sitter::config;
 use intentd_sitter::manifest;
 use intentd_sitter::paths::SitterPaths;
 use intentd_sitter::supervisor::{self, SupervisorConfig, MANIFEST_BASE_URL_ENV};
@@ -46,9 +47,11 @@ fn run() -> i32 {
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| manifest::DEFAULT_MANIFEST_BASE_URL.to_string());
 
+    let channel = config::resolve_channel(args.channel, config::load_channel(&paths.config_path));
+
     supervisor::run(
         paths,
-        args.channel,
+        channel.channel,
         args.passthrough,
         SupervisorConfig::from_env(),
         base_url,

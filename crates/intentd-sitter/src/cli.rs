@@ -11,6 +11,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ChannelOrigin, ResolvedChannel};
+
 /// Environment variable selecting the release channel (`stable` | `beta`).
 pub const CHANNEL_ENV: &str = "INTENTD_CHANNEL";
 
@@ -60,8 +62,10 @@ pub enum CliError {
 /// remaining args preserved verbatim (and in order) for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SitterArgs {
-    /// Release channel: `--sitter-channel` > `INTENTD_CHANNEL` > stable.
-    pub channel: Channel,
+    /// Channel explicitly selected this invocation (`--sitter-channel` >
+    /// `INTENTD_CHANNEL`), if any. `None` falls back to the `config.toml`
+    /// pin, then stable — resolve via [`crate::config::resolve_channel`].
+    pub channel: Option<ResolvedChannel>,
     /// `--sitter-version` was given: print the sitter's own version and exit.
     pub print_version: bool,
     /// All non-`--sitter-*` args, verbatim, for the daemon.
@@ -116,15 +120,21 @@ impl SitterArgs {
         }
 
         let channel = match channel_flag {
-            Some(c) => c,
+            Some(channel) => Some(ResolvedChannel {
+                channel,
+                origin: ChannelOrigin::Flag,
+            }),
             None => match env_channel.filter(|v| !v.is_empty()) {
                 Some(v) => {
                     let v = v.to_str().ok_or_else(|| {
                         CliError::InvalidChannel(v.to_string_lossy().into_owned())
                     })?;
-                    Channel::parse(v)?
+                    Some(ResolvedChannel {
+                        channel: Channel::parse(v)?,
+                        origin: ChannelOrigin::Env,
+                    })
                 }
-                None => Channel::default(),
+                None => None,
             },
         };
 
@@ -144,32 +154,39 @@ mod tests {
         SitterArgs::parse_from(args.iter().map(OsString::from), env.map(OsString::from))
     }
 
+    fn resolved(channel: Channel, origin: ChannelOrigin) -> Option<ResolvedChannel> {
+        Some(ResolvedChannel { channel, origin })
+    }
+
     #[test]
-    fn channel_defaults_to_stable() {
-        assert_eq!(parse(&[], None).unwrap().channel, Channel::Stable);
+    fn no_flag_or_env_selects_no_channel() {
+        assert_eq!(parse(&[], None).unwrap().channel, None);
     }
 
     #[test]
     fn channel_from_env() {
-        assert_eq!(parse(&[], Some("beta")).unwrap().channel, Channel::Beta);
+        assert_eq!(
+            parse(&[], Some("beta")).unwrap().channel,
+            resolved(Channel::Beta, ChannelOrigin::Env)
+        );
     }
 
     #[test]
     fn channel_flag_overrides_env() {
         let args = parse(&["--sitter-channel", "stable"], Some("beta")).unwrap();
-        assert_eq!(args.channel, Channel::Stable);
+        assert_eq!(args.channel, resolved(Channel::Stable, ChannelOrigin::Flag));
     }
 
     #[test]
     fn channel_equals_form() {
         let args = parse(&["--sitter-channel=beta"], None).unwrap();
-        assert_eq!(args.channel, Channel::Beta);
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
         assert!(args.passthrough.is_empty());
     }
 
     #[test]
     fn empty_env_is_unset() {
-        assert_eq!(parse(&[], Some("")).unwrap().channel, Channel::Stable);
+        assert_eq!(parse(&[], Some("")).unwrap().channel, None);
     }
 
     #[test]
@@ -227,7 +244,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(args.channel, Channel::Beta);
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
         assert!(args.print_version);
         assert_eq!(
             args.passthrough,
@@ -248,7 +265,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(args.channel, Channel::Beta);
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
         assert_eq!(
             args.passthrough,
             vec![
