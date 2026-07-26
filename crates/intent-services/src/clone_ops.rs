@@ -143,6 +143,17 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     if m.contains("already exists and is not an empty directory") {
         return C::DestinationExistsNonEmpty;
     }
+    // Ordered before auth: an askpass exec failure drags the auth prose along
+    // with it ("could not read Username … terminal prompts disabled" follows
+    // once the helper fails to run), but the remedy is local — the helper
+    // script is missing/unreachable (e.g. macOS quarantine), not the
+    // credentials (monorepo#837).
+    if m.contains("ssh-askpass-intent")
+        || (m.contains("cannot exec") && m.contains("askpass"))
+        || (m.contains("app.asar") && m.contains("not a directory"))
+    {
+        return C::AskpassMissing;
+    }
     if m.contains("authentication failed")
         || m.contains("could not read username")
         || m.contains("could not read password")
@@ -806,6 +817,30 @@ mod tests {
         ] {
             assert_eq!(classify_clone_error(msg), C::AuthRequired, "msg: {msg}");
         }
+    }
+
+    /// Askpass exec failures outrank auth-required even though git's stderr
+    /// carries the auth prose alongside them: the helper script is
+    /// missing/unreachable (e.g. macOS quarantine relocated the app bundle),
+    /// so the remedy is local — not credentials (monorepo#837).
+    #[test]
+    fn classify_clone_error_askpass_missing() {
+        use intent_core::CloneErrorCategory as C;
+        for msg in [
+            "fatal: cannot exec '/Users/x/Downloads/Intent.app/Contents/Resources/app.asar/resources/bin/ssh-askpass-intent.sh': Not a directory\nfatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: cannot exec ssh-askpass-intent.sh\nfatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: cannot exec '/usr/local/bin/my-askpass': No such file or directory\nfatal: could not read Password for 'https://github.com': terminal prompts disabled",
+            "sh: /Applications/Intent.app/Contents/Resources/app.asar/resources/bin/helper.sh: Not a directory",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::AskpassMissing, "msg: {msg}");
+        }
+        // Plain auth prose without any askpass signal stays auth-required.
+        assert_eq!(
+            classify_clone_error(
+                "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+            ),
+            C::AuthRequired
+        );
     }
 
     #[test]

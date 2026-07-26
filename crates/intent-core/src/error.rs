@@ -49,9 +49,9 @@ pub enum Error {
     /// the underlying cause instead of a bare "Internal error" and key
     /// behavior off `error.data.code` (monorepo#825/#826). User-fixable
     /// categories (`PathInvalid`, `DestinationExistsNonEmpty`) surface as
-    /// `-32602`; environmental ones (`AuthRequired`, `RepoNotFound`,
-    /// `AccessDenied`, `Network`, `Other`) as `-32603` with the detail
-    /// preserved in the message.
+    /// `-32602`; environmental ones (`AuthRequired`, `AskpassMissing`,
+    /// `RepoNotFound`, `AccessDenied`, `Network`, `Other`) as `-32603` with
+    /// the detail preserved in the message.
     #[error("workspace.create clone failed ({}): {detail}", category.as_str())]
     CloneFailed {
         category: CloneErrorCategory,
@@ -69,6 +69,11 @@ pub enum CloneErrorCategory {
     DestinationExistsNonEmpty,
     /// The remote rejected the clone for lack of credentials.
     AuthRequired,
+    /// The daemon's askpass helper script could not be executed (missing or
+    /// unreachable — e.g. macOS quarantine relocating the app bundle). Looks
+    /// like an auth failure in git's stderr, but the fix is local
+    /// (monorepo#837).
+    AskpassMissing,
     /// The remote reports the repository does not exist ("Repository not
     /// found", HTTP 404). With credential injection in play (monorepo#825),
     /// GitHub also answers 404 for private repositories the presented token
@@ -90,6 +95,7 @@ impl CloneErrorCategory {
             CloneErrorCategory::PathInvalid => "path-invalid",
             CloneErrorCategory::DestinationExistsNonEmpty => "destination-exists-non-empty",
             CloneErrorCategory::AuthRequired => "auth-required",
+            CloneErrorCategory::AskpassMissing => "askpass-missing",
             CloneErrorCategory::RepoNotFound => "repo-not-found",
             CloneErrorCategory::AccessDenied => "access-denied",
             CloneErrorCategory::Network => "network",
@@ -111,6 +117,7 @@ impl Error {
                     -32602
                 }
                 CloneErrorCategory::AuthRequired
+                | CloneErrorCategory::AskpassMissing
                 | CloneErrorCategory::RepoNotFound
                 | CloneErrorCategory::AccessDenied
                 | CloneErrorCategory::Network
