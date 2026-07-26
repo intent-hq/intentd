@@ -2013,6 +2013,18 @@ async fn clone_failed_maps_to_structured_error_data() {
         rpc.data.expect("structured data")["code"],
         serde_json::json!("repo-not-found")
     );
+
+    // The askpass exec-failure shape (monorepo#837) is environmental too:
+    // -32603 with the documented wire spelling.
+    let rpc = super::domain_to_rpc(intent_core::Error::CloneFailed {
+        category: intent_core::CloneErrorCategory::AskpassMissing,
+        detail: "fatal: cannot exec 'ssh-askpass-intent.sh': Not a directory".to_string(),
+    });
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.data.expect("structured data")["code"],
+        serde_json::json!("askpass-missing")
+    );
 }
 
 #[tokio::test]
