@@ -12043,10 +12043,23 @@ mod worktree_provisioning {
     /// `default_workspaces_root()` — so production daemons (which never call
     /// `.with_workspaces_root()`) still report the `cowSupported` capability.
     /// Guarded by `INTENTD_WORKSPACES_DIR` (env-var mutation is
-    /// process-global, hence the lock + restore).
+    /// process-global, hence the lock + drop-guard restore).
     #[tokio::test]
     async fn cow_supported_probes_default_root_when_none_injected() {
         static ENV_WS_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        /// Restores (or removes) `INTENTD_WORKSPACES_DIR` on drop so a panic
+        /// mid-test cannot leak the override into other in-process tests.
+        struct WsDirEnvGuard {
+            prior: Option<std::ffi::OsString>,
+        }
+        impl Drop for WsDirEnvGuard {
+            fn drop(&mut self) {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
+                    None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
+                }
+            }
+        }
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-cowcap-root");
@@ -12054,14 +12067,11 @@ mod worktree_provisioning {
 
         let result = {
             let _lock = ENV_WS_DIR_LOCK.lock().await;
-            let prior = std::env::var_os("INTENTD_WORKSPACES_DIR");
+            let _env = WsDirEnvGuard {
+                prior: std::env::var_os("INTENTD_WORKSPACES_DIR"),
+            };
             std::env::set_var("INTENTD_WORKSPACES_DIR", &root.0);
-            let result = svc.compute_cow_supported().await;
-            match prior {
-                Some(v) => std::env::set_var("INTENTD_WORKSPACES_DIR", v),
-                None => std::env::remove_var("INTENTD_WORKSPACES_DIR"),
-            }
-            result
+            svc.compute_cow_supported().await
         };
         assert!(
             result.is_some(),
@@ -12414,6 +12424,12 @@ mod worktree_provisioning {
         assert!(
             wt_repo.is_worktree(),
             "fallback checkout is a linked worktree"
+        );
+        let persisted = store.get_workspace(&dup.id).await.expect("get");
+        assert_eq!(
+            persisted.checkout_mode,
+            Some(intent_core::CheckoutMode::Worktree),
+            "fallback mode round-trips through the store"
         );
     }
 
