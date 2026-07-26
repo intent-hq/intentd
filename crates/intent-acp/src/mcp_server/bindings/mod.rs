@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 pub(crate) mod agent;
@@ -66,10 +66,14 @@ pub(crate) fn prelude() -> String {
 /// (`workspace.setAgentName` / `git.commit` / `git.agentCommit` /
 /// `ws.browser.exec`, and the caller-aware `ws.agent.*` methods — `create`,
 /// `delegate`, `send`, `sendToTask`, `wakeOrCreate`, `reportToParent`) can do so.
+/// `turn_attachments` threads the §7.1 turn-attachment registry to the
+/// bindings that register attachments mid-dispatch (`ws.app.question.ask`);
+/// `None` keeps those bindings inert (FE front door, tests).
 pub(crate) async fn try_dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     caller_agent_id: &Option<AgentId>,
+    turn_attachments: Option<&Arc<TurnAttachmentRegistry>>,
     method: &str,
     args: &Value,
 ) -> Result<Option<Value>, String> {
@@ -142,7 +146,15 @@ pub(crate) async fn try_dispatch(
             .map(Some);
     }
     if let Some(rest) = method.strip_prefix("app.") {
-        return app::try_dispatch(api, workspace_id, caller_agent_id.as_ref(), rest, args).await;
+        return app::try_dispatch(
+            api,
+            workspace_id,
+            caller_agent_id.as_ref(),
+            turn_attachments,
+            rest,
+            args,
+        )
+        .await;
     }
     Ok(None)
 }
