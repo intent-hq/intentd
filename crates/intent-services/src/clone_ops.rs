@@ -42,6 +42,9 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
 /// https / git-fetch-pack / git-index-pack) settles before we escalate.
 const TERM_GRACE: Duration = Duration::from_millis(500);
 
+/// Bound on the stderr tail retained by [`stream_stderr`] for error messages.
+const STDERR_TAIL_MAX: usize = 4096;
+
 /// Preserved from the reference `cloneWithProgress`: skip LFS smudge during
 /// checkout so a missing/unreachable LFS object does not fail the clone. The
 /// caller can invoke `git lfs pull` after the clone succeeds.
@@ -112,6 +115,10 @@ pub(crate) fn parse_owner_repo(url: &str) -> Option<(String, String)> {
 
 /// Redact a `user[:pass]@` credential fragment from any URL-like substring in
 /// `text`. Best-effort; used only for the terminal `error` payload.
+///
+/// Two passes: an authority pass anchored on `://`, then a scheme-less pass
+/// masking bare `user[:pass]@host` fragments — a front-truncated stderr tail
+/// or an scp-like remote carries no `://` anchor to find (monorepo#836).
 fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -127,6 +134,32 @@ fn redact_credentials(text: &str) -> String {
             out.push_str(authority);
         }
         rest = &rest[end_authority..];
+    }
+    out.push_str(rest);
+    redact_bare_userinfo(&out)
+}
+
+/// Scheme-less pass of [`redact_credentials`]: mask the userinfo of any bare
+/// `user[:pass]@host` fragment. Deliberately over-eager — it also masks the
+/// `git@` of scp-like remotes — because a mangled username in an error
+/// message is harmless while a leaked password or token is not, and tokens
+/// often travel as the username with no `:pass` (e.g. `ghp_…@github.com`).
+fn redact_bare_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        let before = &rest[..at];
+        // The userinfo starts after the last delimiter before the `@`.
+        let start = before
+            .rfind([' ', '\t', '\r', '\n', '/', '\'', '"'])
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        out.push_str(&before[..start]);
+        if start < at {
+            out.push_str("***");
+        }
+        out.push('@');
+        rest = &rest[at + 1..];
     }
     out.push_str(rest);
     out
@@ -503,16 +536,40 @@ where
         }
         // Keep a bounded tail (~4KiB) of stderr for error messages.
         tail.push_str(&text);
-        if tail.len() > 4096 {
-            let drop_to = tail.len() - 4096;
-            tail.drain(..drop_to);
-        }
+        trim_tail(&mut tail);
     }
     if tail.trim().is_empty() {
         None
     } else {
         Some(tail.trim().to_string())
     }
+}
+
+/// Drop the front of `tail` so at most ~[`STDERR_TAIL_MAX`] bytes remain,
+/// cutting only at a line boundary: a byte-offset cut can split a URL's
+/// scheme, leaving a bare `user:pass@host` fragment the `://`-anchored pass
+/// of [`redact_credentials`] cannot find (monorepo#836). The partially-cut
+/// line is dropped whole — up to the next `\n`/`\r`. If a single line
+/// exceeds the cap we fall back to a char-boundary byte cut (never dropping
+/// the message entirely); the scheme-less redaction pass covers any token
+/// that cut can split.
+fn trim_tail(tail: &mut String) {
+    if tail.len() <= STDERR_TAIL_MAX {
+        return;
+    }
+    let drop_to = tail.len() - STDERR_TAIL_MAX;
+    let cut = tail.as_bytes()[drop_to..]
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .map(|i| drop_to + i + 1)
+        .unwrap_or_else(|| {
+            let mut cut = drop_to;
+            while !tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            cut
+        });
+    tail.drain(..cut);
 }
 
 /// `read_until` but matching *any* byte in `delims`, mirroring `tokio`'s
@@ -770,6 +827,75 @@ mod tests {
     fn redact_credentials_passthrough_when_none() {
         let input = "fatal: repository not found";
         assert_eq!(redact_credentials(input), input);
+    }
+
+    #[test]
+    fn redact_credentials_masks_front_truncated_scheme() {
+        // Regression for monorepo#836: a front-truncated tail can cut inside
+        // `https://`, leaving no `://` anchor for the authority pass.
+        let input = "/user:secret@host/x.git': timed out";
+        let out = redact_credentials(input);
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("/***@host/x.git"), "{out}");
+    }
+
+    #[test]
+    fn redact_credentials_masks_bare_userinfo() {
+        let out = redact_credentials("fatal: unable to access 'user:secret@host/x.git'");
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("'***@host/x.git'"), "{out}");
+
+        // Token-as-username carries no `:pass` and must still be masked.
+        let out = redact_credentials("fetch of ghp_abc123@github.com failed");
+        assert!(!out.contains("ghp_abc123"), "{out}");
+        assert_eq!(out, "fetch of ***@github.com failed");
+    }
+
+    #[test]
+    fn redact_credentials_scp_like_masking_keeps_classification() {
+        use intent_core::CloneErrorCategory as C;
+        // The scheme-less pass is over-eager by design: `git@` is masked too,
+        // but the auth marker survives for classify_clone_error.
+        let out = redact_credentials("git@github.com: Permission denied (publickey).");
+        assert_eq!(out, "***@github.com: Permission denied (publickey).");
+        assert_eq!(classify_clone_error(&out), C::AuthRequired);
+    }
+
+    #[test]
+    fn trim_tail_drops_partially_cut_line_whole() {
+        // Arrange the cut to land mid-URL on the first line: the whole line
+        // must be dropped, never leaving a credential fragment (monorepo#836).
+        let secret_line = "fatal: 'https://user:secret@host/x.git': fail\n";
+        let mut tail = format!("{secret_line}{}\n", "x".repeat(STDERR_TAIL_MAX - 26));
+        assert!(tail.len() > STDERR_TAIL_MAX);
+        trim_tail(&mut tail);
+        assert!(tail.len() <= STDERR_TAIL_MAX);
+        assert!(!tail.contains("secret"), "{tail}");
+        assert!(tail.starts_with('x'));
+    }
+
+    #[test]
+    fn trim_tail_bounds_and_noop_under_cap() {
+        let line = format!("{}\n", "y".repeat(99));
+        let mut tail = line.repeat(45); // 4500 bytes, cut lands mid-line
+        trim_tail(&mut tail);
+        assert!(tail.len() <= STDERR_TAIL_MAX);
+        assert_eq!(tail.len() % 100, 0, "only whole lines survive");
+
+        let mut small = String::from("short line\n");
+        trim_tail(&mut small);
+        assert_eq!(small, "short line\n");
+    }
+
+    #[test]
+    fn trim_tail_oversized_single_line_falls_back_to_byte_cut() {
+        // One giant line with no boundary: keep the last ~4KiB rather than
+        // dropping the message; multi-byte chars never split (no panic).
+        let mut tail = format!("x{}", "é".repeat(3000)); // 6001 bytes, cut lands mid-char
+        trim_tail(&mut tail);
+        assert!(tail.len() <= STDERR_TAIL_MAX);
+        assert!(!tail.is_empty());
+        assert!(tail.chars().all(|c| c == 'é'));
     }
 
     #[test]
