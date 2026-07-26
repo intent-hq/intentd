@@ -29,12 +29,20 @@
 //! 6. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
 //!
+//! When the startup channel came from `config.toml` or the stable default
+//! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
+//! check re-resolves the channel from `config.toml` first, so
+//! `intentd sitter channel <value>` takes effect on a running service at its
+//! next periodic check. Flag/env selections stay pinned for the process
+//! lifetime.
+//!
 //! The updater API is blocking, so checks run on the blocking thread pool
 //! (`spawn_blocking`) and never stall the supervisor's timers or signal
 //! handling.
 
 use std::ffi::OsString;
 use std::io;
+use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +51,7 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::cli::Channel;
+use crate::config::{self, ChannelOrigin, ResolvedChannel};
 use crate::paths::SitterPaths;
 use crate::state;
 use crate::updater::{UpdateError, UpdateOutcome, Updater};
@@ -150,11 +159,24 @@ fn random_u64() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
+/// The channel an update check should use. Flag/env selections stay pinned
+/// for the process lifetime; config/default selections re-resolve from
+/// `config.toml` so a running service follows `intentd sitter channel`
+/// pins without a restart.
+fn effective_channel(startup: ResolvedChannel, config_path: &Path) -> Channel {
+    match startup.origin {
+        ChannelOrigin::Flag | ChannelOrigin::Env => startup.channel,
+        ChannelOrigin::Config | ChannelOrigin::Default => {
+            config::resolve_channel(None, config::load_channel(config_path)).channel
+        }
+    }
+}
+
 /// Build a tokio runtime and drive the supervisor to completion, returning
 /// the sitter's process exit code.
 pub fn run(
     paths: SitterPaths,
-    channel: Channel,
+    channel: ResolvedChannel,
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
     base_url: String,
@@ -188,7 +210,7 @@ pub fn run(
 
 struct Supervisor {
     paths: SitterPaths,
-    channel: Channel,
+    channel: ResolvedChannel,
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
     updater: Arc<Updater>,
@@ -235,7 +257,7 @@ impl Supervisor {
                                 "intentd-sitter: no intentd daemon is installed for channel {} \
                                  and the update check failed; cannot start (check network access \
                                  and retry)",
-                                self.channel
+                                self.channel.channel
                             );
                             return 1;
                         }
@@ -254,12 +276,12 @@ impl Supervisor {
                 Some(version) => {
                     // The channel flag only governs updater behavior, which
                     // one-shots don't have; surface a mismatch but run anyway.
-                    if state.channel != self.channel {
+                    if state.channel != self.channel.channel {
                         eprintln!(
                             "intentd-sitter: note: channel {} requested but the installed \
                              daemon was installed from channel {}; one-shot commands run \
                              the installed daemon as-is",
-                            self.channel, state.channel
+                            self.channel.channel, state.channel
                         );
                     }
                     version
@@ -269,7 +291,7 @@ impl Supervisor {
                         "intentd-sitter: no intentd daemon is installed for channel {}; \
                          start the daemon first (`intentd serve` or \
                          `brew services start intentd`) so it gets installed",
-                        self.channel
+                        self.channel.channel
                     );
                     return 1;
                 }
@@ -380,10 +402,11 @@ impl Supervisor {
     }
 
     /// One blocking update check on the blocking pool (the updater's HTTP
-    /// client is blocking; never run it on the async runtime).
+    /// client is blocking; never run it on the async runtime). Re-resolves
+    /// the channel from `config.toml` first unless flag/env pinned it.
     async fn check(&self) -> Result<UpdateOutcome, UpdateError> {
         let updater = Arc::clone(&self.updater);
-        let channel = self.channel;
+        let channel = effective_channel(self.channel, &self.paths.config_path);
         tokio::task::spawn_blocking(move || updater.check_and_install(channel))
             .await
             .map_err(|e| UpdateError::Io(io::Error::other(e)))?
@@ -560,6 +583,39 @@ mod tests {
         assert_eq!(config.backoff_cap, Duration::from_secs(60));
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
         assert_eq!(config.kill_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn effective_channel_pins_flag_env_and_follows_config_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "channel = \"beta\"\n").unwrap();
+
+        // Flag/env selections stay pinned regardless of the config file.
+        for origin in [ChannelOrigin::Flag, ChannelOrigin::Env] {
+            let startup = ResolvedChannel {
+                channel: Channel::Stable,
+                origin,
+            };
+            assert_eq!(effective_channel(startup, &config_path), Channel::Stable);
+        }
+
+        // Config/default selections re-resolve from the file each time.
+        for origin in [ChannelOrigin::Config, ChannelOrigin::Default] {
+            let startup = ResolvedChannel {
+                channel: Channel::Stable,
+                origin,
+            };
+            assert_eq!(effective_channel(startup, &config_path), Channel::Beta);
+        }
+
+        // Pin removed mid-run: back to the stable default.
+        std::fs::remove_file(&config_path).unwrap();
+        let startup = ResolvedChannel {
+            channel: Channel::Beta,
+            origin: ChannelOrigin::Config,
+        };
+        assert_eq!(effective_channel(startup, &config_path), Channel::Stable);
     }
 
     /// Deterministic 12h–24h jitter sweep: every draw lands in [min, max)

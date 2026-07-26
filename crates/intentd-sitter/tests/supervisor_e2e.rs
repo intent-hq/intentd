@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use intentd_sitter::cli::{Channel, CHANNEL_ENV};
 use intentd_sitter::manifest::TARGET_TRIPLE;
 use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::state::{self, SitterState};
@@ -248,6 +249,7 @@ fn send_signal(child: &Child, signal: &str) {
 }
 
 const MANIFEST_PATH: &str = "/channel-stable/stable.json";
+const BETA_MANIFEST_PATH: &str = "/channel-beta/beta.json";
 
 #[test]
 fn forwards_args_verbatim_and_clean_exit_passes_through() {
@@ -404,6 +406,136 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
     assert_eq!(
         state::load(&paths.state_path).current_version.as_deref(),
         Some("0.2.0")
+    );
+}
+
+#[test]
+fn config_channel_switch_applies_at_next_periodic_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    // No --sitter-channel flag and no INTENTD_CHANNEL env: the channel comes
+    // from config.toml / the stable default, so the supervisor re-resolves
+    // it before each periodic check.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(CHANNEL_ENV)
+        .env(CHECK_MIN_ENV, "300")
+        .env(CHECK_MAX_ENV, "301")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0 on the beta channel only, then pin channel=beta in
+    // config.toml mid-run (what `intentd sitter channel beta` writes).
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    fs::write(&paths.config_path, "channel = \"beta\"\n").unwrap();
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(20), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.first().map(String::as_str),
+        Some(MANIFEST_PATH),
+        "startup check must use the stable default: {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|p| p == BETA_MANIFEST_PATH),
+        "the check after the config switch must fetch beta.json: {requests:?}"
+    );
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.current_version.as_deref(), Some("0.2.0"));
+    assert_eq!(state.channel, Channel::Beta);
+    assert!(paths.daemon_binary("0.2.0").exists());
+}
+
+#[test]
+fn flag_pinned_channel_ignores_config_switch_mid_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    // A fully installable beta 0.2.0 is on offer; the flag-pinned sitter
+    // must never even fetch its manifest.
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHECK_MIN_ENV, "100")
+        .env(CHECK_MAX_ENV, "101")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .args(["serve", "--sitter-channel=stable"])
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Write the config pin mid-run, then let several more checks elapse.
+    fs::write(&paths.config_path, "channel = \"beta\"\n").unwrap();
+    let checks_at_switch = requests.lock().unwrap().len();
+    wait_until(
+        "several more periodic checks",
+        Duration::from_secs(15),
+        || requests.lock().unwrap().len() >= checks_at_switch + 3,
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests.iter().all(|p| p == MANIFEST_PATH),
+        "flag-pinned sitter must never fetch beta.json: {requests:?}"
+    );
+    let starts = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| line.starts_with("start "))
+        .count();
+    assert_eq!(starts, 1, "pinned sitter must not install/restart");
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.1.0")
     );
 }
 
