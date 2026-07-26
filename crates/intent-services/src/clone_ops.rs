@@ -205,12 +205,10 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     // not the user-supplied destination, so §9.1's "correct the path and
     // retry" remedy does not apply; it rides the clone-failed catch-all.
     //
-    // NOTE(§9.1 askpass-missing, monorepo#837): the documented
-    // `askpass-missing` shape ("… app.asar …: not a directory") has no arm
-    // here yet. When the `AskpassMissing` port lands it must be ordered
-    // ahead of BOTH the auth arm (§9.1 gives it precedence over
-    // auth-required) and this path arm (whose "not a directory" row would
-    // otherwise swallow its ENOTDIR spelling).
+    // The §9.1 `askpass-missing` shape ("… app.asar …: not a directory",
+    // monorepo#837) is handled by the `AskpassMissing` arm above, ordered
+    // ahead of both the auth arm and this path arm — its "not a directory"
+    // row must not swallow the askpass ENOTDIR spelling.
     if m.contains("is not a valid path")
         || m.contains("could not create work tree")
         || m.contains("could not create directory")
@@ -936,16 +934,15 @@ mod tests {
             classify_clone_error("error: invalid path 'aux/config'"),
             C::Other
         );
-        // Pins today's classification of the §9.1 `askpass-missing` shape
-        // (monorepo#837): its ENOTDIR spelling currently hits this arm's
-        // "not a directory" row. The eventual `AskpassMissing` port must
-        // change this intentionally (ordered ahead of both the auth arm and
-        // this path arm), not silently.
+        // The §9.1 `askpass-missing` shape (monorepo#837): its ENOTDIR
+        // spelling previously rode this arm's "not a directory" row; the
+        // `AskpassMissing` arm is ordered ahead of both the auth arm and
+        // this path arm, so it now classifies askpass-missing.
         assert_eq!(
             classify_clone_error(
                 "error: cannot run /Applications/X.app/Contents/Resources/app.asar/bin/ssh-askpass-intent: Not a directory"
             ),
-            C::PathInvalid
+            C::AskpassMissing
         );
     }
 
