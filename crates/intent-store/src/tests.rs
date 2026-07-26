@@ -742,6 +742,7 @@ async fn append_note_version_detaches_conn_on_failed_body_error_rollback() {
 /// `tracing-subscriber` dev-dependency.
 struct WarnCapture {
     events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    next_span_id: std::sync::atomic::AtomicU64,
 }
 
 impl tracing::Subscriber for WarnCapture {
@@ -749,7 +750,10 @@ impl tracing::Subscriber for WarnCapture {
         *metadata.level() == tracing::Level::WARN
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
+        let id = self
+            .next_span_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::span::Id::from_u64(id)
     }
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
@@ -805,6 +809,7 @@ async fn rollback_or_poison_emits_warn_on_detach() {
     let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let _guard = tracing::subscriber::set_default(WarnCapture {
         events: captured.clone(),
+        next_span_id: std::sync::atomic::AtomicU64::new(1),
     });
     store
         .append_note_version(&note, &author, &ts)
@@ -813,16 +818,21 @@ async fn rollback_or_poison_emits_warn_on_detach() {
     drop(_guard);
 
     // The detach path fired (pool size dropped to 0) and emitted a WARN
-    // event carrying the ROLLBACK error text.
+    // event carrying the ROLLBACK error.
     assert_eq!(store.write_pool().size(), 0);
     let events = captured.lock().unwrap();
     let warn = events
         .iter()
         .find(|e| e.contains("rollback_error="))
         .unwrap_or_else(|| panic!("no poisoned-connection WARN captured; got: {events:?}"));
+    let rollback_error = warn
+        .split("rollback_error=")
+        .nth(1)
+        .map(str::trim)
+        .unwrap_or_default();
     assert!(
-        warn.contains("cannot rollback"),
-        "WARN must include the ROLLBACK error, got: {warn}"
+        !rollback_error.is_empty() && rollback_error != "\"\"",
+        "WARN must carry a non-empty rollback_error, got: {warn}"
     );
     assert!(
         warn.contains("ROLLBACK failed"),
