@@ -28,6 +28,21 @@
 //!    their exit status passes through
 //! 6. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
+//! 7. SIGHUP (unix only, sent by `intentd restart`) stops the child
+//!    gracefully and respawns it on the current `state.json` version —
+//!    activating a prior `sitter channel --redownload` install — without
+//!    the sitter exiting. A SIGHUP that lands during a crash-backoff sleep
+//!    has the same semantics: it cuts the wait short, re-resolves the
+//!    version from `state.json`, and resets the backoff. Serve mode
+//!    advertises itself for this via `<data_dir>/sitter/sitter.pid`,
+//!    written before the supervision loop and removed on exit
+//!
+//! When the startup channel came from `config.toml` or the stable default
+//! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
+//! check re-resolves the channel from `config.toml` first, so
+//! `intentd sitter channel <value>` takes effect on a running service at its
+//! next periodic check. Flag/env selections stay pinned for the process
+//! lifetime.
 //!
 //! The updater API is blocking, so checks run on the blocking thread pool
 //! (`spawn_blocking`) and never stall the supervisor's timers or signal
@@ -35,6 +50,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::Path;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +59,7 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::cli::Channel;
+use crate::config::{self, ChannelOrigin, ResolvedChannel};
 use crate::paths::SitterPaths;
 use crate::state;
 use crate::updater::{UpdateError, UpdateOutcome, Updater};
@@ -150,11 +167,88 @@ fn random_u64() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
+/// Read a sitter pidfile and probe the recorded process for liveness.
+/// Returns the pid only when the file holds one and that process is alive;
+/// a missing, unparsable, or stale (dead pid) file is treated as absent.
+#[cfg(unix)]
+pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let pid = contents.trim().parse::<i32>().ok().filter(|pid| *pid > 0)?;
+    let pid = nix::unistd::Pid::from_raw(pid);
+    nix::sys::signal::kill(pid, None).is_ok().then_some(pid)
+}
+
+/// Pidfile guard: writes the sitter's own pid on creation and removes the
+/// file on drop — but only when it still holds this process's pid, so a
+/// later serve sitter's entry (last writer wins) is never deleted by an
+/// earlier one exiting. Serve mode only — `intentd restart` reads it to
+/// find the supervising sitter.
+#[cfg(unix)]
+struct PidFile {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl PidFile {
+    fn create(path: &Path) -> Option<Self> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Some(pid) = read_live_pid(path) {
+            eprintln!(
+                "intentd-sitter: pidfile {} already names live pid {pid}; another \
+                 serve sitter appears to be running (overwriting — `intentd restart` \
+                 will target this sitter)",
+                path.display()
+            );
+        }
+        match std::fs::write(path, format!("{}\n", std::process::id())) {
+            Ok(()) => Some(Self {
+                path: path.to_path_buf(),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "intentd-sitter: failed to write pidfile {}: {e} \
+                     (`intentd restart` will not find this sitter)",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        // Only remove the file when it still holds our pid: another serve
+        // sitter may have overwritten it, and deleting its entry would
+        // break `intentd restart` for that live sitter.
+        let ours = std::process::id().to_string();
+        if std::fs::read_to_string(&self.path).is_ok_and(|s| s.trim() == ours) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The channel an update check should use. Flag/env selections stay pinned
+/// for the process lifetime; config/default selections re-resolve from
+/// `config.toml` so a running service follows `intentd sitter channel`
+/// pins without a restart.
+fn effective_channel(startup: ResolvedChannel, config_path: &Path) -> Channel {
+    match startup.origin {
+        ChannelOrigin::Flag | ChannelOrigin::Env => startup.channel,
+        ChannelOrigin::Config | ChannelOrigin::Default => {
+            config::resolve_channel(None, config::load_channel(config_path)).channel
+        }
+    }
+}
+
 /// Build a tokio runtime and drive the supervisor to completion, returning
 /// the sitter's process exit code.
 pub fn run(
     paths: SitterPaths,
-    channel: Channel,
+    channel: ResolvedChannel,
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
     base_url: String,
@@ -188,7 +282,7 @@ pub fn run(
 
 struct Supervisor {
     paths: SitterPaths,
-    channel: Channel,
+    channel: ResolvedChannel,
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
     updater: Arc<Updater>,
@@ -235,7 +329,7 @@ impl Supervisor {
                                 "intentd-sitter: no intentd daemon is installed for channel {} \
                                  and the update check failed; cannot start (check network access \
                                  and retry)",
-                                self.channel
+                                self.channel.channel
                             );
                             return 1;
                         }
@@ -254,12 +348,12 @@ impl Supervisor {
                 Some(version) => {
                     // The channel flag only governs updater behavior, which
                     // one-shots don't have; surface a mismatch but run anyway.
-                    if state.channel != self.channel {
+                    if state.channel != self.channel.channel {
                         eprintln!(
                             "intentd-sitter: note: channel {} requested but the installed \
                              daemon was installed from channel {}; one-shot commands run \
                              the installed daemon as-is",
-                            self.channel, state.channel
+                            self.channel.channel, state.channel
                         );
                     }
                     version
@@ -269,7 +363,7 @@ impl Supervisor {
                         "intentd-sitter: no intentd daemon is installed for channel {}; \
                          start the daemon first (`intentd serve` or \
                          `brew services start intentd`) so it gets installed",
-                        self.channel
+                        self.channel.channel
                     );
                     return 1;
                 }
@@ -285,6 +379,17 @@ impl Supervisor {
                 return 1;
             }
         };
+        // `intentd restart` finds the serve sitter through this pidfile;
+        // written only after the signal handlers are installed so a reader
+        // can never SIGHUP a sitter that would still die to it. Removed on
+        // drop (any return path); a hard kill leaves a stale file, which
+        // readers detect via a liveness probe.
+        #[cfg(unix)]
+        let _pidfile = if supervised {
+            PidFile::create(&self.paths.pid_path)
+        } else {
+            None
+        };
         let mut backoff = self.config.backoff_initial;
 
         loop {
@@ -299,8 +404,14 @@ impl Supervisor {
                         return 1;
                     }
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
-                        Some(code) => return code,
-                        None => continue,
+                        BackoffOutcome::Shutdown(code) => return code,
+                        #[cfg(unix)]
+                        BackoffOutcome::RestartRequested => {
+                            self.refresh_version_from_state(&mut current_version);
+                            backoff = self.config.backoff_initial;
+                            continue;
+                        }
+                        BackoffOutcome::Elapsed => continue,
                     }
                 }
             };
@@ -330,10 +441,16 @@ impl Supervisor {
                         if spawned_at.elapsed() >= self.config.backoff_reset_after {
                             backoff = self.config.backoff_initial;
                         }
-                        if let Some(code) = self.backoff_sleep(&mut backoff, &mut signals).await {
-                            return code;
+                        match self.backoff_sleep(&mut backoff, &mut signals).await {
+                            BackoffOutcome::Shutdown(code) => return code,
+                            #[cfg(unix)]
+                            BackoffOutcome::RestartRequested => {
+                                self.refresh_version_from_state(&mut current_version);
+                                backoff = self.config.backoff_initial;
+                            }
+                            BackoffOutcome::Elapsed => {}
                         }
-                        break; // respawn the same version
+                        break; // respawn (possibly a new version after SIGHUP)
                     }
                     _ = tokio::time::sleep_until(next_check_at), if supervised => {
                         match self.check().await {
@@ -355,7 +472,30 @@ impl Supervisor {
                         }
                         next_check_at = self.schedule_next_check();
                     }
-                    signal = signals.recv() => {
+                    event = signals.recv() => {
+                        let signal = match event {
+                            // `intentd restart` (SIGHUP): stop the child
+                            // gracefully and respawn it on the current
+                            // state.json version — activating a prior
+                            // `sitter channel --redownload` install — with
+                            // the backoff reset. The sitter never exits on
+                            // SIGHUP; the channel pin is re-resolved by the
+                            // next periodic check as usual. One-shots have
+                            // no supervised child to restart.
+                            #[cfg(unix)]
+                            SignalEvent::Restart => {
+                                if !supervised {
+                                    eprintln!("intentd-sitter: ignoring SIGHUP (one-shot invocation)");
+                                    continue;
+                                }
+                                eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                                self.graceful_stop(&mut child).await;
+                                self.refresh_version_from_state(&mut current_version);
+                                backoff = self.config.backoff_initial;
+                                break; // respawn (possibly a new version)
+                            }
+                            SignalEvent::Shutdown(signal) => signal,
+                        };
                         forward_signal(&child, signal);
                         let status = match tokio::time::timeout(self.config.kill_timeout, child.wait()).await {
                             Ok(Ok(status)) => status,
@@ -380,10 +520,11 @@ impl Supervisor {
     }
 
     /// One blocking update check on the blocking pool (the updater's HTTP
-    /// client is blocking; never run it on the async runtime).
+    /// client is blocking; never run it on the async runtime). Re-resolves
+    /// the channel from `config.toml` first unless flag/env pinned it.
     async fn check(&self) -> Result<UpdateOutcome, UpdateError> {
         let updater = Arc::clone(&self.updater);
-        let channel = self.channel;
+        let channel = effective_channel(self.channel, &self.paths.config_path);
         tokio::task::spawn_blocking(move || updater.check_and_install(channel))
             .await
             .map_err(|e| UpdateError::Io(io::Error::other(e)))?
@@ -403,15 +544,42 @@ impl Supervisor {
         Instant::now() + delay
     }
 
-    /// Sleep the current backoff delay (doubling it, capped, for next time).
-    /// Returns `Some(exit_code)` when a shutdown signal arrives mid-sleep.
-    async fn backoff_sleep(&self, backoff: &mut Duration, signals: &mut Signals) -> Option<i32> {
+    /// Re-resolve the version to respawn from `state.json` (the SIGHUP
+    /// semantics): picks up whatever `sitter channel --redownload`
+    /// force-installed, keeping the current version when `state.json`
+    /// names nothing installed.
+    fn refresh_version_from_state(&self, current_version: &mut String) {
+        let state = state::load(&self.paths.state_path);
+        match state
+            .current_version
+            .filter(|v| self.paths.daemon_binary(v).exists())
+        {
+            Some(version) => *current_version = version,
+            None => eprintln!(
+                "intentd-sitter: state.json names no installed version; \
+                 respawning intentd {current_version}"
+            ),
+        }
+    }
+
+    /// Sleep the current backoff delay (doubling it, capped, for next
+    /// time), reporting how the sleep ended so the caller can exit on a
+    /// shutdown signal or re-resolve the version from `state.json` (and
+    /// reset the backoff) on a restart request (SIGHUP).
+    async fn backoff_sleep(&self, backoff: &mut Duration, signals: &mut Signals) -> BackoffOutcome {
         let delay = *backoff;
         *backoff = backoff.saturating_mul(2).min(self.config.backoff_cap);
         eprintln!("intentd-sitter: respawning intentd in {delay:?}");
         tokio::select! {
-            _ = tokio::time::sleep(delay) => None,
-            signal = signals.recv() => Some(128 + signal),
+            _ = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
+            event = signals.recv() => match event {
+                SignalEvent::Shutdown(signal) => BackoffOutcome::Shutdown(128 + signal),
+                #[cfg(unix)]
+                SignalEvent::Restart => {
+                    eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                    BackoffOutcome::RestartRequested
+                }
+            },
         }
     }
 
@@ -441,12 +609,37 @@ impl Supervisor {
     }
 }
 
-/// Shutdown signals the sitter forwards to the child. `recv()` resolves to
-/// the raw signal number (SIGINT on windows, where only ctrl-c exists).
+/// How a crash-backoff sleep ([`Supervisor::backoff_sleep`]) ended.
+enum BackoffOutcome {
+    /// The full delay elapsed; respawn the current version.
+    Elapsed,
+    /// A restart request (SIGHUP) cut the wait short; the caller must
+    /// re-resolve the version from `state.json` and reset the backoff
+    /// before respawning.
+    #[cfg(unix)]
+    RestartRequested,
+    /// A shutdown signal arrived; exit with this code.
+    Shutdown(i32),
+}
+
+/// What a received signal asks the sitter to do.
+enum SignalEvent {
+    /// Forward the raw signal number to the child and exit with its status
+    /// (SIGTERM/SIGINT; ctrl-c on windows).
+    Shutdown(i32),
+    /// Restart the supervised child in place without exiting the sitter
+    /// (SIGHUP, sent by `intentd restart`).
+    #[cfg(unix)]
+    Restart,
+}
+
+/// Signals the sitter reacts to. `recv()` resolves to the requested
+/// [`SignalEvent`] (only ctrl-c/shutdown exists on windows).
 #[cfg(unix)]
 struct Signals {
     term: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
+    hup: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -456,13 +649,15 @@ impl Signals {
         Ok(Self {
             term: signal(SignalKind::terminate())?,
             int: signal(SignalKind::interrupt())?,
+            hup: signal(SignalKind::hangup())?,
         })
     }
 
-    async fn recv(&mut self) -> i32 {
+    async fn recv(&mut self) -> SignalEvent {
         tokio::select! {
-            _ = self.term.recv() => nix::sys::signal::Signal::SIGTERM as i32,
-            _ = self.int.recv() => nix::sys::signal::Signal::SIGINT as i32,
+            _ = self.term.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGTERM as i32),
+            _ = self.int.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGINT as i32),
+            _ = self.hup.recv() => SignalEvent::Restart,
         }
     }
 }
@@ -476,9 +671,9 @@ impl Signals {
         Ok(Self)
     }
 
-    async fn recv(&mut self) -> i32 {
+    async fn recv(&mut self) -> SignalEvent {
         let _ = tokio::signal::ctrl_c().await;
-        2 // SIGINT's conventional number
+        SignalEvent::Shutdown(2) // SIGINT's conventional number
     }
 }
 
@@ -562,6 +757,39 @@ mod tests {
         assert_eq!(config.kill_timeout, Duration::from_millis(5000));
     }
 
+    #[test]
+    fn effective_channel_pins_flag_env_and_follows_config_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "channel = \"beta\"\n").unwrap();
+
+        // Flag/env selections stay pinned regardless of the config file.
+        for origin in [ChannelOrigin::Flag, ChannelOrigin::Env] {
+            let startup = ResolvedChannel {
+                channel: Channel::Stable,
+                origin,
+            };
+            assert_eq!(effective_channel(startup, &config_path), Channel::Stable);
+        }
+
+        // Config/default selections re-resolve from the file each time.
+        for origin in [ChannelOrigin::Config, ChannelOrigin::Default] {
+            let startup = ResolvedChannel {
+                channel: Channel::Stable,
+                origin,
+            };
+            assert_eq!(effective_channel(startup, &config_path), Channel::Beta);
+        }
+
+        // Pin removed mid-run: back to the stable default.
+        std::fs::remove_file(&config_path).unwrap();
+        let startup = ResolvedChannel {
+            channel: Channel::Beta,
+            origin: ChannelOrigin::Config,
+        };
+        assert_eq!(effective_channel(startup, &config_path), Channel::Stable);
+    }
+
     /// Deterministic 12h–24h jitter sweep: every draw lands in [min, max)
     /// and the draws spread across both halves of the window.
     #[test]
@@ -609,6 +837,64 @@ mod tests {
     fn degenerate_jitter_window_collapses_to_min() {
         assert_eq!(next_check_delay(HOUR, HOUR, 123), HOUR);
         assert_eq!(next_check_delay(2 * HOUR, HOUR, 123), 2 * HOUR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_live_pid_treats_missing_garbage_and_dead_pids_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        assert_eq!(read_live_pid(&path), None, "missing file");
+
+        for garbage in ["", "not a pid", "-4", "0"] {
+            std::fs::write(&path, garbage).unwrap();
+            assert_eq!(read_live_pid(&path), None, "garbage {garbage:?}");
+        }
+
+        // A live pid (our own) is returned.
+        std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+        assert_eq!(
+            read_live_pid(&path),
+            Some(nix::unistd::Pid::from_raw(std::process::id() as i32))
+        );
+
+        // A stale pid (spawned and already reaped) is treated as absent.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        std::fs::write(&path, dead_pid.to_string()).unwrap();
+        assert_eq!(read_live_pid(&path), None, "stale pid must read as absent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_writes_own_pid_and_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("sitter.pid");
+        let guard = PidFile::create(&path).expect("pidfile created");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(guard);
+        assert!(!path.exists(), "pidfile must be removed on drop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidfile_guard_drop_leaves_another_sitters_pid_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sitter.pid");
+        let guard = PidFile::create(&path).expect("pidfile created");
+        // A later serve sitter overwrites the pidfile (last writer wins);
+        // this guard's drop must not delete that sitter's entry.
+        std::fs::write(&path, "999999\n").unwrap();
+        drop(guard);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "999999",
+            "drop must leave a pidfile it no longer owns in place"
+        );
     }
 
     #[cfg(unix)]

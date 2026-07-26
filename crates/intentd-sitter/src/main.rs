@@ -5,12 +5,16 @@
 //! startup update check, spawn the installed daemon with all forwarded args
 //! verbatim, keep it updated on the randomized 12–24h cadence, and babysit
 //! crashes. One-shot subcommands run the installed daemon exactly once with
-//! no updater activity.
+//! no updater activity. The intercepted `intentd sitter channel` and
+//! `intentd restart` commands are handled entirely here — they never spawn
+//! the daemon.
 
-use intentd_sitter::cli::{self, SitterArgs};
+use intentd_sitter::cli::{self, SitterArgs, SitterCommand};
+use intentd_sitter::config;
 use intentd_sitter::manifest;
 use intentd_sitter::paths::SitterPaths;
 use intentd_sitter::supervisor::{self, SupervisorConfig, MANIFEST_BASE_URL_ENV};
+use intentd_sitter::updater::{UpdateOutcome, Updater};
 
 fn main() {
     std::process::exit(run());
@@ -46,11 +50,142 @@ fn run() -> i32 {
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| manifest::DEFAULT_MANIFEST_BASE_URL.to_string());
 
+    match args.sitter_command() {
+        Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &base_url),
+        Some(Err(e)) => {
+            eprintln!("intentd-sitter: {e}");
+            return 2;
+        }
+        None => {}
+    }
+
+    let channel = config::resolve_channel(args.channel, config::load_channel(&paths.config_path));
+
     supervisor::run(
         paths,
-        args.channel,
+        channel,
         args.passthrough,
         SupervisorConfig::from_env(),
         base_url,
     )
+}
+
+/// How to apply a new channel pin / freshly installed binary right away.
+const RESTART_HINT: &str = "apply it now with `intentd restart` (fallback: \
+     `brew services restart intentd` / `systemctl --user restart intentd`)";
+
+/// Execute an intercepted sitter-owned command; returns the exit code.
+/// Never spawns the daemon.
+fn run_sitter_command(
+    command: SitterCommand,
+    args: &SitterArgs,
+    paths: &SitterPaths,
+    base_url: &str,
+) -> i32 {
+    match command {
+        SitterCommand::Channel { set, redownload } => {
+            run_channel_command(set, redownload, args, paths, base_url)
+        }
+        SitterCommand::Restart => run_restart(paths),
+    }
+}
+
+/// `intentd sitter channel [stable|beta] [--redownload]` — never touches a
+/// running daemon.
+fn run_channel_command(
+    set: Option<cli::Channel>,
+    redownload: bool,
+    args: &SitterArgs,
+    paths: &SitterPaths,
+    base_url: &str,
+) -> i32 {
+    let Some(channel) = set else {
+        let resolved =
+            config::resolve_channel(args.channel, config::load_channel(&paths.config_path));
+        println!("{} (from {})", resolved.channel, resolved.origin);
+        return 0;
+    };
+
+    if let Err(e) = config::save_channel(&paths.config_path, channel) {
+        eprintln!(
+            "intentd-sitter: failed to write {}: {e}",
+            paths.config_path.display()
+        );
+        return 1;
+    }
+    println!(
+        "channel {channel} pinned in {}",
+        paths.config_path.display()
+    );
+
+    if redownload {
+        let updater = match Updater::with_base_url(paths.clone(), base_url) {
+            Ok(updater) => updater,
+            Err(e) => {
+                eprintln!("intentd-sitter: {e} (the channel pin was still written)");
+                return 1;
+            }
+        };
+        match updater.force_install(channel) {
+            // `AlreadyCurrent` is defensive/unreachable here: force_install
+            // bypasses the newer-only comparison and always reinstalls, but
+            // the arm keeps the match exhaustive (and prints something
+            // sensible) if updater internals ever change.
+            Ok(
+                UpdateOutcome::Installed { version, .. }
+                | UpdateOutcome::AlreadyCurrent { version },
+            ) => {
+                println!(
+                    "installed intentd {version} from channel {channel}; \
+                     the new binary becomes active after a restart"
+                );
+                println!("{RESTART_HINT}");
+            }
+            Err(e) => {
+                eprintln!(
+                    "intentd-sitter: failed to install from channel {channel}: {e} \
+                     (the channel pin was still written)"
+                );
+                return 1;
+            }
+        }
+    } else {
+        println!(
+            "{RESTART_HINT}; a running service otherwise picks it up \
+             at its next periodic update check"
+        );
+    }
+    0
+}
+
+/// `intentd restart` — restart the supervised daemon in place by sending
+/// SIGHUP to the serve-mode sitter found via its pidfile. Stale pidfiles
+/// (dead pid) are treated as no running service.
+#[cfg(unix)]
+fn run_restart(paths: &SitterPaths) -> i32 {
+    let Some(pid) = supervisor::read_live_pid(&paths.pid_path) else {
+        eprintln!(
+            "intentd-sitter: no running supervised intentd found (no live pid in {}); \
+             start the service first (`intentd serve`, `brew services start intentd`, \
+             or `systemctl --user start intentd`)",
+            paths.pid_path.display()
+        );
+        return 1;
+    };
+    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP) {
+        eprintln!("intentd-sitter: failed to signal the supervised sitter (pid {pid}): {e}");
+        return 1;
+    }
+    println!("restarting intentd: sent SIGHUP to the supervised sitter (pid {pid})");
+    0
+}
+
+/// No SIGHUP on windows: point at the service manager instead.
+#[cfg(not(unix))]
+fn run_restart(_paths: &SitterPaths) -> i32 {
+    eprintln!(
+        "intentd-sitter: `intentd restart` is not supported on Windows; \
+         restart the service instead"
+    );
+    1
 }

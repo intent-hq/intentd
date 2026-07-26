@@ -1,15 +1,18 @@
 //! Sitter CLI parsing.
 //!
 //! The sitter forwards ALL args verbatim to the daemon, so it owns only the
-//! `--sitter-*` flag namespace, stripped before forwarding. Everything else —
-//! including `--version`, `serve`, `--resume-all` — is collected in order as
-//! passthrough args. A manual scan is used instead of clap so unknown daemon
-//! flags are never rejected here.
+//! `--sitter-*` flag namespace, stripped before forwarding, plus the
+//! intercepted `sitter` subcommand namespace ([`SitterCommand`]). Everything
+//! else — including `--version`, `serve`, `--resume-all` — is collected in
+//! order as passthrough args. A manual scan is used instead of clap so
+//! unknown daemon flags are never rejected here.
 
 use std::ffi::OsString;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::config::{ChannelOrigin, ResolvedChannel};
 
 /// Environment variable selecting the release channel (`stable` | `beta`).
 pub const CHANNEL_ENV: &str = "INTENTD_CHANNEL";
@@ -54,14 +57,84 @@ pub enum CliError {
         "unknown sitter flag {0:?} (the sitter owns only --sitter-channel and --sitter-version)"
     )]
     UnknownSitterFlag(String),
+    #[error(
+        "missing sitter subcommand: usage: intentd sitter channel [stable|beta] [--redownload]"
+    )]
+    MissingSitterSubcommand,
+    #[error("unknown sitter subcommand {0:?} (supported sitter subcommands: channel)")]
+    UnknownSitterSubcommand(String),
+    #[error(
+        "--redownload requires a channel value: intentd sitter channel <stable|beta> --redownload"
+    )]
+    RedownloadWithoutChannel,
+    #[error("unexpected argument {0:?} to `intentd sitter channel`")]
+    UnexpectedChannelArg(String),
+    #[error("unexpected argument {0:?} to `intentd restart` (it takes no arguments)")]
+    UnexpectedRestartArg(String),
+}
+
+/// Intercepted sitter-owned subcommand, recognized when `sitter` (or bare
+/// `restart`) is the first passthrough token — like the `--sitter-*` flag
+/// namespace it is never forwarded to the daemon. A bare `--` before it
+/// still forwards everything verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SitterCommand {
+    /// `intentd sitter channel [stable|beta] [--redownload]` — get or set
+    /// the persistent channel pin in `<data_dir>/sitter/config.toml`.
+    Channel {
+        /// Channel to pin; `None` is the get form (print the effective
+        /// channel and its origin).
+        set: Option<Channel>,
+        /// Set form only: immediately fetch the channel manifest and
+        /// force-install its version, bypassing the newer-only comparison.
+        redownload: bool,
+    },
+    /// `intentd restart` — restart the supervised daemon in place by
+    /// signaling the serve-mode sitter found via its pidfile (SIGHUP).
+    Restart,
+}
+
+impl SitterCommand {
+    /// Parse the tokens after the leading `sitter`.
+    fn parse(rest: &[OsString]) -> Result<Self, CliError> {
+        let Some((sub, args)) = rest.split_first() else {
+            return Err(CliError::MissingSitterSubcommand);
+        };
+        if sub.to_str() != Some("channel") {
+            return Err(CliError::UnknownSitterSubcommand(
+                sub.to_string_lossy().into_owned(),
+            ));
+        }
+        let mut set = None;
+        let mut redownload = false;
+        for arg in args {
+            match arg.to_str() {
+                Some("--redownload") => redownload = true,
+                Some(value) if set.is_none() && !value.starts_with('-') => {
+                    set = Some(Channel::parse(value)?);
+                }
+                _ => {
+                    return Err(CliError::UnexpectedChannelArg(
+                        arg.to_string_lossy().into_owned(),
+                    ));
+                }
+            }
+        }
+        if redownload && set.is_none() {
+            return Err(CliError::RedownloadWithoutChannel);
+        }
+        Ok(SitterCommand::Channel { set, redownload })
+    }
 }
 
 /// Parsed sitter invocation: the stripped `--sitter-*` options plus the
 /// remaining args preserved verbatim (and in order) for the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SitterArgs {
-    /// Release channel: `--sitter-channel` > `INTENTD_CHANNEL` > stable.
-    pub channel: Channel,
+    /// Channel explicitly selected this invocation (`--sitter-channel` >
+    /// `INTENTD_CHANNEL`), if any. `None` falls back to the `config.toml`
+    /// pin, then stable — resolve via [`crate::config::resolve_channel`].
+    pub channel: Option<ResolvedChannel>,
     /// `--sitter-version` was given: print the sitter's own version and exit.
     pub print_version: bool,
     /// All non-`--sitter-*` args, verbatim, for the daemon.
@@ -116,15 +189,21 @@ impl SitterArgs {
         }
 
         let channel = match channel_flag {
-            Some(c) => c,
+            Some(channel) => Some(ResolvedChannel {
+                channel,
+                origin: ChannelOrigin::Flag,
+            }),
             None => match env_channel.filter(|v| !v.is_empty()) {
                 Some(v) => {
                     let v = v.to_str().ok_or_else(|| {
                         CliError::InvalidChannel(v.to_string_lossy().into_owned())
                     })?;
-                    Channel::parse(v)?
+                    Some(ResolvedChannel {
+                        channel: Channel::parse(v)?,
+                        origin: ChannelOrigin::Env,
+                    })
                 }
-                None => Channel::default(),
+                None => None,
             },
         };
 
@@ -133,6 +212,24 @@ impl SitterArgs {
             print_version,
             passthrough,
         })
+    }
+
+    /// The intercepted sitter-owned subcommand, when the first passthrough
+    /// token is `sitter` or `restart`. After a bare `--` the first
+    /// passthrough token is the `--` itself, so `intentd -- sitter …` and
+    /// `intentd -- restart` still forward verbatim.
+    pub fn sitter_command(&self) -> Option<Result<SitterCommand, CliError>> {
+        let first = self.passthrough.first()?;
+        match first.to_str() {
+            Some("sitter") => Some(SitterCommand::parse(&self.passthrough[1..])),
+            Some("restart") => Some(match self.passthrough.get(1) {
+                Some(arg) => Err(CliError::UnexpectedRestartArg(
+                    arg.to_string_lossy().into_owned(),
+                )),
+                None => Ok(SitterCommand::Restart),
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -144,32 +241,39 @@ mod tests {
         SitterArgs::parse_from(args.iter().map(OsString::from), env.map(OsString::from))
     }
 
+    fn resolved(channel: Channel, origin: ChannelOrigin) -> Option<ResolvedChannel> {
+        Some(ResolvedChannel { channel, origin })
+    }
+
     #[test]
-    fn channel_defaults_to_stable() {
-        assert_eq!(parse(&[], None).unwrap().channel, Channel::Stable);
+    fn no_flag_or_env_selects_no_channel() {
+        assert_eq!(parse(&[], None).unwrap().channel, None);
     }
 
     #[test]
     fn channel_from_env() {
-        assert_eq!(parse(&[], Some("beta")).unwrap().channel, Channel::Beta);
+        assert_eq!(
+            parse(&[], Some("beta")).unwrap().channel,
+            resolved(Channel::Beta, ChannelOrigin::Env)
+        );
     }
 
     #[test]
     fn channel_flag_overrides_env() {
         let args = parse(&["--sitter-channel", "stable"], Some("beta")).unwrap();
-        assert_eq!(args.channel, Channel::Stable);
+        assert_eq!(args.channel, resolved(Channel::Stable, ChannelOrigin::Flag));
     }
 
     #[test]
     fn channel_equals_form() {
         let args = parse(&["--sitter-channel=beta"], None).unwrap();
-        assert_eq!(args.channel, Channel::Beta);
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
         assert!(args.passthrough.is_empty());
     }
 
     #[test]
     fn empty_env_is_unset() {
-        assert_eq!(parse(&[], Some("")).unwrap().channel, Channel::Stable);
+        assert_eq!(parse(&[], Some("")).unwrap().channel, None);
     }
 
     #[test]
@@ -227,7 +331,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(args.channel, Channel::Beta);
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
         assert!(args.print_version);
         assert_eq!(
             args.passthrough,
@@ -248,13 +352,164 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(args.channel, Channel::Beta);
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
         assert_eq!(
             args.passthrough,
             vec![
                 OsString::from("--"),
                 OsString::from("--sitter-channel=stable"),
             ]
+        );
+    }
+
+    fn sitter_cmd(args: &[&str]) -> Option<Result<SitterCommand, CliError>> {
+        parse(args, None).unwrap().sitter_command()
+    }
+
+    #[test]
+    fn non_sitter_invocations_have_no_sitter_command() {
+        assert_eq!(sitter_cmd(&[]), None);
+        assert_eq!(sitter_cmd(&["serve", "--resume-all"]), None);
+        assert_eq!(sitter_cmd(&["doctor", "sitter"]), None);
+    }
+
+    #[test]
+    fn sitter_channel_get_form() {
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel"]),
+            Some(Ok(SitterCommand::Channel {
+                set: None,
+                redownload: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn sitter_channel_set_form() {
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "beta"]),
+            Some(Ok(SitterCommand::Channel {
+                set: Some(Channel::Beta),
+                redownload: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn sitter_channel_set_with_redownload_in_either_order() {
+        let expected = Some(Ok(SitterCommand::Channel {
+            set: Some(Channel::Stable),
+            redownload: true,
+        }));
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "stable", "--redownload"]),
+            expected
+        );
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "--redownload", "stable"]),
+            expected
+        );
+    }
+
+    #[test]
+    fn sitter_channel_redownload_without_value_is_error() {
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "--redownload"]),
+            Some(Err(CliError::RedownloadWithoutChannel))
+        );
+    }
+
+    #[test]
+    fn sitter_channel_invalid_value_is_error() {
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "nightly"]),
+            Some(Err(CliError::InvalidChannel("nightly".to_string())))
+        );
+    }
+
+    #[test]
+    fn sitter_channel_extra_args_are_errors() {
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "beta", "stable"]),
+            Some(Err(CliError::UnexpectedChannelArg("stable".to_string())))
+        );
+        assert_eq!(
+            sitter_cmd(&["sitter", "channel", "beta", "--force"]),
+            Some(Err(CliError::UnexpectedChannelArg("--force".to_string())))
+        );
+    }
+
+    #[test]
+    fn bare_sitter_and_unknown_subcommand_are_errors() {
+        assert_eq!(
+            sitter_cmd(&["sitter"]),
+            Some(Err(CliError::MissingSitterSubcommand))
+        );
+        assert_eq!(
+            sitter_cmd(&["sitter", "restart"]),
+            Some(Err(CliError::UnknownSitterSubcommand(
+                "restart".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn bare_restart_is_intercepted() {
+        assert_eq!(sitter_cmd(&["restart"]), Some(Ok(SitterCommand::Restart)));
+    }
+
+    #[test]
+    fn restart_with_extra_args_is_error() {
+        assert_eq!(
+            sitter_cmd(&["restart", "now"]),
+            Some(Err(CliError::UnexpectedRestartArg("now".to_string())))
+        );
+        assert_eq!(
+            sitter_cmd(&["restart", "--force"]),
+            Some(Err(CliError::UnexpectedRestartArg("--force".to_string())))
+        );
+    }
+
+    #[test]
+    fn restart_not_first_token_is_forwarded() {
+        assert_eq!(sitter_cmd(&["serve", "restart"]), None);
+    }
+
+    #[test]
+    fn double_dash_forwards_restart_verbatim() {
+        let args = parse(&["--", "restart"], None).unwrap();
+        assert_eq!(args.sitter_command(), None);
+        assert_eq!(
+            args.passthrough,
+            vec![OsString::from("--"), OsString::from("restart")]
+        );
+    }
+
+    #[test]
+    fn double_dash_forwards_sitter_verbatim() {
+        let args = parse(&["--", "sitter", "channel", "beta"], None).unwrap();
+        assert_eq!(args.sitter_command(), None);
+        assert_eq!(
+            args.passthrough,
+            vec![
+                OsString::from("--"),
+                OsString::from("sitter"),
+                OsString::from("channel"),
+                OsString::from("beta"),
+            ]
+        );
+    }
+
+    #[test]
+    fn sitter_flags_still_stripped_around_sitter_command() {
+        let args = parse(&["--sitter-channel=beta", "sitter", "channel"], None).unwrap();
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
+        assert_eq!(
+            args.sitter_command(),
+            Some(Ok(SitterCommand::Channel {
+                set: None,
+                redownload: false,
+            }))
         );
     }
 

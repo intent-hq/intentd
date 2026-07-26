@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+use intentd_sitter::cli::{Channel, CHANNEL_ENV};
 use intentd_sitter::manifest::TARGET_TRIPLE;
 use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::state::{self, SitterState};
@@ -248,6 +249,7 @@ fn send_signal(child: &Child, signal: &str) {
 }
 
 const MANIFEST_PATH: &str = "/channel-stable/stable.json";
+const BETA_MANIFEST_PATH: &str = "/channel-beta/beta.json";
 
 #[test]
 fn forwards_args_verbatim_and_clean_exit_passes_through() {
@@ -408,6 +410,136 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
 }
 
 #[test]
+fn config_channel_switch_applies_at_next_periodic_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    // No --sitter-channel flag and no INTENTD_CHANNEL env: the channel comes
+    // from config.toml / the stable default, so the supervisor re-resolves
+    // it before each periodic check.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(CHANNEL_ENV)
+        .env(CHECK_MIN_ENV, "300")
+        .env(CHECK_MAX_ENV, "301")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Publish 0.2.0 on the beta channel only, then pin channel=beta in
+    // config.toml mid-run (what `intentd sitter channel beta` writes).
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    fs::write(&paths.config_path, "channel = \"beta\"\n").unwrap();
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(20), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.first().map(String::as_str),
+        Some(MANIFEST_PATH),
+        "startup check must use the stable default: {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|p| p == BETA_MANIFEST_PATH),
+        "the check after the config switch must fetch beta.json: {requests:?}"
+    );
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.current_version.as_deref(), Some("0.2.0"));
+    assert_eq!(state.channel, Channel::Beta);
+    assert!(paths.daemon_binary("0.2.0").exists());
+}
+
+#[test]
+fn flag_pinned_channel_ignores_config_switch_mid_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    // A fully installable beta 0.2.0 is on offer; the flag-pinned sitter
+    // must never even fetch its manifest.
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHECK_MIN_ENV, "100")
+        .env(CHECK_MAX_ENV, "101")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .args(["serve", "--sitter-channel=stable"])
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    // Write the config pin mid-run, then let several more checks elapse.
+    fs::write(&paths.config_path, "channel = \"beta\"\n").unwrap();
+    let checks_at_switch = requests.lock().unwrap().len();
+    wait_until(
+        "several more periodic checks",
+        Duration::from_secs(15),
+        || requests.lock().unwrap().len() >= checks_at_switch + 3,
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests.iter().all(|p| p == MANIFEST_PATH),
+        "flag-pinned sitter must never fetch beta.json: {requests:?}"
+    );
+    let starts = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| line.starts_with("start "))
+        .count();
+    assert_eq!(starts, 1, "pinned sitter must not install/restart");
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.1.0")
+    );
+}
+
+#[test]
 fn crash_respawn_backs_off_exponentially() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
@@ -445,6 +577,91 @@ fn crash_respawn_backs_off_exponentially() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("respawning intentd in"), "stderr: {stderr}");
+}
+
+#[test]
+fn sighup_during_crash_backoff_respawns_the_state_json_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    // 0.1.0 crash-loops; a 30s backoff (never elapsing within the test)
+    // guarantees the SIGHUP below lands during the backoff sleep.
+    preinstall(&paths, "0.1.0", &crash_script(7));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(CHANNEL_ENV)
+        .env(BACKOFF_INITIAL_ENV, "30000")
+        .env(BACKOFF_CAP_ENV, "30000")
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    let stderr = stderr_path(dir.path());
+    wait_until(
+        "the crashed daemon to enter backoff",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&log_path).contains("run")
+                && read_or_empty(&stderr).contains("respawning intentd in")
+        },
+    );
+
+    // The recovery a crash-looping user reaches for: force-install a fixed
+    // 0.2.0 (`sitter channel beta --redownload`), then `intentd restart`
+    // (SIGHUP) while the sitter is still deep in its backoff sleep.
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    let output = run_one_shot(
+        dir.path(),
+        &base_url,
+        &["sitter", "channel", "beta", "--redownload"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+
+    send_signal(&sitter, "HUP");
+    // Well under the 30s backoff: the SIGHUP must cut the sleep short AND
+    // re-resolve the version from state.json, not respawn crashing 0.1.0.
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the restart"
+    );
+    let runs = read_or_empty(&log_path)
+        .lines()
+        .filter(|line| *line == "run")
+        .count();
+    assert_eq!(runs, 1, "crashing 0.1.0 must not have been respawned");
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
 }
 
 #[test]
@@ -617,6 +834,174 @@ fn one_shot_with_nothing_installed_fails_fast_without_installing() {
     assert!(
         !paths.daemon_binary("0.2.0").exists(),
         "one-shot must not install"
+    );
+}
+
+/// Run a second sitter process to completion against the same data dir,
+/// capturing stdout/stderr (without truncating the serve sitter's logs).
+fn run_one_shot(data_dir: &Path, base_url: &str, args: &[&str]) -> std::process::Output {
+    Command::new(SITTER_BIN)
+        .env_remove(CHANNEL_ENV)
+        .env(DATA_DIR_ENV, data_dir)
+        .env(MANIFEST_BASE_URL_ENV, base_url)
+        .env(FAKE_DAEMON_LOG, daemon_log_path(data_dir))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn restart_command_respawns_state_version_without_exiting_sitter() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    // Hour-long check interval: only the SIGHUP may restart the child.
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .env_remove(CHANNEL_ENV)
+        .env(CHECK_MIN_ENV, "3600000")
+        .env(CHECK_MAX_ENV, "3600001")
+        .env(KILL_TIMEOUT_ENV, "5000")
+        .arg("serve")
+        .spawn()
+        .unwrap();
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    assert_eq!(
+        read_or_empty(&paths.pid_path).trim(),
+        sitter.id().to_string(),
+        "serve mode must write its pid to sitter.pid"
+    );
+
+    // Publish beta 0.2.0 and force-install it (`sitter channel beta
+    // --redownload`); the running child must stay on 0.1.0.
+    let archive = make_tar_xz(long_running_script("0.2.0").as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    {
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{asset}"), archive);
+        routes.insert(
+            BETA_MANIFEST_PATH.to_string(),
+            manifest_json("0.2.0", &base_url, &asset, &sha),
+        );
+    }
+    let output = run_one_shot(
+        dir.path(),
+        &base_url,
+        &["sitter", "channel", "beta", "--redownload"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+    assert!(
+        !read_or_empty(&log_path).contains("start 0.2.0"),
+        "--redownload must not restart the running daemon"
+    );
+
+    // `intentd restart` respawns the child on the state.json version.
+    let output = run_one_shot(dir.path(), &base_url, &["restart"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("restarting intentd"), "stdout: {stdout}");
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter must survive the restart"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 :: serve".to_string(),
+            "start 0.2.0 :: serve".to_string(),
+        ],
+        "each version must run exactly once"
+    );
+    assert!(
+        !paths.pid_path.exists(),
+        "the pidfile must be removed on exit"
+    );
+}
+
+#[test]
+fn restart_without_live_sitter_or_with_stale_pidfile_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let base_url = dead_url();
+
+    // No pidfile at all.
+    let output = run_one_shot(dir.path(), &base_url, &["restart"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no running supervised intentd"),
+        "stderr: {stderr}"
+    );
+
+    // Stale pidfile: the pid of an already-reaped process reads as absent.
+    let mut dead = Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    fs::create_dir_all(paths.pid_path.parent().unwrap()).unwrap();
+    fs::write(&paths.pid_path, format!("{dead_pid}\n")).unwrap();
+    let output = run_one_shot(dir.path(), &base_url, &["restart"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no running supervised intentd"),
+        "stderr: {stderr}"
+    );
+
+    assert!(
+        !daemon_log_path(dir.path()).exists(),
+        "`intentd restart` must never spawn the daemon"
+    );
+}
+
+#[test]
+fn double_dash_restart_forwards_verbatim_to_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &args_dump_script());
+
+    let output = run_one_shot(dir.path(), &dead_url(), &["--", "restart"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_or_empty(&daemon_log_path(dir.path())),
+        "--\nrestart\n",
+        "after `--` a literal restart must reach the daemon verbatim"
     );
 }
 
