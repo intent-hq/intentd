@@ -529,15 +529,11 @@ pub(crate) fn env_probe() -> Value {
 }
 
 /// Expand `~` / `~/...` to `home` (mirrors the FE `expandPath`). Anything else
-/// passes through verbatim.
+/// passes through verbatim. Delegates to the shared [`intent_core::tilde`]
+/// helper so extra leading separators (`~//sub`) stay under `home`
+/// (intent-hq/monorepo#832).
 pub(crate) fn expand_path(input: &str, home: &Path) -> PathBuf {
-    if input == "~" {
-        return home.to_path_buf();
-    }
-    if let Some(rest) = input.strip_prefix("~/") {
-        return home.join(rest);
-    }
-    PathBuf::from(input)
+    intent_core::expand_tilde_with(input, home)
 }
 
 /// Walk up from `start` looking for a `.git` directory OR a worktree `.git`
