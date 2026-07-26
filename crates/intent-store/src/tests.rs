@@ -2955,6 +2955,81 @@ async fn agent_session_status_only_lookup() {
     ));
 }
 
+/// `set_agent_session_resolved_model` (D14) guard: the write lands only
+/// while `model` still equals `expected_model` — a mismatch (concurrent
+/// `agent.setModel`) returns `false` and leaves `resolved_model` untouched.
+/// `clear_agent_session_resolved_model` is idempotent (already-NULL column
+/// and absent row are both no-ops).
+#[tokio::test]
+async fn agent_session_resolved_model_guard_and_clear() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-aaaaaaaa-1111-2222-3333-555555555555");
+    let mut session = sample_agent_session(&agent_id, &ws);
+    session.model = Some("claude-code:claude-fable-5[1m]".to_string());
+    store
+        .insert_agent_session(&session)
+        .await
+        .expect("insert session");
+
+    // Guard failure: expected_model no longer matches → false, no write.
+    let landed = store
+        .set_agent_session_resolved_model(&ws, &agent_id, "claude-code:sonnet", Some("Sonnet 5"))
+        .await
+        .expect("guarded write");
+    assert!(!landed, "mismatched expected_model must not land");
+    let (_, resolved, _, _) = store
+        .get_agent_session_token_usage(&ws, &agent_id)
+        .await
+        .expect("read");
+    assert_eq!(resolved, None, "resolved_model untouched on guard failure");
+
+    // Guard success: matching expected_model lands the resolution.
+    let landed = store
+        .set_agent_session_resolved_model(
+            &ws,
+            &agent_id,
+            "claude-code:claude-fable-5[1m]",
+            Some("Fable 5"),
+        )
+        .await
+        .expect("guarded write");
+    assert!(landed);
+    let (_, resolved, _, _) = store
+        .get_agent_session_token_usage(&ws, &agent_id)
+        .await
+        .expect("read");
+    assert_eq!(resolved.as_deref(), Some("Fable 5"));
+
+    // A None resolution overwrites (clears) via the same guarded write.
+    let landed = store
+        .set_agent_session_resolved_model(&ws, &agent_id, "claude-code:claude-fable-5[1m]", None)
+        .await
+        .expect("guarded clear");
+    assert!(landed);
+    let (_, resolved, _, _) = store
+        .get_agent_session_token_usage(&ws, &agent_id)
+        .await
+        .expect("read");
+    assert_eq!(resolved, None);
+
+    // clear is idempotent: already-NULL column and absent row are no-ops.
+    store
+        .clear_agent_session_resolved_model(&ws, &agent_id)
+        .await
+        .expect("clear on already-NULL column");
+    let missing = AgentId::from("agent-ffffffff-0000-0000-0000-000000000001");
+    store
+        .clear_agent_session_resolved_model(&ws, &missing)
+        .await
+        .expect("clear on absent row is a no-op");
+}
+
 /// `set_agent_session_status` stop_reason parameter: `None` leaves the column
 /// untouched; `Some(None)` clears it to NULL; `Some(Some(reason))` sets the
 /// new value. Exercises the three-way encoding for set/clear/leave-unchanged

@@ -1699,7 +1699,11 @@ impl Services {
         // The stored model changed, so any persisted display resolution (D14)
         // now names the wrong model — clear it; the next session open
         // re-resolves against the new id. Best-effort: the setModel itself
-        // already landed.
+        // already landed. Benign race: a session open interleaving between
+        // the model UPDATE above and this clear can persist a fresh (valid)
+        // resolution for the NEW id which this then wipes — the only cost is
+        // a lost resolution until the next open (stats fall back to
+        // normalizing the raw id), never a stale mis-attribution.
         if let Err(e) = self
             .store
             .clear_agent_session_resolved_model(&workspace_id, &agent_id)
