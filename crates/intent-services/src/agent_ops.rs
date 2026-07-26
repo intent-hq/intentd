@@ -5045,30 +5045,35 @@ impl Services {
     /// newer superset — never an older snapshot.
     pub(crate) async fn persist_queue_snapshot(&self, agent_id: &AgentId) {
         let _gate = self.agent_queue_persist_gate.lock().await;
-        let rows: Vec<intent_store::AgentQueueRow> = {
-            let guard = self
-                .agent_queues
-                .lock()
-                .expect("agent queue registry poisoned");
-            guard
-                .get(agent_id)
-                .map(|q| {
-                    q.iter()
-                        .enumerate()
-                        .map(|(i, m)| intent_store::AgentQueueRow {
-                            id: m.id.clone(),
-                            agent_id: agent_id.clone(),
-                            position: i as i64,
-                            payload: serde_json::to_value(m).unwrap_or(Value::Null),
-                            created_at: m.queued_at.clone(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let rows = self.queue_rows(agent_id);
         if let Err(e) = self.store.replace_agent_queue(agent_id, &rows).await {
             tracing::warn!(agent = %agent_id, error = %e, "agent queue write-through failed");
         }
+    }
+
+    /// Snapshot an agent's in-memory queue as `agent_queue` rows (brief lock,
+    /// dropped on return). Callers that persist the result must hold
+    /// `agent_queue_persist_gate` across snapshot + store write.
+    fn queue_rows(&self, agent_id: &AgentId) -> Vec<intent_store::AgentQueueRow> {
+        let guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        guard
+            .get(agent_id)
+            .map(|q| {
+                q.iter()
+                    .enumerate()
+                    .map(|(i, m)| intent_store::AgentQueueRow {
+                        id: m.id.clone(),
+                        agent_id: agent_id.clone(),
+                        position: i as i64,
+                        payload: serde_json::to_value(m).unwrap_or(Value::Null),
+                        created_at: m.queued_at.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Rehydrate every persisted agent queue into the in-memory map at daemon
@@ -5150,6 +5155,20 @@ impl Services {
         queue: Vec<Value>,
     ) {
         self.persist_queue_snapshot(agent_id).await;
+        self.publish_queue_event(agent_id, workspace_id, queue)
+            .await;
+    }
+
+    /// Publish `agent:queue:updated` WITHOUT the write-through persist — for
+    /// the one caller ([`Services::migrate_queue_and_gc_poisoned_session`])
+    /// whose durable snapshot was already committed by an atomic store op.
+    /// Everything else goes through [`Services::publish_queue_updated_for`].
+    async fn publish_queue_event(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        queue: Vec<Value>,
+    ) {
         let event = intent_store::NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
@@ -5185,17 +5204,25 @@ impl Services {
     /// session). `id`, `content`, `queued_at`, `image_blocks`, `file_blocks`
     /// and `message_metadata` are preserved.
     ///
-    /// When entries moved, the target's queue snapshot is write-through
-    /// persisted and `agent:queue:updated` published (both via
-    /// [`Services::publish_queue_updated_for`]). The poisoned session is then
-    /// hard-deleted through [`Services::agent_delete_op`], which emits
-    /// `agent:deleted`, drops the (now empty) in-memory queue entry, and
-    /// clears the failure streak + failure-wake dedup records; the persisted
-    /// `agent_queue` rows cascade with the `agent_session` row (`ON DELETE
-    /// CASCADE`, migration 0046) so nothing rehydrates at the next startup.
-    /// No-op safe: an empty (or absent) queue still GCs the session, and a
-    /// missing poisoned session stays idempotent (the delete succeeds
-    /// quietly). Returns the number of migrated messages.
+    /// When entries moved, the durable hand-off is committed ATOMICALLY via
+    /// [`Store::move_agent_queue`]: one write transaction deletes both
+    /// agents' persisted rows and inserts the target snapshot, so a crash at
+    /// any point leaves the messages durable on exactly one queue — never
+    /// neither. Unlike the best-effort write-throughs, a failed move is an
+    /// ERROR: the in-memory drain is rolled back, GC is skipped (the
+    /// messages stay durable on the poisoned queue), and the caller can
+    /// retry. On success `agent:queue:updated` is published for the target
+    /// and the poisoned session is hard-deleted through
+    /// [`Services::agent_delete_op`], which emits `agent:deleted`, drops the
+    /// (now empty) in-memory queue entry, and clears the failure streak +
+    /// failure-wake dedup records; any persisted `agent_queue` rows cascade
+    /// with the `agent_session` row (`ON DELETE CASCADE`, migration 0046) so
+    /// nothing rehydrates at the next startup. No-op safe: an empty (or
+    /// absent) queue still GCs the session, and a missing poisoned session
+    /// stays idempotent (the delete succeeds quietly). Returns the number of
+    /// migrated messages.
+    ///
+    /// [`Store::move_agent_queue`]: intent_store::Store::move_agent_queue
     // TODO(monorepo#847): drop the allow once `agent_wake_or_create_op`
     // wires this in (follow-up change on this branch).
     #[allow(dead_code)]
@@ -5217,41 +5244,59 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {poisoned_id}")));
             }
         }
-        let migrated = {
+        // Drain in-memory, keeping the original entries for rollback should
+        // the durable move fail below.
+        let drained: Vec<QueuedMessage> = {
             let mut guard = self
                 .agent_queues
                 .lock()
                 .expect("agent queue registry poisoned");
             let drained = guard.remove(poisoned_id).unwrap_or_default();
-            let count = drained.len();
-            if count > 0 {
+            if !drained.is_empty() {
                 let queue = guard.entry(target_id.clone()).or_default();
-                for mut message in drained {
+                for message in &drained {
+                    let mut message = message.clone();
                     message.editing = false;
                     message.persisted = false;
                     message.requeued_after_failure = false;
                     queue.push(message);
                 }
             }
-            count
+            drained
         };
+        let migrated = drained.len();
         if migrated > 0 {
-            // The migrated entries keep their ids and `agent_queue.id` is a
-            // GLOBAL primary key, so the poisoned agent's stale persisted
-            // rows must be cleared BEFORE the target's write-through — the
-            // session delete below would cascade them anyway, but too late
-            // for the insert. Best-effort like every write-through: the
-            // in-memory queue stays authoritative and the delete's cascade
-            // still unblocks the next re-persist.
-            if let Err(e) = self.store.delete_agent_queue(poisoned_id).await {
-                tracing::warn!(
-                    agent = %poisoned_id,
-                    error = %e,
-                    "clearing poisoned agent's persisted queue rows failed"
-                );
+            // Atomic durable hand-off: one transaction clears BOTH agents'
+            // persisted rows and inserts the target snapshot. (The migrated
+            // entries keep their ids and `agent_queue.id` is a GLOBAL
+            // primary key, so a non-atomic clear-then-replace pair risks a
+            // crash window with the messages on NEITHER queue.) The snapshot
+            // is taken inside the persist gate, same ordering contract as
+            // `persist_queue_snapshot`.
+            let moved = {
+                let _gate = self.agent_queue_persist_gate.lock().await;
+                let rows = self.queue_rows(target_id);
+                self.store
+                    .move_agent_queue(poisoned_id, target_id, &rows)
+                    .await
+            };
+            if let Err(e) = moved {
+                // Roll back the in-memory drain and skip GC: the messages
+                // remain durable on the poisoned queue (rows untouched) and
+                // in its in-memory queue, so the caller can retry.
+                let migrated_ids: HashSet<&str> = drained.iter().map(|m| m.id.as_str()).collect();
+                let mut guard = self
+                    .agent_queues
+                    .lock()
+                    .expect("agent queue registry poisoned");
+                if let Some(queue) = guard.get_mut(target_id) {
+                    queue.retain(|m| !migrated_ids.contains(m.id.as_str()));
+                }
+                guard.insert(poisoned_id.clone(), drained);
+                return Err(e);
             }
             let queue = self.queue_snapshot(target_id);
-            self.publish_queue_updated_for(target_id, workspace_id, queue)
+            self.publish_queue_event(target_id, workspace_id, queue)
                 .await;
         }
         self.agent_delete_op(poisoned_id.clone(), Some(workspace_id.clone()))

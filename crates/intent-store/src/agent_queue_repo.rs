@@ -81,6 +81,72 @@ impl Store {
         .await
     }
 
+    /// Atomically move the persisted queue between two agents: ONE write
+    /// transaction deletes the rows of BOTH agents and inserts `rows` under
+    /// `to` (an empty `rows` slice just clears both). Backs the
+    /// poisoned-session queue migration (monorepo#847): migrated entries
+    /// keep their ids and `agent_queue.id` is a global primary key, so a
+    /// non-atomic clear-then-replace pair risks either a PK-conflict
+    /// rollback or a crash window where the messages are durable on
+    /// NEITHER queue — this op commits the hand-off as a single unit.
+    /// Every row must belong to `to`; a mismatch fails fast.
+    pub async fn move_agent_queue(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        rows: &[AgentQueueRow],
+    ) -> Result<()> {
+        if let Some(row) = rows.iter().find(|r| r.agent_id != *to) {
+            return Err(Error::Internal(format!(
+                "move agent queue row {} belongs to agent {}, not {}",
+                row.id, row.agent_id.0, to.0
+            )));
+        }
+        let pool = self.write_pool();
+        let from = from.clone();
+        let to = to.clone();
+        let owned: Vec<(String, i64, String, String)> = rows
+            .iter()
+            .map(|r| {
+                serde_json::to_string(&r.payload)
+                    .map(|payload| (r.id.clone(), r.position, payload, r.created_at.clone()))
+                    .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
+            })
+            .collect::<Result<_>>()?;
+
+        crate::with_write_txn_retry(|| async {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("move agent queue begin failed: {e}")))?;
+            sqlx::query("DELETE FROM agent_queue WHERE agent_id IN (?, ?)")
+                .bind(&from.0)
+                .bind(&to.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("move agent queue clear failed: {e}")))?;
+            for (id, position, payload, created_at) in &owned {
+                sqlx::query(
+                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at) \
+                     VALUES (?,?,?,?,?)",
+                )
+                .bind(id)
+                .bind(&to.0)
+                .bind(position)
+                .bind(payload)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("move agent queue insert failed: {e}")))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("move agent queue commit failed: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Load every persisted queue entry, ordered by agent then queue position,
     /// for startup rehydration. Joined against `agent_session` so entries
     /// whose session row no longer exists are skipped (defensive; the FK

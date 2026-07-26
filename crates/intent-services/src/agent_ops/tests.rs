@@ -10240,6 +10240,71 @@ async fn migrate_queue_rejects_unknown_target_without_draining() {
     assert!(svc.dequeue_message(&poisoned).is_some());
 }
 
+/// Durable invariant on the failure path: when the atomic store move fails,
+/// the helper errors, rolls back the in-memory drain, and SKIPS the GC — the
+/// parked messages stay durable (and in memory) on the poisoned queue, on
+/// exactly one queue, and the caller can retry.
+#[tokio::test]
+async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
+    let (_t, svc, ws) = setup().await;
+    let poisoned = create_agent(&svc, &ws, "Poisoned").await;
+    let target = create_agent(&svc, &ws, "Fresh").await;
+
+    svc.agent_queues.lock().unwrap().insert(
+        poisoned.clone(),
+        vec![parked_entry("m-0", "first"), parked_entry("m-1", "second")],
+    );
+    svc.persist_queue_snapshot(&poisoned).await;
+    assert_eq!(persisted_queue(&svc, &poisoned).await.len(), 2);
+
+    // Force the move to fail: hide the table for the duration of the call.
+    // `with_write_txn_retry` only retries SQLITE_BUSY, so this errors fast.
+    sqlx::query("ALTER TABLE agent_queue RENAME TO agent_queue_hidden")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("hide table");
+    let err = svc
+        .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
+        .await
+        .expect_err("failed store move must surface as an error");
+    assert!(matches!(err, Error::Internal(_)));
+    sqlx::query("ALTER TABLE agent_queue_hidden RENAME TO agent_queue")
+        .execute(svc.store().write_pool())
+        .await
+        .expect("restore table");
+
+    // GC skipped: the poisoned session survives with its durable rows, and
+    // the in-memory drain was rolled back — nothing leaked onto the target.
+    assert!(svc.store().get_agent_session(&poisoned).await.is_ok());
+    let rows = persisted_queue(&svc, &poisoned).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["id"], "m-0");
+    assert!(persisted_queue(&svc, &target).await.is_empty());
+    {
+        let guard = svc.agent_queues.lock().unwrap();
+        assert!(guard.get(&target).is_none_or(|q| q.is_empty()));
+        let parked = guard.get(&poisoned).expect("still parked");
+        assert_eq!(parked.len(), 2);
+        assert_eq!(parked[0].id, "m-0");
+        assert!(
+            parked[0].editing,
+            "rollback must restore the original entry"
+        );
+    }
+
+    // The failure was transient — a retry now completes the hand-off.
+    let migrated = svc
+        .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
+        .await
+        .expect("retry succeeds");
+    assert_eq!(migrated, 2);
+    assert!(matches!(
+        svc.store().get_agent_session(&poisoned).await,
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(persisted_queue(&svc, &target).await.len(), 2);
+}
+
 /// Resume appends the system interruption marker before the continuation, and
 /// the append is idempotent on retry: when a prior resume attempt already left
 /// the marker as the transcript tail (continuation delivery failed, row reset
