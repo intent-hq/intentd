@@ -887,7 +887,8 @@ impl Store {
     ///
     /// Uses raw `BEGIN IMMEDIATE` (same pattern as
     /// `Store::update_workspace_token_usage` / `insert_events`, monorepo#783):
-    /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
+    /// IMMEDIATE mode acquires the RESERVED (write) lock upfront — readers may
+    /// still proceed, especially in WAL mode — avoiding the
     /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
     /// that intermittently fails with SQLITE_BUSY (code 5). With
     /// `max_connections=1` on the write pool, concurrent writers serialize at
