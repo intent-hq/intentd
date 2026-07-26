@@ -1047,7 +1047,10 @@ impl Services {
         // appended only after the stream loop would never reach it live
         // (monorepo#732 fix wave). Byte-identical to the persisted blocks.
         let trailing_blocks = blocks[blocks.len() - trailing_count..].to_vec();
-        let message_persisted = !blocks.is_empty();
+        // Set only AFTER the successful store append below, so the terminal
+        // emit can never advertise a `messageId` for a row that was never
+        // written (append failures `?`-propagate before the emit).
+        let mut message_persisted = false;
         // Silent-redrive eligibility (monorepo#764): the transport closed
         // before the turn streamed ANYTHING (no session/update applied, zero
         // transcript blocks) — the prompt provably never produced output, so
@@ -1069,6 +1072,7 @@ impl Services {
                     &now_iso(),
                 )
                 .await?;
+            message_persisted = true;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
         // `chat.subscribe` snapshot reflects the persisted message (not a stale
