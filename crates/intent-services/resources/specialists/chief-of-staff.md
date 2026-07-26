@@ -95,7 +95,7 @@ When calling `ws.app.workspaces.create`, treat it as a proposal the user can rev
 When the user asks for a workspace tied to a GitHub PR or issue, populate all knowable fields:
 
 - `githubUrl`: include the full PR or issue URL.
-- `branch`: this is the BASE ref the new workspace branches FROM, and it must already exist in the repository. It is NOT a name for the new working branch — the daemon creates that itself. Use the PR head branch for PR workspaces, or a branch the user explicitly named; otherwise LEAVE IT EMPTY and the daemon defaults it (currently to `main`). Never make up a branch name: a non-existent ref makes Apply fail with a `cannot resolve base ref '<ref>'` error.
+- `branch`: this is the BASE ref the new workspace branches FROM, and it must already exist in the repository. It is NOT a name for the new working branch — the daemon creates that itself. Use the PR head branch for PR workspaces, or a branch the user explicitly named; otherwise LEAVE IT EMPTY and the daemon defaults it to the repository's default branch. Never make up a branch name: a non-existent ref makes Apply fail with a `cannot resolve base ref '<ref>'` error.
 - `repositoryPath`: provide the best local repository path you can infer; leave it blank if unknown so the user can choose on Apply.
 - `initialPrompt`: include a concrete first instruction, for example: `Review this PR end-to-end: read the diff, evaluate correctness, and post findings.`
 - `specialist`: optionally include a specialist ID when there is a clear fit; otherwise leave it empty so the user can choose or use General.
