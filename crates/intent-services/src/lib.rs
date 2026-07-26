@@ -6148,6 +6148,20 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn system_capabilities(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            // Machine-level capabilities (PROTOCOL §5.7). `cowSupported` reuses
+            // the same cached workspaces-root probe as Workspace.cowSupported
+            // (§5.1); it is included as true/false when the probe ran and
+            // omitted when it could not run (presence-detected by clients).
+            let mut caps = serde_json::Map::new();
+            if let Some(cow_supported) = self.compute_cow_supported().await {
+                caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
+            }
+            Ok(serde_json::Value::Object(caps))
+        })
+    }
+
     fn rules_list(
         &self,
         workspace_id: Option<WorkspaceId>,
