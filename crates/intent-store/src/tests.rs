@@ -4531,6 +4531,88 @@ async fn agent_queue_replace_load_delete_round_trip() {
 }
 
 #[tokio::test]
+async fn agent_queue_move_is_atomic_hand_off() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let poisoned = AgentId::new();
+    let target = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&poisoned, &ws))
+        .await
+        .expect("insert poisoned");
+    store
+        .insert_agent_session(&sample_agent_session(&target, &ws))
+        .await
+        .expect("insert target");
+
+    // Seed persisted rows on BOTH agents. The migrated entries reuse the
+    // poisoned rows' ids — `agent_queue.id` is a global primary key, so a
+    // non-atomic clear-then-replace would conflict; the single-transaction
+    // move must land them under the target while both agents' old rows go.
+    let old = vec![
+        queue_row(&poisoned, 0, "first"),
+        queue_row(&poisoned, 1, "second"),
+    ];
+    store
+        .replace_agent_queue(&poisoned, &old)
+        .await
+        .expect("seed poisoned");
+    store
+        .replace_agent_queue(&target, &[queue_row(&target, 0, "stale-target")])
+        .await
+        .expect("seed target");
+
+    let moved: Vec<AgentQueueRow> = old
+        .iter()
+        .map(|r| AgentQueueRow {
+            agent_id: target.clone(),
+            ..r.clone()
+        })
+        .collect();
+    store
+        .move_agent_queue(&poisoned, &target, &moved)
+        .await
+        .expect("move queue");
+
+    // One load observes the whole hand-off: the poisoned queue is empty and
+    // the target holds exactly the moved rows (ids preserved, in order).
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert!(loaded.iter().all(|r| r.agent_id == target));
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].id, old[0].id);
+    assert_eq!(loaded[0].payload["content"], "first");
+    assert_eq!(loaded[1].id, old[1].id);
+    assert_eq!(loaded[1].payload["content"], "second");
+
+    // Row/agent mismatch (rows not owned by `to`) fails fast without
+    // touching either queue.
+    let bad = vec![queue_row(&poisoned, 0, "wrong-owner")];
+    assert!(store
+        .move_agent_queue(&poisoned, &target, &bad)
+        .await
+        .is_err());
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 2);
+    assert!(loaded.iter().all(|r| r.agent_id == target));
+
+    // An empty move just clears both queues.
+    store
+        .move_agent_queue(&target, &poisoned, &[])
+        .await
+        .expect("empty move");
+    assert!(store
+        .load_all_agent_queues()
+        .await
+        .expect("load queues")
+        .is_empty());
+}
+
+#[tokio::test]
 async fn agent_queue_cascades_with_agent_session() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
