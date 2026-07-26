@@ -120,6 +120,24 @@ impl Updater {
     /// points at a newer version than `state.current_version`, download,
     /// verify, and install it. Equal or older manifests are a no-op.
     pub fn check_and_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
+        self.install_from_manifest(channel, false)
+    }
+
+    /// Fetch the channel manifest and install its version unconditionally,
+    /// bypassing the newer-only comparison — the explicit
+    /// `sitter channel <value> --redownload` path, and thus the only
+    /// downgrade path (e.g. beta → stable). Reuses the same
+    /// download/verify/install/prune sequence; never touches a running
+    /// daemon (the new binary takes effect on the next spawn).
+    pub fn force_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
+        self.install_from_manifest(channel, true)
+    }
+
+    fn install_from_manifest(
+        &self,
+        channel: Channel,
+        force: bool,
+    ) -> Result<UpdateOutcome, UpdateError> {
         let url = manifest::manifest_url(&self.base_url, channel);
         let bytes = self.fetch(&url, MANIFEST_TIMEOUT)?;
         let manifest = manifest::parse(&bytes)?;
@@ -135,15 +153,17 @@ impl Updater {
         })?;
 
         let state = state::load(&self.paths.state_path);
-        if let Some(current) = state.current_version.as_deref() {
-            // Only trust "already current" when the binary actually exists;
-            // a wiped versions dir must trigger a reinstall.
-            if self.paths.daemon_binary(current).exists()
-                && !manifest_is_newer(&manifest.version, current)?
-            {
-                return Ok(UpdateOutcome::AlreadyCurrent {
-                    version: current.to_string(),
-                });
+        if !force {
+            if let Some(current) = state.current_version.as_deref() {
+                // Only trust "already current" when the binary actually
+                // exists; a wiped versions dir must trigger a reinstall.
+                if self.paths.daemon_binary(current).exists()
+                    && !manifest_is_newer(&manifest.version, current)?
+                {
+                    return Ok(UpdateOutcome::AlreadyCurrent {
+                        version: current.to_string(),
+                    });
+                }
             }
         }
 
