@@ -5,7 +5,11 @@
 //! `~/.workspaces`. Only directories carrying `.workspace/workspace.json` are
 //! candidates; everything else is ignored. The importer is read-only toward
 //! the source and idempotent: ids already present in the DB are skipped
-//! (updated only with `--force`).
+//! (updated only with `--force`). Manifests written by intentd itself
+//! (`workspace.create` / `workspace.duplicate` stamp
+//! `"managedBy": "intentd"`) are also skipped so a fresh daemon sharing the
+//! workspaces root never adopts another daemon's live workspaces; `--force`
+//! imports them anyway (the recovery path for a wiped DB).
 //!
 //! Two entry points share this module:
 //! - [`maybe_import_on_first_boot`] — fired by `intentd serve` only when the
@@ -61,6 +65,19 @@ pub const LEGACY_IMPORT_MARKER_KEY: &str = "import.legacyCompletedAt";
 /// Legacy-only `workspace.json` fields intentd does not model — dropped on
 /// import (the FE `WorkspaceSchema` extras written next to the §9.1 fields).
 const LEGACY_ONLY_FIELDS: &[&str] = &["changesets", "conversationInfo", "timeline"];
+
+/// Manifest marker field written by intentd's `write_workspace_metadata_file`
+/// (`workspace.create` / `workspace.duplicate`). A manifest carrying
+/// `"managedBy": "intentd"` belongs to a live daemon-managed workspace, not a
+/// legacy one, and is skipped unless `--force` is set.
+const MANAGED_BY_FIELD: &str = "managedBy";
+
+/// [`MANAGED_BY_FIELD`] value identifying intentd-written manifests.
+const MANAGED_BY_INTENTD: &str = "intentd";
+
+/// Skip reason for daemon-managed manifests — an operational skip that never
+/// blocks the first-boot completion marker.
+const MANAGED_SKIP_REASON: &str = "daemon-managed manifest";
 
 /// Inputs for one import run.
 #[derive(Debug, Clone, Default)]
@@ -291,6 +308,7 @@ impl Report {
 
 fn is_operational_skip(reason: &str) -> bool {
     reason == "already in DB"
+        || reason == MANAGED_SKIP_REASON
         || reason.starts_with("update failed:")
         || reason.starts_with("insert failed:")
         || reason.starts_with("lookup failed:")
@@ -579,6 +597,14 @@ async fn import_one(
     }
     if !seen.insert(id.clone()) {
         report.skip(id, dir, "duplicate id already found under an earlier root");
+        return;
+    }
+    // Manifests intentd wrote itself (`workspace.create` / `.duplicate`) mark
+    // live daemon-managed workspaces — a fresh daemon sharing the workspaces
+    // root must never adopt them. `--force` remains the wiped-DB recovery path.
+    if !opts.force && obj.get(MANAGED_BY_FIELD).and_then(Value::as_str) == Some(MANAGED_BY_INTENTD)
+    {
+        report.skip(id, dir, MANAGED_SKIP_REASON);
         return;
     }
     let ws = match workspace_from_legacy_json(obj) {
@@ -1516,13 +1542,15 @@ fn message_from_legacy_json(raw: Value) -> Result<(String, Value, Option<Value>,
 }
 
 /// Build a [`Workspace`] from a legacy `workspace.json` object: drop the
-/// legacy-only FE fields, default the intentd-only required fields, and apply
-/// the worktree fallback (a `worktreePath` that no longer exists on disk is
-/// cleared and the workspace becomes `skipWorktree`; `branch` is kept as-is).
+/// legacy-only FE fields and the [`MANAGED_BY_FIELD`] marker, default the
+/// intentd-only required fields, and apply the worktree fallback (a
+/// `worktreePath` that no longer exists on disk is cleared and the workspace
+/// becomes `skipWorktree`; `branch` is kept as-is).
 fn workspace_from_legacy_json(mut obj: Map<String, Value>) -> Result<Workspace, String> {
     for key in LEGACY_ONLY_FIELDS {
         obj.remove(*key);
     }
+    obj.remove(MANAGED_BY_FIELD);
     let now = now_iso();
     for (key, default) in [
         ("title", json!("")),
@@ -1870,6 +1898,7 @@ mod tests {
     fn compatibility_failures_exclude_operational_skips() {
         for reason in [
             "already in DB",
+            "daemon-managed manifest",
             "update failed: database busy",
             "insert failed: database busy",
             "lookup failed: database busy",
@@ -2215,6 +2244,74 @@ mod tests {
             .iter()
             .any(|entry| entry.id == "ws-recovered" && entry.outcome == Outcome::Imported));
         assert_eq!(store.list_workspaces(true).await.unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn skips_daemon_managed_manifest_without_force() {
+        let root = temp_root("managed");
+        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
+        write_legacy_workspace(&root, "ws-legacy", json!({}));
+        let store = open_store().await;
+
+        let report = run(&store, &opts(vec![root.clone()])).await.unwrap();
+
+        assert_eq!(report.imported(), 1, "{report}");
+        assert_eq!(report.skipped(), 1, "{report}");
+        assert!(report.entries.iter().any(|entry| {
+            entry.id == "ws-managed"
+                && matches!(&entry.outcome, Outcome::Skipped(reason) if reason == MANAGED_SKIP_REASON)
+        }));
+        // Operational skip — must never block the first-boot marker.
+        assert!(!report.has_compatibility_failures(), "{report}");
+        assert!(store
+            .get_workspace(&WorkspaceId::from("ws-managed"))
+            .await
+            .is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn first_boot_hook_skips_daemon_managed_manifest_and_writes_marker() {
+        let root = temp_root("boot-managed");
+        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
+        let store = open_store().await;
+
+        maybe_import_on_first_boot(&store, false, vec![root.clone()], None, None).await;
+
+        assert!(store.list_workspaces(true).await.unwrap().is_empty());
+        assert!(store
+            .get_setting(LEGACY_IMPORT_MARKER_KEY)
+            .await
+            .unwrap()
+            .is_some());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn force_imports_daemon_managed_manifest() {
+        let root = temp_root("managed-force");
+        write_legacy_workspace(&root, "ws-managed", json!({"managedBy": "intentd"}));
+        let store = open_store().await;
+
+        let force_opts = Options {
+            roots: vec![root.clone()],
+            force: true,
+            ..Options::default()
+        };
+        let report = run(&store, &force_opts).await.unwrap();
+
+        assert_eq!(report.imported(), 1, "{report}");
+        // `managedBy` is dropped before deserialization — the import must not
+        // fail on the marker field.
+        let ws = store
+            .get_workspace(&WorkspaceId::from("ws-managed"))
+            .await
+            .unwrap();
+        assert_eq!(ws.title, "Legacy ws-managed");
 
         std::fs::remove_dir_all(&root).ok();
     }

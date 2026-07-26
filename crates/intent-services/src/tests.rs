@@ -13600,6 +13600,9 @@ mod worktree_provisioning {
         assert!(value["timeline"].is_array());
         assert!(value["conversationInfo"].is_array());
         assert_eq!(value["changesets"].as_array().unwrap().len(), 0);
+        // intentd marks manifests it writes so the legacy import in a fresh
+        // daemon never adopts another daemon's live workspaces.
+        assert_eq!(value["managedBy"], "intentd");
     }
 
     /// When the caller passes `title: ""` (the JSON-RPC shape onboarding

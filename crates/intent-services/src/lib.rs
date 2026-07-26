@@ -3723,7 +3723,9 @@ async fn workspace_id_available(store: &Store, workspaces_root: &Path, id: &Work
 /// that renderer code paths (FE `FileSystemWorkspaceRepository.findById`)
 /// still read for per-workspace metadata. Adds the FE-only
 /// `changesets`/`timeline`/`conversationInfo` arrays required by the FE
-/// `WorkspaceSchema`; every other field flows from the serialized `Workspace`.
+/// `WorkspaceSchema` plus a `"managedBy": "intentd"` marker so the legacy
+/// import in `intentd` never re-adopts a manifest the daemon itself wrote;
+/// every other field flows from the serialized `Workspace`.
 fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
     let dir = root.join(&ws.id.0).join(".workspace");
     std::fs::create_dir_all(&dir)
@@ -3735,6 +3737,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
         obj.entry("timeline").or_insert(serde_json::json!([]));
         obj.entry("conversationInfo")
             .or_insert(serde_json::json!([]));
+        obj.insert("managedBy".to_string(), serde_json::json!("intentd"));
     }
     let bytes = serde_json::to_vec_pretty(&value)
         .map_err(|e| Error::Internal(format!("serialize workspace failed: {e}")))?;
