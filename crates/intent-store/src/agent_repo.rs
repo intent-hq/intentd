@@ -884,6 +884,17 @@ impl Store {
     /// [`Store::get_workspace_agent_usage_data`]) and is treated as zero. The
     /// write-once first set ([`Store::set_acp_session_id`]) does NOT share this
     /// helper and never touches the baseline.
+    ///
+    /// Uses raw `BEGIN IMMEDIATE` (same pattern as
+    /// `Store::update_workspace_token_usage` / `insert_events`, monorepo#783):
+    /// IMMEDIATE mode acquires the exclusive write lock upfront, avoiding the
+    /// DEFERRED-mode lock-upgrade race (read → write inside one transaction)
+    /// that intermittently fails with SQLITE_BUSY (code 5). With
+    /// `max_connections=1` on the write pool, concurrent writers serialize at
+    /// `pool.acquire()` instead. The CAS-loss early return happens before any
+    /// write statement, so the guard's COMMIT closes a read-only transaction —
+    /// there is no partial write to undo and the connection never returns to
+    /// the pool with a transaction open.
     async fn write_acp_session_id(
         &self,
         workspace_id: &WorkspaceId,
@@ -891,73 +902,83 @@ impl Store {
         expected_old: Option<&str>,
         acp_session_id: &str,
     ) -> Result<String> {
-        let mut tx =
-            self.write_pool().begin().await.map_err(|e| {
-                Error::Internal(format!("replace acp session id begin failed: {e}"))
+        let mut conn =
+            self.write_pool().acquire().await.map_err(|e| {
+                Error::Internal(format!("replace acp session id acquire failed: {e}"))
             })?;
-        let row = sqlx::query(
-            "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
-             WHERE id=? AND workspace_id=?",
-        )
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
-        let stored_id = row
-            .as_ref()
-            .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
-        if stored_id.as_deref() != expected_old {
-            // The stored id changed between the caller's CAS read and this
-            // transaction: treat it as a CAS loss and keep the canonical value
-            // (falling back to the fresh id only if the row vanished).
-            return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
-        }
-        let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
-            .map(|r| {
-                (
-                    r.get::<Option<String>, _>("token_usage")
-                        .and_then(|s| serde_json::from_str(&s).ok()),
-                    r.get::<Option<String>, _>("token_usage_baseline")
-                        .and_then(|s| serde_json::from_str(&s).ok()),
-                )
-            })
-            .unwrap_or((None, None));
-        let folded = match (&baseline, &snapshot) {
-            (None, None) => None,
-            (b, s) => {
-                let b = b.clone().unwrap_or_default();
-                let s = s.clone().unwrap_or_default();
-                Some(TokenUsageTotals {
-                    input_tokens: b.input_tokens.saturating_add(s.input_tokens),
-                    output_tokens: b.output_tokens.saturating_add(s.output_tokens),
-                    cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
-                    cache_creation_tokens: b
-                        .cache_creation_tokens
-                        .saturating_add(s.cache_creation_tokens),
-                })
-            }
-        };
-        let folded_json = folded
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| Error::Internal(format!("encode token_usage_baseline failed: {e}")))?;
-        sqlx::query(
-            "UPDATE agent_session SET acp_session_id=?, token_usage_baseline=?, \
-             token_usage=NULL WHERE id=? AND workspace_id=?",
-        )
-        .bind(acp_session_id)
-        .bind(folded_json)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
-        tx.commit()
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
-            .map_err(|e| Error::Internal(format!("replace acp session id commit failed: {e}")))?;
-        Ok(acp_session_id.to_string())
+            .map_err(|e| Error::Internal(format!("replace acp session id begin failed: {e}")))?;
+
+        let body_result = async {
+            let row = sqlx::query(
+                "SELECT acp_session_id, token_usage, token_usage_baseline FROM agent_session \
+                 WHERE id=? AND workspace_id=?",
+            )
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("replace acp session id read failed: {e}")))?;
+            let stored_id = row
+                .as_ref()
+                .and_then(|r| r.get::<Option<String>, _>("acp_session_id"));
+            if stored_id.as_deref() != expected_old {
+                // The stored id changed between the caller's CAS read and this
+                // transaction: treat it as a CAS loss and keep the canonical
+                // value (falling back to the fresh id only if the row
+                // vanished). Nothing has been written, so committing below is
+                // a no-op close of a read-only transaction.
+                return Ok(stored_id.unwrap_or_else(|| acp_session_id.to_string()));
+            }
+            let (snapshot, baseline): (Option<TokenUsageTotals>, Option<TokenUsageTotals>) = row
+                .map(|r| {
+                    (
+                        r.get::<Option<String>, _>("token_usage")
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        r.get::<Option<String>, _>("token_usage_baseline")
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                    )
+                })
+                .unwrap_or((None, None));
+            let folded = match (&baseline, &snapshot) {
+                (None, None) => None,
+                (b, s) => {
+                    let b = b.clone().unwrap_or_default();
+                    let s = s.clone().unwrap_or_default();
+                    Some(TokenUsageTotals {
+                        input_tokens: b.input_tokens.saturating_add(s.input_tokens),
+                        output_tokens: b.output_tokens.saturating_add(s.output_tokens),
+                        cache_read_tokens: b.cache_read_tokens.saturating_add(s.cache_read_tokens),
+                        cache_creation_tokens: b
+                            .cache_creation_tokens
+                            .saturating_add(s.cache_creation_tokens),
+                    })
+                }
+            };
+            let folded_json = folded
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Internal(format!("encode token_usage_baseline failed: {e}")))?;
+            sqlx::query(
+                "UPDATE agent_session SET acp_session_id=?, token_usage_baseline=?, \
+                 token_usage=NULL WHERE id=? AND workspace_id=?",
+            )
+            .bind(acp_session_id)
+            .bind(folded_json)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("replace acp session id failed: {e}")))?;
+            Ok(acp_session_id.to_string())
+        }
+        .await;
+
+        crate::commit_with_rollback_guard(conn, body_result, "replace acp session id commit failed")
+            .await
     }
 
     /// Delete an agent session and its message log (the `agent_message` rows
@@ -2173,6 +2194,157 @@ mod tests {
             .expect("usage data");
         assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot untouched");
         assert!(rows[0].3.is_none(), "baseline untouched on recheck loss");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Post-conversion to raw `BEGIN IMMEDIATE` (monorepo#783): the CAS-loss
+    /// early return leaves id, snapshot, and baseline untouched AND leaves no
+    /// transaction open on the sole write-pool connection — a subsequent raw
+    /// `BEGIN IMMEDIATE` on the write pool succeeds (it would fail with
+    /// "cannot start a transaction within a transaction" on a leaked one).
+    #[tokio::test]
+    async fn write_acp_session_id_cas_loss_leaves_no_open_transaction() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-baseline".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(
+                &agent_id,
+                &ws_id,
+                &ts,
+                Some("acp-current"),
+            ))
+            .await
+            .expect("insert");
+        let snap = TokenUsageTotals {
+            input_tokens: 5,
+            output_tokens: 6,
+            cache_read_tokens: 7,
+            cache_creation_tokens: 8,
+        };
+        store
+            .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
+            .await
+            .expect("set snapshot");
+
+        let canonical = store
+            .write_acp_session_id(&ws_id, &agent_id, Some("acp-stale"), "acp-x")
+            .await
+            .expect("cas loss returns canonical id");
+        assert_eq!(canonical, "acp-current");
+
+        // The write pool has max_connections=1, so this acquires the SAME
+        // connection the CAS-loss path used; a leaked open transaction would
+        // make BEGIN IMMEDIATE fail here.
+        let mut conn = store.write_pool().acquire().await.expect("acquire");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .expect("no transaction left open by the CAS-loss path");
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .expect("commit probe txn");
+        drop(conn);
+
+        let sess = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(sess.acp_session_id.as_deref(), Some("acp-current"));
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        assert_eq!(rows[0].2.as_ref(), Some(&snap), "snapshot untouched");
+        assert!(rows[0].3.is_none(), "baseline untouched on CAS loss");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Stress loop for the `BEGIN IMMEDIATE` conversion (monorepo#783,
+    /// mirroring the #738 verification loop shape): each iteration races
+    /// `replace_acp_session_id` (fold + id swap) against a concurrent
+    /// write-pool writer (the token-usage recompute) and asserts ZERO
+    /// SQLITE_BUSY failures — IMMEDIATE mode serializes writers at
+    /// `pool.acquire()` instead of racing the DEFERRED lock upgrade.
+    ///
+    /// Run standalone with:
+    /// `cargo test -p intent-store replace_acp_session_id_racing_writer_no_busy -- --nocapture`
+    #[tokio::test]
+    async fn replace_acp_session_id_racing_writer_no_busy() {
+        use intent_core::{now_iso, TokenUsage};
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-baseline".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(
+                &agent_id,
+                &ws_id,
+                &ts,
+                Some("acp-0"),
+            ))
+            .await
+            .expect("insert");
+
+        for i in 0..120u64 {
+            // A fresh snapshot each round forces the swap to fold.
+            let snap = TokenUsageTotals {
+                input_tokens: i + 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            };
+            store
+                .set_agent_session_token_usage(&ws_id, &agent_id, &snap)
+                .await
+                .expect("set snapshot");
+            let old = format!("acp-{i}");
+            let new = format!("acp-{}", i + 1);
+            let swap = store.replace_acp_session_id(&ws_id, &agent_id, &old, &new);
+            let recompute = store.update_workspace_token_usage(&ws_id, |_, _| {
+                Some(TokenUsage {
+                    totals: snap.clone(),
+                    ..TokenUsage::default()
+                })
+            });
+            let (swapped, recomputed) = tokio::join!(swap, recompute);
+            let canonical = swapped.expect("swap must never hit SQLITE_BUSY");
+            assert_eq!(canonical, new, "iteration {i} swaps to the fresh id");
+            recomputed.expect("recompute must never hit SQLITE_BUSY");
+        }
+
+        // 120 folds of (i+1)/1 input/output accumulated into the baseline.
+        let rows = store
+            .get_workspace_agent_usage_data(&ws_id)
+            .await
+            .expect("usage data");
+        assert!(rows[0].2.is_none(), "snapshot cleared by the last fold");
+        assert_eq!(
+            rows[0].3.as_ref(),
+            Some(&TokenUsageTotals {
+                input_tokens: (1..=120).sum(),
+                output_tokens: 120,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            }),
+            "every fold landed exactly once"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
