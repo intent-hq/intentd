@@ -3831,6 +3831,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `system.capabilities`: machine-level capabilities independent of any
+    /// workspace — `{ cowSupported?: boolean }` (PROTOCOL §5.7). `cowSupported`
+    /// reports the CoW probe of the workspaces root (`true`/`false` for a
+    /// supported/unsupported filesystem, omitted when the probe cannot run) —
+    /// the same cached probe that fills `Workspace.cowSupported` (§5.1).
+    /// Unlike the `system.status`/`system.shutdown` control fast-path, this is
+    /// a router method: it needs the service layer's workspaces-root
+    /// resolution and aggregate cache, not composition-root daemon state.
+    fn system_capabilities(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::system_capabilities not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // rules.* — user-rule overrides + (internal) prompt-injection (§18.1,
     // PROTOCOL §5.21). `list`/`get` are reads; `update` upserts the user

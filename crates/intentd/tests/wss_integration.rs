@@ -338,7 +338,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.2",
+        sess[0]["result"]["protocolVersion"], "2.3",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1341,6 +1341,32 @@ async fn wss_agent_session_shape_rpcs_round_trip() {
         Some("Agent not found")
     );
 
+    srv.ws.stop().await;
+}
+
+/// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
+/// params and no workspaceId. The result is a plain object whose optional
+/// `cowSupported` mirrors the cached workspaces-root CoW probe that fills
+/// `Workspace.cowSupported` (§5.1). The harness injects an existing hermetic
+/// workspaces root, so the probe always runs and the field is present as a
+/// boolean (true on CoW filesystems like APFS, false on e.g. ext4); when the
+/// probe cannot run the field is omitted, never null.
+#[tokio::test]
+async fn wss_system_capabilities_reports_cow_supported() {
+    let srv = start(WsOptions::default()).await;
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"system.capabilities","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    let result = resp["result"].as_object().expect("result is an object");
+    assert!(
+        result.get("cowSupported").is_some_and(Value::is_boolean),
+        "cowSupported present as a boolean when the probe ran (hermetic root exists): {resp}"
+    );
     srv.ws.stop().await;
 }
 

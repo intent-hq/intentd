@@ -12382,6 +12382,30 @@ mod worktree_provisioning {
         );
     }
 
+    /// `system.capabilities` (PROTOCOL §5.7): the trait method returns a plain
+    /// object whose `cowSupported` mirrors `compute_cow_supported` — present as
+    /// a boolean when the probe ran (the injected root exists), never null.
+    #[tokio::test]
+    async fn system_capabilities_reports_cow_supported_from_root_probe() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-syscap-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let caps = svc.system_capabilities().await.expect("capabilities");
+        let obj = caps.as_object().expect("result is an object");
+        assert!(
+            obj.get("cowSupported").is_some_and(|v| v.is_boolean()),
+            "cowSupported present as a boolean when the probe ran: {caps}"
+        );
+        assert_eq!(
+            obj.get("cowSupported").and_then(|v| v.as_bool()),
+            svc.compute_cow_supported().await,
+            "capability mirrors the shared workspaces-root probe"
+        );
+    }
+
     /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
     /// standalone CoW clone (not a linked worktree) checked out on the
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`

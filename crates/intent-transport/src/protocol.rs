@@ -2,12 +2,13 @@
 //!
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
-//! `system.status` → `protocolVersion`. Version 2.2 adds `system.importLegacy`,
-//! covering 296 dispatchable method names (263 router + 31 fast-path + 2
-//! aliases) + 1 notification + 4 reverse RPCs.
+//! `system.status` → `protocolVersion`. Version 2.3 adds the
+//! `system.capabilities` router method, covering 300 dispatchable method
+//! names (265 router + 33 fast-path + 2 aliases) + 1 notification + 4
+//! reverse RPCs.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "2.2";
+pub const PROTOCOL_VERSION: &str = "2.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

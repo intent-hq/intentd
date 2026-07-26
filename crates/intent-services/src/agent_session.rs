@@ -159,7 +159,11 @@ impl Transcript {
 
     /// Record a tool call into the transcript (CS-0 D6). On first sight of a
     /// `toolCallId`, flush any open text and push a `tool_use` block; on repeats,
-    /// patch its `metadata.status`. When the tool reaches `completed`/`error`
+    /// merge the NON-EMPTY update fields into the existing block —
+    /// `tool_call_update`s are sparse (absent fields map to `""`/`Null`), so a
+    /// status-only update must not wipe the recorded name/title/input, while a
+    /// richer title/input arriving mid-flight must be persisted. Status always
+    /// patches. When the tool reaches `completed`/`error`
     /// WITH output, append (then patch) a matching `tool_result` block; when a
     /// `completed` (not `error`) output carries a proposal-MIME resource item
     /// (§7.1), a standalone proposal-resource block is additionally appended
@@ -184,10 +188,37 @@ impl Transcript {
     fn record_tool(&mut self, tc: &MappedToolCall, registered: Vec<Value>) -> Option<usize> {
         let use_index = match self.tool_use_index.get(&tc.tool_call_id) {
             Some(&i) => {
-                if let Some(meta) = self.blocks[i]
-                    .get_mut("metadata")
-                    .and_then(Value::as_object_mut)
-                {
+                let block = &mut self.blocks[i];
+                // A non-empty title refreshes the echoed `_acpTitle` (and the
+                // derived name when non-empty); a non-null input replaces the
+                // block input, re-attaching the freshest title.
+                if !tc.title.is_empty() && !tc.tool_name.trim().is_empty() {
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert("name".to_string(), Value::String(tc.tool_name.clone()));
+                    }
+                }
+                if !tc.input.is_null() {
+                    let title = if tc.title.is_empty() {
+                        block["input"]
+                            .get("_acpTitle")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    } else {
+                        tc.title.clone()
+                    };
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.insert(
+                            "input".to_string(),
+                            crate::tool_block::attach_acp_title(tc.input.clone(), &title),
+                        );
+                    }
+                } else if !tc.title.is_empty() {
+                    if let Some(obj) = block.get_mut("input").and_then(Value::as_object_mut) {
+                        obj.insert("_acpTitle".to_string(), Value::String(tc.title.clone()));
+                    }
+                }
+                if let Some(meta) = block.get_mut("metadata").and_then(Value::as_object_mut) {
                     meta.insert("status".to_string(), Value::String(tc.status.to_string()));
                 }
                 i
@@ -1130,16 +1161,18 @@ impl Services {
                 // DELIV-1: enrich the idle payload with `agentName` (so
                 // subscribers don't fall back to a generic "Agent" label)
                 // and — when the child persisted one via `agent.reportToParent`
-                // — the completion `report`. `isBackground` rides along so
-                // subscribers (e.g. iOS notifications) can branch on the
-                // session's background flag without a follow-up read. The
-                // lookup is a single indexed row read per idle event; a store
-                // error is swallowed and the event still fires with the base
-                // payload.
+                // — the completion report, emitted under both
+                // `completionReport` (canonical) and `report` (back-compat).
+                // `isBackground` rides along so subscribers (e.g. iOS
+                // notifications) can branch on the session's background flag
+                // without a follow-up read. The lookup is a single indexed row
+                // read per idle event; a store error is swallowed and the
+                // event still fires with the base payload.
                 if let Ok(session) = self.store.get_agent_session(agent_id).await {
                     data["agentName"] = Value::String(session.name);
                     data["isBackground"] = Value::Bool(session.is_background);
                     if let Some(report) = session.completion_report {
+                        data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
                     }
                 }
@@ -1359,6 +1392,7 @@ impl Services {
                 // parsing; a miss falls back to the legacy lift inside
                 // `record_tool`. `tool_call_update`s are name-less, so the
                 // FIFO gate resolves the name recorded at first sight.
+                let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
                 let registered: Vec<Value> = if tc.status == "completed" {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
@@ -1378,15 +1412,44 @@ impl Services {
                 let Some(block_index) = transcript.record_tool(&tc, registered.clone()) else {
                     return true;
                 };
+                // On a known toolCallId the transcript block is the
+                // authoritative MERGED state — publish its name/title/kind/
+                // input so a sparse (e.g. status-only) update doesn't wipe
+                // the row live, and `tool_delta`'s rebuilt block stays
+                // byte-identical to the persisted one (§7.1). First-sight
+                // events carry the mapped fields verbatim, as before.
+                let (tool_name, title, tool_kind, input) = if known {
+                    let block = &transcript.blocks[block_index];
+                    (
+                        block["name"].as_str().unwrap_or(&tc.tool_name).to_string(),
+                        block["input"]
+                            .get("_acpTitle")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&tc.title)
+                            .to_string(),
+                        block["metadata"]["toolKind"]
+                            .as_str()
+                            .unwrap_or(tc.tool_kind)
+                            .to_string(),
+                        block["input"].clone(),
+                    )
+                } else {
+                    (
+                        tc.tool_name.clone(),
+                        tc.title.clone(),
+                        tc.tool_kind.to_string(),
+                        tc.input.clone(),
+                    )
+                };
                 // D4: enrich additively — keep the existing fields, add agentId,
                 // the (previously dropped) toolCallId, and the block identity.
                 let mut data = json!({
                     "agentId": agent_id.0,
-                    "toolName": tc.tool_name,
-                    "title": tc.title,
-                    "toolKind": tc.tool_kind,
+                    "toolName": tool_name,
+                    "title": title,
+                    "toolKind": tool_kind,
                     "toolCallId": tc.tool_call_id,
-                    "input": tc.input,
+                    "input": input,
                     "status": tc.status,
                     "messageId": message_id,
                     "blockIndex": block_index,

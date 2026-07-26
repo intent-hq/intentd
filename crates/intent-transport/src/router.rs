@@ -2507,6 +2507,13 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "system.capabilities" => {
+            // Machine-level capabilities, no workspaceId (PROTOCOL §5.7).
+            // Router method (unlike the system.* control fast-path): the
+            // cowSupported probe lives in the service layer's aggregate cache.
+            let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api
