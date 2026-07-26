@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -835,13 +836,45 @@ struct AgentHandle {
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
     spawned_provider: String,
+    /// Pause gate for the idle wake listener (monorepo#855): while > 0 the
+    /// listener neither locks nor consumes `notifications`. Raised around
+    /// `start_session` so a `session/load` replay burst is always drained by
+    /// the resume path, never opened as an implicit turn.
+    wake_gate: Arc<AtomicUsize>,
+    /// The per-agent idle-notification listener (monorepo#855), installed by
+    /// `create_agent` after the handle lands; aborted when the handle drops.
+    wake_listener: Option<JoinHandle<()>>,
 }
 
 impl Drop for AgentHandle {
     fn drop(&mut self) {
         self.serve_task.abort();
+        if let Some(listener) = &self.wake_listener {
+            listener.abort();
+        }
     }
 }
+
+/// Decrements the paired [`AgentHandle::wake_gate`] on drop, so every raise
+/// (however the raising scope exits) is matched by exactly one lower.
+struct WakeGateGuard(Arc<AtomicUsize>);
+
+impl Drop for WakeGateGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::SeqCst);
+    }
+}
+
+/// Quiescence settle window for implicit harness-wake turns (monorepo#855):
+/// an implicit turn finalizes once no `session/update` arrived for this long.
+#[cfg(not(test))]
+const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(2000);
+#[cfg(test)]
+const HARNESS_WAKE_SETTLE: Duration = Duration::from_millis(200);
+
+/// Idle-listener poll cadence: how often the per-agent wake listener checks
+/// for out-of-turn notifications while no prompt turn owns the receiver.
+const HARNESS_WAKE_POLL: Duration = Duration::from_millis(50);
 
 type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
 
@@ -1263,7 +1296,7 @@ impl AgentManager {
             Arc::new(crate::PtyTerminalHost::new(self.services.pty()));
         let handler = Arc::new(
             ClientRequestHandler::new(
-                workspace_id,
+                workspace_id.clone(),
                 agent_id.clone(),
                 agent_name.into(),
                 FileService::new(cwd),
@@ -1297,6 +1330,8 @@ impl AgentManager {
             session_mcp_servers,
             spawned_model: opts.model.map(|s| s.to_string()),
             spawned_provider: opts.provider.command.to_string(),
+            wake_gate: Arc::new(AtomicUsize::new(0)),
+            wake_listener: None,
         };
         // Concurrency safety: fully reap any stale handle + child for this agent
         // BEFORE installing the new one, reusing the process-group teardown.
@@ -1322,7 +1357,16 @@ impl AgentManager {
         // (handle + registry) as it happens, not just at the next prompt.
         // Detached: the watcher stands down on its own when the handle goes
         // away (deliberate teardown) or a respawn supersedes the child.
-        let _watcher = self.arm_child_exit_watcher(agent_id, child_pid);
+        let _watcher = self.arm_child_exit_watcher(agent_id.clone(), child_pid);
+        // Idle wake listener (monorepo#855): stream out-of-turn
+        // `session/update` bursts as implicit agent-initiated turns instead of
+        // buffering them until the next prompt. Stored on the handle so the
+        // teardown paths (stop/detach/respawn) abort it with the handle.
+        let listener = self.spawn_wake_listener(agent_id.clone(), workspace_id);
+        match self.handles.lock().unwrap().get_mut(&agent_id) {
+            Some(h) => h.wake_listener = Some(listener),
+            None => listener.abort(),
+        }
         Ok(())
     }
 
@@ -1539,7 +1583,7 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<String> {
-        let (conn, session_mcp_servers) = {
+        let (conn, session_mcp_servers, wake_gate) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -1547,8 +1591,15 @@ impl AgentManager {
             (
                 handle.connection.clone(),
                 handle.session_mcp_servers.clone(),
+                handle.wake_gate.clone(),
             )
         };
+        // Pause the idle wake listener for the whole session-open (monorepo#855):
+        // a `session/load` replay burst must be drained by the resume path
+        // below, never opened as an implicit harness-wake turn. The guard
+        // lowers the gate on every exit path.
+        wake_gate.fetch_add(1, AtomicOrdering::SeqCst);
+        let _wake_gate_guard = WakeGateGuard(wake_gate);
         // Load the agent session record once and reuse both `workspace_id` (for
         // the pre-handshake status hint) and `acp_session_id` (for the resume
         // branch decision below) from the same struct.
@@ -3385,6 +3436,101 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
     ) -> bool {
         self.try_begin(agent_id, workspace_id).await
+    }
+
+    /// Arm the per-agent idle-notification listener (monorepo#855): a
+    /// background poll that opens an implicit agent-initiated turn when an
+    /// out-of-turn `session/update` arrives while no prompt turn is consuming
+    /// the handle's notification receiver. Captures only [`Services`] and
+    /// re-upgrades the attached manager each tick, so the task never keeps
+    /// the manager alive; it stands down on its own when the handle is gone
+    /// or the manager was dropped/never attached (bare test wiring).
+    fn spawn_wake_listener(&self, agent_id: AgentId, workspace_id: WorkspaceId) -> JoinHandle<()> {
+        let services = self.services.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HARNESS_WAKE_POLL).await;
+                let Some(mgr) = services.agent_manager() else {
+                    return;
+                };
+                if !mgr.wake_listener_tick(&agent_id, &workspace_id).await {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// One idle-listener poll: consume an out-of-turn `session/update` (if
+    /// any) into an implicit harness-wake turn. Returns `false` when the
+    /// agent's handle is gone (the listener exits). Skips the tick — leaving
+    /// buffered notifications untouched — while the wake gate is raised
+    /// (`start_session` resume-replay in flight), while a prompt turn owns
+    /// the single-flight slot, or when the receiver is locked by another
+    /// consumer.
+    async fn wake_listener_tick(
+        self: &Arc<Self>,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        let (notes, gate) = {
+            let map = self.handles.lock().unwrap();
+            let Some(handle) = map.get(agent_id) else {
+                return false;
+            };
+            (handle.notifications.clone(), handle.wake_gate.clone())
+        };
+        if gate.load(AtomicOrdering::SeqCst) > 0 {
+            return true;
+        }
+        if self.busy.lock().unwrap().contains(agent_id) {
+            return true;
+        }
+        let Ok(mut guard) = notes.try_lock() else {
+            return true;
+        };
+        let Ok(first) = guard.try_recv() else {
+            return true;
+        };
+        // Only a mappable `session/update` opens a turn; anything else is
+        // dropped — the same net effect as the prompt path, where
+        // `route_notification` ignores unmappable notifications.
+        if intent_acp::session::map_notification(&first).is_none() {
+            return true;
+        }
+        // Claim the single-flight slot so a racing `agent.sendMessage` queues
+        // instead of interleaving. On the rare loss (a send claimed the slot
+        // between the busy check and here), still drive the turn while
+        // holding the receiver lock — the prompt worker blocks on it, and the
+        // ready-to-send check inside the turn finalizes promptly — but leave
+        // slot release and the idle emit to the slot's owner.
+        let claimed = self.try_begin(agent_id, workspace_id).await;
+        self.registry.mark_active(agent_id);
+        self.services
+            .run_harness_wake_turn(
+                &mut guard,
+                first,
+                agent_id,
+                workspace_id,
+                HARNESS_WAKE_SETTLE,
+            )
+            .await;
+        self.registry.mark_idle(agent_id);
+        drop(guard);
+        if claimed {
+            self.end_turn(agent_id).await;
+            self.services
+                .publish_harness_wake_idle(agent_id, workspace_id)
+                .await;
+            // A user send that raced in queued behind this turn's slot; with
+            // the slot released, kick the self-drain so it streams now
+            // (handoff: the drained prompt turn locks the receiver next).
+            if self.services.has_ready_to_send(agent_id) {
+                self.clone()
+                    .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    .await;
+            }
+        }
+        true
     }
 
     /// Retry a failed agent spawn (`agent.retry` RPC path). Only valid when
@@ -6198,6 +6344,8 @@ mod dead_child_respawn_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
+            wake_gate: Arc::new(AtomicUsize::new(0)),
+            wake_listener: None,
         };
         mgr.handles.lock().unwrap().insert(agent_id.clone(), handle);
         (c2a_agent, a2c_agent)

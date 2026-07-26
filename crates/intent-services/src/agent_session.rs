@@ -20,8 +20,8 @@ use intent_acp::session::{
 };
 use intent_acp::{AcpError, Connection, IncomingNotification};
 use intent_core::events::{
-    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_STREAM_STATUS,
-    AGENT_TOOL_CALL,
+    AGENT_FAILED, AGENT_IDLE, AGENT_STREAM_CHUNK, AGENT_STREAM_END, AGENT_STREAM_START,
+    AGENT_STREAM_STATUS, AGENT_TOOL_CALL,
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, Error, EventActor, Result, WorkspaceId,
@@ -1350,6 +1350,150 @@ impl Services {
                 Error::Internal(format!("session/prompt failed: {e}"))
             }
         })
+    }
+
+    /// Drive one implicit agent-initiated turn (monorepo#855): the agent's
+    /// harness produced out-of-turn `session/update`s with no prompt turn
+    /// consuming the channel, so stream them live as their own turn. `first`
+    /// is the notification that woke the idle listener; further updates are
+    /// drained from `notifications` until the settle window (`settle`) elapses
+    /// with no traffic — quiescence finalizes the turn. There is no
+    /// `session/prompt` in flight, so quiescence is the only normal exit; a
+    /// preempting prompt turn aborts the driving worker instead (the
+    /// interrupt/abort flush semantics then apply, same as a prompt turn).
+    ///
+    /// Emits `agent:stream:start` `{ agentId, messageId, reason: "harness-wake" }`
+    /// before routing, streams via the same [`route_notification`] path
+    /// (chunks/tool events + live-turn slot updates), then finalizes:
+    /// persists the assistant row (skipped when the burst produced zero
+    /// transcript blocks — status-only updates), clears the live-turn slot,
+    /// and emits exactly one `agent:stream:end` (with `messageId` when a row
+    /// was persisted). The `agent:idle` lifecycle emit stays with the caller,
+    /// which owns the single-flight slot.
+    ///
+    /// Returns the persisted assistant `messageId`, or `None` when the burst
+    /// persisted nothing.
+    pub(crate) async fn run_harness_wake_turn(
+        &self,
+        notifications: &mut mpsc::UnboundedReceiver<IncomingNotification>,
+        first: IncomingNotification,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        settle: std::time::Duration,
+    ) -> Option<String> {
+        let message_id = Uuid::now_v7().to_string();
+        let mut transcript = Transcript::new(message_id.clone());
+        // Live-turn slot + abort-safe guard, same contract as a prompt turn:
+        // a `chat.subscribe` arriving mid-wake reconstructs the partial
+        // message, and an abort (preempting prompt / stop) clears the slot.
+        let _live_guard = self.begin_live_turn(agent_id, &message_id);
+        self.publish_agent_event(
+            workspace_id,
+            agent_id,
+            AGENT_STREAM_START,
+            json!({
+                "agentId": agent_id.0,
+                "messageId": message_id,
+                "reason": "harness-wake",
+            }),
+        )
+        .await;
+        let mut updates_applied = self
+            .route_notification(&first, agent_id, workspace_id, &mut transcript)
+            .await;
+        // Drain until quiescence: each received notification re-arms the
+        // settle window; the window elapsing (or the channel closing)
+        // finalizes the turn. Polled in short ticks so a user send that
+        // raced in (queued behind this turn's slot) preempts promptly —
+        // finalize first, then the caller hands the receiver off to the
+        // drained prompt turn.
+        let mut last_update = tokio::time::Instant::now();
+        loop {
+            if self.has_ready_to_send(agent_id) {
+                break;
+            }
+            let elapsed = last_update.elapsed();
+            if elapsed >= settle {
+                break;
+            }
+            let tick = (settle - elapsed).min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(tick, notifications.recv()).await {
+                Ok(Some(note)) => {
+                    updates_applied |= self
+                        .route_notification(&note, agent_id, workspace_id, &mut transcript)
+                        .await;
+                    last_update = tokio::time::Instant::now();
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        let blocks = transcript.into_blocks();
+        let mut message_persisted = false;
+        if !blocks.is_empty() {
+            match self
+                .store
+                .append_agent_message_with_id(
+                    agent_id,
+                    &message_id,
+                    "assistant",
+                    &Value::Array(blocks),
+                    None,
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(_) => message_persisted = true,
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "harness-wake turn persist failed");
+                }
+            }
+        } else if !updates_applied {
+            tracing::debug!(agent = %agent_id, "harness-wake turn produced no content");
+        }
+        self.clear_live_turn(agent_id);
+        let mut end_data = json!({ "agentId": agent_id.0 });
+        if message_persisted {
+            end_data["messageId"] = json!(message_id);
+        }
+        self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
+            .await;
+        message_persisted.then_some(message_id)
+    }
+
+    /// Emit the `agent:idle` lifecycle signal for a finished harness-wake turn
+    /// (monorepo#855), honoring the same ready-to-send suppression as a prompt
+    /// turn's idle emit. `reason: "harness_wake_complete"` distinguishes it
+    /// from `stream_complete` for subscribers.
+    pub(crate) async fn publish_harness_wake_idle(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+    ) {
+        if self.has_ready_to_send(agent_id) {
+            tracing::debug!(
+                agent = %agent_id,
+                "agent:idle suppressed after harness-wake — ready-to-send queue non-empty",
+            );
+            return;
+        }
+        let mut data = json!({
+            "agentId": agent_id.0,
+            "reason": "harness_wake_complete",
+            "status": "idle",
+        });
+        if let Ok(session) = self.store.get_agent_session(agent_id).await {
+            data["agentName"] = Value::String(session.name);
+            data["isBackground"] = Value::Bool(session.is_background);
+            if let Some(report) = session.completion_report {
+                data["completionReport"] = Value::String(report.clone());
+                data["report"] = Value::String(report);
+            }
+        }
+        self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
+            .await;
+        self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
+            .await;
     }
 
     /// Persist one turn's end-of-turn usage report and refresh the workspace
