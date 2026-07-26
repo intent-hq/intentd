@@ -5,8 +5,9 @@
 //! startup update check, spawn the installed daemon with all forwarded args
 //! verbatim, keep it updated on the randomized 12–24h cadence, and babysit
 //! crashes. One-shot subcommands run the installed daemon exactly once with
-//! no updater activity. The intercepted `intentd sitter channel` command is
-//! handled entirely here — it never spawns the daemon.
+//! no updater activity. The intercepted `intentd sitter channel` and
+//! `intentd restart` commands are handled entirely here — they never spawn
+//! the daemon.
 
 use intentd_sitter::cli::{self, SitterArgs, SitterCommand};
 use intentd_sitter::config;
@@ -73,15 +74,31 @@ fn run() -> i32 {
 const RESTART_HINT: &str = "apply it now with `intentd restart` (fallback: \
      `brew services restart intentd` / `systemctl --user restart intentd`)";
 
-/// Execute an intercepted `intentd sitter …` command; returns the exit code.
-/// Never spawns the daemon and never touches a running one.
+/// Execute an intercepted sitter-owned command; returns the exit code.
+/// Never spawns the daemon.
 fn run_sitter_command(
     command: SitterCommand,
     args: &SitterArgs,
     paths: &SitterPaths,
     base_url: &str,
 ) -> i32 {
-    let SitterCommand::Channel { set, redownload } = command;
+    match command {
+        SitterCommand::Channel { set, redownload } => {
+            run_channel_command(set, redownload, args, paths, base_url)
+        }
+        SitterCommand::Restart => run_restart(paths),
+    }
+}
+
+/// `intentd sitter channel [stable|beta] [--redownload]` — never touches a
+/// running daemon.
+fn run_channel_command(
+    set: Option<cli::Channel>,
+    redownload: bool,
+    args: &SitterArgs,
+    paths: &SitterPaths,
+    base_url: &str,
+) -> i32 {
     let Some(channel) = set else {
         let resolved =
             config::resolve_channel(args.channel, config::load_channel(&paths.config_path));
@@ -135,4 +152,36 @@ fn run_sitter_command(
         );
     }
     0
+}
+
+/// `intentd restart` — restart the supervised daemon in place by sending
+/// SIGHUP to the serve-mode sitter found via its pidfile. Stale pidfiles
+/// (dead pid) are treated as no running service.
+#[cfg(unix)]
+fn run_restart(paths: &SitterPaths) -> i32 {
+    let Some(pid) = supervisor::read_live_pid(&paths.pid_path) else {
+        eprintln!(
+            "intentd-sitter: no running supervised intentd found (no live pid in {}); \
+             start the service first (`intentd serve`, `brew services start intentd`, \
+             or `systemctl --user start intentd`)",
+            paths.pid_path.display()
+        );
+        return 1;
+    };
+    if let Err(e) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGHUP) {
+        eprintln!("intentd-sitter: failed to signal the supervised sitter (pid {pid}): {e}");
+        return 1;
+    }
+    println!("restarting intentd: sent SIGHUP to the supervised sitter (pid {pid})");
+    0
+}
+
+/// No SIGHUP on windows: point at the service manager instead.
+#[cfg(not(unix))]
+fn run_restart(_paths: &SitterPaths) -> i32 {
+    eprintln!(
+        "intentd-sitter: `intentd restart` is not supported on Windows; \
+         restart the service instead"
+    );
+    1
 }

@@ -69,10 +69,12 @@ pub enum CliError {
     RedownloadWithoutChannel,
     #[error("unexpected argument {0:?} to `intentd sitter channel`")]
     UnexpectedChannelArg(String),
+    #[error("unexpected argument {0:?} to `intentd restart` (it takes no arguments)")]
+    UnexpectedRestartArg(String),
 }
 
-/// Intercepted sitter-owned subcommand (`intentd sitter …`), recognized when
-/// `sitter` is the first passthrough token — like the `--sitter-*` flag
+/// Intercepted sitter-owned subcommand, recognized when `sitter` (or bare
+/// `restart`) is the first passthrough token — like the `--sitter-*` flag
 /// namespace it is never forwarded to the daemon. A bare `--` before it
 /// still forwards everything verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +89,9 @@ pub enum SitterCommand {
         /// force-install its version, bypassing the newer-only comparison.
         redownload: bool,
     },
+    /// `intentd restart` — restart the supervised daemon in place by
+    /// signaling the serve-mode sitter found via its pidfile (SIGHUP).
+    Restart,
 }
 
 impl SitterCommand {
@@ -210,14 +215,21 @@ impl SitterArgs {
     }
 
     /// The intercepted sitter-owned subcommand, when the first passthrough
-    /// token is `sitter`. After a bare `--` the first passthrough token is
-    /// the `--` itself, so `intentd -- sitter …` still forwards verbatim.
+    /// token is `sitter` or `restart`. After a bare `--` the first
+    /// passthrough token is the `--` itself, so `intentd -- sitter …` and
+    /// `intentd -- restart` still forward verbatim.
     pub fn sitter_command(&self) -> Option<Result<SitterCommand, CliError>> {
         let first = self.passthrough.first()?;
-        if first.to_str() != Some("sitter") {
-            return None;
+        match first.to_str() {
+            Some("sitter") => Some(SitterCommand::parse(&self.passthrough[1..])),
+            Some("restart") => Some(match self.passthrough.get(1) {
+                Some(arg) => Err(CliError::UnexpectedRestartArg(
+                    arg.to_string_lossy().into_owned(),
+                )),
+                None => Ok(SitterCommand::Restart),
+            }),
+            _ => None,
         }
-        Some(SitterCommand::parse(&self.passthrough[1..]))
     }
 }
 
@@ -438,6 +450,38 @@ mod tests {
             Some(Err(CliError::UnknownSitterSubcommand(
                 "restart".to_string()
             )))
+        );
+    }
+
+    #[test]
+    fn bare_restart_is_intercepted() {
+        assert_eq!(sitter_cmd(&["restart"]), Some(Ok(SitterCommand::Restart)));
+    }
+
+    #[test]
+    fn restart_with_extra_args_is_error() {
+        assert_eq!(
+            sitter_cmd(&["restart", "now"]),
+            Some(Err(CliError::UnexpectedRestartArg("now".to_string())))
+        );
+        assert_eq!(
+            sitter_cmd(&["restart", "--force"]),
+            Some(Err(CliError::UnexpectedRestartArg("--force".to_string())))
+        );
+    }
+
+    #[test]
+    fn restart_not_first_token_is_forwarded() {
+        assert_eq!(sitter_cmd(&["serve", "restart"]), None);
+    }
+
+    #[test]
+    fn double_dash_forwards_restart_verbatim() {
+        let args = parse(&["--", "restart"], None).unwrap();
+        assert_eq!(args.sitter_command(), None);
+        assert_eq!(
+            args.passthrough,
+            vec![OsString::from("--"), OsString::from("restart")]
         );
     }
 

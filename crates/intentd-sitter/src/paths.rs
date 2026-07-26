@@ -14,7 +14,8 @@
 //! ├── versions/<version>/intentd[.exe]   # installed daemon binaries
 //! ├── tmp/                               # in-flight downloads/extractions
 //! ├── config.toml                        # user-editable channel pin
-//! └── state.json                         # persisted sitter state
+//! ├── state.json                         # persisted sitter state
+//! └── sitter.pid                         # serve-mode sitter pid (while running)
 //! ```
 
 use std::ffi::OsString;
@@ -50,6 +51,9 @@ pub struct SitterPaths {
     pub state_path: PathBuf,
     /// `<sitter_dir>/config.toml` — user-editable channel pin.
     pub config_path: PathBuf,
+    /// `<sitter_dir>/sitter.pid` — pid of the serve-mode sitter while it
+    /// runs (`intentd restart` reads it to find the supervisor).
+    pub pid_path: PathBuf,
 }
 
 impl SitterPaths {
@@ -80,6 +84,7 @@ impl SitterPaths {
             tmp_dir: sitter_dir.join("tmp"),
             state_path: sitter_dir.join("state.json"),
             config_path: sitter_dir.join("config.toml"),
+            pid_path: sitter_dir.join("sitter.pid"),
             sitter_dir,
         }
     }
@@ -120,6 +125,8 @@ mod tests {
         let paths = SitterPaths::from_data_dir(Path::new("/data"));
         let sitter = PathBuf::from("/data").join("sitter");
         assert_eq!(paths.state_path, sitter.join("state.json"));
+        assert_eq!(paths.config_path, sitter.join("config.toml"));
+        assert_eq!(paths.pid_path, sitter.join("sitter.pid"));
         assert_eq!(paths.versions_dir, sitter.join("versions"));
         assert_eq!(paths.tmp_dir, sitter.join("tmp"));
         let bin = paths.daemon_binary("1.2.3");
