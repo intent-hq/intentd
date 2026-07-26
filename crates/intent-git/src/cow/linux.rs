@@ -69,47 +69,9 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
 }
 
 pub fn clone(src: &Path, dst: &Path) -> Result<()> {
-    // Tree walk: create directory structure and clone files
-    clone_recursive(src, dst)
-}
-
-fn clone_recursive(src: &Path, dst: &Path) -> Result<()> {
-    // Use symlink_metadata to detect symlinks without following them
-    let metadata = fs::symlink_metadata(src)
-        .map_err(|e| Error::Internal(format!("stat source failed: {e}")))?;
-
-    if metadata.is_symlink() {
-        // Recreate the symlink
-        let target =
-            fs::read_link(src).map_err(|e| Error::Internal(format!("read symlink failed: {e}")))?;
-        std::os::unix::fs::symlink(&target, dst)
-            .map_err(|e| Error::Internal(format!("create symlink failed: {e}")))?;
-        Ok(())
-    } else if metadata.is_dir() {
-        // Create destination directory
-        fs::create_dir(dst).map_err(|e| Error::Internal(format!("create dest dir failed: {e}")))?;
-
-        // Preserve source directory permissions
-        let src_perms = metadata.permissions();
-        fs::set_permissions(dst, src_perms)
-            .map_err(|e| Error::Internal(format!("set dir permissions failed: {e}")))?;
-
-        // Recursively clone entries
-        let entries =
-            fs::read_dir(src).map_err(|e| Error::Internal(format!("read dir failed: {e}")))?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::Internal(format!("dir entry failed: {e}")))?;
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            clone_recursive(&src_path, &dst_path)?;
-        }
-
-        Ok(())
-    } else if metadata.is_file() {
-        clone_file(src, dst)
-    } else {
-        // Devices, FIFOs, etc. — skip
-        Ok(())
-    }
+    // Best-effort tree walk shared with the macOS fallback: create the
+    // directory structure, recreate symlinks, reflink regular files, and
+    // skip genuinely non-clonable entries (sockets/FIFOs/devices, nested
+    // mounts, per-entry unsupported errnos) with logging.
+    super::best_effort::clone_tree(src, dst, clone_file)
 }

@@ -83,6 +83,19 @@ pub async fn provision_sandbox(
         .join(&agent_id.0);
     let sandbox_path = sandbox_parent.join(&repo_slug);
 
+    // A linked worktree's `.git` is a gitfile pointing into the original
+    // repository's `.git/worktrees/<name>`: CoW-cloning it would give the
+    // sandbox a `.git` that still points at the ORIGINAL repo, so the branch
+    // creation + checkout below would rewrite the user's source checkout.
+    // Fall back to shared mode instead.
+    if user_dir.join(".git").is_file() {
+        tracing::warn!(
+            user_dir = %user_dir.display(),
+            "provision_sandbox: canonical directory is a linked git worktree (gitfile .git); falling back to shared mode"
+        );
+        return Ok(ProvisionOutcome::Unsupported);
+    }
+
     // Ensure sandbox parent exists (needed for cow_probe)
     std::fs::create_dir_all(&sandbox_parent)
         .map_err(|e| Error::Internal(format!("create sandbox parent dir failed: {e}")))?;
@@ -93,8 +106,21 @@ pub async fn provision_sandbox(
         return Ok(ProvisionOutcome::Unsupported);
     }
 
-    // CoW clone the user's directory
-    cow_clone(&user_dir, &sandbox_path)?;
+    // CoW clone the user's directory. The probe can pass while the clone
+    // itself is still unsupported (e.g. a nested cross-volume mount inside the
+    // tree); degrade to shared mode instead of failing the agent start.
+    if let Err(e) = cow_clone(&user_dir, &sandbox_path) {
+        let _ = std::fs::remove_dir_all(&sandbox_path);
+        if matches!(e, Error::Unsupported(_)) {
+            tracing::warn!(
+                user_dir = %user_dir.display(),
+                error = %e,
+                "provision_sandbox: CoW clone unsupported despite a passing probe; falling back to shared mode"
+            );
+            return Ok(ProvisionOutcome::Unsupported);
+        }
+        return Err(e);
+    }
 
     // Open the sandbox repo and record the base commit SHA
     // Scope git2 objects to ensure they're dropped before any await points

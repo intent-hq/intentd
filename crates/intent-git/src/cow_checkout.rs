@@ -25,6 +25,12 @@ use crate::map_git_err;
 /// branch of the same name is reused rather than recreated. Returns the SHA of
 /// the commit the checkout lands on. On failure after the clone, the partially
 /// provisioned `checkout_path` is removed best-effort.
+///
+/// A `repo_path` that is itself a linked git worktree (its `.git` is a
+/// gitfile) is refused with `Error::Unsupported`: the cloned gitfile would
+/// still point into the ORIGINAL repository's `.git/worktrees/<name>`, so the
+/// branch switch + hard reset below would rewrite the user's source checkout.
+/// Callers route such repos to linked-worktree provisioning instead.
 pub fn provision_cow_checkout(
     repo_path: &Path,
     checkout_path: &Path,
@@ -32,14 +38,44 @@ pub fn provision_cow_checkout(
     base_ref: Option<&str>,
     remote: &str,
 ) -> Result<String> {
+    if repo_path.join(".git").is_file() {
+        return Err(Error::Unsupported(format!(
+            "repository at {} is a linked git worktree (gitfile .git); CoW-cloning it would corrupt the source checkout",
+            repo_path.display()
+        )));
+    }
     if let Some(parent) = checkout_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::Internal(format!("cannot create checkout parent dir: {e}")))?;
     }
     cow_clone(repo_path, checkout_path)?;
-    checkout_in_clone(checkout_path, branch, base_ref, remote).inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(checkout_path);
-    })
+    strip_worktree_registrations(checkout_path)
+        .and_then(|()| checkout_in_clone(checkout_path, branch, base_ref, remote))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(checkout_path);
+        })
+}
+
+/// A cloned main repository carries the source's `.git/worktrees/<name>/`
+/// registrations, which point at the ORIGINAL repo's working trees: they make
+/// the clone refuse to check out branches "already checked out" in the
+/// source's linked worktrees, and pruning them from the clone could touch the
+/// original's trees. Remove them from the clone before branching/checkout.
+/// The source repository is never modified.
+fn strip_worktree_registrations(checkout_path: &Path) -> Result<()> {
+    let worktrees_dir = checkout_path.join(".git").join("worktrees");
+    if worktrees_dir.is_dir() {
+        std::fs::remove_dir_all(&worktrees_dir).map_err(|e| {
+            Error::Internal(format!(
+                "cannot remove stale worktree registrations from clone: {e}"
+            ))
+        })?;
+        tracing::debug!(
+            checkout = %checkout_path.display(),
+            "provision_cow_checkout: removed stale .git/worktrees registrations from clone"
+        );
+    }
+    Ok(())
 }
 
 /// Branch + checkout + hard reset inside the freshly cloned repository.
@@ -222,6 +258,87 @@ mod tests {
         let sha =
             provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some(&base), "origin").unwrap();
         assert_eq!(sha, pinned_sha, "existing branch is reused, not recreated");
+    }
+
+    #[test]
+    fn refuses_linked_worktree_source_as_unsupported() {
+        // Case A: the source repo is itself a linked git worktree (its `.git`
+        // is a gitfile). CoW-cloning it would corrupt the original checkout,
+        // so provisioning must refuse with Unsupported BEFORE cloning.
+        let dir = init_repo("cowchk-gitfile");
+        commit_file(dir.path(), "a.txt", "x\n");
+        let branch = head_branch(&dir);
+
+        // Create a linked worktree of the repo and use IT as the source.
+        let wt_path = unique_checkout("gitfile-wt");
+        let _wt_cleanup = Cleanup(wt_path.clone());
+        crate::worktree::provision_worktree(
+            dir.path(),
+            "gitfile-wt",
+            &wt_path,
+            "wt-branch",
+            Some(&branch),
+            "origin",
+        )
+        .unwrap();
+        assert!(wt_path.join(".git").is_file(), "worktree .git is a gitfile");
+
+        let checkout = unique_checkout("gitfile-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        let err = provision_cow_checkout(&wt_path, &checkout, "cow-ws", Some(&branch), "origin")
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got: {err:?}");
+        assert!(!checkout.exists(), "nothing is cloned for a gitfile source");
+        // The source worktree is untouched.
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("a.txt")).unwrap(),
+            "x\n"
+        );
+    }
+
+    #[test]
+    fn strips_stale_worktree_registrations_from_clone() {
+        // Case B: the source main repo has linked worktrees; the clone
+        // inherits `.git/worktrees/<name>` registrations pointing at the
+        // ORIGINAL repo's trees. They must be stripped from the clone so it
+        // can check out branches "already checked out" in the source's
+        // worktrees — without modifying the source.
+        let dir = init_repo("cowchk-strip");
+        commit_file(dir.path(), "a.txt", "x\n");
+        if !cow_available(dir.path()) {
+            return;
+        }
+        let base = head_branch(&dir);
+
+        // Register a linked worktree on branch `busy` in the source repo.
+        let wt_path = unique_checkout("strip-wt");
+        let _wt_cleanup = Cleanup(wt_path.clone());
+        crate::worktree::provision_worktree(
+            dir.path(),
+            "strip-wt",
+            &wt_path,
+            "busy",
+            Some(&base),
+            "origin",
+        )
+        .unwrap();
+        assert!(dir.path().join(".git/worktrees").is_dir());
+
+        // Provision a CoW checkout ON the branch held by the source's linked
+        // worktree; without the strip, git refuses ("already checked out").
+        let checkout = unique_checkout("strip-dst");
+        let _cleanup = Cleanup(checkout.clone());
+        provision_cow_checkout(dir.path(), &checkout, "busy", Some(&base), "origin").unwrap();
+
+        let clone = Repository::open(&checkout).unwrap();
+        assert_eq!(clone.head().unwrap().shorthand().unwrap(), "busy");
+        assert!(
+            !checkout.join(".git/worktrees").exists(),
+            "stale registrations are stripped from the clone"
+        );
+        // The source repo's registrations and worktree are untouched.
+        assert!(dir.path().join(".git/worktrees").is_dir());
+        assert!(wt_path.join(".git").is_file());
     }
 
     #[test]
