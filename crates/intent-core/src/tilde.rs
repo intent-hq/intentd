@@ -6,6 +6,11 @@
 //! cwd (intent-hq/monorepo#822). Path-typed params are expanded at the daemon
 //! boundary with these helpers: a leading `~` / `~/` resolves to the user's
 //! home directory; `~user` forms and non-tilde paths pass through unchanged.
+//!
+//! Expansion is `/`-separated only: a Windows-style `~\` prefix is not
+//! recognized and passes through verbatim (the daemon's supported targets are
+//! unix-first). When no home directory can be resolved from the environment,
+//! inputs also pass through unchanged.
 
 use std::path::{Path, PathBuf};
 
