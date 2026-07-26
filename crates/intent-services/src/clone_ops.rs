@@ -182,12 +182,33 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
     {
         return C::Network;
     }
+    // Path-shaped git stderr (remaining #826/#562 slice): git reports
+    // destination failures via `die_errno` prefixes ("could not create
+    // leading directories of '…': <errno>") whose errno suffix varies, so
+    // match the prefixes errno-agnostically alongside the common errno
+    // spellings (ENOENT/EACCES/EROFS/ENOTDIR/ENAMETOOLONG).
+    //
+    // Checkout-time `error: invalid path '…'` is deliberately NOT matched:
+    // it is caused by repository content (git's verify_path /
+    // core.protectNTFS / core.protectHFS rejecting a tracked filename),
+    // not the user-supplied destination, so §9.1's "correct the path and
+    // retry" remedy does not apply; it rides the clone-failed catch-all.
+    //
+    // NOTE(§9.1 askpass-missing, monorepo#837): the documented
+    // `askpass-missing` shape ("… app.asar …: not a directory") has no arm
+    // here yet. When the `AskpassMissing` port lands it must be ordered
+    // ahead of BOTH the auth arm (§9.1 gives it precedence over
+    // auth-required) and this path arm (whose "not a directory" row would
+    // otherwise swallow its ENOTDIR spelling).
     if m.contains("is not a valid path")
         || m.contains("could not create work tree")
         || m.contains("could not create directory")
+        || m.contains("could not create leading directories")
         || m.contains("permission denied")
         || m.contains("read-only file system")
         || m.contains("no such file or directory")
+        || m.contains("not a directory")
+        || m.contains("file name too long")
     {
         return C::PathInvalid;
     }
@@ -842,6 +863,53 @@ mod tests {
         );
         assert_eq!(
             classify_clone_error("fatal: could not create directory '/nope/x'"),
+            C::PathInvalid
+        );
+    }
+
+    /// Git-stderr path failure shapes classify as `path-invalid` (remaining
+    /// #826/#562 slice): git's `die_errno` destination messages carry a
+    /// varying errno suffix, so the prefixes match errno-agnostically and
+    /// the common errno spellings match on their own.
+    #[test]
+    fn classify_clone_error_git_stderr_path_shapes() {
+        use intent_core::CloneErrorCategory as C;
+        for msg in [
+            // The #826 symptom shape, plus errno variants not covered by
+            // the bare errno rows.
+            "fatal: could not create leading directories of '/x/repo': Read-only file system",
+            "fatal: could not create leading directories of '/tmp/f/repo': Not a directory",
+            "fatal: could not create leading directories of '/x/repo': File name too long",
+            // ENOENT-style path error.
+            "fatal: could not create work tree dir 'repo': No such file or directory",
+            // Local filesystem denial on the destination.
+            "fatal: could not create work tree dir '/usr/local/repo': Permission denied",
+        ] {
+            assert_eq!(classify_clone_error(msg), C::PathInvalid, "msg: {msg}");
+        }
+        // Precedence guard: SSH auth denials stay `auth-required` despite the
+        // broadened "permission denied" / path rows.
+        assert_eq!(
+            classify_clone_error("git@host: Permission denied (publickey,password)."),
+            C::AuthRequired
+        );
+        // Checkout-time `invalid path` is repository-content-caused (git's
+        // verify_path rejecting a tracked filename), not a destination
+        // failure — §9.1's "correct the path and retry" doesn't apply, so it
+        // stays on the clone-failed catch-all.
+        assert_eq!(
+            classify_clone_error("error: invalid path 'aux/config'"),
+            C::Other
+        );
+        // Pins today's classification of the §9.1 `askpass-missing` shape
+        // (monorepo#837): its ENOTDIR spelling currently hits this arm's
+        // "not a directory" row. The eventual `AskpassMissing` port must
+        // change this intentionally (ordered ahead of both the auth arm and
+        // this path arm), not silently.
+        assert_eq!(
+            classify_clone_error(
+                "error: cannot run /Applications/X.app/Contents/Resources/app.asar/bin/ssh-askpass-intent: Not a directory"
+            ),
             C::PathInvalid
         );
     }
