@@ -1,6 +1,10 @@
 [package]
 name = "intentd"
+<<<<<<< Updated upstream
 version = "0.2.6"
+=======
+version = "0.2.8"
+>>>>>>> Stashed changes
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
