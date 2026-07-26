@@ -498,8 +498,8 @@ fn make_stub_git(dir: &Path, capture: &Path) -> String {
     std::fs::create_dir_all(dir).expect("mkdir stub dir");
     let script = format!(
         "#!/bin/sh\n\
-         for a in \"$@\"; do printf '%s\\n' \"$a\"; done > {capture}.argv\n\
-         printf '%s' \"${{INTENT_GIT_GITHUB_TOKEN-}}\" > {capture}.token\n\
+         for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{capture}.argv\"\n\
+         printf '%s' \"${{INTENT_GIT_GITHUB_TOKEN-}}\" > \"{capture}.token\"\n\
          echo \"fatal: could not read Username for 'https://github.com': terminal prompts disabled\" >&2\n\
          exit 128\n",
         capture = capture.display()

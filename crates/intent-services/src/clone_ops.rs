@@ -151,6 +151,11 @@ pub(crate) fn classify_clone_error(detail: &str) -> intent_core::CloneErrorCateg
         // `Permission denied (publickey,password).` on non-GitHub hosts.
         || m.contains("permission denied (publickey")
         || m.contains("invalid username or password")
+        // GitLab's credential rejection ("remote: HTTP Basic: Access denied.
+        // The provided password or token is incorrect…") carries no
+        // "authentication failed" prose; match it here so it does not fall
+        // through to the access-denied row — the remedy is credentials.
+        || m.contains("http basic: access denied")
     {
         return C::AuthRequired;
     }
@@ -225,8 +230,20 @@ pub(crate) fn spawn_clone(job: CloneJob) {
 /// promoting it to `repositoryPath`. The terminal `git:clone:done` frame is
 /// still published, so remote clients observe the same event flow as
 /// `git.clone`.
-pub(crate) async fn perform_clone(job: CloneJob) -> std::result::Result<(), String> {
+pub(crate) async fn perform_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     run_clone(job).await
+}
+
+/// A failed clone with its classification already decided by [`run_clone`],
+/// so the JSON-RPC surface (`workspace.create`) and the streamed
+/// `git:clone:done` frame share one classification decision. `category` is
+/// `None` for failures that were deliberately not classified (spawn / wait
+/// errors — environmental, not git stderr); callers map that to the
+/// `clone-failed` catch-all (PROTOCOL §9.1).
+pub(crate) struct CloneFailure {
+    pub category: Option<CloneErrorCategory>,
+    /// Human-readable cause, already credential-redacted.
+    pub detail: String,
 }
 
 /// The machine-readable `errorCode` for a `git:clone:done` frame: the
@@ -266,7 +283,7 @@ fn build_clone_command(url: &str, target_path: &Path, token: Option<&str>) -> Co
     cmd
 }
 
-async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
+async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     let CloneJob {
         request_id,
         workspace_id,
@@ -301,6 +318,11 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
     #[cfg(unix)]
     cmd.process_group(0);
 
+    // Spawn / wait errors are deliberately NOT run through the stderr
+    // classifier: "git spawn failed: No such file or directory" is an
+    // environmental failure, not the user-fixable `path-invalid` the prose
+    // would match. Both surfaces (the `git:clone:done` frame and the
+    // JSON-RPC error) share the `None` decision made here.
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -311,7 +333,10 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
                 done_event(&ws, &request_id, false, Some(&msg), None),
             )
             .await;
-            return Err(msg);
+            return Err(CloneFailure {
+                category: None,
+                detail: msg,
+            });
         }
     };
     let stderr = match child.stderr.take() {
@@ -325,7 +350,10 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
                 done_event(&ws, &request_id, false, Some(&msg), None),
             )
             .await;
-            return Err(msg);
+            return Err(CloneFailure {
+                category: None,
+                detail: msg,
+            });
         }
     };
 
@@ -359,19 +387,17 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
                 _ => format!("git clone failed ({})", status),
             };
             let redacted = redact_credentials(&msg);
+            let category = classified(&redacted);
             publish(
                 &bus,
                 &ws,
-                done_event(
-                    &ws,
-                    &request_id,
-                    false,
-                    Some(&redacted),
-                    classified(&redacted),
-                ),
+                done_event(&ws, &request_id, false, Some(&redacted), category),
             )
             .await;
-            Err(redacted)
+            Err(CloneFailure {
+                category,
+                detail: redacted,
+            })
         }
         Ok(Err(e)) => {
             let msg = format!("git wait failed: {e}");
@@ -381,20 +407,27 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), String> {
                 done_event(&ws, &request_id, false, Some(&msg), None),
             )
             .await;
-            Err(msg)
+            Err(CloneFailure {
+                category: None,
+                detail: msg,
+            })
         }
         Err(_) => {
             reap_child_group(&mut child).await;
             // The daemon's own clone timeout is a `network`-category failure
             // per the clone failure taxonomy (PROTOCOL §9.1).
             let msg = "git clone timed out".to_string();
+            let category = classified(&msg);
             publish(
                 &bus,
                 &ws,
-                done_event(&ws, &request_id, false, Some(&msg), classified(&msg)),
+                done_event(&ws, &request_id, false, Some(&msg), category),
             )
             .await;
-            Err(msg)
+            Err(CloneFailure {
+                category,
+                detail: msg,
+            })
         }
     }
 }
@@ -848,6 +881,15 @@ mod tests {
         // Auth prose outranks the access-denied row when both appear.
         assert_eq!(
             classify_clone_error("remote: HTTP Basic: Access denied. Authentication failed"),
+            C::AuthRequired
+        );
+        // GitLab's credential rejection carries no "authentication failed"
+        // prose but is still an auth failure — the remedy is credentials.
+        assert_eq!(
+            classify_clone_error(
+                "remote: HTTP Basic: Access denied. The provided password or token \
+                 is incorrect or your account has 2FA enabled"
+            ),
             C::AuthRequired
         );
         // Wire spellings match the clone failure taxonomy (PROTOCOL §9.1).

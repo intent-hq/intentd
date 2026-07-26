@@ -7358,11 +7358,13 @@ impl WorkspaceApi for Services {
                                 url,
                             )
                             .await;
-                            // Clone failures are classified into a typed error
-                            // carrying the sanitized stderr tail so clients can
-                            // show the underlying cause (monorepo#826). The
-                            // detail is already credential-redacted by
-                            // `run_clone`.
+                            // Clone failures surface as a typed error carrying
+                            // the sanitized stderr tail so clients can show the
+                            // underlying cause (monorepo#826). The category was
+                            // decided once inside `run_clone` — shared with the
+                            // streamed `git:clone:done.errorCode` — with `None`
+                            // (spawn/wait failures) mapping to the `clone-failed`
+                            // catch-all (PROTOCOL §9.1).
                             clone_ops::perform_clone(clone_ops::CloneJob {
                                 request_id,
                                 workspace_id: Some(id.clone()),
@@ -7372,9 +7374,11 @@ impl WorkspaceApi for Services {
                                 bus: bus_ref,
                             })
                             .await
-                            .map_err(|detail| Error::CloneFailed {
-                                category: clone_ops::classify_clone_error(&detail),
-                                detail,
+                            .map_err(|failure| Error::CloneFailed {
+                                category: failure
+                                    .category
+                                    .unwrap_or(intent_core::CloneErrorCategory::Other),
+                                detail: failure.detail,
                             })?;
                             input.repository_path =
                                 Some(target.to_string_lossy().to_string());
@@ -12470,14 +12474,21 @@ impl WorkspaceApi for Services {
             // Resolve a GitHub token for private HTTPS github.com clones
             // (monorepo#825): SSH / non-GitHub URLs skip resolution entirely;
             // the value travels to the child via the environment only.
-            let token = github_git_token_for_url(registry.as_deref(), &url).await;
-            clone_ops::spawn_clone(clone_ops::CloneJob {
-                request_id: request_id.clone(),
-                workspace_id: None,
-                url,
-                target_path: target.clone(),
-                token,
-                bus,
+            // Resolution runs inside the spawned task so the ack below stays
+            // prompt (§5.6) — with `tokenSource: auto` the bounded secrets /
+            // `gh` lookups can take a few seconds.
+            let spawn_request_id = request_id.clone();
+            let spawn_target = target.clone();
+            tokio::spawn(async move {
+                let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                clone_ops::spawn_clone(clone_ops::CloneJob {
+                    request_id: spawn_request_id,
+                    workspace_id: None,
+                    url,
+                    target_path: spawn_target,
+                    token,
+                    bus,
+                });
             });
             Ok(serde_json::json!({
                 "requestId": request_id,
