@@ -1512,10 +1512,17 @@ async fn dispatch(
                     .collect::<Vec<_>>(),
                 _ => return Err(rpc(INVALID_PARAMS, "eventTypes must be an array")),
             };
+            // Optional subscriber identity (monorepo#937): when present, the
+            // named agent receives batched wake messages on matching events;
+            // absent (FE front door) registers a match-only subscription.
+            let subscriber = params
+                .get("agentId")
+                .and_then(Value::as_str)
+                .map(AgentId::from);
             let exclude_self = params.get("excludeSelf").and_then(Value::as_bool);
             let batch_window = opt_int(params, "batchWindow");
             let result = api
-                .agent_subscribe(ws, event_types, exclude_self, batch_window)
+                .agent_subscribe(ws, subscriber, event_types, exclude_self, batch_window)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

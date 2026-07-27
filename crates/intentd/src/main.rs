@@ -840,6 +840,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Ok(loaded) => tracing::info!(loaded, "rehydrated persisted completion watches on startup"),
         Err(e) => tracing::warn!(error = %e, "completion watch startup rehydration failed"),
     }
+    // Rehydrate persisted event subscriptions (monorepo#937) so `event.subscribe`
+    // registrations survive daemon restarts; rows whose subscriber agent is
+    // gone are pruned. Best-effort: a failure is logged but never aborts
+    // startup (agents can re-subscribe).
+    match services.heal_event_subscriptions_on_startup().await {
+        Ok(0) => {}
+        Ok(loaded) => tracing::info!(
+            loaded,
+            "rehydrated persisted event subscriptions on startup"
+        ),
+        Err(e) => tracing::warn!(error = %e, "event subscription startup rehydration failed"),
+    }
     // Hydrate the script registry from the persisted definitions (§5.8) so
     // `script.*` survives daemon restarts. Best-effort: a failure is logged
     // but never aborts startup (scripts can still be re-created live).

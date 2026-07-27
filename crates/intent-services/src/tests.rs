@@ -3492,7 +3492,7 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     let (_tmp, svc, ws) = event_setup().await;
     // Empty eventTypes → error (TS resolveSubscriptionEventTypes guard).
     let err = svc
-        .event_subscribe(ws.clone(), vec![], None, None)
+        .event_subscribe(ws.clone(), None, vec![], None, None)
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Internal(m) if m.contains("eventTypes is required")));
@@ -3500,7 +3500,13 @@ async fn subscribe_resolves_star_and_unsubscribe_roundtrips() {
     // Bare `*` expands to the category wildcards; `excludeSelf`/`batchWindow`
     // are accepted (TS shim forwards them) without changing the result shape.
     let sub = svc
-        .event_subscribe(ws.clone(), vec!["*".to_string()], Some(true), Some(250))
+        .event_subscribe(
+            ws.clone(),
+            None,
+            vec!["*".to_string()],
+            Some(true),
+            Some(250),
+        )
         .await
         .expect("subscribe");
     assert!(sub.event_types.contains(&"agent:*".to_string()));

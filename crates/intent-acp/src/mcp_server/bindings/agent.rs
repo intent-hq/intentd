@@ -63,7 +63,7 @@ pub(crate) async fn dispatch(
         "delegate" => delegate(api, ws, caller, args).await,
         "send" => send(api, ws, caller, args).await,
         "sendToTask" => send_to_task(api, ws, caller, args).await,
-        "subscribe" => subscribe(api, ws, args).await,
+        "subscribe" => subscribe(api, ws, caller, args).await,
         "unsubscribe" => unsubscribe(api, ws, args).await,
         "list" => list(api, ws).await,
         "status" => status(api, ws, args).await,
@@ -305,6 +305,7 @@ async fn send_to_task(
 async fn subscribe(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
@@ -318,6 +319,7 @@ async fn subscribe(
     let v = api
         .agent_subscribe(
             ws.clone(),
+            caller.cloned(),
             event_types,
             opt_bool(args, "excludeSelf"),
             args.get("batchWindow").and_then(Value::as_i64),
