@@ -3660,7 +3660,7 @@ mod mcp_bridge_tests {
 
         use crate::mcp_bridge::{
             run_bridge, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE, BRIDGE_DISCONNECTED_MESSAGE,
-            INITIAL_BUFFER_MAX_LINES,
+            INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
         };
 
         fn fast_cfg() -> BridgeRetryConfig {
@@ -3837,6 +3837,29 @@ mod mcp_bridge_tests {
             bridge.send_request(9999).await;
             let resp = bridge.read_response().await;
             assert_disconnected_error(&resp, 9999);
+        }
+
+        /// The byte cap rejects an oversized line, and overflow is sticky:
+        /// once any line has been rejected, later lines that would fit are
+        /// rejected too, so a later request can never be served after an
+        /// earlier one failed (monorepo#908).
+        #[tokio::test]
+        async fn initial_buffer_byte_cap_overflow_is_sticky() {
+            let addr = reserve_free_addr().await;
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+            // One line larger than the whole byte cap is rejected outright.
+            let big = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+                "x".repeat(INITIAL_BUFFER_MAX_BYTES)
+            );
+            bridge.stdin.write_all(big.as_bytes()).await.unwrap();
+            bridge.stdin.flush().await.unwrap();
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 1);
+            // A small line that would fit is rejected too — overflow is sticky.
+            bridge.send_request(2).await;
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 2);
         }
 
         /// Buffered lines participate in `pending` tracking once flushed: a

@@ -216,7 +216,7 @@ pub(crate) const BRIDGE_DISCONNECTED_MESSAGE: &str =
 pub(crate) const INITIAL_BUFFER_MAX_LINES: usize = 1024;
 
 /// Companion byte cap for the initial-window stdin buffer.
-const INITIAL_BUFFER_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const INITIAL_BUFFER_MAX_BYTES: usize = 1024 * 1024;
 
 /// Retry/backoff knobs for [`run_stdio_bridge`]. Defaults give the initial
 /// connect ~10 attempts over ~5s and mid-session reconnects a ~30s total
@@ -332,7 +332,9 @@ where
 /// are never answered — the caller exits non-zero instead), while a reconnect
 /// returns `Ok(None)` so the bridge exits cleanly — a restarted daemon listens
 /// on a new port this bridge can never learn. `Ok(None)` is also returned when
-/// stdin reaches EOF while disconnected.
+/// stdin reaches EOF while disconnected; during the initial window any
+/// buffered lines are dropped unanswered — the provider closed stdin, so
+/// nothing is awaiting responses.
 async fn connect_with_retry<R, W>(
     addr: &str,
     cfg: BridgeRetryConfig,
@@ -349,6 +351,7 @@ where
     let mut delay = cfg.backoff_start;
     let mut attempts: u32 = 0;
     let mut buffered_bytes: usize = buffer.iter().map(String::len).sum();
+    let mut overflowed = false;
     loop {
         attempts += 1;
         // Service stdin while the connect itself is pending (not just during
@@ -364,8 +367,15 @@ where
                 result = &mut connect => break result,
                 line = input.next_line() => match line? {
                     Some(line) => {
-                        buffer_or_reject(line, initial, buffer, &mut buffered_bytes, output)
-                            .await?
+                        buffer_or_reject(
+                            line,
+                            initial,
+                            buffer,
+                            &mut buffered_bytes,
+                            &mut overflowed,
+                            output,
+                        )
+                        .await?
                     }
                     None => return Ok(None),
                 },
@@ -396,8 +406,15 @@ where
                 _ = &mut sleep => break,
                 line = input.next_line() => match line? {
                     Some(line) => {
-                        buffer_or_reject(line, initial, buffer, &mut buffered_bytes, output)
-                            .await?
+                        buffer_or_reject(
+                            line,
+                            initial,
+                            buffer,
+                            &mut buffered_bytes,
+                            &mut overflowed,
+                            output,
+                        )
+                        .await?
                     }
                     None => return Ok(None),
                 },
@@ -411,21 +428,29 @@ where
 /// connect window the line is buffered for forwarding after the connect
 /// succeeds (monorepo#908); past the defensive caps — or during a mid-session
 /// reconnect — id-carrying requests fall back to the retryable disconnected
-/// error.
+/// error. Overflow is sticky: once any line is rejected, every later line is
+/// rejected too, so a later request can never be served after an earlier one
+/// failed (and buffered notifications are never delivered out of order
+/// relative to dropped ones).
 async fn buffer_or_reject<W: AsyncWrite + Unpin>(
     line: String,
     initial: bool,
     buffer: &mut Vec<String>,
     buffered_bytes: &mut usize,
+    overflowed: &mut bool,
     output: &mut W,
 ) -> std::io::Result<()> {
     if initial
+        && !*overflowed
         && buffer.len() < INITIAL_BUFFER_MAX_LINES
         && *buffered_bytes + line.len() <= INITIAL_BUFFER_MAX_BYTES
     {
         *buffered_bytes += line.len();
         buffer.push(line);
         return Ok(());
+    }
+    if initial {
+        *overflowed = true;
     }
     reject_if_request(&line, output).await
 }
