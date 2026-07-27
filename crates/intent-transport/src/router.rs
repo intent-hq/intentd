@@ -2536,6 +2536,18 @@ async fn dispatch(
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "unsloth.status" => {
+            // Observe the daemon-managed singleton Unsloth server
+            // (monorepo#878); no workspaceId — the server is daemon-global.
+            let r = api.unsloth_status().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
+        "unsloth.stop" => {
+            // Gracefully terminate the managed Unsloth server; a no-op
+            // (`{ stopped: false }`) when none is running, not an error.
+            let r = api.unsloth_stop().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "accept-changes.getStatus" => {
             let ws = require_ws_note(params)?;
             let r = api

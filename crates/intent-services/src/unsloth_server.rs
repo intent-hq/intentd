@@ -51,11 +51,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use intent_core::{Error, Result};
 use intent_providers::{UnslothEndpoint, UnslothModelLimit};
 use serde_json::Value;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
@@ -125,6 +126,13 @@ fn missing_binary_error() -> Error {
 /// shutdown was requested mid-startup.
 fn shutting_down_error() -> Error {
     Error::Internal("unsloth server startup aborted: daemon is shutting down".to_string())
+}
+
+/// The error an in-flight `ensure_endpoint` gets when `unsloth.stop` aborted
+/// it mid-startup (not terminal — a later `ensure_endpoint` call may start a
+/// new server).
+fn stop_requested_error() -> Error {
+    Error::Internal("unsloth server startup aborted: unsloth.stop was called".to_string())
 }
 
 /// Fallback quant variant when per-repo size metadata is unavailable,
@@ -279,6 +287,33 @@ pub(crate) fn best_fitting_quant(
         .map(|(tag, _)| (*tag).to_string())
 }
 
+/// Snapshot of the managed server's live state, for the `unsloth.status`
+/// RPC. Constructed by [`UnslothServerManager::status_snapshot`]; `None`
+/// from that method means no server is running.
+#[derive(Debug, Clone)]
+pub struct UnslothStatus {
+    /// Full HF repo id currently served (or being started).
+    pub repo_id: String,
+    /// Port the managed server listens on.
+    pub port: u16,
+    /// OS pid of the managed server child, when known.
+    pub pid: Option<u32>,
+    /// Seconds since the child was spawned.
+    pub uptime_secs: u64,
+    /// Coarse startup phase: `"starting"`, `"minting"`, `"loading"`, or
+    /// `"ready"`.
+    pub phase: String,
+    /// CPU percent summed across the server's process tree (raw `sysinfo`
+    /// convention: 100 = one full core), sampled at snapshot time. `0.0`
+    /// when the pid is unknown or the sample failed.
+    pub cpu_percent: f32,
+    /// Resident memory (bytes) summed across the server's process tree —
+    /// `unsloth` spawns `llama-server` as a child that holds the model
+    /// weights, so the tree total (not just the root process) is what
+    /// matters for capacity planning.
+    pub memory_bytes: u64,
+}
+
 /// Outcome of one readiness probe attempt against the managed server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
@@ -402,6 +437,19 @@ pub(crate) fn parse_generated_config(body: &str, served_repo: &str) -> Result<Un
     })
 }
 
+/// Lightweight, `Clone`-able mirror of a [`ManagedServer`]'s identity, kept
+/// under its own `std::sync::Mutex` so `unsloth.status` never has to take the
+/// startup-serializing `state` [`TokioMutex`] (which a spawn can legitimately
+/// hold for up to [`MODEL_READY_TIMEOUT`]). Updated at every point
+/// `state`'s `Some`/`None`-ness changes (spawn, teardown-for-respawn, failed
+/// startup, `stop`, `shutdown`).
+#[derive(Clone)]
+struct ServerIdentity {
+    repo_id: String,
+    pid: Option<u32>,
+    started_at: Instant,
+}
+
 /// One managed server child: the process handle plus what it was started
 /// with, so reuse/restart decisions compare against the live state.
 struct ManagedServer {
@@ -417,6 +465,8 @@ struct ManagedServer {
     /// snapshotting without waiting races the child's final output and can
     /// lose the diagnostic exactly when it's needed.
     drain_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// When the child was spawned; feeds `unsloth.status`'s uptime field.
+    started_at: Instant,
 }
 
 /// How long [`ManagedServer::tail`] waits for the drain tasks to consume the
@@ -504,6 +554,31 @@ pub struct UnslothServerManager {
     /// at the next probe tick, aborts, and releases the lock — daemon
     /// shutdown never waits out the model-ready window.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// One-shot latch set by [`Self::stop`] BEFORE taking the state lock, so
+    /// an in-flight `ensure_endpoint` startup polling loop
+    /// ([`Self::wait_until`]) notices at its next probe tick (≤
+    /// [`UnslothConfig::probe_interval`]) and aborts instead of leaving
+    /// `unsloth.stop` blocked behind the state lock for up to
+    /// [`MODEL_READY_TIMEOUT`]. Unlike `shutting_down` this is NOT terminal:
+    /// it is reset to `false` once consumed (by the aborted startup's
+    /// teardown, or by `stop` itself when there was nothing to interrupt) so
+    /// a later `ensure_endpoint` is unaffected. Checked in every startup
+    /// polling loop, including [`Self::mint_endpoint`]'s.
+    stop_requested: std::sync::atomic::AtomicBool,
+    /// Coarse startup phase surfaced by `unsloth.status` (`"starting"`,
+    /// `"minting"`, `"loading"`, `"ready"`); `None` when no server is
+    /// running. Updated at each stage transition in
+    /// [`Self::ensure_endpoint`]/[`Self::wait_and_mint`] and cleared on
+    /// teardown (dead child, model switch, failed startup, or shutdown).
+    phase: Mutex<Option<&'static str>>,
+    /// Lightweight, lock-free-to-read mirror of the live server's identity
+    /// (repo, pid, spawn time), kept in lockstep with `state`'s
+    /// `Some`/`None`-ness. `unsloth.status` reads ONLY this (plus `phase`,
+    /// both plain `std::sync::Mutex`es) so it never contends with `state`'s
+    /// `TokioMutex` — which `ensure_endpoint` can hold across
+    /// minutes-long startup awaits — keeping status observability
+    /// responsive even mid-download.
+    identity: Mutex<Option<ServerIdentity>>,
 }
 
 impl Default for UnslothServerManager {
@@ -519,6 +594,9 @@ impl UnslothServerManager {
             config,
             quant_cache: Mutex::new(HashMap::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            stop_requested: std::sync::atomic::AtomicBool::new(false),
+            phase: Mutex::new(None),
+            identity: Mutex::new(None),
         }
     }
 
@@ -526,6 +604,89 @@ impl UnslothServerManager {
     fn is_shutting_down(&self) -> bool {
         self.shutting_down
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether [`Self::stop`] has an outstanding, not-yet-consumed request.
+    fn is_stop_requested(&self) -> bool {
+        self.stop_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the coarse startup phase (`unsloth.status`'s `phase` field).
+    fn set_phase(&self, phase: Option<&'static str>) {
+        *lock_ignore_poison(&self.phase) = phase;
+    }
+
+    /// Update the identity mirror (`unsloth.status`'s lock-free read path).
+    fn set_identity(&self, identity: Option<ServerIdentity>) {
+        *lock_ignore_poison(&self.identity) = identity;
+    }
+
+    /// Snapshot the managed server's live state for `unsloth.status`; `None`
+    /// when no server is running OR the last-known pid is no longer alive
+    /// (a dead child not yet reaped by the next `ensure_endpoint` call —
+    /// checked via a unix signal-0 liveness probe, best-effort elsewhere).
+    /// Deliberately reads only the `identity`/`phase` mirrors (both plain
+    /// `std::sync::Mutex`es), never `state`'s `TokioMutex`, so this stays
+    /// responsive even while a startup is in flight (see [`Self::identity`]).
+    /// `cpu_percent`/`memory_bytes` sum the server's whole process tree
+    /// (`unsloth` spawns `llama-server` as a child holding the model
+    /// weights) — best-effort: a sampling failure yields zeros rather than
+    /// failing the whole snapshot.
+    pub async fn status_snapshot(&self) -> Option<UnslothStatus> {
+        let identity = lock_ignore_poison(&self.identity).clone()?;
+        if let Some(pid) = identity.pid {
+            if !pid_is_alive(pid) {
+                return None;
+            }
+        }
+        let phase = lock_ignore_poison(&self.phase)
+            .unwrap_or("starting")
+            .to_string();
+        let (cpu_percent, memory_bytes) = match identity.pid {
+            Some(pid) => sample_process_tree(pid).await,
+            None => (0.0, 0),
+        };
+        Some(UnslothStatus {
+            repo_id: identity.repo_id,
+            port: self.config.port,
+            pid: identity.pid,
+            uptime_secs: identity.started_at.elapsed().as_secs(),
+            phase,
+            cpu_percent,
+            memory_bytes,
+        })
+    }
+
+    /// Stop the managed server if one is running, returning whether one was
+    /// actually stopped (`false` = already stopped, a no-op). Equivalent to
+    /// [`Self::shutdown`] but does not set the terminal shutdown latch — a
+    /// later `ensure_endpoint` call may start a new server. Sets
+    /// [`Self::stop_requested`] BEFORE taking the state lock so an in-flight
+    /// startup's polling loop aborts within one probe tick instead of
+    /// blocking this call for the full startup window.
+    pub async fn stop(&self) -> bool {
+        let was_running = lock_ignore_poison(&self.identity).is_some();
+        if !was_running {
+            return false;
+        }
+        self.stop_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut state = self.state.lock().await;
+            if let Some(mut server) = state.take() {
+                tracing::info!(repo = %server.repo_id, "stopping managed unsloth server (unsloth.stop)");
+                kill_server_child(&mut server.child).await;
+                self.set_phase(None);
+                self.set_identity(None);
+            }
+        }
+        // Reset the one-shot latch whether we performed the teardown above or
+        // an aborted `ensure_endpoint` already did (see `stop_requested`'s
+        // doc comment) — either way the request has been fulfilled.
+        self.stop_requested
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// Ensure a managed server is running and ready for `repo_id`, returning
@@ -580,6 +741,8 @@ impl UnslothServerManager {
                 "stopping managed unsloth server (model switch or dead child)"
             );
             kill_server_child(&mut old.child).await;
+            self.set_phase(None);
+            self.set_identity(None);
         }
 
         let binary = (self.config.resolve_binary)().ok_or_else(missing_binary_error)?;
@@ -594,7 +757,13 @@ impl UnslothServerManager {
                 return Err(shutting_down_error());
             }
             let server = self.start_server(&binary, repo_id, &quant)?;
+            self.set_identity(Some(ServerIdentity {
+                repo_id: server.repo_id.clone(),
+                pid: server.child.id(),
+                started_at: server.started_at,
+            }));
             *state = Some(server);
+            self.set_phase(Some("starting"));
         } else {
             status(format!(
                 "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
@@ -607,6 +776,7 @@ impl UnslothServerManager {
         {
             Ok(endpoint) => {
                 state.as_mut().unwrap().endpoint = Some(endpoint.clone());
+                self.set_phase(Some("ready"));
                 Ok(endpoint)
             }
             Err(failure) if failure.preserve_server && !self.is_shutting_down() => {
@@ -623,11 +793,17 @@ impl UnslothServerManager {
                 Err(failure.error)
             }
             Err(failure) => {
-                // Genuinely dead child, mint failure, or shutdown in
-                // progress: tear down so the next attempt starts clean, and
-                // surface the output tail (with any minted key material
-                // redacted — the error is client-visible).
+                // Genuinely dead child, mint failure, shutdown, or
+                // `unsloth.stop` interrupting a long-running startup wait
+                // (see `stop_requested`'s doc comment): tear down so the
+                // next attempt starts clean, and surface the output tail
+                // (with any minted key material redacted — the error is
+                // client-visible).
                 let mut failed = state.take().expect("state set above");
+                self.set_phase(None);
+                self.set_identity(None);
+                self.stop_requested
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 kill_server_child(&mut failed.child).await;
                 let tail = redact_key_material(&failed.tail().await);
                 if tail.is_empty() {
@@ -747,6 +923,7 @@ impl UnslothServerManager {
             endpoint: None,
             output_tail,
             drain_tasks,
+            started_at: Instant::now(),
         })
     }
 
@@ -795,6 +972,7 @@ impl UnslothServerManager {
                 self.config.server_up_timeout.as_secs()
             ))),
             WaitError::ShuttingDown => StartupFailure::terminal(shutting_down_error()),
+            WaitError::StopRequested => StartupFailure::terminal(stop_requested_error()),
         })?;
 
         // Phase 2: mint the opencode auth material. `--no-launch` requires a
@@ -804,7 +982,9 @@ impl UnslothServerManager {
         // the first-use model download, so it gets the same generous,
         // progress-aware deadline as the phase-3 readiness probe below.
         status(format!("Unsloth server up; preparing model {repo_id}…"));
+        self.set_phase(Some("minting"));
         let endpoint = self.mint_endpoint(binary, repo_id, server, status).await?;
+        self.set_phase(Some("loading"));
 
         // Phase 3: model ready — authed probe answers 200. First use can mean
         // a multi-GB download, so this window is generous and progress status
@@ -837,6 +1017,7 @@ impl UnslothServerManager {
                 self.config.model_ready_timeout.as_secs() / 60
             ))),
             WaitError::ShuttingDown => StartupFailure::terminal(shutting_down_error()),
+            WaitError::StopRequested => StartupFailure::terminal(stop_requested_error()),
         })?;
         Ok(endpoint)
     }
@@ -915,6 +1096,13 @@ impl UnslothServerManager {
                 stdout_task.abort();
                 stderr_task.abort();
                 return Err(StartupFailure::terminal(shutting_down_error()));
+            }
+            if self.is_stop_requested() {
+                let _ = mint_child.start_kill();
+                let _ = mint_child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(StartupFailure::terminal(stop_requested_error()));
             }
             if !server.is_alive() {
                 let _ = mint_child.start_kill();
@@ -1009,6 +1197,9 @@ impl UnslothServerManager {
             if self.is_shutting_down() {
                 return Err(WaitError::ShuttingDown);
             }
+            if self.is_stop_requested() {
+                return Err(WaitError::StopRequested);
+            }
             if !server.is_alive() {
                 return Err(WaitError::ChildExited);
             }
@@ -1035,6 +1226,8 @@ impl UnslothServerManager {
         if let Some(mut server) = state.take() {
             tracing::info!(repo = %server.repo_id, "shutting down managed unsloth server");
             kill_server_child(&mut server.child).await;
+            self.set_phase(None);
+            self.set_identity(None);
         }
     }
 }
@@ -1078,6 +1271,10 @@ enum WaitError {
     TimedOut,
     /// [`UnslothServerManager::shutdown`] was requested mid-startup.
     ShuttingDown,
+    /// [`UnslothServerManager::stop`] was requested mid-startup — unlike
+    /// `ShuttingDown` this is not terminal; a later `ensure_endpoint` call
+    /// may start a new server.
+    StopRequested,
 }
 
 /// Redact minted key material from client-visible text: any `sk-…` token is
@@ -1098,6 +1295,59 @@ fn redact_key_material(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Best-effort liveness probe for `unsloth.status`'s staleness check: whether
+/// `pid` still refers to a live process, via a unix signal-0 probe (no signal
+/// actually delivered — `ESRCH` means the pid is gone). On non-unix this
+/// always reports alive: [`ManagedServer::is_alive`]'s `try_wait` remains the
+/// authoritative check there, exercised at the next `ensure_endpoint` call.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Sum CPU percent + resident memory across `root`'s whole process tree
+/// (itself plus every descendant, discovered via the shared `ps`-based
+/// [`intent_acp::descendant_pids`] walk) — `unsloth` spawns `llama-server`
+/// as a child that holds the model weights, so the root pid alone
+/// undercounts. `sysinfo` needs two refreshes
+/// [`sysinfo::MINIMUM_CPU_UPDATE_INTERVAL`] apart to compute a CPU delta;
+/// that wait is paid here since this only runs on an on-demand status
+/// call, never on a hot path. Best-effort throughout: pids that have since
+/// exited are silently skipped, never an error.
+async fn sample_process_tree(root: u32) -> (f32, u64) {
+    #[allow(unused_mut)]
+    let mut pids: Vec<u32> = vec![root];
+    #[cfg(unix)]
+    pids.extend(
+        intent_acp::descendant_pids(root)
+            .await
+            .into_iter()
+            .filter_map(|p| u32::try_from(p).ok()),
+    );
+    let sys_pids: Vec<Pid> = pids.iter().map(|&p| Pid::from(p as usize)).collect();
+    let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&sys_pids), true, refresh_kind);
+    tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&sys_pids), true, refresh_kind);
+    let mut cpu_percent = 0.0;
+    let mut memory_bytes = 0u64;
+    for pid in &sys_pids {
+        if let Some(proc) = sys.process(*pid) {
+            cpu_percent += proc.cpu_usage();
+            memory_bytes += proc.memory();
+        }
+    }
+    (cpu_percent, memory_bytes)
 }
 
 /// GET `url` (optionally with a Bearer key), returning the HTTP status code
@@ -1126,16 +1376,24 @@ where
 }
 
 /// SIGTERM the child's process group, wait briefly, then SIGKILL — same
-/// convention as the provider-child teardown in `agent_manager`.
+/// convention as the provider-child teardown in `agent_manager`. `unsloth`
+/// spawns `llama-server` as a child (the same relationship
+/// [`sample_process_tree`] accounts for), and — per
+/// `intent_acp::descendant_sweep`'s rationale — a child CAN move into its own
+/// process group and survive a plain `killpg`, so descendants are
+/// snapshotted before the kill and swept afterwards regardless of process
+/// group, exactly like the agent-provider teardown in `agent_manager`.
 #[cfg(unix)]
 async fn kill_server_child(child: &mut Child) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
     if let Some(pid) = child.id() {
+        let descendants = intent_acp::descendant_pids(pid).await;
         let pgid = Pid::from_raw(pid as i32);
         let _ = killpg(pgid, Signal::SIGTERM);
         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
         let _ = killpg(pgid, Signal::SIGKILL);
+        intent_acp::sweep_escaped_descendants(&descendants).await;
     } else {
         let _ = child.start_kill();
     }
@@ -1913,6 +2171,125 @@ mod tests {
             // Post-shutdown spawns are refused outright.
             let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
             assert!(err.to_string().contains("shutting down"), "got: {err}");
+        }
+
+        #[tokio::test]
+        async fn status_snapshot_stays_responsive_during_in_flight_startup() {
+            // Regression: `status_snapshot` must never contend with the
+            // startup-serializing `state` lock — it reads the lock-free
+            // `identity`/`phase` mirrors instead. `run` sleeps but never
+            // opens the HTTP socket, so the startup sits in its phase-1 probe
+            // loop for the whole (long) window; `status_snapshot` must return
+            // promptly throughout, not block behind `ensure_endpoint`.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), 1);
+            config.server_up_timeout = Duration::from_secs(600);
+            let mgr = Arc::new(UnslothServerManager::with_config(config));
+
+            let m2 = mgr.clone();
+            let startup = tokio::spawn(async move { m2.ensure_endpoint(REPO, &|_| {}).await });
+            // Give the startup time to spawn the child and enter the probe
+            // loop (holding `state` for the remainder of the long timeout).
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let start = tokio::time::Instant::now();
+            let status = tokio::time::timeout(Duration::from_secs(5), mgr.status_snapshot())
+                .await
+                .expect("status_snapshot must not block behind the startup's state lock")
+                .expect("server tracked as running mid-startup");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "status_snapshot must return promptly, not wait out the startup timeout"
+            );
+            assert_eq!(status.repo_id, REPO);
+            assert_eq!(status.phase, "starting");
+            assert!(status.pid.is_some());
+
+            mgr.shutdown().await;
+            let _ = startup.await;
+        }
+
+        #[tokio::test]
+        async fn stop_aborts_in_flight_startup_within_one_probe_tick() {
+            // Regression: `unsloth.stop` must interrupt a long-running
+            // startup instead of blocking behind `state`'s lock for the
+            // whole startup window (the same shape as `shutdown`'s abort,
+            // but non-terminal: a later `ensure_endpoint` may start anew).
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), 1);
+            config.server_up_timeout = Duration::from_secs(600);
+            let mgr = Arc::new(UnslothServerManager::with_config(config));
+
+            let m2 = mgr.clone();
+            let startup = tokio::spawn(async move { m2.ensure_endpoint(REPO, &|_| {}).await });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let start = tokio::time::Instant::now();
+            assert!(
+                mgr.stop().await,
+                "stop reports true when a server was starting"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "stop must abort the in-flight startup, not wait out its timeout"
+            );
+            let err = startup.await.expect("join").unwrap_err();
+            assert!(err.to_string().contains("unsloth.stop"), "got: {err}");
+            assert!(mgr.status_snapshot().await.is_none(), "no server tracked");
+
+            // A later ensure_endpoint is unaffected (stop is not terminal).
+            let dir2 = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary2 = write_stub_binary(dir2.path(), dir2.path(), port, None);
+            let mgr2 = UnslothServerManager::with_config(test_config(
+                binary2,
+                dir2.path().to_path_buf(),
+                port,
+            ));
+            mgr2.ensure_endpoint(REPO, &|_| {})
+                .await
+                .expect("stop is not terminal: a fresh manager still starts normally");
+            mgr2.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn status_snapshot_reports_absent_for_a_dead_untracked_pid() {
+            // Regression: `status_snapshot` must not report `running: true`
+            // off a stale identity once the child has actually exited AND
+            // been reaped — e.g. its pid was recycled into an unrelated
+            // process by the time of the snapshot. (A dead-but-not-yet-reaped
+            // zombie still answers a signal-0 probe on unix, so this test
+            // reaps the child directly — as the true OS parent — to exercise
+            // the case `pid_is_alive` is actually meant to catch, rather than
+            // relying on a race with the kernel's own reaping.)
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            // `run` exits shortly after startup completes, standing in for a
+            // server that crashes post-ready without the daemon noticing yet.
+            let binary = write_stub_binary(dir.path(), dir.path(), port, Some("sleep 0.3"));
+            let mgr = UnslothServerManager::with_config(test_config(
+                binary,
+                dir.path().to_path_buf(),
+                port,
+            ));
+            mgr.ensure_endpoint(REPO, &|_| {}).await.expect("starts");
+            let pid = mgr
+                .status_snapshot()
+                .await
+                .and_then(|s| s.pid)
+                .expect("pid while running");
+
+            // Reap the child directly (this test process is its true OS
+            // parent), forcing the terminal "exited and reaped" state that a
+            // signal-0 probe can actually observe.
+            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+
+            assert!(
+                mgr.status_snapshot().await.is_none(),
+                "status must not report a reaped-dead child as running"
+            );
         }
 
         #[tokio::test]

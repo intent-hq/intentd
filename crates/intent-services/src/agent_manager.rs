@@ -1111,6 +1111,23 @@ impl AgentManager {
         self.handles.lock().unwrap().contains_key(agent_id)
     }
 
+    /// Number of currently-tracked agents spawned with the given provider id
+    /// (e.g. `"unsloth"`), for `unsloth.status`'s `attachedAgentCount`.
+    pub fn count_agents_with_provider(&self, provider_id: &str) -> usize {
+        self.handles
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|h| h.spawned_provider == provider_id)
+            .count()
+    }
+
+    /// The daemon-owned singleton Unsloth server manager, for the
+    /// `unsloth.status` / `unsloth.stop` RPCs.
+    pub fn unsloth_manager(&self) -> &Arc<crate::unsloth_server::UnslothServerManager> {
+        &self.unsloth
+    }
+
     /// Spawn a provider child, acquire a concurrency slot, stand up the per-agent
     /// agent→BE MCP server + bridge (denylisted for `agent_type`, §6.8/§18.4),
     /// write the generated `--mcp-config` for providers that consume it, wire the
