@@ -995,6 +995,45 @@ impl Services {
         // Resolve provider using the same precedence as spawn path, then build
         // provider-specific _meta for system-prompt injection.
         let provider_id = resolve_provider_id(stored.model.as_deref(), stored.provider.as_deref());
+        // A committed cross-provider `agent.setModel` deliberately leaves the
+        // OLD provider's `acp_session_id` in place (deferred-commit: a switch
+        // reverted before the next message must stay a no-op, and the original
+        // id must remain usable for a same-provider resume). Never offer that
+        // foreign id to the NEW provider's binary via `session/load`: a
+        // provider that silently accepted it would skip the supervisor-XML
+        // history replay entirely (monorepo#907). The stored id's owner is the
+        // committed `last_turn_provider` (written at turn start once the spawn
+        // identity is up); when it differs from the provider this turn
+        // resolves to, skip resume so the caller falls into the recreate +
+        // history-replay branch. `None` (no committed turn yet — legacy rows
+        // or a crash before the identity commit) keeps today's behavior.
+        // One crash window errs on the safe side: a cross-provider turn that
+        // reached `recreate_acp_session` (stored id already the NEW
+        // provider's) but died before the identity commit still carries the
+        // OLD `last_turn_provider` on restart, so this guard skips a resume
+        // that would have been legitimate — a redundant recreate + replay,
+        // never a foreign load or context loss.
+        // Both sides are canonicalized through the registry before comparing:
+        // the commit stores the spawn-resolved `provider.id`, but the resolved
+        // id here may be a legacy default alias (`acp`/`augment`/`default`)
+        // from a persisted row — an alias spawns the same default binary, so
+        // it must not read as a provider change.
+        let (_, last_turn_provider) = self
+            .store
+            .get_agent_session_last_turn_model(&workspace_id, agent_id)
+            .await?;
+        if let Some(owner) = last_turn_provider {
+            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            if canonical(&owner) != canonical(&provider_id) {
+                tracing::info!(
+                    agent = %agent_id,
+                    from = %owner,
+                    to = %provider_id,
+                    "cross-provider switch: skipping session/load of the old provider's session"
+                );
+                return Ok(None);
+            }
+        }
         let meta = build_session_meta(&provider_id, stored.system_prompt.as_deref());
         self.publish_status_event(
             &workspace_id,

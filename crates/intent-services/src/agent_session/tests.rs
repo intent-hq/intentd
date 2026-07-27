@@ -1551,6 +1551,164 @@ async fn resume_requires_capability_and_stored_id() {
     assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
 }
 
+/// monorepo#907 regression: a COMMITTED cross-provider `agent.setModel`
+/// leaves the old provider's `acp_session_id` in place (deferred-commit
+/// semantics), so the resume path must never offer that foreign id to the
+/// NEW provider's binary via `session/load` — a provider that silently
+/// accepted it would skip the history replay entirely. The stored id's owner
+/// is the committed `last_turn_provider`; when it differs from the provider
+/// this turn resolves to, resume is skipped outright (the manager then falls
+/// into the recreate + supervisor-XML-replay branch). Reverting the switch
+/// before the next message restores the match, so the original id resumes.
+#[tokio::test]
+async fn resume_skips_foreign_session_after_cross_provider_switch() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+
+    // Turn 1 ran on claude-code: session id persisted, identity committed.
+    bus.store()
+        .set_agent_session_model(
+            &ws,
+            &agent_id,
+            "claude-code:opus",
+            Some("claude-code"),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+    bus.store()
+        .set_agent_session_last_turn_model(&ws, &agent_id, Some("opus"), "claude-code")
+        .await
+        .unwrap();
+
+    // Committed cross-provider switch (the narrow setModel writer): model +
+    // provider now say grok, but the stored acp_session_id is claude-code's.
+    bus.store()
+        .set_agent_session_model(&ws, &agent_id, "grok:grok-4-fast", Some("grok"), &now_iso())
+        .await
+        .unwrap();
+    assert!(
+        services
+            .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "foreign session/load must be skipped after a committed cross-provider switch"
+    );
+    // The skip must not destroy the stored id: revert depends on it.
+    let stored = bus.store().get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.acp_session_id.as_deref(), Some(ACP_SID));
+
+    // Switch-and-revert before the next message: the identity matches the
+    // stored id's owner again, so the original session resumes via load.
+    bus.store()
+        .set_agent_session_model(
+            &ws,
+            &agent_id,
+            "claude-code:opus",
+            Some("claude-code"),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("revert-before-send resumes the original session");
+    assert_eq!(opened.session_id, ACP_SID);
+}
+
+/// Same-provider model switches keep `session/load` resume: only a provider
+/// identity change gates the monorepo#907 skip, never the model. An agent
+/// with no committed last-turn identity (legacy rows / a crash between the
+/// session open and the identity commit) also keeps today's resume behavior.
+#[tokio::test]
+async fn resume_survives_same_provider_model_switch() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+    bus.store()
+        .set_agent_session_model(
+            &ws,
+            &agent_id,
+            "claude-code:opus",
+            Some("claude-code"),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+
+    // No committed last-turn identity yet → resume proceeds as before.
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("no committed identity keeps resume");
+    assert_eq!(opened.session_id, ACP_SID);
+
+    bus.store()
+        .set_agent_session_last_turn_model(&ws, &agent_id, Some("opus"), "claude-code")
+        .await
+        .unwrap();
+    // Same-provider model switch: the session id's owner is unchanged.
+    bus.store()
+        .set_agent_session_model(
+            &ws,
+            &agent_id,
+            "claude-code:sonnet",
+            Some("claude-code"),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("same-provider switch keeps session/load resume");
+    assert_eq!(opened.session_id, ACP_SID);
+}
+
+/// Legacy default-provider aliases (`acp`/`augment`/`default`) spawn the same
+/// default binary as the canonical id, so an alias-vs-canonical difference
+/// between the persisted row and the committed `last_turn_provider` must not
+/// read as a cross-provider switch: both sides canonicalize through the
+/// registry before the monorepo#907 comparison.
+#[tokio::test]
+async fn resume_survives_default_provider_alias_mismatch() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+    // Legacy row: bare model + alias provider → resolve_provider_id yields
+    // the alias verbatim ("acp"), while the turn-start commit always stores
+    // the spawn-resolved canonical id ("auggie").
+    bus.store()
+        .set_agent_session_model(&ws, &agent_id, "opus4.7", Some("acp"), &now_iso())
+        .await
+        .unwrap();
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+    bus.store()
+        .set_agent_session_last_turn_model(&ws, &agent_id, Some("opus4.7"), "auggie")
+        .await
+        .unwrap();
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("alias-vs-canonical default provider ids keep resume");
+    assert_eq!(opened.session_id, ACP_SID);
+}
+
 #[tokio::test]
 async fn recreate_acp_session_replaces_stored_id() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;
