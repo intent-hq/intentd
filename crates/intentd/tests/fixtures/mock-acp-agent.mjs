@@ -59,31 +59,37 @@ function mcpConfigPath() {
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
 }
 
+// Resolve the workspace-mcp server entry from the generated `--mcp-config`
+// file or the session-setup stash (STAB-156). Returns { command, args, env }
+// or null when neither delivery mechanism carried the bridge.
+function resolveWorkspaceMcpServer() {
+  const path = mcpConfigPath();
+  if (path) {
+    const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
+    const srv = (cfg.mcpServers && cfg.mcpServers['workspace-mcp']) || null;
+    if (srv) return srv;
+  }
+  // ACP session-setup delivery: the `session/new` `mcpServers` array
+  // carries untagged stdio entries { name, command, args, env: [{name,value}] }.
+  // Also the fallback when an `--mcp-config` file exists but lacks the
+  // bridge entry, so either delivery mechanism can win.
+  const entry = sessionMcpServers.find((s) => s && s.name === 'workspace-mcp');
+  if (entry) {
+    return {
+      command: entry.command,
+      args: entry.args || [],
+      env: Object.fromEntries((entry.env || []).map((e) => [e.name, e.value])),
+    };
+  }
+  return null;
+}
+
 // Spawn the configured workspace-mcp server, perform an MCP initialize +
 // tools/call, and resolve with the call response. Rejects on any transport error
 // so the test fails loudly rather than silently skipping the mutation.
 function callWorkspaceTool(toolCall) {
   return new Promise((resolve, reject) => {
-    let srv = null;
-    const path = mcpConfigPath();
-    if (path) {
-      const cfg = JSON.parse(fs.readFileSync(path, 'utf8'));
-      srv = (cfg.mcpServers && cfg.mcpServers['workspace-mcp']) || null;
-    }
-    if (!srv) {
-      // ACP session-setup delivery: the `session/new` `mcpServers` array
-      // carries untagged stdio entries { name, command, args, env: [{name,value}] }.
-      // Also the fallback when an `--mcp-config` file exists but lacks the
-      // bridge entry, so either delivery mechanism can win.
-      const entry = sessionMcpServers.find((s) => s && s.name === 'workspace-mcp');
-      if (entry) {
-        srv = {
-          command: entry.command,
-          args: entry.args || [],
-          env: Object.fromEntries((entry.env || []).map((e) => [e.name, e.value])),
-        };
-      }
-    }
+    const srv = resolveWorkspaceMcpServer();
     if (!srv) return reject(new Error('no workspace-mcp server in config'));
     log(`spawning bridge: ${srv.command} ${(srv.args || []).join(' ')}`);
     const child = spawn(srv.command, srv.args || [], {
@@ -125,6 +131,87 @@ function callWorkspaceTool(toolCall) {
       if (resp.error) return reject(new Error(`tool call error: ${JSON.stringify(resp.error)}`));
       resolve(resp.result);
     })().catch(reject);
+  });
+}
+
+// Bridge-concurrency probe (monorepo#871): over ONE bridge connection, fire a
+// long `tools/call` (agent JS that spins until `releaseFile` exists) and —
+// while it is still in flight — a `tools/list` ping. The release file is only
+// written AFTER the ping response arrives, so the long call can only complete
+// if the bridge dispatched both requests concurrently; a serialized bridge
+// deadlocks (ping parked behind the long call, which waits on the ping) and
+// the probe times out. Resolves { toolCount, longCallOk }.
+function runBridgeConcurrencyProbe(probe) {
+  return new Promise((resolve, reject) => {
+    const srv = resolveWorkspaceMcpServer();
+    if (!srv) return reject(new Error('no workspace-mcp server in config'));
+    log(`spawning bridge (concurrency probe): ${srv.command} ${(srv.args || []).join(' ')}`);
+    const child = spawn(srv.command, srv.args || [], {
+      env: { ...process.env, ...(srv.env || {}) },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    child.on('error', reject);
+    const rl = readline.createInterface({ input: child.stdout });
+    const pending = new Map();
+    rl.on('line', (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let msg;
+      try {
+        msg = JSON.parse(trimmed);
+      } catch {
+        return;
+      }
+      const fn = pending.get(msg.id);
+      if (fn) {
+        pending.delete(msg.id);
+        fn(msg);
+      }
+    });
+    const request = (id, method, params, timeoutMs = 20000) =>
+      new Promise((res, rej) => {
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          rej(new Error(`bridge request timeout after ${timeoutMs}ms: ${method} id=${id}`));
+        }, timeoutMs);
+        pending.set(id, (msg) => {
+          clearTimeout(timer);
+          res(msg);
+        });
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+      });
+
+    (async () => {
+      await request(1, 'initialize', {});
+      // Long call fired WITHOUT awaiting: it blocks server-side until the
+      // release file exists.
+      const longCall = request(2, 'tools/call', {
+        name: 'workspace_api',
+        arguments: { code: probe.longCallCode, summary: 'long blocking call (concurrency probe)' },
+      });
+      longCall.catch(() => {}); // inspected below; avoid unhandled rejection
+      // Liveness ping on the SAME connection while the long call is pending.
+      // The old serialized bridge never answers this (deadlock → timeout).
+      const toolsResp = await request(3, 'tools/list', {});
+      const tools = (toolsResp.result && toolsResp.result.tools) || [];
+      if (toolsResp.error || tools.length === 0) {
+        throw new Error(`tools/list during long call failed: ${JSON.stringify(toolsResp)}`);
+      }
+      log(`tools/list answered during long call: ${tools.length} tool(s)`);
+      // Ping answered → unblock the long call.
+      fs.writeFileSync(probe.releaseFile, 'go');
+      const longResp = await longCall;
+      child.stdin.end();
+      child.kill();
+      if (longResp.error) {
+        throw new Error(`long tools/call failed: ${JSON.stringify(longResp.error)}`);
+      }
+      resolve({ toolCount: tools.length, longCallOk: true });
+    })().catch((err) => {
+      child.stdin.end();
+      child.kill();
+      reject(err);
+    });
   });
 }
 
@@ -327,6 +414,28 @@ async function handlePrompt(id, params) {
     return;
   }
   const active = selectBehavior(behavior, promptText);
+  // Bridge-concurrency probe (monorepo#871): { longCallCode, releaseFile }.
+  // On success the turn resolves with the probe stats stamped into the text
+  // response; any failure (deadlock timeout, tool error) resolves `refusal`.
+  if (behavior.bridgeConcurrency) {
+    try {
+      const stats = await runBridgeConcurrencyProbe(behavior.bridgeConcurrency);
+      note('session/update', {
+        sessionId: SESSION_ID,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: `bridge-concurrency ok toolCount=${stats.toolCount} longCallOk=${stats.longCallOk}`,
+          },
+        },
+      });
+      return result(id, { stopReason: 'end_turn' });
+    } catch (err) {
+      log(`bridge concurrency probe failed: ${err.message}`);
+      return result(id, { stopReason: 'refusal' });
+    }
+  }
   // Optional per-rule delay BEFORE the tool calls so a test can observe
   // intermediate state (e.g. a parent's waiting flags) while this agent's
   // turn is still in flight.
