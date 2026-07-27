@@ -36,7 +36,10 @@ pub enum MergeOutcome {
         conflicting_paths: Vec<String>,
         canonical_head: String,
     },
-    /// Blocked: canonical has uncommitted user edits overlapping merge paths.
+    /// Blocked: the merge could not proceed but stays retryable — canonical
+    /// has uncommitted user edits overlapping merge paths (`overlapping_paths`
+    /// populated), or the sandbox branch is missing/unborn (`overlapping_paths`
+    /// empty; see `reason`).
     Blocked {
         reason: String,
         overlapping_paths: Vec<String>,
@@ -333,7 +336,6 @@ pub async fn merge_sandbox(
     let canonical_head_commit = canonical_head_ref
         .peel_to_commit()
         .map_err(|e| Error::Internal(format!("peel canonical HEAD failed: {e}")))?;
-    let canonical_head_sha = canonical_head_commit.id().to_string();
 
     // Check for dirty state in canonical
     let canonical_dirty = is_dirty(&canonical_repo)?;
@@ -365,31 +367,122 @@ pub async fn merge_sandbox(
         }
     }
 
-    // Fetch sandbox branch into canonical (no checkout, just fetch)
-    // Use the filesystem path as a remote
+    // A missing or unborn sandbox branch is not an internal error: the agent
+    // never committed anything on it. Surface a typed Blocked outcome so
+    // callers keep the sandbox retryable.
+    let branch_ref_name = format!("refs/heads/{}", sandbox.branch);
+    let branch_is_committish = sandbox_repo
+        .find_reference(&branch_ref_name)
+        .and_then(|r| r.peel_to_commit())
+        .is_ok();
+    if !branch_is_committish {
+        tracing::warn!(
+            agent = %agent_id.0,
+            branch = %sandbox.branch,
+            sandbox_path = %sandbox.path,
+            "sandbox merge skipped: branch is missing or unborn in the sandbox repo"
+        );
+        return Ok(MergeOutcome::Blocked {
+            reason: format!(
+                "sandbox branch '{}' is missing or unborn in the sandbox repository",
+                sandbox.branch
+            ),
+            overlapping_paths: Vec::new(),
+        });
+    }
+
+    // Defensive audit: today only sb/<agentId> ever diverges from the
+    // workspace repo; warn if any OTHER local sandbox branch has a tip the
+    // workspace repo cannot reach.
+    let diverged = audit_diverged_sandbox_branches(&sandbox_repo, &canonical_repo, &sandbox.branch);
+    if !diverged.is_empty() {
+        tracing::warn!(
+            agent = %agent_id.0,
+            branches = ?diverged,
+            sandbox_path = %sandbox.path,
+            "sandbox has local branches (other than the merge branch) not reachable in the workspace repo"
+        );
+    }
+
+    // Fetch sandbox branch into canonical (no checkout, just fetch).
+    // Shell out to git with an explicit full refspec into a temporary ref and
+    // tag auto-follow disabled: CoW repos carry non-commit refs
+    // (refs/intent/blobs/*, refs/stash) that libgit2's local transport trips
+    // over ("object is not a committish", InvalidSpec) — its pack negotiation
+    // revwalk-hides every local ref and rejects blob targets.
     let sandbox_path_str = sandbox_path
         .to_str()
         .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
+    let temp_ref = format!("refs/intent/sandbox-merge/{}", agent_id.0);
+    let refspec = format!("+{}:{}", branch_ref_name, temp_ref);
 
-    canonical_repo
-        .remote_anonymous(sandbox_path_str)
-        .and_then(|mut remote| remote.fetch(&[&sandbox.branch], None, None))
+    // Sandbox paths are intentd-controlled absolute paths under
+    // workspaces_root, so the positional <repository> argument cannot be
+    // mistaken for an option or a remote-helper URL. GIT_TERMINAL_PROMPT=0 and
+    // a null stdin force fail-fast instead of a hidden credential prompt
+    // (parity with intent-git/src/fetch.rs); the transport is local-only.
+    let fetch_out = std::process::Command::new("git")
+        .arg("fetch")
+        .arg("--no-tags")
+        .arg("--quiet")
+        .arg(sandbox_path_str)
+        .arg(&refspec)
+        .current_dir(&canonical_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
         .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))?;
+    if !fetch_out.status.success() {
+        return Err(Error::Internal(format!(
+            "fetch sandbox branch failed: {}",
+            String::from_utf8_lossy(&fetch_out.stderr).trim()
+        )));
+    }
 
-    // Get the range of commits to cherry-pick: from snapshot (or base) to sandbox HEAD
+    let outcome = apply_sandbox_commits(
+        &canonical_repo,
+        &sandbox_repo,
+        &sandbox,
+        &canonical_head_commit,
+    );
+
+    // The temp ref only anchors the fetch; drop it regardless of outcome.
+    if let Ok(mut r) = canonical_repo.find_reference(&temp_ref) {
+        let _ = r.delete();
+    }
+
+    outcome
+}
+
+/// Cherry-pick the sandbox commits (post-snapshot, or post-base) onto the
+/// canonical HEAD. Assumes the sandbox branch objects are already present in
+/// the canonical ODB (fetched by [`merge_sandbox`]).
+fn apply_sandbox_commits(
+    canonical_repo: &git2::Repository,
+    sandbox_repo: &git2::Repository,
+    sandbox: &Sandbox,
+    canonical_head_commit: &git2::Commit<'_>,
+) -> Result<MergeOutcome> {
+    let canonical_head_sha = canonical_head_commit.id().to_string();
+
+    // Get the range of commits to cherry-pick: from snapshot (or base) to the
+    // sandbox branch tip. Resolve the branch ref rather than HEAD — the fetch
+    // in `merge_sandbox` only brought over `refs/heads/<branch>` objects, so a
+    // detached or re-pointed HEAD would yield a range whose commits are absent
+    // from the canonical ODB.
     let start_sha = sandbox
         .snapshot_commit_sha
         .as_ref()
         .unwrap_or(&sandbox.base_commit_sha);
     let sandbox_head = sandbox_repo
-        .head()
-        .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?
+        .find_reference(&format!("refs/heads/{}", sandbox.branch))
+        .map_err(|e| Error::Internal(format!("get sandbox branch failed: {e}")))?
         .peel_to_commit()
-        .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
+        .map_err(|e| Error::Internal(format!("peel sandbox branch failed: {e}")))?;
     let sandbox_head_sha = sandbox_head.id().to_string();
 
     // Get commits to apply (reversed for cherry-pick order)
-    let commits_to_apply = get_commits_after(&sandbox_repo, start_sha, &sandbox_head_sha)?;
+    let commits_to_apply = get_commits_after(sandbox_repo, start_sha, &sandbox_head_sha)?;
 
     if commits_to_apply.is_empty() {
         // No commits to apply (only the snapshot, or base == HEAD)
@@ -485,6 +578,53 @@ pub async fn merge_sandbox(
         commit_range: format!("{}..{}", start_sha, sandbox_head_sha),
         canonical_head: current_oid.to_string(),
     })
+}
+
+/// Defensive audit: list local sandbox branches (other than the merge branch)
+/// whose tips are not reachable from any local branch tip (or HEAD) of the
+/// workspace repo. Today only `sb/<agentId>` ever diverges; a non-empty result
+/// means that assumption broke. Best-effort: errors are swallowed.
+fn audit_diverged_sandbox_branches(
+    sandbox_repo: &git2::Repository,
+    canonical_repo: &git2::Repository,
+    merge_branch: &str,
+) -> Vec<String> {
+    let mut diverged = Vec::new();
+    let Ok(branches) = sandbox_repo.branches(Some(git2::BranchType::Local)) else {
+        return diverged;
+    };
+
+    let mut canonical_tips: Vec<git2::Oid> = Vec::new();
+    if let Some(oid) = canonical_repo.head().ok().and_then(|h| h.target()) {
+        canonical_tips.push(oid);
+    }
+    if let Ok(canonical_branches) = canonical_repo.branches(Some(git2::BranchType::Local)) {
+        for (branch, _) in canonical_branches.flatten() {
+            if let Some(oid) = branch.get().target() {
+                canonical_tips.push(oid);
+            }
+        }
+    }
+
+    for (branch, _) in branches.flatten() {
+        let Ok(Some(name)) = branch.name().map(|n| n.map(str::to_string)) else {
+            continue;
+        };
+        if name == merge_branch {
+            continue;
+        }
+        let Some(tip) = branch.get().target() else {
+            continue;
+        };
+        let reachable = canonical_repo.find_commit(tip).is_ok()
+            && canonical_tips
+                .iter()
+                .any(|c| *c == tip || canonical_repo.graph_descendant_of(*c, tip).unwrap_or(false));
+        if !reachable {
+            diverged.push(name);
+        }
+    }
+    diverged
 }
 
 /// Resolve the canonical repository directory for a workspace's sandboxes —
@@ -2396,6 +2536,286 @@ mod tests {
             err.to_string().contains("worktree-mode"),
             "expected worktree-mode rejection, got: {err}"
         );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_with_non_commit_advertised_refs() {
+        // Regression: CoW clones inherit refs/intent/blobs/* (blob objects) and
+        // refs/stash from the source repo. The merge-back fetch must not fail
+        // with `object is not a committish; code=InvalidSpec (-12)` when the
+        // sandbox advertises such non-commit refs.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("noncommit-refs");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        // Blob ref in the canonical repo (intentd writes refs/intent/blobs/*
+        // there); the local-transport fetch walks every canonical ref and must
+        // not choke on the non-commit target.
+        {
+            let canonical_repo = git2::Repository::open(&canonical_path).unwrap();
+            let blob_oid = canonical_repo.blob(b"intent blob payload").unwrap();
+            canonical_repo
+                .reference(
+                    &format!("refs/intent/blobs/{}", blob_oid),
+                    blob_oid,
+                    false,
+                    "test blob ref",
+                )
+                .unwrap();
+        }
+
+        // Clone canonical to sandbox (stands in for the CoW clone)
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let mut sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            {
+                let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+                sandbox_repo
+                    .branch(&branch_name, &head_commit, false)
+                    .unwrap();
+                sandbox_repo
+                    .set_head(&format!("refs/heads/{}", branch_name))
+                    .unwrap();
+
+                // Blob ref, as inherited from the source repo by CoW clones.
+                let blob_oid = sandbox_repo.blob(b"intent blob payload").unwrap();
+                sandbox_repo
+                    .reference(
+                        &format!("refs/intent/blobs/{}", blob_oid),
+                        blob_oid,
+                        false,
+                        "test blob ref",
+                    )
+                    .unwrap();
+            }
+
+            // A stash (refs/stash), also inherited by CoW clones.
+            fs::write(sandbox_path.join("stashme.txt"), "wip").unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            sandbox_repo
+                .stash_save(&sig, "wip stash", Some(git2::StashFlags::INCLUDE_UNTRACKED))
+                .unwrap();
+        }
+
+        // Agent work on the sandbox branch.
+        commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("merge must not fail on advertised non-commit refs");
+        match outcome {
+            MergeOutcome::Merged { .. } => {
+                assert!(canonical_path.join("agent.txt").exists());
+            }
+            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
+
+        // The temp fetch ref is cleaned up after the merge.
+        let canonical_repo = git2::Repository::open(&canonical_path).unwrap();
+        assert!(
+            canonical_repo
+                .find_reference(&format!("refs/intent/sandbox-merge/{}", agent_id.0))
+                .is_err(),
+            "temp fetch ref must be deleted after merge"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_uses_branch_tip_not_head() {
+        // Regression: the commit range must come from refs/heads/<branch>, not
+        // sandbox HEAD — the merge-back fetch only brings over the branch's
+        // objects, so a detached/re-pointed HEAD would reference commits absent
+        // from the canonical ODB.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("branch-tip-not-head");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{}", branch_name))
+                .unwrap();
+        }
+
+        // Agent work lands on the sandbox branch...
+        commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
+
+        // ...then HEAD is detached at the pre-work base commit. The merge must
+        // still pick up the branch tip's commit.
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let base_oid = git2::Oid::from_str(&base_sha).unwrap();
+            sandbox_repo.set_head_detached(base_oid).unwrap();
+            sandbox_repo
+                .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                .unwrap();
+        }
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("merge must resolve the branch tip, not HEAD");
+        match outcome {
+            MergeOutcome::Merged { .. } => {
+                assert!(canonical_path.join("agent.txt").exists());
+            }
+            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_missing_branch_yields_blocked() {
+        // A missing (or unborn) sb/<agentId> branch must yield a typed Blocked
+        // outcome (callers mark the sandbox merge-pending, which is retryable)
+        // rather than an internal fetch error.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("missing-branch");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        // Clone canonical to sandbox; the sb/<agentId> branch is never created.
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: format!("sb/{}", agent_id.0),
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("missing branch must not be an internal error");
+        match outcome {
+            MergeOutcome::Blocked {
+                reason,
+                overlapping_paths,
+            } => {
+                assert!(
+                    reason.contains("missing or unborn"),
+                    "unexpected reason: {reason}"
+                );
+                assert!(overlapping_paths.is_empty());
+            }
+            _ => panic!("Expected Blocked outcome, got {:?}", outcome),
+        }
+
+        // The sandbox record is untouched, so the merge stays retryable.
+        assert!(store
+            .get_sandbox(&ws.id, &agent_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn audit_reports_diverged_non_merge_branches() {
+        // Only branches OTHER than the merge branch with tips unreachable in
+        // the workspace repo are reported.
+        let (test_root, canonical_path) = temp_repo_in_target("audit-diverged");
+        commit_file(&canonical_path, "f.txt", "x", "base");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+        let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+        let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+
+        // Merge branch with agent work (diverged, but excluded from the audit).
+        sandbox_repo
+            .branch("sb/agent-1", &head_commit, false)
+            .unwrap();
+        sandbox_repo.set_head("refs/heads/sb/agent-1").unwrap();
+        commit_file(&sandbox_path, "agent.txt", "agent", "Agent work");
+
+        // In-sync branch at the canonical HEAD (reachable; not reported).
+        sandbox_repo.branch("in-sync", &head_commit, false).unwrap();
+
+        // Rogue branch with a commit the workspace repo has never seen.
+        sandbox_repo.branch("rogue", &head_commit, false).unwrap();
+        sandbox_repo.set_head("refs/heads/rogue").unwrap();
+        commit_file(&sandbox_path, "rogue.txt", "rogue", "Rogue work");
+
+        let canonical_repo = git2::Repository::open(&canonical_path).unwrap();
+        let diverged =
+            audit_diverged_sandbox_branches(&sandbox_repo, &canonical_repo, "sb/agent-1");
+        assert_eq!(diverged, vec!["rogue".to_string()]);
 
         let _ = fs::remove_dir_all(&test_root);
     }

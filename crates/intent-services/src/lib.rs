@@ -2835,15 +2835,29 @@ impl Services {
             .as_ref()
             .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?;
 
-        // Open sandbox repository
-        let sandbox_repo = git2::Repository::open(sandbox_path)
-            .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
-
-        // Fetch canonical HEAD into sandbox as canonical/HEAD
-        sandbox_repo
-            .remote_anonymous(canonical_path)
-            .and_then(|mut remote| remote.fetch(&["HEAD:refs/remotes/canonical/HEAD"], None, None))
+        // Fetch canonical HEAD into sandbox as canonical/HEAD. Shell out to
+        // git with an explicit refspec and tag auto-follow disabled: the
+        // canonical repo carries non-commit refs (refs/intent/blobs/*,
+        // refs/stash) that libgit2's local transport trips over ("object is
+        // not a committish", InvalidSpec) — same failure class fixed for the
+        // merge-back fetch in sandbox_ops::merge_sandbox.
+        let fetch_out = std::process::Command::new("git")
+            .arg("fetch")
+            .arg("--no-tags")
+            .arg("--quiet")
+            .arg(canonical_path)
+            .arg("+HEAD:refs/remotes/canonical/HEAD")
+            .current_dir(sandbox_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
             .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
+        if !fetch_out.status.success() {
+            return Err(Error::Internal(format!(
+                "fetch canonical to sandbox failed: {}",
+                String::from_utf8_lossy(&fetch_out.stderr).trim()
+            )));
+        }
 
         Ok(())
     }
