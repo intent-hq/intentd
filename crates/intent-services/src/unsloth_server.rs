@@ -16,14 +16,26 @@
 //! [`UnslothEndpoint`] feeds the `OPENCODE_CONFIG_CONTENT` injection
 //! (`intent_providers::build_provider_env_with_unsloth`).
 //!
-//! Lifecycle policy (validated against a real install, 2026-07-27):
+//! Lifecycle policy (validated against a real install, 2026-07-27; revised
+//! 2026-07-27 after dogfooding a first-use 16.7 GB download, monorepo#878):
 //! - start on demand at agent spawn; reuse the running server while it serves
 //!   the requested repo; kill + respawn on model switch or a dead child.
 //! - the server requires auth even on `/v1/models` — an HTTP 401/403 during
 //!   probing means "server up, model maybe still loading", not failure.
-//! - first use can mean a multi-GB Hugging Face download before the server is
-//!   ready, so the model-ready timeout is generous and progress status is
-//!   surfaced through the caller-supplied status callback.
+//! - first use can mean a multi-GB Hugging Face download, and — contrary to
+//!   the original assumption — `unsloth start opencode --no-launch` can
+//!   itself be the step that performs/waits on that download rather than the
+//!   post-mint readiness probe. Both the mint invocation and the model-ready
+//!   probe therefore get the same generous, progress-aware deadline (status
+//!   updates surfaced through the caller-supplied callback throughout); only
+//!   a dead managed-server child fails the wait early.
+//! - a startup wait that times out (or a caller's spawn retry) while the
+//!   managed server process is still alive does NOT kill it: the server (and
+//!   any in-flight download it owns) is left running, and the NEXT
+//!   `ensure_endpoint` call for the same repo attaches to and waits on that
+//!   same server instead of killing + respawning it and discarding progress.
+//!   Only a genuinely dead child, a model switch, or an explicit shutdown
+//!   tears the server down.
 //!
 //! Test strategy: this module adds no new RPC method — it is spawn-path
 //! plumbing behind the existing `agent.*` methods — and the production spawn
@@ -44,7 +56,7 @@ use std::time::Duration;
 use intent_core::{Error, Result};
 use intent_providers::{UnslothEndpoint, UnslothModelLimit};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -70,8 +82,13 @@ const STATUS_UPDATE_INTERVAL: Duration = Duration::from_secs(15);
 const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long `unsloth start opencode --no-launch` may take to mint the
-/// opencode auth material (no model download happens on this path).
-const MINT_TIMEOUT: Duration = Duration::from_secs(60);
+/// opencode auth material. Dogfooding (monorepo#878) showed this step can
+/// itself perform/wait on the first-use multi-GB model download — not just
+/// the post-mint readiness probe — so it shares [`MODEL_READY_TIMEOUT`]'s
+/// generous deadline rather than a short fixed one; the mint wait polls
+/// progressively (status updates, fails fast the moment the managed server
+/// process dies) instead of blocking atomically on the command's exit.
+const MINT_TIMEOUT: Duration = MODEL_READY_TIMEOUT;
 
 /// How many trailing output lines of the server child are retained for
 /// diagnostics when it dies during startup.
@@ -517,6 +534,13 @@ impl UnslothServerManager {
     /// switch or a dead child. `status` receives human-readable progress
     /// messages while a (potentially multi-GB first-use download) startup is
     /// in flight.
+    ///
+    /// Retry reuse (monorepo#878): when a live server already serves
+    /// `repo_id` but hasn't finished starting yet (no minted endpoint —
+    /// e.g. a caller's spawn retry landed here while the FIRST attempt's
+    /// wait is still, or again, in flight), this attaches to and waits on
+    /// that SAME server rather than killing + respawning it. Killing on
+    /// every retry would discard an in-flight multi-GB download's progress.
     pub async fn ensure_endpoint(
         &self,
         repo_id: &str,
@@ -527,15 +551,29 @@ impl UnslothServerManager {
         }
         let mut state = self.state.lock().await;
 
-        // Reuse: live child serving the requested repo with a minted endpoint.
-        if let Some(server) = state.as_mut() {
+        // Live child serving the requested repo: reuse the minted endpoint
+        // outright, or — if it's still starting — attach to it instead of
+        // tearing it down.
+        let attach = if let Some(server) = state.as_mut() {
             if server.repo_id == repo_id && server.is_alive() {
                 if let Some(ep) = &server.endpoint {
                     return Ok(ep.clone());
                 }
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        if attach {
+            tracing::info!(
+                repo = %repo_id,
+                "attaching to already-starting unsloth server instead of respawning (retry reuse)"
+            );
+        } else if let Some(mut old) = state.take() {
             // Model switch or dead/half-started child: tear down and respawn.
-            let mut old = state.take().expect("state checked above");
             tracing::info!(
                 old_repo = %old.repo_id,
                 new_repo = %repo_id,
@@ -546,16 +584,22 @@ impl UnslothServerManager {
 
         let binary = (self.config.resolve_binary)().ok_or_else(missing_binary_error)?;
 
-        status(format!("Starting Unsloth server for {repo_id}…"));
-        let quant = self.resolve_quant_variant(repo_id).await;
-        // Re-check the latch: the HF fetch above can take up to
-        // [`UnslothConfig::hf_files_timeout`], and shutdown may have been
-        // requested meanwhile — don't spawn a child nobody will reap.
-        if self.is_shutting_down() {
-            return Err(shutting_down_error());
+        if !attach {
+            status(format!("Starting Unsloth server for {repo_id}…"));
+            let quant = self.resolve_quant_variant(repo_id).await;
+            // Re-check the latch: the HF fetch above can take up to
+            // [`UnslothConfig::hf_files_timeout`], and shutdown may have
+            // been requested meanwhile — don't spawn a child nobody will reap.
+            if self.is_shutting_down() {
+                return Err(shutting_down_error());
+            }
+            let server = self.start_server(&binary, repo_id, &quant)?;
+            *state = Some(server);
+        } else {
+            status(format!(
+                "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
+            ));
         }
-        let server = self.start_server(&binary, repo_id, &quant)?;
-        *state = Some(server);
 
         match self
             .wait_and_mint(&binary, repo_id, state.as_mut().unwrap(), status)
@@ -565,18 +609,34 @@ impl UnslothServerManager {
                 state.as_mut().unwrap().endpoint = Some(endpoint.clone());
                 Ok(endpoint)
             }
-            Err(e) => {
-                // Startup failed: kill the half-started child so the next
-                // attempt starts clean, and surface the output tail (with
-                // any minted key material redacted — the error is
-                // client-visible).
+            Err(failure) if failure.preserve_server && !self.is_shutting_down() => {
+                // A deadline timeout with the managed server still alive
+                // (monorepo#878): leave it running. The next
+                // `ensure_endpoint` call for this repo attaches to it above
+                // instead of respawning and discarding an in-flight
+                // download.
+                tracing::warn!(
+                    repo = %repo_id,
+                    error = %failure.error,
+                    "unsloth startup wait timed out but the managed server is still alive; leaving it running for a retry to attach to"
+                );
+                Err(failure.error)
+            }
+            Err(failure) => {
+                // Genuinely dead child, mint failure, or shutdown in
+                // progress: tear down so the next attempt starts clean, and
+                // surface the output tail (with any minted key material
+                // redacted — the error is client-visible).
                 let mut failed = state.take().expect("state set above");
                 kill_server_child(&mut failed.child).await;
                 let tail = redact_key_material(&failed.tail().await);
                 if tail.is_empty() {
-                    Err(e)
+                    Err(failure.error)
                 } else {
-                    Err(Error::Internal(format!("{e}\nserver output tail:\n{tail}")))
+                    Err(Error::Internal(format!(
+                        "{}\nserver output tail:\n{tail}",
+                        failure.error
+                    )))
                 }
             }
         }
@@ -692,19 +752,26 @@ impl UnslothServerManager {
 
     /// Startup sequence after the child is spawned: wait for the HTTP socket,
     /// mint the opencode auth material, then probe with the minted key until
-    /// the model is loaded (tolerating a first-use multi-GB download).
+    /// the model is loaded (tolerating a first-use multi-GB download). Every
+    /// error path is tagged [`StartupFailure::preserve_server`] so the caller
+    /// ([`Self::ensure_endpoint`]) knows whether to leave the managed server
+    /// running for a retry to attach to or tear it down.
     async fn wait_and_mint(
         &self,
         binary: &Path,
         repo_id: &str,
         server: &mut ManagedServer,
         status: &StatusCallback,
-    ) -> Result<UnslothEndpoint> {
+    ) -> std::result::Result<UnslothEndpoint, StartupFailure> {
         let probe_url = format!("http://127.0.0.1:{}/v1/models", self.config.port);
         let client = reqwest::Client::builder()
             .timeout(PROBE_REQUEST_TIMEOUT)
             .build()
-            .map_err(|e| Error::Internal(format!("failed to build http client: {e}")))?;
+            .map_err(|e| {
+                StartupFailure::terminal(Error::Internal(format!(
+                    "failed to build http client: {e}"
+                )))
+            })?;
 
         // Phase 1: socket up (any HTTP status).
         self.wait_until(self.config.server_up_timeout, server, || async {
@@ -713,21 +780,24 @@ impl UnslothServerManager {
         })
         .await
         .map_err(|e| match e {
-            WaitError::ChildExited => Error::Internal(format!(
+            WaitError::ChildExited => StartupFailure::terminal(Error::Internal(format!(
                 "unsloth server exited during startup (model {repo_id})"
-            )),
-            WaitError::TimedOut => Error::Internal(format!(
+            ))),
+            WaitError::TimedOut => StartupFailure::transient(Error::Internal(format!(
                 "unsloth server did not open its HTTP port within {}s",
                 self.config.server_up_timeout.as_secs()
-            )),
-            WaitError::ShuttingDown => shutting_down_error(),
+            ))),
+            WaitError::ShuttingDown => StartupFailure::terminal(shutting_down_error()),
         })?;
 
         // Phase 2: mint the opencode auth material. `--no-launch` requires a
         // running server (validated: it errors with "No running Unsloth
-        // server found" otherwise), which phase 1 guarantees.
+        // server found" otherwise), which phase 1 guarantees. Dogfooding
+        // (monorepo#878) showed this invocation can itself perform/wait on
+        // the first-use model download, so it gets the same generous,
+        // progress-aware deadline as the phase-3 readiness probe below.
         status(format!("Unsloth server up; preparing model {repo_id}…"));
-        let endpoint = self.mint_endpoint(binary, repo_id).await?;
+        let endpoint = self.mint_endpoint(binary, repo_id, server, status).await?;
 
         // Phase 3: model ready — authed probe answers 200. First use can mean
         // a multi-GB download, so this window is generous and progress status
@@ -752,14 +822,14 @@ impl UnslothServerManager {
             })
             .await;
         result.map_err(|e| match e {
-            WaitError::ChildExited => Error::Internal(format!(
+            WaitError::ChildExited => StartupFailure::terminal(Error::Internal(format!(
                 "unsloth server exited while loading model {repo_id}"
-            )),
-            WaitError::TimedOut => Error::Internal(format!(
+            ))),
+            WaitError::TimedOut => StartupFailure::transient(Error::Internal(format!(
                 "model {repo_id} did not become ready within {} minutes (download may still be in progress — retry later)",
                 self.config.model_ready_timeout.as_secs() / 60
-            )),
-            WaitError::ShuttingDown => shutting_down_error(),
+            ))),
+            WaitError::ShuttingDown => StartupFailure::terminal(shutting_down_error()),
         })?;
         Ok(endpoint)
     }
@@ -768,7 +838,22 @@ impl UnslothServerManager {
     /// generated `~/.unsloth/studio/auth/agents/opencode/opencode.json`.
     /// `UNSLOTH_STUDIO_URL` is set when the managed port differs from the
     /// CLI default so the mint talks to OUR server.
-    async fn mint_endpoint(&self, binary: &Path, repo_id: &str) -> Result<UnslothEndpoint> {
+    ///
+    /// Dogfooding (monorepo#878) showed this command can itself perform (or
+    /// wait behind) the first-use multi-GB model download rather than the
+    /// post-mint readiness probe, so — unlike blocking atomically on
+    /// `cmd.output()` — this polls the mint child's liveness against
+    /// [`UnslothConfig::mint_timeout`] (shares [`MODEL_READY_TIMEOUT`]'s
+    /// generous default), refreshing progress status periodically and
+    /// failing fast only if the managed SERVER child dies or a shutdown is
+    /// requested mid-mint.
+    async fn mint_endpoint(
+        &self,
+        binary: &Path,
+        repo_id: &str,
+        server: &mut ManagedServer,
+        status: &StatusCallback,
+    ) -> std::result::Result<UnslothEndpoint, StartupFailure> {
         let mut cmd = Command::new(binary);
         cmd.arg("start")
             .arg("opencode")
@@ -785,48 +870,94 @@ impl UnslothServerManager {
                 format!("http://127.0.0.1:{}", self.config.port),
             );
         }
-        let output = tokio::time::timeout(self.config.mint_timeout, async {
-            cmd.output()
-                .await
-                .map_err(|e| Error::Internal(format!("failed to run unsloth start opencode: {e}")))
-        })
-        .await
-        .map_err(|_| {
-            Error::Internal(format!(
-                "unsloth start opencode --no-launch timed out after {}s",
-                self.config.mint_timeout.as_secs()
-            ))
-        })??;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(Error::Internal(format!(
+        let mut mint_child = cmd.spawn().map_err(|e| {
+            StartupFailure::terminal(Error::Internal(format!(
+                "failed to run unsloth start opencode: {e}"
+            )))
+        })?;
+
+        let deadline = tokio::time::Instant::now() + self.config.mint_timeout;
+        let mut last_status = tokio::time::Instant::now();
+        let exit_status = loop {
+            if self.is_shutting_down() {
+                let _ = mint_child.start_kill();
+                let _ = mint_child.wait().await;
+                return Err(StartupFailure::terminal(shutting_down_error()));
+            }
+            if !server.is_alive() {
+                let _ = mint_child.start_kill();
+                let _ = mint_child.wait().await;
+                return Err(StartupFailure::terminal(Error::Internal(format!(
+                    "unsloth server exited while minting opencode auth for model {repo_id}"
+                ))));
+            }
+            match mint_child.try_wait() {
+                Ok(Some(exit)) => break exit,
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(StartupFailure::terminal(Error::Internal(format!(
+                        "failed to poll unsloth start opencode: {e}"
+                    ))))
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let _ = mint_child.start_kill();
+                let _ = mint_child.wait().await;
+                // The managed server is still alive (checked above) — the
+                // mint deadline just elapsed, possibly because it's waiting
+                // behind a first-use download. Preserve the server so a
+                // retry attaches instead of respawning.
+                return Err(StartupFailure::transient(Error::Internal(format!(
+                    "unsloth start opencode --no-launch timed out after {}s",
+                    self.config.mint_timeout.as_secs()
+                ))));
+            }
+            if last_status.elapsed() >= STATUS_UPDATE_INTERVAL {
+                last_status = tokio::time::Instant::now();
+                status(format!(
+                    "Preparing model {repo_id}… (first use may take several minutes)"
+                ));
+            }
+            tokio::time::sleep(self.config.probe_interval).await;
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(mut out) = mint_child.stdout.take() {
+            let _ = out.read_to_end(&mut stdout).await;
+        }
+        if let Some(mut err) = mint_child.stderr.take() {
+            let _ = err.read_to_end(&mut stderr).await;
+        }
+        if !exit_status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
+            let stdout = String::from_utf8_lossy(&stdout);
+            return Err(StartupFailure::terminal(Error::Internal(format!(
                 "unsloth start opencode --no-launch failed ({}): {}",
-                output.status,
+                exit_status,
                 if stderr.trim().is_empty() {
                     stdout.trim()
                 } else {
                     stderr.trim()
                 }
-            )));
+            ))));
         }
         // InvalidInput (not Internal) for the same reason as
         // `missing_binary_error`: an unresolvable home directory is an
         // environment misconfiguration and the message must survive the
         // JSON-RPC envelope.
         let home = self.config.home_dir.as_deref().ok_or_else(|| {
-            Error::InvalidInput(
+            StartupFailure::terminal(Error::InvalidInput(
                 "cannot resolve home directory (HOME/USERPROFILE unset) — needed to read the unsloth-generated opencode config".to_string(),
-            )
+            ))
         })?;
         let path = generated_config_path(home);
         let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            Error::Internal(format!(
+            StartupFailure::terminal(Error::Internal(format!(
                 "unsloth start opencode succeeded but generated config is unreadable ({}): {e}",
                 path.display()
-            ))
+            )))
         })?;
-        parse_generated_config(&body, repo_id)
+        parse_generated_config(&body, repo_id).map_err(StartupFailure::terminal)
     }
 
     /// Poll `check` every [`UnslothConfig::probe_interval`] until it returns
@@ -872,6 +1003,38 @@ impl UnslothServerManager {
         if let Some(mut server) = state.take() {
             tracing::info!(repo = %server.repo_id, "shutting down managed unsloth server");
             kill_server_child(&mut server.child).await;
+        }
+    }
+}
+
+/// A failed startup wait ([`UnslothServerManager::wait_and_mint`]), carrying
+/// whether the managed server is worth keeping alive for a subsequent
+/// `ensure_endpoint` call to attach to (monorepo#878 retry reuse).
+struct StartupFailure {
+    error: Error,
+    /// `true` only for a plain wait-deadline timeout with the managed server
+    /// process still alive — never for a dead child, a mint command
+    /// failure/parse error, or a shutdown-in-progress. Those cases mean the
+    /// server (or the startup attempt) is not worth preserving.
+    preserve_server: bool,
+}
+
+impl StartupFailure {
+    /// A failure worth preserving the server for (deadline timeout, server
+    /// still alive): the caller leaves the managed server running.
+    fn transient(error: Error) -> Self {
+        Self {
+            error,
+            preserve_server: true,
+        }
+    }
+
+    /// A failure that means the server/attempt is not worth keeping: the
+    /// caller tears it down.
+    fn terminal(error: Error) -> Self {
+        Self {
+            error,
+            preserve_server: false,
         }
     }
 }
@@ -1742,6 +1905,123 @@ mod tests {
                 "got: {msg}"
             );
             assert!(mgr.state.lock().await.is_none(), "state cleared on failure");
+        }
+
+        /// Regression for monorepo#878, bug 1: a mint step that outlives a
+        /// short `mint_timeout` (simulating `unsloth start opencode
+        /// --no-launch` blocking behind a first-use download) must time out
+        /// WITHOUT killing the still-alive managed server — the old code
+        /// blocked atomically on `cmd.output()` with a fixed 60s deadline and
+        /// had no way to distinguish "still downloading" from "hung".
+        #[tokio::test]
+        async fn mint_timeout_preserves_a_still_alive_server() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            // `start` never returns (simulates a long first-use download);
+            // `run` sleeps, keeping the managed server process alive.
+            let binary_path = dir.path().join("unsloth");
+            let log = dir.path().join("stub.log");
+            let script = format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) sleep 300 ;;\n  start) sleep 300 ;;\nesac\n",
+                log = log.display(),
+            );
+            std::fs::write(&binary_path, script).expect("write stub");
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            let mut config = test_config(binary_path, dir.path().to_path_buf(), port);
+            config.mint_timeout = Duration::from_millis(200);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let pid_before = {
+                let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+                assert!(err.to_string().contains("timed out"), "got: {err}");
+                let mut state = mgr.state.lock().await;
+                let server = state.as_mut().expect(
+                    "a mint timeout with the server still alive must NOT clear state \
+                     (monorepo#878: killing here discards an in-flight download)",
+                );
+                assert!(server.is_alive(), "managed server left running");
+                server.child.id().expect("pid")
+            };
+
+            // The still-running mint child from the first attempt must not
+            // have been reaped by a respawn.
+            let alive = unsafe { libc_kill_probe(pid_before) };
+            assert!(alive, "preserved server child must still be running");
+
+            mgr.shutdown().await;
+        }
+
+        /// Regression for monorepo#878, bug 2: a spawn retry for a repo whose
+        /// server is already starting/downloading must attach to and wait on
+        /// the existing server rather than killing + respawning it (which
+        /// discards in-flight download progress, e.g. "0.0 GB already
+        /// cached" on the second attempt in the repro log). Simulated here
+        /// with a `start` arm that always blocks past `mint_timeout`: the
+        /// first `ensure_endpoint` call times out (preserving the server per
+        /// the previous test), and the second — the "retry" — must attach to
+        /// the SAME server rather than spawning a second one.
+        #[tokio::test]
+        async fn retry_attaches_to_an_in_flight_startup_instead_of_respawning() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary_path = dir.path().join("unsloth");
+            let log = dir.path().join("stub.log");
+            let script = format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) sleep 300 ;;\n  start) sleep 300 ;;\nesac\n",
+                log = log.display(),
+            );
+            std::fs::write(&binary_path, script).expect("write stub");
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            let mut config = test_config(binary_path, dir.path().to_path_buf(), port);
+            config.mint_timeout = Duration::from_millis(200);
+            let mgr = UnslothServerManager::with_config(config);
+
+            // Attempt 1: mint times out; server preserved (bug 1's fix).
+            let err1 = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            assert!(err1.to_string().contains("timed out"), "got: {err1}");
+            let pid1 = mgr
+                .state
+                .lock()
+                .await
+                .as_mut()
+                .expect("server preserved after attempt 1")
+                .child
+                .id()
+                .expect("pid");
+
+            // Attempt 2 ("the retry"): must attach to the same server, not
+            // kill + respawn it.
+            let err2 = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            assert!(err2.to_string().contains("timed out"), "got: {err2}");
+            let pid2 = mgr
+                .state
+                .lock()
+                .await
+                .as_mut()
+                .expect("server still preserved after attempt 2")
+                .child
+                .id()
+                .expect("pid");
+            assert_eq!(
+                pid1, pid2,
+                "the retry must attach to the SAME server process, not respawn"
+            );
+
+            let log = stub_log(dir.path());
+            assert_eq!(
+                log.matches("run --model").count(),
+                1,
+                "only ONE server spawn across both attempts: {log}"
+            );
+            assert_eq!(
+                log.matches("start opencode").count(),
+                2,
+                "each attempt re-attempts the mint against the SAME server: {log}"
+            );
+
+            mgr.shutdown().await;
         }
     }
 }
