@@ -1203,6 +1203,57 @@ mod tests {
         kill(pty.as_ref(), &id).await.unwrap();
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn terminal_write_del_emits_erase_redraw_on_bus_without_launcher_term() {
+        let pty = host();
+        let (_tmp, bus) = bus().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let zdotdir = tempfile::tempdir().expect("isolated zsh config dir");
+        let env = std::collections::BTreeMap::from([
+            // Electron-launched daemons can inherit no terminal type. This is
+            // the production regression fixture: zsh then redraws DEL as a
+            // literal space instead of emitting cursor-left control bytes.
+            ("TERM".to_string(), "".to_string()),
+            ("ZDOTDIR".to_string(), zdotdir.path().display().to_string()),
+        ]);
+        let res = create(
+            pty.clone(),
+            Some(bus),
+            None,
+            ws("ws-erase"),
+            80,
+            24,
+            None,
+            Some("/bin/zsh".to_string()),
+            Some(env),
+        )
+        .await
+        .unwrap();
+        let id = term_id(&res);
+
+        let ready = collect_data_until(&mut sub, b"\x1b[?2004h", TIMEOUT).await;
+        assert!(
+            contains_sub(&ready, b"\x1b[?2004h"),
+            "zsh prompt must be ready before probing ZLE; got {ready:?}"
+        );
+
+        write(
+            pty.as_ref(),
+            &id,
+            &base64::engine::general_purpose::STANDARD.encode(b"ab\x7f"),
+        )
+        .unwrap();
+
+        let acc = collect_data_until(&mut sub, b"\x08", Duration::from_secs(1)).await;
+        assert!(
+            contains_sub(&acc, b"\x08"),
+            "zsh must emit a cursor-left redraw for DEL instead of a visible space; got {acc:?}"
+        );
+
+        kill(pty.as_ref(), &id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn natural_exit_emits_exit_event_with_code() {
         let pty = host();
