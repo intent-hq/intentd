@@ -256,7 +256,11 @@ jobs:
       - name: Scan changed files for conflict markers
         run: |
           set -euo pipefail
-          mapfile -t files < <(git diff --name-only --diff-filter=ACMR ${{ github.event.pull_request.base.sha }} HEAD)
+          # NUL-delimited via a temp file: robust to quoted/non-ASCII pathnames,
+          # and a failing `git diff` fails the step instead of being swallowed
+          # by process substitution.
+          git diff -z --name-only --diff-filter=ACMR ${{ github.event.pull_request.base.sha }} HEAD > "$RUNNER_TEMP/changed-files.z"
+          mapfile -d '' -t files < "$RUNNER_TEMP/changed-files.z"
           fail=0
           for f in "${files[@]}"; do
             [ -f "$f" ] || continue
@@ -266,8 +270,10 @@ jobs:
               eq=$(grep -nE '^={7}$' "$f" || true)
               [ -n "$eq" ] && hits="$hits"$'\n'"$eq"
             fi
-            echo "::error file=$f::committed git conflict markers found"
-            printf '%s\n' "$hits" | sort -t: -k1,1n | sed "s|^|$f:|"
+            while IFS= read -r hit; do
+              echo "::error file=$f,line=${hit%%:*}::committed git conflict marker"
+              printf '%s:%s\n' "$f" "$hit"
+            done < <(printf '%s\n' "$hits" | sort -t: -k1,1n)
             fail=1
           done
           if [ "$fail" -ne 0 ]; then
