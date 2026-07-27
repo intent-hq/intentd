@@ -9,7 +9,7 @@ use intent_core::{
     NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
     WorkspaceStatus,
 };
-use intent_store::Store;
+use intent_store::{NewTrackedChange, Store};
 use serde_json::json;
 
 use crate::auto_commit::{
@@ -216,6 +216,28 @@ async fn setup_dirty_workspace(repo: &GitRepo) -> (TempDb, Services, WorkspaceId
     (tmp, services, ws_id)
 }
 
+/// Attribute `change.txt` (the dirty file from `setup_dirty_workspace`) to
+/// `agent`: `git_agent_commit`'s no-files fallback commits only the paths the
+/// tracked-changes pipeline attributes to the committing agent (monorepo#939),
+/// so idle auto-commit tests that expect a commit must record attribution.
+async fn attribute_dirty_change(svc: &Services, ws: &WorkspaceId, agent: &str) {
+    let change = NewTrackedChange {
+        workspace_id: ws.clone(),
+        path: "change.txt".to_string(),
+        stage: "unstaged".to_string(),
+        status: "added".to_string(),
+        agent_id: Some(agent.to_string()),
+        session_id: None,
+        turn: None,
+        commit_hash: None,
+        old_blob_sha: None,
+        new_blob_sha: None,
+        additions: 1,
+        deletions: 0,
+    };
+    svc.store().upsert_tracked_change(&change).await.unwrap();
+}
+
 #[test]
 fn normalize_subject_collapses_whitespace_and_clamps() {
     let raw = "  Fix\n the\tthing  ";
@@ -273,6 +295,7 @@ async fn task_linked_idle_commits_with_both_trailers() {
     svc.store().insert_note(&note).await.unwrap();
     let agent = session("agent-a1", &ws_id, Some("task-1"), false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-a1").await;
     let event = idle_event(&ws_id, "agent-a1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
 
@@ -343,6 +366,7 @@ async fn non_task_agent_commits_with_agent_id_only() {
     let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
     let agent = session("agent-n1", &ws_id, None, false, "Custom Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-n1").await;
     let event = idle_event(&ws_id, "agent-n1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
     let (agent_id, linked, message) = last_commit_trailers(&repo.dir).await;
@@ -384,6 +408,7 @@ async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     // Auto-generated name pattern → name_explicitly_set = false.
     let agent = session("agent-f1", &ws_id, None, false, "Agent abc123", false);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-f1").await;
     let event = idle_event(&ws_id, "agent-f1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
     let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
@@ -420,6 +445,7 @@ async fn generated_message_replaces_fallback_subject() {
     let svc = svc.with_auggie_bin(bin);
     let agent = session("agent-g1", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-g1").await;
     let event = idle_event(&ws_id, "agent-g1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
     let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
@@ -440,6 +466,7 @@ async fn generation_timeout_falls_back_to_subject() {
     let svc = svc.with_auggie_bin(bin).with_auto_commit_timeout_ms(250);
     let agent = session("agent-t1", &ws_id, None, false, "Timeout Agent", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
     let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
@@ -456,6 +483,7 @@ async fn malformed_output_falls_back_to_subject() {
     let svc = svc.with_auggie_bin(bin);
     let agent = session("agent-m1", &ws_id, None, false, "Malformed Agent", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-m1").await;
     let event = idle_event(&ws_id, "agent-m1", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
     let (_a, _l, message) = last_commit_trailers(&repo.dir).await;
@@ -497,6 +525,7 @@ async fn generated_message_preserves_trailers() {
     let svc = svc.with_auggie_bin(bin);
     let agent = session("agent-tr", &ws_id, Some("task-gen"), false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-tr").await;
     let event = idle_event(&ws_id, "agent-tr", "end_turn");
     svc.handle_agent_idle_auto_commit(&event).await;
     let (agent_id, linked_note_id, message) = last_commit_trailers(&repo.dir).await;

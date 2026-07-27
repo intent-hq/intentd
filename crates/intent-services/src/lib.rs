@@ -13631,17 +13631,44 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to commit: workspace has no worktree".to_string())
             })?;
-            // PARITY NOTE: TS filters to the agent's own unstaged changes via the
-            // file-tracking attribution pipeline (deferred — not yet ported). Until
-            // it lands, an explicit `files` list is committed as-is; without one, a
-            // `userRequested` checkpoint commits only the already-staged paths
-            // (plain `git commit` semantics — a user checkpoint must not sweep up
+            // Commit-set selection (TS parity, monorepo#939): an explicit
+            // `files` list is committed as-is; without one, a `userRequested`
+            // checkpoint commits only the already-staged paths (plain
+            // `git commit` semantics — a user checkpoint must not sweep up
             // other agents' worktree changes), while an agent-initiated commit
-            // falls back to every changed path in the worktree.
-            let (to_commit, needs_stage) = match files {
-                Some(f) if !f.is_empty() => (f, true),
-                _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false),
-                _ => (intent_git::commit::all_changed_paths(&worktree)?, true),
+            // commits only the paths the file-tracking attribution pipeline
+            // credits to the committing agent (`tracked_changes` rows at stage
+            // unstaged/staged), intersected with the actual worktree changes so
+            // a stale attribution row never resurrects a committed/reverted
+            // file. Without an `agent_id` attribution is impossible, so the
+            // commit is refused rather than sweeping the whole worktree.
+            let (to_commit, needs_stage, attribution_filtered) = match files {
+                Some(f) if !f.is_empty() => (f, true, false),
+                _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false, false),
+                _ => {
+                    let Some(agent) = agent_id.as_ref() else {
+                        return Err(Error::Internal(
+                            "Agent-initiated commit without an agentId cannot be attributed: \
+                             pass an explicit `files` list"
+                                .to_string(),
+                        ));
+                    };
+                    let attributed: HashSet<String> = store
+                        .list_tracked_changes(&workspace_id)
+                        .await?
+                        .into_iter()
+                        .filter(|r| {
+                            matches!(r.stage.as_str(), "unstaged" | "staged")
+                                && r.agent_id.as_deref() == Some(agent.as_str())
+                        })
+                        .map(|r| crate::file_tracking::normalize_path(&r.path))
+                        .collect();
+                    let filtered: Vec<String> = intent_git::commit::all_changed_paths(&worktree)?
+                        .into_iter()
+                        .filter(|p| attributed.contains(&crate::file_tracking::normalize_path(p)))
+                        .collect();
+                    (filtered, true, true)
+                }
             };
             if to_commit.is_empty() {
                 return Err(Error::Internal(
@@ -13657,6 +13684,20 @@ impl WorkspaceApi for Services {
                 agent_id.as_ref().map(AgentId::as_str),
                 linked_note_id.as_ref().map(NoteId::as_str),
             )?;
+            if attribution_filtered {
+                // Mirror `ac_commit`: move the committed paths' attribution
+                // rows (staged/unstaged → committed) so the audit trail stays
+                // consistent with the git stage.
+                for path in &outcome.files {
+                    let key = crate::file_tracking::normalize_path(path);
+                    let _ = store
+                        .set_tracked_change_stage(&workspace_id, &key, "staged", "committed")
+                        .await;
+                    let _ = store
+                        .set_tracked_change_stage(&workspace_id, &key, "unstaged", "committed")
+                        .await;
+                }
+            }
             let file_count = to_commit.len() as i64;
             // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
