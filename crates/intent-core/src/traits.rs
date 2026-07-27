@@ -3866,6 +3866,35 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `unsloth.status`: observe the daemon-managed singleton Unsloth server
+    /// (monorepo#878) — `{ running: boolean, repoId?, port?, pid?, uptimeSecs?,
+    /// phase?, cpuPercent?, memoryBytes?, attachedAgentCount? }`. `running:
+    /// false` (with every other field omitted) when no managed server is up;
+    /// `attachedAgentCount` counts currently-tracked agents spawned with the
+    /// `unsloth` provider, regardless of `running` (a stopped-but-attached
+    /// state is possible mid-restart).
+    fn unsloth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::unsloth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `unsloth.stop`: gracefully terminate the managed Unsloth server (and
+    /// its process tree) if one is running — `{ stopped: boolean }`.
+    /// `stopped: false` is a no-op result, not an error, when no server was
+    /// running. Safe to call while agents are attached; the daemon does not
+    /// block or warn — callers should check `unsloth.status`'s
+    /// `attachedAgentCount` first if a live-agent warning is desired.
+    fn unsloth_stop(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::unsloth_stop not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // rules.* — user-rule overrides + (internal) prompt-injection (§18.1,
     // PROTOCOL §5.21). `list`/`get` are reads; `update` upserts the user

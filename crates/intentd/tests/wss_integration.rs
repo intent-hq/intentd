@@ -1370,6 +1370,51 @@ async fn wss_system_capabilities_reports_cow_supported() {
     srv.ws.stop().await;
 }
 
+/// `unsloth.status` / `unsloth.stop` (monorepo#878 follow-up): no params, no
+/// workspaceId — the managed Unsloth server is daemon-global. This harness's
+/// `Services` is never attached to a real `AgentManager`
+/// (`attach_agent_manager` is composition-root-only wiring), so both methods
+/// exercise their documented "unattached" degrade path — the same shape a
+/// freshly-started daemon reports before any unsloth-provider agent has ever
+/// spawned. The daemon-managed server itself needs a real `unsloth` binary
+/// and is out of scope for CI; `intent-services`' `unsloth_server` unit tests
+/// cover the running-server shapes (status fields, resource sampling, stop
+/// terminating the process tree) against a stubbed process.
+#[tokio::test]
+async fn wss_unsloth_status_and_stop_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"unsloth.status","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "running": false }),
+        "no AgentManager attached: unsloth.status degrades to the absent shape: {resp}"
+    );
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"unsloth.stop","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 2);
+    assert_eq!(
+        resp["result"],
+        serde_json::json!({ "stopped": false }),
+        "no AgentManager attached: unsloth.stop is a no-op: {resp}"
+    );
+
+    srv.ws.stop().await;
+}
+
 #[tokio::test]
 async fn health_reports_ok_and_client_count() {
     let srv = start(WsOptions::default()).await;

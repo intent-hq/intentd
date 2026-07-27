@@ -3,9 +3,10 @@
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
 //! `system.status` → `protocolVersion`. Version 2.5 adds the
-//! `system.gitCredential` UDS-only fast-path method (monorepo#884), covering
-//! 302 dispatchable method names (266 router + 34 fast-path + 2 aliases)
-//! + 1 notification + 4 reverse RPCs.
+//! `system.gitCredential` UDS-only fast-path method (monorepo#884) and the
+//! `unsloth.status` / `unsloth.stop` router methods (monorepo#878
+//! follow-up), covering 304 dispatchable method names (268 router + 34
+//! fast-path + 2 aliases) + 1 notification + 4 reverse RPCs.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
 pub const PROTOCOL_VERSION: &str = "2.5";

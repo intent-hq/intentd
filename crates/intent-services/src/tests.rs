@@ -12512,6 +12512,34 @@ mod worktree_provisioning {
         );
     }
 
+    /// `unsloth.status` (monorepo#878 follow-up): with no `AgentManager`
+    /// attached (read-only/test wiring), the RPC degrades to `{ running:
+    /// false }` rather than erroring — mirrors `agent_manager()`'s `None`
+    /// convention elsewhere in this trait.
+    #[tokio::test]
+    async fn unsloth_status_reports_not_running_without_attached_agent_manager() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+
+        let status = svc.unsloth_status().await.expect("status");
+        assert_eq!(status, serde_json::json!({ "running": false }));
+    }
+
+    /// `unsloth.stop` (monorepo#878 follow-up): with no `AgentManager`
+    /// attached, stopping is a no-op — `{ stopped: false }`, not an error.
+    #[tokio::test]
+    async fn unsloth_stop_is_a_no_op_without_attached_agent_manager() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+
+        let result = svc.unsloth_stop().await.expect("stop");
+        assert_eq!(result, serde_json::json!({ "stopped": false }));
+    }
+
     /// cowIsolation on + CoW-capable filesystem: `workspace.create` yields a
     /// standalone CoW clone (not a linked worktree) checked out on the
     /// workspace branch from `baseRef`, with `worktreePath`/`baseCommitSha`

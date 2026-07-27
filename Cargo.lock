@@ -2042,6 +2042,7 @@ dependencies = [
  "serde_yaml",
  "similar",
  "sqlx",
+ "sysinfo",
  "tempfile",
  "time",
  "tokio",

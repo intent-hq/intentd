@@ -6997,6 +6997,43 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn unsloth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let Some(manager) = self.agent_manager() else {
+                return Ok(serde_json::json!({ "running": false }));
+            };
+            let unsloth = manager.unsloth_manager();
+            let attached_agent_count = manager.count_agents_with_provider("unsloth");
+            match unsloth.status_snapshot().await {
+                Some(status) => Ok(serde_json::json!({
+                    "running": true,
+                    "repoId": status.repo_id,
+                    "port": status.port,
+                    "pid": status.pid,
+                    "uptimeSecs": status.uptime_secs,
+                    "phase": status.phase,
+                    "cpuPercent": status.cpu_percent,
+                    "memoryBytes": status.memory_bytes,
+                    "attachedAgentCount": attached_agent_count,
+                })),
+                None => Ok(serde_json::json!({
+                    "running": false,
+                    "attachedAgentCount": attached_agent_count,
+                })),
+            }
+        })
+    }
+
+    fn unsloth_stop(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let Some(manager) = self.agent_manager() else {
+                return Ok(serde_json::json!({ "stopped": false }));
+            };
+            let stopped = manager.unsloth_manager().stop().await;
+            Ok(serde_json::json!({ "stopped": stopped }))
+        })
+    }
+
     fn rules_list(
         &self,
         workspace_id: Option<WorkspaceId>,
