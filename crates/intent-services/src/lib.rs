@@ -953,9 +953,10 @@ impl Services {
     /// Recompute a workspace's derived `displayStatus` and publish
     /// `workspace:displayStatus-changed` iff it transitioned since the last
     /// observation (PROTOCOL §6.5). Called after the mutations that can move
-    /// the derivation (task/note status updates, PR link/status changes) —
-    /// never from a polling loop. The first observation for a workspace seeds
-    /// the cache without emitting (no baseline to transition from); a read
+    /// the derivation (task/note status updates, task-note deletion, PR
+    /// link/status changes) — never from a polling loop. The first
+    /// observation for a workspace seeds the cache without emitting (no
+    /// baseline to transition from); a read
     /// failure skips the recompute entirely so a transient store error can
     /// never fake a transition. Best-effort: errors are swallowed, the
     /// mutation's own result is the contract.
@@ -10765,6 +10766,13 @@ impl WorkspaceApi for Services {
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
             )
             .await;
+            // Deleting a task note can move the derived displayStatus rollup
+            // (§6.5), e.g. removing the last open spec-child task.
+            if note.metadata.task.is_some() {
+                services
+                    .maybe_emit_display_status_changed(&workspace_id)
+                    .await;
+            }
             Ok(NoteDeleteResult {
                 ok: true,
                 note_id,

@@ -17695,6 +17695,33 @@ mod display_status_events {
         assert_silent(&mut sub).await;
     }
 
+    /// Deleting an open spec-child task note that moves the derived rollup
+    /// (in_progress → not_started once the last open task is gone) emits the
+    /// transition event: `note.delete` goes through the same
+    /// recompute+maybe-emit hook as the task-status mutations.
+    #[tokio::test]
+    async fn task_note_delete_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), NoteId::from("t1"), None)
+            .await
+            .expect("delete note");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "not_started" })
+        );
+    }
+
     /// When `taskStats` is unavailable (transient notes-read failure), the
     /// enrich path leaves `displayStatus` absent — clients fall back to local
     /// derivation on a missing field — and never seeds the last-observed
