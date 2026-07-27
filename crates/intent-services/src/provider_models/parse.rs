@@ -294,6 +294,16 @@ pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool
     estimate_model_bytes(params_billion) <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
 }
 
+/// Whether a model whose weight files total `model_bytes` on disk fits
+/// within [`RAM_FIT_FRACTION`] of `total_ram_bytes`, with the same
+/// [`FIT_HEADROOM_BYTES`] KV-cache/runtime allowance the catalog's
+/// param-count estimate bakes in. Shared with the spawn-time quant-variant
+/// selection ([`crate::unsloth_server`]) so both fit checks apply one
+/// consistent headroom policy.
+pub(crate) fn gguf_bytes_fit_within_ram(model_bytes: u64, total_ram_bytes: u64) -> bool {
+    (model_bytes as f64) + FIT_HEADROOM_BYTES <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
+}
+
 /// Parse the total parameter count (in billions) out of an HF repo id's model
 /// name, tolerating both dense names (`27B`) and MoE names that also carry an
 /// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the
