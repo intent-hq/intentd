@@ -10,8 +10,8 @@ use std::path::Path;
 use std::process::Stdio;
 
 use intent_providers::{
-    apply_codex_config_args, build_provider_args, build_provider_env, enhanced_path, ArgInputs,
-    ProviderConfig,
+    apply_codex_config_args, build_provider_args, build_provider_env_with_unsloth, enhanced_path,
+    ArgInputs, ProviderConfig, UnslothEndpoint,
 };
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
@@ -33,8 +33,13 @@ pub struct SpawnOptions<'a> {
     pub mcp_config_file: Option<&'a str>,
     /// Pre-serialized MCP block (OpenCode `mcp` config shape) merged into
     /// `OPENCODE_CONFIG_CONTENT` for providers that take env config
-    /// (opencode). Ignored by every other provider.
+    /// (opencode, unsloth). Ignored by every other provider.
     pub env_mcp_config: Option<&'a str>,
+    /// Unsloth-managed server endpoint injected as the
+    /// `provider.unsloth-studio` block in `OPENCODE_CONFIG_CONTENT` (unsloth
+    /// provider only; supplied by the managed-server lifecycle at spawn
+    /// time). Ignored by every other provider.
+    pub unsloth_endpoint: Option<&'a UnslothEndpoint>,
     /// Whether to append the provider's quiet flag.
     pub quiet: bool,
     /// Discovered provider binary, used for `PATH` enrichment.
@@ -65,6 +70,7 @@ impl<'a> SpawnOptions<'a> {
             rules_file: None,
             mcp_config_file: None,
             env_mcp_config: None,
+            unsloth_endpoint: None,
             quiet: false,
             provider_binary: None,
             extra_env: BTreeMap::new(),
@@ -135,11 +141,12 @@ pub fn build_command(opts: &SpawnOptions) -> Command {
     if let Some(cwd) = opts.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in build_provider_env(
+    for (key, value) in build_provider_env_with_unsloth(
         opts.provider,
         opts.model,
         opts.rules_file,
         opts.env_mcp_config,
+        opts.unsloth_endpoint,
     ) {
         cmd.env(key, value);
     }

@@ -222,7 +222,9 @@ fn find_provider_binary_with_home(
 fn native_install_dir(provider_id: &str) -> Option<&'static str> {
     match provider_id {
         "grok" => Some(".grok"),
-        "opencode" => Some(".opencode"),
+        // unsloth rides the opencode binary, so it shares opencode's
+        // native-installer tier (`~/.opencode/bin/opencode`).
+        "opencode" | "unsloth" => Some(".opencode"),
         _ => None,
     }
 }

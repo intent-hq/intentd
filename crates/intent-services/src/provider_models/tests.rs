@@ -5,9 +5,33 @@ use serde_json::json;
 
 use super::finish;
 use super::parse::{
+    build_unsloth_rows, estimate_model_bytes, fits_within_ram, parse_hf_unsloth_response,
+    parse_param_count_billions,
+};
+use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
 use super::probe::{exit_attribution, ProbeError};
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Recorded (trimmed) response from
+/// `https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000`
+/// (captured 2026-07-27), covering: a dense model (`Ornith-1.0-35B-GGUF`), an
+/// MoE model whose name carries both total and active param counts
+/// (`Qwen3.6-35B-A3B-GGUF`), a huge dense model that must be filtered out on
+/// a typical machine (`Ornith-1.0-397B-GGUF`), a small dense model
+/// (`gpt-oss-20b-GGUF`), a repo with no parseable size in its name
+/// (`grok-2-GGUF`), and a `private: true` entry that must never surface.
+const UNSLOTH_HF_FIXTURE: &str = r#"[
+  {"id":"unsloth/Ornith-1.0-35B-GGUF","downloads":99353,"trendingScore":65,"private":false},
+  {"id":"unsloth/Qwen3.6-35B-A3B-GGUF","downloads":811019,"trendingScore":48,"private":false},
+  {"id":"unsloth/Ornith-1.0-397B-GGUF","downloads":5227,"trendingScore":12,"private":false},
+  {"id":"unsloth/gpt-oss-20b-GGUF","downloads":522935,"trendingScore":6,"private":false},
+  {"id":"unsloth/grok-2-GGUF","downloads":17569,"trendingScore":2,"private":false},
+  {"id":"unsloth/secret-model-GGUF","downloads":1,"trendingScore":0,"private":true},
+  {"id":"","downloads":1,"trendingScore":0,"private":false}
+]"#;
 
 #[test]
 fn parse_acp_models_from_session_new_result() {
@@ -946,6 +970,181 @@ async fn opencode_timeout_flows_into_attributed_warning() {
     assert_eq!(
         fetch.warning.as_deref(),
         Some("opencode: opencode models timed out")
+    );
+}
+
+#[test]
+fn parse_param_count_billions_handles_dense_and_moe_names() {
+    // Dense: bare "<N>B" size token.
+    assert_eq!(
+        parse_param_count_billions("unsloth/Ornith-1.0-35B-GGUF"),
+        Some(35.0)
+    );
+    // MoE: total ("35B") wins over the active-parameter marker ("A3B").
+    assert_eq!(
+        parse_param_count_billions("unsloth/Qwen3.6-35B-A3B-GGUF"),
+        Some(35.0)
+    );
+    // Small dense model in lowercase ("20b").
+    assert_eq!(
+        parse_param_count_billions("unsloth/gpt-oss-20b-GGUF"),
+        Some(20.0)
+    );
+    // Sub-billion size in millions.
+    assert_eq!(
+        parse_param_count_billions("unsloth/functiongemma-270m-it-GGUF"),
+        Some(0.27)
+    );
+    // Fractional size.
+    assert_eq!(
+        parse_param_count_billions("unsloth/Qwen3.5-0.8B-MTP-GGUF"),
+        Some(0.8)
+    );
+    // No size token anywhere in the name.
+    assert_eq!(parse_param_count_billions("unsloth/grok-2-GGUF"), None);
+    assert_eq!(
+        parse_param_count_billions("unsloth/Qwen3-Coder-Next-GGUF"),
+        None
+    );
+}
+
+#[test]
+fn fits_within_ram_applies_the_seventy_percent_threshold() {
+    // A 20B dense model: ~20e9 * 0.6 + 1GiB headroom ≈ 12.99 GB. Comfortably
+    // under 70% of 32 GiB (~22.4 GB).
+    assert!(fits_within_ram(20.0, 32 * GIB));
+    // A 397B dense model: ~397e9 * 0.6 + 1GiB ≈ 239 GB, far over 70% of a
+    // typical 64 GiB machine (~44.8 GB).
+    assert!(!fits_within_ram(397.0, 64 * GIB));
+    // Boundary: exactly at the threshold must fit (<=, not <).
+    let exact = estimate_model_bytes(10.0);
+    let total_ram = (exact / 0.7).ceil() as u64;
+    assert!(fits_within_ram(10.0, total_ram));
+}
+
+#[test]
+fn parse_hf_unsloth_response_drops_private_and_empty_id_rows() {
+    let repos = parse_hf_unsloth_response(UNSLOTH_HF_FIXTURE);
+    // 7 entries in the fixture minus 1 private minus 1 empty-id = 5.
+    assert_eq!(repos.len(), 5);
+    assert!(repos.iter().all(|r| r.id != "unsloth/secret-model-GGUF"));
+    assert!(repos.iter().any(|r| r.id == "unsloth/Ornith-1.0-35B-GGUF"));
+}
+
+#[test]
+fn parse_hf_unsloth_response_malformed_json_yields_empty() {
+    assert!(parse_hf_unsloth_response("not json").is_empty());
+    assert!(parse_hf_unsloth_response(r#"{"not":"an array"}"#).is_empty());
+    assert!(parse_hf_unsloth_response("").is_empty());
+}
+
+#[test]
+fn build_unsloth_rows_one_row_per_repo_sorted_by_downloads() {
+    let repos = parse_hf_unsloth_response(UNSLOTH_HF_FIXTURE);
+    // No RAM info: every parsed repo becomes a row, unfiltered.
+    let (rows, hidden) = build_unsloth_rows(&repos, None);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(hidden, 0);
+    // Sorted by downloads descending: Qwen3.6-35B-A3B (811019) first.
+    assert_eq!(rows[0]["id"], "unsloth/Qwen3.6-35B-A3B-GGUF");
+    assert_eq!(rows[0]["name"], "Qwen3.6-35B-A3B");
+    assert_eq!(rows[0]["provider"], "unsloth");
+    assert_eq!(rows[0]["description"], "811,019 downloads");
+    assert_eq!(rows[1]["id"], "unsloth/gpt-oss-20b-GGUF");
+}
+
+#[test]
+fn build_unsloth_rows_filters_by_ram_fit_and_counts_hidden() {
+    let repos = parse_hf_unsloth_response(UNSLOTH_HF_FIXTURE);
+    // 24 GiB machine: the 35B models (~2 rows, ≈22 GB estimated) and the
+    // 397B model (≈239 GB) don't fit within 70% (≈16.8 GB); grok-2 has no
+    // parseable size and is also excluded (unknown ⇒ hidden); only the 20B
+    // gpt-oss model (≈13 GB) fits.
+    let (rows, hidden) = build_unsloth_rows(&repos, Some(24 * GIB));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "unsloth/gpt-oss-20b-GGUF");
+    assert_eq!(hidden, 4);
+}
+
+#[test]
+fn build_unsloth_rows_empty_input_yields_no_rows() {
+    let (rows, hidden) = build_unsloth_rows(&[], Some(32 * GIB));
+    assert!(rows.is_empty());
+    assert_eq!(hidden, 0);
+}
+
+#[test]
+fn build_unsloth_rows_tolerates_non_ascii_repo_names() {
+    // Regression: a multi-byte name whose len-5 offset is not a char
+    // boundary must not panic in the `-GGUF` suffix strip.
+    let repos = parse_hf_unsloth_response(r#"[{"id": "unsloth/ééé", "downloads": 1}]"#);
+    let (rows, _hidden) = build_unsloth_rows(&repos, None);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "ééé");
+}
+
+#[test]
+fn unsloth_fetch_outcome_unknown_size_repo_hidden_even_with_abundant_ram() {
+    // On a generous 512 GiB machine every parseable model fits, but grok-2
+    // (unparseable size) is still hidden and still surfaces a warning.
+    let fetch = super::unsloth_fetch_outcome(UNSLOTH_HF_FIXTURE, Some(512 * GIB));
+    let rows = fetch.models.expect("models present");
+    assert_eq!(rows.len(), 4);
+    assert!(fetch.warning.is_some());
+    assert!(fetch.warning.unwrap().contains("1 repo(s) hidden"));
+}
+
+#[test]
+fn unsloth_fetch_outcome_all_parseable_and_fitting_has_no_warning() {
+    let body = r#"[
+        {"id": "unsloth/gpt-oss-20b-GGUF", "downloads": 5, "trendingScore": 1.0},
+        {"id": "unsloth/Qwen3.6-35B-A3B-GGUF", "downloads": 9, "trendingScore": 2.0}
+    ]"#;
+    let fetch = super::unsloth_fetch_outcome(body, Some(512 * GIB));
+    let rows = fetch.models.expect("models present");
+    assert_eq!(rows.len(), 2);
+    assert!(fetch.warning.is_none());
+}
+
+#[test]
+fn unsloth_fetch_outcome_notes_hidden_count_in_warning() {
+    let fetch = super::unsloth_fetch_outcome(UNSLOTH_HF_FIXTURE, Some(24 * GIB));
+    let rows = fetch.models.expect("models present");
+    assert_eq!(rows.len(), 1);
+    let warning = fetch.warning.expect("warning present");
+    assert!(warning.contains("unsloth:"), "{warning}");
+    assert!(warning.contains("4 repo(s) hidden"), "{warning}");
+}
+
+#[test]
+fn unsloth_fetch_outcome_all_hidden_degrades_to_unavailable() {
+    // A tiny RAM budget filters out every parseable repo.
+    let fetch = super::unsloth_fetch_outcome(UNSLOTH_HF_FIXTURE, Some(1024));
+    assert!(fetch.models.is_none());
+    let warning = fetch.warning.expect("warning present");
+    assert!(
+        warning.starts_with("unsloth: no models reported"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn unsloth_fetch_outcome_empty_catalog_degrades_to_unavailable() {
+    let fetch = super::unsloth_fetch_outcome("[]", Some(32 * GIB));
+    assert!(fetch.models.is_none());
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("unsloth: no models reported")
+    );
+}
+
+#[test]
+fn unsloth_fetch_outcome_malformed_response_degrades_to_unavailable() {
+    let fetch = super::unsloth_fetch_outcome("not json", Some(32 * GIB));
+    assert!(fetch.models.is_none());
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("unsloth: no models reported")
     );
 }
 
