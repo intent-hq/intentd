@@ -773,4 +773,330 @@ mod tests {
         // Clean up
         let _ = fs::remove_dir_all(&test_root);
     }
+
+    /// Provision a sandbox with one clean commit and strand it `merge_pending`,
+    /// returning `(test_root, repo_path, sandbox_path, ws, services, bus)`.
+    /// Returns `None` when CoW is unsupported (test should skip).
+    #[allow(clippy::type_complexity)]
+    async fn setup_merge_pending_sandbox(
+        store: &Store,
+        name: &str,
+        agent_id: &AgentId,
+    ) -> Option<(
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        intent_core::Workspace,
+        Services,
+        EventBus,
+    )> {
+        let (test_root, repo_path) = temp_repo_in_target(name);
+        let workspaces_root = test_root.join("workspaces");
+        fs::create_dir_all(&workspaces_root).unwrap();
+
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return None;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        create_agent_session(store, &ws.id, agent_id, None, None).await;
+        let outcome = provision_sandbox(store, &ws.id, agent_id, &config)
+            .await
+            .unwrap();
+        let ProvisionOutcome::Supported {
+            path: sandbox_path, ..
+        } = outcome
+        else {
+            panic!("Expected Supported outcome");
+        };
+
+        let mut session = store.get_agent_session(agent_id).await.unwrap();
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().to_string());
+        session.sandbox_branch = Some(format!("sb/{}", agent_id.0));
+        store.update_agent_session(&ws.id, &session).await.unwrap();
+
+        // Clean commit in the sandbox
+        let sandbox_repo = Repository::open(&sandbox_path).unwrap();
+        fs::write(sandbox_path.join("swept.txt"), "swept content").unwrap();
+        let mut index = sandbox_repo.index().unwrap();
+        index.add_path(Path::new("swept.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = sandbox_repo.find_tree(tree_oid).unwrap();
+        let parent_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        sandbox_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Swept work",
+                &tree,
+                &[&parent_commit],
+            )
+            .unwrap();
+
+        // Strand the sandbox merge_pending (as the pre-#592 fetch bug did)
+        store
+            .update_sandbox_status(&ws.id, agent_id, SandboxStatus::MergePending, &now_iso())
+            .await
+            .unwrap();
+
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone())
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(workspaces_root);
+
+        Some((test_root, repo_path, sandbox_path, ws, services, bus))
+    }
+
+    #[tokio::test]
+    async fn test_sweep_merges_stranded_merge_pending_sandbox() {
+        // The sweep finds a merge_pending sandbox with clean work, merges it
+        // into canonical, discards it, and emits sandbox:merged — identical
+        // bookkeeping to the completion / RPC paths.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-swept");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-merge", &agent_id).await
+        else {
+            return;
+        };
+
+        let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.merged, 1, "Sweep should merge the stranded sandbox");
+        assert_eq!(summary.errors, 0);
+        assert_eq!(summary.conflicts, 0);
+
+        // Sandbox discarded, commit landed in canonical, event emitted
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
+        assert!(sandbox.is_none(), "Sandbox should be discarded after merge");
+        assert!(
+            repo_path.join("swept.txt").exists(),
+            "Swept commit should land in canonical"
+        );
+        let merged_event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
+        assert!(
+            merged_event.is_ok(),
+            "sandbox:merged event should be emitted by the sweep"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_skips_sandbox_at_retry_cap() {
+        // A sandbox that already burned the retry cap stays merge_pending for
+        // manual sandbox.merge / sandbox.discard — the sweep must not touch it.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-capped");
+        let Some((test_root, _repo_path, sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-cap", &agent_id).await
+        else {
+            return;
+        };
+
+        for _ in 0..crate::SANDBOX_MERGE_SWEEP_RETRY_CAP {
+            store
+                .increment_sandbox_retry_count(&ws.id, &agent_id)
+                .await
+                .unwrap();
+        }
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.skipped_capped, 1, "Capped sandbox must be skipped");
+        assert_eq!(summary.merged, 0);
+
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status,
+            SandboxStatus::MergePending,
+            "Capped sandbox stays merge_pending for manual handling"
+        );
+        assert!(
+            sandbox_path.exists(),
+            "Capped sandbox must not be discarded"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_skips_busy_agent() {
+        // A sandbox whose agent is mid-turn is skipped — no merge under an
+        // active worker; the sandbox stays merge_pending for the next sweep.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-busy");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-busy", &agent_id).await
+        else {
+            return;
+        };
+
+        services.set_test_busy(&agent_id, true);
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.skipped_busy, 1, "Busy agent must be skipped");
+        assert_eq!(summary.merged, 0);
+
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::MergePending);
+        assert!(
+            !repo_path.join("swept.txt").exists(),
+            "Canonical must be untouched while the agent is busy"
+        );
+
+        // Once the agent goes idle, the next sweep merges it.
+        services.set_test_busy(&agent_id, false);
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(
+            summary.merged, 1,
+            "Idle agent's sandbox merges on next sweep"
+        );
+        assert!(repo_path.join("swept.txt").exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_conflict_consumes_retry_and_returns_to_merge_pending() {
+        // A conflicting merge attempt consumes one retry and returns the
+        // sandbox to merge_pending (not conflict_bounced — there is no live
+        // agent turn to bounce).
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-conflicted");
+        let Some((test_root, repo_path, sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-conflict", &agent_id).await
+        else {
+            return;
+        };
+
+        // Conflicting canonical commit on the same file the sandbox touched
+        let canonical_repo = Repository::open(&repo_path).unwrap();
+        fs::write(repo_path.join("swept.txt"), "canonical version").unwrap();
+        let mut index = canonical_repo.index().unwrap();
+        index.add_path(Path::new("swept.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = canonical_repo.find_tree(tree_oid).unwrap();
+        let parent = canonical_repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        canonical_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Canonical clash",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.conflicts, 1, "Conflict should be tallied");
+        assert_eq!(summary.merged, 0);
+
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status,
+            SandboxStatus::MergePending,
+            "Conflicted sandbox returns to merge_pending"
+        );
+        assert_eq!(sandbox.retry_count, 1, "Conflict consumes one retry");
+        assert!(sandbox_path.exists(), "Sandbox must not be discarded");
+        let canonical_content = fs::read_to_string(repo_path.join("swept.txt")).unwrap();
+        assert_eq!(
+            canonical_content, "canonical version",
+            "Canonical must stay pristine on conflict"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_blocked_does_not_consume_retry() {
+        // A Blocked outcome (dirty canonical overlapping the sandbox's
+        // changes) returns the sandbox to merge_pending WITHOUT consuming a
+        // retry — blocked-ness resolves externally and must not burn the cap.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-blocked");
+        let Some((test_root, repo_path, sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-blocked", &agent_id).await
+        else {
+            return;
+        };
+
+        // Uncommitted canonical change to the same file the sandbox touched
+        // → dirty-overlap Blocked.
+        fs::write(repo_path.join("swept.txt"), "uncommitted canonical edit").unwrap();
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.blocked, 1, "Blocked should be tallied");
+        assert_eq!(summary.merged, 0);
+        assert_eq!(summary.conflicts, 0);
+
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(
+            sandbox.status,
+            SandboxStatus::MergePending,
+            "Blocked sandbox returns to merge_pending"
+        );
+        assert_eq!(sandbox.retry_count, 0, "Blocked must NOT consume a retry");
+        assert!(sandbox_path.exists(), "Sandbox must not be discarded");
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_recover_stranded_merging_sandboxes() {
+        // A sandbox stranded `merging` by a daemon that died mid-merge is
+        // invisible to the sweep; startup recovery resets it to merge_pending
+        // and the next sweep then merges it.
+
+        let (store, _db) = temp_store().await;
+        let agent_id = AgentId::from("agent-stranded");
+        let Some((test_root, repo_path, _sandbox_path, ws, services, _bus)) =
+            setup_merge_pending_sandbox(&store, "sweep-recover", &agent_id).await
+        else {
+            return;
+        };
+
+        // Simulate a crash mid-merge: sandbox left `merging`.
+        store
+            .update_sandbox_status(&ws.id, &agent_id, SandboxStatus::Merging, &now_iso())
+            .await
+            .unwrap();
+
+        // The sweep alone cannot see it.
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert!(summary.is_empty(), "Sweep must not see a merging sandbox");
+
+        // Startup recovery resets it, then the sweep merges it.
+        let recovered = services.recover_stranded_merging_sandboxes().await;
+        assert_eq!(recovered, 1, "Stranded merging sandbox should be recovered");
+        let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap().unwrap();
+        assert_eq!(sandbox.status, SandboxStatus::MergePending);
+
+        let summary = services.sweep_merge_pending_sandboxes().await;
+        assert_eq!(summary.merged, 1, "Recovered sandbox merges on next sweep");
+        assert!(repo_path.join("swept.txt").exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
 }
