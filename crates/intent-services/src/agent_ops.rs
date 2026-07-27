@@ -3203,7 +3203,10 @@ impl Services {
             .unwrap_or_default()
             .to_string();
 
-        // Track effective isolation mode for the result
+        // Track effective isolation mode for the result. Provisioning runs in
+        // a background task (monorepo#871), so an eligible CoW request reports
+        // "pending" here; the settled outcome is observable via the session's
+        // sandbox fields and the `sandbox:created` event.
         let mut effective_isolation: Option<&str> = None;
 
         // Provision sandbox if isolation=cow is requested (Task 3).
@@ -3225,7 +3228,6 @@ impl Services {
             }
         }
         if isolation.as_deref() == Some("cow") {
-            use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
             let workspace = self.store.get_workspace(&workspace_id).await.ok();
             if let Some(ws) = workspace {
                 // Sandbox-eligible: direct-mode workspaces (no worktree or
@@ -3245,80 +3247,31 @@ impl Services {
                         .workspaces_root
                         .clone()
                         .unwrap_or_else(crate::default_workspaces_root);
-                    {
-                        let config = ProvisionConfig {
-                            workspaces_root: root,
-                        };
-                        let aid = AgentId::from(agent_id.as_str());
-                        match provision_sandbox(&self.store, &workspace_id, &aid, &config).await {
-                            Ok(ProvisionOutcome::Supported {
-                                path,
-                                branch,
-                                base_commit_sha,
-                                snapshot_commit_sha,
-                            }) => {
-                                // Update the session with sandbox metadata
-                                if let Ok(mut session) = self.store.get_agent_session(&aid).await {
-                                    session.sandbox_id = Some(format!(
-                                        "sandbox-{}-{}",
-                                        workspace_id.as_str(),
-                                        aid.as_str()
-                                    ));
-                                    session.sandbox_path = Some(path.to_string_lossy().to_string());
-                                    session.sandbox_branch = Some(branch.clone());
-                                    let _ = self
-                                        .store
-                                        .update_agent_session(&workspace_id, &session)
-                                        .await;
-
-                                    // Track successful CoW provisioning
-                                    effective_isolation = Some("cow");
-
-                                    // Emit sandbox:created event
-                                    crate::publish_event(
-                                        &self.event_bus,
-                                        intent_store::NewEvent {
-                                            workspace_id: workspace_id.clone(),
-                                            timestamp: crate::now_iso(),
-                                            event_type: "sandbox:created".to_string(),
-                                            actor: crate::system_actor(),
-                                            session_id: Some(aid.0.clone()),
-                                            correlation_id: None,
-                                            parent_event_id: None,
-                                            metadata: None,
-                                            data: json!({
-                                                "workspaceId": workspace_id.as_str(),
-                                                "agentId": agent_id,
-                                                "sandboxPath": path.to_string_lossy(),
-                                                "branch": branch,
-                                                "baseCommitSha": base_commit_sha,
-                                                "snapshotCommitSha": snapshot_commit_sha,
-                                            }),
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
-                            Ok(ProvisionOutcome::Unsupported) => {
-                                // Fallback to shared mode (no action needed, session stays without sandbox fields)
-                                effective_isolation = Some("direct");
-                                tracing::debug!(
-                                    workspace = %workspace_id,
-                                    agent = %agent_id,
-                                    "CoW not supported; fallback to shared mode"
-                                );
-                            }
-                            Err(e) => {
-                                effective_isolation = Some("direct");
-                                tracing::warn!(
-                                    workspace = %workspace_id,
-                                    agent = %agent_id,
-                                    error = %e,
-                                    "Sandbox provisioning failed; fallback to shared mode"
-                                );
-                            }
-                        }
-                    }
+                    let aid = AgentId::from(agent_id.as_str());
+                    // The CoW clone runs OFF the delegate critical path
+                    // (monorepo#871): on large checkouts it takes tens of
+                    // seconds, which previously blew through the 30s
+                    // `workspace_api` budget and the harness's own MCP client
+                    // timeout. Register the settlement gate BEFORE returning
+                    // so the child's turn worker (`ensure_started`) blocks its
+                    // first ACP spawn until the clone settles — the child
+                    // never spawns against a half-copied sandbox.
+                    let settled = self.begin_sandbox_provisioning(&aid);
+                    effective_isolation = Some("pending");
+                    let services = self.clone();
+                    let ws_id = workspace_id.clone();
+                    tokio::spawn(async move {
+                        services
+                            .provision_delegate_sandbox(&ws_id, &aid, root)
+                            .await;
+                        // Settle the gate LAST — the session's sandbox fields
+                        // and the `sandbox:created` event are already
+                        // published, so a released waiter observes the settled
+                        // state. Dropping the sender releases waiters even if
+                        // provisioning panicked.
+                        services.settle_sandbox_provisioning(&aid);
+                        drop(settled);
+                    });
                 }
             }
         }
@@ -3428,6 +3381,86 @@ impl Services {
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
         Ok(result)
+    }
+
+    /// Background half of the delegate CoW-isolation path (monorepo#871): run
+    /// [`provision_sandbox`](crate::sandbox_ops::provision_sandbox) and settle
+    /// the outcome onto the child's session. Success persists the sandbox
+    /// fields and emits `sandbox:created` (payload unchanged, §5.5);
+    /// `Unsupported`/failure falls back to shared mode exactly as before —
+    /// debug/warn log only, the session keeps no sandbox fields and the child
+    /// spawns in the shared checkout.
+    async fn provision_delegate_sandbox(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        workspaces_root: std::path::PathBuf,
+    ) {
+        use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
+        let config = ProvisionConfig { workspaces_root };
+        match provision_sandbox(&self.store, workspace_id, agent_id, &config).await {
+            Ok(ProvisionOutcome::Supported {
+                path,
+                branch,
+                base_commit_sha,
+                snapshot_commit_sha,
+            }) => {
+                // Update the session with sandbox metadata
+                if let Ok(mut session) = self.store.get_agent_session(agent_id).await {
+                    session.sandbox_id = Some(format!(
+                        "sandbox-{}-{}",
+                        workspace_id.as_str(),
+                        agent_id.as_str()
+                    ));
+                    session.sandbox_path = Some(path.to_string_lossy().to_string());
+                    session.sandbox_branch = Some(branch.clone());
+                    let _ = self
+                        .store
+                        .update_agent_session(workspace_id, &session)
+                        .await;
+
+                    // Emit sandbox:created event
+                    crate::publish_event(
+                        &self.event_bus,
+                        intent_store::NewEvent {
+                            workspace_id: workspace_id.clone(),
+                            timestamp: crate::now_iso(),
+                            event_type: "sandbox:created".to_string(),
+                            actor: crate::system_actor(),
+                            session_id: Some(agent_id.0.clone()),
+                            correlation_id: None,
+                            parent_event_id: None,
+                            metadata: None,
+                            data: json!({
+                                "workspaceId": workspace_id.as_str(),
+                                "agentId": agent_id.as_str(),
+                                "sandboxPath": path.to_string_lossy(),
+                                "branch": branch,
+                                "baseCommitSha": base_commit_sha,
+                                "snapshotCommitSha": snapshot_commit_sha,
+                            }),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Ok(ProvisionOutcome::Unsupported) => {
+                // Fallback to shared mode (no action needed, session stays without sandbox fields)
+                tracing::debug!(
+                    workspace = %workspace_id,
+                    agent = %agent_id,
+                    "CoW not supported; fallback to shared mode"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id,
+                    agent = %agent_id,
+                    error = %e,
+                    "Sandbox provisioning failed; fallback to shared mode"
+                );
+            }
+        }
     }
 
     /// Auto-subscribe `parent_agent_id` to `child_agent_id`'s completion

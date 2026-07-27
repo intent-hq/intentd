@@ -445,6 +445,16 @@ pub struct Services {
     /// each agent's [`WorkspaceMcpServer`]) so registration and claim observe
     /// the same state.
     turn_attachments: Arc<intent_core::TurnAttachmentRegistry>,
+    /// Per-agent in-flight sandbox-provisioning gates (monorepo#871). A
+    /// delegate with CoW isolation kicks the clone off in a background task
+    /// and returns immediately; the child's turn worker awaits the gate
+    /// before its first ACP spawn so the child never runs against a
+    /// half-copied sandbox. The entry is removed — and the paired
+    /// `watch::Sender` dropped — when provisioning settles (success or
+    /// shared-mode fallback), releasing every waiter. Shared across clones
+    /// so the [`AgentManager`]'s turn worker and the delegate front doors
+    /// observe the same gates.
+    sandbox_provisioning: Arc<Mutex<HashMap<AgentId, tokio::sync::watch::Receiver<()>>>>,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -511,6 +521,7 @@ impl Services {
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
+            sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -17298,6 +17309,53 @@ impl Services {
     /// Garbage-collect orphaned sandboxes (startup GC).
     pub async fn gc_orphaned_sandboxes(&self) -> Result<()> {
         sandbox_ops::gc_orphaned_sandboxes(&self.store).await
+    }
+
+    /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).
+    /// Called by the delegate op BEFORE it returns, so the child's turn
+    /// worker observes the gate before its first spawn attempt. The returned
+    /// sender is held by the background provisioning task; dropping it (or
+    /// calling [`Services::settle_sandbox_provisioning`] first) releases
+    /// every waiter — including on a panic, since the sender drops with the
+    /// task.
+    pub(crate) fn begin_sandbox_provisioning(
+        &self,
+        agent_id: &AgentId,
+    ) -> tokio::sync::watch::Sender<()> {
+        let (tx, rx) = tokio::sync::watch::channel(());
+        self.sandbox_provisioning
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), rx);
+        tx
+    }
+
+    /// Remove the provisioning gate for `agent_id` once provisioning has
+    /// settled (success or shared-mode fallback). Waiters already holding a
+    /// cloned receiver are released when the paired sender drops; later
+    /// arrivals find no entry and proceed immediately.
+    pub(crate) fn settle_sandbox_provisioning(&self, agent_id: &AgentId) {
+        self.sandbox_provisioning.lock().unwrap().remove(agent_id);
+    }
+
+    /// Await settlement of an in-flight sandbox provisioning for `agent_id`,
+    /// if any (monorepo#871). No timeout by design: the CoW clone of a large
+    /// checkout may take tens of seconds and the whole point is that copy
+    /// time counts against no request-scoped budget. Returns immediately
+    /// when no provisioning is in flight (the common case for every turn
+    /// after the first).
+    pub(crate) async fn await_sandbox_provisioning(&self, agent_id: &AgentId) {
+        let rx = self
+            .sandbox_provisioning
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned();
+        if let Some(mut rx) = rx {
+            // The provisioning task never sends a value; `changed()` resolves
+            // (with `Err`) when the sender drops, i.e. on settlement.
+            let _ = rx.changed().await;
+        }
     }
 }
 

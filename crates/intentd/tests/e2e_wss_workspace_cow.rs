@@ -732,10 +732,13 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
     .await;
     assert_eq!(delegated["ok"], json!(true), "delegate ok: {delegated}");
     let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
+    // Provisioning runs off the delegate critical path (monorepo#871): the
+    // delegate result reports "pending" immediately; the settled outcome is
+    // observed via the `sandbox:created` event asserted below.
     assert_eq!(
         delegated["effectiveIsolation"],
-        json!("cow"),
-        "CoW sandbox provisioned: {delegated}"
+        json!("pending"),
+        "CoW sandbox provisioning kicked off in the background: {delegated}"
     );
 
     // sandbox:created — §5.5 payload: workspaceId, agentId, sandboxPath,
