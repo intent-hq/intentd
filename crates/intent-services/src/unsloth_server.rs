@@ -20,6 +20,16 @@
 //! - first use can mean a multi-GB Hugging Face download before the server is
 //!   ready, so the model-ready timeout is generous and progress status is
 //!   surfaced through the caller-supplied status callback.
+//!
+//! Test strategy: this module adds no new RPC method — it is spawn-path
+//! plumbing behind the existing `agent.*` methods — and the production spawn
+//! path requires the external `unsloth` binary, so the WSS-e2e convention
+//! (AGENTS.md) does not apply directly. Coverage is crate-level: pure unit
+//! tests (quant selection, probe classification, generated-config parsing
+//! against a recorded fixture) plus lifecycle tests driving the real manager
+//! against a stub `unsloth` shell script and a loopback HTTP responder — no
+//! network, no real binary. The full path is exercised manually with a real
+//! install (spec verification plan).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -78,6 +88,12 @@ pub type StatusCallback = dyn Fn(String) + Send + Sync;
 /// messages behind a literal "Internal error").
 fn missing_binary_error() -> Error {
     Error::InvalidInput(format!("unsloth CLI not found — {UNSLOTH_INSTALL_HINT}"))
+}
+
+/// The error an in-flight or new `ensure_endpoint` gets when a daemon
+/// shutdown was requested mid-startup.
+fn shutting_down_error() -> Error {
+    Error::Internal("unsloth server startup aborted: daemon is shutting down".to_string())
 }
 
 /// Quant variant the daemon picks when starting the server, mirroring the
@@ -279,6 +295,12 @@ impl Default for UnslothConfig {
 pub struct UnslothServerManager {
     state: TokioMutex<Option<ManagedServer>>,
     config: UnslothConfig,
+    /// Terminal shutdown latch. [`Self::shutdown`] sets it BEFORE taking the
+    /// state lock so an in-flight startup (which can legitimately sit in its
+    /// probe loop for many minutes during a first-use model download) notices
+    /// at the next probe tick, aborts, and releases the lock — daemon
+    /// shutdown never waits out the model-ready window.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Default for UnslothServerManager {
@@ -292,7 +314,14 @@ impl UnslothServerManager {
         Self {
             state: TokioMutex::new(None),
             config,
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether [`Self::shutdown`] has been requested.
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ensure a managed server is running and ready for `repo_id`, returning
@@ -306,6 +335,9 @@ impl UnslothServerManager {
         repo_id: &str,
         status: &StatusCallback,
     ) -> Result<UnslothEndpoint> {
+        if self.is_shutting_down() {
+            return Err(shutting_down_error());
+        }
         let mut state = self.state.lock().await;
 
         // Reuse: live child serving the requested repo with a minted endpoint.
@@ -423,6 +455,7 @@ impl UnslothServerManager {
                 "unsloth server did not open its HTTP port within {}s",
                 self.config.server_up_timeout.as_secs()
             )),
+            WaitError::ShuttingDown => shutting_down_error(),
         })?;
 
         // Phase 2: mint the opencode auth material. `--no-launch` requires a
@@ -461,6 +494,7 @@ impl UnslothServerManager {
                 "model {repo_id} did not become ready within {} minutes (download may still be in progress — retry later)",
                 self.config.model_ready_timeout.as_secs() / 60
             )),
+            WaitError::ShuttingDown => shutting_down_error(),
         })?;
         Ok(endpoint)
     }
@@ -511,11 +545,15 @@ impl UnslothServerManager {
                 }
             )));
         }
-        let home = self
-            .config
-            .home_dir
-            .as_deref()
-            .ok_or_else(|| Error::Internal("cannot resolve home directory".to_string()))?;
+        // InvalidInput (not Internal) for the same reason as
+        // `missing_binary_error`: an unresolvable home directory is an
+        // environment misconfiguration and the message must survive the
+        // JSON-RPC envelope.
+        let home = self.config.home_dir.as_deref().ok_or_else(|| {
+            Error::InvalidInput(
+                "cannot resolve home directory (HOME/USERPROFILE unset) — needed to read the unsloth-generated opencode config".to_string(),
+            )
+        })?;
         let path = generated_config_path(home);
         let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
             Error::Internal(format!(
@@ -527,7 +565,7 @@ impl UnslothServerManager {
     }
 
     /// Poll `check` every [`UnslothConfig::probe_interval`] until it returns
-    /// `true`, the child exits, or `timeout` elapses.
+    /// `true`, the child exits, a shutdown is requested, or `timeout` elapses.
     async fn wait_until<F, Fut>(
         &self,
         timeout: Duration,
@@ -540,6 +578,9 @@ impl UnslothServerManager {
     {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            if self.is_shutting_down() {
+                return Err(WaitError::ShuttingDown);
+            }
             if !server.is_alive() {
                 return Err(WaitError::ChildExited);
             }
@@ -554,8 +595,14 @@ impl UnslothServerManager {
     }
 
     /// Kill the managed server (daemon shutdown / explicit teardown). No-op
-    /// when no server is running.
+    /// when no server is running. Sets the terminal shutdown latch BEFORE
+    /// taking the state lock, so an in-flight `ensure_endpoint` startup
+    /// (potentially sitting in a minutes-long model-download probe loop)
+    /// aborts at its next probe tick and releases the lock — shutdown waits
+    /// at most ~one probe interval plus the startup's own cleanup kill.
     pub async fn shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut state = self.state.lock().await;
         if let Some(mut server) = state.take() {
             tracing::info!(repo = %server.repo_id, "shutting down managed unsloth server");
@@ -569,6 +616,8 @@ impl UnslothServerManager {
 enum WaitError {
     ChildExited,
     TimedOut,
+    /// [`UnslothServerManager::shutdown`] was requested mid-startup.
+    ShuttingDown,
 }
 
 /// GET `url` (optionally with a Bearer key), returning the HTTP status code
@@ -964,6 +1013,37 @@ mod tests {
                 mgr.state.lock().await.is_none(),
                 "failed startup must clear state so the next attempt starts clean"
             );
+        }
+
+        #[tokio::test]
+        async fn shutdown_aborts_in_flight_startup_without_waiting_out_the_timeout() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // `run` sleeps but never opens the HTTP socket, so the startup
+            // sits in its phase-1 probe loop for the whole (long) window
+            // unless shutdown aborts it.
+            let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), 1);
+            config.server_up_timeout = Duration::from_secs(600);
+            let mgr = Arc::new(UnslothServerManager::with_config(config));
+
+            let m2 = mgr.clone();
+            let startup = tokio::spawn(async move { m2.ensure_endpoint(REPO, &|_| {}).await });
+            // Give the startup time to spawn the child and enter the loop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let start = tokio::time::Instant::now();
+            mgr.shutdown().await;
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "shutdown must not wait out the startup window"
+            );
+            let err = startup.await.expect("join").unwrap_err();
+            assert!(err.to_string().contains("shutting down"), "got: {err}");
+            assert!(mgr.state.lock().await.is_none(), "no server left tracked");
+
+            // Post-shutdown spawns are refused outright.
+            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            assert!(err.to_string().contains("shutting down"), "got: {err}");
         }
 
         #[tokio::test]
