@@ -8,7 +8,7 @@
 //! [`record_session_started`] / [`record_lines_changed`] fold their one-shot
 //! deltas straight into the store. Stats aggregate globally across workspaces
 //! into the `usage_stats_hourly` table (one row per UTC hour bucket +
-//! normalized model).
+//! normalized model + resolved provider id).
 
 use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
 use intent_store::{LocalStamp, Store, UsageStatsDelta};
@@ -238,6 +238,19 @@ pub fn stats_model_key(
         .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
 }
 
+/// The `usage_stats_hourly` provider key for a session: the resolved provider
+/// id (callers compute it with [`crate::agent_session::resolve_provider_id`]
+/// when the session row is readable), trimmed and lowercased; `"unknown"`
+/// when the provider is unknowable — the session row read failed, or the row
+/// predates provider attribution.
+pub fn stats_provider_key(provider_id: Option<&str>) -> String {
+    provider_id
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_ascii_lowercase())
+        .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+}
+
 /// Record one agent-session start (D2: *sessions* = agent sessions) into the
 /// current UTC hour bucket of `usage_stats_hourly`, keyed by the session's
 /// [`stats_model_key`] (normalized model, falling back to the resolved
@@ -258,12 +271,13 @@ pub async fn record_session_started(
     // No resolved display model exists at creation time — the configOptions
     // resolution (D13/D14) only happens at session open.
     let model = stats_model_key(raw_model, None, Some(&provider_id));
+    let provider_key = stats_provider_key(Some(&provider_id));
     let delta = UsageStatsDelta {
         sessions_started: 1,
         ..Default::default()
     };
     if let Err(e) = store
-        .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+        .add_usage_stats(&bucket, &model, &provider_key, local.as_ref(), &delta)
         .await
     {
         tracing::warn!(error = %e, "record session-start usage stats failed");
@@ -316,13 +330,14 @@ pub async fn record_lines_changed(
         resolved_model.as_deref(),
         provider_id.as_deref(),
     );
+    let provider_key = stats_provider_key(provider_id.as_deref());
     let delta = UsageStatsDelta {
         lines_added,
         lines_deleted,
         ..Default::default()
     };
     if let Err(e) = store
-        .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+        .add_usage_stats(&bucket, &model, &provider_key, local.as_ref(), &delta)
         .await
     {
         tracing::warn!(agent = %agent_id, error = %e, "record lines-changed usage stats failed");

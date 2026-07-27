@@ -156,10 +156,10 @@ fn floor_to_hour(t: OffsetDateTime) -> OffsetDateTime {
 ///
 /// Result shape (all periods): `totals` (4 counters), `runs`, `sessions`,
 /// `longestRunMs`, `linesAdded`, `linesDeleted`, `byModel` (sorted desc by
-/// total tokens), `byHourOfDay` (24 entries), `byMonth` (12 entries, the
-/// period's local year; zeroed for 24h), and `availablePeriods` computed over
-/// ALL rows regardless of the requested period. Empty periods return zeroed
-/// shapes, never an error.
+/// total tokens), `byProvider` (raw provider ids, same sorting), `byHourOfDay`
+/// (24 entries), `byMonth` (12 entries, the period's local year; zeroed for
+/// 24h), and `availablePeriods` computed over ALL rows regardless of the
+/// requested period. Empty periods return zeroed shapes, never an error.
 pub fn aggregate_usage(
     rows: &[UsageStatsRow],
     period: UsagePeriod,
@@ -185,6 +185,7 @@ pub fn aggregate_usage(
     let mut lines_added = 0u64;
     let mut lines_deleted = 0u64;
     let mut by_model: BTreeMap<String, (TokenCell, u64)> = BTreeMap::new();
+    let mut by_provider: BTreeMap<String, (TokenCell, u64)> = BTreeMap::new();
     let mut by_hour = [TokenCell::default(); 24];
     let mut by_month = [TokenCell::default(); 12];
     let mut months: BTreeSet<String> = BTreeSet::new();
@@ -240,6 +241,9 @@ pub fn aggregate_usage(
         let entry = by_model.entry(row.model.clone()).or_default();
         entry.0.add(row);
         entry.1 += row.runs;
+        let entry = by_provider.entry(row.provider.clone()).or_default();
+        entry.0.add(row);
+        entry.1 += row.runs;
     }
 
     // byModel sorted desc by total tokens; ties break on model name (asc, via
@@ -251,6 +255,21 @@ pub fn aggregate_usage(
         .map(|(model, (cell, runs))| {
             let mut v = cell.json();
             v["model"] = json!(model);
+            v["runs"] = json!(runs);
+            v
+        })
+        .collect();
+
+    // byProvider mirrors byModel: raw provider ids on the wire ('unknown' for
+    // pre-migration rows), sorted desc by total tokens, ties on provider id
+    // asc (the BTreeMap ordering surviving the stable sort).
+    let mut providers: Vec<(String, (TokenCell, u64))> = by_provider.into_iter().collect();
+    providers.sort_by_key(|(_, (cell, _))| std::cmp::Reverse(cell.total()));
+    let by_provider_json: Vec<Value> = providers
+        .into_iter()
+        .map(|(provider, (cell, runs))| {
+            let mut v = cell.json();
+            v["provider"] = json!(provider);
             v["runs"] = json!(runs);
             v
         })
@@ -294,6 +313,7 @@ pub fn aggregate_usage(
         "linesAdded": lines_added,
         "linesDeleted": lines_deleted,
         "byModel": by_model_json,
+        "byProvider": by_provider_json,
         "byHourOfDay": by_hour_json,
         "byMonth": by_month_json,
         "availablePeriods": {
@@ -312,9 +332,14 @@ mod tests {
     }
 
     fn row(bucket: &str, model: &str, input: u64, output: u64) -> UsageStatsRow {
+        prow(bucket, model, "claude-code", input, output)
+    }
+
+    fn prow(bucket: &str, model: &str, provider: &str, input: u64, output: u64) -> UsageStatsRow {
         UsageStatsRow {
             bucket_utc: bucket.to_string(),
             model: model.to_string(),
+            provider: provider.to_string(),
             input_tokens: input,
             output_tokens: output,
             ..Default::default()
@@ -409,6 +434,78 @@ mod tests {
     }
 
     #[test]
+    fn by_provider_aggregates_across_buckets_sorted_desc_with_ties_asc() {
+        let now = parse("2026-07-25T10:00:00Z");
+        // codex spans two buckets (60 total) and outranks claude-code (50);
+        // droid and pi tie at 5 and must come out in provider-id order. The
+        // June row is outside the period and must not leak into byProvider.
+        let mut codex_a = prow("2026-07-10T14:00:00Z", "GPT-6", "codex", 40, 0);
+        codex_a.runs = 1;
+        let mut codex_b = prow("2026-07-11T09:00:00Z", "GPT-6 Mini", "codex", 20, 0);
+        codex_b.runs = 2;
+        let mut claude = prow("2026-07-12T08:00:00Z", "Opus 4.8", "claude-code", 30, 20);
+        claude.runs = 3;
+        let rows = vec![
+            codex_a,
+            codex_b,
+            claude,
+            prow("2026-07-13T10:00:00Z", "Pi 1", "pi", 5, 0),
+            prow("2026-07-14T10:00:00Z", "Droid 1", "droid", 5, 0),
+            prow("2026-06-30T12:00:00Z", "Opus 4.8", "opencode", 999, 0),
+        ];
+        let v = aggregate_usage(
+            &rows,
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        let by_provider = v["byProvider"].as_array().unwrap();
+        assert_eq!(by_provider.len(), 4, "June opencode row excluded");
+        assert_eq!(by_provider[0]["provider"], "codex");
+        assert_eq!(by_provider[0]["inputTokens"], 60);
+        assert_eq!(by_provider[0]["runs"], 3);
+        assert_eq!(by_provider[1]["provider"], "claude-code");
+        assert_eq!(by_provider[1]["inputTokens"], 30);
+        assert_eq!(by_provider[1]["outputTokens"], 20);
+        assert_eq!(by_provider[1]["runs"], 3);
+        assert_eq!(by_provider[2]["provider"], "droid", "tie breaks id asc");
+        assert_eq!(by_provider[3]["provider"], "pi");
+    }
+
+    #[test]
+    fn by_provider_keeps_unknown_bucket_for_unattributed_rows() {
+        // Pre-migration rows carry provider 'unknown'; the wire keeps the raw
+        // id — no display-name mapping in the daemon.
+        let now = parse("2026-07-25T10:00:00Z");
+        let rows = vec![
+            prow("2026-07-10T14:00:00Z", "Opus 4.8", "unknown", 10, 0),
+            prow("2026-07-11T14:00:00Z", "Opus 4.8", "claude-code", 90, 0),
+        ];
+        let v = aggregate_usage(
+            &rows,
+            UsagePeriod::Month {
+                year: 2026,
+                month: 7,
+            },
+            0,
+            now,
+        )
+        .unwrap();
+        // One model, two providers: byProvider splits what byModel folds.
+        assert_eq!(v["byModel"].as_array().unwrap().len(), 1);
+        let by_provider = v["byProvider"].as_array().unwrap();
+        assert_eq!(by_provider.len(), 2);
+        assert_eq!(by_provider[0]["provider"], "claude-code");
+        assert_eq!(by_provider[0]["inputTokens"], 90);
+        assert_eq!(by_provider[1]["provider"], "unknown");
+        assert_eq!(by_provider[1]["inputTokens"], 10);
+    }
+
+    #[test]
     fn tz_shift_moves_buckets_across_period_boundaries() {
         let now = parse("2026-07-25T10:00:00Z");
         // 23:30 UTC June 30 bucket floor is 23:00Z; at +120 minutes it is
@@ -490,6 +587,7 @@ mod tests {
         assert_eq!(v["linesAdded"], 0);
         assert_eq!(v["linesDeleted"], 0);
         assert_eq!(v["byModel"], json!([]));
+        assert_eq!(v["byProvider"], json!([]));
         assert_eq!(v["byHourOfDay"].as_array().unwrap().len(), 24);
         assert_eq!(v["byMonth"].as_array().unwrap().len(), 12);
         assert_eq!(v["availablePeriods"]["months"], json!([]));

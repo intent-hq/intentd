@@ -1603,9 +1603,10 @@ impl Services {
             resolved_model.as_deref(),
             provider_id.as_deref(),
         );
+        let provider_key = usage_stats::stats_provider_key(provider_id.as_deref());
         if let Err(e) = self
             .store
-            .add_usage_stats(&bucket, &model, local.as_ref(), &delta)
+            .add_usage_stats(&bucket, &model, &provider_key, local.as_ref(), &delta)
             .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "record turn usage stats failed");
