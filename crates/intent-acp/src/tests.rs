@@ -3650,17 +3650,20 @@ mod mcp_bridge_tests {
     /// knobs so tests stay fast.
     mod stdio_bridge_resilience {
         use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
         use std::time::Duration;
 
         use serde_json::{json, Value};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
         use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::Notify;
         use tokio::task::JoinHandle;
         use tokio::time::{sleep, timeout};
 
         use crate::mcp_bridge::{
-            run_bridge, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE, BRIDGE_DISCONNECTED_MESSAGE,
-            INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
+            run_bridge, run_bridge_with, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE,
+            BRIDGE_DISCONNECTED_MESSAGE, INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
         };
 
         fn fast_cfg() -> BridgeRetryConfig {
@@ -3683,6 +3686,28 @@ mod mcp_bridge_tests {
             let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
             let handle = tokio::spawn(async move {
                 run_bridge(&addr.to_string(), stdin_remote, stdout_remote, cfg).await
+            });
+            BridgeHarness {
+                stdin,
+                stdout: BufReader::new(stdout),
+                handle,
+            }
+        }
+
+        /// [`spawn_bridge`] with an injected connector (monorepo#906 tests).
+        fn spawn_bridge_with_connector<C, Fut>(
+            addr: SocketAddr,
+            cfg: BridgeRetryConfig,
+            connect: C,
+        ) -> BridgeHarness
+        where
+            C: FnMut() -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = std::io::Result<TcpStream>> + Send,
+        {
+            let (stdin, stdin_remote) = tokio::io::duplex(64 * 1024);
+            let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
+            let handle = tokio::spawn(async move {
+                run_bridge_with(&addr.to_string(), stdin_remote, stdout_remote, cfg, connect).await
             });
             BridgeHarness {
                 stdin,
@@ -3934,6 +3959,160 @@ mod mcp_bridge_tests {
             let resp = bridge.read_response().await;
             assert_eq!(resp["id"], json!(2));
             assert_eq!(resp["result"]["ok"], json!(true));
+        }
+
+        /// Regression for monorepo#906: a stdin line that races a *pending*
+        /// mid-session reconnect attempt must be decided by that attempt's
+        /// outcome, not rejected against possibly stale readiness. The gated
+        /// connector pins the bridge in "attempt in flight" while the test
+        /// writes the request; a pre-fix bridge answers `-32001` here, the
+        /// fixed bridge holds the line and forwards it on the fresh
+        /// connection.
+        #[tokio::test]
+        async fn line_racing_pending_reconnect_is_forwarded_when_attempt_succeeds() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicU32::new(0));
+            let gate = Arc::new(Notify::new());
+            let connect = {
+                let attempts = attempts.clone();
+                let gate = gate.clone();
+                move || {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    let gate = gate.clone();
+                    async move {
+                        if n >= 2 {
+                            gate.notified().await;
+                        }
+                        TcpStream::connect(addr).await
+                    }
+                }
+            };
+            let mut bridge = spawn_bridge_with_connector(addr, fast_cfg(), connect);
+
+            // Session 1: answer one request cleanly, then drop the TCP side.
+            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (read1, mut write1) = conn1.into_split();
+            bridge.send_request(1).await;
+            let mut lines1 = BufReader::new(read1).lines();
+            let line = timeout(Duration::from_secs(5), lines1.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
+            write1
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(1));
+            drop(write1);
+            drop(lines1);
+
+            // Wait until reconnect attempt 2 is in flight (parked on the gate).
+            timeout(Duration::from_secs(5), async {
+                while attempts.load(Ordering::SeqCst) < 2 {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("bridge never started the reconnect attempt");
+
+            // This request races the pending attempt: it must be held, not
+            // rejected with -32001.
+            bridge.send_request(2).await;
+            sleep(Duration::from_millis(50)).await;
+            gate.notify_one();
+
+            let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("bridge never completed the reconnect")
+                .unwrap();
+            tokio::spawn(answer_requests(conn2));
+
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(2));
+            assert_eq!(
+                resp["result"]["ok"],
+                json!(true),
+                "request racing a successful reconnect must be forwarded, got: {resp}"
+            );
+        }
+
+        /// Companion to the race regression (monorepo#906): when the pending
+        /// attempt the line raced *fails*, the held line gets the retryable
+        /// disconnected error — held lines are decided by the attempt's
+        /// outcome, never silently dropped.
+        #[tokio::test]
+        async fn line_racing_pending_reconnect_gets_retryable_error_when_attempt_fails() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicU32::new(0));
+            let gate = Arc::new(Notify::new());
+            let connect = {
+                let attempts = attempts.clone();
+                let gate = gate.clone();
+                move || {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    let gate = gate.clone();
+                    async move {
+                        if n == 1 {
+                            TcpStream::connect(addr).await
+                        } else {
+                            gate.notified().await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "gated refuse",
+                            ))
+                        }
+                    }
+                }
+            };
+            let mut bridge = spawn_bridge_with_connector(addr, fast_cfg(), connect);
+
+            // Session 1: answer one request cleanly, then drop the TCP side.
+            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (read1, mut write1) = conn1.into_split();
+            bridge.send_request(1).await;
+            let mut lines1 = BufReader::new(read1).lines();
+            let line = timeout(Duration::from_secs(5), lines1.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
+            write1
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(1));
+            drop(write1);
+            drop(lines1);
+
+            timeout(Duration::from_secs(5), async {
+                while attempts.load(Ordering::SeqCst) < 2 {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("bridge never started the reconnect attempt");
+
+            bridge.send_request(2).await;
+            sleep(Duration::from_millis(50)).await;
+            gate.notify_one();
+
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 2);
         }
 
         #[tokio::test]
