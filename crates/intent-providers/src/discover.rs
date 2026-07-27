@@ -111,7 +111,11 @@ fn gated_reason(provider: &ProviderConfig) -> Option<String> {
 /// aggregate surface and `host.providerAuthStatus` share one resolution
 /// precedence: native installer locations (grok `~/.grok/bin`, opencode
 /// `~/.opencode/bin`), then `~/.augment/bin`, then the enhanced PATH scan
-/// (inherited PATH + enriched tool dirs + login-shell capture).
+/// (inherited PATH + enriched tool dirs + login-shell capture). Providers with
+/// [`ProviderConfig::requires_secondary_binary`] set (unsloth: `opencode` +
+/// `unsloth`) additionally require that second binary to resolve — the
+/// `resolved_path` still reports the primary `command`'s path (the ACP spawn
+/// target), but `installed` is `false` unless both binaries are present.
 pub fn discover_providers() -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
@@ -124,11 +128,24 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             } else {
                 find_provider_binary(provider.id, provider.command, None)
             };
+            // The secondary binary (unsloth: the `unsloth` CLI itself) is
+            // resolved with the same provider_id/command pair the daemon's
+            // managed-server lifecycle uses (`UnslothConfig::default`'s
+            // `resolve_binary`), so discovery and the actual spawn path agree
+            // on where the binary must live.
+            let secondary_resolved =
+                |secondary: &str| find_provider_binary(secondary, secondary, None).is_some();
+            let installed = gated_off.is_none()
+                && installed_with_secondary(
+                    resolved_path.is_some(),
+                    provider.requires_secondary_binary,
+                    secondary_resolved,
+                );
             ProviderAvailability {
                 id: provider.id,
                 display_name: provider.display_name,
                 command: provider.command,
-                installed: resolved_path.is_some(),
+                installed,
                 resolved_path,
                 gated_off,
                 auth_check_args: provider.auth_check_args,
@@ -137,6 +154,19 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             }
         })
         .collect()
+}
+
+/// Combine a provider's primary-binary resolution with its optional secondary
+/// requirement ([`ProviderConfig::requires_secondary_binary`]): `true` only
+/// when the primary resolved AND (no secondary is required OR the secondary
+/// resolves too). Pure/injectable so the four presence combinations are unit
+/// tested without touching the real filesystem or `PATH`.
+fn installed_with_secondary(
+    primary_resolved: bool,
+    requires_secondary: Option<&str>,
+    secondary_resolved: impl Fn(&str) -> bool,
+) -> bool {
+    primary_resolved && requires_secondary.is_none_or(secondary_resolved)
 }
 
 /// Probe npx availability (path only, no spawning). Returns the resolved path
@@ -629,6 +659,64 @@ mod find_provider_binary_tests {
         let dirs = vec![PathBuf::from("/nonexistent/first"), login_dir];
         assert_eq!(find_in_dirs(&dirs, "opencode"), Some(bin));
         assert_eq!(find_in_dirs(&dirs, "intent-test-absent-cmd"), None);
+    }
+
+    #[test]
+    fn installed_with_secondary_no_requirement_mirrors_primary() {
+        assert!(installed_with_secondary(true, None, |_| false));
+        assert!(!installed_with_secondary(false, None, |_| true));
+    }
+
+    #[test]
+    fn installed_with_secondary_requires_both_present() {
+        // Both present.
+        assert!(installed_with_secondary(true, Some("unsloth"), |_| true));
+        // Only primary (opencode) present, secondary (unsloth CLI) missing.
+        assert!(!installed_with_secondary(true, Some("unsloth"), |_| false));
+        // Only secondary present, primary missing.
+        assert!(!installed_with_secondary(false, Some("unsloth"), |_| true));
+        // Neither present.
+        assert!(!installed_with_secondary(false, Some("unsloth"), |_| false));
+    }
+
+    #[test]
+    fn unsloth_registry_entry_requires_the_unsloth_cli_secondary_binary() {
+        let unsloth = crate::config::ACP_PROVIDERS
+            .iter()
+            .find(|p| p.id == "unsloth")
+            .expect("unsloth must be registered");
+        assert_eq!(
+            unsloth.command, "opencode",
+            "unsloth rides opencode's ACP runtime"
+        );
+        assert_eq!(
+            unsloth.requires_secondary_binary,
+            Some("unsloth"),
+            "unsloth availability must additionally require the unsloth CLI"
+        );
+    }
+
+    #[test]
+    fn discover_providers_unsloth_installed_iff_command_field_present() {
+        // Regardless of the real host's installed binaries, the discovery
+        // snapshot's `installed` flag for unsloth must be consistent with
+        // `installed_with_secondary`'s semantics: it can only be `true` when
+        // both the primary (opencode) and secondary (unsloth CLI) resolved.
+        let providers = discover_providers();
+        let unsloth = providers
+            .iter()
+            .find(|p| p.id == "unsloth")
+            .expect("unsloth must be in the discovery snapshot");
+        if unsloth.installed {
+            assert!(
+                unsloth.resolved_path.is_some(),
+                "installed=true requires a resolved opencode path"
+            );
+            assert!(
+                find_provider_binary("unsloth", "unsloth", None).is_some(),
+                "installed=true requires the unsloth CLI to also resolve"
+            );
+        }
     }
 
     #[test]
