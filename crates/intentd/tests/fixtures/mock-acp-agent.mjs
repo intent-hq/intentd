@@ -53,6 +53,21 @@ function log(msg) {
   process.stderr.write(`[mock-agent] ${msg}\n`);
 }
 
+// Session-lifecycle log: one JSON line per session/new | session/load —
+// { method, sessionId, pid } — when MOCK_AGENT_SESSION_LOG points at a file.
+// Lets e2e tests assert exactly which session ids the daemon offered to which
+// child process (e.g. that a cross-provider switch never issues session/load
+// with the old provider's id — monorepo#907).
+function logSessionCall(method, sessionId) {
+  const path = process.env.MOCK_AGENT_SESSION_LOG;
+  if (!path) return;
+  try {
+    fs.appendFileSync(path, JSON.stringify({ method, sessionId, pid: process.pid }) + '\n');
+  } catch (err) {
+    log(`session log write failed: ${err.message}`);
+  }
+}
+
 function mcpConfigPath() {
   const argv = process.argv;
   const i = argv.indexOf('--mcp-config');
@@ -633,7 +648,13 @@ async function dispatch(msg) {
         log(`delaying initialize reply by ${behavior.initializeDelayMs}ms`);
         await new Promise((r) => setTimeout(r, behavior.initializeDelayMs));
       }
-      return result(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: false } });
+      // `loadSession: true` behavior: advertise the capability and accept any
+      // session/load (see the session/load arm) — the worst-case provider that
+      // silently accepts a foreign session id (monorepo#907).
+      return result(msg.id, {
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: behavior.loadSession === true },
+      });
     case 'authenticate':
       return result(msg.id, {});
     case 'session/new': {
@@ -653,15 +674,22 @@ async function dispatch(msg) {
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
+      logSessionCall('session/new', SESSION_ID);
       return result(msg.id, { sessionId: SESSION_ID });
     }
     case 'session/load':
-      // Mirror session/new's stash-overwrite so a future loadSession-capable
-      // fixture (or a test sending session/load first) can't observe a stale
-      // list; the load itself is still rejected (loadSession: false).
+      // Mirror session/new's stash-overwrite so a loadSession-capable run (or
+      // a test sending session/load first) can't observe a stale list.
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
+      logSessionCall('session/load', msg.params && msg.params.sessionId);
+      // With `loadSession: true` behavior, accept ANY session id — including a
+      // foreign one — modelling the worst-case provider monorepo#907 guards
+      // against. Otherwise reject (capability was advertised false anyway).
+      if (behavior.loadSession === true) {
+        return result(msg.id, {});
+      }
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
     case 'session/set_mode':
       // Accept any mode change request (no-op for the mock).
