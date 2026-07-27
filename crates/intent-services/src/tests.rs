@@ -17520,3 +17520,178 @@ mod display_status {
         );
     }
 }
+
+/// Transition-only emission of `workspace:displayStatus-changed` (PROTOCOL
+/// §6.5): the recompute-and-compare seam behind
+/// `maybe_emit_display_status_changed` publishes exactly on a derived-status
+/// transition — a first observation seeds without emitting and a no-op
+/// recompute stays silent.
+mod display_status_events {
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata, TaskStatus,
+        WorkspaceApi, WorkspaceId,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    /// Direct child task note of the spec, so it counts into `taskStats`.
+    fn task_note(ws: &WorkspaceId, id: &str, status: TaskStatus) -> Note {
+        let ts = now_iso();
+        Note {
+            id: NoteId::from(id),
+            workspace_id: ws.clone(),
+            title: format!("Task {id}"),
+            content: String::new(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(NoteId::from("spec")),
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata {
+                task: Some(TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    /// Subscribe to only `workspace:displayStatus-changed` for this workspace.
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:displayStatus-changed".to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_silent(sub: &mut Subscription) {
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(res.is_err(), "expected no displayStatus event: {res:?}");
+    }
+
+    /// A task-completion transition (in_progress → complete over
+    /// `task.updateNoteStatus`) emits the event with the self-sufficient
+    /// `{ workspaceId, displayStatus }` payload.
+    #[tokio::test]
+    async fn task_completion_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                NoteId::from("t1"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("update status");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(ev["workspaceId"], h.ws.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
+    }
+
+    /// A task-status change that does not move the derived rollup (a second
+    /// task flipping not_started → in_progress while the rollup is already
+    /// `in_progress`) publishes no displayStatus event.
+    #[tokio::test]
+    async fn no_op_recompute_stays_silent() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                NoteId::from("t2"),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("update status");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The first observation for a workspace seeds the cache without emitting;
+    /// the next actual transition emits.
+    #[tokio::test]
+    async fn first_observation_seeds_without_emitting() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+
+        let mut sub = subscribe(&h);
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+        assert_silent(&mut sub).await;
+
+        // Repeat recompute with no underlying change: still silent.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+        assert_silent(&mut sub).await;
+    }
+}

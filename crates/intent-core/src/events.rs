@@ -187,6 +187,11 @@ pub const WORKSPACE_ACTIVITY: &str = "workspace:activity";
 // `attention-changed` is emitted by `workspace.dismissAttention`/`markSeen` (§9.9).
 pub const WORKSPACE_ACTIVITY_CHANGED: &str = "workspace:activity-changed";
 pub const WORKSPACE_ATTENTION_CHANGED: &str = "workspace:attention-changed";
+// Derived `Workspace.displayStatus` rollup transition (PROTOCOL §6.5):
+// recomputed-and-compared after the task/PR mutations that can move the
+// derivation; the self-sufficient payload `{ workspaceId, displayStatus }`
+// updates the workspace card badge with no follow-up fetch.
+pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
@@ -387,6 +392,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ACTIVITY,
     WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
     SPEC_UPDATED,
