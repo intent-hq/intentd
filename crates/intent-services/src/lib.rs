@@ -8418,6 +8418,48 @@ impl WorkspaceApi for Services {
                                     input.repository_name = Some(name);
                                 }
                             }
+                        } else if input.is_new_repo.unwrap_or(false) {
+                            // New-project flow (intent-hq/monorepo#962): the FE
+                            // marks non-git / not-yet-existing folders with
+                            // `isNewRepo: true` expecting the daemon to
+                            // initialize them. Reuse the
+                            // `workspace.initializeRepository` blocking body
+                            // *before* branch naming so the downstream worktree
+                            // provisioning sees a real checkout; a failure
+                            // fails the whole create pre-insert (no row
+                            // persisted, no `workspace:created`), matching the
+                            // clone-failure rule (PROTOCOL §5.1). Skipped when
+                            // a `githubUrl` clone is in play (above) or the
+                            // path already carries a `.git` (existing_repo).
+                            if let Some(repo_path) = input
+                                .repository_path
+                                .as_deref()
+                                .filter(|p| !p.is_empty())
+                                .map(PathBuf::from)
+                            {
+                                tokio::task::spawn_blocking(move || {
+                                    initialize_repository_blocking(&repo_path)
+                                })
+                                .await
+                                .map_err(|e| {
+                                    Error::Internal(format!(
+                                        "workspace.create: repository initialization task failed: {e}"
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    let detail = match e {
+                                        Error::Internal(msg) => msg,
+                                        other => other.to_string(),
+                                    };
+                                    let detail = detail
+                                        .strip_prefix("workspace.initializeRepository: ")
+                                        .map(str::to_string)
+                                        .unwrap_or(detail);
+                                    Error::Internal(format!(
+                                        "workspace.create: repository initialization failed: {detail}"
+                                    ))
+                                })?;
+                            }
                         }
                     }
                     // Repository owner/name derivation from origin remote (STAB-64):
