@@ -478,6 +478,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        display_status: None,
         token_usage,
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,

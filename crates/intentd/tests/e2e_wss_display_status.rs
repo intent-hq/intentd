@@ -1,11 +1,12 @@
-//! WSS end-to-end for the `pr:linked` / `pr:updated` event payloads
-//! (PROTOCOL §6.5): both must carry the daemon-owned `pullRequests` list so a
-//! subscribed client can render the full per-branch PR list without a refetch.
-//! Drives a real [`WsApiServer`] over TLS with bearer-token auth and a pinned
-//! self-signed fingerprint (the production transport path) with a stub forge
-//! injected via `with_source_control`, then triggers the same refresh the 60s
-//! background sweep runs and asserts the `events.event` notifications observed
-//! over the wire.
+//! WSS end-to-end for the derived `Workspace.displayStatus` aggregate and its
+//! `workspace:displayStatus-changed` transition event (PROTOCOL §6.5):
+//! `workspace.list` / `workspace.get` responses carry `displayStatus`, and a
+//! task-status change plus a PR-linkage change driven over the wire each emit
+//! exactly one `events.event` notification with the self-sufficient
+//! `{ workspaceId, displayStatus }` payload. Drives a real [`WsApiServer`]
+//! over TLS with bearer-token auth and a pinned self-signed fingerprint (the
+//! production transport path) with a stub forge injected via
+//! `with_source_control`.
 
 #![cfg(unix)]
 
@@ -39,15 +40,13 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
+
+use common::TlsWs;
 
 /// A fixed 64-char hex token (valid shape) shared by server + client.
-const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
-
-type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -147,12 +146,10 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 
 /// Stub forge: `get_pr` reports the linked PR (#42, head `feature`) as merged;
 /// when `open_pr_number` is set, `list_prs` offers that open PR on the same
-/// head ref (the relink successor). When `caps` is set it overrides the
-/// advertised capabilities (default all-true) for the gating tests.
+/// head ref.
 #[derive(Default)]
 struct StubForge {
     open_pr_number: Option<u64>,
-    caps: Option<ScCapabilities>,
 }
 
 fn sample_pr() -> PullRequest {
@@ -180,14 +177,14 @@ impl SourceControl for StubForge {
         "stub"
     }
     fn capabilities(&self) -> ScCapabilities {
-        self.caps.unwrap_or(ScCapabilities {
+        ScCapabilities {
             draft_prs: true,
             squash_merge: true,
             rebase_merge: true,
             review_required_changes: true,
             check_runs: true,
             issues: true,
-        })
+        }
     }
     async fn check_auth(&self) -> ScResult<AuthStatus> {
         unimplemented!()
@@ -223,8 +220,14 @@ impl SourceControl for StubForge {
     async fn create_pr(&self, _: &RepoRef, _: NewPullRequest) -> ScResult<PullRequest> {
         unimplemented!()
     }
-    async fn get_pr(&self, _: &RepoRef, _: u64) -> ScResult<PullRequest> {
-        Ok(sample_pr())
+    async fn get_pr(&self, _: &RepoRef, number: u64) -> ScResult<PullRequest> {
+        let mut pr = sample_pr();
+        if Some(number) == self.open_pr_number {
+            pr.number = number;
+            pr.url = format!("https://github.com/o/r/pull/{number}");
+            pr.state = PrState::Open;
+        }
+        Ok(pr)
     }
     async fn list_prs(&self, _: &RepoRef, _: PrQuery) -> ScResult<Page<PullRequest>> {
         let items = match self.open_pr_number {
@@ -333,27 +336,17 @@ struct Fixture {
     _ws: WsApiServer,
     port: u16,
     cfg: Arc<ClientConfig>,
-    services: Arc<Services>,
     ws_id: WorkspaceId,
     _dir: TempDir,
 }
 
-/// Boot a TLS + bearer-auth WSS listener whose services carry the stub forge
-/// and a seeded workspace linked to PR #42 on branch `feature`.
-async fn boot(forge: StubForge) -> Fixture {
-    boot_seeded(forge, "feature", None, Some(42)).await
-}
-
-/// Like [`boot`], but with explicit workspace `branch`, `baseRef`, and PR
-/// linkage so tests can seed unlinked/review workspaces.
-async fn boot_seeded(
-    forge: StubForge,
-    branch: &str,
-    base_ref: Option<&str>,
-    pr_number: Option<u64>,
-) -> Fixture {
+/// Boot a TLS + bearer-auth WSS listener over a seeded workspace. When
+/// `linkable` is true the workspace carries repo info on branch `feature`
+/// (unlinked) so the stub forge can discover the open PR; otherwise it has no
+/// repo info at all (PR paths inert for the task-driven test).
+async fn boot(forge: StubForge, linkable: bool) -> Fixture {
     let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-pr-events-{}", &short[..8]));
+    let dir = std::env::temp_dir().join(format!("intentd-display-status-{}", &short[..8]));
     std::fs::create_dir_all(&dir).unwrap();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
@@ -364,9 +357,13 @@ async fn boot_seeded(
     let ts = now_iso();
     let ws = Workspace {
         id: ws_id.clone(),
-        title: "PR events".into(),
-        branch: branch.into(),
-        base_ref: base_ref.map(Into::into),
+        title: "Display status".into(),
+        branch: if linkable {
+            "feature".into()
+        } else {
+            String::new()
+        },
+        base_ref: None,
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: None,
@@ -378,15 +375,15 @@ async fn boot_seeded(
         tags: vec![],
         path: None,
         repository_path: None,
-        repository_owner: Some("o".into()),
-        repository_name: Some("r".into()),
+        repository_owner: linkable.then(|| "o".into()),
+        repository_name: linkable.then(|| "r".into()),
         worktree_path: None,
         scope: None,
         skip_worktree: false,
         setup_script: None,
         is_remote: false,
         default_model: None,
-        pr_number,
+        pr_number: None,
         pr_url: None,
         pr_status: None,
         active_pull_request: None,
@@ -426,7 +423,6 @@ async fn boot_seeded(
         _ws: ws_srv,
         port,
         cfg,
-        services,
         ws_id,
         _dir: TempDir(dir),
     }
@@ -488,280 +484,194 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
     .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
 }
 
-/// Relink-after-merge over the wire: the linked PR (#42) is fetched as merged
-/// and an open successor (#300) exists on the same branch → the refresh emits
-/// `pr:linked` whose payload carries prNumber 300 plus the full `pullRequests`
-/// list (merged #42 retained, open #300 added), matching PROTOCOL §6.5.
-#[tokio::test]
-async fn pr_linked_event_carries_pull_requests_list_over_wss() {
-    let fx = boot(StubForge {
-        open_pr_number: Some(300),
-        ..Default::default()
+/// Assert no `workspace:displayStatus-changed` notification arrives within the
+/// window (transition-only emission — no spam on no-op recomputes).
+async fn assert_no_display_status_event(ws: &mut TlsWs) {
+    let res = timeout(Duration::from_millis(500), async {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v["method"] == json!("events.event")
+                        && v["params"]["event"]["type"] == json!("workspace:displayStatus-changed")
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Message::Ping(p) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                _ => {}
+            }
+        }
     })
     .await;
+    assert!(res.is_err(), "unexpected displayStatus event: {res:?}");
+}
 
+/// Task-driven transition over the wire: `workspace.get`/`workspace.list`
+/// carry the derived `displayStatus`; completing the only spec task over
+/// `task.updateNoteStatus` emits `workspace:displayStatus-changed` with the
+/// self-sufficient `{ workspaceId, displayStatus: "complete" }` payload, and a
+/// repeat no-op status write emits nothing.
+#[tokio::test]
+async fn task_completion_transition_over_wss() {
+    let fx = boot(StubForge::default(), false).await;
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    // Seed a spec-child task note (in_progress) over the wire.
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "note.create",
+        json!({ "workspaceId": fx.ws_id.as_str(), "title": "Task A", "parentId": "spec" }),
+    )
+    .await;
+    let note_id = created["note"]["id"].as_str().expect("note id").to_string();
+    let marked = wss_rpc(
+        &mut rpc,
+        2,
+        "task.markAsTask",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+
+    // The emit path derives displayStatus on get/list (also seeding the
+    // last-observed cache for the transition below).
+    let got = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "in_progress");
+    let listed = wss_rpc(&mut rpc, 4, "workspace.list", json!({})).await;
+    let ws_row = listed["workspaces"]
+        .as_array()
+        .expect("workspaces array")
+        .iter()
+        .find(|w| w["id"] == fx.ws_id.as_str())
+        .expect("seeded workspace listed");
+    assert_eq!(ws_row["displayStatus"], "in_progress");
+
+    // Subscribe on a separate connection, then complete the task.
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
     let sub_res = wss_rpc(
         &mut sub,
-        1,
+        10,
         "events.subscribe",
-        json!({ "eventTypes": ["pr:linked"], "workspaceId": fx.ws_id.as_str() }),
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
     )
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
 
-    // Drive the same per-workspace refresh the 60s background sweep runs.
-    let outcome = fx
-        .services
-        .refresh_workspace_pr(&fx.ws_id)
-        .await
-        .expect("refresh");
-    assert_eq!(outcome, intent_services::PrRefreshOutcome::Linked);
+    let updated = wss_rpc(
+        &mut rpc,
+        5,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": "complete" }),
+    )
+    .await;
+    assert_eq!(updated["ok"], true, "updateNoteStatus ok: {updated}");
 
-    let evt = next_event(&mut sub, "pr:linked").await;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
     assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
-    let data = &evt["data"];
-    assert_eq!(data["workspaceId"], fx.ws_id.as_str());
-    assert_eq!(data["prNumber"], 300);
-    assert_eq!(data["prUrl"], "https://github.com/o/r/pull/300");
-    assert_eq!(data["prStatus"], "Open");
-    assert_eq!(data["activePullRequest"]["number"], 300);
-    let list = data["pullRequests"].as_array().expect("pullRequests array");
-    assert_eq!(list.len(), 2);
-    let merged = list.iter().find(|p| p["number"] == 42).expect("merged #42");
-    assert_eq!(merged["status"], "Merged");
-    let open = list.iter().find(|p| p["number"] == 300).expect("open #300");
-    assert_eq!(open["status"], "Open");
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "complete" })
+    );
+
+    // A repeat write to the same status is a no-op transition: no event.
+    let again = wss_rpc(
+        &mut rpc,
+        6,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": fx.ws_id.as_str(), "noteId": note_id, "status": "complete" }),
+    )
+    .await;
+    assert_eq!(again["ok"], true, "repeat updateNoteStatus ok: {again}");
+    assert_no_display_status_event(&mut sub).await;
 }
 
-/// baseRef discovery over the wire (§7.6, FE `matchesBaseRef` parity): an
-/// unlinked review workspace on its own branch (`review-ws`) whose `baseRef`
-/// equals an open PR's head ref (`feature`) links that PR — the refresh
-/// emits `pr:linked` with the discovered PR in the payload.
+/// PR-driven transition over the wire: an unlinked workspace on branch
+/// `feature` discovers the stub forge's open PR (#300, mergeable) via
+/// `pr.refresh` — the linkage flips the derived rollup to `pr_ready` and emits
+/// `workspace:displayStatus-changed` alongside `pr:linked`.
 #[tokio::test]
-async fn pr_linked_via_baseref_discovery_over_wss() {
-    let fx = boot_seeded(
+async fn pr_linkage_transition_over_wss() {
+    let fx = boot(
         StubForge {
             open_pr_number: Some(300),
-            ..Default::default()
         },
-        "review-ws",
-        Some("feature"),
-        None,
+        true,
     )
     .await;
 
-    let mut sub = connect(fx.port, fx.cfg.clone()).await;
-    let sub_res = wss_rpc(
-        &mut sub,
-        1,
-        "events.subscribe",
-        json!({ "eventTypes": ["pr:linked"], "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
-
-    // Drive the same per-workspace refresh the 60s background sweep runs:
-    // no head-ref match on "review-ws", so the baseRef fallback links #300.
-    let outcome = fx
-        .services
-        .refresh_workspace_pr(&fx.ws_id)
-        .await
-        .expect("refresh");
-    assert_eq!(outcome, intent_services::PrRefreshOutcome::Linked);
-
-    let evt = next_event(&mut sub, "pr:linked").await;
-    assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
-    let data = &evt["data"];
-    assert_eq!(data["prNumber"], 300);
-    assert_eq!(data["prUrl"], "https://github.com/o/r/pull/300");
-    assert_eq!(data["prStatus"], "Open");
-    assert_eq!(data["activePullRequest"]["number"], 300);
-}
-
-/// Merged-without-successor over the wire: the linked PR (#42) is fetched as
-/// merged and no open successor exists → the refresh emits `pr:updated` whose
-/// payload carries the status delta plus the seeded `pullRequests` list.
-#[tokio::test]
-async fn pr_updated_event_carries_pull_requests_list_over_wss() {
-    let fx = boot(StubForge::default()).await;
-
-    let mut sub = connect(fx.port, fx.cfg.clone()).await;
-    let sub_res = wss_rpc(
-        &mut sub,
-        1,
-        "events.subscribe",
-        json!({ "eventTypes": ["pr:updated"], "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
-
-    let outcome = fx
-        .services
-        .refresh_workspace_pr(&fx.ws_id)
-        .await
-        .expect("refresh");
-    assert_eq!(outcome, intent_services::PrRefreshOutcome::Updated);
-
-    let evt = next_event(&mut sub, "pr:updated").await;
-    assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
-    let data = &evt["data"];
-    assert_eq!(data["workspaceId"], fx.ws_id.as_str());
-    assert_eq!(data["prNumber"], 42);
-    assert_eq!(data["prStatus"], "Merged");
-    assert_eq!(data["activePullRequest"]["number"], 42);
-    assert_eq!(data["activePullRequest"]["status"], "Merged");
-    let list = data["pullRequests"].as_array().expect("pullRequests array");
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0]["number"], 42);
-    assert_eq!(list[0]["status"], "Merged");
-}
-
-/// `pr.refresh` over the wire (PROTOCOL §5.7 extension): the RPC forces the
-/// same refresh the 60s background sweep runs and returns the post-refresh
-/// linkage state; the `pr:linked` event flows through the existing refresh
-/// path (no duplicate emission). A separate subscriber connection observes the
-/// event so the RPC response and notification framing stay independent.
-#[tokio::test]
-async fn pr_refresh_rpc_reports_post_refresh_state_over_wss() {
-    let fx = boot(StubForge {
-        open_pr_number: Some(300),
-        ..Default::default()
-    })
-    .await;
-
-    let mut sub = connect(fx.port, fx.cfg.clone()).await;
-    let sub_res = wss_rpc(
-        &mut sub,
-        1,
-        "events.subscribe",
-        json!({ "eventTypes": ["pr:linked"], "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
-
-    // Relink-after-merge via the RPC: linked #42 is fetched as merged and an
-    // open successor #300 exists on the same branch.
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let result = wss_rpc(
+    // Seed the last-observed cache over the wire (not_started; no PR yet).
+    let got = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(got["workspace"]["displayStatus"], "not_started");
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        10,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["workspace:displayStatus-changed"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    // Drive the same refresh the 60s background sweep runs: discovery links
+    // open PR #300 (mergeable, non-draft) → displayStatus flips to pr_ready.
+    let refreshed = wss_rpc(
         &mut rpc,
         2,
         "pr.refresh",
         json!({ "workspaceId": fx.ws_id.as_str() }),
     )
     .await;
-    assert_eq!(result["outcome"], "linked");
-    assert_eq!(result["prNumber"], 300);
-    assert_eq!(result["prUrl"], "https://github.com/o/r/pull/300");
-    assert_eq!(result["prStatus"], "Open");
-    let list = result["pullRequests"]
-        .as_array()
-        .expect("pullRequests array");
-    assert_eq!(list.len(), 2);
+    assert_eq!(refreshed["outcome"], "linked", "refresh: {refreshed}");
 
-    let evt = next_event(&mut sub, "pr:linked").await;
+    let evt = next_event(&mut sub, "workspace:displayStatus-changed").await;
     assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
-    assert_eq!(evt["data"]["prNumber"], 300);
-    assert_eq!(evt["data"]["pullRequests"].as_array().unwrap().len(), 2);
-}
-
-/// Like [`wss_rpc`] but returns the full response envelope so callers can
-/// assert `error` payloads (code + message) instead of panicking on them.
-async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value {
-    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(req.to_string())).await.unwrap();
-    timeout(common::rpc_read_timeout(), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v.get("id") == Some(&json!(id)) {
-                        return v;
-                    }
-                }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Message::Pong(_) => {}
-                _ => panic!("unexpected message"),
-            }
-        }
-    })
-    .await
-    .expect("response timeout")
-}
-
-/// `pr.capabilities` over the wire (PROTOCOL §5.7 extension): returns the
-/// provider id plus the camelCase capability flags, and requires only a
-/// resolvable provider — the seeded workspace is linked, but the flags do not
-/// depend on any PR state.
-#[tokio::test]
-async fn pr_capabilities_returns_provider_flags_over_wss() {
-    let fx = boot(StubForge::default()).await;
-
-    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let result = wss_rpc(
-        &mut rpc,
-        1,
-        "pr.capabilities",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(result["provider"], "stub");
-    let caps = &result["capabilities"];
-    assert_eq!(caps["draftPrs"], true);
-    assert_eq!(caps["squashMerge"], true);
-    assert_eq!(caps["rebaseMerge"], true);
-    assert_eq!(caps["reviewRequiredChanges"], true);
-    assert_eq!(caps["checkRuns"], true);
-    assert_eq!(caps["issues"], true);
-}
-
-/// Runtime capability gating over the wire (§7.2/§7.4): a provider without
-/// `squashMerge` rejects `pr.merge {mergeMethod:"squash"}` with `-32603` and
-/// the stable `unsupported by provider:` message prefix; `pr.capabilities`
-/// reflects the same disabled flags.
-#[tokio::test]
-async fn pr_merge_squash_gated_by_capabilities_over_wss() {
-    let fx = boot(StubForge {
-        caps: Some(ScCapabilities {
-            draft_prs: false,
-            squash_merge: false,
-            rebase_merge: false,
-            review_required_changes: false,
-            check_runs: false,
-            issues: false,
-        }),
-        ..Default::default()
-    })
-    .await;
-
-    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
-    let caps = wss_rpc(
-        &mut rpc,
-        1,
-        "pr.capabilities",
-        json!({ "workspaceId": fx.ws_id.as_str() }),
-    )
-    .await;
-    assert_eq!(caps["capabilities"]["squashMerge"], false);
-
-    let resp = wss_rpc_raw(
-        &mut rpc,
-        2,
-        "pr.merge",
-        json!({ "workspaceId": fx.ws_id.as_str(), "mergeMethod": "squash" }),
-    )
-    .await;
-    let err = &resp["error"];
-    assert_eq!(err["code"], -32603, "error envelope: {resp}");
-    assert_eq!(err["message"], "Internal error", "error envelope: {resp}");
-    // The stable detail rides in `error.data` (PROTOCOL §9 envelope).
-    assert!(
-        err["data"]
-            .as_str()
-            .unwrap()
-            .starts_with("unsupported by provider:"),
-        "error envelope: {resp}"
+    assert_eq!(
+        evt["data"],
+        json!({ "workspaceId": fx.ws_id.as_str(), "displayStatus": "pr_ready" })
     );
+
+    // The linked state is visible on the read path too.
+    let after = wss_rpc(
+        &mut rpc,
+        3,
+        "workspace.get",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(after["workspace"]["displayStatus"], "pr_ready");
+
+    // A second refresh re-fetches the same open PR: no transition, no event.
+    let again = wss_rpc(
+        &mut rpc,
+        4,
+        "pr.refresh",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert_eq!(again["outcome"], "unchanged", "second refresh: {again}");
+    assert_no_display_status_event(&mut sub).await;
 }

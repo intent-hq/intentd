@@ -140,6 +140,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     }
 }
@@ -11078,6 +11079,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11204,6 +11206,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11321,6 +11324,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11433,6 +11437,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11544,6 +11549,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11660,6 +11666,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -12225,6 +12232,7 @@ mod known_repo {
             agent_summary: None,
             diff_summary: None,
             cow_supported: None,
+            display_status: None,
             checkout_mode: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
@@ -17320,5 +17328,436 @@ mod turn_token_usage {
             }
         }
         assert!(seen >= 1, "at least one tokenUsage-changed event fired");
+    }
+}
+
+/// Unit tests for the pure `compute_display_status` derivation ("current
+/// cycle" precedence): active/latest open PR → open tasks → merged PR →
+/// complete/not_started.
+mod display_status {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceTaskStats,
+    };
+
+    use crate::compute_display_status;
+
+    fn pr(status: PullRequestStatus, updated_at: &str) -> PullRequestInfo {
+        PullRequestInfo {
+            id: format!("pr-{updated_at}"),
+            number: 1,
+            url: "https://github.com/o/r/pull/1".to_string(),
+            title: "PR".to_string(),
+            status,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: updated_at.to_string(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        }
+    }
+
+    fn stats(total: usize, completed: usize, in_progress: usize) -> WorkspaceTaskStats {
+        WorkspaceTaskStats {
+            total,
+            completed,
+            in_progress,
+        }
+    }
+
+    #[test]
+    fn no_prs_no_tasks_is_not_started() {
+        assert_eq!(
+            compute_display_status(None, &[], None),
+            WorkspaceDisplayStatus::NotStarted
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(0, 0, 0))),
+            WorkspaceDisplayStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn no_prs_uses_pure_task_logic() {
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 0, 0))),
+            WorkspaceDisplayStatus::NotStarted
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 0, 1))),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 1, 0))),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::Complete
+        );
+    }
+
+    #[test]
+    fn open_active_pr_mergeable_is_pr_ready() {
+        let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        open.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&open), &[], Some(&stats(2, 0, 1))),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    #[test]
+    fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(Some(&open), &[], None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
+        draft.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&draft), &[], None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        flagged.mergeable = Some(true);
+        flagged.is_draft = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&flagged), &[], None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn merged_pr_never_masks_open_tasks() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(
+                Some(&merged),
+                std::slice::from_ref(&merged),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(
+                Some(&merged),
+                std::slice::from_ref(&merged),
+                Some(&stats(3, 0, 0))
+            ),
+            WorkspaceDisplayStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn merged_pr_never_masks_open_pr_in_list() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        let list = vec![merged.clone(), open.clone()];
+        assert_eq!(
+            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut ready = open;
+        ready.mergeable = Some(true);
+        let list = vec![merged.clone(), ready];
+        assert_eq!(
+            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    #[test]
+    fn open_pr_fallback_picks_most_recently_updated() {
+        let stale = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        let mut fresh = pr(PullRequestStatus::Open, "2026-01-05T00:00:00Z");
+        fresh.mergeable = Some(true);
+        let list = vec![stale, fresh];
+        assert_eq!(
+            compute_display_status(None, &list, None),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    #[test]
+    fn merged_with_all_tasks_done_is_pr_merged() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(Some(&merged), &[], Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(Some(&merged), &[], None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn merged_latest_from_list_without_active_pr() {
+        let closed = pr(PullRequestStatus::Closed, "2026-01-01T00:00:00Z");
+        let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
+        let list = vec![closed, merged];
+        assert_eq!(
+            compute_display_status(None, &list, None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn closed_pr_falls_through_to_task_logic() {
+        let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(Some(&closed), &[], Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::Complete
+        );
+        assert_eq!(
+            compute_display_status(Some(&closed), &[], None),
+            WorkspaceDisplayStatus::NotStarted
+        );
+    }
+}
+
+/// Transition-only emission of `workspace:displayStatus-changed` (PROTOCOL
+/// §6.5): the recompute-and-compare seam behind
+/// `maybe_emit_display_status_changed` publishes exactly on a derived-status
+/// transition — a first observation seeds without emitting and a no-op
+/// recompute stays silent.
+mod display_status_events {
+    use std::time::Duration;
+
+    use intent_core::{
+        now_iso, ContentType, Note, NoteId, NoteMetadata, NoteVisibility, TaskMetadata, TaskStatus,
+        WorkspaceApi, WorkspaceId,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb};
+    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+    struct Harness {
+        _tmp: TempDb,
+        store: Store,
+        services: Services,
+        bus: EventBus,
+        ws: WorkspaceId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        Harness {
+            _tmp: tmp,
+            store,
+            services,
+            bus,
+            ws,
+        }
+    }
+
+    /// Direct child task note of the spec, so it counts into `taskStats`.
+    fn task_note(ws: &WorkspaceId, id: &str, status: TaskStatus) -> Note {
+        let ts = now_iso();
+        Note {
+            id: NoteId::from(id),
+            workspace_id: ws.clone(),
+            title: format!("Task {id}"),
+            content: String::new(),
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(NoteId::from("spec")),
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata {
+                task: Some(TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    /// Subscribe to only `workspace:displayStatus-changed` for this workspace.
+    fn subscribe(h: &Harness) -> Subscription {
+        h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:displayStatus-changed".to_string()],
+            ..Default::default()
+        })
+    }
+
+    async fn recv_one(sub: &mut Subscription) -> Value {
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        assert_eq!(batch.len(), 1, "expected exactly one event");
+        serde_json::to_value(&batch[0]).expect("serialize event")
+    }
+
+    async fn assert_silent(sub: &mut Subscription) {
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(res.is_err(), "expected no displayStatus event: {res:?}");
+    }
+
+    /// A task-completion transition (in_progress → complete over
+    /// `task.updateNoteStatus`) emits the event with the self-sufficient
+    /// `{ workspaceId, displayStatus }` payload.
+    #[tokio::test]
+    async fn task_completion_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                NoteId::from("t1"),
+                "complete".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("update status");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(ev["workspaceId"], h.ws.0);
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "complete" })
+        );
+    }
+
+    /// A task-status change that does not move the derived rollup (a second
+    /// task flipping not_started → in_progress while the rollup is already
+    /// `in_progress`) publishes no displayStatus event.
+    #[tokio::test]
+    async fn no_op_recompute_stays_silent() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert t1");
+        h.store
+            .insert_note(&task_note(&h.ws, "t2", TaskStatus::NotStarted))
+            .await
+            .expect("insert t2");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .task_update_note_status(
+                h.ws.clone(),
+                NoteId::from("t2"),
+                "in_progress".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("update status");
+        assert_silent(&mut sub).await;
+    }
+
+    /// The first observation for a workspace seeds the cache without emitting;
+    /// the next actual transition emits.
+    #[tokio::test]
+    async fn first_observation_seeds_without_emitting() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+
+        let mut sub = subscribe(&h);
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+        assert_silent(&mut sub).await;
+
+        // Repeat recompute with no underlying change: still silent.
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+        assert_silent(&mut sub).await;
+    }
+
+    /// Deleting an open spec-child task note that moves the derived rollup
+    /// (in_progress → not_started once the last open task is gone) emits the
+    /// transition event: `note.delete` goes through the same
+    /// recompute+maybe-emit hook as the task-status mutations.
+    #[tokio::test]
+    async fn task_note_delete_transition_emits() {
+        let h = harness().await;
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        // Seed the last-observed cache (first observation never emits).
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .delete_note(h.ws.clone(), NoteId::from("t1"), None)
+            .await
+            .expect("delete note");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "not_started" })
+        );
+    }
+
+    /// When `taskStats` is unavailable (transient notes-read failure), the
+    /// enrich path leaves `displayStatus` absent — clients fall back to local
+    /// derivation on a missing field — and never seeds the last-observed
+    /// cache from the stats-free compute.
+    #[tokio::test]
+    async fn enrich_omits_display_status_when_task_stats_unavailable() {
+        let h = harness().await;
+        // Hermetic root: enrichment probes the workspaces root for
+        // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+        let root = tempfile::tempdir().expect("temp workspaces root");
+        let services = h
+            .services
+            .clone()
+            .with_workspaces_root(root.path().to_path_buf());
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("get ws");
+        // Force list_notes to fail so taskStats is not computable.
+        sqlx::query("DROP TABLE note")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop note table");
+
+        services.enrich_workspace_aggregates(&mut ws).await;
+        assert!(ws.task_stats.is_none(), "taskStats must be absent");
+        assert!(ws.display_status.is_none(), "displayStatus must be absent");
+        let seeded = services
+            .last_display_statuses
+            .lock()
+            .expect("lock cache")
+            .contains_key(&h.ws);
+        assert!(
+            !seeded,
+            "cache must not be seeded from a stats-free compute"
+        );
     }
 }

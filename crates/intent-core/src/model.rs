@@ -108,6 +108,21 @@ pub enum NoteVisibility {
     Public,
 }
 
+/// Derived `Workspace.displayStatus` (TS `WorkspaceDisplayStatus` union):
+/// the BE-owned "current cycle" status rollup over the active/latest PR and
+/// `taskStats`. Wire values are the snake_case variant names, matching the FE
+/// union exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDisplayStatus {
+    NotStarted,
+    InProgress,
+    Complete,
+    PrReady,
+    PrOpen,
+    PrMerged,
+}
+
 /// Workspace entity (§9.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,6 +195,12 @@ pub struct Workspace {
     pub agent_summary: Option<WorkspaceAgentSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_summary: Option<WorkspaceDiffSummary>,
+    /// Derived "current cycle" display status. Computed on the same
+    /// `workspace.list` / `workspace.get` emit path as the card aggregates
+    /// (never persisted) from the active/latest PR and `taskStats`; omitted
+    /// elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_status: Option<WorkspaceDisplayStatus>,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -258,6 +279,7 @@ pub fn chief_workspace() -> Workspace {
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
+        display_status: None,
         token_usage: None,
         cow_supported: None,
         checkout_mode: None,
@@ -2815,6 +2837,7 @@ mod tests {
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
+            display_status: None,
             token_usage: None,
             cow_supported: None,
             checkout_mode: None,

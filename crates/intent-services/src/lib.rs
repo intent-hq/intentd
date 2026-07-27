@@ -18,7 +18,7 @@ use intent_core::events::{
     PR_UPDATED, SEARCH_DONE, SEARCH_RESULT, SETTINGS_CHANGED, SKILLS_CHANGED, TASK_AGENT_LINKED,
     TASK_AGENT_UNLINKED, TASK_READY_TASKS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
     WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CONTEXT_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_TOKEN_USAGE_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::AgentReverseDispatch;
 use intent_core::{
@@ -33,14 +33,15 @@ use intent_core::{
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
-    NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    NoteVisibility, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
+    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity,
+    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -382,6 +383,17 @@ pub struct Services {
     idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for idle debounce tasks (incremented on each schedule).
     idle_debounce_gen: Arc<Mutex<u64>>,
+    /// Last-observed derived `displayStatus` per workspace (PROTOCOL §6.5):
+    /// the recompute-and-compare seam behind
+    /// [`Services::maybe_emit_display_status_changed`]. A mutation that can
+    /// move the derivation recomputes it and publishes
+    /// `workspace:displayStatus-changed` only on an actual transition, so
+    /// no-op recomputes never spam the bus. Seeded lazily (first recompute
+    /// after a mutation, or an emit-path enrichment) — a first observation
+    /// records without emitting. In-memory only; a daemon restart re-seeds on
+    /// first touch. Shared across clones so every service handle compares
+    /// against the same last-emitted value.
+    last_display_statuses: Arc<Mutex<HashMap<WorkspaceId, WorkspaceDisplayStatus>>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -488,6 +500,7 @@ impl Services {
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
             idle_debounce_gen: Arc::new(Mutex::new(0)),
+            last_display_statuses: Arc::new(Mutex::new(HashMap::new())),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             token_usage_watermarks: Arc::new(Mutex::new(HashMap::new())),
@@ -915,6 +928,65 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
+        // Derived "current cycle" display status over the active/latest PR and
+        // the taskStats computed above; never persisted. Only populated when
+        // taskStats was computable: on a transient notes-read failure the field
+        // stays absent (clients fall back to local derivation on a missing
+        // field) and the last-observed cache is left untouched, so a
+        // None-compute can never misreport `not_started`/`pr_*` or pollute the
+        // baseline. Seed the last-observed cache when absent so the first
+        // post-read mutation compares against this baseline (a seed never
+        // emits; see [`Services::maybe_emit_display_status_changed`]).
+        if ws.task_stats.is_some() {
+            let display_status = compute_display_status(
+                ws.active_pull_request.as_ref(),
+                ws.pull_requests.as_deref().unwrap_or_default(),
+                ws.task_stats.as_ref(),
+            );
+            if let Ok(mut map) = self.last_display_statuses.lock() {
+                map.entry(ws.id.clone()).or_insert(display_status);
+            }
+            ws.display_status = Some(display_status);
+        }
+    }
+
+    /// Recompute a workspace's derived `displayStatus` and publish
+    /// `workspace:displayStatus-changed` iff it transitioned since the last
+    /// observation (PROTOCOL §6.5). Called after the mutations that can move
+    /// the derivation (task/note status updates, task-note deletion, PR
+    /// link/status changes) — never from a polling loop. The first
+    /// observation for a workspace seeds the cache without emitting (no
+    /// baseline to transition from); a read
+    /// failure skips the recompute entirely so a transient store error can
+    /// never fake a transition. Best-effort: errors are swallowed, the
+    /// mutation's own result is the contract.
+    pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
+        let Ok(ws) = self.store.get_workspace(workspace_id).await else {
+            return;
+        };
+        let Ok(notes) = self.store.list_notes(workspace_id).await else {
+            return;
+        };
+        let task_stats = compute_task_stats(&notes);
+        let status = compute_display_status(
+            ws.active_pull_request.as_ref(),
+            ws.pull_requests.as_deref().unwrap_or_default(),
+            Some(&task_stats),
+        );
+        let transitioned = match self.last_display_statuses.lock() {
+            Ok(mut map) => match map.insert(workspace_id.clone(), status) {
+                Some(previous) => previous != status,
+                None => false,
+            },
+            Err(_) => return,
+        };
+        if transitioned {
+            publish_event(
+                &self.event_bus,
+                display_status_changed_event(workspace_id, status),
+            )
+            .await;
+        }
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -1672,6 +1744,7 @@ impl Services {
                     ws.updated_at = now_iso();
                     self.store.update_workspace(&ws).await?;
                     publish_event(&self.event_bus, pr_unlinked_event(&ws.id)).await;
+                    self.maybe_emit_display_status_changed(&ws.id).await;
                     return Ok(PrRefreshOutcome::Unlinked);
                 }
                 let info = pr_ops::build_pr_info(&pr);
@@ -1719,6 +1792,7 @@ impl Services {
                         ws.updated_at = now_iso();
                         self.store.update_workspace(&ws).await?;
                         publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                        self.maybe_emit_display_status_changed(&ws.id).await;
                         return Ok(PrRefreshOutcome::Linked);
                     }
                 }
@@ -1735,6 +1809,7 @@ impl Services {
                 ws.updated_at = now_iso();
                 self.store.update_workspace(&ws).await?;
                 publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                self.maybe_emit_display_status_changed(&ws.id).await;
                 Ok(PrRefreshOutcome::Updated)
             }
             None => {
@@ -1763,6 +1838,7 @@ impl Services {
                         ws.updated_at = now_iso();
                         self.store.update_workspace(&ws).await?;
                         publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+                        self.maybe_emit_display_status_changed(&ws.id).await;
                         Ok(PrRefreshOutcome::Linked)
                     }
                     None => Ok(PrRefreshOutcome::Unchanged),
@@ -3629,6 +3705,68 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
     stats
 }
 
+/// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
+/// "Proposed representation" / "Decision: BE-owned displayStatus"):
+/// 1. Active PR — the linked `activePullRequest` when open/draft, else the
+///    most recently updated open/draft entry in `pullRequests` — yields
+///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+/// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
+///    has started, else `not_started`.
+/// 3. Latest PR (linked, else most recently updated entry) merged →
+///    `pr_merged`.
+/// 4. All tasks complete → `complete`; else `not_started`.
+///
+/// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
+/// for open/draft entries) or open tasks (step 2 precedes the merged check).
+fn compute_display_status(
+    active_pr: Option<&PullRequestInfo>,
+    pull_requests: &[PullRequestInfo],
+    task_stats: Option<&WorkspaceTaskStats>,
+) -> WorkspaceDisplayStatus {
+    let is_open = |pr: &&PullRequestInfo| {
+        matches!(
+            pr.status,
+            PullRequestStatus::Open | PullRequestStatus::Draft
+        )
+    };
+    let open_pr = active_pr.filter(is_open).or_else(|| {
+        pull_requests
+            .iter()
+            .filter(is_open)
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+    });
+    if let Some(pr) = open_pr {
+        let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
+        return if pr.mergeable == Some(true) && !draft {
+            WorkspaceDisplayStatus::PrReady
+        } else {
+            WorkspaceDisplayStatus::PrOpen
+        };
+    }
+    let (total, completed, in_progress) = task_stats
+        .map(|s| (s.total, s.completed, s.in_progress))
+        .unwrap_or_default();
+    if total > 0 && completed < total {
+        return if in_progress > 0 || completed > 0 {
+            WorkspaceDisplayStatus::InProgress
+        } else {
+            WorkspaceDisplayStatus::NotStarted
+        };
+    }
+    let latest_pr = active_pr.or_else(|| {
+        pull_requests
+            .iter()
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+    });
+    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged) {
+        return WorkspaceDisplayStatus::PrMerged;
+    }
+    if total > 0 && completed == total {
+        return WorkspaceDisplayStatus::Complete;
+    }
+    WorkspaceDisplayStatus::NotStarted
+}
+
 /// Project a workspace's notes into the canonical `WorkspaceTask` list, porting
 /// `getWorkspaceTasks` (`workspace-summaries.ts`) over the `getSpecTaskNotes`
 /// (`task-stats.ts`) filter: spec-linked direct child task notes, **including
@@ -4766,6 +4904,28 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "activity": activity,
+        }),
+    }
+}
+
+/// Build a `workspace:displayStatus-changed` change event with the
+/// self-sufficient payload `{ workspaceId, displayStatus }` (PROTOCOL §6.5).
+fn display_status_changed_event(
+    workspace_id: &WorkspaceId,
+    display_status: WorkspaceDisplayStatus,
+) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_DISPLAY_STATUS_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "displayStatus": display_status,
         }),
     }
 }
@@ -5925,6 +6085,11 @@ impl Services {
             ),
         )
         .await;
+        // Newly created task notes can move the derived displayStatus rollup
+        // (§6.5), e.g. a completed workspace gaining fresh open tasks.
+        if !created_note_ids.is_empty() {
+            self.maybe_emit_display_status_changed(&workspace_id).await;
+        }
         Ok(TaskConvertBlocksResult {
             ok: true,
             converted_count: created_note_ids.len() as i64,
@@ -7832,6 +7997,7 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                         cow_supported: None,
+                        display_status: None,
                         checkout_mode: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
@@ -9196,6 +9362,7 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                display_status: None,
                 checkout_mode: None,
             };
             // Provision the checkout for the duplicate (TS
@@ -10601,6 +10768,13 @@ impl WorkspaceApi for Services {
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
             )
             .await;
+            // Deleting a task note can move the derived displayStatus rollup
+            // (§6.5), e.g. removing the last open spec-child task.
+            if note.metadata.task.is_some() {
+                services
+                    .maybe_emit_display_status_changed(&workspace_id)
+                    .await;
+            }
             Ok(NoteDeleteResult {
                 ok: true,
                 note_id,
@@ -10852,6 +11026,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskUpdateNoteStatusResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             let new_status = parse_task_status_strict(&status)?;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
@@ -10913,6 +11088,12 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
+                // A task-status transition can move the derived displayStatus
+                // rollup (§6.5): recompute-and-compare, emitting only on an
+                // actual transition.
+                services
+                    .maybe_emit_display_status_changed(&note.workspace_id)
+                    .await;
             }
             Ok(TaskUpdateNoteStatusResult {
                 ok: true,
@@ -11088,6 +11269,7 @@ impl WorkspaceApi for Services {
         effort: Option<String>,
     ) -> BoxFuture<'_, Result<TaskMarkAsTaskResult>> {
         let store = self.store.clone();
+        let services = self.clone();
         Box::pin(async move {
             let new_status =
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
@@ -11114,6 +11296,11 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now;
             store.update_note(&note).await?;
+            // Marking a note as a task (or moving its status) can move the
+            // derived displayStatus rollup (§6.5).
+            services
+                .maybe_emit_display_status_changed(&note.workspace_id)
+                .await;
             Ok(TaskMarkAsTaskResult {
                 ok: true,
                 note_id: note.id,
@@ -11189,6 +11376,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<TaskAssignAgentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
+        let services = self.clone();
         Box::pin(async move {
             if !is_valid_agent_id(&agent_id) {
                 return Err(Error::Internal(format!(
@@ -11271,6 +11459,11 @@ impl WorkspaceApi for Services {
                     ),
                 )
                 .await;
+                // The not_started → in_progress transition can move the
+                // derived displayStatus rollup (§6.5).
+                services
+                    .maybe_emit_display_status_changed(&note.workspace_id)
+                    .await;
             }
             Ok(TaskAssignAgentResult {
                 ok: true,
@@ -17036,6 +17229,7 @@ impl Services {
         ws.updated_at = now_iso();
         self.store.update_workspace(&ws).await?;
         publish_event(&self.event_bus, pr_linked_event(&ws)).await;
+        self.maybe_emit_display_status_changed(workspace_id).await;
 
         let _ = worktree; // attribution move below is workspace-scoped.
         self.ac_move_stage(workspace_id, "pushed", "pull_request")
@@ -17077,6 +17271,7 @@ impl Services {
                 ws.updated_at = now_iso();
                 let _ = self.store.update_workspace(&ws).await;
                 publish_event(&self.event_bus, pr_updated_event(&ws)).await;
+                self.maybe_emit_display_status_changed(&workspace_id).await;
                 self.ac_move_stage(&workspace_id, "pull_request", "merged")
                     .await;
                 let step = accept_changes::step(
