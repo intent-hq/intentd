@@ -2194,8 +2194,16 @@ impl AgentManager {
             .get_agent_messages(agent_id, None)
             .await
             .unwrap_or_default();
-        // The current user message was already appended → render all but the last.
-        let prior = messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
+        // The current user message was already appended → render everything
+        // BEFORE it. Truncating at the last user row (not just the last row)
+        // keeps the current message out of the replay even when turn-start
+        // appends trail it (the `model_changed` system notice lands after the
+        // user row and before this render); with no user row fall back to
+        // dropping the last message.
+        let prior = match messages.iter().rposition(|m| m.role == "user") {
+            Some(idx) => &messages[..idx],
+            None => messages.split_last().map(|(_, rest)| rest).unwrap_or(&[]),
+        };
         if prior.is_empty() {
             return content.to_string();
         }
@@ -3713,6 +3721,113 @@ impl AgentManager {
         }
     }
 
+    /// Persist the informational `model_changed` transcript row when this
+    /// turn's spawn identity (`resolve_spawn`'s model/provider) differs from
+    /// the last committed turn's (`agent_session.last_turn_model` /
+    /// `last_turn_provider`), then commit the current identity as the new
+    /// last-turn pair (deferred commit: `agent.setModel` toggles reverted
+    /// before any message never produce a notice because nothing was
+    /// committed). No notice on the agent's very first turn (no committed
+    /// prior identity). The row is `role: "system"` — excluded from
+    /// supervisor-XML replay, which only renders user/assistant/error — with
+    /// metadata `{ type: "model_changed", from, to, fromProvider, toProvider }`
+    /// (`from`/`to` are the spawn-resolved model ids, `null` = provider
+    /// default). Emits `agent:message` so clients update live. Entirely
+    /// best-effort: read/append/publish failures are logged and the turn
+    /// proceeds. Called only from `ensure_started`'s SUCCESS paths (live-child
+    /// reuse, or after `start_session` returned Ok) so a failed spawn/switch
+    /// never persists a notice or commits an identity the agent never ran
+    /// under; retry attempts within one turn (`retry_spawn`) cannot duplicate
+    /// the notice — the identity commit lands with the first success.
+    async fn maybe_persist_model_change_notice(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &ResolvedSpawn,
+    ) {
+        let to_model = resolved.model.as_deref();
+        let to_provider = resolved.provider.id;
+        let (from_model, from_provider) = match self
+            .services
+            .store
+            .get_agent_session_last_turn_model(workspace_id, agent_id)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to read last-turn model; skipping model-change notice");
+                return;
+            }
+        };
+        let changed = match from_provider.as_deref() {
+            // No committed prior turn → first turn, never a notice.
+            None => false,
+            Some(prev_provider) => {
+                prev_provider != to_provider || from_model.as_deref() != to_model
+            }
+        };
+        if changed {
+            let label = |provider: &str, model: Option<&str>| match model {
+                Some(m) => format!("{provider}:{m}"),
+                None => format!("{provider} (default model)"),
+            };
+            let from_label = label(
+                from_provider.as_deref().unwrap_or(""),
+                from_model.as_deref(),
+            );
+            let to_label = label(to_provider, to_model);
+            let content = json!([{
+                "type": "text",
+                "text": format!("Model changed from {from_label} to {to_label}."),
+            }]);
+            let metadata = json!({
+                "type": "model_changed",
+                "from": from_model,
+                "to": to_model,
+                "fromProvider": from_provider,
+                "toProvider": to_provider,
+            });
+            match self
+                .services
+                .store
+                .append_agent_message_with_metadata(
+                    agent_id,
+                    "system",
+                    &content,
+                    Some(&metadata),
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(message) => {
+                    self.services
+                        .publish_agent_mutation_event(
+                            workspace_id,
+                            agent_id,
+                            intent_core::events::AGENT_MESSAGE,
+                            crate::agent_ops::agent_message_event_payload(agent_id, &message),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to persist model-change notice");
+                }
+            }
+        }
+        // Commit this turn's identity (also the first-turn baseline) so the
+        // next turn compares against what THIS turn actually ran under.
+        if from_provider.as_deref() != Some(to_provider) || from_model.as_deref() != to_model {
+            if let Err(e) = self
+                .services
+                .store
+                .set_agent_session_last_turn_model(workspace_id, agent_id, to_model, to_provider)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn model");
+            }
+        }
+    }
+
     /// Ensure the agent's child process + ACP session exist, spawning lazily on
     /// first turn (the TS spawn-on-first-message semantics) and reusing the live
     /// session otherwise. When the session's model/provider has changed (via
@@ -3767,7 +3882,12 @@ impl AgentManager {
                 self.kill_child_only(agent_id).await;
             } else if let Some(acp) = session.acp_session_id.clone() {
                 if self.handle_is_live(agent_id) {
-                    // Model unchanged and child is live — reuse the existing session.
+                    // Model unchanged and child is live — reuse the existing
+                    // session. The notice/commit still runs: the live child may
+                    // predate a same-provider model change the reuse tolerates,
+                    // and an unchanged identity is a cheap no-op read.
+                    self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+                        .await;
                     return Ok(acp);
                 }
                 // The child/transport died while the agent sat idle
@@ -3809,8 +3929,18 @@ impl AgentManager {
             )
             .await?;
         }
-        self.start_session(agent_id, resolved.cwd.clone(), &resolved.provider)
-            .await
+        let acp_session_id = self
+            .start_session(agent_id, resolved.cwd.clone(), &resolved.provider)
+            .await?;
+        // Model-change transcript notice: only AFTER the child + ACP session
+        // are provably up under the new identity — a failed spawn/switch must
+        // not persist a notice or commit `last_turn_*` to an identity the
+        // agent never ran under. Store-based (not handle-based) so detection
+        // also covers idle-agent respawns. Best-effort — a notice failure
+        // never blocks the turn.
+        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+            .await;
+        Ok(acp_session_id)
     }
 
     /// Tear down every tracked agent (clean daemon shutdown kills all children).

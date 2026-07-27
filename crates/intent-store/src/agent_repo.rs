@@ -563,6 +563,63 @@ impl Store {
         Ok(())
     }
 
+    /// Read the model/provider identity of the agent's last committed turn
+    /// (model-change transcript notice): `(last_turn_model, last_turn_provider)`.
+    /// Both are NULL until the agent's first turn commits its identity via
+    /// [`Store::set_agent_session_last_turn_model`]. Scoped to `workspace_id`
+    /// (defense-in-depth). `NotFound` if the session row is absent or the
+    /// workspace does not match.
+    pub async fn get_agent_session_last_turn_model(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let row = sqlx::query(
+            "SELECT last_turn_model, last_turn_provider FROM agent_session \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get agent session last turn model failed: {e}")))?;
+        let Some(row) = row else {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        };
+        Ok((
+            row.get::<Option<String>, _>("last_turn_model"),
+            row.get::<Option<String>, _>("last_turn_provider"),
+        ))
+    }
+
+    /// Persist the model/provider identity the CURRENT turn runs under
+    /// (model-change transcript notice). Written at turn start once the
+    /// turn's spawn identity is resolved — NOT on `agent.setModel` — so
+    /// picker toggles reverted before any message never commit a "last
+    /// turn" identity. `model` is the spawn-resolved model id (`None` for
+    /// the provider default). Scoped to `workspace_id` (defense-in-depth);
+    /// an absent row is a no-op (the caller just read the session).
+    pub async fn set_agent_session_last_turn_model(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        model: Option<&str>,
+        provider: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_session SET last_turn_model=?, last_turn_provider=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(model)
+        .bind(provider)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session last turn model failed: {e}")))?;
+        Ok(())
+    }
+
     /// Read one session's `model`, `resolved_model` (D14 display identity of
     /// an explicit pick, if any), `provider`, and its persisted cumulative
     /// end-of-turn `token_usage` snapshot (§5.23) in a single row read. This
