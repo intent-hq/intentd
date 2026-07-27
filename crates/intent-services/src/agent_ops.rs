@@ -1778,7 +1778,7 @@ impl Services {
         self.clear_failure_wake_dedup_all_roles(&agent_id);
         // Drop the deleted agent's event subscriptions (monorepo#937): the
         // wake target is gone, so matching/batching for it is pure leak.
-        self.remove_event_subscriptions_for_agent(&agent_id);
+        self.remove_event_subscriptions_for_agent(&agent_id).await;
         if let Some(workspace_id) = session_workspace_id {
             crate::publish_event(
                 &self.event_bus,
@@ -3890,7 +3890,7 @@ impl Services {
     ) -> Result<Value> {
         self.remove_all_for_parent(&agent_id);
         self.remove_groups_for_parent(&agent_id);
-        self.remove_event_subscriptions_for_agent(&agent_id);
+        self.remove_event_subscriptions_for_agent(&agent_id).await;
         Ok(json!({ "success": true }))
     }
 

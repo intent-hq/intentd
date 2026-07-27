@@ -12782,16 +12782,24 @@ impl WorkspaceApi for Services {
                     "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
                 ));
             }
+            // Fail closed on a phantom subscriber before registering
+            // (monorepo#568 precedent for agent.watchCompletion).
+            if let Some(subscriber) = &subscriber_agent_id {
+                self.validate_event_subscriber(&workspace_id, subscriber)
+                    .await?;
+            }
             // Registers the subscription with a live bus delivery task
             // (matching + batching + subscriber wake, monorepo#937); bare `*`
             // expands to the category wildcards inside registration.
-            let (subscription_id, resolved) = self.register_event_subscription(
-                &workspace_id,
-                subscriber_agent_id,
-                &event_types,
-                exclude_self,
-                batch_window,
-            );
+            let (subscription_id, resolved) = self
+                .register_event_subscription(
+                    &workspace_id,
+                    subscriber_agent_id,
+                    &event_types,
+                    exclude_self,
+                    batch_window,
+                )
+                .await;
             Ok(EventSubscribeResult {
                 subscription_id,
                 event_types: resolved,
@@ -12808,7 +12816,7 @@ impl WorkspaceApi for Services {
             if subscription_id.is_empty() {
                 return Err(Error::Internal("subscriptionId is required".to_string()));
             }
-            if !self.remove_event_subscription(&subscription_id) {
+            if !self.remove_event_subscription(&subscription_id).await {
                 return Err(Error::Internal("Subscription not found".to_string()));
             }
             Ok(EventUnsubscribeResult {
@@ -14833,15 +14841,30 @@ impl WorkspaceApi for Services {
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Same empty-types guard as `event.subscribe`: an empty filter
+            // would match EVERY event (and persist that across restarts).
+            if event_types.is_empty() {
+                return Err(Error::Internal(
+                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                ));
+            }
+            // Fail closed on a phantom subscriber before registering
+            // (monorepo#568 precedent for agent.watchCompletion).
+            if let Some(subscriber) = &subscriber_agent_id {
+                self.validate_event_subscriber(&workspace_id, subscriber)
+                    .await?;
+            }
             // Shares the one real implementation with `event.subscribe`
             // (registration + live bus delivery, monorepo#937).
-            let (subscription_id, resolved) = self.register_event_subscription(
-                &workspace_id,
-                subscriber_agent_id,
-                &event_types,
-                exclude_self,
-                batch_window,
-            );
+            let (subscription_id, resolved) = self
+                .register_event_subscription(
+                    &workspace_id,
+                    subscriber_agent_id,
+                    &event_types,
+                    exclude_self,
+                    batch_window,
+                )
+                .await;
             Ok(serde_json::json!({
                 "subscriptionId": subscription_id,
                 "eventTypes": resolved,
@@ -14855,7 +14878,7 @@ impl WorkspaceApi for Services {
         subscription_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            if !self.remove_event_subscription(&subscription_id) {
+            if !self.remove_event_subscription(&subscription_id).await {
                 return Err(Error::Internal("Subscription not found".to_string()));
             }
             Ok(serde_json::json!({ "success": true, "subscriptionId": subscription_id }))

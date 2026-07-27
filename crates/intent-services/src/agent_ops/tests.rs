@@ -5183,6 +5183,61 @@ async fn subscribe_then_unsubscribe_roundtrips() {
     assert!(matches!(err, Error::Internal(_)));
 }
 
+/// monorepo#937 (review): fail closed on invalid subscribers — an unknown
+/// agent id, a deleted agent, and an empty eventTypes array must all be
+/// rejected before anything registers or persists.
+#[tokio::test]
+async fn event_subscription_rejects_invalid_subscriber_and_empty_types() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(AgentId::from("agent-nope")),
+            vec!["agent:*".into()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("unknown subscriber must fail");
+    assert!(matches!(err, Error::InvalidParams(m) if m.contains("not found")));
+
+    svc.agent_delete_op(subscriber.clone(), None)
+        .await
+        .expect("delete");
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber),
+            vec!["agent:*".into()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("deleted subscriber must fail");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("deleted") || m.contains("not found")),
+        "unexpected error: {err:?}"
+    );
+
+    let err = svc
+        .agent_subscribe(ws.clone(), None, vec![], None, None)
+        .await
+        .expect_err("empty eventTypes must fail");
+    assert!(matches!(err, Error::Internal(m) if m.contains("eventTypes is required")));
+
+    let rows = svc
+        .store()
+        .list_event_subscriptions()
+        .await
+        .expect("list rows");
+    assert!(
+        rows.is_empty(),
+        "nothing may persist on rejected subscribes"
+    );
+}
+
 /// monorepo#937: an agent-owned `event.subscribe` delivers a batched wake to
 /// the subscriber when a matching event is published by another actor.
 #[tokio::test]
@@ -5425,7 +5480,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
         .await
         .expect("delete subscriber");
     assert!(
-        !svc.remove_event_subscription(&sub_id),
+        !svc.remove_event_subscription(&sub_id).await,
         "subscription should already be gone after subscriber delete"
     );
     let loaded = svc

@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use intent_core::{now_iso, AgentId, Event, WorkspaceId};
+use intent_core::{now_iso, AgentId, Error, Event, Result, WorkspaceId};
 use intent_store::PersistedEventSubscription;
 use uuid::Uuid;
 
@@ -52,10 +52,57 @@ pub(crate) struct EventSubscriptionEntry {
 }
 
 impl Services {
+    /// Validate a caller-supplied subscriber identity before registering
+    /// (fail closed, mirroring the monorepo#568 `agent.watchCompletion`
+    /// precedent): the agent must exist and not be deleted, and a subscriber
+    /// outside `workspace_id` is only allowed from the chief workspace (the
+    /// same scope rule as `check_watch_scope`). Transient store errors are
+    /// treated as valid — never reject a live subscribe on a flaky read.
+    pub(crate) async fn validate_event_subscriber(
+        &self,
+        workspace_id: &WorkspaceId,
+        subscriber: &AgentId,
+    ) -> Result<()> {
+        match self.store.get_agent_session(subscriber).await {
+            Ok(session) => {
+                if matches!(session.status, intent_core::AgentStatus::Deleted) {
+                    return Err(Error::InvalidParams(format!(
+                        "subscriber agent {} is deleted",
+                        subscriber.0
+                    )));
+                }
+                if &session.workspace_id != workspace_id && !session.workspace_id.is_chief() {
+                    return Err(Error::InvalidParams(format!(
+                        "subscriber agent {} belongs to workspace {}, not {}; only \
+                         chief-workspace agents may subscribe to another workspace's events",
+                        subscriber.0, session.workspace_id.0, workspace_id.0
+                    )));
+                }
+                Ok(())
+            }
+            Err(intent_store::Error::NotFound(_)) => Err(Error::InvalidParams(format!(
+                "subscriber agent {} not found",
+                subscriber.0
+            ))),
+            Err(e) => {
+                tracing::warn!(
+                    "event.subscribe: subscriber liveness check failed for {}: {e}",
+                    subscriber.0
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Register a subscription: resolve wildcards, insert into the registry,
-    /// spawn its delivery task, and (for agent-owned subscriptions)
-    /// write-through persist. Returns `(subscription_id, resolved_types)`.
-    pub(crate) fn register_event_subscription(
+    /// spawn its delivery task, and (for agent-owned subscriptions) persist
+    /// the row with an AWAITED upsert — the row is committed before this
+    /// returns, so an immediately following `event.unsubscribe` (whose
+    /// delete is also awaited) can never lose the INSERT/DELETE race and
+    /// resurrect the subscription on the next restart. A failed persist only
+    /// logs: the in-memory subscription still delivers live. Returns
+    /// `(subscription_id, resolved_types)`.
+    pub(crate) async fn register_event_subscription(
         &self,
         workspace_id: &WorkspaceId,
         subscriber_agent_id: Option<AgentId>,
@@ -74,7 +121,11 @@ impl Services {
             created_at: now_iso(),
         };
         self.insert_event_subscription(record.clone());
-        self.persist_event_subscription(&record);
+        if let Some(persisted) = record_to_persisted(&record) {
+            if let Err(e) = self.store.upsert_event_subscription(&persisted).await {
+                tracing::warn!("event_subscription upsert failed {}: {e}", record.id);
+            }
+        }
         (record.id, record.event_types)
     }
 
@@ -89,8 +140,10 @@ impl Services {
     }
 
     /// Remove a subscription: abort its delivery task and delete the
-    /// persisted row. Returns `false` when the id is unknown.
-    pub(crate) fn remove_event_subscription(&self, subscription_id: &str) -> bool {
+    /// persisted row (AWAITED, so the registration-time awaited upsert and
+    /// this delete are strictly ordered — no resurrection on restart).
+    /// Returns `false` when the id is unknown.
+    pub(crate) async fn remove_event_subscription(&self, subscription_id: &str) -> bool {
         let entry = self
             .event_subscriptions
             .lock()
@@ -103,14 +156,18 @@ impl Services {
             task.abort();
         }
         if entry.record.subscriber_agent_id.is_some() {
-            self.delete_persisted_event_subscription(&entry.record.id);
+            if let Err(e) = self.store.delete_event_subscription(&entry.record.id).await {
+                tracing::warn!("event_subscription delete failed {}: {e}", entry.record.id);
+            }
         }
         true
     }
 
-    /// Remove every subscription owned by `agent_id` (subscriber deleted) —
-    /// aborts delivery tasks and clears the persisted rows.
-    pub(crate) fn remove_event_subscriptions_for_agent(&self, agent_id: &AgentId) -> usize {
+    /// Remove every subscription owned by `agent_id` (subscriber deleted /
+    /// `agent.cancelSubscriptions`) — aborts delivery tasks and clears the
+    /// persisted rows (AWAITED, same INSERT/DELETE ordering guarantee as
+    /// [`Services::remove_event_subscription`]).
+    pub(crate) async fn remove_event_subscriptions_for_agent(&self, agent_id: &AgentId) -> usize {
         let removed: Vec<EventSubscriptionEntry> = {
             let mut guard = self
                 .event_subscriptions
@@ -129,16 +186,16 @@ impl Services {
             }
         }
         if !removed.is_empty() {
-            let store = self.store.clone();
-            let agent = agent_id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = store.delete_event_subscriptions_for_agent(&agent).await {
-                    tracing::warn!(
-                        "event_subscription delete for agent {} failed: {e}",
-                        agent.0
-                    );
-                }
-            });
+            if let Err(e) = self
+                .store
+                .delete_event_subscriptions_for_agent(agent_id)
+                .await
+            {
+                tracing::warn!(
+                    "event_subscription delete for agent {} failed: {e}",
+                    agent_id.0
+                );
+            }
         }
         removed.len()
     }
@@ -189,37 +246,6 @@ impl Services {
                 }
             }
         }))
-    }
-
-    /// Best-effort write-through persist of an agent-owned subscription
-    /// (restart durability). Mirrors `Services::persist_completion_watch`:
-    /// spawns an async persist task, not durable-before-observable — the
-    /// crash window between in-memory registration and commit is
-    /// milliseconds and the subscriber can re-subscribe. Front-door
-    /// subscriptions (no subscriber agent) are in-memory only.
-    fn persist_event_subscription(&self, record: &EventSubscriptionRecord) {
-        let Some(persisted) = record_to_persisted(record) else {
-            return;
-        };
-        let store = self.store.clone();
-        tokio::spawn(async move {
-            let id = persisted.id.clone();
-            if let Err(e) = store.upsert_event_subscription(&persisted).await {
-                tracing::warn!("event_subscription upsert failed {id}: {e}");
-            }
-        });
-    }
-
-    /// Best-effort async delete of a persisted subscription row
-    /// (`event.unsubscribe`).
-    fn delete_persisted_event_subscription(&self, subscription_id: &str) {
-        let store = self.store.clone();
-        let id = subscription_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = store.delete_event_subscription(&id).await {
-                tracing::warn!("event_subscription delete failed {id}: {e}");
-            }
-        });
     }
 
     /// Rehydrate persisted event subscriptions at daemon startup: load every
@@ -302,7 +328,10 @@ fn persisted_to_record(p: &PersistedEventSubscription) -> EventSubscriptionRecor
         subscriber_agent_id: Some(p.subscriber_agent_id.clone()),
         event_types: p.event_types.clone(),
         exclude_self: p.exclude_self,
-        batch_window_ms: p.batch_window_ms,
+        // Re-run the registration-time guard: a non-positive stored window
+        // (hand-edited DB, migration bug) would otherwise wrap through the
+        // `as u64` cast into an astronomically large batch window.
+        batch_window_ms: normalize_batch_window_ms(Some(p.batch_window_ms)),
         created_at: p.created_at.clone(),
     }
 }
