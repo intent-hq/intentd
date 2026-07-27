@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.9] - 2026-07-27
+
+### 🚀 Features
+
+- Unsloth provider registry entry + HF GGUF catalog with memory-fit filtering ([#593](https://github.com/intent-hq/intentd/pull/593))
+
+### 🐛 Bug Fixes
+
+- Robust sandbox merge-back and faster best-effort CoW clone ([#592](https://github.com/intent-hq/intentd/pull/592))
+
+### ⚙️ Miscellaneous Tasks
+
+- Fail PRs containing committed git conflict markers (#588 incident) ([#591](https://github.com/intent-hq/intentd/pull/591))
+
+
 ## [0.2.8] - 2026-07-27
 
 ### 🚀 Features
