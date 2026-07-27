@@ -232,6 +232,12 @@ pub(crate) struct BridgeRetryConfig {
     pub backoff_start: Duration,
     /// Upper bound on the (doubling) backoff delay.
     pub backoff_cap: Duration,
+    /// Per-attempt cap on how long a single connect may stay pending. The
+    /// bridge only ever dials loopback, where connects resolve immediately,
+    /// so this is a defensive bound: it keeps a pathologically hanging
+    /// attempt from stalling held stdin lines (monorepo#906) or the
+    /// `reconnect_window` deadline for the OS connect timeout.
+    pub connect_timeout: Duration,
 }
 
 impl Default for BridgeRetryConfig {
@@ -241,6 +247,7 @@ impl Default for BridgeRetryConfig {
             reconnect_window: Duration::from_secs(30),
             backoff_start: Duration::from_millis(50),
             backoff_cap: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -266,9 +273,11 @@ enum SessionEnd {
 /// error instead. A mid-session TCP drop keeps the stdio side alive while the
 /// bridge reconnects to the same address. While reconnecting, each stdin
 /// request that carries an `id` is answered with a retryable JSON-RPC error
-/// ([`BRIDGE_DISCONNECTED_CODE`]) instead of being dropped, and requests that
-/// were in flight when the connection died get the same synthesized error so
-/// the provider's MCP client never has to time out.
+/// ([`BRIDGE_DISCONNECTED_CODE`]) instead of being dropped — except for lines
+/// that race a still-pending connect attempt, which are held until that
+/// attempt's outcome is known (monorepo#906) — and requests that were in
+/// flight when the connection died get the same synthesized error so the
+/// provider's MCP client never has to time out.
 pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
     run_bridge(
         addr,
@@ -284,24 +293,55 @@ pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
 pub(crate) async fn run_bridge<R, W>(
     addr: &str,
     input: R,
-    mut output: W,
+    output: W,
     cfg: BridgeRetryConfig,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let target = addr.to_string();
+    run_bridge_with(addr, input, output, cfg, move || {
+        let target = target.clone();
+        async move { TcpStream::connect(&target).await }
+    })
+    .await
+}
+
+/// [`run_bridge`] with an injectable connector, so tests can control exactly
+/// when a connect attempt resolves and deterministically exercise the
+/// line-races-pending-connect window (monorepo#906).
+pub(crate) async fn run_bridge_with<R, W, C, Fut>(
+    addr: &str,
+    input: R,
+    mut output: W,
+    cfg: BridgeRetryConfig,
+    mut connect: C,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    C: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<TcpStream>>,
+{
     let mut input = BufReader::new(input).lines();
     let mut initial = true;
     let mut buffered: Vec<String> = Vec::new();
     loop {
-        let stream =
-            match connect_with_retry(addr, cfg, initial, &mut buffered, &mut input, &mut output)
-                .await?
-            {
-                Some(stream) => stream,
-                None => return Ok(()),
-            };
+        let stream = match connect_with_retry(
+            addr,
+            cfg,
+            initial,
+            &mut buffered,
+            &mut input,
+            &mut output,
+            &mut connect,
+        )
+        .await?
+        {
+            Some(stream) => stream,
+            None => return Ok(()),
+        };
         initial = false;
         match pump_session(
             stream,
@@ -319,33 +359,45 @@ where
     }
 }
 
-/// Connect to `addr` with bounded backoff. While waiting between attempts,
-/// keep servicing stdin. During the initial window (`initial == true`) lines
-/// are buffered into `buffer` for forwarding once the connect succeeds
-/// (monorepo#908), bounded by [`INITIAL_BUFFER_MAX_LINES`] /
-/// [`INITIAL_BUFFER_MAX_BYTES`]; past the caps — or during a mid-session
-/// reconnect — requests with an `id` are answered with the retryable
-/// disconnected error and notifications are dropped.
+/// Connect via `connect` with bounded backoff. While waiting between
+/// attempts, keep servicing stdin. During the initial window
+/// (`initial == true`) lines are buffered into `buffer` for forwarding once
+/// the connect succeeds (monorepo#908), bounded by
+/// [`INITIAL_BUFFER_MAX_LINES`] / [`INITIAL_BUFFER_MAX_BYTES`]; past the caps
+/// — or during a mid-session reconnect backoff — requests with an `id` are
+/// answered with the retryable disconnected error and notifications are
+/// dropped.
+///
+/// Mid-session lines that race a *pending* connect attempt are held until
+/// that attempt's outcome is known (monorepo#906): tokio only refreshes IO
+/// readiness on a driver turn, so a stdin wake can observe the connect as
+/// stale-`Pending` even though the kernel already established it — rejecting
+/// on that observation would spuriously `-32001` a request the fresh
+/// connection could serve. On success held lines join `buffer` (flushed in
+/// order by the session); on failure they get the retryable error then.
 ///
 /// Returns `Ok(Some(stream))` on success. On give-up, the initial connect
 /// surfaces the last error (the daemon was never reachable; buffered requests
 /// are never answered — the caller exits non-zero instead), while a reconnect
 /// returns `Ok(None)` so the bridge exits cleanly — a restarted daemon listens
 /// on a new port this bridge can never learn. `Ok(None)` is also returned when
-/// stdin reaches EOF while disconnected; during the initial window any
-/// buffered lines are dropped unanswered — the provider closed stdin, so
-/// nothing is awaiting responses.
-async fn connect_with_retry<R, W>(
+/// stdin reaches EOF while disconnected; any buffered or held lines are
+/// dropped unanswered — the provider closed stdin, so nothing is awaiting
+/// responses.
+async fn connect_with_retry<R, W, C, Fut>(
     addr: &str,
     cfg: BridgeRetryConfig,
     initial: bool,
     buffer: &mut Vec<String>,
     input: &mut Lines<BufReader<R>>,
     output: &mut W,
+    connect: &mut C,
 ) -> std::io::Result<Option<TcpStream>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+    C: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<TcpStream>>,
 {
     let deadline = Instant::now() + cfg.reconnect_window;
     let mut delay = cfg.backoff_start;
@@ -354,36 +406,60 @@ where
     let mut overflowed = false;
     loop {
         attempts += 1;
-        // Service stdin while the connect itself is pending (not just during
-        // the backoff sleep) so a blackholed address cannot leave requests
-        // unserviced for the OS connect timeout. `biased` polls the connect
-        // first: a request racing with a completed connect is forwarded on
-        // the fresh connection instead of being spuriously buffered/rejected.
-        let connect = TcpStream::connect(addr);
-        tokio::pin!(connect);
+        // Service stdin while the connect itself is pending, holding lines
+        // for the attempt's outcome (see above) instead of rejecting them
+        // against possibly stale readiness (monorepo#906). `connect_timeout`
+        // bounds the attempt so a blackholed address cannot stall held lines
+        // (or the reconnect deadline) for the OS connect timeout.
+        let mut held: Vec<String> = Vec::new();
+        let mut held_bytes: usize = 0;
+        let attempt = tokio::time::timeout(cfg.connect_timeout, connect());
+        tokio::pin!(attempt);
         let connected = loop {
             tokio::select! {
                 biased;
-                result = &mut connect => break result,
+                result = &mut attempt => break result.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "mcp bridge connect attempt timed out",
+                    ))
+                }),
                 line = input.next_line() => match line? {
                     Some(line) => {
-                        buffer_or_reject(
-                            line,
-                            initial,
-                            buffer,
-                            &mut buffered_bytes,
-                            &mut overflowed,
-                            output,
-                        )
-                        .await?
+                        if initial {
+                            buffer_or_reject(
+                                line,
+                                initial,
+                                buffer,
+                                &mut buffered_bytes,
+                                &mut overflowed,
+                                output,
+                            )
+                            .await?
+                        } else if !overflowed
+                            && held.len() < INITIAL_BUFFER_MAX_LINES
+                            && held_bytes + line.len() <= INITIAL_BUFFER_MAX_BYTES
+                        {
+                            held_bytes += line.len();
+                            held.push(line);
+                        } else {
+                            overflowed = true;
+                            reject_if_request(&line, output).await?;
+                        }
                     }
                     None => return Ok(None),
                 },
             }
         };
         match connected {
-            Ok(stream) => return Ok(Some(stream)),
+            Ok(stream) => {
+                buffer.append(&mut held);
+                return Ok(Some(stream));
+            }
             Err(e) => {
+                for line in held.drain(..) {
+                    reject_if_request(&line, output).await?;
+                }
                 if initial {
                     if attempts >= cfg.initial_attempts {
                         tracing::warn!(%addr, error = %e, attempts, "mcp bridge initial connect failed; giving up");
