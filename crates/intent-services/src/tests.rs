@@ -9172,6 +9172,7 @@ mod usage_stats_recording {
             .filter(|r| r.model == model)
             .map(|r| r.provider.clone())
             .collect();
+        providers.sort();
         providers.dedup();
         providers
     }
