@@ -2138,7 +2138,12 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
         loop {
             ticker.tick().await;
             let summary = services.sweep_merge_pending_sandboxes().await;
-            if !summary.is_empty() {
+            // INFO only when the sweep attempted work; skip-only passes
+            // (e.g. a permanently capped sandbox every tick) log at debug so
+            // they do not spam the log forever.
+            let attempted =
+                summary.merged + summary.conflicts + summary.blocked + summary.errors > 0;
+            if attempted {
                 tracing::info!(
                     merged = summary.merged,
                     conflicts = summary.conflicts,
@@ -2148,6 +2153,13 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
                     skipped_raced = summary.skipped_raced,
                     errors = summary.errors,
                     "merge-pending retry sweep completed"
+                );
+            } else if !summary.is_empty() {
+                tracing::debug!(
+                    skipped_capped = summary.skipped_capped,
+                    skipped_busy = summary.skipped_busy,
+                    skipped_raced = summary.skipped_raced,
+                    "merge-pending retry sweep: skips only, nothing attempted"
                 );
             }
         }
