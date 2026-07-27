@@ -9161,6 +9161,21 @@ mod usage_stats_recording {
             .fold((0, 0), |(a, d), r| (a + r.lines_added, d + r.lines_deleted))
     }
 
+    /// Distinct providers recorded across every bucket of one model.
+    async fn providers_for(svc: &Services, model: &str) -> Vec<String> {
+        let mut providers: Vec<String> = svc
+            .store()
+            .list_usage_stats_hourly()
+            .await
+            .expect("list usage stats")
+            .iter()
+            .filter(|r| r.model == model)
+            .map(|r| r.provider.clone())
+            .collect();
+        providers.dedup();
+        providers
+    }
+
     /// `track_change` reports the growth of the row's cumulative per-file
     /// counters — full values on create, the increase on update, and a
     /// clamped zero when the diff shrinks (reverted lines never go negative).
@@ -9203,6 +9218,7 @@ mod usage_stats_recording {
                 .expect("track grown");
         crate::usage_stats::record_lines_changed(store, &ws, Some(&agent), delta.0, delta.1).await;
         assert_eq!(lines_for(&svc, "Opus 4.8").await, (15, 3));
+        assert_eq!(providers_for(&svc, "Opus 4.8").await, vec!["auggie"]);
 
         // Clearing the workspace/agent metrics aggregates must not touch the
         // time-bucketed usage stats (D5: period-scoped true totals).
@@ -9237,9 +9253,10 @@ mod usage_stats_recording {
             .expect("list")
             .is_empty());
         // Attributed to an agent whose session (and thus model) is unknown →
-        // recorded under the "unknown" model.
+        // recorded under the "unknown" model AND the "unknown" provider.
         crate::usage_stats::record_lines_changed(store, &ws, Some("agent-ghost"), 3, 1).await;
         assert_eq!(lines_for(&svc, "unknown").await, (3, 1));
+        assert_eq!(providers_for(&svc, "unknown").await, vec!["unknown"]);
     }
 }
 

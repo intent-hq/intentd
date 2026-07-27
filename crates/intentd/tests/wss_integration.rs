@@ -1565,6 +1565,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .add_usage_stats(
             &bucket_now,
             "Opus 4.8",
+            "claude-code",
             Some(&stamp(now, divergent_hour)),
             &delta,
         )
@@ -1575,6 +1576,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .add_usage_stats(
             &bucket_old,
             "Sonnet 5",
+            "claude-code",
             Some(&stamp(old, old.hour() as u8)),
             &intent_store::UsageStatsDelta {
                 input_tokens: 7,

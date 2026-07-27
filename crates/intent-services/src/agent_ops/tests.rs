@@ -2079,6 +2079,19 @@ async fn create_records_session_started_usage_stats() {
     assert_eq!(sessions_for("Opus 4.8"), 1);
     assert_eq!(sessions_for(intent_providers::default_provider_id()), 1);
     assert_eq!(sessions_for("unknown"), 0);
+    // Both ticks carry the resolved provider id — the compound prefix for the
+    // explicit model, the default provider for the no-model create.
+    let provider_for = |model: &str| -> Vec<&str> {
+        rows.iter()
+            .filter(|r| r.model == model)
+            .map(|r| r.provider.as_str())
+            .collect()
+    };
+    assert_eq!(provider_for("Opus 4.8"), vec!["auggie"]);
+    assert_eq!(
+        provider_for(intent_providers::default_provider_id()),
+        vec![intent_providers::default_provider_id()]
+    );
     assert!(
         rows.iter().all(|r| r.bucket_utc.ends_with(":00:00Z")),
         "buckets are UTC hour floors: {rows:?}"
