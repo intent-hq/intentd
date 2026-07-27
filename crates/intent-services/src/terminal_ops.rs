@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::events::EventBus;
-use crate::{publish_event, system_actor};
+use crate::{publish_event, system_actor, SettingsRegistry};
 
 /// How often the output streamer polls for natural process exit. The broadcast
 /// sender lives in the (still-tracked) session, so a child that exits on its own
@@ -53,14 +53,18 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// output onto the bus; returns `{ terminalId }`. `env` is an optional
 /// overlay layered onto the daemon's inherited environment (`portable-pty`
 /// inherits by default), so callers can pass per-terminal variables through
-/// without dropping them. When `cwd` is omitted the PTY spawns in the
-/// workspace's worktree root (see [`default_cwd`]); an explicit `cwd` always
-/// wins.
+/// without dropping them. When the `exposeGitCredentialToChildren` setting is
+/// on and a GitHub token resolves, the github.com-scoped credential-helper
+/// env pairs are injected under the caller's overlay — caller-supplied keys
+/// always win (see [`git_credential_env`]). When `cwd` is omitted the PTY
+/// spawns in the workspace's worktree root (see [`default_cwd`]); an explicit
+/// `cwd` always wins.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Option<Store>,
+    settings: Option<Arc<SettingsRegistry>>,
     workspace_id: WorkspaceId,
     cols: u16,
     rows: u16,
@@ -77,9 +81,8 @@ pub(crate) async fn create(
             None => None,
         },
     };
-    if let Some(map) = env {
-        spec.env = map.into_iter().collect();
-    }
+    let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
+    spec.env = overlay_credential_env(git_credential_env(settings.as_deref()).await, user_env);
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -107,6 +110,69 @@ async fn default_cwd(
     }
     let workspace = store.get_workspace(workspace_id).await.ok()?;
     crate::git_ops::worktree_path(&workspace)
+}
+
+/// Environment pairs offering the daemon-managed GitHub credential to git
+/// run inside a spawned terminal, gated on
+/// `sourceControl.github.exposeGitCredentialToChildren` (monorepo#884): the
+/// github.com-scoped credential helper carried by `GIT_CONFIG_PARAMETERS`
+/// plus the token under `INTENT_GIT_GITHUB_TOKEN` — never raw
+/// `GITHUB_TOKEN`/`GH_TOKEN`. The token is resolved once at spawn time (no
+/// live refresh mid-session — a terminal spawned before a token existed keeps
+/// its env until respawned). Resolution never fails or blocks the spawn: no
+/// usable token simply yields no pairs (logged at debug).
+pub(crate) async fn git_credential_env(
+    settings: Option<&SettingsRegistry>,
+) -> Vec<(String, String)> {
+    if !expose_git_credential(settings) {
+        return Vec::new();
+    }
+    let token = intent_sourcecontrol::token::resolve(&crate::github_token_source(settings)).await;
+    if token.is_none() {
+        tracing::debug!(
+            "no GitHub token resolved; spawning terminal without credential helper env"
+        );
+    }
+    credential_pairs(token.as_deref())
+}
+
+/// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
+/// minimal/test compositions) reads as **off** so bare spawns never trigger
+/// token resolution; the production composition root always wires the
+/// registry, where the schema default (`true`) applies.
+fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
+    settings.is_some_and(|r| {
+        r.snapshot()
+            .effective
+            .source_control
+            .github
+            .expose_git_credential_to_children
+    })
+}
+
+/// Build the credential env pairs for `token` on top of the daemon's own
+/// inherited `GIT_CONFIG_PARAMETERS` (the PTY child inherits the daemon env,
+/// so overwriting the variable without re-appending would drop inherited
+/// entries). Empty when `token` is unusable.
+fn credential_pairs(token: Option<&str>) -> Vec<(String, String)> {
+    let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+    intent_git::auth::scoped_credential_env(token, inherited.as_deref())
+}
+
+/// Layer caller-supplied env over the injected credential pairs: a key the
+/// caller sets drops the injected pair outright (user env always wins), and
+/// caller pairs come last so they also win the host's later-entry-overrides
+/// application order.
+fn overlay_credential_env(
+    credential: Vec<(String, String)>,
+    user: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = credential
+        .into_iter()
+        .filter(|(key, _)| !user.iter().any(|(user_key, _)| user_key == key))
+        .collect();
+    env.extend(user);
+    env
 }
 
 /// Write base64-encoded input to a PTY's stdin.
@@ -436,22 +502,28 @@ fn terminal_event(workspace_id: &WorkspaceId, event_type: &str, data: Value) -> 
 /// calls on the shared [`PtyHost`], scoped to the agent session id (§6.7).
 pub struct PtyTerminalHost {
     pty: Arc<PtyHost>,
+    /// Settings registry backing the credential-injection gate
+    /// ([`git_credential_env`]); `None` (minimal compositions) disables
+    /// injection.
+    settings: Option<Arc<SettingsRegistry>>,
 }
 
 impl PtyTerminalHost {
     /// Wire the adapter over the shared host.
-    pub fn new(pty: Arc<PtyHost>) -> Self {
-        Self { pty }
+    pub fn new(pty: Arc<PtyHost>, settings: Option<Arc<SettingsRegistry>>) -> Self {
+        Self { pty, settings }
     }
 }
 
 impl TerminalHost for PtyTerminalHost {
     fn create(&self, params: TerminalCreateParams) -> BoxFuture<'_, AcpResult<String>> {
         let pty = self.pty.clone();
+        let settings = self.settings.clone();
         Box::pin(async move {
+            let credential = git_credential_env(settings.as_deref()).await;
             let mut spec = SpawnSpec::new(params.session_id, params.command);
             spec.args = params.args;
-            spec.env = params.env;
+            spec.env = overlay_credential_env(credential, params.env);
             spec.cwd = params.cwd;
             if let Some(limit) = params
                 .output_byte_limit
@@ -688,6 +760,92 @@ mod tests {
         assert_eq!(strip_ansi(input), "red hide é✓😀");
     }
 
+    // ---- credential injection helpers (no spawn) ----
+
+    /// A registry backed by a throwaway config file, optionally overriding
+    /// the `exposeGitCredentialToChildren` gate.
+    fn registry_with_expose(value: Option<bool>) -> Arc<SettingsRegistry> {
+        let dir = tempfile::tempdir().expect("temp config dir").keep();
+        let registry = SettingsRegistry::load(dir.join("config.toml")).expect("load registry");
+        if let Some(v) = value {
+            registry
+                .apply(&[(
+                    "sourceControl.github.exposeGitCredentialToChildren".to_string(),
+                    serde_json::json!(v),
+                )])
+                .expect("apply exposeGitCredentialToChildren");
+        }
+        Arc::new(registry)
+    }
+
+    /// No registry (minimal/test compositions) reads as off; a wired registry
+    /// follows the setting, whose schema default is on.
+    #[test]
+    fn expose_gate_defaults() {
+        assert!(!expose_git_credential(None));
+        assert!(expose_git_credential(Some(&registry_with_expose(None))));
+        assert!(expose_git_credential(Some(&registry_with_expose(Some(
+            true
+        )))));
+        assert!(!expose_git_credential(Some(&registry_with_expose(Some(
+            false
+        )))));
+    }
+
+    /// The gate short-circuits injection: no registry and setting-off both
+    /// yield no pairs without attempting token resolution.
+    #[tokio::test]
+    async fn git_credential_env_respects_gate() {
+        assert!(git_credential_env(None).await.is_empty());
+        let off = registry_with_expose(Some(false));
+        assert!(git_credential_env(Some(&off)).await.is_empty());
+    }
+
+    /// An unusable token yields no pairs; a usable one yields exactly the
+    /// `GIT_CONFIG_PARAMETERS` + token-env pair set from the shared builder.
+    #[test]
+    fn credential_pairs_shape() {
+        assert!(credential_pairs(None).is_empty());
+        assert!(credential_pairs(Some("")).is_empty());
+        let pairs = credential_pairs(Some("tok-123"));
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                intent_git::auth::GIT_CONFIG_PARAMETERS_ENV,
+                intent_git::auth::TOKEN_ENV
+            ]
+        );
+        assert_eq!(pairs[1].1, "tok-123");
+    }
+
+    /// Caller-supplied env wins: a colliding key drops the injected pair and
+    /// caller pairs stay last (later-entry-overrides application order).
+    #[test]
+    fn overlay_credential_env_user_wins() {
+        let credential = vec![
+            ("GIT_CONFIG_PARAMETERS".to_string(), "injected".to_string()),
+            ("INTENT_GIT_GITHUB_TOKEN".to_string(), "tok".to_string()),
+        ];
+        let user = vec![
+            ("GIT_CONFIG_PARAMETERS".to_string(), "user".to_string()),
+            ("OTHER".to_string(), "x".to_string()),
+        ];
+        let merged = overlay_credential_env(credential, user);
+        assert_eq!(
+            merged,
+            vec![
+                ("INTENT_GIT_GITHUB_TOKEN".to_string(), "tok".to_string()),
+                ("GIT_CONFIG_PARAMETERS".to_string(), "user".to_string()),
+                ("OTHER".to_string(), "x".to_string()),
+            ]
+        );
+        assert_eq!(
+            overlay_credential_env(Vec::new(), vec![("A".to_string(), "1".to_string())]),
+            vec![("A".to_string(), "1".to_string())]
+        );
+    }
+
     // ---- error / not-found paths (no live process) ----
 
     #[test]
@@ -757,6 +915,7 @@ mod tests {
             pty.clone(),
             None,
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -797,6 +956,7 @@ mod tests {
             pty.clone(),
             None,
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -826,6 +986,7 @@ mod tests {
 
         let res = create(
             pty.clone(),
+            None,
             None,
             None,
             ws("ws-named"),
@@ -976,6 +1137,7 @@ mod tests {
             pty.clone(),
             None,
             Some(store),
+            None,
             wsid.clone(),
             80,
             24,
@@ -1004,6 +1166,7 @@ mod tests {
         let res = create(
             pty.clone(),
             Some(bus),
+            None,
             None,
             ws("ws-1"),
             80,
@@ -1042,6 +1205,7 @@ mod tests {
             pty.clone(),
             Some(bus),
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -1071,6 +1235,7 @@ mod tests {
             pty.clone(),
             Some(bus),
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -1098,6 +1263,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             None,
             ws("ws-1"),
@@ -1145,6 +1311,7 @@ mod tests {
             pty.clone(),
             None,
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -1169,6 +1336,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             None,
             ws("ws-1"),
@@ -1196,6 +1364,7 @@ mod tests {
             pty.clone(),
             None,
             None,
+            None,
             ws("ws-a"),
             80,
             24,
@@ -1216,6 +1385,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             None,
             ws("ws-1"),
@@ -1260,6 +1430,7 @@ mod tests {
             pty.clone(),
             None,
             None,
+            None,
             ws("ws-1"),
             80,
             24,
@@ -1297,6 +1468,7 @@ mod tests {
         let pty = host();
         let res = create(
             pty.clone(),
+            None,
             None,
             None,
             ws("ws-1"),
@@ -1349,7 +1521,7 @@ mod tests {
     #[tokio::test]
     async fn acp_create_output_and_wait_for_exit() {
         let pty = host();
-        let adapter = PtyTerminalHost::new(pty.clone());
+        let adapter = PtyTerminalHost::new(pty.clone(), None);
         let params = TerminalCreateParams {
             session_id: "sess-1".to_string(),
             command: "sh".to_string(),
@@ -1391,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn acp_create_with_byte_limit_then_release() {
         let pty = host();
-        let adapter = PtyTerminalHost::new(pty.clone());
+        let adapter = PtyTerminalHost::new(pty.clone(), None);
         let params = TerminalCreateParams {
             session_id: "sess-2".to_string(),
             command: "cat".to_string(),
@@ -1412,7 +1584,7 @@ mod tests {
     #[tokio::test]
     async fn acp_unknown_terminal_errors_on_every_op() {
         let pty = host();
-        let adapter = PtyTerminalHost::new(pty);
+        let adapter = PtyTerminalHost::new(pty, None);
         assert!(matches!(
             adapter.output("bad".to_string()).await,
             Err(AcpError::Terminal(_))
@@ -1434,7 +1606,7 @@ mod tests {
     #[tokio::test]
     async fn acp_kill_terminates_tracked_terminal() {
         let pty = host();
-        let adapter = PtyTerminalHost::new(pty.clone());
+        let adapter = PtyTerminalHost::new(pty.clone(), None);
         let params = TerminalCreateParams {
             session_id: "sess-3".to_string(),
             command: "cat".to_string(),

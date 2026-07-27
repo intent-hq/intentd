@@ -490,16 +490,18 @@ where
 /// real credential — asserted absent from argv and every wire frame.
 const E2E_TOKEN: &str = "e2e-825-stored-token-value";
 
-/// Materialise a stub `git` in `dir` that records its argv and the
-/// `INTENT_GIT_GITHUB_TOKEN` env var to capture files, then fails with the
-/// auth-shaped stderr `GIT_TERMINAL_PROMPT=0` produces for a private HTTPS
-/// repo. Returns the PATH value (stub dir first) for the daemon.
+/// Materialise a stub `git` in `dir` that records its argv plus the
+/// `INTENT_GIT_GITHUB_TOKEN` and `GIT_CONFIG_PARAMETERS` env vars to capture
+/// files, then fails with the auth-shaped stderr `GIT_TERMINAL_PROMPT=0`
+/// produces for a private HTTPS repo. Returns the PATH value (stub dir first)
+/// for the daemon.
 fn make_stub_git(dir: &Path, capture: &Path) -> String {
     std::fs::create_dir_all(dir).expect("mkdir stub dir");
     let script = format!(
         "#!/bin/sh\n\
          for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{capture}.argv\"\n\
          printf '%s' \"${{INTENT_GIT_GITHUB_TOKEN-}}\" > \"{capture}.token\"\n\
+         printf '%s' \"${{GIT_CONFIG_PARAMETERS-}}\" > \"{capture}.params\"\n\
          echo \"fatal: could not read Username for 'https://github.com': terminal prompts disabled\" >&2\n\
          exit 128\n",
         capture = capture.display()
@@ -558,9 +560,10 @@ async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
 
 /// Regression for monorepo#825 (credential injection): a `git.clone` of a
 /// private HTTPS github.com repo offers the stored token to the child git via
-/// the env-backed credential helper — the helper `-c` config is in argv, the
-/// token bytes are NOT (env only) — and the auth-shaped failure is classified
-/// as `errorCode: "auth-required"` on `git:clone:done` with no token leaking
+/// the env-backed credential helper — the helper config travels in
+/// `GIT_CONFIG_PARAMETERS`, the token bytes only in `INTENT_GIT_GITHUB_TOKEN`
+/// (neither in argv) — and the auth-shaped failure is classified as
+/// `errorCode: "auth-required"` on `git:clone:done` with no token leaking
 /// into any wire frame.
 #[tokio::test]
 async fn git_clone_injects_stored_token_and_classifies_auth_failure() {
@@ -619,16 +622,23 @@ async fn git_clone_injects_stored_token_and_classifies_auth_failure() {
         "token must not leak onto the wire: {serialized}"
     );
 
-    // The stub captured the spawn: helper config in argv, token in env only.
+    // The stub captured the spawn: helper config in GIT_CONFIG_PARAMETERS,
+    // token in its own env var, neither in argv.
     let argv =
         std::fs::read_to_string(capture.with_extension("argv")).expect("stub git captured argv");
     assert!(
-        argv.contains("credential.https://github.com.helper="),
-        "credential helper offered to child git: {argv}"
-    );
-    assert!(
         !argv.contains(E2E_TOKEN),
         "token must never appear in argv: {argv}"
+    );
+    let params = std::fs::read_to_string(capture.with_extension("params"))
+        .expect("stub git captured GIT_CONFIG_PARAMETERS");
+    assert!(
+        params.contains("credential.https://github.com.helper="),
+        "credential helper offered via GIT_CONFIG_PARAMETERS: {params}"
+    );
+    assert!(
+        !params.contains(E2E_TOKEN),
+        "token must never appear in GIT_CONFIG_PARAMETERS: {params}"
     );
     let token = std::fs::read_to_string(capture.with_extension("token"))
         .expect("stub git captured token env");
