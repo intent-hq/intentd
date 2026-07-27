@@ -1576,7 +1576,7 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .add_usage_stats(
             &bucket_old,
             "Sonnet 5",
-            "claude-code",
+            "codex",
             Some(&stamp(old, old.hour() as u8)),
             &intent_store::UsageStatsDelta {
                 input_tokens: 7,
@@ -1607,6 +1607,16 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
     assert_eq!(by_model.len(), 1, "{resp}");
     assert_eq!(by_model[0]["model"], "Opus 4.8");
     assert_eq!(by_model[0]["runs"], 2);
+    // byProvider mirrors byModel with raw provider ids: only the in-window
+    // claude-code bucket shows; the out-of-window codex bucket is excluded.
+    let by_provider = r["byProvider"].as_array().expect("byProvider");
+    assert_eq!(by_provider.len(), 1, "{resp}");
+    assert_eq!(by_provider[0]["provider"], "claude-code");
+    assert_eq!(by_provider[0]["runs"], 2);
+    assert_eq!(by_provider[0]["inputTokens"], 100);
+    assert_eq!(by_provider[0]["outputTokens"], 40);
+    assert_eq!(by_provider[0]["cacheReadTokens"], 20);
+    assert_eq!(by_provider[0]["cacheCreationTokens"], 10);
     let by_hour = r["byHourOfDay"].as_array().expect("byHourOfDay");
     assert_eq!(by_hour.len(), 24);
     // The seeded bucket occupies exactly one trailing-window slot (the newest
@@ -1638,6 +1648,13 @@ async fn wss_stats_get_usage_round_trip_with_seeded_store() {
         .expect("Opus row in current month");
     assert_eq!(opus["inputTokens"], 100);
     assert_eq!(opus["runs"], 2);
+    let by_provider = resp["result"]["byProvider"].as_array().expect("byProvider");
+    let claude = by_provider
+        .iter()
+        .find(|p| p["provider"] == "claude-code")
+        .expect("claude-code row in current month");
+    assert_eq!(claude["inputTokens"], 100);
+    assert_eq!(claude["runs"], 2);
     // Month-view hour-of-day grouping follows the recorded local stamp, not
     // the UTC bucket hour (D12).
     let by_hour = resp["result"]["byHourOfDay"]
