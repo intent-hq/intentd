@@ -21,7 +21,11 @@
 //! a live socket) does the walk recurse into it per-entry. Subtrees cloned
 //! by the fast path contain no non-clonable entries — otherwise the
 //! directory-level clone would have failed — so skip semantics and counts
-//! are identical to the pure per-entry walk.
+//! are identical to the pure per-entry walk. The foreign-volume skip is
+//! only checked per-entry: a subtree containing a nested mount relies on the
+//! platform `clone_dir` failing with EXDEV → `Unsupported` (recursive
+//! clonefile cannot cross volumes), which drops it into the per-entry walk
+//! where the dev check applies.
 
 use intent_core::{Error, Result};
 use std::fs;
@@ -150,9 +154,16 @@ fn clone_entry(
                         );
                         // A failed whole-directory clone can leave a partial
                         // destination behind; clear it so the per-entry walk
-                        // does not die on EEXIST.
-                        if dst.exists() {
-                            fs::remove_dir_all(dst).map_err(|e| {
+                        // does not die on EEXIST. Match on the actual entry
+                        // type: a non-directory leftover must not turn the
+                        // recoverable fallback into a hard error.
+                        if let Ok(dst_meta) = fs::symlink_metadata(dst) {
+                            let removal = if dst_meta.file_type().is_dir() {
+                                fs::remove_dir_all(dst)
+                            } else {
+                                fs::remove_file(dst)
+                            };
+                            removal.map_err(|e| {
                                 Error::Internal(format!(
                                     "cannot remove partial subtree clone before per-entry retry: {e}"
                                 ))

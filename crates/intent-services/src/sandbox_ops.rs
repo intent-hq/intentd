@@ -36,7 +36,10 @@ pub enum MergeOutcome {
         conflicting_paths: Vec<String>,
         canonical_head: String,
     },
-    /// Blocked: canonical has uncommitted user edits overlapping merge paths.
+    /// Blocked: the merge could not proceed but stays retryable — canonical
+    /// has uncommitted user edits overlapping merge paths (`overlapping_paths`
+    /// populated), or the sandbox branch is missing/unborn (`overlapping_paths`
+    /// empty; see `reason`).
     Blocked {
         reason: String,
         overlapping_paths: Vec<String>,
@@ -413,6 +416,11 @@ pub async fn merge_sandbox(
     let temp_ref = format!("refs/intent/sandbox-merge/{}", agent_id.0);
     let refspec = format!("+{}:{}", branch_ref_name, temp_ref);
 
+    // Sandbox paths are intentd-controlled absolute paths under
+    // workspaces_root, so the positional <repository> argument cannot be
+    // mistaken for an option or a remote-helper URL. GIT_TERMINAL_PROMPT=0 and
+    // a null stdin force fail-fast instead of a hidden credential prompt
+    // (parity with intent-git/src/fetch.rs); the transport is local-only.
     let fetch_out = std::process::Command::new("git")
         .arg("fetch")
         .arg("--no-tags")
@@ -420,6 +428,8 @@ pub async fn merge_sandbox(
         .arg(sandbox_path_str)
         .arg(&refspec)
         .current_dir(&canonical_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))?;
     if !fetch_out.status.success() {
@@ -455,16 +465,20 @@ fn apply_sandbox_commits(
 ) -> Result<MergeOutcome> {
     let canonical_head_sha = canonical_head_commit.id().to_string();
 
-    // Get the range of commits to cherry-pick: from snapshot (or base) to sandbox HEAD
+    // Get the range of commits to cherry-pick: from snapshot (or base) to the
+    // sandbox branch tip. Resolve the branch ref rather than HEAD — the fetch
+    // in `merge_sandbox` only brought over `refs/heads/<branch>` objects, so a
+    // detached or re-pointed HEAD would yield a range whose commits are absent
+    // from the canonical ODB.
     let start_sha = sandbox
         .snapshot_commit_sha
         .as_ref()
         .unwrap_or(&sandbox.base_commit_sha);
     let sandbox_head = sandbox_repo
-        .head()
-        .map_err(|e| Error::Internal(format!("get sandbox HEAD failed: {e}")))?
+        .find_reference(&format!("refs/heads/{}", sandbox.branch))
+        .map_err(|e| Error::Internal(format!("get sandbox branch failed: {e}")))?
         .peel_to_commit()
-        .map_err(|e| Error::Internal(format!("peel sandbox HEAD failed: {e}")))?;
+        .map_err(|e| Error::Internal(format!("peel sandbox branch failed: {e}")))?;
     let sandbox_head_sha = sandbox_head.id().to_string();
 
     // Get commits to apply (reversed for cherry-pick order)
@@ -2631,6 +2645,80 @@ mod tests {
                 .is_err(),
             "temp fetch ref must be deleted after merge"
         );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_merge_uses_branch_tip_not_head() {
+        // Regression: the commit range must come from refs/heads/<branch>, not
+        // sandbox HEAD — the merge-back fetch only brings over the branch's
+        // objects, so a detached/re-pointed HEAD would reference commits absent
+        // from the canonical ODB.
+        let (store, _db) = temp_store().await;
+        let (test_root, canonical_path) = temp_repo_in_target("branch-tip-not-head");
+
+        let ws = workspace_for_repo(&canonical_path);
+        store.insert_workspace(&ws).await.unwrap();
+
+        let agent_id = AgentId(uuid::Uuid::new_v4().to_string());
+        create_test_agent(&store, &ws.id, &agent_id).await;
+
+        let base_sha = commit_file(&canonical_path, "file1.txt", "base", "Add file1");
+
+        let sandbox_path = test_root.join("sandbox");
+        git2::Repository::clone(canonical_path.to_str().unwrap(), &sandbox_path).unwrap();
+
+        let branch_name = format!("sb/{}", agent_id.0);
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let head_commit = sandbox_repo.head().unwrap().peel_to_commit().unwrap();
+            sandbox_repo
+                .branch(&branch_name, &head_commit, false)
+                .unwrap();
+            sandbox_repo
+                .set_head(&format!("refs/heads/{}", branch_name))
+                .unwrap();
+        }
+
+        // Agent work lands on the sandbox branch...
+        commit_file(&sandbox_path, "agent.txt", "agent work", "Agent work");
+
+        // ...then HEAD is detached at the pre-work base commit. The merge must
+        // still pick up the branch tip's commit.
+        {
+            let sandbox_repo = git2::Repository::open(&sandbox_path).unwrap();
+            let base_oid = git2::Oid::from_str(&base_sha).unwrap();
+            sandbox_repo.set_head_detached(base_oid).unwrap();
+            sandbox_repo
+                .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                .unwrap();
+        }
+
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: ws.id.clone(),
+            agent_id: agent_id.clone(),
+            path: sandbox_path.to_string_lossy().to_string(),
+            branch: branch_name,
+            base_commit_sha: base_sha,
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.insert_sandbox(&sandbox).await.unwrap();
+
+        let outcome = merge_sandbox(&store, &ws.id, &agent_id)
+            .await
+            .expect("merge must resolve the branch tip, not HEAD");
+        match outcome {
+            MergeOutcome::Merged { .. } => {
+                assert!(canonical_path.join("agent.txt").exists());
+            }
+            _ => panic!("Expected Merged outcome, got {:?}", outcome),
+        }
 
         let _ = fs::remove_dir_all(&test_root);
     }
