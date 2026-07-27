@@ -431,6 +431,15 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scripts: Option<Vec<RepoScript>>,
 
+    /// Repo-root-relative directory prefixes excluded from CoW checkout
+    /// provisioning (`workspace.create`/`workspace.duplicate`): matching
+    /// directories are not cloned into the checkout (e.g. huge caches that
+    /// slow the clone down). `.git` and the repo root itself cannot be
+    /// excluded (such entries are ignored with a warning). Absent ⇒ clone
+    /// everything (today's behavior).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cow_clone_exclude: Option<Vec<String>>,
+
     /// Unknown/extra keys preserved on round-trip to avoid dropping fields other tools add.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -3157,6 +3166,10 @@ mod tests {
                 env: None,
                 auto_start: None,
             }]),
+            cow_clone_exclude: Some(vec![
+                "node_modules".to_string(),
+                "packages/big/cache".to_string(),
+            ]),
             extra: {
                 let mut m = BTreeMap::new();
                 m.insert("customKey".to_string(), serde_json::json!("customValue"));
@@ -3171,6 +3184,10 @@ mod tests {
         assert_eq!(v["archiveScript"], "docker compose down");
         assert_eq!(v["scripts"][0]["name"], "build");
         assert_eq!(v["scripts"][0]["mode"], "command");
+        assert_eq!(
+            v["cowCloneExclude"],
+            serde_json::json!(["node_modules", "packages/big/cache"])
+        );
         assert_eq!(v["customKey"], "customValue");
         let back: RepoConfig = serde_json::from_value(v).unwrap();
         assert_eq!(back, cfg);
@@ -3184,6 +3201,7 @@ mod tests {
         assert_eq!(v.get("runScript"), None);
         assert_eq!(v.get("archiveScript"), None);
         assert_eq!(v.get("scripts"), None);
+        assert_eq!(v.get("cowCloneExclude"), None);
         let back: RepoConfig = serde_json::from_value(v).unwrap();
         assert_eq!(back, bare);
 

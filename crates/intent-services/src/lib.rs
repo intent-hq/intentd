@@ -8455,35 +8455,65 @@ impl WorkspaceApi for Services {
                                     let locks = worktree_locks.clone();
                                     let lock_key = repo_dir.clone();
                                     async move {
+                                        // `cowCloneExclude` comes from the
+                                        // source repo's config; only the CoW
+                                        // clone path consumes it.
+                                        let clone_excludes =
+                                            if mode == intent_core::CheckoutMode::Cow {
+                                                repo_config::read_repo_config(&repo)
+                                                    .await
+                                                    .cow_clone_exclude
+                                                    .unwrap_or_default()
+                                            } else {
+                                                Vec::new()
+                                            };
+                                        let lock_requested = std::time::Instant::now();
                                         locks
                                             .with_lock(&lock_key, move || async move {
-                                                tokio::task::spawn_blocking(move || match mode {
-                                                    intent_core::CheckoutMode::Cow => {
-                                                        intent_git::cow_checkout::provision_cow_checkout(
-                                                            &repo,
-                                                            &wt,
-                                                            &branch,
-                                                            base_ref.as_deref(),
-                                                            &remote,
-                                                        )
-                                                    }
-                                                    intent_core::CheckoutMode::Worktree => {
-                                                        intent_git::worktree::provision_worktree(
-                                                            &repo,
-                                                            &name,
-                                                            &wt,
-                                                            &branch,
-                                                            base_ref.as_deref(),
-                                                            &remote,
-                                                        )
-                                                    }
-                                                })
+                                                let lock_wait = lock_requested.elapsed();
+                                                let provision_started =
+                                                    std::time::Instant::now();
+                                                let repo_for_log = repo.clone();
+                                                let result = match tokio::task::spawn_blocking(
+                                                    move || match mode {
+                                                        intent_core::CheckoutMode::Cow => {
+                                                            intent_git::cow_checkout::provision_cow_checkout(
+                                                                &repo,
+                                                                &wt,
+                                                                &branch,
+                                                                base_ref.as_deref(),
+                                                                &remote,
+                                                                &clone_excludes,
+                                                            )
+                                                        }
+                                                        intent_core::CheckoutMode::Worktree => {
+                                                            intent_git::worktree::provision_worktree(
+                                                                &repo,
+                                                                &name,
+                                                                &wt,
+                                                                &branch,
+                                                                base_ref.as_deref(),
+                                                                &remote,
+                                                            )
+                                                        }
+                                                    },
+                                                )
                                                 .await
-                                                .map_err(|e| {
-                                                    Error::Internal(format!(
+                                                {
+                                                    Ok(r) => r,
+                                                    Err(e) => Err(Error::Internal(format!(
                                                         "checkout provisioning task failed: {e}"
-                                                    ))
-                                                })?
+                                                    ))),
+                                                };
+                                                tracing::info!(
+                                                    repository_path = %repo_for_log.display(),
+                                                    mode = ?mode,
+                                                    lock_wait_ms = lock_wait.as_millis() as u64,
+                                                    provision_ms = provision_started.elapsed().as_millis() as u64,
+                                                    ok = result.is_ok(),
+                                                    "workspace.create: checkout provisioning lock wait + duration"
+                                                );
+                                                result
                                             })
                                             .await
                                     }
@@ -9825,9 +9855,23 @@ impl WorkspaceApi for Services {
                         let locks = worktree_locks.clone();
                         let lock_key = repo_dir.clone();
                         async move {
+                            // `cowCloneExclude` comes from the source repo's
+                            // config; only the CoW clone path consumes it.
+                            let clone_excludes = if mode == intent_core::CheckoutMode::Cow {
+                                repo_config::read_repo_config(&repo)
+                                    .await
+                                    .cow_clone_exclude
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            let lock_requested = std::time::Instant::now();
                             locks
                                 .with_lock(&lock_key, move || async move {
-                                    tokio::task::spawn_blocking(move || match mode {
+                                    let lock_wait = lock_requested.elapsed();
+                                    let provision_started = std::time::Instant::now();
+                                    let repo_for_log = repo.clone();
+                                    let result = tokio::task::spawn_blocking(move || match mode {
                                         intent_core::CheckoutMode::Cow => {
                                             intent_git::cow_checkout::provision_cow_checkout(
                                                 &repo,
@@ -9835,6 +9879,7 @@ impl WorkspaceApi for Services {
                                                 &provision_branch,
                                                 base_ref.as_deref(),
                                                 "origin",
+                                                &clone_excludes,
                                             )
                                         }
                                         intent_core::CheckoutMode::Worktree => {
@@ -9848,7 +9893,16 @@ impl WorkspaceApi for Services {
                                             )
                                         }
                                     })
-                                    .await
+                                    .await;
+                                    tracing::info!(
+                                        repository_path = %repo_for_log.display(),
+                                        mode = ?mode,
+                                        lock_wait_ms = lock_wait.as_millis() as u64,
+                                        provision_ms = provision_started.elapsed().as_millis() as u64,
+                                        ok = matches!(&result, Ok(Ok(_))),
+                                        "workspace.duplicate: checkout provisioning lock wait + duration"
+                                    );
+                                    result
                                 })
                                 .await
                         }
