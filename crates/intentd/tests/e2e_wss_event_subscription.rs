@@ -200,7 +200,10 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     assert_eq!(un["success"], json!(true));
     assert_eq!(un["subscriptionId"], json!(sub_id));
 
-    // … and a further matching event no longer delivers.
+    // … and a further matching event no longer delivers. Settle first so any
+    // batch already in flight when the delivery task was aborted lands
+    // before the baseline read (review: flake window).
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let baseline = conversation_text(&mut rpc, 101, &ws_id, &subscriber).await;
     let _third = create_agent(&mut rpc, 102, &ws_id, "Worker2").await;
     tokio::time::sleep(Duration::from_millis(400)).await;
