@@ -541,6 +541,13 @@ impl UnslothServerManager {
     /// wait is still, or again, in flight), this attaches to and waits on
     /// that SAME server rather than killing + respawning it. Killing on
     /// every retry would discard an in-flight multi-GB download's progress.
+    /// This applies identically to the server a model switch just spawned:
+    /// the switch's kill-old-then-spawn-new step runs through the same
+    /// spawn + [`Self::wait_and_mint`] path as a fresh start, so a retry for
+    /// the switched-to repo attaches to that new (possibly still cold-
+    /// loading) server rather than tearing it down and spawning a third one
+    /// (dogfooding repro: switching models mid-download hit the same 60s
+    /// mint deadline this fix addresses, not just first-use starts).
     pub async fn ensure_endpoint(
         &self,
         repo_id: &str,
@@ -2123,6 +2130,110 @@ mod tests {
                 log.matches("start opencode").count(),
                 2,
                 "each attempt re-attempts the mint against the SAME server: {log}"
+            );
+
+            mgr.shutdown().await;
+        }
+
+        /// Regression for the model-SWITCH repro (dogfooding, Qwen -> LFM):
+        /// switching models kills the old server and spawns a new one for the
+        /// new repo; if the new server's mint step outlives `mint_timeout`
+        /// (e.g. it starts resolving/downloading a different quant variant
+        /// mid-load), a spawn retry for the SAME (switched-to) repo must
+        /// attach to that new server rather than killing + respawning it —
+        /// exactly like the fresh-start case, since the switch's spawn goes
+        /// through the identical `ensure_endpoint` -> `wait_and_mint` path.
+        #[tokio::test]
+        async fn retry_after_model_switch_attaches_to_the_new_server_instead_of_respawning() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+
+            // The FIRST model (old) starts and becomes ready normally.
+            let binary = write_stub_binary(dir.path(), dir.path(), port, None);
+            let mut config = test_config(binary.clone(), dir.path().to_path_buf(), port);
+            config.mint_timeout = Duration::from_millis(200);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let old_repo = "unsloth/qwen-old-model-GGUF";
+            mgr.ensure_endpoint(old_repo, &|_| {})
+                .await
+                .expect("old model cold-starts fine");
+
+            // Rewrite the SAME binary path (resolved fresh on every spawn) to
+            // one whose `run` and `start` both hang past `mint_timeout`
+            // (simulating the new model's cold load / quant re-resolution
+            // outliving the mint deadline), then request the NEW repo — a
+            // model switch.
+            let log = dir.path().join("stub.log");
+            let switch_script = format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) sleep 300 ;;\n  start) sleep 300 ;;\nesac\n",
+                log = log.display(),
+            );
+            std::fs::write(&binary, switch_script).expect("rewrite stub for switch");
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+
+            let new_repo = "unsloth/lfm-new-model-GGUF";
+            let old_pid = mgr
+                .state
+                .lock()
+                .await
+                .as_mut()
+                .expect("old server running before switch")
+                .child
+                .id()
+                .expect("pid");
+
+            let err1 = mgr.ensure_endpoint(new_repo, &|_| {}).await.unwrap_err();
+            assert!(err1.to_string().contains("timed out"), "got: {err1}");
+            let (new_pid, new_repo_seen) = {
+                let mut state = mgr.state.lock().await;
+                let server = state
+                    .as_mut()
+                    .expect("new (switched-to) server preserved after mint timeout");
+                (server.child.id().expect("pid"), server.repo_id.clone())
+            };
+            assert_ne!(
+                old_pid, new_pid,
+                "the switch must have killed the old server"
+            );
+            assert_eq!(
+                new_repo_seen, new_repo,
+                "the preserved server serves the NEW repo"
+            );
+            assert!(
+                !unsafe { libc_kill_probe(old_pid) },
+                "old server must be dead after the switch"
+            );
+
+            // Retry for the SAME (new) repo must attach to that same new
+            // server, not kill + respawn a third one.
+            let err2 = mgr.ensure_endpoint(new_repo, &|_| {}).await.unwrap_err();
+            assert!(err2.to_string().contains("timed out"), "got: {err2}");
+            let retry_pid = mgr
+                .state
+                .lock()
+                .await
+                .as_mut()
+                .expect("new server still preserved after the retry")
+                .child
+                .id()
+                .expect("pid");
+            assert_eq!(
+                new_pid, retry_pid,
+                "the retry after a model switch must attach to the SAME new server, not respawn"
+            );
+
+            let full_log = stub_log(dir.path());
+            assert_eq!(
+                full_log.matches(&format!("run --model {new_repo}")).count(),
+                1,
+                "only ONE spawn for the NEW model across the switch + retry: {full_log}"
+            );
+            assert_eq!(
+                full_log.matches("start opencode --no-launch --model unsloth/lfm").count(),
+                2,
+                "the switch and the retry each re-attempt the mint against the SAME new server: {full_log}"
             );
 
             mgr.shutdown().await;
