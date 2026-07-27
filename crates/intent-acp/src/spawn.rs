@@ -35,10 +35,10 @@ pub struct SpawnOptions<'a> {
     /// `OPENCODE_CONFIG_CONTENT` for providers that take env config
     /// (opencode, unsloth). Ignored by every other provider.
     pub env_mcp_config: Option<&'a str>,
-    /// Unsloth-managed server endpoint injected as the `provider.unsloth`
-    /// block in `OPENCODE_CONFIG_CONTENT` (unsloth provider only; supplied
-    /// by the managed-server lifecycle at spawn time). Ignored by every
-    /// other provider.
+    /// Unsloth-managed server endpoint injected as the
+    /// `provider.unsloth-studio` block in `OPENCODE_CONFIG_CONTENT` (unsloth
+    /// provider only; supplied by the managed-server lifecycle at spawn
+    /// time). Ignored by every other provider.
     pub unsloth_endpoint: Option<&'a UnslothEndpoint>,
     /// Whether to append the provider's quiet flag.
     pub quiet: bool,

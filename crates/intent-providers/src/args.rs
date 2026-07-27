@@ -20,11 +20,27 @@ const MODEL_SENTINEL_DEFAULT: &str = "default";
 /// so no network install happens at spawn time.
 const UNSLOTH_NPM_PACKAGE: &str = "@ai-sdk/openai-compatible";
 
+/// Provider id used inside opencode's config for the injected block. Matches
+/// the id Unsloth's own `unsloth start opencode --no-launch` writes into its
+/// generated opencode.json, so both configs are interchangeable.
+const UNSLOTH_OPENCODE_PROVIDER_ID: &str = "unsloth-studio";
+
 /// Display name for the unsloth provider block inside opencode's config.
 const UNSLOTH_PROVIDER_NAME: &str = "Unsloth (local)";
 
+/// Per-model token limits for the unsloth provider block, discovered from the
+/// running server by the managed-server lifecycle (mirrors the `limit` object
+/// Unsloth writes into its generated opencode.json).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnslothModelLimit {
+    /// Context window in tokens (e.g. 262144).
+    pub context: u64,
+    /// Max output tokens (e.g. 8192).
+    pub output: u64,
+}
+
 /// Connection parameters for the Unsloth-managed OpenAI-compatible server,
-/// injected as a custom `provider.unsloth` block into
+/// injected as a custom `provider.unsloth-studio` block into
 /// `OPENCODE_CONFIG_CONTENT` (the unsloth provider rides the opencode
 /// binary). Values are produced by the managed-server lifecycle at spawn
 /// time; until that lifecycle exists callers pass `None` and the child
@@ -36,12 +52,19 @@ pub struct UnslothEndpoint {
     pub base_url: String,
     /// API key, sent by opencode as `Authorization: Bearer <api_key>`.
     pub api_key: String,
-    /// Model id served by the endpoint; keys the provider's `models` map and
-    /// is the default when the session carries no model of its own.
+    /// Model id served by the endpoint — the full repo id (e.g.
+    /// `unsloth/gemma-4-26B-A4B-it-GGUF`), keying the provider's `models` map
+    /// and the default when the session carries no model of its own.
     pub model_id: String,
     /// Human-readable model name for opencode's model picker; falls back to
     /// [`Self::model_id`] when `None`.
     pub model_display_name: Option<String>,
+    /// Token limits for the served model, when discovered by the lifecycle.
+    pub limit: Option<UnslothModelLimit>,
+    /// Tokens reserved for compaction; emits
+    /// `"compaction":{"auto":true,"reserved":<n>}` when set (matching
+    /// Unsloth's generated opencode.json).
+    pub compaction_reserved: Option<u64>,
 }
 
 /// Inputs that drive optional flag appends during arg assembly.
@@ -204,8 +227,8 @@ const MAX_OLD_SPACE_ENV: &str = "INTENTD_ACP_NODE_MAX_OLD_SPACE_MB";
 /// - `opencode` / `unsloth`: `OPENCODE_CONFIG_CONTENT` with `model` (when
 ///   set), `instructions` (when a rules file path is provided), and `mcp`
 ///   (when a pre-serialized MCP block is provided via `mcp_config_json`).
-///   The unsloth endpoint (which adds the `provider.unsloth` block) rides
-///   [`build_provider_env_with_unsloth`]; this 4-arg form passes `None`.
+///   The unsloth endpoint (which adds the `provider.unsloth-studio` block)
+///   rides [`build_provider_env_with_unsloth`]; this 4-arg form passes `None`.
 ///
 /// `mcp_config_json` must be a serialized JSON object in the OpenCode `mcp`
 /// config shape (see `to_opencode_mcp_config` in `intent-acp`); it is spliced
@@ -221,12 +244,15 @@ pub fn build_provider_env(
 
 /// [`build_provider_env`] plus the Unsloth endpoint. For the `unsloth`
 /// provider (which rides the opencode binary), a `Some(endpoint)` injects the
-/// custom OpenAI-compatible `provider.unsloth` block plus a
-/// `model: "unsloth/<model-id>"` default into `OPENCODE_CONFIG_CONTENT`
-/// (shape verified against opencode 1.18.3 — see the spike notes referenced
-/// on [`UnslothEndpoint`]). With `None` (managed-server lifecycle not yet
-/// run) the unsloth child spawns with permission-only config and no provider
-/// block. Every other provider ignores `unsloth_endpoint`.
+/// custom OpenAI-compatible `provider.unsloth-studio` block plus
+/// `model` / `small_model` defaults (`unsloth-studio/<model-id>`) and an
+/// optional `compaction` block into `OPENCODE_CONFIG_CONTENT` — the same
+/// shape Unsloth itself generates via `unsloth start opencode --no-launch`
+/// (verified against opencode 1.18.3 and a real Unsloth install; see the
+/// spike notes referenced on [`UnslothEndpoint`]). With `None`
+/// (managed-server lifecycle not yet run) the unsloth child spawns with
+/// permission-only config and no provider block. Every other provider
+/// ignores `unsloth_endpoint`.
 pub fn build_provider_env_with_unsloth(
     config: &ProviderConfig,
     model: Option<&str>,
@@ -273,10 +299,24 @@ pub fn build_provider_env_with_unsloth(
                     // served model; the top-level `model` must use the
                     // `<provider-id>/<model-id>` form matching a key in the
                     // provider's `models` map (spike constraint), so the
-                    // effective id is registered there too.
+                    // effective id is registered there too. `small_model`
+                    // mirrors `model` and compaction is emitted when the
+                    // lifecycle discovered a reserve — matching the config
+                    // Unsloth itself generates via
+                    // `unsloth start opencode --no-launch`.
                     let model_id = session_model.unwrap_or(&ep.model_id);
                     parts.push(unsloth_provider_part(ep, model_id));
-                    parts.push(format!("\"model\":\"unsloth/{}\"", json_escape(model_id)));
+                    let model_ref = format!(
+                        "\"{UNSLOTH_OPENCODE_PROVIDER_ID}/{}\"",
+                        json_escape(model_id)
+                    );
+                    parts.push(format!("\"model\":{model_ref}"));
+                    parts.push(format!("\"small_model\":{model_ref}"));
+                    if let Some(reserved) = ep.compaction_reserved {
+                        parts.push(format!(
+                            "\"compaction\":{{\"auto\":true,\"reserved\":{reserved}}}"
+                        ));
+                    }
                 }
                 // No endpoint: permission-only config — opencode spawns on
                 // its own catalog until the managed-server lifecycle supplies
@@ -302,15 +342,24 @@ pub fn build_provider_env_with_unsloth(
     env
 }
 
-/// Serialize the `provider.unsloth` block for `OPENCODE_CONFIG_CONTENT`:
-/// an OpenAI-compatible custom provider resolved through the bundled
-/// [`UNSLOTH_NPM_PACKAGE`], carrying the endpoint's baseURL + apiKey and a
-/// `models` map keyed by the served model id (plus `effective_model` when a
-/// session model overrides it, so the top-level `model` always matches a key).
+/// Serialize the `provider.unsloth-studio` block for
+/// `OPENCODE_CONFIG_CONTENT`: an OpenAI-compatible custom provider resolved
+/// through the bundled [`UNSLOTH_NPM_PACKAGE`], carrying the endpoint's
+/// baseURL + apiKey and a `models` map keyed by the full repo id (plus
+/// `effective_model` when a session model overrides it, so the top-level
+/// `model` always matches a key). Per-model `limit` (context/output tokens)
+/// rides along when the lifecycle discovered it — the same shape Unsloth
+/// writes into its generated opencode.json.
 fn unsloth_provider_part(ep: &UnslothEndpoint, effective_model: &str) -> String {
     let display = ep.model_display_name.as_deref().unwrap_or(&ep.model_id);
+    let limit = ep.limit.map_or(String::new(), |l| {
+        format!(
+            ",\"limit\":{{\"context\":{},\"output\":{}}}",
+            l.context, l.output
+        )
+    });
     let mut models = format!(
-        "\"{}\":{{\"name\":\"{}\"}}",
+        "\"{}\":{{\"name\":\"{}\"{limit}}}",
         json_escape(&ep.model_id),
         json_escape(display)
     );
@@ -322,7 +371,7 @@ fn unsloth_provider_part(ep: &UnslothEndpoint, effective_model: &str) -> String 
         ));
     }
     format!(
-        "\"provider\":{{\"unsloth\":{{\"npm\":\"{UNSLOTH_NPM_PACKAGE}\",\"name\":\"{UNSLOTH_PROVIDER_NAME}\",\"options\":{{\"baseURL\":\"{}\",\"apiKey\":\"{}\"}},\"models\":{{{models}}}}}}}",
+        "\"provider\":{{\"{UNSLOTH_OPENCODE_PROVIDER_ID}\":{{\"npm\":\"{UNSLOTH_NPM_PACKAGE}\",\"name\":\"{UNSLOTH_PROVIDER_NAME}\",\"options\":{{\"baseURL\":\"{}\",\"apiKey\":\"{}\"}},\"models\":{{{models}}}}}}}",
         json_escape(&ep.base_url),
         json_escape(&ep.api_key),
     )

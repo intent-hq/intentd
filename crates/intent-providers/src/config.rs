@@ -299,7 +299,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         // Rides the opencode binary (`opencode acp`) as its ACP runtime: the
         // Unsloth-managed local OpenAI-compatible server is injected as a
-        // custom `provider.unsloth` block via `OPENCODE_CONFIG_CONTENT`
+        // custom `provider.unsloth-studio` block via `OPENCODE_CONFIG_CONTENT`
         // (`build_provider_env`, args.rs). Endpoint/apiKey/model come from
         // the managed-server lifecycle at spawn time (`UnslothEndpoint`);
         // no CLI auth probe — the injected config carries its own apiKey.

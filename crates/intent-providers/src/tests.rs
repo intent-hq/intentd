@@ -1130,30 +1130,56 @@ fn opencode_env_escapes_json_in_instructions_path() {
     );
 }
 
-/// The endpoint fixture matching the spike's working config
-/// (`http://127.0.0.1:8752/v1` + Bearer apiKey + one served model).
+/// The endpoint fixture matching the config a real Unsloth install generates
+/// via `unsloth start opencode --no-launch` (`http://127.0.0.1:<port>/v1` +
+/// Bearer apiKey + one served model keyed by full repo id, with discovered
+/// context limits and a compaction reserve).
 fn unsloth_endpoint() -> UnslothEndpoint {
     UnslothEndpoint {
         base_url: "http://127.0.0.1:8752/v1".to_string(),
         api_key: "sk-unsloth-key".to_string(),
-        model_id: "stub-model-1".to_string(),
-        model_display_name: Some("Stub Model 1".to_string()),
+        model_id: "unsloth/stub-model-GGUF".to_string(),
+        model_display_name: Some("Stub Model".to_string()),
+        limit: Some(UnslothModelLimit {
+            context: 262144,
+            output: 8192,
+        }),
+        compaction_reserved: Some(8192),
     }
 }
 
 #[test]
-fn unsloth_env_injects_provider_block_matching_spike_shape() {
-    // With an endpoint and no session model: the provider.unsloth block plus
-    // the `unsloth/<model>` default, permission.task=deny first — the exact
-    // shape the spike proved against opencode 1.18.3.
+fn unsloth_env_injects_provider_block_matching_unsloth_generated_shape() {
+    // With an endpoint and no session model: the provider.unsloth-studio
+    // block (id, models-map keying, limit fields), model + small_model
+    // defaults, and the compaction block — permission.task=deny first. This
+    // is the exact shape Unsloth itself writes into opencode.json via
+    // `unsloth start opencode --no-launch` (validated 2026-07-27).
     let unsloth = find_provider("unsloth").unwrap();
     let ep = unsloth_endpoint();
     let env = build_provider_env_with_unsloth(unsloth, None, None, None, Some(&ep));
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(
-            r#"{"permission":{"task":"deny"},"provider":{"unsloth":{"npm":"@ai-sdk/openai-compatible","name":"Unsloth (local)","options":{"baseURL":"http://127.0.0.1:8752/v1","apiKey":"sk-unsloth-key"},"models":{"stub-model-1":{"name":"Stub Model 1"}}}},"model":"unsloth/stub-model-1"}"#
+            r#"{"permission":{"task":"deny"},"provider":{"unsloth-studio":{"npm":"@ai-sdk/openai-compatible","name":"Unsloth (local)","options":{"baseURL":"http://127.0.0.1:8752/v1","apiKey":"sk-unsloth-key"},"models":{"unsloth/stub-model-GGUF":{"name":"Stub Model","limit":{"context":262144,"output":8192}}}}},"model":"unsloth-studio/unsloth/stub-model-GGUF","small_model":"unsloth-studio/unsloth/stub-model-GGUF","compaction":{"auto":true,"reserved":8192}}"#
         )
+    );
+}
+
+#[test]
+fn unsloth_env_omits_limit_and_compaction_when_undiscovered() {
+    // Lifecycle didn't discover limits: no `limit` in the models map and no
+    // top-level `compaction` block.
+    let unsloth = find_provider("unsloth").unwrap();
+    let mut ep = unsloth_endpoint();
+    ep.limit = None;
+    ep.compaction_reserved = None;
+    let env = build_provider_env_with_unsloth(unsloth, None, None, None, Some(&ep));
+    let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+    assert!(!config.contains("\"limit\""), "no limit block: {config}");
+    assert!(
+        !config.contains("\"compaction\""),
+        "no compaction block: {config}"
     );
 }
 
@@ -1167,23 +1193,29 @@ fn unsloth_env_session_model_overrides_endpoint_model() {
     let env = build_provider_env_with_unsloth(unsloth, Some("other-model"), None, None, Some(&ep));
     let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
     assert!(
-        config.contains(r#""model":"unsloth/other-model""#),
+        config.contains(r#""model":"unsloth-studio/other-model""#),
         "session model must win: {config}"
+    );
+    assert!(
+        config.contains(r#""small_model":"unsloth-studio/other-model""#),
+        "small_model must mirror model: {config}"
     );
     assert!(
         config.contains(r#""other-model":{"name":"other-model"}"#),
         "session model must be registered in the models map: {config}"
     );
     assert!(
-        config.contains(r#""stub-model-1":{"name":"Stub Model 1"}"#),
-        "served model stays in the models map: {config}"
+        config.contains(
+            r#""unsloth/stub-model-GGUF":{"name":"Stub Model","limit":{"context":262144,"output":8192}}"#
+        ),
+        "served model stays in the models map with its limits: {config}"
     );
 
     // The "default" sentinel falls back to the endpoint's served model.
     let env = build_provider_env_with_unsloth(unsloth, Some("default"), None, None, Some(&ep));
     let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
     assert!(
-        config.contains(r#""model":"unsloth/stub-model-1""#),
+        config.contains(r#""model":"unsloth-studio/unsloth/stub-model-GGUF""#),
         "sentinel model must fall back to the endpoint model: {config}"
     );
 }
@@ -1199,7 +1231,7 @@ fn unsloth_env_without_endpoint_is_permission_only() {
         Some(r#"{"permission":{"task":"deny"}}"#)
     );
     // Even with a session model — without the provider block there is no
-    // `unsloth/<model>` key to reference, so the model is dropped.
+    // `unsloth-studio/<model>` key to reference, so the model is dropped.
     let env = build_provider_env(unsloth, Some("stub-model-1"), None, None);
     assert_eq!(
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
@@ -1218,7 +1250,7 @@ fn unsloth_env_merges_instructions_and_mcp_after_provider_block() {
         build_provider_env_with_unsloth(unsloth, None, Some("/tmp/rules.md"), Some(mcp), Some(&ep));
     let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
     assert!(
-        config.starts_with(r#"{"permission":{"task":"deny"},"provider":{"unsloth":"#),
+        config.starts_with(r#"{"permission":{"task":"deny"},"provider":{"unsloth-studio":"#),
         "permission then provider block first: {config}"
     );
     assert!(
@@ -1241,13 +1273,15 @@ fn unsloth_env_escapes_endpoint_values() {
         api_key: r"key\with\slashes".to_string(),
         model_id: "m1".to_string(),
         model_display_name: None,
+        limit: None,
+        compaction_reserved: None,
     };
     let env = build_provider_env_with_unsloth(unsloth, None, None, None, Some(&ep));
     let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
     let parsed: serde_json::Value =
         serde_json::from_str(config).expect("emitted config must be valid JSON");
     assert_eq!(
-        parsed["provider"]["unsloth"]["options"]["apiKey"],
+        parsed["provider"]["unsloth-studio"]["options"]["apiKey"],
         ep.api_key
     );
     assert!(
