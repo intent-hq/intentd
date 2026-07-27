@@ -238,6 +238,44 @@ jobs:
             ci
             perf
 
+  # Conflict-marker guard: fails the PR if any changed file contains committed
+  # git conflict markers (the #588 incident: release-plz pushed a branch with
+  # '<' x7 / '>' x7 marker lines in CHANGELOG.md, Cargo.lock and Cargo.toml,
+  # and no check caught it). Matches the exact line forms git emits — seven
+  # '<' or '>' followed by a space and a label — and counts a bare
+  # seven-'=' line only when the same file also has both of the other two,
+  # so Markdown setext headings / code snippets don't false-positive.
+  conflict-markers:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch PR base commit
+        run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+      - name: Scan changed files for conflict markers
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR ${{ github.event.pull_request.base.sha }} HEAD)
+          fail=0
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
+            hits=$(grep -nIE '^(<{7}|>{7}) ' "$f" || true)
+            [ -n "$hits" ] || continue
+            if grep -qIE '^<{7} ' "$f" && grep -qIE '^>{7} ' "$f"; then
+              eq=$(grep -nE '^={7}$' "$f" || true)
+              [ -n "$eq" ] && hits="$hits"$'\n'"$eq"
+            fi
+            echo "::error file=$f::committed git conflict markers found"
+            printf '%s\n' "$hits" | sort -t: -k1,1n | sed "s|^|$f:|"
+            fail=1
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Conflict markers detected in changed files — resolve them before merging."
+            exit 1
+          fi
+          echo "No conflict markers in ${#files[@]} changed file(s)."
+
   # Packaging assets guard: asserts the systemd user unit keeps the exact
   # semantics the daemon's `service install` used to generate (Type=simple,
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
