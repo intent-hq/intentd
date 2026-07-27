@@ -127,8 +127,17 @@ pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io:
 /// channel to a single writer task, so lines are written whole and never
 /// interleave; completion order may differ from request order, which is valid
 /// id-correlated JSON-RPC. Notifications (no `id`) still produce no response
-/// and malformed lines are still skipped. When the connection tears down, all
-/// in-flight request tasks are aborted.
+/// and malformed lines are still skipped.
+///
+/// Teardown semantics: when the read side ends (EOF or error), all in-flight
+/// request tasks are aborted at whatever await point they have reached. This
+/// is intentional — the peer can no longer receive the responses, and running
+/// orphaned calls to completion would hold their resources with no consumer.
+/// The trade-off: combined with the stdio proxy's synthesized retryable
+/// [`BRIDGE_DISCONNECTED_CODE`] errors, a provider retry after a TCP blip can
+/// re-run a call whose first attempt partially executed before the abort, so
+/// non-idempotent tool calls (e.g. mutation scripts) may double-apply the
+/// steps that completed before the drop.
 async fn serve_connection<S: BridgeDispatch>(
     server: Arc<S>,
     stream: TcpStream,
@@ -147,33 +156,38 @@ async fn serve_connection<S: BridgeDispatch>(
     let mut in_flight = JoinSet::new();
     let mut lines = BufReader::new(read).lines();
     let result = loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                // Reap finished request tasks so the set does not grow
-                // unboundedly over a long-lived connection.
-                while in_flight.try_join_next().is_some() {}
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                let permit = limiter
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("bridge semaphore is never closed");
-                let server = server.clone();
-                let response_tx = response_tx.clone();
-                in_flight.spawn(async move {
-                    let _permit = permit;
-                    if let Some(response) = server.dispatch(message).await {
-                        let _ = response_tx.send(format!("{response}\n")).await;
-                    }
-                });
+        tokio::select! {
+            // Reap finished request tasks as they complete — not only when
+            // the next line arrives — so an idle connection does not
+            // accumulate finished handles after a burst.
+            joined = in_flight.join_next(), if !in_flight.is_empty() => {
+                let _ = joined;
             }
-            Ok(None) => break Ok(()),
-            Err(e) => break Err(e),
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let permit = limiter
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("bridge semaphore is never closed");
+                    let server = server.clone();
+                    let response_tx = response_tx.clone();
+                    in_flight.spawn(async move {
+                        let _permit = permit;
+                        if let Some(response) = server.dispatch(message).await {
+                            let _ = response_tx.send(format!("{response}\n")).await;
+                        }
+                    });
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            },
         }
     };
     // Connection teardown: abort in-flight request tasks, then let the writer
@@ -305,7 +319,24 @@ where
     let mut attempts: u32 = 0;
     loop {
         attempts += 1;
-        match TcpStream::connect(addr).await {
+        // Service stdin while the connect itself is pending (not just during
+        // the backoff sleep) so a blackholed address cannot leave requests
+        // unserviced for the OS connect timeout. `biased` polls the connect
+        // first: a request racing with a completed connect is forwarded on
+        // the fresh connection instead of being spuriously rejected.
+        let connect = TcpStream::connect(addr);
+        tokio::pin!(connect);
+        let connected = loop {
+            tokio::select! {
+                biased;
+                result = &mut connect => break result,
+                line = input.next_line() => match line? {
+                    Some(line) => reject_if_request(&line, output).await?,
+                    None => return Ok(None),
+                },
+            }
+        };
+        match connected {
             Ok(stream) => return Ok(Some(stream)),
             Err(e) => {
                 if initial {
