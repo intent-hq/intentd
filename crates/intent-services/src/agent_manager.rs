@@ -5692,8 +5692,7 @@ async fn persist_error_and_requeue(
     // clients get a structured "retry will recreate" signal, not just the raw
     // stopReason string.
     let session_corrupted = streak >= crate::POISONED_FAILURE_STREAK_THRESHOLD
-        || crate::is_session_fatal_stop_reason(error_text)
-        || crate::is_deterministic_prompt_rejection(error_text);
+        || crate::is_session_fatal_error(error_text);
     if session_corrupted {
         tracing::warn!(
             agent = %agent_id,

@@ -2312,9 +2312,11 @@ impl Services {
         if session.status != intent_core::AgentStatus::Error {
             return false;
         }
-        if session.stop_reason.as_deref().is_some_and(|reason| {
-            is_session_fatal_stop_reason(reason) || is_deterministic_prompt_rejection(reason)
-        }) {
+        if session
+            .stop_reason
+            .as_deref()
+            .is_some_and(is_session_fatal_error)
+        {
             return true;
         }
         self.failure_streak_count(&session.id) >= POISONED_FAILURE_STREAK_THRESHOLD
@@ -6202,6 +6204,16 @@ pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
     lower.contains("session/prompt failed")
         && lower.contains("400 bad request")
         && lower.contains("\"apistatus\":\"invalidargument\"")
+}
+
+/// Classify a terminal-failure text as session-fatal on its own (independent
+/// of the failure streak): a provider block ([`is_session_fatal_stop_reason`])
+/// or the deterministic chat-stream 400 prompt rejection
+/// ([`is_deterministic_prompt_rejection`]). Single predicate shared by
+/// [`Services::session_poisoned`] and the `sessionCorrupted` event flag in
+/// `persist_error_and_requeue` so the two surfaces cannot drift.
+pub(crate) fn is_session_fatal_error(error_text: &str) -> bool {
+    is_session_fatal_stop_reason(error_text) || is_deterministic_prompt_rejection(error_text)
 }
 
 /// Normalize a terminal-failure error text for streak comparison
