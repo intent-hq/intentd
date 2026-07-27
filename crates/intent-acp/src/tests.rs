@@ -1199,6 +1199,140 @@ mod session_tests {
     }
 
     #[test]
+    fn codex_nested_mcp_input_unwraps_arguments_and_derives_name() {
+        // Codex nests the model's parameters under `arguments` alongside
+        // `server`/`tool`. The mapper must hoist them to the top level and
+        // derive the name from `{server}_{tool}` — the workspace-mcp prefix
+        // strip then yields the bare registry name.
+        let call = ToolCall::new("t1", "workspace_api").kind(ToolKind::Other).raw_input(json!({
+            "arguments": { "summary": "Read spec", "code": "return await ws.note.read('spec')" },
+            "server": "workspace-mcp",
+            "tool": "workspace_api",
+        }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "workspace_api");
+        assert_eq!(tc.input["summary"], json!("Read spec"));
+        assert_eq!(tc.input["code"], json!("return await ws.note.read('spec')"));
+        assert!(
+            tc.input.get("arguments").is_none(),
+            "unwrapped input must not retain the nested arguments object"
+        );
+        assert!(tc.input.get("server").is_none());
+        assert!(tc.input.get("tool").is_none());
+    }
+
+    #[test]
+    fn codex_unwrap_preserves_acp_title_and_keeps_other_server_names() {
+        // `_acpTitle` on the outer object rides the unwrap; a server other
+        // than workspace-mcp has no affix to strip, so the derived name stays
+        // `{server}_{tool}`.
+        let call = ToolCall::new("t1", "list_issues")
+            .kind(ToolKind::Other)
+            .raw_input(json!({
+                "arguments": { "repo": "intent-hq/monorepo" },
+                "server": "github",
+                "tool": "list_issues",
+                "_acpTitle": "List issues",
+            }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "github_list_issues");
+        assert_eq!(tc.input["repo"], json!("intent-hq/monorepo"));
+        assert_eq!(tc.input["_acpTitle"], json!("List issues"));
+    }
+
+    #[test]
+    fn non_codex_shapes_pass_through_verbatim() {
+        // `arguments` not an object → no unwrap.
+        let array_args = json!({
+            "arguments": ["not", "an", "object"],
+            "server": "workspace-mcp",
+            "tool": "workspace_api",
+        });
+        let call = ToolCall::new("t1", "Some tool")
+            .kind(ToolKind::Other)
+            .raw_input(array_args.clone());
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.input, array_args);
+        assert_eq!(tc.tool_name, "Some tool");
+
+        // Missing `tool` → no unwrap.
+        let no_tool = json!({ "arguments": { "a": 1 }, "server": "workspace-mcp" });
+        let call = ToolCall::new("t2", "Some tool")
+            .kind(ToolKind::Other)
+            .raw_input(no_tool.clone());
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.input, no_tool);
+
+        // Missing `server` → no unwrap.
+        let no_server = json!({ "arguments": { "a": 1 }, "tool": "workspace_api" });
+        let call = ToolCall::new("t3", "Some tool")
+            .kind(ToolKind::Other)
+            .raw_input(no_server.clone());
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.input, no_server);
+    }
+
+    #[test]
+    fn codex_unwrap_applies_to_tool_call_updates() {
+        // Sparse updates may re-deliver the raw input; the same unwrap must
+        // apply on the `tool_call_update` path.
+        let update = ToolCallUpdate::new(
+            "t1",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .raw_input(json!({
+                    "arguments": { "summary": "Read spec", "code": "return 1" },
+                    "server": "workspace-mcp",
+                    "tool": "workspace_api",
+                    "_acpTitle": "Workspace API",
+                })),
+        );
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCallUpdate(update)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "workspace_api");
+        assert_eq!(tc.status, "completed");
+        assert_eq!(tc.input["summary"], json!("Read spec"));
+        assert_eq!(tc.input["code"], json!("return 1"));
+        assert_eq!(tc.input["_acpTitle"], json!("Workspace API"));
+        assert!(tc.input.get("arguments").is_none());
+
+        // Non-codex update input passes through verbatim.
+        let plain = ToolCallUpdate::new(
+            "t2",
+            ToolCallUpdateFields::new().raw_input(json!({ "arguments": "text", "tool": "x" })),
+        );
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCallUpdate(plain)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.input, json!({ "arguments": "text", "tool": "x" }));
+    }
+
+    #[test]
     fn unmapped_variants_return_none() {
         let thought =
             SessionUpdate::AgentThoughtChunk(agent_client_protocol::schema::v1::ContentChunk::new(
