@@ -38,10 +38,26 @@ use crate::{publish_event, system_actor, SettingsRegistry};
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
+/// Terminal type advertised by interactive PTYs rendered by xterm.js clients.
+const DEFAULT_TERM: &str = "xterm-256color";
+
 /// The default shell spawned when `terminal.create` omits a command. Mirrors the
 /// ancestor's reliance on the user's login shell (`$SHELL`, then `/bin/sh`).
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// Ensure the effective terminal environment has a usable terminal type while
+/// preserving explicit or inherited non-empty values.
+fn ensure_terminal_term(env: &mut Vec<(String, String)>, inherited_term: Option<&str>) {
+    match env.iter_mut().rev().find(|(name, _)| name == "TERM") {
+        Some((_, value)) if value.is_empty() => *value = DEFAULT_TERM.to_string(),
+        Some(_) => {}
+        None if inherited_term.is_none_or(str::is_empty) => {
+            env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
+        }
+        None => {}
+    }
 }
 
 /// Resolve a wire terminal id (`pty-{n}`) to a [`PtyId`], or `NotFound`.
@@ -56,9 +72,10 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// without dropping them. When the `exposeGitCredentialToChildren` setting is
 /// on, the github.com-scoped daemon-backed credential-helper env pair is
 /// injected under the caller's overlay — caller-supplied keys
-/// always win (see [`git_credential_env`]). When `cwd` is omitted the PTY
-/// spawns in the workspace's worktree root (see [`default_cwd`]); an explicit
-/// `cwd` always wins.
+/// always win (see [`git_credential_env`]). An absent caller `TERM` preserves
+/// non-empty daemon inheritance; otherwise a missing or empty effective value
+/// defaults to `xterm-256color`. When `cwd` is omitted the PTY spawns in the
+/// workspace's worktree root (see [`default_cwd`]); an explicit `cwd` wins.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
@@ -83,6 +100,8 @@ pub(crate) async fn create(
     };
     let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
     spec.env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
+    let inherited_term = std::env::var("TERM").ok();
+    ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -522,6 +541,8 @@ impl TerminalHost for PtyTerminalHost {
             let mut spec = SpawnSpec::new(params.session_id, params.command);
             spec.args = params.args;
             spec.env = overlay_credential_env(credential, params.env);
+            let inherited_term = std::env::var("TERM").ok();
+            ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
             spec.cwd = params.cwd;
             if let Some(limit) = params
                 .output_byte_limit
@@ -649,6 +670,47 @@ mod tests {
         Arc::new(PtyHost::new())
     }
 
+    /// Reap a test PTY even when an assertion unwinds before async cleanup.
+    #[cfg(target_os = "macos")]
+    struct PtyKillGuard {
+        pty: Arc<PtyHost>,
+        id: Option<PtyId>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PtyKillGuard {
+        fn new(pty: Arc<PtyHost>, id: PtyId) -> Self {
+            Self { pty, id: Some(id) }
+        }
+
+        fn disarm(&mut self) {
+            self.id = None;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PtyKillGuard {
+        fn drop(&mut self) {
+            let Some(id) = self.id.take() else {
+                return;
+            };
+            let pty = self.pty.clone();
+            if let Ok(thread) = std::thread::Builder::new()
+                .name("pty-test-cleanup".to_string())
+                .spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                    {
+                        runtime.block_on(pty.kill(id));
+                    }
+                })
+            {
+                let _ = thread.join();
+            }
+        }
+    }
+
     fn ws(id: &str) -> WorkspaceId {
         WorkspaceId::from(id)
     }
@@ -741,6 +803,41 @@ mod tests {
     #[test]
     fn default_shell_is_nonempty() {
         assert!(!default_shell().is_empty());
+    }
+
+    #[test]
+    fn terminal_env_defaults_missing_or_empty_term() {
+        let mut missing = Vec::new();
+        ensure_terminal_term(&mut missing, None);
+        assert_eq!(
+            missing,
+            vec![("TERM".to_string(), DEFAULT_TERM.to_string())]
+        );
+
+        let mut inherited_empty = Vec::new();
+        ensure_terminal_term(&mut inherited_empty, Some(""));
+        assert_eq!(
+            inherited_empty,
+            vec![("TERM".to_string(), DEFAULT_TERM.to_string())]
+        );
+
+        let mut empty = vec![("TERM".to_string(), String::new())];
+        ensure_terminal_term(&mut empty, Some("screen-256color"));
+        assert_eq!(empty, vec![("TERM".to_string(), DEFAULT_TERM.to_string())]);
+    }
+
+    #[test]
+    fn terminal_env_preserves_explicit_or_inherited_nonempty_term() {
+        let mut env = vec![("TERM".to_string(), "screen-256color".to_string())];
+        ensure_terminal_term(&mut env, None);
+        assert_eq!(
+            env,
+            vec![("TERM".to_string(), "screen-256color".to_string())]
+        );
+
+        let mut inherited = Vec::new();
+        ensure_terminal_term(&mut inherited, Some("tmux-256color"));
+        assert!(inherited.is_empty());
     }
 
     #[test]
@@ -1201,6 +1298,59 @@ mod tests {
         );
 
         kill(pty.as_ref(), &id).await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn terminal_write_del_emits_erase_redraw_on_bus_without_launcher_term() {
+        let pty = host();
+        let (_tmp, bus) = bus().await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let zdotdir = tempfile::tempdir().expect("isolated zsh config dir");
+        let env = std::collections::BTreeMap::from([
+            // Electron-launched daemons can inherit an empty terminal type.
+            // `create` must coerce it before zsh initializes ZLE.
+            ("TERM".to_string(), "".to_string()),
+            ("ZDOTDIR".to_string(), zdotdir.path().display().to_string()),
+        ]);
+        let res = create(
+            pty.clone(),
+            Some(bus),
+            None,
+            None,
+            ws("ws-erase"),
+            80,
+            24,
+            None,
+            Some("/bin/zsh".to_string()),
+            Some(env),
+        )
+        .await
+        .unwrap();
+        let id = term_id(&res);
+        let mut kill_guard = PtyKillGuard::new(pty.clone(), resolve(&id).unwrap());
+
+        let ready = collect_data_until(&mut sub, b"\x1b[?2004h", TIMEOUT).await;
+        assert!(
+            contains_sub(&ready, b"\x1b[?2004h"),
+            "zsh prompt must be ready before probing ZLE; got {ready:?}"
+        );
+
+        write(
+            pty.as_ref(),
+            &id,
+            &base64::engine::general_purpose::STANDARD.encode(b"ab\x7f"),
+        )
+        .unwrap();
+
+        let acc = collect_data_until(&mut sub, b"\x08", Duration::from_secs(1)).await;
+        assert!(
+            contains_sub(&acc, b"\x08"),
+            "zsh must emit a cursor-left redraw for DEL instead of a visible space; got {acc:?}"
+        );
+
+        kill(pty.as_ref(), &id).await.unwrap();
+        kill_guard.disarm();
     }
 
     #[tokio::test]
