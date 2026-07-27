@@ -208,6 +208,16 @@ pub(crate) const BRIDGE_DISCONNECTED_CODE: i64 = -32001;
 pub(crate) const BRIDGE_DISCONNECTED_MESSAGE: &str =
     "workspace-mcp bridge temporarily disconnected; retry";
 
+/// Max stdin lines buffered during the initial connect window (monorepo#908).
+/// The window is ~5s and a well-behaved client sends a handful of lines; the
+/// cap only guards against a flooding client growing memory unboundedly.
+/// Overflowing id-carrying requests fall back to the retryable disconnected
+/// error.
+pub(crate) const INITIAL_BUFFER_MAX_LINES: usize = 1024;
+
+/// Companion byte cap for the initial-window stdin buffer.
+pub(crate) const INITIAL_BUFFER_MAX_BYTES: usize = 1024 * 1024;
+
 /// Retry/backoff knobs for [`run_stdio_bridge`]. Defaults give the initial
 /// connect ~10 attempts over ~5s and mid-session reconnects a ~30s total
 /// window; tests shrink these to keep runs fast.
@@ -248,9 +258,13 @@ enum SessionEnd {
 /// the socket and socket lines to stdout, giving a spawned provider a real stdio
 /// MCP server that proxies to the in-process workspace tools.
 ///
-/// Resilience (monorepo#871): the initial connect is retried with bounded
-/// backoff, and a mid-session TCP drop keeps the stdio side alive while the
-/// bridge reconnects to the same address. While disconnected, each stdin
+/// Resilience (monorepo#871, monorepo#908): the initial connect is retried
+/// with bounded backoff while stdin lines (notably the MCP `initialize`
+/// handshake) are buffered and forwarded in order once the connect succeeds,
+/// so a startup race never surfaces an error to the provider; on give-up the
+/// buffered requests are never answered and the bridge exits with the connect
+/// error instead. A mid-session TCP drop keeps the stdio side alive while the
+/// bridge reconnects to the same address. While reconnecting, each stdin
 /// request that carries an `id` is answered with a retryable JSON-RPC error
 /// ([`BRIDGE_DISCONNECTED_CODE`]) instead of being dropped, and requests that
 /// were in flight when the connection died get the same synthesized error so
@@ -279,13 +293,24 @@ where
 {
     let mut input = BufReader::new(input).lines();
     let mut initial = true;
+    let mut buffered: Vec<String> = Vec::new();
     loop {
-        let stream = match connect_with_retry(addr, cfg, initial, &mut input, &mut output).await? {
-            Some(stream) => stream,
-            None => return Ok(()),
-        };
+        let stream =
+            match connect_with_retry(addr, cfg, initial, &mut buffered, &mut input, &mut output)
+                .await?
+            {
+                Some(stream) => stream,
+                None => return Ok(()),
+            };
         initial = false;
-        match pump_session(stream, &mut input, &mut output).await? {
+        match pump_session(
+            stream,
+            std::mem::take(&mut buffered),
+            &mut input,
+            &mut output,
+        )
+        .await?
+        {
             SessionEnd::StdinEof => return Ok(()),
             SessionEnd::TcpDropped => {
                 tracing::warn!(%addr, "mcp bridge connection dropped; reconnecting");
@@ -295,18 +320,26 @@ where
 }
 
 /// Connect to `addr` with bounded backoff. While waiting between attempts,
-/// keep servicing stdin: requests with an `id` are answered with the retryable
-/// disconnected error, notifications are dropped.
+/// keep servicing stdin. During the initial window (`initial == true`) lines
+/// are buffered into `buffer` for forwarding once the connect succeeds
+/// (monorepo#908), bounded by [`INITIAL_BUFFER_MAX_LINES`] /
+/// [`INITIAL_BUFFER_MAX_BYTES`]; past the caps — or during a mid-session
+/// reconnect — requests with an `id` are answered with the retryable
+/// disconnected error and notifications are dropped.
 ///
 /// Returns `Ok(Some(stream))` on success. On give-up, the initial connect
-/// surfaces the last error (the daemon was never reachable), while a reconnect
+/// surfaces the last error (the daemon was never reachable; buffered requests
+/// are never answered — the caller exits non-zero instead), while a reconnect
 /// returns `Ok(None)` so the bridge exits cleanly — a restarted daemon listens
 /// on a new port this bridge can never learn. `Ok(None)` is also returned when
-/// stdin reaches EOF while disconnected.
+/// stdin reaches EOF while disconnected; during the initial window any
+/// buffered lines are dropped unanswered — the provider closed stdin, so
+/// nothing is awaiting responses.
 async fn connect_with_retry<R, W>(
     addr: &str,
     cfg: BridgeRetryConfig,
     initial: bool,
+    buffer: &mut Vec<String>,
     input: &mut Lines<BufReader<R>>,
     output: &mut W,
 ) -> std::io::Result<Option<TcpStream>>
@@ -317,13 +350,15 @@ where
     let deadline = Instant::now() + cfg.reconnect_window;
     let mut delay = cfg.backoff_start;
     let mut attempts: u32 = 0;
+    let mut buffered_bytes: usize = buffer.iter().map(String::len).sum();
+    let mut overflowed = false;
     loop {
         attempts += 1;
         // Service stdin while the connect itself is pending (not just during
         // the backoff sleep) so a blackholed address cannot leave requests
         // unserviced for the OS connect timeout. `biased` polls the connect
         // first: a request racing with a completed connect is forwarded on
-        // the fresh connection instead of being spuriously rejected.
+        // the fresh connection instead of being spuriously buffered/rejected.
         let connect = TcpStream::connect(addr);
         tokio::pin!(connect);
         let connected = loop {
@@ -331,7 +366,17 @@ where
                 biased;
                 result = &mut connect => break result,
                 line = input.next_line() => match line? {
-                    Some(line) => reject_if_request(&line, output).await?,
+                    Some(line) => {
+                        buffer_or_reject(
+                            line,
+                            initial,
+                            buffer,
+                            &mut buffered_bytes,
+                            &mut overflowed,
+                            output,
+                        )
+                        .await?
+                    }
                     None => return Ok(None),
                 },
             }
@@ -351,15 +396,26 @@ where
                 tracing::debug!(%addr, error = %e, attempts, "mcp bridge connect failed; backing off");
             }
         }
-        // Back off before the next attempt, servicing stdin in the meantime so
-        // disconnected-period requests get an immediate retryable error.
+        // Back off before the next attempt, servicing stdin in the meantime:
+        // initial-window lines keep buffering, mid-session requests get an
+        // immediate retryable error.
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
                 _ = &mut sleep => break,
                 line = input.next_line() => match line? {
-                    Some(line) => reject_if_request(&line, output).await?,
+                    Some(line) => {
+                        buffer_or_reject(
+                            line,
+                            initial,
+                            buffer,
+                            &mut buffered_bytes,
+                            &mut overflowed,
+                            output,
+                        )
+                        .await?
+                    }
                     None => return Ok(None),
                 },
             }
@@ -368,12 +424,46 @@ where
     }
 }
 
+/// Handle one stdin line received while disconnected: during the initial
+/// connect window the line is buffered for forwarding after the connect
+/// succeeds (monorepo#908); past the defensive caps — or during a mid-session
+/// reconnect — id-carrying requests fall back to the retryable disconnected
+/// error. Overflow is sticky: once any line is rejected, every later line is
+/// rejected too, so a later request can never be served after an earlier one
+/// failed (and buffered notifications are never delivered out of order
+/// relative to dropped ones).
+async fn buffer_or_reject<W: AsyncWrite + Unpin>(
+    line: String,
+    initial: bool,
+    buffer: &mut Vec<String>,
+    buffered_bytes: &mut usize,
+    overflowed: &mut bool,
+    output: &mut W,
+) -> std::io::Result<()> {
+    if initial
+        && !*overflowed
+        && buffer.len() < INITIAL_BUFFER_MAX_LINES
+        && *buffered_bytes + line.len() <= INITIAL_BUFFER_MAX_BYTES
+    {
+        *buffered_bytes += line.len();
+        buffer.push(line);
+        return Ok(());
+    }
+    if initial {
+        *overflowed = true;
+    }
+    reject_if_request(&line, output).await
+}
+
 /// Pump one connected session: stdin lines → socket, socket lines → stdout.
-/// Tracks the `id` of every forwarded request until its response comes back;
-/// when the TCP side drops, every still-pending id gets the synthesized
-/// retryable error so the provider client is never left waiting.
+/// Lines buffered during the initial connect window are flushed to the socket
+/// first, in order, before live traffic is pumped (monorepo#908). Tracks the
+/// `id` of every forwarded request until its response comes back; when the
+/// TCP side drops, every still-pending id gets the synthesized retryable
+/// error so the provider client is never left waiting.
 async fn pump_session<R, W>(
     stream: TcpStream,
+    buffered: Vec<String>,
     input: &mut Lines<BufReader<R>>,
     output: &mut W,
 ) -> std::io::Result<SessionEnd>
@@ -386,31 +476,53 @@ where
     // Requests forwarded but not yet answered, keyed by the id's canonical
     // JSON so numeric and string ids never collide.
     let mut pending: HashMap<String, Value> = HashMap::new();
-    let end = loop {
-        tokio::select! {
-            line = input.next_line() => match line? {
-                Some(line) => {
-                    if line.trim().is_empty() {
-                        continue;
+    // Buffered ids are registered for the whole batch up front: once the
+    // flush begins the session owns these requests, so a TCP drop mid-flush
+    // synthesizes the retryable error for the not-yet-written ones too.
+    for line in &buffered {
+        if let Some(id) = request_id(line) {
+            pending.insert(id.to_string(), id);
+        }
+    }
+    let mut flush_dropped = false;
+    for line in &buffered {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if write_line(&mut tcp_write, line).await.is_err() {
+            flush_dropped = true;
+            break;
+        }
+    }
+    let end = if flush_dropped {
+        SessionEnd::TcpDropped
+    } else {
+        loop {
+            tokio::select! {
+                line = input.next_line() => match line? {
+                    Some(line) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if let Some(id) = request_id(&line) {
+                            pending.insert(id.to_string(), id);
+                        }
+                        if write_line(&mut tcp_write, &line).await.is_err() {
+                            break SessionEnd::TcpDropped;
+                        }
                     }
-                    if let Some(id) = request_id(&line) {
-                        pending.insert(id.to_string(), id);
+                    None => break SessionEnd::StdinEof,
+                },
+                line = tcp_lines.next_line() => match line {
+                    Ok(Some(line)) => {
+                        if let Some(id) = response_id(&line) {
+                            pending.remove(&id.to_string());
+                        }
+                        write_line(output, &line).await?;
                     }
-                    if write_line(&mut tcp_write, &line).await.is_err() {
-                        break SessionEnd::TcpDropped;
-                    }
-                }
-                None => break SessionEnd::StdinEof,
-            },
-            line = tcp_lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    if let Some(id) = response_id(&line) {
-                        pending.remove(&id.to_string());
-                    }
-                    write_line(output, &line).await?;
-                }
-                Ok(None) | Err(_) => break SessionEnd::TcpDropped,
-            },
+                    Ok(None) | Err(_) => break SessionEnd::TcpDropped,
+                },
+            }
         }
     };
     if matches!(end, SessionEnd::TcpDropped) {

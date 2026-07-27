@@ -3643,22 +3643,24 @@ mod mcp_bridge_tests {
         }
     }
 
-    /// Stdio-bridge resilience (monorepo#871): initial-connect retry,
-    /// mid-session reconnect, and synthesized retryable errors while
-    /// disconnected. `run_bridge` is driven with in-memory duplex streams in
-    /// place of stdin/stdout and shrunk retry knobs so tests stay fast.
+    /// Stdio-bridge resilience (monorepo#871, monorepo#908): initial-connect
+    /// retry with stdin buffering, mid-session reconnect, and synthesized
+    /// retryable errors while disconnected mid-session. `run_bridge` is driven
+    /// with in-memory duplex streams in place of stdin/stdout and shrunk retry
+    /// knobs so tests stay fast.
     mod stdio_bridge_resilience {
         use std::net::SocketAddr;
         use std::time::Duration;
 
         use serde_json::{json, Value};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream};
         use tokio::net::{TcpListener, TcpStream};
         use tokio::task::JoinHandle;
         use tokio::time::{sleep, timeout};
 
         use crate::mcp_bridge::{
             run_bridge, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE, BRIDGE_DISCONNECTED_MESSAGE,
+            INITIAL_BUFFER_MAX_BYTES, INITIAL_BUFFER_MAX_LINES,
         };
 
         fn fast_cfg() -> BridgeRetryConfig {
@@ -3755,20 +3757,49 @@ mod mcp_bridge_tests {
             assert_eq!(resp["result"]["ok"], json!(true));
         }
 
+        /// A request written before the listener is reachable is buffered
+        /// during the initial connect window (monorepo#908) — never answered
+        /// with `-32001` — and gets the real server response once the connect
+        /// succeeds a couple of backoff cycles later.
         #[tokio::test]
-        async fn initial_connect_gives_up_and_rejects_requests_meanwhile() {
+        async fn initial_window_buffers_requests_until_listener_appears() {
+            let addr = reserve_free_addr().await;
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+            // Written while nothing is listening: must be buffered, not
+            // answered with the retryable error.
+            bridge.send_request(1).await;
+            // Let the bridge burn a couple of backoff cycles first.
+            sleep(Duration::from_millis(50)).await;
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("bridge never retried the connect")
+                .unwrap();
+            tokio::spawn(answer_requests(conn));
+            // The FIRST line on stdout is the real response for id 1; a
+            // pre-fix bridge writes the -32001 reject here instead.
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(1));
+            assert_eq!(
+                resp["result"]["ok"],
+                json!(true),
+                "buffered request must get the real response, got: {resp}"
+            );
+        }
+
+        /// Initial-window exhaustion still surfaces `Err` (the bridge exits
+        /// non-zero) and the buffered request is never answered — no `-32001`
+        /// is written for it (monorepo#908).
+        #[tokio::test]
+        async fn initial_window_exhaustion_errors_without_answering_buffered_requests() {
             let addr = reserve_free_addr().await;
             let cfg = BridgeRetryConfig {
-                initial_attempts: 30,
+                initial_attempts: 5,
                 ..fast_cfg()
             };
             let mut bridge = spawn_bridge(addr, cfg);
-            // Sent while the bridge is still retrying: answered with the
-            // retryable error rather than dropped.
             bridge.send_request(7).await;
-            let resp = bridge.read_response().await;
-            assert_disconnected_error(&resp, 7);
-            // The bounded retry then gives up with the connect error.
+            // The bounded retry gives up with the connect error.
             let result = timeout(Duration::from_secs(5), bridge.handle)
                 .await
                 .expect("bridge did not give up in time")
@@ -3777,6 +3808,89 @@ mod mcp_bridge_tests {
                 result.is_err(),
                 "initial-connect give-up must surface an error"
             );
+            // Nothing was written to stdout for the buffered request.
+            let mut leftover = String::new();
+            timeout(
+                Duration::from_secs(5),
+                bridge.stdout.read_to_string(&mut leftover),
+            )
+            .await
+            .expect("stdout drain timed out")
+            .expect("stdout drain failed");
+            assert!(
+                leftover.is_empty(),
+                "no response may be written for buffered requests on give-up: {leftover}"
+            );
+        }
+
+        /// Lines past the defensive initial-window buffer cap fall back to
+        /// the retryable disconnected error instead of growing the buffer
+        /// unboundedly (monorepo#908).
+        #[tokio::test]
+        async fn initial_buffer_overflow_falls_back_to_retryable_error() {
+            let addr = reserve_free_addr().await;
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+            for id in 0..(INITIAL_BUFFER_MAX_LINES as i64) {
+                bridge.send_request(id).await;
+            }
+            // The line past the cap is rejected with the retryable error.
+            bridge.send_request(9999).await;
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 9999);
+        }
+
+        /// The byte cap rejects an oversized line, and overflow is sticky:
+        /// once any line has been rejected, later lines that would fit are
+        /// rejected too, so a later request can never be served after an
+        /// earlier one failed (monorepo#908).
+        #[tokio::test]
+        async fn initial_buffer_byte_cap_overflow_is_sticky() {
+            let addr = reserve_free_addr().await;
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+            // One line larger than the whole byte cap is rejected outright.
+            let big = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+                "x".repeat(INITIAL_BUFFER_MAX_BYTES)
+            );
+            bridge.stdin.write_all(big.as_bytes()).await.unwrap();
+            bridge.stdin.flush().await.unwrap();
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 1);
+            // A small line that would fit is rejected too — overflow is sticky.
+            bridge.send_request(2).await;
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 2);
+        }
+
+        /// Buffered lines participate in `pending` tracking once flushed: a
+        /// TCP drop right after the flush still synthesizes the retryable
+        /// error for the buffered id (monorepo#908).
+        #[tokio::test]
+        async fn buffered_request_gets_retryable_error_if_tcp_drops_after_flush() {
+            let addr = reserve_free_addr().await;
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+            bridge.send_request(9).await;
+            sleep(Duration::from_millis(50)).await;
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("bridge never connected")
+                .unwrap();
+            // Read the flushed request, then drop the connection without
+            // answering it.
+            let (read, write) = conn.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let line = timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("buffered request never flushed to the connection")
+                .unwrap()
+                .unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(msg["id"], json!(9), "buffered line is flushed in order");
+            drop(write);
+            drop(lines);
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 9);
         }
 
         #[tokio::test]

@@ -169,7 +169,22 @@ async fn main() -> ExitCode {
         Command::Status => cmd_status().await,
         Command::Stop => cmd_stop().await,
         Command::Doctor => cmd_doctor().await,
-        Command::McpBridge { connect } => to_exit(cmd_mcp_bridge(&connect).await),
+        Command::McpBridge { connect } => {
+            // The bridge reads stdin via `tokio::io::stdin()`, whose pending
+            // blocking-pool read outlives `run_stdio_bridge`; returning
+            // through the runtime drop would wait on it — i.e. until the
+            // provider closes stdin — so an initial-connect give-up would
+            // never actually exit (monorepo#908). Exit explicitly instead;
+            // there is no bridge state to unwind and stdout is flushed per
+            // line.
+            match cmd_mcp_bridge(&connect).await {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Import { from } => to_exit(cmd_import(&from).await),
         Command::ImportLegacy {
             root,
