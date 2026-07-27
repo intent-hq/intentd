@@ -7562,7 +7562,17 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::write(&root, &path, &content)
+            let result = file_ops::write(&root, &path, &content)?;
+            // Attribution (monorepo#939): an agent's workspace-api `file.write`
+            // must land on `tracked_changes` just like an ACP
+            // `fs/write_text_file` does via `file:changed`, or the
+            // attribution-filtered `git.agentCommit` fallback (and thus idle
+            // auto-commit) never sees the agent's edit. FE/user writes (no
+            // agent caller) stay unattributed.
+            if let Some(agent) = caller_agent_id.as_ref() {
+                record_agent_file_write(&store, &workspace_id, agent, &root, &path).await;
+            }
+            Ok(result)
         })
     }
 
@@ -18726,6 +18736,90 @@ struct AcExtras {
 /// Per-path attribution `(agent_id, session_id, turn)` carried across a
 /// `file-tracking.sync` reconcile so reconciled rows keep their provenance.
 type AttributionByPath = HashMap<String, (Option<String>, Option<String>, Option<i64>)>;
+
+/// Record a `tracked_changes` attribution row for an agent's workspace-api
+/// `file.write` (monorepo#939), mirroring the agent event sink's handling of
+/// ACP `file:changed` (`agent_manager`'s `record_agent_file_change`): stage
+/// `unstaged`, best-effort diff stats + blob SHAs via
+/// [`crate::diffs::compute_and_store`], then the metrics / usage-stats
+/// recomputes. Best-effort throughout — a tracking miss never fails the write.
+async fn record_agent_file_write(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent: &AgentId,
+    root: &str,
+    path: &str,
+) {
+    let ws = match store.get_workspace(workspace_id).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!(error = %e, "file-tracking: workspace lookup failed");
+            return;
+        }
+    };
+    let Some(worktree) = git_ops::worktree_path(&ws) else {
+        return;
+    };
+    let rel_path = file_ops::workspace_relative(root, path)
+        .unwrap_or_else(|| crate::file_tracking::normalize_path(path));
+    if rel_path.is_empty() {
+        return;
+    }
+    // Diff compute is best-effort: a missing repo / clean worktree still
+    // records the attribution row (with zero stats) so provenance is kept.
+    let summary =
+        match crate::diffs::compute_and_store(store, &worktree, workspace_id, &rel_path, false)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(e) => {
+                tracing::warn!(error = %e, "file-tracking: diff compute failed");
+                None
+            }
+        };
+    let status = match summary.as_ref() {
+        Some(s) if s.old_blob_sha.is_none() => "added",
+        Some(s) if s.new_blob_sha.is_none() => "deleted",
+        _ => "modified",
+    };
+    let change = intent_store::NewTrackedChange {
+        workspace_id: workspace_id.clone(),
+        path: rel_path,
+        stage: "unstaged".to_string(),
+        status: status.to_string(),
+        agent_id: Some(agent.as_str().to_string()),
+        session_id: None,
+        turn: None,
+        commit_hash: None,
+        old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
+        new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
+        additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
+        deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+    };
+    let (lines_added, lines_deleted) = match crate::file_tracking::track_change(store, change).await
+    {
+        Ok(delta) => delta,
+        Err(e) => {
+            tracing::warn!(error = %e, "file-tracking: track_change failed");
+            return;
+        }
+    };
+    // Recompute the durable line-change aggregates so the metrics.* reads
+    // (§17.5) reflect this edit. Best-effort: attribution is already recorded.
+    if let Err(e) = crate::metrics::recompute(store, workspace_id).await {
+        tracing::warn!(error = %e, "metrics: recompute failed");
+    }
+    // Global usage-stats (D5): fold the attributed lines-changed delta into
+    // the current `usage_stats_hourly` bucket. Best-effort inside.
+    crate::usage_stats::record_lines_changed(
+        store,
+        workspace_id,
+        Some(agent.as_str()),
+        lines_added,
+        lines_deleted,
+    )
+    .await;
+}
 
 /// Resolve a workspace's worktree path for the `file-tracking.*` reads (used to
 /// render the absolute `TrackedChange.file`). `None` for a missing/remote/

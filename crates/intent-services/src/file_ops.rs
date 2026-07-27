@@ -95,6 +95,19 @@ fn is_within(root: &str, full: &Path) -> bool {
     full.to_string_lossy().starts_with(root)
 }
 
+/// Workspace-relative, forward-slash form of `path` for attribution rows:
+/// resolve against `root` the same way the file ops do, then strip the root
+/// prefix and normalize. `None` when the root is empty or the resolved path
+/// does not sit under it.
+pub(crate) fn workspace_relative(root: &str, path: &str) -> Option<String> {
+    if root.is_empty() {
+        return None;
+    }
+    let full = node_resolve(root, path);
+    let rel = full.strip_prefix(root).ok()?;
+    Some(crate::file_tracking::normalize_path(&rel.to_string_lossy()))
+}
+
 /// Resolve `rel` against `root` and enforce the within-workspace guard.
 fn resolve_within(root: &str, rel: &str) -> Result<PathBuf> {
     let full = node_resolve(root, rel);

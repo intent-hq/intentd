@@ -8836,6 +8836,74 @@ mod file_tracking {
         );
     }
 
+    /// An agent-context `file.write` records an attributed `tracked_changes`
+    /// row (stage `unstaged`, diff stats populated) — the workspace-api file
+    /// tools feed the same attribution pipeline as ACP `fs/write_text_file`
+    /// (monorepo#939), so the attribution-filtered `git.agentCommit` fallback
+    /// sees the edit.
+    #[tokio::test]
+    async fn file_write_with_agent_context_records_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        svc.file_write(
+            ws.clone(),
+            "agent-edit.txt".to_string(),
+            "written by agent\n".to_string(),
+            Some(AgentId::from("agent-w1")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.path == "agent-edit.txt")
+            .expect("attribution row recorded");
+        assert_eq!(row.stage, "unstaged");
+        assert_eq!(row.status, "added");
+        assert_eq!(row.agent_id.as_deref(), Some("agent-w1"));
+        assert_eq!(row.additions, 1);
+
+        // The attribution-filtered fallback now commits this write.
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "agent write".to_string(),
+                Some(AgentId::from("agent-w1")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["agent-edit.txt".to_string()]);
+    }
+
+    /// A `file.write` without an agent caller context (FE/user write) records
+    /// no attribution row.
+    #[tokio::test]
+    async fn file_write_without_agent_context_records_no_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        svc.file_write(
+            ws.clone(),
+            "user-edit.txt".to_string(),
+            "written by user\n".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "no attribution for a userless write: {rows:?}"
+        );
+        assert!(repo.dir.join("user-edit.txt").exists(), "file was written");
+    }
+
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
     /// `CommitSummary`, walking older pages via the opaque continuation
     /// token; attribution trailers populate `agentId`/`linkedNoteId`. The
