@@ -985,6 +985,34 @@ fn project_lite(session: AgentSession) -> AgentLite {
     AgentLite::from_session(session, count, last_response, last_user, digest)
 }
 
+/// Project a metadata-only [`AgentSession`] summary plus its bounded
+/// [`intent_store::SessionMessageProjection`] into [`AgentLite`] — the
+/// transcript-free equivalent of [`project_lite`] (monorepo#958). The derived
+/// fields (`lastAgentResponse`/digest/`lastUserMessage`) only ever read the
+/// newest assistant/user rows, so feeding them the projection's last rows
+/// yields output identical to a full-transcript projection of the same data.
+fn project_lite_from_projection(
+    session: AgentSession,
+    projection: &intent_store::SessionMessageProjection,
+) -> AgentLite {
+    let (last_response, digest) = projection
+        .last_assistant
+        .as_ref()
+        .map(|m| last_response_and_digest(std::slice::from_ref(m)))
+        .unwrap_or((None, None));
+    let last_user = projection
+        .last_user
+        .as_ref()
+        .and_then(|m| last_user_message(std::slice::from_ref(m)));
+    AgentLite::from_session(
+        session,
+        projection.message_count,
+        last_response,
+        last_user,
+        digest,
+    )
+}
+
 /// Whether `blocks` contains a `tool_use` block with no matching `tool_result`
 /// (matched by `tool_use_id == toolCallId`). The daemon-side port of the FE
 /// `hasUnresolvedToolUse` content-block branch: a tool call that has been
@@ -1047,12 +1075,26 @@ fn strip_anonymous_tool_blocks(mut message: AgentMessage) -> AgentMessage {
 }
 
 impl Services {
-    /// `agent.list` (PROTOCOL §5.5).
+    /// `agent.list` (PROTOCOL §5.5). Reads metadata-only session summaries
+    /// plus the bounded per-workspace message projections (monorepo#958):
+    /// a fixed number of store queries regardless of session count, and no
+    /// message row beyond each session's newest user/assistant pair is ever
+    /// fetched or decoded — full transcripts are never hydrated.
     pub(crate) async fn agent_list_op(&self, workspace_id: WorkspaceId) -> Result<Vec<AgentLite>> {
-        let sessions = self.store.list_agent_sessions(&workspace_id).await?;
+        let sessions = self
+            .store
+            .list_agent_session_summaries(&workspace_id)
+            .await?;
+        let mut projections = self
+            .store
+            .get_agent_session_message_projections(&workspace_id)
+            .await?;
         Ok(sessions
             .into_iter()
-            .map(|s| self.project_lite_with_flags(s))
+            .map(|s| {
+                let projection = projections.remove(&s.id.0).unwrap_or_default();
+                self.project_lite_with_flags_from_projection(s, &projection)
+            })
             .collect())
     }
 
@@ -1060,18 +1102,27 @@ impl Services {
     /// maps it to `-32602 "Agent not found"`. When `workspace_id` is supplied
     /// the caller's workspace must match the session's; a mismatch surfaces as
     /// `NotFound` (defense-in-depth against bare-id probes across workspaces).
+    ///
+    /// Uses the metadata-only session lookup plus the bounded message
+    /// projections (monorepo#958) — the transcript is never hydrated; only
+    /// the session's newest user/assistant rows are fetched and decoded.
     pub(crate) async fn agent_get_op(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
     ) -> Result<AgentLite> {
-        let session = self.store.get_agent_session(&agent_id).await?;
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        Ok(self.project_lite_with_flags(session))
+        let mut projections = self
+            .store
+            .get_agent_session_message_projections(&session.workspace_id)
+            .await?;
+        let projection = projections.remove(&agent_id.0).unwrap_or_default();
+        Ok(self.project_lite_with_flags_from_projection(session, &projection))
     }
 
     /// Project an [`AgentSession`] into [`AgentLite`] and overlay the daemon-owned
@@ -1083,6 +1134,28 @@ impl Services {
     /// projection `turnInFlight` implies `isResponding` (the converse need not
     /// hold — a busy worker may not have opened its live-turn slot yet).
     pub(crate) fn project_lite_with_flags(&self, session: AgentSession) -> AgentLite {
+        self.project_lite_with_flags_inner(session, project_lite)
+    }
+
+    /// [`project_lite_with_flags`](Self::project_lite_with_flags) over a
+    /// metadata-only session summary plus its bounded message projection
+    /// (monorepo#958) — same runtime-flag overlay, no transcript required.
+    pub(crate) fn project_lite_with_flags_from_projection(
+        &self,
+        session: AgentSession,
+        projection: &intent_store::SessionMessageProjection,
+    ) -> AgentLite {
+        self.project_lite_with_flags_inner(session, |s| project_lite_from_projection(s, projection))
+    }
+
+    /// Shared runtime-flag overlay behind the two `project_lite_with_flags*`
+    /// entry points: compute the flags from the session, project it via
+    /// `project`, then overlay.
+    fn project_lite_with_flags_inner(
+        &self,
+        session: AgentSession,
+        project: impl FnOnce(AgentSession) -> AgentLite,
+    ) -> AgentLite {
         let (is_responding, is_waiting_on_tool, is_waiting_for_other_agents, waiting_for_agent_ids) =
             self.agent_activity_flags_for(&session);
         let (turn_in_flight, last_stream_activity_at) =
@@ -1091,7 +1164,7 @@ impl Services {
         // rehydrating via agent.list/agent.get after the failure event still
         // sees the corrupted flag.
         let session_corrupted = self.session_poisoned(&session);
-        let mut lite = project_lite(session);
+        let mut lite = project(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
         lite.is_waiting_for_other_agents = is_waiting_for_other_agents;
