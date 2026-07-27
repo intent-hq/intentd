@@ -942,7 +942,11 @@ pub struct AgentManager {
     /// resume and open a fresh `session/new` instead — armed by
     /// [`AgentManager::edit_and_regenerate`] (immediately after target
     /// validation, before the stop) because a resumed provider session would
-    /// retain the truncated turns in its context. Deliberately NOT cleared by
+    /// retain the truncated turns in its context, and by
+    /// [`AgentManager::agent_retry`] when the session is poisoned
+    /// (monorepo#940: resuming would replay the exact context the provider
+    /// deterministically rejects, so the redrive must open a fresh
+    /// `session/new`). Deliberately NOT cleared by
     /// [`AgentManager::stop`] (unlike `recreated`/`prepend_pending`): the
     /// truncation is already persisted, so the stale provider history must
     /// never be resumed regardless of intervening stops. Enforced at BOTH
@@ -3626,6 +3630,24 @@ impl AgentManager {
         // Use the session's persisted workspace_id for safety (cross-workspace guard)
         let workspace_id = &session.workspace_id;
 
+        // monorepo#940: consult poisoning BEFORE `clear_failure_streak` below —
+        // the identical-failure streak feeds `session_poisoned`, so checking
+        // after the clear would miss streak-poisoned sessions. When poisoned,
+        // resuming the provider session via `session/load` would replay the
+        // exact context the provider deterministically rejects; arm
+        // `force_recreate` (same mechanism as `agent.editAndRegenerate`) so
+        // the redrive's `start_session` skips the resume and opens a fresh
+        // `session/new` (recreated-flag history prepend + token-usage
+        // baseline fold).
+        if self.services.session_poisoned(&session) {
+            tracing::warn!(
+                agent = %agent_id,
+                stop_reason = session.stop_reason.as_deref().unwrap_or(""),
+                "retrying a poisoned session: arming force-recreate so the redrive opens a fresh session/new instead of resuming the corrupted one (monorepo#940)"
+            );
+            self.force_recreate.lock().unwrap().insert(agent_id.clone());
+        }
+
         // agent.retry is the deliberate quarantine escape hatch (monorepo#840):
         // clear the identical-failure streak alongside the status/stop_reason
         // so the redrive starts from a clean slate — and the failure-wake
@@ -5665,9 +5687,13 @@ async fn persist_error_and_requeue(
     // `session_poisoned` sees a consistent (status, streak) pair as soon as
     // the Error status lands.
     let streak = mgr.services.record_terminal_failure(agent_id, error_text);
-    if streak >= crate::POISONED_FAILURE_STREAK_THRESHOLD
-        || crate::is_session_fatal_stop_reason(error_text)
-    {
+    // monorepo#940: the same classification that quarantines the session
+    // (`session_poisoned`) is surfaced on the wire as `sessionCorrupted` so
+    // clients get a structured "retry will recreate" signal, not just the raw
+    // stopReason string.
+    let session_corrupted = streak >= crate::POISONED_FAILURE_STREAK_THRESHOLD
+        || crate::is_session_fatal_error(error_text);
+    if session_corrupted {
         tracing::warn!(
             agent = %agent_id,
             streak,
@@ -5694,6 +5720,17 @@ async fn persist_error_and_requeue(
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
     } else {
         // Emit agent:status-changed with stopReason so live subscribers get the canonical field.
+        // `sessionCorrupted: true` is included only when the failure classifies as
+        // corrupted/poisoned (absent otherwise, matching the serialized projections).
+        let mut data = json!({
+            "agentId": agent_id.0,
+            "status": "error",
+            "isActive": false,
+            "stopReason": error_text,
+        });
+        if session_corrupted {
+            data["sessionCorrupted"] = json!(true);
+        }
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: ts,
@@ -5703,12 +5740,7 @@ async fn persist_error_and_requeue(
             correlation_id: None,
             parent_event_id: None,
             metadata: None,
-            data: json!({
-                "agentId": agent_id.0,
-                "status": "error",
-                "isActive": false,
-                "stopReason": error_text,
-            }),
+            data,
         };
         crate::publish_event(&mgr.services.event_bus, event).await;
     }
@@ -6039,6 +6071,7 @@ mod role_reminder_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 
@@ -7240,6 +7273,7 @@ mod agent_retry_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 

@@ -1316,6 +1316,81 @@ async fn create_then_list_and_get_projects_agent_lite() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
+/// monorepo#940: `sessionCorrupted` is derived on emit over the persisted
+/// (status, stop_reason) — a client rehydrating via `agent.get`/`agent.list`/
+/// `agent.getSession` after the failure event still sees the flag, and an
+/// ordinary error session omits it from the wire entirely.
+#[tokio::test]
+async fn projections_derive_session_corrupted_after_rehydration() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Poisoned").await;
+
+    // Park the session in Error with a session-fatal provider block —
+    // persisted via the store, so the read path below is a genuine
+    // rehydration round-trip (nothing in memory carries the flag).
+    svc.store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            intent_core::AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let lite = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert!(lite.session_corrupted, "agent.get derives the flag");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(v["sessionCorrupted"], json!(true));
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(
+        agents.iter().any(|a| a.id == id && a.session_corrupted),
+        "agent.list derives the flag"
+    );
+
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert!(
+        session.session_corrupted,
+        "agent.getSession derives the flag"
+    );
+    let v = serde_json::to_value(&session).unwrap();
+    assert_eq!(v["sessionCorrupted"], json!(true));
+
+    // Ordinary error: flag absent from the serialized wire shape (not false).
+    let plain = create_agent(&svc, &ws, "Plain").await;
+    svc.store
+        .set_agent_session_status(
+            &ws,
+            &plain,
+            intent_core::AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some("connection reset by peer".into())),
+        )
+        .await
+        .expect("park session in ordinary error");
+    let lite = svc.agent_get_op(plain.clone(), None).await.expect("get");
+    assert!(!lite.session_corrupted);
+    let v = serde_json::to_value(&lite).unwrap();
+    assert!(
+        v.get("sessionCorrupted").is_none(),
+        "false is omitted from the wire (got {v:?})"
+    );
+    let session = svc.agent_get_session_op(plain).await.expect("getSession");
+    let v = serde_json::to_value(&session).unwrap();
+    assert!(v.get("sessionCorrupted").is_none());
+}
+
 #[tokio::test]
 async fn agent_create_mints_server_assigned_agent_id() {
     // Agent ids are server-assigned: every create mints a fresh
@@ -10820,6 +10895,136 @@ fn session_fatal_stop_reason_classifier() {
         "tool output blocked by firewall; safety checks passed"
     ));
     assert!(!is_session_fatal_stop_reason(""));
+}
+
+/// The exact monorepo#940 failure shape: the chat-stream 400 `invalidArgument`
+/// payload wrapped in `session/prompt failed: JSON-RPC error -32603: …`, with
+/// a per-attempt `requestId`.
+fn issue_940_error(request_id: &str) -> String {
+    format!(
+        "internal error: session/prompt failed: JSON-RPC error -32603: Internal error: \
+         HTTP error: 400 Bad Request: {{\"httpStatus\":400,\"apiStatus\":\"invalidArgument\",\
+         \"message\":\"HTTP error: 400 Bad Request\",\"requestId\":\"{request_id}\",\
+         \"httpUrl\":\"https://e2.api.augmentcode.com/chat-stream\"}}"
+    )
+}
+
+/// monorepo#940 classifier: the deterministic chat-stream 400
+/// `invalidArgument` prompt rejection is session-fatal; plain 4xx/5xx, other
+/// `apiStatus` values, and `invalidArgument` echoed in model output without
+/// the `session/prompt failed:` wrapper stay retryable.
+#[test]
+fn deterministic_prompt_rejection_classifier() {
+    use crate::is_deterministic_prompt_rejection;
+    // The exact #940 error string classifies.
+    assert!(is_deterministic_prompt_rejection(&issue_940_error(
+        "dab7bd0f-9663-4bfc-a341-0a1b2c3d4e5f"
+    )));
+    // Plain 4xx/5xx without the structured invalidArgument payload do not.
+    assert!(!is_deterministic_prompt_rejection(
+        "session/prompt failed: JSON-RPC error -32603: Internal error: HTTP error: \
+         429 Too Many Requests"
+    ));
+    assert!(!is_deterministic_prompt_rejection(
+        "session/prompt failed: JSON-RPC error -32603: Internal error: HTTP error: \
+         500 Internal Server Error"
+    ));
+    // A different apiStatus stays retryable even on a 400.
+    assert!(!is_deterministic_prompt_rejection(
+        "session/prompt failed: HTTP error: 400 Bad Request: \
+         {\"httpStatus\":400,\"apiStatus\":\"resourceExhausted\"}"
+    ));
+    // invalidArgument echoed in model output without the wrapper does not classify.
+    assert!(!is_deterministic_prompt_rejection(
+        "the API returned 400 Bad Request with \"apiStatus\":\"invalidArgument\" earlier"
+    ));
+    assert!(!is_deterministic_prompt_rejection(""));
+}
+
+/// monorepo#940: the exact #940 error text as a `stop_reason` poisons an
+/// Error-status session immediately (no streak needed), and the streak
+/// normalization means consecutive 400 payloads differing only in
+/// `requestId` still count as the SAME failure.
+#[tokio::test]
+async fn deterministic_prompt_rejection_poisons_session_and_streak() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Rejected").await;
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+
+    // Error + the #940 rejection → poisoned without any streak.
+    session.status = intent_core::AgentStatus::Error;
+    session.stop_reason = Some(issue_940_error("fb034c3c-1111-4222-8333-444455556666"));
+    assert!(
+        svc.session_poisoned(&session),
+        "#940 prompt rejection is session-fatal"
+    );
+    // Non-Error status still gates.
+    session.status = intent_core::AgentStatus::Active;
+    assert!(!svc.session_poisoned(&session), "Active is never poisoned");
+
+    // Streak: payloads differing ONLY in requestId increment, not reset.
+    assert_eq!(
+        svc.record_terminal_failure(
+            &id,
+            &issue_940_error("fb034c3c-1111-4222-8333-444455556666")
+        ),
+        1
+    );
+    assert_eq!(
+        svc.record_terminal_failure(
+            &id,
+            &issue_940_error("dab7bd0f-9663-4bfc-a341-0a1b2c3d4e5f")
+        ),
+        2
+    );
+    assert_eq!(
+        svc.record_terminal_failure(
+            &id,
+            &issue_940_error("ec7c7fd1-7777-4888-9999-aaaabbbbcccc")
+        ),
+        3
+    );
+    // A genuinely different error kind still resets the streak.
+    assert_eq!(
+        svc.record_terminal_failure(&id, "connection reset by peer"),
+        1
+    );
+}
+
+/// monorepo#940: `normalize_failure_text` replaces `"requestId":"…"` values
+/// and standalone UUID-shaped tokens with stable placeholders, and leaves
+/// everything else (including near-UUID tokens) untouched.
+#[test]
+fn normalize_failure_text_strips_volatile_tokens() {
+    use crate::normalize_failure_text;
+    // requestId value replaced regardless of shape; key and quotes kept.
+    assert_eq!(
+        normalize_failure_text("{\"requestId\":\"not-a-uuid-token\",\"httpStatus\":400}"),
+        "{\"requestId\":\"<redacted>\",\"httpStatus\":400}"
+    );
+    // Standalone UUIDs replaced anywhere in the text.
+    assert_eq!(
+        normalize_failure_text("request dab7bd0f-9663-4bfc-a341-0a1b2c3d4e5f failed"),
+        "request <uuid> failed"
+    );
+    // Two payloads differing only in requestId normalize identically…
+    assert_eq!(
+        normalize_failure_text(&issue_940_error("fb034c3c-1111-4222-8333-444455556666")),
+        normalize_failure_text(&issue_940_error("dab7bd0f-9663-4bfc-a341-0a1b2c3d4e5f"))
+    );
+    // …while different error kinds stay different.
+    assert_ne!(
+        normalize_failure_text("HTTP error: 400 Bad Request"),
+        normalize_failure_text("HTTP error: 429 Too Many Requests")
+    );
+    // A UUID-shaped run embedded in a longer hex/dash token is NOT replaced.
+    let embedded = "deadbeefdab7bd0f-9663-4bfc-a341-0a1b2c3d4e5f";
+    assert_eq!(normalize_failure_text(embedded), embedded);
+    // Non-UUID text passes through unchanged.
+    assert_eq!(
+        normalize_failure_text("connection reset by peer"),
+        "connection reset by peer"
+    );
 }
 
 /// monorepo#840: `session_poisoned` requires `Error` status AND either a

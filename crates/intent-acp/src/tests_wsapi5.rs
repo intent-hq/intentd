@@ -705,6 +705,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         context_references: None,
         image_blocks: None,
         stop_reason: None,
+        session_corrupted: false,
         metadata: AgentMetadata {
             is_background: false,
             specialist: None,

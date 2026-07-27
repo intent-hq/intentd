@@ -1941,6 +1941,15 @@ pub struct AgentSession {
     /// omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Derived-on-emit corrupted/poisoned-session flag (monorepo#940): `true`
+    /// when the session is parked in `error` AND the failure classifies as
+    /// session-fatal (provider block or deterministic prompt rejection) or the
+    /// identical-failure streak hit the poisoned threshold — retry will
+    /// recreate the provider session instead of resuming. NOT persisted: the
+    /// service layer overlays it on read (`agent.getSession`); omitted from
+    /// the wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_corrupted: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -2081,6 +2090,11 @@ pub struct AgentLite {
     /// (Phase 2). Top-level `stopReason`, matching the FE shared type; omitted when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// Derived-on-emit corrupted/poisoned-session flag (monorepo#940); see
+    /// [`AgentSession::session_corrupted`]. Overlaid by the service projection
+    /// (`agent.list`/`agent.get`); omitted from the wire when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_corrupted: bool,
     pub metadata: AgentMetadata,
 }
 
@@ -2138,6 +2152,7 @@ impl AgentLite {
             context_references: session.context_references,
             image_blocks: session.image_blocks,
             stop_reason: session.stop_reason,
+            session_corrupted: session.session_corrupted,
             metadata,
         }
     }
@@ -3275,6 +3290,7 @@ mod tests {
             is_background: true,
             metadata: None,
             stop_reason: None,
+            session_corrupted: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
             sandbox_id: None,
@@ -3341,6 +3357,7 @@ mod tests {
             is_background: false,
             metadata: None,
             stop_reason: None,
+            session_corrupted: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,

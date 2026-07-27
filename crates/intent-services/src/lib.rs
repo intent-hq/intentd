@@ -2253,18 +2253,24 @@ impl Services {
     /// Record a terminal turn/spawn failure for the consecutive-identical
     /// streak (monorepo#840). The SAME error text back-to-back increments the
     /// streak; a different error resets it to 1. Returns the updated count.
+    /// Comparison (and storage) uses the NORMALIZED text
+    /// ([`normalize_failure_text`]) so volatile per-attempt tokens — e.g. the
+    /// fresh `"requestId"` a chat-stream 400 payload embeds on every attempt
+    /// (monorepo#940) — don't make identical failures look different and
+    /// reset the streak.
     pub(crate) fn record_terminal_failure(&self, agent_id: &AgentId, error_text: &str) -> u32 {
+        let normalized = normalize_failure_text(error_text);
         let mut guard = self
             .agent_failure_streaks
             .lock()
             .expect("agent failure streak registry poisoned");
         let entry = guard
             .entry(agent_id.clone())
-            .or_insert_with(|| (error_text.to_string(), 0));
-        if entry.0 == error_text {
+            .or_insert_with(|| (normalized.clone(), 0));
+        if entry.0 == normalized {
             entry.1 += 1;
         } else {
-            *entry = (error_text.to_string(), 1);
+            *entry = (normalized, 1);
         }
         entry.1
     }
@@ -2293,13 +2299,15 @@ impl Services {
     /// Whether `session` is provably poisoned (monorepo#840): parked in
     /// `Error` with either a session-fatal provider-block `stop_reason`
     /// (redriving the same context is guaranteed to fail — the provider said
-    /// "start a new session") or a streak of
-    /// [`POISONED_FAILURE_STREAK_THRESHOLD`] consecutive identical terminal
-    /// failures. A poisoned session is quarantined: message deliveries park
-    /// in its queue instead of driving turns, and `agent.wakeOrCreate`
-    /// spawns a fresh agent instead of waking it. `agent.retry` remains the
-    /// escape hatch (it clears the Error status, the `stop_reason`, and the
-    /// streak before redriving).
+    /// "start a new session"), a deterministic `session/prompt` 400
+    /// `invalidArgument` rejection (monorepo#940: the provider rejects the
+    /// persisted history itself, so every replay fails identically), or a
+    /// streak of [`POISONED_FAILURE_STREAK_THRESHOLD`] consecutive identical
+    /// terminal failures. A poisoned session is quarantined: message
+    /// deliveries park in its queue instead of driving turns, and
+    /// `agent.wakeOrCreate` spawns a fresh agent instead of waking it.
+    /// `agent.retry` remains the escape hatch (it clears the Error status,
+    /// the `stop_reason`, and the streak before redriving).
     pub(crate) fn session_poisoned(&self, session: &AgentSession) -> bool {
         if session.status != intent_core::AgentStatus::Error {
             return false;
@@ -2307,7 +2315,7 @@ impl Services {
         if session
             .stop_reason
             .as_deref()
-            .is_some_and(is_session_fatal_stop_reason)
+            .is_some_and(is_session_fatal_error)
         {
             return true;
         }
@@ -6178,6 +6186,121 @@ pub(crate) fn is_session_fatal_stop_reason(stop_reason: &str) -> bool {
     provider_block
         || lower.contains("please start a new session")
         || lower.contains("start a new session to continue")
+}
+
+/// Classify a persisted `stop_reason` as the deterministic chat-stream 400
+/// `invalidArgument` prompt rejection (monorepo#940): the provider rejects
+/// the SESSION HISTORY itself (e.g. a persisted exchange ending in a dangling
+/// `tool_use`), so every `session/prompt` replay — including after a fresh
+/// spawn + successful `session/load` — fails identically and only a fresh
+/// session can recover. The match is substring-anchored like
+/// [`is_session_fatal_stop_reason`] and deliberately narrow: it requires the
+/// `session/prompt failed:` wrapper (so an `invalidArgument` merely echoed in
+/// model output does not classify), the `400 Bad Request` HTTP status, and
+/// the structured `"apiStatus":"invalidArgument"` payload field. Plain
+/// 4xx/5xx errors and other `apiStatus` values stay retryable.
+pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
+    let lower = stop_reason.to_ascii_lowercase();
+    lower.contains("session/prompt failed")
+        && lower.contains("400 bad request")
+        && lower.contains("\"apistatus\":\"invalidargument\"")
+}
+
+/// Classify a terminal-failure text as session-fatal on its own (independent
+/// of the failure streak): a provider block ([`is_session_fatal_stop_reason`])
+/// or the deterministic chat-stream 400 prompt rejection
+/// ([`is_deterministic_prompt_rejection`]). Single predicate shared by
+/// [`Services::session_poisoned`] and the `sessionCorrupted` event flag in
+/// `persist_error_and_requeue` so the two surfaces cannot drift.
+pub(crate) fn is_session_fatal_error(error_text: &str) -> bool {
+    is_session_fatal_stop_reason(error_text) || is_deterministic_prompt_rejection(error_text)
+}
+
+/// Normalize a terminal-failure error text for streak comparison
+/// (monorepo#940): volatile per-attempt tokens are replaced with stable
+/// placeholders so two otherwise-identical failures still compare equal in
+/// [`Services::record_terminal_failure`]. Two shapes are normalized: the
+/// value of any JSON `"requestId":"…"` field (the chat-stream 400 payload
+/// embeds a fresh one on every attempt) and any standalone UUID-shaped token
+/// (8-4-4-4-12 hex). Genuinely different errors remain different.
+pub(crate) fn normalize_failure_text(error_text: &str) -> String {
+    replace_uuid_tokens(&replace_request_id_values(error_text))
+}
+
+/// Replace the value of every case-insensitive JSON `"requestId":"…"` field
+/// with a stable placeholder, preserving the key and quotes.
+fn replace_request_id_values(text: &str) -> String {
+    const KEY: &str = "\"requestid\":\"";
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(rel) = lower[pos..].find(KEY) {
+        let value_start = pos + rel + KEY.len();
+        out.push_str(&text[pos..value_start]);
+        match text[value_start..].find('"') {
+            Some(end_rel) => {
+                out.push_str("<redacted>");
+                pos = value_start + end_rel;
+            }
+            None => {
+                pos = value_start;
+                break;
+            }
+        }
+    }
+    out.push_str(&text[pos..]);
+    out
+}
+
+fn is_uuid_byte(b: u8) -> bool {
+    b.is_ascii_hexdigit() || b == b'-'
+}
+
+/// The length (36) of a UUID-shaped token (8-4-4-4-12 hex) at the start of
+/// `bytes`, or `None` when the prefix is not UUID-shaped.
+fn uuid_token_len(bytes: &[u8]) -> Option<usize> {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut idx = 0;
+    for (gi, &group_len) in GROUPS.iter().enumerate() {
+        if gi > 0 {
+            if bytes.get(idx) != Some(&b'-') {
+                return None;
+            }
+            idx += 1;
+        }
+        for _ in 0..group_len {
+            if !bytes.get(idx).is_some_and(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            idx += 1;
+        }
+    }
+    Some(idx)
+}
+
+/// Replace every standalone UUID-shaped token (not embedded in a longer
+/// hex/dash run) with a stable placeholder.
+fn replace_uuid_tokens(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(len) = uuid_token_len(&bytes[i..]) {
+            let preceded = i > 0 && is_uuid_byte(bytes[i - 1]);
+            let followed = i + len < bytes.len() && is_uuid_byte(bytes[i + len]);
+            if !preceded && !followed {
+                out.push_str(&text[copied..i]);
+                out.push_str("<uuid>");
+                i += len;
+                copied = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 /// Build a concise, human-readable wake string describing a child agent's

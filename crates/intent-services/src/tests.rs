@@ -260,6 +260,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
     };
     store
         .insert_agent_session(&mk_agent("agent-1", "Builder", Some("implementor")))
@@ -1427,6 +1428,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
     };
     svc.store
         .insert_agent_session(&session)
@@ -3782,6 +3784,7 @@ mod change_event_parity {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -5524,6 +5527,7 @@ mod mcp_callback {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -9424,6 +9428,7 @@ mod search_adapters {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -11118,6 +11123,7 @@ mod rules {
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
+            session_corrupted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -11245,6 +11251,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -11362,6 +11369,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -11475,6 +11483,7 @@ mod rules {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -11588,6 +11597,7 @@ mod rules {
             sandbox_path: None, // NO sandbox — explicit "shared" override!
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -11705,6 +11715,7 @@ mod rules {
             sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
             sandbox_branch: Some("sb/agent-1".into()),
             stop_reason: None,
+            session_corrupted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -13950,6 +13961,7 @@ mod file_ops_service {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store
             .insert_agent_session(&agent)
@@ -14904,6 +14916,7 @@ mod heal_stale_agent_sessions {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 
@@ -15847,6 +15860,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
         is_background: false,
         metadata: None,
     };
@@ -15881,6 +15895,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
         is_background: false,
         metadata: None,
     };
@@ -15994,6 +16009,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
         is_background: false,
         metadata: None,
     };
@@ -16541,6 +16557,7 @@ mod last_activity_events {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 
@@ -16793,6 +16810,7 @@ mod turn_token_usage {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 

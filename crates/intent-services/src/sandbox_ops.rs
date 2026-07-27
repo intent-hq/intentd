@@ -1035,6 +1035,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
@@ -1160,6 +1161,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1306,6 +1308,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1434,6 +1437,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1531,6 +1535,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -1606,6 +1611,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

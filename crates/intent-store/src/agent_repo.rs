@@ -1252,6 +1252,8 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
         is_background: col::<i64>(row, "is_background")? != 0,
         metadata,
         stop_reason: col(row, "stop_reason")?,
+        // Derived on emit by the service layer (monorepo#940); never persisted.
+        session_corrupted: false,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
         sandbox_id: col(row, "sandbox_id")?,
@@ -1764,6 +1766,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -1870,6 +1873,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -2014,6 +2018,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 
@@ -3105,6 +3110,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store
             .insert_agent_session(&session)
@@ -3244,6 +3250,7 @@ mod tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -3457,6 +3464,7 @@ mod tests {
                 sandbox_path: None,
                 sandbox_branch: None,
                 stop_reason: None,
+                session_corrupted: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
