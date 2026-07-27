@@ -6,28 +6,151 @@
 # which triggers the existing cargo-dist release.yml unchanged.
 
 [workspace]
-# Library crates are internal and never released; only the intentd binary
-# crate (opted in below) is versioned and tagged.
+# Only the packages opted in below are processed (notably NOT intentd-sitter,
+# which ships through its own `sitter-v*` pipeline, release-sitter.yml).
 release = false
 # Only Release-PR merges cut releases: without this, `release-plz release`
 # would tag any main commit whose Cargo.toml version is ahead of the latest
 # tag (e.g. a manual bump in a regular PR).
 release_always = false
+# Shared defaults for every opted-in package: no crates.io publishing —
+# releases are git-tag-only: versions are determined from git tags matching
+# git_tag_name, never from the cargo registry. NOTE: git_only is set
+# per-package (not here) because a workspace-level git_only pulls every
+# workspace member into git-only processing regardless of `release = false`
+# — including intentd-sitter, which must stay on its own pipeline.
+publish = false
+# cargo-dist (v-release.yml) owns the GitHub Release; release-plz only tags.
+git_release_enable = false
+# The whole workspace releases as a single unit under one `vX.Y.Z` tag
+# (monorepo#889): the library crates share intentd's tag for version
+# detection but never create tags or changelogs themselves (only the
+# intentd package below overrides git_tag_enable / changelog_update).
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+changelog_update = false
+# The lib crates are internal (never published), so there is no API baseline
+# for cargo-semver-checks to compare against.
+semver_check = false
 
 [[package]]
 name = "intentd"
 release = true
-# No crates.io publishing — releases are git-tag-only: versions are determined
-# from git tags matching git_tag_name, never from the cargo registry.
-publish = false
 git_only = true
-# cargo-dist (release.yml) owns the GitHub Release; release-plz only tags.
-git_release_enable = false
 git_tag_enable = true
-git_tag_name = "v{{ version }}"
 changelog_update = true
 # Keep the changelog at the repository root rather than crates/intentd/.
 changelog_path = "./CHANGELOG.md"
+# intentd's changelog covers the whole workspace: commits that only touch the
+# library crates change the shipped binary, so they must show up here
+# (monorepo#889 — e.g. intentd#592 touched only intent-git/intent-services
+# and was missing from the v0.2.9 changelog).
+changelog_include = [
+    "intent-acp",
+    "intent-context",
+    "intent-core",
+    "intent-git",
+    "intent-js",
+    "intent-linear",
+    "intent-providers",
+    "intent-pty",
+    "intent-search",
+    "intent-sentry",
+    "intent-services",
+    "intent-sourcecontrol",
+    "intent-store",
+    "intent-transport",
+]
+version_group = "intentd"
+
+# Library crates: processed (so lib-crate-only commits are diffed and flow
+# into intentd's version bump and changelog via version_group and
+# changelog_include above) but never tagged, released, or given their own
+# changelog — the workspace-level defaults above take care of that.
+
+[[package]]
+name = "intent-acp"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-context"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-core"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-git"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-js"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-linear"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-providers"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-pty"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-search"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-sentry"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-services"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-sourcecontrol"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-store"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-transport"
+release = true
+git_only = true
+version_group = "intentd"
 
 # Changelog rendering aligned with the monorepo cliff.toml conventions
 # (same groups and body layout; release-plz runs git-cliff under the hood).
