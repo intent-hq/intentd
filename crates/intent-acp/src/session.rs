@@ -357,14 +357,58 @@ fn map_content(block: &ContentBlock) -> (Value, Option<String>) {
     }
 }
 
+/// Codex delivers MCP tool calls with the model's parameters nested one level
+/// down (reference `acp-provider-streaming.ts` ~L1580–1606):
+///
+/// ```json
+/// { "arguments": { "noteId": "spec" }, "server": "workspace-mcp", "tool": "read_note" }
+/// ```
+///
+/// Detect that shape — `arguments` an object (not an array) plus string
+/// `tool` and `server` — and return the unwrapped top-level input together
+/// with the rewritten `{server}_{tool}` tool name (e.g.
+/// `workspace-mcp_read_note`). A non-null `_acpTitle` on the outer object is
+/// preserved onto the unwrapped input, as in the reference. Returns `None`
+/// for any other shape (input passes through verbatim).
+fn unwrap_codex_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> {
+    let obj = raw_input?.as_object()?;
+    let args = obj.get("arguments")?.as_object()?;
+    let tool = obj.get("tool")?.as_str()?;
+    let server = obj.get("server")?.as_str()?;
+    let mut unwrapped = args.clone();
+    if let Some(title) = obj.get("_acpTitle") {
+        if !title.is_null() {
+            unwrapped.insert("_acpTitle".to_string(), title.clone());
+        }
+    }
+    Some((Value::Object(unwrapped), format!("{server}_{tool}")))
+}
+
+/// Resolve the mapped `input` and tool name for a tool call. When the codex
+/// nested-MCP shape is detected ([`unwrap_codex_mcp_input`]) the arguments
+/// are hoisted to the top level and the rewritten `{server}_{tool}` name is
+/// fed through [`derive_tool_name`]'s title path — the title-prefix rule and
+/// `workspace-mcp` affix strip still apply, so `workspace-mcp_read_note`
+/// yields `read_note` while other servers keep the `{server}_{tool}` name.
+/// Otherwise the input passes through verbatim and the name derives from the
+/// ACP `title`.
+fn resolve_input_and_name(title: &str, raw_input: Option<&Value>) -> (Value, String) {
+    if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
+        let name = derive_tool_name(&rewritten, Some(&input));
+        return (input, name);
+    }
+    let name = derive_tool_name(title, raw_input);
+    (raw_input.cloned().unwrap_or(Value::Null), name)
+}
+
 /// Map a fresh `tool_call` (status defaults to "started").
 fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
     let title = tool_call.title.clone();
-    let tool_name = derive_tool_name(&title, tool_call.raw_input.as_ref());
+    let (input, tool_name) = resolve_input_and_name(&title, tool_call.raw_input.as_ref());
     MappedToolCall {
         tool_call_id: tool_call.tool_call_id.0.to_string(),
         tool_kind: tool_kind_word(tool_call.kind, &tool_name),
-        input: tool_call.raw_input.clone().unwrap_or(Value::Null),
+        input,
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
         tool_name,
@@ -376,13 +420,13 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
 fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
     let fields = &update.fields;
     let title = fields.title.clone().unwrap_or_default();
-    let tool_name = derive_tool_name(&title, fields.raw_input.as_ref());
+    let (input, tool_name) = resolve_input_and_name(&title, fields.raw_input.as_ref());
     MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
         status: fields.status.map_or("started", tool_status_word),
         tool_call_id: update.tool_call_id.0.to_string(),
-        input: fields.raw_input.clone().unwrap_or(Value::Null),
+        input,
         output: fields.raw_output.clone(),
         tool_name,
         title,
@@ -429,11 +473,11 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
-/// reassigned by an upstream codex-input unwrap (reference ~L1580–1606); for
-/// every path we reach today (title is prose, no prefix, no `workspace-mcp`
-/// affix), the two are equivalent. If a future codex-style path rewrite
-/// mutates the tool name before this call, feed the rewritten string into
-/// `title` to keep parity.
+/// reassigned by an upstream codex-input unwrap (reference ~L1580–1606). That
+/// unwrap now exists upstream here too: [`unwrap_codex_mcp_input`] (via the
+/// tool-call mappers' [`resolve_input_and_name`]) feeds the rewritten
+/// `{server}_{tool}` string in as `title`, keeping the two equivalent on
+/// every path.
 pub fn derive_tool_name(title: &str, raw_input: Option<&Value>) -> String {
     if let Some(name) = split_name_prefix(title) {
         return strip_workspace_mcp_affix(name);
