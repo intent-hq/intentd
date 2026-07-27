@@ -336,9 +336,14 @@ fn parse_size_token(token: &str) -> Option<f64> {
     Some(value * unit / 1_000_000_000_f64)
 }
 
-/// Strip a trailing `-GGUF` (case-insensitive) from a bare repo name.
+/// Strip a trailing `-GGUF` (case-insensitive) from a bare repo name. The
+/// char-boundary guard keeps the byte slice panic-free on (unexpected)
+/// non-ASCII repo names from the network.
 fn strip_gguf_suffix(name: &str) -> &str {
-    if name.len() >= 5 && name[name.len() - 5..].eq_ignore_ascii_case("-gguf") {
+    if name.len() >= 5
+        && name.is_char_boundary(name.len() - 5)
+        && name[name.len() - 5..].eq_ignore_ascii_case("-gguf")
+    {
         &name[..name.len() - 5]
     } else {
         name

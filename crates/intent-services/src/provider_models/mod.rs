@@ -557,14 +557,16 @@ fn unsloth_fetch_outcome(body: &str, total_ram_bytes: Option<u64>) -> ProviderMo
     if rows.is_empty() {
         return ProviderModelsFetch::unavailable(
             "unsloth",
-            format!("no models reported (all {hidden} repos too large for available memory)"),
+            format!(
+                "no models reported (all {hidden} repos too large for available memory or of unknown size)"
+            ),
         );
     }
     if hidden > 0 {
         ProviderModelsFetch {
             models: Some(rows),
             warning: Some(format!(
-                "unsloth: {hidden} repo(s) hidden (estimated to exceed available memory)"
+                "unsloth: {hidden} repo(s) hidden (estimated to exceed available memory, or size unknown)"
             )),
         }
     } else {

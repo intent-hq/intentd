@@ -1074,14 +1074,36 @@ fn build_unsloth_rows_empty_input_yields_no_rows() {
 }
 
 #[test]
-fn unsloth_fetch_outcome_success_with_no_hidden_repos_has_no_warning() {
-    // Fixture limited to models that all fit a generous 512 GiB machine.
+fn build_unsloth_rows_tolerates_non_ascii_repo_names() {
+    // Regression: a multi-byte name whose len-5 offset is not a char
+    // boundary must not panic in the `-GGUF` suffix strip.
+    let repos = parse_hf_unsloth_response(r#"[{"id": "unsloth/ééé", "downloads": 1}]"#);
+    let (rows, _hidden) = build_unsloth_rows(&repos, None);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "ééé");
+}
+
+#[test]
+fn unsloth_fetch_outcome_unknown_size_repo_hidden_even_with_abundant_ram() {
+    // On a generous 512 GiB machine every parseable model fits, but grok-2
+    // (unparseable size) is still hidden and still surfaces a warning.
     let fetch = super::unsloth_fetch_outcome(UNSLOTH_HF_FIXTURE, Some(512 * GIB));
     let rows = fetch.models.expect("models present");
-    // grok-2 (unparseable size) is still hidden even with abundant RAM.
     assert_eq!(rows.len(), 4);
     assert!(fetch.warning.is_some());
     assert!(fetch.warning.unwrap().contains("1 repo(s) hidden"));
+}
+
+#[test]
+fn unsloth_fetch_outcome_all_parseable_and_fitting_has_no_warning() {
+    let body = r#"[
+        {"id": "unsloth/gpt-oss-20b-GGUF", "downloads": 5, "trendingScore": 1.0},
+        {"id": "unsloth/Qwen3.6-35B-A3B-GGUF", "downloads": 9, "trendingScore": 2.0}
+    ]"#;
+    let fetch = super::unsloth_fetch_outcome(body, Some(512 * GIB));
+    let rows = fetch.models.expect("models present");
+    assert_eq!(rows.len(), 2);
+    assert!(fetch.warning.is_none());
 }
 
 #[test]
