@@ -38,10 +38,23 @@ use crate::{publish_event, system_actor, SettingsRegistry};
 /// child is what lets the streamer emit `terminal:exit` in that case.
 const EXIT_POLL: Duration = Duration::from_millis(25);
 
+/// Terminal type advertised by interactive PTYs rendered by xterm.js clients.
+const DEFAULT_TERM: &str = "xterm-256color";
+
 /// The default shell spawned when `terminal.create` omits a command. Mirrors the
 /// ancestor's reliance on the user's login shell (`$SHELL`, then `/bin/sh`).
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+}
+
+/// Ensure the effective terminal environment has a usable terminal type while
+/// preserving an explicit non-empty caller override.
+fn ensure_terminal_term(env: &mut Vec<(String, String)>) {
+    match env.iter_mut().rev().find(|(name, _)| name == "TERM") {
+        Some((_, value)) if value.is_empty() => *value = DEFAULT_TERM.to_string(),
+        Some(_) => {}
+        None => env.push(("TERM".to_string(), DEFAULT_TERM.to_string())),
+    }
 }
 
 /// Resolve a wire terminal id (`pty-{n}`) to a [`PtyId`], or `NotFound`.
@@ -56,9 +69,10 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// without dropping them. When the `exposeGitCredentialToChildren` setting is
 /// on, the github.com-scoped daemon-backed credential-helper env pair is
 /// injected under the caller's overlay — caller-supplied keys
-/// always win (see [`git_credential_env`]). When `cwd` is omitted the PTY
-/// spawns in the workspace's worktree root (see [`default_cwd`]); an explicit
-/// `cwd` always wins.
+/// always win (see [`git_credential_env`]). A missing or empty `TERM` defaults
+/// to `xterm-256color`; an explicit non-empty value is preserved. When `cwd`
+/// is omitted the PTY spawns in the workspace's worktree root (see
+/// [`default_cwd`]); an explicit `cwd` always wins.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
@@ -83,6 +97,7 @@ pub(crate) async fn create(
     };
     let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
     spec.env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
+    ensure_terminal_term(&mut spec.env);
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -522,6 +537,7 @@ impl TerminalHost for PtyTerminalHost {
             let mut spec = SpawnSpec::new(params.session_id, params.command);
             spec.args = params.args;
             spec.env = overlay_credential_env(credential, params.env);
+            ensure_terminal_term(&mut spec.env);
             spec.cwd = params.cwd;
             if let Some(limit) = params
                 .output_byte_limit
@@ -741,6 +757,30 @@ mod tests {
     #[test]
     fn default_shell_is_nonempty() {
         assert!(!default_shell().is_empty());
+    }
+
+    #[test]
+    fn terminal_env_defaults_missing_or_empty_term() {
+        let mut missing = Vec::new();
+        ensure_terminal_term(&mut missing);
+        assert_eq!(
+            missing,
+            vec![("TERM".to_string(), DEFAULT_TERM.to_string())]
+        );
+
+        let mut empty = vec![("TERM".to_string(), String::new())];
+        ensure_terminal_term(&mut empty);
+        assert_eq!(empty, vec![("TERM".to_string(), DEFAULT_TERM.to_string())]);
+    }
+
+    #[test]
+    fn terminal_env_preserves_explicit_nonempty_term() {
+        let mut env = vec![("TERM".to_string(), "screen-256color".to_string())];
+        ensure_terminal_term(&mut env);
+        assert_eq!(
+            env,
+            vec![("TERM".to_string(), "screen-256color".to_string())]
+        );
     }
 
     #[test]
@@ -1211,9 +1251,8 @@ mod tests {
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         let zdotdir = tempfile::tempdir().expect("isolated zsh config dir");
         let env = std::collections::BTreeMap::from([
-            // Electron-launched daemons can inherit no terminal type. This is
-            // the production regression fixture: zsh then redraws DEL as a
-            // literal space instead of emitting cursor-left control bytes.
+            // Electron-launched daemons can inherit an empty terminal type.
+            // `create` must coerce it before zsh initializes ZLE.
             ("TERM".to_string(), "".to_string()),
             ("ZDOTDIR".to_string(), zdotdir.path().display().to_string()),
         ]);
