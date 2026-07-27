@@ -1655,7 +1655,7 @@ impl Services {
         agent_id: AgentId,
         model_id: String,
     ) -> Result<Value> {
-        let mut session = self.load_session_internal(&agent_id).await?;
+        let session = self.load_session_internal(&agent_id).await?;
         // Parse the compound prefix once: reject unknown providers before any
         // mutation (the same misroute vector as agent.create — persisting one
         // would make the next spawn silently fall back to the default binary,
@@ -1685,16 +1685,24 @@ impl Services {
             )?;
             None
         };
-        session.model = Some(model_id.clone());
-        if let Some(model_provider) = model_provider {
-            if session.provider.as_ref() != Some(&model_provider) {
-                session.provider = Some(model_provider);
-            }
-        }
-        session.updated_at = now_iso();
-        let workspace_id = session.workspace_id.clone();
+        // Reconcile the provider to the compound prefix (bare ids keep the
+        // session's provider). The write goes through the narrow
+        // `set_agent_session_model` — the ONE writer allowed to change
+        // `provider` after first real use — because a cross-provider switch
+        // after `acp_session_id` is persisted would otherwise trip
+        // `update_agent_session`'s immutability guard (monorepo#882); the
+        // next turn then respawns the new provider's binary, opens a fresh
+        // `session/new`, and replays history as `<supervisor>` XML.
+        let provider = model_provider.or(session.provider);
+        let workspace_id = session.workspace_id;
         self.store
-            .update_agent_session(&workspace_id, &session)
+            .set_agent_session_model(
+                &workspace_id,
+                &agent_id,
+                &model_id,
+                provider.as_deref(),
+                &now_iso(),
+            )
             .await?;
         // The stored model changed, so any persisted display resolution (D14)
         // now names the wrong model — clear it; the next session open
