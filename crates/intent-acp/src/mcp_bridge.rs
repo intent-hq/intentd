@@ -3,22 +3,53 @@
 //!
 //! [`serve_workspace_mcp_tcp`] binds a loopback TCP listener and serves a
 //! [`WorkspaceMcpServer`] over newline-delimited JSON-RPC (one
-//! [`WorkspaceMcpServer::handle_message`] per request line). The generated
+//! [`WorkspaceMcpServer::handle_message`] per request line, dispatched
+//! concurrently per connection so a long call never blocks the requests
+//! behind it). The generated
 //! `--mcp-config` points a provider's MCP client at the `intentd mcp-bridge`
 //! subcommand, whose body is [`run_stdio_bridge`]: a stdio↔TCP proxy that
 //! forwards the child's MCP frames to this listener. This is the Rust analog of
 //! the TS `http-mcp-bridge` + `mcp-stdio-server` proxy pair — a real transport,
 //! not an in-process `handle_message` shortcut.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::mcp_server::WorkspaceMcpServer;
+
+/// Per-connection cap on concurrently dispatched requests. Small on purpose:
+/// enough that a long `tools/call` never blocks a liveness ping behind it
+/// (monorepo#871), bounded so a misbehaving client cannot spawn unboundedly.
+const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+
+/// Capacity of the per-connection response channel feeding the writer task.
+const RESPONSE_CHANNEL_CAPACITY: usize = 32;
+
+/// Dispatch seam for the bridge listener: production is [`WorkspaceMcpServer`];
+/// tests inject controllable handlers to exercise concurrency semantics.
+pub(crate) trait BridgeDispatch: Send + Sync + 'static {
+    fn dispatch(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>>;
+}
+
+impl BridgeDispatch for WorkspaceMcpServer {
+    fn dispatch(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>> {
+        Box::pin(async move { self.handle_message(&message).await })
+    }
+}
 
 /// A running per-agent MCP TCP endpoint. Dropping the handle aborts the accept
 /// loop, so the listener is torn down with the agent that owns it.
@@ -58,6 +89,12 @@ impl Drop for McpBridge {
 pub async fn serve_workspace_mcp_tcp(
     server: Arc<WorkspaceMcpServer>,
 ) -> std::io::Result<McpBridge> {
+    serve_mcp_tcp(server).await
+}
+
+/// Generic body of [`serve_workspace_mcp_tcp`], parameterized over the dispatch
+/// seam so tests can serve a mock handler over a real loopback socket.
+pub(crate) async fn serve_mcp_tcp<S: BridgeDispatch>(server: Arc<S>) -> std::io::Result<McpBridge> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {
@@ -81,27 +118,67 @@ pub async fn serve_workspace_mcp_tcp(
     Ok(McpBridge { addr, task })
 }
 
-/// Serve one accepted MCP connection: read request lines, dispatch through the
-/// shared server, and write each response back as a single line.
-async fn serve_connection(
-    server: Arc<WorkspaceMcpServer>,
+/// Serve one accepted MCP connection: read request lines and dispatch each one
+/// on its own task so a long `tools/call` never head-of-line blocks a liveness
+/// ping behind it (monorepo#871). Responses are funneled through an mpsc
+/// channel to a single writer task, so lines are written whole and never
+/// interleave; completion order may differ from request order, which is valid
+/// id-correlated JSON-RPC. Notifications (no `id`) still produce no response
+/// and malformed lines are still skipped. When the connection tears down, all
+/// in-flight request tasks are aborted.
+async fn serve_connection<S: BridgeDispatch>(
+    server: Arc<S>,
     stream: TcpStream,
 ) -> std::io::Result<()> {
     let (read, mut write) = stream.into_split();
+    let (response_tx, mut response_rx) = mpsc::channel::<String>(RESPONSE_CHANNEL_CAPACITY);
+    let writer = tokio::spawn(async move {
+        while let Some(line) = response_rx.recv().await {
+            if write.write_all(line.as_bytes()).await.is_err() || write.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let limiter = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+    let mut in_flight = JoinSet::new();
     let mut lines = BufReader::new(read).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    let result = loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                // Reap finished request tasks so the set does not grow
+                // unboundedly over a long-lived connection.
+                while in_flight.try_join_next().is_some() {}
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let permit = limiter
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("bridge semaphore is never closed");
+                let server = server.clone();
+                let response_tx = response_tx.clone();
+                in_flight.spawn(async move {
+                    let _permit = permit;
+                    if let Some(response) = server.dispatch(message).await {
+                        let _ = response_tx.send(format!("{response}\n")).await;
+                    }
+                });
+            }
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
         }
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if let Some(response) = server.handle_message(&message).await {
-            write.write_all(format!("{response}\n").as_bytes()).await?;
-            write.flush().await?;
-        }
-    }
-    Ok(())
+    };
+    // Connection teardown: abort in-flight request tasks, then let the writer
+    // drain and exit once every sender is gone.
+    in_flight.shutdown().await;
+    drop(response_tx);
+    let _ = writer.await;
+    result
 }
 
 /// Body of the `intentd mcp-bridge --connect <addr>` subcommand: connect to a
