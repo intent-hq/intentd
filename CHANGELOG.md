@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.8] - 2026-07-27
+
+### 🚀 Features
+
+- Structured error.data for unresolvable base ref (monorepo#761) ([#525](https://github.com/intent-hq/intentd/pull/525))
+- Local wall-clock bucketing for usage stats (D12) ([#544](https://github.com/intent-hq/intentd/pull/544))
+- System.capabilities RPC exposing machine-level cowSupported (protocol 2.3) ([#549](https://github.com/intent-hq/intentd/pull/549))
+- Github.repoConfig.get RPC — fetch .intent/config.json remotely (protocol 2.4) ([#557](https://github.com/intent-hq/intentd/pull/557))
+- Ws.app.question.ask binding with AtTurnEnd question attachments (intent-hq/monorepo#732)
+- Inject stored GitHub token into clones and classify auth failures (monorepo#825)
+- Circuit breaker for provider-blocked (poisoned) agent sessions (monorepo#840)
+- Skip daemon-managed manifests in legacy import ([#579](https://github.com/intent-hq/intentd/pull/579))
+- Migrate parked queues and GC poisoned sessions in agent.wakeOrCreate (monorepo#847) ([#585](https://github.com/intent-hq/intentd/pull/585))
+- Stream harness-wake session/updates as implicit agent-initiated turns ([#587](https://github.com/intent-hq/intentd/pull/587))
+
+### 🐛 Bug Fixes
+
+- Include archived workspaces in the workspace.subscribe snapshot
+- Detect dead ACP child processes and recover transparently ([#764](https://github.com/intent-hq/intentd/pull/764)) ([#523](https://github.com/intent-hq/intentd/pull/523))
+- Rename skipWorktree -> skipIsolation in workspace.update params ([#533](https://github.com/intent-hq/intentd/pull/533))
+- CowSupported probe default-root fallback + CoW-to-worktree creation fallback ([#540](https://github.com/intent-hq/intentd/pull/540))
+- Scrub phantom anchor markers and support overlapping comment ranges ([#541](https://github.com/intent-hq/intentd/pull/541))
+- Emit completionReport alongside report on wake/idle payloads ([#548](https://github.com/intent-hq/intentd/pull/548))
+- Keep tool title/name/input across sparse tool_call_update events ([#551](https://github.com/intent-hq/intentd/pull/551))
+- Expand leading ~ in workspace.create and git.clone paths ([#554](https://github.com/intent-hq/intentd/pull/554))
+- Classify workspace.create clone failures into typed errors with sanitized detail (monorepo#826)
+- Emit trailing AtTurnEnd attachment blocks on agent:stream:end (intent-hq/monorepo#732)
+- Make CoW cloning best-effort and handle git-worktree edge cases ([#574](https://github.com/intent-hq/intentd/pull/574))
+
+
 ## [0.2.7] - 2026-07-25
 
 ### 🚀 Features
