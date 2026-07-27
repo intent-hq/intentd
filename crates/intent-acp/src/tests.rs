@@ -3642,6 +3642,265 @@ mod mcp_bridge_tests {
             }
         }
     }
+
+    /// Stdio-bridge resilience (monorepo#871): initial-connect retry,
+    /// mid-session reconnect, and synthesized retryable errors while
+    /// disconnected. `run_bridge` is driven with in-memory duplex streams in
+    /// place of stdin/stdout and shrunk retry knobs so tests stay fast.
+    mod stdio_bridge_resilience {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        use serde_json::{json, Value};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::task::JoinHandle;
+        use tokio::time::{sleep, timeout};
+
+        use crate::mcp_bridge::{
+            run_bridge, BridgeRetryConfig, BRIDGE_DISCONNECTED_CODE, BRIDGE_DISCONNECTED_MESSAGE,
+        };
+
+        fn fast_cfg() -> BridgeRetryConfig {
+            BridgeRetryConfig {
+                initial_attempts: 50,
+                reconnect_window: Duration::from_secs(2),
+                backoff_start: Duration::from_millis(10),
+                backoff_cap: Duration::from_millis(20),
+            }
+        }
+
+        struct BridgeHarness {
+            stdin: DuplexStream,
+            stdout: BufReader<DuplexStream>,
+            handle: JoinHandle<std::io::Result<()>>,
+        }
+
+        fn spawn_bridge(addr: SocketAddr, cfg: BridgeRetryConfig) -> BridgeHarness {
+            let (stdin, stdin_remote) = tokio::io::duplex(64 * 1024);
+            let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
+            let handle = tokio::spawn(async move {
+                run_bridge(&addr.to_string(), stdin_remote, stdout_remote, cfg).await
+            });
+            BridgeHarness {
+                stdin,
+                stdout: BufReader::new(stdout),
+                handle,
+            }
+        }
+
+        impl BridgeHarness {
+            async fn send_request(&mut self, id: i64) {
+                let line = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\"}}\n");
+                self.stdin.write_all(line.as_bytes()).await.unwrap();
+                self.stdin.flush().await.unwrap();
+            }
+
+            async fn read_response(&mut self) -> Value {
+                let mut line = String::new();
+                timeout(Duration::from_secs(5), self.stdout.read_line(&mut line))
+                    .await
+                    .expect("bridge stdout read timed out")
+                    .expect("bridge stdout read failed");
+                serde_json::from_str(line.trim()).expect("bridge stdout line is JSON")
+            }
+        }
+
+        fn assert_disconnected_error(resp: &Value, id: i64) {
+            assert_eq!(resp["id"], json!(id));
+            assert_eq!(resp["error"]["code"], json!(BRIDGE_DISCONNECTED_CODE));
+            assert_eq!(resp["error"]["message"], json!(BRIDGE_DISCONNECTED_MESSAGE));
+            assert_eq!(resp["error"]["data"]["retryable"], json!(true));
+        }
+
+        /// Answer every request line on `stream` with `{"ok":true}`.
+        async fn answer_requests(stream: TcpStream) {
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
+                let out = format!("{resp}\n");
+                if write.write_all(out.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        /// Bind a listener on an ephemeral port, then free the port so nothing
+        /// is listening at that address (yet).
+        async fn reserve_free_addr() -> SocketAddr {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = probe.local_addr().unwrap();
+            drop(probe);
+            addr
+        }
+
+        #[tokio::test]
+        async fn initial_connect_retries_until_listener_appears() {
+            let addr = reserve_free_addr().await;
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+            // Bind only after the bridge has started (and failed) connecting.
+            sleep(Duration::from_millis(50)).await;
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("bridge never retried the connect")
+                .unwrap();
+            tokio::spawn(answer_requests(conn));
+
+            bridge.send_request(1).await;
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(1));
+            assert_eq!(resp["result"]["ok"], json!(true));
+        }
+
+        #[tokio::test]
+        async fn initial_connect_gives_up_and_rejects_requests_meanwhile() {
+            let addr = reserve_free_addr().await;
+            let cfg = BridgeRetryConfig {
+                initial_attempts: 30,
+                ..fast_cfg()
+            };
+            let mut bridge = spawn_bridge(addr, cfg);
+            // Sent while the bridge is still retrying: answered with the
+            // retryable error rather than dropped.
+            bridge.send_request(7).await;
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 7);
+            // The bounded retry then gives up with the connect error.
+            let result = timeout(Duration::from_secs(5), bridge.handle)
+                .await
+                .expect("bridge did not give up in time")
+                .unwrap();
+            assert!(
+                result.is_err(),
+                "initial-connect give-up must surface an error"
+            );
+        }
+
+        #[tokio::test]
+        async fn reconnects_after_mid_session_drop() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+
+            // First connection answers one request, then the server drops it.
+            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (read1, mut write1) = conn1.into_split();
+            bridge.send_request(1).await;
+            let mut lines1 = BufReader::new(read1).lines();
+            let line = timeout(Duration::from_secs(5), lines1.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
+            write1
+                .write_all(format!("{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(1));
+            drop(write1);
+            drop(lines1);
+
+            // The bridge reconnects to the same addr; the second connection
+            // serves the follow-up request and stdio never closed in between.
+            let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("bridge never reconnected")
+                .unwrap();
+            tokio::spawn(answer_requests(conn2));
+            bridge.send_request(2).await;
+            let resp = bridge.read_response().await;
+            assert_eq!(resp["id"], json!(2));
+            assert_eq!(resp["result"]["ok"], json!(true));
+        }
+
+        #[tokio::test]
+        async fn in_flight_ids_get_retryable_error_when_connection_drops() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut bridge = spawn_bridge(addr, fast_cfg());
+
+            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (read1, write1) = conn1.into_split();
+            // Forwarded but never answered: the server reads the request and
+            // then drops the connection.
+            bridge.send_request(9).await;
+            let mut lines1 = BufReader::new(read1).lines();
+            timeout(Duration::from_secs(5), lines1.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            drop(write1);
+            drop(lines1);
+
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 9);
+        }
+
+        #[tokio::test]
+        async fn gap_requests_error_and_bridge_exits_cleanly_after_window() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cfg = BridgeRetryConfig {
+                reconnect_window: Duration::from_millis(300),
+                ..fast_cfg()
+            };
+            let mut bridge = spawn_bridge(addr, cfg);
+
+            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            // Kill the connection and the listener: the daemon is gone for good.
+            drop(conn1);
+            drop(listener);
+
+            // A request during the reconnect gap gets the retryable error.
+            bridge.send_request(2).await;
+            let resp = bridge.read_response().await;
+            assert_disconnected_error(&resp, 2);
+
+            // Once the reconnect window is exhausted the bridge exits cleanly.
+            let result = timeout(Duration::from_secs(5), bridge.handle)
+                .await
+                .expect("bridge did not exit after reconnect window")
+                .unwrap();
+            assert!(
+                result.is_ok(),
+                "reconnect give-up must exit cleanly: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn stdin_eof_ends_bridge_cleanly() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let bridge = spawn_bridge(addr, fast_cfg());
+            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::spawn(answer_requests(conn));
+            drop(bridge.stdin);
+            let result = timeout(Duration::from_secs(5), bridge.handle)
+                .await
+                .expect("bridge did not exit on stdin EOF")
+                .unwrap();
+            assert!(result.is_ok(), "stdin EOF must exit cleanly: {result:?}");
+        }
+    }
 }
 
 // Discrete workspace-metadata tool tests removed in WSAPI-8: the daemon no

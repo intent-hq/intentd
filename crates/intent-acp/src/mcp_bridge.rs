@@ -12,16 +12,19 @@
 //! the TS `http-mcp-bridge` + `mcp-stdio-server` proxy pair — a real transport,
 //! not an in-process `handle_message` shortcut.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 use crate::mcp_server::WorkspaceMcpServer;
 
@@ -181,36 +184,267 @@ async fn serve_connection<S: BridgeDispatch>(
     result
 }
 
+/// JSON-RPC error code (implementation-defined `-32000`-range server error)
+/// synthesized by the bridge for requests it cannot deliver while the TCP side
+/// is disconnected. The message marks it clearly transient so a provider's MCP
+/// client can retry instead of treating the tool as broken.
+pub(crate) const BRIDGE_DISCONNECTED_CODE: i64 = -32001;
+
+/// Human-readable companion to [`BRIDGE_DISCONNECTED_CODE`].
+pub(crate) const BRIDGE_DISCONNECTED_MESSAGE: &str =
+    "workspace-mcp bridge temporarily disconnected; retry";
+
+/// Retry/backoff knobs for [`run_stdio_bridge`]. Defaults give the initial
+/// connect ~10 attempts over ~5s and mid-session reconnects a ~30s total
+/// window; tests shrink these to keep runs fast.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BridgeRetryConfig {
+    /// Max attempts for the initial connect before giving up with an error.
+    pub initial_attempts: u32,
+    /// Total time budget for mid-session reconnects. A restarted daemon binds
+    /// a new (unknowable) port, so past this window the bridge exits cleanly.
+    pub reconnect_window: Duration,
+    /// First backoff delay; doubled after each failed attempt.
+    pub backoff_start: Duration,
+    /// Upper bound on the (doubling) backoff delay.
+    pub backoff_cap: Duration,
+}
+
+impl Default for BridgeRetryConfig {
+    fn default() -> Self {
+        Self {
+            initial_attempts: 10,
+            reconnect_window: Duration::from_secs(30),
+            backoff_start: Duration::from_millis(50),
+            backoff_cap: Duration::from_secs(1),
+        }
+    }
+}
+
+/// How one connected pump session ended.
+enum SessionEnd {
+    /// The stdio side reached EOF: the provider is gone, exit cleanly.
+    StdinEof,
+    /// The TCP side dropped: attempt a reconnect.
+    TcpDropped,
+}
+
 /// Body of the `intentd mcp-bridge --connect <addr>` subcommand: connect to a
 /// per-agent listener (see [`serve_workspace_mcp_tcp`]) and pump stdin lines to
 /// the socket and socket lines to stdout, giving a spawned provider a real stdio
 /// MCP server that proxies to the in-process workspace tools.
+///
+/// Resilience (monorepo#871): the initial connect is retried with bounded
+/// backoff, and a mid-session TCP drop keeps the stdio side alive while the
+/// bridge reconnects to the same address. While disconnected, each stdin
+/// request that carries an `id` is answered with a retryable JSON-RPC error
+/// ([`BRIDGE_DISCONNECTED_CODE`]) instead of being dropped, and requests that
+/// were in flight when the connection died get the same synthesized error so
+/// the provider's MCP client never has to time out.
 pub async fn run_stdio_bridge(addr: &str) -> std::io::Result<()> {
-    let stream = TcpStream::connect(addr).await?;
-    let (tcp_read, mut tcp_write) = stream.into_split();
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    run_bridge(
+        addr,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        BridgeRetryConfig::default(),
+    )
+    .await
+}
 
-    // stdin → socket
-    let up = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdin).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if tcp_write.write_all(line.as_bytes()).await.is_err()
-                || tcp_write.write_all(b"\n").await.is_err()
-                || tcp_write.flush().await.is_err()
-            {
-                break;
+/// Generic body of [`run_stdio_bridge`], parameterized over the stdio pair so
+/// tests can drive the bridge with in-memory duplex streams.
+pub(crate) async fn run_bridge<R, W>(
+    addr: &str,
+    input: R,
+    mut output: W,
+    cfg: BridgeRetryConfig,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut input = BufReader::new(input).lines();
+    let mut initial = true;
+    loop {
+        let stream = match connect_with_retry(addr, cfg, initial, &mut input, &mut output).await? {
+            Some(stream) => stream,
+            None => return Ok(()),
+        };
+        initial = false;
+        match pump_session(stream, &mut input, &mut output).await? {
+            SessionEnd::StdinEof => return Ok(()),
+            SessionEnd::TcpDropped => {
+                tracing::warn!(%addr, "mcp bridge connection dropped; reconnecting");
             }
         }
-    });
-
-    // socket → stdout
-    let mut tcp_lines = BufReader::new(tcp_read).lines();
-    while let Some(line) = tcp_lines.next_line().await? {
-        stdout.write_all(line.as_bytes()).await?;
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
     }
-    up.abort();
-    Ok(())
+}
+
+/// Connect to `addr` with bounded backoff. While waiting between attempts,
+/// keep servicing stdin: requests with an `id` are answered with the retryable
+/// disconnected error, notifications are dropped.
+///
+/// Returns `Ok(Some(stream))` on success. On give-up, the initial connect
+/// surfaces the last error (the daemon was never reachable), while a reconnect
+/// returns `Ok(None)` so the bridge exits cleanly — a restarted daemon listens
+/// on a new port this bridge can never learn. `Ok(None)` is also returned when
+/// stdin reaches EOF while disconnected.
+async fn connect_with_retry<R, W>(
+    addr: &str,
+    cfg: BridgeRetryConfig,
+    initial: bool,
+    input: &mut Lines<BufReader<R>>,
+    output: &mut W,
+) -> std::io::Result<Option<TcpStream>>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let deadline = Instant::now() + cfg.reconnect_window;
+    let mut delay = cfg.backoff_start;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(Some(stream)),
+            Err(e) => {
+                if initial {
+                    if attempts >= cfg.initial_attempts {
+                        tracing::warn!(%addr, error = %e, attempts, "mcp bridge initial connect failed; giving up");
+                        return Err(e);
+                    }
+                } else if Instant::now() >= deadline {
+                    tracing::warn!(%addr, error = %e, "mcp bridge reconnect window exhausted; exiting");
+                    return Ok(None);
+                }
+                tracing::debug!(%addr, error = %e, attempts, "mcp bridge connect failed; backing off");
+            }
+        }
+        // Back off before the next attempt, servicing stdin in the meantime so
+        // disconnected-period requests get an immediate retryable error.
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                line = input.next_line() => match line? {
+                    Some(line) => reject_if_request(&line, output).await?,
+                    None => return Ok(None),
+                },
+            }
+        }
+        delay = (delay * 2).min(cfg.backoff_cap);
+    }
+}
+
+/// Pump one connected session: stdin lines → socket, socket lines → stdout.
+/// Tracks the `id` of every forwarded request until its response comes back;
+/// when the TCP side drops, every still-pending id gets the synthesized
+/// retryable error so the provider client is never left waiting.
+async fn pump_session<R, W>(
+    stream: TcpStream,
+    input: &mut Lines<BufReader<R>>,
+    output: &mut W,
+) -> std::io::Result<SessionEnd>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (tcp_read, mut tcp_write) = stream.into_split();
+    let mut tcp_lines = BufReader::new(tcp_read).lines();
+    // Requests forwarded but not yet answered, keyed by the id's canonical
+    // JSON so numeric and string ids never collide.
+    let mut pending: HashMap<String, Value> = HashMap::new();
+    let end = loop {
+        tokio::select! {
+            line = input.next_line() => match line? {
+                Some(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(id) = request_id(&line) {
+                        pending.insert(id.to_string(), id);
+                    }
+                    if write_line(&mut tcp_write, &line).await.is_err() {
+                        break SessionEnd::TcpDropped;
+                    }
+                }
+                None => break SessionEnd::StdinEof,
+            },
+            line = tcp_lines.next_line() => match line {
+                Ok(Some(line)) => {
+                    if let Some(id) = response_id(&line) {
+                        pending.remove(&id.to_string());
+                    }
+                    write_line(output, &line).await?;
+                }
+                Ok(None) | Err(_) => break SessionEnd::TcpDropped,
+            },
+        }
+    };
+    if matches!(end, SessionEnd::TcpDropped) {
+        for id in pending.into_values() {
+            write_disconnected_error(output, &id).await?;
+        }
+    }
+    Ok(end)
+}
+
+/// The `id` of a stdin line that is a JSON-RPC *request* (has `method` + `id`).
+/// Notifications, client→server responses, and malformed lines yield `None`.
+fn request_id(line: &str) -> Option<Value> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    if msg.get("method").is_some() {
+        msg.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+/// The `id` of a socket line that is a JSON-RPC *response* (has `id`, no
+/// `method`). Server-initiated requests and malformed lines yield `None`.
+fn response_id(line: &str) -> Option<Value> {
+    let msg: Value = serde_json::from_str(line).ok()?;
+    if msg.get("method").is_none() {
+        msg.get("id").cloned()
+    } else {
+        None
+    }
+}
+
+/// If `line` is a request with an id, answer it on `output` with the retryable
+/// disconnected error; anything else (notification, response, malformed) is
+/// dropped, matching connected-path semantics for unanswerable input.
+async fn reject_if_request<W: AsyncWrite + Unpin>(
+    line: &str,
+    output: &mut W,
+) -> std::io::Result<()> {
+    match request_id(line) {
+        Some(id) => write_disconnected_error(output, &id).await,
+        None => Ok(()),
+    }
+}
+
+/// Write the synthesized retryable JSON-RPC error for `id` to `output`.
+async fn write_disconnected_error<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    id: &Value,
+) -> std::io::Result<()> {
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": BRIDGE_DISCONNECTED_CODE,
+            "message": BRIDGE_DISCONNECTED_MESSAGE,
+            "data": { "retryable": true },
+        },
+    });
+    write_line(output, &response.to_string()).await
+}
+
+/// Write one newline-terminated line and flush.
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> std::io::Result<()> {
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await
 }
