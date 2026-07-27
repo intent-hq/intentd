@@ -523,6 +523,75 @@ async fn wake_or_create_widened_wire_contract_over_wss() {
     assert_eq!(got["agent"]["id"], new_agent_id);
 }
 
+/// monorepo#926: the create branch auto-subscribes the caller. A
+/// `agent.wakeOrCreate` with `callerAgentId` on a task with no live assignee
+/// (`action: created_new`) must return `subscriptionId` + the notification
+/// message line, and `agent.getSubscriptions` for the caller must list the
+/// oneShot watch on the created agent immediately — SUB-1 parity with the
+/// wake/queued branches. Hermetic (no ACP provider needed).
+#[tokio::test]
+async fn wake_or_create_created_new_subscribes_caller_over_wss() {
+    let (_daemon, ws_id, task_note_id, port, fp) = boot_daemon_with_task("WOC 926 Task").await;
+    let cfg = client_config(&fp);
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+
+    // The waking caller (coordinator) lives in the same workspace.
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Coordinator" }),
+    )
+    .await;
+    let caller_id = created["agent"]["id"]
+        .as_str()
+        .expect("caller id")
+        .to_string();
+
+    let res = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.wakeOrCreate",
+        json!({
+            "workspaceId": ws_id,
+            "taskNoteId": task_note_id,
+            "contextMessage": "kickoff",
+            "callerAgentId": caller_id,
+        }),
+    )
+    .await;
+    assert_eq!(res["ok"], true);
+    assert_eq!(res["created"], true);
+    assert_eq!(res["action"], "created_new");
+    let child_id = res["agentId"].as_str().expect("agentId").to_string();
+    let sub_id = res["subscriptionId"]
+        .as_str()
+        .expect("created_new must carry subscriptionId (monorepo#926)")
+        .to_string();
+    let message = res["message"].as_str().expect("message");
+    assert!(
+        message.contains("You will be notified when the agent responds."),
+        "notification text parity with the wake branches: {message}"
+    );
+
+    // The caller's watch is visible immediately via `agent.getSubscriptions`.
+    let subs_res = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": ws_id, "agentId": caller_id }),
+    )
+    .await;
+    let subs = subs_res["subscriptions"]
+        .as_array()
+        .expect("subscriptions array");
+    assert_eq!(subs.len(), 1, "one oneShot watch: {subs:?}");
+    assert_eq!(subs[0]["id"], json!(sub_id));
+    assert_eq!(subs[0]["oneShot"], json!(true));
+    assert_eq!(subs[0]["actorIds"], json!([child_id]));
+    assert_eq!(subs[0]["workspaceId"], json!(ws_id));
+}
+
 /// TASK-C2 (follow-up to #104): `agent.delegate` with `taskNoteId` APPENDS
 /// the reference `DelegateTaskTool` "Your Task Note" preamble after the
 /// delegated child's FIRST message with a `---` separator, so the child sees

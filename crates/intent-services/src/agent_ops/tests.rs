@@ -5873,6 +5873,53 @@ async fn wake_or_create_woke_existing_subscribes_caller() {
     assert_eq!(watches[0].child_agent_id, target);
 }
 
+/// monorepo#926: the created_new branch must ALSO auto-subscribe the caller
+/// to the created agent's completion (SUB-1 parity with the wake branches).
+/// The caller gets a oneShot watch on the freshly created agent, the response
+/// carries `subscriptionId` + the notification line, and the child's terminal
+/// `agent:idle` delivers exactly one wake to the caller.
+#[tokio::test]
+async fn wake_or_create_created_new_subscribes_caller() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let note_id = seed_task(&svc, &ws, "SUB-1 create").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+    let sub_id = resp["subscriptionId"].as_str().expect("subscriptionId");
+    let message = resp["message"].as_str().expect("message");
+    assert!(
+        message.contains("You will be notified when the agent responds."),
+        "notification text parity: {message}"
+    );
+
+    let watches = svc.list_watches_for_parent(&caller);
+    assert_eq!(watches.len(), 1, "one fresh watch: {watches:?}");
+    assert_eq!(watches[0].id, sub_id);
+    assert!(watches[0].one_shot);
+    assert!(watches[0].group_id.is_none());
+    assert_eq!(watches[0].child_agent_id, created);
+
+    // The created agent's terminal agent:idle delivers exactly one wake.
+    let baseline = parent_message_count(&svc, &caller).await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &created,
+        json!({ "agentId": created.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
+}
+
 /// The caller-less (FE/RPC) wake registers nothing and the response stays in
 /// the pre-SUB-1 shape (no `subscriptionId` / `message` keys).
 #[tokio::test]

@@ -4731,15 +4731,52 @@ impl Services {
                 input.message_metadata.as_ref(),
             )
             .await?;
-        Ok(build_wake_response(
-            agent,
+        let mut response = build_wake_response(
+            agent.clone(),
             agent_name,
             true,
             "created_new",
-            task_title,
+            task_title.clone(),
             result,
             cleaned_up,
-        ))
+        );
+        // SUB-1 parity (monorepo#926): auto-subscribe the waking caller to the
+        // created agent's completion, mirroring the woke-existing branch. The
+        // child id was freshly minted this call, so no live watch can exist
+        // for the pair — always a fresh oneShot registration (no SUB-2 reuse
+        // and no queued leak-guard: a brand-new agent has no in-flight turn
+        // for the context message to queue behind).
+        if let Some(caller) = input.caller_agent_id.clone() {
+            let caller_session = self.store.get_agent_session(&caller).await.ok();
+            let caller_name = caller_session
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
+            // The watch is anchored in the caller's HOME workspace (falls
+            // back to the call's workspace when the session lookup fails)
+            // so a chief caller's wake lands in `__chief__`.
+            let caller_home_ws = caller_session
+                .map(|s| s.workspace_id)
+                .unwrap_or_else(|| workspace_id.clone());
+            let subscription_id = self.register_completion_watch(
+                &caller_home_ws,
+                &workspace_id,
+                caller.clone(),
+                caller_name,
+                agent.clone(),
+                true,
+                None,
+            )?;
+            self.publish_subscriptions_changed(&caller_home_ws, &caller)
+                .await;
+            response["subscriptionId"] = json!(subscription_id);
+            response["message"] = json!(format!(
+                "Created new agent \"{}\" for task \"{task_title}\".\n\
+                 Context message delivered.\nYou will be notified when the agent responds.",
+                agent.0
+            ));
+        }
+        Ok(response)
     }
 
     /// Resolve the effective **parent** delegation depth for the
