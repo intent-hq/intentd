@@ -48,12 +48,15 @@ fn default_shell() -> String {
 }
 
 /// Ensure the effective terminal environment has a usable terminal type while
-/// preserving an explicit non-empty caller override.
-fn ensure_terminal_term(env: &mut Vec<(String, String)>) {
+/// preserving explicit or inherited non-empty values.
+fn ensure_terminal_term(env: &mut Vec<(String, String)>, inherited_term: Option<&str>) {
     match env.iter_mut().rev().find(|(name, _)| name == "TERM") {
         Some((_, value)) if value.is_empty() => *value = DEFAULT_TERM.to_string(),
         Some(_) => {}
-        None => env.push(("TERM".to_string(), DEFAULT_TERM.to_string())),
+        None if inherited_term.is_none_or(str::is_empty) => {
+            env.push(("TERM".to_string(), DEFAULT_TERM.to_string()));
+        }
+        None => {}
     }
 }
 
@@ -69,10 +72,10 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// without dropping them. When the `exposeGitCredentialToChildren` setting is
 /// on, the github.com-scoped daemon-backed credential-helper env pair is
 /// injected under the caller's overlay — caller-supplied keys
-/// always win (see [`git_credential_env`]). A missing or empty `TERM` defaults
-/// to `xterm-256color`; an explicit non-empty value is preserved. When `cwd`
-/// is omitted the PTY spawns in the workspace's worktree root (see
-/// [`default_cwd`]); an explicit `cwd` always wins.
+/// always win (see [`git_credential_env`]). An absent caller `TERM` preserves
+/// non-empty daemon inheritance; otherwise a missing or empty effective value
+/// defaults to `xterm-256color`. When `cwd` is omitted the PTY spawns in the
+/// workspace's worktree root (see [`default_cwd`]); an explicit `cwd` wins.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create(
     pty: Arc<PtyHost>,
@@ -97,7 +100,8 @@ pub(crate) async fn create(
     };
     let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
     spec.env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
-    ensure_terminal_term(&mut spec.env);
+    let inherited_term = std::env::var("TERM").ok();
+    ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -537,7 +541,8 @@ impl TerminalHost for PtyTerminalHost {
             let mut spec = SpawnSpec::new(params.session_id, params.command);
             spec.args = params.args;
             spec.env = overlay_credential_env(credential, params.env);
-            ensure_terminal_term(&mut spec.env);
+            let inherited_term = std::env::var("TERM").ok();
+            ensure_terminal_term(&mut spec.env, inherited_term.as_deref());
             spec.cwd = params.cwd;
             if let Some(limit) = params
                 .output_byte_limit
@@ -665,6 +670,47 @@ mod tests {
         Arc::new(PtyHost::new())
     }
 
+    /// Reap a test PTY even when an assertion unwinds before async cleanup.
+    #[cfg(target_os = "macos")]
+    struct PtyKillGuard {
+        pty: Arc<PtyHost>,
+        id: Option<PtyId>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PtyKillGuard {
+        fn new(pty: Arc<PtyHost>, id: PtyId) -> Self {
+            Self { pty, id: Some(id) }
+        }
+
+        fn disarm(&mut self) {
+            self.id = None;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for PtyKillGuard {
+        fn drop(&mut self) {
+            let Some(id) = self.id.take() else {
+                return;
+            };
+            let pty = self.pty.clone();
+            if let Ok(thread) = std::thread::Builder::new()
+                .name("pty-test-cleanup".to_string())
+                .spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                    {
+                        runtime.block_on(pty.kill(id));
+                    }
+                })
+            {
+                let _ = thread.join();
+            }
+        }
+    }
+
     fn ws(id: &str) -> WorkspaceId {
         WorkspaceId::from(id)
     }
@@ -762,25 +808,36 @@ mod tests {
     #[test]
     fn terminal_env_defaults_missing_or_empty_term() {
         let mut missing = Vec::new();
-        ensure_terminal_term(&mut missing);
+        ensure_terminal_term(&mut missing, None);
         assert_eq!(
             missing,
             vec![("TERM".to_string(), DEFAULT_TERM.to_string())]
         );
 
+        let mut inherited_empty = Vec::new();
+        ensure_terminal_term(&mut inherited_empty, Some(""));
+        assert_eq!(
+            inherited_empty,
+            vec![("TERM".to_string(), DEFAULT_TERM.to_string())]
+        );
+
         let mut empty = vec![("TERM".to_string(), String::new())];
-        ensure_terminal_term(&mut empty);
+        ensure_terminal_term(&mut empty, Some("screen-256color"));
         assert_eq!(empty, vec![("TERM".to_string(), DEFAULT_TERM.to_string())]);
     }
 
     #[test]
-    fn terminal_env_preserves_explicit_nonempty_term() {
+    fn terminal_env_preserves_explicit_or_inherited_nonempty_term() {
         let mut env = vec![("TERM".to_string(), "screen-256color".to_string())];
-        ensure_terminal_term(&mut env);
+        ensure_terminal_term(&mut env, None);
         assert_eq!(
             env,
             vec![("TERM".to_string(), "screen-256color".to_string())]
         );
+
+        let mut inherited = Vec::new();
+        ensure_terminal_term(&mut inherited, Some("tmux-256color"));
+        assert!(inherited.is_empty());
     }
 
     #[test]
@@ -1260,6 +1317,7 @@ mod tests {
             pty.clone(),
             Some(bus),
             None,
+            None,
             ws("ws-erase"),
             80,
             24,
@@ -1270,6 +1328,7 @@ mod tests {
         .await
         .unwrap();
         let id = term_id(&res);
+        let mut kill_guard = PtyKillGuard::new(pty.clone(), resolve(&id).unwrap());
 
         let ready = collect_data_until(&mut sub, b"\x1b[?2004h", TIMEOUT).await;
         assert!(
@@ -1291,6 +1350,7 @@ mod tests {
         );
 
         kill(pty.as_ref(), &id).await.unwrap();
+        kill_guard.disarm();
     }
 
     #[tokio::test]
