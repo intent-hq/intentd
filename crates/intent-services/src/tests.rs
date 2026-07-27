@@ -140,6 +140,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     }
 }
@@ -11078,6 +11079,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11204,6 +11206,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11321,6 +11324,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11433,6 +11437,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11544,6 +11549,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -11660,6 +11666,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+            display_status: None,
             checkout_mode: None,
         };
 
@@ -12225,6 +12232,7 @@ mod known_repo {
             agent_summary: None,
             diff_summary: None,
             cow_supported: None,
+            display_status: None,
             checkout_mode: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
@@ -17320,5 +17328,195 @@ mod turn_token_usage {
             }
         }
         assert!(seen >= 1, "at least one tokenUsage-changed event fired");
+    }
+}
+
+/// Unit tests for the pure `compute_display_status` derivation ("current
+/// cycle" precedence): active/latest open PR → open tasks → merged PR →
+/// complete/not_started.
+mod display_status {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceTaskStats,
+    };
+
+    use crate::compute_display_status;
+
+    fn pr(status: PullRequestStatus, updated_at: &str) -> PullRequestInfo {
+        PullRequestInfo {
+            id: format!("pr-{updated_at}"),
+            number: 1,
+            url: "https://github.com/o/r/pull/1".to_string(),
+            title: "PR".to_string(),
+            status,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: updated_at.to_string(),
+            base_ref: None,
+            head_ref: None,
+            head_sha: None,
+            author: None,
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        }
+    }
+
+    fn stats(total: usize, completed: usize, in_progress: usize) -> WorkspaceTaskStats {
+        WorkspaceTaskStats {
+            total,
+            completed,
+            in_progress,
+        }
+    }
+
+    #[test]
+    fn no_prs_no_tasks_is_not_started() {
+        assert_eq!(
+            compute_display_status(None, &[], None),
+            WorkspaceDisplayStatus::NotStarted
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(0, 0, 0))),
+            WorkspaceDisplayStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn no_prs_uses_pure_task_logic() {
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 0, 0))),
+            WorkspaceDisplayStatus::NotStarted
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 0, 1))),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 1, 0))),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(None, &[], Some(&stats(3, 3, 0))),
+            WorkspaceDisplayStatus::Complete
+        );
+    }
+
+    #[test]
+    fn open_active_pr_mergeable_is_pr_ready() {
+        let mut open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        open.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&open), &[], Some(&stats(2, 0, 1))),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    #[test]
+    fn open_active_pr_not_mergeable_or_draft_is_pr_open() {
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(Some(&open), &[], None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut draft = pr(PullRequestStatus::Draft, "2026-01-02T00:00:00Z");
+        draft.mergeable = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&draft), &[], None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut flagged = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        flagged.mergeable = Some(true);
+        flagged.is_draft = Some(true);
+        assert_eq!(
+            compute_display_status(Some(&flagged), &[], None),
+            WorkspaceDisplayStatus::PrOpen
+        );
+    }
+
+    #[test]
+    fn merged_pr_never_masks_open_tasks() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(
+                Some(&merged),
+                std::slice::from_ref(&merged),
+                Some(&stats(3, 1, 1))
+            ),
+            WorkspaceDisplayStatus::InProgress
+        );
+        assert_eq!(
+            compute_display_status(
+                Some(&merged),
+                std::slice::from_ref(&merged),
+                Some(&stats(3, 0, 0))
+            ),
+            WorkspaceDisplayStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn merged_pr_never_masks_open_pr_in_list() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-03T00:00:00Z");
+        let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        let list = vec![merged.clone(), open.clone()];
+        assert_eq!(
+            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::PrOpen
+        );
+        let mut ready = open;
+        ready.mergeable = Some(true);
+        let list = vec![merged.clone(), ready];
+        assert_eq!(
+            compute_display_status(Some(&merged), &list, Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    #[test]
+    fn open_pr_fallback_picks_most_recently_updated() {
+        let stale = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        let mut fresh = pr(PullRequestStatus::Open, "2026-01-05T00:00:00Z");
+        fresh.mergeable = Some(true);
+        let list = vec![stale, fresh];
+        assert_eq!(
+            compute_display_status(None, &list, None),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    #[test]
+    fn merged_with_all_tasks_done_is_pr_merged() {
+        let merged = pr(PullRequestStatus::Merged, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(Some(&merged), &[], Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::PrMerged
+        );
+        assert_eq!(
+            compute_display_status(Some(&merged), &[], None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn merged_latest_from_list_without_active_pr() {
+        let closed = pr(PullRequestStatus::Closed, "2026-01-01T00:00:00Z");
+        let merged = pr(PullRequestStatus::Merged, "2026-01-04T00:00:00Z");
+        let list = vec![closed, merged];
+        assert_eq!(
+            compute_display_status(None, &list, None),
+            WorkspaceDisplayStatus::PrMerged
+        );
+    }
+
+    #[test]
+    fn closed_pr_falls_through_to_task_logic() {
+        let closed = pr(PullRequestStatus::Closed, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            compute_display_status(Some(&closed), &[], Some(&stats(2, 2, 0))),
+            WorkspaceDisplayStatus::Complete
+        );
+        assert_eq!(
+            compute_display_status(Some(&closed), &[], None),
+            WorkspaceDisplayStatus::NotStarted
+        );
     }
 }

@@ -33,14 +33,15 @@ use intent_core::{
     NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
     NoteId, NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow,
     NoteUpdateInput, NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary,
-    NoteVisibility, ProjectType, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
-    SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask,
-    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace,
-    WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    NoteVisibility, ProjectType, PullRequestInfo, PullRequestStatus, ReadAssetResult,
+    SaveAssetResult, ScriptCreateParams, SessionStats, SetupScript, TaskAgentLink,
+    TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceActivity,
+    WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceId,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_store::{EventQuery, NewEvent, Store};
 
@@ -915,6 +916,13 @@ impl Services {
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
+        // Derived "current cycle" display status over the active/latest PR and
+        // the taskStats computed above; never persisted.
+        ws.display_status = Some(compute_display_status(
+            ws.active_pull_request.as_ref(),
+            ws.pull_requests.as_deref().unwrap_or_default(),
+            ws.task_stats.as_ref(),
+        ));
     }
 
     /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
@@ -3627,6 +3635,68 @@ fn compute_task_stats(notes: &[Note]) -> WorkspaceTaskStats {
         }
     }
     stats
+}
+
+/// Derive a workspace's `displayStatus` ("current cycle" precedence, spec
+/// "Proposed representation" / "Decision: BE-owned displayStatus"):
+/// 1. Active PR — the linked `activePullRequest` when open/draft, else the
+///    most recently updated open/draft entry in `pullRequests` — yields
+///    `pr_ready` (`mergeable == Some(true)` and not draft) or `pr_open`.
+/// 2. Open tasks remain (`completed < total`) → `in_progress` when any task
+///    has started, else `not_started`.
+/// 3. Latest PR (linked, else most recently updated entry) merged →
+///    `pr_merged`.
+/// 4. All tasks complete → `complete`; else `not_started`.
+///
+/// A merged PR in history never masks an open PR (step 1 scans `pullRequests`
+/// for open/draft entries) or open tasks (step 2 precedes the merged check).
+fn compute_display_status(
+    active_pr: Option<&PullRequestInfo>,
+    pull_requests: &[PullRequestInfo],
+    task_stats: Option<&WorkspaceTaskStats>,
+) -> WorkspaceDisplayStatus {
+    let is_open = |pr: &&PullRequestInfo| {
+        matches!(
+            pr.status,
+            PullRequestStatus::Open | PullRequestStatus::Draft
+        )
+    };
+    let open_pr = active_pr.filter(is_open).or_else(|| {
+        pull_requests
+            .iter()
+            .filter(is_open)
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+    });
+    if let Some(pr) = open_pr {
+        let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
+        return if pr.mergeable == Some(true) && !draft {
+            WorkspaceDisplayStatus::PrReady
+        } else {
+            WorkspaceDisplayStatus::PrOpen
+        };
+    }
+    let (total, completed, in_progress) = task_stats
+        .map(|s| (s.total, s.completed, s.in_progress))
+        .unwrap_or_default();
+    if total > 0 && completed < total {
+        return if in_progress > 0 || completed > 0 {
+            WorkspaceDisplayStatus::InProgress
+        } else {
+            WorkspaceDisplayStatus::NotStarted
+        };
+    }
+    let latest_pr = active_pr.or_else(|| {
+        pull_requests
+            .iter()
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+    });
+    if latest_pr.map(|pr| pr.status) == Some(PullRequestStatus::Merged) {
+        return WorkspaceDisplayStatus::PrMerged;
+    }
+    if total > 0 && completed == total {
+        return WorkspaceDisplayStatus::Complete;
+    }
+    WorkspaceDisplayStatus::NotStarted
 }
 
 /// Project a workspace's notes into the canonical `WorkspaceTask` list, porting
@@ -7830,6 +7900,7 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                         cow_supported: None,
+                        display_status: None,
                         checkout_mode: None,
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
@@ -9194,6 +9265,7 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                display_status: None,
                 checkout_mode: None,
             };
             // Provision the checkout for the duplicate (TS

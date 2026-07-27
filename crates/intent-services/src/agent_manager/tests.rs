@@ -337,6 +337,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     };
     store.insert_workspace(&ws).await.unwrap();
@@ -1131,6 +1132,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     };
     store.insert_workspace(&ws).await.unwrap();
@@ -1420,6 +1422,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     };
     let session = AgentSession {
@@ -3440,6 +3443,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     };
     store
@@ -5021,6 +5025,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
@@ -5230,6 +5235,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     };
 

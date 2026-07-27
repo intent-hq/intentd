@@ -60,8 +60,8 @@ pub use model::{
     TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageTotals, TopChangedFile, Workspace, WorkspaceActivity, WorkspaceAgentInfo,
     WorkspaceAgentSummary, WorkspaceAttention, WorkspaceCreate, WorkspaceCreateInitialAgent,
-    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceEventSummary,
-    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    WorkspaceCreateResult, WorkspaceDiffSummary, WorkspaceDiffSummaryFile, WorkspaceDisplayStatus,
+    WorkspaceEventSummary, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 pub use secrets::{default_secrets_path, FileSecretStore, SECRETS_FILE_ENV};
 pub use server_control::ServerControl;

@@ -2520,6 +2520,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        display_status: None,
         checkout_mode: None,
     }
 }

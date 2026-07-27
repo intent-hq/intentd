@@ -4259,6 +4259,7 @@ mod workspace_api_tool_tests {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                display_status: None,
                 checkout_mode: None,
             };
             Arc::new(Self { ws: Mutex::new(ws) })
