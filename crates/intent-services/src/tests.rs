@@ -8688,6 +8688,390 @@ mod file_tracking {
         (tmp, Services::new(store), ws_id)
     }
 
+    /// Agent-initiated `git.agentCommit` with no `files` commits only the
+    /// paths the tracked-changes pipeline attributes to the committing agent
+    /// (monorepo#939): another agent's and unattributed worktree changes stay
+    /// uncommitted, and the committed paths' attribution rows move to
+    /// `committed` (the `ac_commit` mirror).
+    #[tokio::test]
+    async fn agent_commit_no_files_commits_only_attributed_paths() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("a.txt"), "agent a\n").unwrap();
+        std::fs::write(repo.dir.join("b.txt"), "agent b\n").unwrap();
+        std::fs::write(repo.dir.join("user.txt"), "user edit\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "b.txt", "unstaged", Some("agent-b")))
+            .await
+            .unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws.clone(),
+                "agent a work".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["a.txt".to_string()]);
+        assert_eq!(r.file_count, 1);
+
+        // The other agent's and the unattributed changes stay uncommitted.
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let dirty: Vec<&str> = st.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(dirty.contains(&"b.txt"), "b.txt stays dirty: {dirty:?}");
+        assert!(
+            dirty.contains(&"user.txt"),
+            "user.txt stays dirty: {dirty:?}"
+        );
+        assert!(!dirty.contains(&"a.txt"), "a.txt was committed: {dirty:?}");
+
+        // a.txt's attribution row moved to `committed`; b.txt's is untouched.
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let stage_of = |p: &str| {
+            rows.iter()
+                .find(|r| r.path == p)
+                .map(|r| r.stage.clone())
+                .unwrap()
+        };
+        assert_eq!(stage_of("a.txt"), "committed");
+        assert_eq!(stage_of("b.txt"), "unstaged");
+    }
+
+    /// A path another actor already staged is not swept into the
+    /// attribution-filtered commit — the commit tree is built from exactly
+    /// the attributed paths (`git commit -- <paths>` semantics), and the
+    /// pre-staged entry survives in the index afterwards.
+    #[tokio::test]
+    async fn agent_commit_does_not_sweep_prestaged_unattributed_paths() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("prestaged.txt"), "other actor\n").unwrap();
+        intent_git::stage::stage(&repo.dir, &["prestaged.txt".to_string()]).unwrap();
+        std::fs::write(repo.dir.join("a.txt"), "agent a\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "agent a only".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["a.txt".to_string()]);
+        assert_eq!(r.file_count, 1);
+
+        // The commit's actual delta matches the response.
+        let head = intent_git::history::history(&repo.dir, 1).unwrap();
+        assert_eq!(
+            head[0].files.as_deref(),
+            Some(&["a.txt".to_string()][..]),
+            "commit contains only the attributed path"
+        );
+        // The other actor's staged entry is still pending.
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let entry = st
+            .files
+            .iter()
+            .find(|f| f.path == "prestaged.txt")
+            .expect("prestaged.txt still pending");
+        assert!(entry.staged, "prestaged.txt still staged: {st:?}");
+    }
+
+    /// A stale attribution row (its file is unchanged in the worktree) commits
+    /// nothing — the intersection with the actual worktree changes is empty,
+    /// surfacing the "No uncommitted changes found for this agent" error the
+    /// auto-commit subscriber treats as a silent skip. The unattributed dirty
+    /// file is not swept either.
+    #[tokio::test]
+    async fn agent_commit_stale_attribution_commits_nothing() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        // seed.txt is committed and unchanged, but a stale row attributes it.
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "seed.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        std::fs::write(repo.dir.join("other.txt"), "someone else\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(
+                ws,
+                "msg".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("No uncommitted changes found for this agent"),
+            "got: {err}"
+        );
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 1, "no new commit");
+    }
+
+    /// No `files` + no `agent_id` + not user-requested → refused with an error
+    /// requiring an explicit `files` list; the worktree is never swept.
+    #[tokio::test]
+    async fn agent_commit_no_files_without_agent_id_is_refused() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("dirty.txt"), "dirty\n").unwrap();
+
+        let err = svc
+            .git_agent_commit(ws, "msg".to_string(), None, None, None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("pass an explicit `files` list"),
+            "got: {err}"
+        );
+        let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+        assert_eq!(commits.len(), 1, "no new commit");
+    }
+
+    /// An explicit `files` list is committed as-is — attribution is not
+    /// consulted (unchanged behavior).
+    #[tokio::test]
+    async fn agent_commit_explicit_files_bypasses_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("dirty.txt"), "dirty\n").unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "explicit".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                Some(vec!["dirty.txt".to_string()]),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["dirty.txt".to_string()]);
+        assert_eq!(r.file_count, 1);
+    }
+
+    /// A `userRequested` no-files checkpoint still commits only the
+    /// already-staged paths — no attribution filter, no agent-id requirement
+    /// (unchanged behavior).
+    #[tokio::test]
+    async fn agent_commit_user_requested_commits_staged_only() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("staged.txt"), "staged\n").unwrap();
+        intent_git::stage::stage(&repo.dir, &["staged.txt".to_string()]).unwrap();
+        std::fs::write(repo.dir.join("unstaged.txt"), "unstaged\n").unwrap();
+
+        let r = svc
+            .git_agent_commit(ws, "checkpoint".to_string(), None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["staged.txt".to_string()]);
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(
+            st.files.iter().any(|f| f.path == "unstaged.txt"),
+            "unstaged file survives the userRequested checkpoint"
+        );
+    }
+
+    /// An agent-context `file.write` records an attributed `tracked_changes`
+    /// row (stage `unstaged`, diff stats populated) — the workspace-api file
+    /// tools feed the same attribution pipeline as ACP `fs/write_text_file`
+    /// (monorepo#939), so the attribution-filtered `git.agentCommit` fallback
+    /// sees the edit.
+    #[tokio::test]
+    async fn file_write_with_agent_context_records_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        svc.file_write(
+            ws.clone(),
+            "agent-edit.txt".to_string(),
+            "written by agent\n".to_string(),
+            Some(AgentId::from("agent-w1")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.path == "agent-edit.txt")
+            .expect("attribution row recorded");
+        assert_eq!(row.stage, "unstaged");
+        assert_eq!(row.status, "added");
+        assert_eq!(row.agent_id.as_deref(), Some("agent-w1"));
+        assert_eq!(row.additions, 1);
+
+        // The attribution-filtered fallback now commits this write.
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "agent write".to_string(),
+                Some(AgentId::from("agent-w1")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["agent-edit.txt".to_string()]);
+    }
+
+    /// A `file.write` without an agent caller context (FE/user write) records
+    /// no attribution row.
+    #[tokio::test]
+    async fn file_write_without_agent_context_records_no_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        svc.file_write(
+            ws.clone(),
+            "user-edit.txt".to_string(),
+            "written by user\n".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "no attribution for a userless write: {rows:?}"
+        );
+        assert!(repo.dir.join("user-edit.txt").exists(), "file was written");
+    }
+
+    /// An agent-context `file.delete` records a `deleted` attribution row for
+    /// the caller (monorepo#939); a no-agent-context delete records none.
+    #[tokio::test]
+    async fn file_delete_agent_context_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        commit_file(&repo.dir, "doomed.txt", "to be deleted\n", "add doomed");
+        commit_file(&repo.dir, "user-doomed.txt", "user file\n", "add user file");
+
+        svc.file_delete(
+            ws.clone(),
+            "doomed.txt".to_string(),
+            Some(AgentId::from("agent-d1")),
+        )
+        .await
+        .unwrap();
+        svc.file_delete(ws.clone(), "user-doomed.txt".to_string(), None)
+            .await
+            .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.path == "doomed.txt")
+            .expect("attribution row recorded for agent delete");
+        assert_eq!(row.stage, "unstaged");
+        assert_eq!(row.status, "deleted");
+        assert_eq!(row.agent_id.as_deref(), Some("agent-d1"));
+        assert!(
+            !rows.iter().any(|r| r.path == "user-doomed.txt"),
+            "no attribution for a userless delete: {rows:?}"
+        );
+    }
+
+    /// An agent-context `file.rename` records both sides — old path `deleted`,
+    /// new path `added` — attributed to the caller (monorepo#939), and the
+    /// attribution-filtered fallback commits the rename. A no-agent-context
+    /// rename records none.
+    #[tokio::test]
+    async fn file_rename_agent_context_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        commit_file(&repo.dir, "old-name.txt", "contents\n", "add old-name");
+
+        svc.file_rename(
+            ws.clone(),
+            "old-name.txt".to_string(),
+            "new-name.txt".to_string(),
+            Some(AgentId::from("agent-r1")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let old_row = rows
+            .iter()
+            .find(|r| r.path == "old-name.txt")
+            .expect("old-path attribution row recorded");
+        assert_eq!(old_row.status, "deleted");
+        assert_eq!(old_row.agent_id.as_deref(), Some("agent-r1"));
+        let new_row = rows
+            .iter()
+            .find(|r| r.path == "new-name.txt")
+            .expect("new-path attribution row recorded");
+        assert_eq!(new_row.status, "added");
+        assert_eq!(new_row.agent_id.as_deref(), Some("agent-r1"));
+
+        // The attribution-filtered fallback commits both sides of the rename.
+        let r = svc
+            .git_agent_commit(
+                ws.clone(),
+                "agent rename".to_string(),
+                Some(AgentId::from("agent-r1")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.files.contains(&"old-name.txt".to_string())
+                && r.files.contains(&"new-name.txt".to_string()),
+            "both rename sides committed: {:?}",
+            r.files
+        );
+    }
+
+    /// A `file.rename` without an agent caller context records no attribution.
+    #[tokio::test]
+    async fn file_rename_without_agent_context_records_no_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        commit_file(&repo.dir, "before.txt", "contents\n", "add before");
+
+        svc.file_rename(
+            ws.clone(),
+            "before.txt".to_string(),
+            "after.txt".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "no attribution for a userless rename: {rows:?}"
+        );
+        assert!(repo.dir.join("after.txt").exists(), "file was renamed");
+    }
+
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
     /// `CommitSummary`, walking older pages via the opaque continuation
     /// token; attribution trailers populate `agentId`/`linkedNoteId`. The

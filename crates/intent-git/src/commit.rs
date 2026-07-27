@@ -77,6 +77,98 @@ pub fn commit_with_trailers(
     commit(worktree_path, &body)
 }
 
+/// Create a commit whose tree is the parent tree plus **only** the given
+/// `paths` taken from the working tree (`git commit -- <paths>` semantics),
+/// with attribution trailers. Pre-staged changes to other paths are left in
+/// the on-disk index and are never swept into the commit — used by the
+/// attribution-filtered `git.agentCommit` fallback so another actor's staged
+/// work cannot ride along. `paths` are worktree-relative; a path missing from
+/// the working tree is committed as a deletion.
+pub fn commit_paths_with_trailers(
+    worktree_path: &Path,
+    message: &str,
+    agent_id: Option<&str>,
+    linked_note_id: Option<&str>,
+    paths: &[String],
+) -> Result<CommitOutcome> {
+    let body = build_commit_message(message, agent_id, linked_note_id);
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| Error::Internal("Repository has no working directory".to_string()))?
+        .to_path_buf();
+    let parent = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .and_then(|oid| repo.find_commit(oid).ok());
+
+    // Build the commit tree in memory: seed from the parent tree, then apply
+    // only `paths` from the working tree. This in-memory state is never
+    // written back — the on-disk index (including other actors' staged
+    // entries) is reloaded and updated per-path after the commit below.
+    let mut index = repo.index().map_err(map_git_err)?;
+    match &parent {
+        Some(c) => {
+            let parent_tree = c.tree().map_err(map_git_err)?;
+            index.read_tree(&parent_tree).map_err(map_git_err)?;
+        }
+        None => index.clear().map_err(map_git_err)?,
+    }
+    for raw in paths {
+        let rel = Path::new(raw);
+        if workdir.join(rel).exists() {
+            index.add_path(rel).map_err(map_git_err)?;
+        } else if index.get_path(rel, 0).is_some() {
+            // Tracked in the parent tree but deleted in the worktree → drop
+            // from the commit tree.
+            index.remove_path(rel).map_err(map_git_err)?;
+        } else {
+            // Neither on disk nor tracked: reject like `stage()` does so a
+            // bogus explicit `files` entry still surfaces as an error.
+            return Err(Error::Internal(format!(
+                "fatal: pathspec '{raw}' did not match any files"
+            )));
+        }
+    }
+    let tree_oid = index.write_tree().map_err(map_git_err)?;
+    let tree = repo.find_tree(tree_oid).map_err(map_git_err)?;
+
+    if let Some(parent) = &parent {
+        if parent.tree_id() == tree_oid {
+            return Err(Error::Internal(CLEAN_TREE_ERROR.to_string()));
+        }
+    }
+
+    let sig = repo.signature().map_err(map_git_err)?;
+    let parents: Vec<&Commit> = parent.iter().collect();
+    let oid = repo
+        .commit(Some("HEAD"), &sig, &sig, &body, &tree, &parents)
+        .map_err(map_git_err)?;
+
+    // Refresh the on-disk index entries for the committed paths (matching
+    // `git commit -- <paths>`, which updates the index for the pathspec) so
+    // they read as clean against the new HEAD. `read(true)` drops the
+    // in-memory tree built above and reloads the real index first, keeping
+    // every other entry (including other actors' staged work) intact.
+    index.read(true).map_err(map_git_err)?;
+    for raw in paths {
+        let rel = Path::new(raw);
+        if workdir.join(rel).exists() {
+            index.add_path(rel).map_err(map_git_err)?;
+        } else {
+            index.remove_path(rel).map_err(map_git_err)?;
+        }
+    }
+    index.write().map_err(map_git_err)?;
+
+    let files = changed_files(&repo, parent.as_ref(), &tree)?;
+    Ok(CommitOutcome {
+        hash: oid.to_string(),
+        files,
+    })
+}
+
 /// Build a commit message body with attribution trailers, porting the
 /// reference `agent-commit.service.ts::buildCommitMessage`.
 ///
@@ -245,6 +337,77 @@ mod tests {
         let (agent, note) = crate::history::parse_trailers(&agent_only);
         assert_eq!(agent.as_deref(), Some("agent-42"));
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn commit_paths_leaves_unrelated_staged_entries_out_of_the_commit() {
+        // Another actor pre-staged `staged.txt`; committing only `mine.txt`
+        // must not sweep it in, and it must stay staged afterwards.
+        let dir = init_repo("commit-paths-staged");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "staged.txt", "other actor\n");
+        stage(dir.path(), &["staged.txt".to_string()]).unwrap();
+        write_file(dir.path(), "mine.txt", "mine\n");
+
+        let out = commit_paths_with_trailers(
+            dir.path(),
+            "scoped",
+            Some("agent-1"),
+            None,
+            &["mine.txt".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out.files, vec!["mine.txt".to_string()]);
+
+        let st = crate::status::status(dir.path()).unwrap();
+        let staged_entry = st
+            .files
+            .iter()
+            .find(|f| f.path == "staged.txt")
+            .expect("staged.txt still pending");
+        assert!(staged_entry.staged, "staged.txt still staged: {st:?}");
+        assert!(
+            st.files.iter().all(|f| f.path != "mine.txt"),
+            "mine.txt clean after commit: {st:?}"
+        );
+    }
+
+    #[test]
+    fn commit_paths_commits_worktree_deletion() {
+        let dir = init_repo("commit-paths-delete");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        commit_file(dir.path(), "gone.txt", "bye\n");
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+
+        let out = commit_paths_with_trailers(
+            dir.path(),
+            "remove gone",
+            Some("agent-1"),
+            None,
+            &["gone.txt".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out.files, vec!["gone.txt".to_string()]);
+        let st = crate::status::status(dir.path()).unwrap();
+        assert!(
+            st.files.iter().all(|f| f.path != "gone.txt"),
+            "deletion committed: {st:?}"
+        );
+    }
+
+    #[test]
+    fn commit_paths_rejects_unknown_pathspec() {
+        let dir = init_repo("commit-paths-bogus");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        let err = commit_paths_with_trailers(
+            dir.path(),
+            "bogus",
+            Some("agent-1"),
+            None,
+            &["nope.txt".to_string()],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("did not match any files"));
     }
 
     #[test]

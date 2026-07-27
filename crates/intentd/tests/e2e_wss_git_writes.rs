@@ -239,6 +239,11 @@ fn make_source_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("source-repo");
     std::fs::create_dir_all(&repo).expect("mkdir source repo");
     run_git(&["init", "-q", "-b", "main"], &repo);
+    // Repo-level identity: linked worktrees share the repo config, and the
+    // daemon-side commit paths (`repo.signature()`) need `user.name`/`user.email`
+    // — CI runners have no global git identity.
+    run_git(&["config", "user.name", "e2e"], &repo);
+    run_git(&["config", "user.email", "e2e@example.com"], &repo);
     std::fs::write(repo.join("tracked.txt"), "seed\n").unwrap();
     run_git(&["add", "tracked.txt"], &repo);
     run_git(&["commit", "-q", "-m", "seed"], &repo);
@@ -516,6 +521,10 @@ async fn git_push_and_fetch_round_trip_over_wss() {
 /// Exercises the working-tree write pair (`git.stageHunk` → `git.unstageHunk`)
 /// plus `git.removeLockFile`. Each call is checked against its PROTOCOL.md §5.6
 /// response shape and the resulting `git.status` file entry's `staged` flag.
+/// Also covers the `git.agentCommit` no-`files` fallback semantics
+/// (monorepo#939): the transport path carries no agent context, so an
+/// agent-initiated commit is refused (-32603) rather than sweeping the
+/// worktree, while a `userRequested` checkpoint commits only the staged paths.
 #[tokio::test]
 async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
     if !gate() {
@@ -585,6 +594,71 @@ async fn git_hunk_and_lockfile_ops_round_trip_over_wss() {
     .await;
     assert_eq!(resp["result"]["ok"], json!(true));
     assert_eq!(resp["result"]["removed"], json!(false));
+
+    // git.agentCommit fallback semantics over WSS (monorepo#939, §5.6):
+    //
+    // (1) agent-initiated (no `files`, no `userRequested`): the transport
+    // path carries no agent context, so attribution is impossible — refuse
+    // with -32603 rather than sweeping the dirty worktree.
+    let resp = wss_rpc(
+        &mut ws,
+        20,
+        "git.agentCommit",
+        json!({ "workspaceId": ws_id, "message": "agent sweep" }),
+    )
+    .await;
+    assert!(resp.get("result").is_none(), "no-agentId refusal: {resp}");
+    assert_eq!(resp["error"]["code"], json!(-32603), "{resp}");
+    assert!(
+        resp["error"]["data"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be attributed"),
+        "refusal names the attribution gap: {resp}"
+    );
+    let status = wss_rpc(&mut ws, 21, "git.status", json!({ "workspaceId": ws_id })).await;
+    let files = status["result"]["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|f| f["path"] == json!("tracked.txt")),
+        "refusal left the dirty worktree untouched: {files:?}"
+    );
+
+    // (2) userRequested with no `files` commits only the already-staged
+    // paths — a second unstaged file stays dirty in the worktree.
+    std::fs::write(wt.join("unstaged.txt"), "left behind\n").unwrap();
+    let resp = wss_rpc(
+        &mut ws,
+        22,
+        "git.stage",
+        json!({ "workspaceId": ws_id, "paths": ["tracked.txt"] }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true), "stage: {resp}");
+    let resp = wss_rpc(
+        &mut ws,
+        23,
+        "git.agentCommit",
+        json!({
+            "workspaceId": ws_id,
+            "message": "user checkpoint",
+            "userRequested": true,
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["ok"], json!(true), "agentCommit: {resp}");
+    assert_eq!(resp["result"]["files"], json!(["tracked.txt"]));
+    assert_eq!(resp["result"]["fileCount"], json!(1));
+    assert_eq!(resp["result"]["hash"].as_str().expect("hash").len(), 40);
+    let status = wss_rpc(&mut ws, 24, "git.status", json!({ "workspaceId": ws_id })).await;
+    let files = status["result"]["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|f| f["path"] == json!("unstaged.txt")),
+        "unstaged file survives the userRequested commit: {files:?}"
+    );
+    assert!(
+        files.iter().all(|f| f["path"] != json!("tracked.txt")),
+        "staged file was committed: {files:?}"
+    );
 
     // Plant a lock file inside the linked worktree's git dir. Workspace
     // worktrees are `git worktree add`-style linked, so `.git` is a file

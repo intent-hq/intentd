@@ -7736,7 +7736,18 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::write(&root, &path, &content)
+            let result = file_ops::write(&root, &path, &content)?;
+            // Attribution (monorepo#939): an agent's workspace-api `file.write`
+            // must land on `tracked_changes` just like an ACP
+            // `fs/write_text_file` does via `file:changed`, or the
+            // attribution-filtered `git.agentCommit` fallback (and thus idle
+            // auto-commit) never sees the agent's edit. FE/user writes (no
+            // agent caller) stay unattributed.
+            if let Some(agent) = caller_agent_id.as_ref() {
+                record_agent_file_mutation(&store, &workspace_id, agent, &root, &path, "modified")
+                    .await;
+            }
+            Ok(result)
         })
     }
 
@@ -7764,7 +7775,14 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::delete(&root, &path)
+            let result = file_ops::delete(&root, &path)?;
+            // Attribution (monorepo#939): agent-context deletes land on
+            // `tracked_changes` like the ACP `file:changed` delete action does.
+            if let Some(agent) = caller_agent_id.as_ref() {
+                record_agent_file_mutation(&store, &workspace_id, agent, &root, &path, "deleted")
+                    .await;
+            }
+            Ok(result)
         })
     }
 
@@ -7793,7 +7811,30 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::rename(&root, &old_path, &new_path)
+            let result = file_ops::rename(&root, &old_path, &new_path)?;
+            // Attribution (monorepo#939): an agent-context file rename records
+            // both sides (old path deleted, new path added), matching what the
+            // ACP `file:changed` pipeline would attribute for the equivalent
+            // delete + create. Directory renames are skipped — attribution
+            // rows are per-file and a directory path has no diff entry.
+            let is_directory = result
+                .get("isDirectory")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if let (Some(agent), false) = (caller_agent_id.as_ref(), is_directory) {
+                record_agent_file_mutation(
+                    &store,
+                    &workspace_id,
+                    agent,
+                    &root,
+                    &old_path,
+                    "deleted",
+                )
+                .await;
+                record_agent_file_mutation(&store, &workspace_id, agent, &root, &new_path, "added")
+                    .await;
+            }
+            Ok(result)
         })
     }
 
@@ -13812,39 +13853,120 @@ impl WorkspaceApi for Services {
             let worktree = git_ops::worktree_path(&ws).ok_or_else(|| {
                 Error::Internal("Failed to commit: workspace has no worktree".to_string())
             })?;
-            // PARITY NOTE: TS filters to the agent's own unstaged changes via the
-            // file-tracking attribution pipeline (deferred — not yet ported). Until
-            // it lands, an explicit `files` list is committed as-is; without one, a
-            // `userRequested` checkpoint commits only the already-staged paths
-            // (plain `git commit` semantics — a user checkpoint must not sweep up
+            // Commit-set selection (TS parity, monorepo#939): an explicit
+            // `files` list is committed as-is; without one, a `userRequested`
+            // checkpoint commits only the already-staged paths (plain
+            // `git commit` semantics — a user checkpoint must not sweep up
             // other agents' worktree changes), while an agent-initiated commit
-            // falls back to every changed path in the worktree.
-            let (to_commit, needs_stage) = match files {
-                Some(f) if !f.is_empty() => (f, true),
-                _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false),
-                _ => (intent_git::commit::all_changed_paths(&worktree)?, true),
+            // commits only the paths the file-tracking attribution pipeline
+            // credits to the committing agent (`tracked_changes` rows at stage
+            // unstaged/staged), intersected with the actual worktree changes so
+            // a stale attribution row never resurrects a committed/reverted
+            // file. Without an `agent_id` attribution is impossible, so the
+            // commit is refused rather than sweeping the whole worktree.
+            let (to_commit, needs_stage, attribution_filtered) = match files {
+                Some(f) if !f.is_empty() => (f, true, false),
+                _ if user_requested => (intent_git::commit::staged_paths(&worktree)?, false, false),
+                _ => {
+                    let Some(agent) = agent_id.as_ref() else {
+                        return Err(Error::Internal(
+                            "Agent-initiated commit without an agentId cannot be attributed: \
+                             pass an explicit `files` list"
+                                .to_string(),
+                        ));
+                    };
+                    let attributed: HashSet<String> = store
+                        .list_tracked_changes(&workspace_id)
+                        .await?
+                        .into_iter()
+                        .filter(|r| {
+                            matches!(r.stage.as_str(), "unstaged" | "staged")
+                                && r.agent_id.as_deref() == Some(agent.as_str())
+                        })
+                        .map(|r| crate::file_tracking::normalize_path(&r.path))
+                        .collect();
+                    let changed = intent_git::commit::all_changed_paths(&worktree)?;
+                    let filtered: Vec<String> = changed
+                        .iter()
+                        .filter(|p| attributed.contains(&crate::file_tracking::normalize_path(p)))
+                        .cloned()
+                        .collect();
+                    if filtered.is_empty() && !changed.is_empty() {
+                        // Diagnosable skip (monorepo#939 trade-off): agent
+                        // work not visible to the attribution pipeline (e.g.
+                        // terminal/shell edits) is no longer swept — surface
+                        // it at warn so lost auto-commits can be traced.
+                        tracing::warn!(
+                            workspace = %workspace_id.0,
+                            agent = %agent.as_str(),
+                            dirty = changed.len(),
+                            "agentCommit: worktree is dirty but no changes are \
+                             attributed to this agent; nothing will be committed"
+                        );
+                    }
+                    (filtered, true, true)
+                }
             };
             if to_commit.is_empty() {
-                return Err(Error::Internal(
-                    "No uncommitted changes found for this agent".to_string(),
-                ));
+                return Err(Error::Internal(if user_requested {
+                    "No staged changes found to commit".to_string()
+                } else {
+                    "No uncommitted changes found for this agent".to_string()
+                }));
             }
-            if needs_stage {
-                intent_git::stage::stage(&worktree, &to_commit)?;
+            // With an explicit commit set (named `files` or the attribution
+            // filter), commit exactly those paths (`git commit -- <paths>`
+            // semantics) so paths another actor pre-staged are never swept
+            // into this commit. The `userRequested` staged-only checkpoint
+            // commits the index as-is.
+            let outcome = if needs_stage {
+                intent_git::commit::commit_paths_with_trailers(
+                    &worktree,
+                    &message,
+                    agent_id.as_ref().map(AgentId::as_str),
+                    linked_note_id.as_ref().map(NoteId::as_str),
+                    &to_commit,
+                )?
+            } else {
+                intent_git::commit::commit_with_trailers(
+                    &worktree,
+                    &message,
+                    agent_id.as_ref().map(AgentId::as_str),
+                    linked_note_id.as_ref().map(NoteId::as_str),
+                )?
+            };
+            if attribution_filtered {
+                // Mirror `ac_commit`: move the committed paths' attribution
+                // rows (staged/unstaged → committed) so the audit trail stays
+                // consistent with the git stage. Best-effort, but loud — a
+                // stuck row makes the next filtered commit resurrect the path.
+                for path in &outcome.files {
+                    let key = crate::file_tracking::normalize_path(path);
+                    for from in ["staged", "unstaged"] {
+                        if let Err(e) = store
+                            .set_tracked_change_stage(&workspace_id, &key, from, "committed")
+                            .await
+                        {
+                            tracing::warn!(
+                                path = %key,
+                                error = %e,
+                                "agentCommit: failed to advance attribution row to committed"
+                            );
+                        }
+                    }
+                }
             }
-            let outcome = intent_git::commit::commit_with_trailers(
-                &worktree,
-                &message,
-                agent_id.as_ref().map(AgentId::as_str),
-                linked_note_id.as_ref().map(NoteId::as_str),
-            )?;
-            let file_count = to_commit.len() as i64;
+            // Report the commit's actual delta (`outcome.files`), not the
+            // requested set — with a pathspec-limited commit they match, and
+            // for an explicit `files` list the delta is the truth (a named
+            // but unchanged path is not part of the commit).
+            let file_count = outcome.files.len() as i64;
             // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
             // relay so the UI refreshes without a follow-up `git.status` read.
             publish_event(
                 &bus,
-                git_commit_event(&ws.id, &outcome.hash, &message, &to_commit),
+                git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
             )
             .await;
             let status = intent_git::status::status(&worktree)
@@ -13853,7 +13975,7 @@ impl WorkspaceApi for Services {
             publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
-                files: to_commit,
+                files: outcome.files,
                 file_count,
             })
         })
@@ -18928,6 +19050,108 @@ struct AcExtras {
 /// Per-path attribution `(agent_id, session_id, turn)` carried across a
 /// `file-tracking.sync` reconcile so reconciled rows keep their provenance.
 type AttributionByPath = HashMap<String, (Option<String>, Option<String>, Option<i64>)>;
+
+/// Record a `tracked_changes` attribution row for an agent's workspace-api
+/// file mutation (`file.write`/`file.delete`/`file.rename`, monorepo#939),
+/// mirroring the agent event sink's handling of ACP `file:changed`
+/// (`agent_manager`'s `record_agent_file_change`): stage `unstaged`,
+/// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
+/// then the metrics / usage-stats recomputes. The status is inferred from the
+/// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Best-effort throughout — a tracking miss never fails the mutation.
+async fn record_agent_file_mutation(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    agent: &AgentId,
+    root: &str,
+    path: &str,
+    fallback_status: &str,
+) {
+    let ws = match store.get_workspace(workspace_id).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            tracing::warn!(error = %e, "file-tracking: workspace lookup failed");
+            return;
+        }
+    };
+    let Some(worktree) = git_ops::worktree_path(&ws) else {
+        return;
+    };
+    // Resolve to a worktree-relative path with `.`/`..` segments collapsed —
+    // the attribution-filtered commit set is intersected against
+    // `all_changed_paths` (worktree-relative), so a non-canonical path here
+    // would silently drop the file from the agent's commits. When the mutation
+    // root is a sandbox (or empty), fall back to resolving against the
+    // worktree itself; if neither resolves, skip rather than record a row
+    // that can never match.
+    let rel_path = match file_ops::workspace_relative(root, path)
+        .or_else(|| file_ops::workspace_relative(&worktree.to_string_lossy(), path))
+    {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            tracing::warn!(
+                path,
+                "file-tracking: could not resolve a workspace-relative path; skipping attribution"
+            );
+            return;
+        }
+    };
+    // Diff compute is best-effort: a missing repo / clean worktree still
+    // records the attribution row (with zero stats) so provenance is kept.
+    let summary =
+        match crate::diffs::compute_and_store(store, &worktree, workspace_id, &rel_path, false)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(e) => {
+                tracing::warn!(error = %e, "file-tracking: diff compute failed");
+                None
+            }
+        };
+    let status = match summary.as_ref() {
+        Some(s) if s.old_blob_sha.is_none() => "added",
+        Some(s) if s.new_blob_sha.is_none() => "deleted",
+        Some(_) => "modified",
+        None => fallback_status,
+    };
+    let change = intent_store::NewTrackedChange {
+        workspace_id: workspace_id.clone(),
+        path: rel_path,
+        stage: "unstaged".to_string(),
+        status: status.to_string(),
+        agent_id: Some(agent.as_str().to_string()),
+        session_id: None,
+        turn: None,
+        commit_hash: None,
+        old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
+        new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
+        additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
+        deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
+    };
+    let (lines_added, lines_deleted) = match crate::file_tracking::track_change(store, change).await
+    {
+        Ok(delta) => delta,
+        Err(e) => {
+            tracing::warn!(error = %e, "file-tracking: track_change failed");
+            return;
+        }
+    };
+    // Recompute the durable line-change aggregates so the metrics.* reads
+    // (§17.5) reflect this edit. Best-effort: attribution is already recorded.
+    if let Err(e) = crate::metrics::recompute(store, workspace_id).await {
+        tracing::warn!(error = %e, "metrics: recompute failed");
+    }
+    // Global usage-stats (D5): fold the attributed lines-changed delta into
+    // the current `usage_stats_hourly` bucket. Best-effort inside.
+    crate::usage_stats::record_lines_changed(
+        store,
+        workspace_id,
+        Some(agent.as_str()),
+        lines_added,
+        lines_deleted,
+    )
+    .await;
+}
 
 /// Resolve a workspace's worktree path for the `file-tracking.*` reads (used to
 /// render the absolute `TrackedChange.file`). `None` for a missing/remote/
