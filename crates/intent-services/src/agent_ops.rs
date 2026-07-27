@@ -3261,16 +3261,33 @@ impl Services {
                     let services = self.clone();
                     let ws_id = workspace_id.clone();
                     tokio::spawn(async move {
-                        services
-                            .provision_delegate_sandbox(&ws_id, &aid, root)
+                        // Drop guard: settles the gate even if provisioning
+                        // panics, so the gate map never accumulates stale
+                        // entries. On the normal path the guard drops AFTER
+                        // `provision_delegate_sandbox` returns — the session's
+                        // sandbox fields and the `sandbox:created` event are
+                        // already published, so a released waiter observes the
+                        // settled state. Dropping the held sender (also via
+                        // the guard) releases every waiter.
+                        struct SettleGuard {
+                            services: Services,
+                            aid: AgentId,
+                            _release: tokio::sync::watch::Sender<()>,
+                        }
+                        impl Drop for SettleGuard {
+                            fn drop(&mut self) {
+                                self.services.settle_sandbox_provisioning(&self.aid);
+                            }
+                        }
+                        let guard = SettleGuard {
+                            services,
+                            aid,
+                            _release: settled,
+                        };
+                        guard
+                            .services
+                            .provision_delegate_sandbox(&ws_id, &guard.aid, root)
                             .await;
-                        // Settle the gate LAST — the session's sandbox fields
-                        // and the `sandbox:created` event are already
-                        // published, so a released waiter observes the settled
-                        // state. Dropping the sender releases waiters even if
-                        // provisioning panicked.
-                        services.settle_sandbox_provisioning(&aid);
-                        drop(settled);
                     });
                 }
             }

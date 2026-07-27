@@ -17314,10 +17314,11 @@ impl Services {
     /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).
     /// Called by the delegate op BEFORE it returns, so the child's turn
     /// worker observes the gate before its first spawn attempt. The returned
-    /// sender is held by the background provisioning task; dropping it (or
-    /// calling [`Services::settle_sandbox_provisioning`] first) releases
-    /// every waiter — including on a panic, since the sender drops with the
-    /// task.
+    /// sender is held by the background provisioning task; waiters are
+    /// released only when that sender drops — including on a panic, since
+    /// the sender drops with the task. Pair with
+    /// [`Services::settle_sandbox_provisioning`], which just removes the map
+    /// entry so later arrivals proceed immediately.
     pub(crate) fn begin_sandbox_provisioning(
         &self,
         agent_id: &AgentId,

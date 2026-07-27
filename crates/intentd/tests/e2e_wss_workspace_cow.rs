@@ -14,9 +14,11 @@
 //! - `skipIsolation: true` wins over `workspace.cowIsolation` ON: direct
 //!   mode, no checkout provisioned at all (no probe, no fallback).
 //! - `agent.delegate` in a CoW workspace provisions a per-agent CoW sandbox
-//!   (`sandbox:created` event, `effectiveIsolation: "cow"`), and completion
-//!   merges the sandbox back into the workspace checkout (`sandbox:merged`
-//!   event, filesystem changes land, sandbox dir discarded).
+//!   (`effectiveIsolation: "pending"` in the delegate result; the
+//!   `sandbox:created` event and session sandbox fields report the settled
+//!   outcome), and completion merges the sandbox back into the workspace
+//!   checkout (`sandbox:merged` event, filesystem changes land, sandbox dir
+//!   discarded).
 //! - SLOW sandbox provisioning (test seam) never blocks `agent.delegate` —
 //!   the RPC returns promptly with `effectiveIsolation: "pending"` and the
 //!   gated child still spawns in the settled sandbox (monorepo#871).
@@ -660,8 +662,9 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
 }
 
 /// Scenario C — `agent.delegate` in a CoW workspace: the delegated agent gets
-/// its own per-agent CoW sandbox (`sandbox:created` event with the §5.5
-/// payload, `effectiveIsolation: "cow"` in the delegate result), and when the
+/// its own per-agent CoW sandbox (`effectiveIsolation: "pending"` in the
+/// delegate result; the `sandbox:created` event with the §5.5 payload
+/// reports the settled outcome), and when the
 /// child completes its turn the daemon auto-merges the sandbox back into the
 /// workspace checkout (`sandbox:merged` event, the file written inside the
 /// sandbox lands in the checkout as a commit, and the sandbox directory is
