@@ -168,7 +168,14 @@ pub(crate) fn parse_generated_config(body: &str, served_repo: &str) -> Result<Un
     let provider = root
         .get("provider")
         .and_then(|p| p.as_object())
-        .and_then(|p| p.values().find(|v| v.get("options").is_some()))
+        .and_then(|p| {
+            // Prefer the known `unsloth-studio` key; fall back to any block
+            // carrying `options` so a renamed key still resolves (map
+            // iteration order is only reached when the known key is absent).
+            p.get("unsloth-studio")
+                .filter(|v| v.get("options").is_some())
+                .or_else(|| p.values().find(|v| v.get("options").is_some()))
+        })
         .ok_or_else(|| {
             Error::Internal(
                 "unsloth generated opencode.json has no provider block with options".to_string(),
@@ -239,7 +246,16 @@ struct ManagedServer {
     endpoint: Option<UnslothEndpoint>,
     /// Rolling tail of the child's combined stdout/stderr for diagnostics.
     output_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
+    /// The stdout/stderr drain tasks, kept so [`Self::tail`] can await them
+    /// (post-kill the pipes hit EOF and the drains terminate promptly) —
+    /// snapshotting without waiting races the child's final output and can
+    /// lose the diagnostic exactly when it's needed.
+    drain_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
+
+/// How long [`ManagedServer::tail`] waits for the drain tasks to consume the
+/// dead child's final output before snapshotting.
+const DRAIN_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl ManagedServer {
     /// Whether the child process is still running (`try_wait` probe).
@@ -247,8 +263,13 @@ impl ManagedServer {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Snapshot the retained output tail as one newline-joined string.
-    fn tail(&self) -> String {
+    /// Snapshot the retained output tail as one newline-joined string. Waits
+    /// (bounded) for the drain tasks first so a fast-exiting child's final
+    /// lines are captured — call only after the child is dead.
+    async fn tail(&mut self) -> String {
+        for task in self.drain_tasks.drain(..) {
+            let _ = tokio::time::timeout(DRAIN_SETTLE_TIMEOUT, task).await;
+        }
         let tail = self.output_tail.lock().unwrap();
         tail.iter().cloned().collect::<Vec<_>>().join("\n")
     }
@@ -373,10 +394,12 @@ impl UnslothServerManager {
             }
             Err(e) => {
                 // Startup failed: kill the half-started child so the next
-                // attempt starts clean, and surface the output tail.
+                // attempt starts clean, and surface the output tail (with
+                // any minted key material redacted — the error is
+                // client-visible).
                 let mut failed = state.take().expect("state set above");
                 kill_server_child(&mut failed.child).await;
-                let tail = failed.tail();
+                let tail = redact_key_material(&failed.tail().await);
                 if tail.is_empty() {
                     Err(e)
                 } else {
@@ -409,11 +432,12 @@ impl UnslothServerManager {
         // Drain stdout/stderr into a rolling tail so a startup failure has a
         // diagnosable trace (and the pipes never fill up and stall the child).
         let output_tail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let mut drain_tasks = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(drain_into_tail(stdout, output_tail.clone()));
+            drain_tasks.push(tokio::spawn(drain_into_tail(stdout, output_tail.clone())));
         }
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_into_tail(stderr, output_tail.clone()));
+            drain_tasks.push(tokio::spawn(drain_into_tail(stderr, output_tail.clone())));
         }
 
         tracing::info!(repo = %repo_id, port = self.config.port, "spawned managed unsloth server");
@@ -422,6 +446,7 @@ impl UnslothServerManager {
             repo_id: repo_id.to_string(),
             endpoint: None,
             output_tail,
+            drain_tasks,
         })
     }
 
@@ -620,6 +645,26 @@ enum WaitError {
     ShuttingDown,
 }
 
+/// Redact minted key material from client-visible text: any `sk-…` token is
+/// replaced with `sk-[redacted]` (the unsloth CLI prints endpoint + key
+/// material on some startup paths, and the output tail rides an error the
+/// client renders).
+fn redact_key_material(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find("sk-") {
+        out.push_str(&rest[..idx]);
+        out.push_str("sk-[redacted]");
+        let after = &rest[idx + 3..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// GET `url` (optionally with a Bearer key), returning the HTTP status code
 /// or `None` on a connect/timeout error.
 async fn probe_status(client: &reqwest::Client, url: &str, api_key: Option<&str>) -> Option<u16> {
@@ -784,6 +829,37 @@ mod tests {
         let no_url = r#"{ "provider": { "p": { "options": { "apiKey": "k" } } } }"#;
         let err = parse_generated_config(no_url, REPO).unwrap_err();
         assert!(err.to_string().contains("baseURL"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_generated_config_prefers_unsloth_studio_key() {
+        // A foreign provider block with options must not win over the known
+        // `unsloth-studio` key, regardless of map iteration order.
+        let body = r#"{
+          "provider": {
+            "aaa-other": { "options": { "baseURL": "http://evil/v1", "apiKey": "other" } },
+            "unsloth-studio": {
+              "options": { "baseURL": "http://127.0.0.1:8888/v1", "apiKey": "right" },
+              "models": {}
+            }
+          }
+        }"#;
+        let ep = parse_generated_config(body, REPO).expect("parses");
+        assert_eq!(ep.api_key, "right");
+        assert_eq!(ep.base_url, "http://127.0.0.1:8888/v1");
+    }
+
+    #[test]
+    fn redact_key_material_strips_sk_tokens() {
+        assert_eq!(
+            redact_key_material("api key: sk-abc123_DEF done"),
+            "api key: sk-[redacted] done"
+        );
+        assert_eq!(
+            redact_key_material("sk-one\nBearer sk-two."),
+            "sk-[redacted]\nBearer sk-[redacted]."
+        );
+        assert_eq!(redact_key_material("no keys here"), "no keys here");
     }
 
     #[test]
