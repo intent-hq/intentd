@@ -83,3 +83,11 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          # All git_only packages run `cargo package --workspace` in separate
+          # temporary worktrees; a shared target dir means only the first one
+          # compiles cold and the rest reuse the build cache. The path must
+          # end in `.../target` so release-plz's packaged-dir fast path
+          # (`is_cargo_packaged_dir`) recognizes `target/package/*` and lists
+          # files from disk instead of re-running `cargo package --list`
+          # (which fails for internal path-only dependencies).
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz/target
