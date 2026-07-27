@@ -13704,10 +13704,25 @@ impl WorkspaceApi for Services {
                         })
                         .map(|r| crate::file_tracking::normalize_path(&r.path))
                         .collect();
-                    let filtered: Vec<String> = intent_git::commit::all_changed_paths(&worktree)?
-                        .into_iter()
+                    let changed = intent_git::commit::all_changed_paths(&worktree)?;
+                    let filtered: Vec<String> = changed
+                        .iter()
                         .filter(|p| attributed.contains(&crate::file_tracking::normalize_path(p)))
+                        .cloned()
                         .collect();
+                    if filtered.is_empty() && !changed.is_empty() {
+                        // Diagnosable skip (monorepo#939 trade-off): agent
+                        // work not visible to the attribution pipeline (e.g.
+                        // terminal/shell edits) is no longer swept — surface
+                        // it at warn so lost auto-commits can be traced.
+                        tracing::warn!(
+                            workspace = %workspace_id.0,
+                            agent = %agent.as_str(),
+                            dirty = changed.len(),
+                            "agentCommit: worktree is dirty but no changes are \
+                             attributed to this agent; nothing will be committed"
+                        );
+                    }
                     (filtered, true, true)
                 }
             };
@@ -13742,24 +13757,35 @@ impl WorkspaceApi for Services {
             if attribution_filtered {
                 // Mirror `ac_commit`: move the committed paths' attribution
                 // rows (staged/unstaged → committed) so the audit trail stays
-                // consistent with the git stage.
+                // consistent with the git stage. Best-effort, but loud — a
+                // stuck row makes the next filtered commit resurrect the path.
                 for path in &outcome.files {
                     let key = crate::file_tracking::normalize_path(path);
-                    let _ = store
-                        .set_tracked_change_stage(&workspace_id, &key, "staged", "committed")
-                        .await;
-                    let _ = store
-                        .set_tracked_change_stage(&workspace_id, &key, "unstaged", "committed")
-                        .await;
+                    for from in ["staged", "unstaged"] {
+                        if let Err(e) = store
+                            .set_tracked_change_stage(&workspace_id, &key, from, "committed")
+                            .await
+                        {
+                            tracing::warn!(
+                                path = %key,
+                                error = %e,
+                                "agentCommit: failed to advance attribution row to committed"
+                            );
+                        }
+                    }
                 }
             }
-            let file_count = to_commit.len() as i64;
+            // Report the commit's actual delta (`outcome.files`), not the
+            // requested set — with a pathspec-limited commit they match, and
+            // for an explicit `files` list the delta is the truth (a named
+            // but unchanged path is not part of the commit).
+            let file_count = outcome.files.len() as i64;
             // `git:commit` mirrors the reserved `GitOperationEvent` FE shape;
             // `changes:git-status` feeds the FE bridge's `git:status-changed`
             // relay so the UI refreshes without a follow-up `git.status` read.
             publish_event(
                 &bus,
-                git_commit_event(&ws.id, &outcome.hash, &message, &to_commit),
+                git_commit_event(&ws.id, &outcome.hash, &message, &outcome.files),
             )
             .await;
             let status = intent_git::status::status(&worktree)
@@ -13768,7 +13794,7 @@ impl WorkspaceApi for Services {
             publish_event(&bus, changes_git_status_event(&ws.id, status_json)).await;
             Ok(intent_core::GitAgentCommitResult {
                 hash: outcome.hash,
-                files: to_commit,
+                files: outcome.files,
                 file_count,
             })
         })

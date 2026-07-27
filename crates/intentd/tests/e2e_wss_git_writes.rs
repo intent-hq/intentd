@@ -239,6 +239,11 @@ fn make_source_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("source-repo");
     std::fs::create_dir_all(&repo).expect("mkdir source repo");
     run_git(&["init", "-q", "-b", "main"], &repo);
+    // Repo-level identity: linked worktrees share the repo config, and the
+    // daemon-side commit paths (`repo.signature()`) need `user.name`/`user.email`
+    // — CI runners have no global git identity.
+    run_git(&["config", "user.name", "e2e"], &repo);
+    run_git(&["config", "user.email", "e2e@example.com"], &repo);
     std::fs::write(repo.join("tracked.txt"), "seed\n").unwrap();
     run_git(&["add", "tracked.txt"], &repo);
     run_git(&["commit", "-q", "-m", "seed"], &repo);
