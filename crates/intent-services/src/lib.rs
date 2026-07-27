@@ -6907,11 +6907,13 @@ impl WorkspaceApi for Services {
         let pty = self.pty.clone();
         let bus = self.event_bus.clone();
         let store = self.store.clone();
+        let settings = self.settings_registry.clone();
         Box::pin(async move {
             terminal_ops::create(
                 pty,
                 bus,
                 Some(store),
+                settings,
                 workspace_id,
                 cols,
                 rows,

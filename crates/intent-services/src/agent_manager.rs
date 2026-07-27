@@ -1303,8 +1303,9 @@ impl AgentManager {
         let child_pid = child.id();
         let connection = Arc::new(connection);
 
-        let terminal_host: Arc<dyn intent_acp::TerminalHost> =
-            Arc::new(crate::PtyTerminalHost::new(self.services.pty()));
+        let terminal_host: Arc<dyn intent_acp::TerminalHost> = Arc::new(
+            crate::PtyTerminalHost::new(self.services.pty(), self.services.settings_registry()),
+        );
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
@@ -3846,10 +3847,11 @@ impl AgentManager {
     ) -> Result<String> {
         let session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let settings = self.services.effective_settings();
         let mut resolved = resolve_spawn(
             &session,
             workspace.as_ref(),
-            &self.services.effective_settings(),
+            &settings,
             self.chief_cwd_root.as_deref(),
         )?;
 
@@ -3946,6 +3948,26 @@ impl AgentManager {
         opts.npx_fallback_package = resolved.npx_fallback_package;
         opts.extra_env = resolved.extra_env.clone();
         opts.unsloth_endpoint = resolved.unsloth_endpoint.as_ref();
+        // monorepo#884: offer the daemon-managed GitHub token to the provider
+        // child as a github.com-scoped credential helper — never as raw
+        // GITHUB_TOKEN/GH_TOKEN (the MCP secret denylist stays intact). Gated
+        // on the opt-out setting; the token resolves at spawn time only (no
+        // live refresh mid-session) and best-effort — setting off / no token
+        // leaves the child env untouched, and the spawn never fails on it.
+        let git_credential_expose = settings
+            .source_control
+            .github
+            .expose_git_credential_to_children;
+        let git_credential_token = if git_credential_expose {
+            self.services.ac_git_token(&resolved.cwd).await
+        } else {
+            None
+        };
+        inject_git_credential_env(
+            &mut opts.extra_env,
+            git_credential_expose,
+            git_credential_token.as_deref(),
+        );
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -4920,6 +4942,27 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.env_mcp_config = env_mcp_config;
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts
+}
+
+/// Append the github.com-scoped credential-helper env pairs (monorepo#884) to
+/// a provider spawn's extra env: `GIT_CONFIG_PARAMETERS` carrying the
+/// sq-quoted helper entry (no token bytes) and
+/// [`intent_git::auth::TOKEN_ENV`] carrying the token itself. The daemon's own
+/// `GIT_CONFIG_PARAMETERS` (which the child would inherit) is preserved by
+/// appending after it, so existing setups keep winning. Setting off or no
+/// usable token ⇒ no changes; pre-existing caller keys are never clobbered.
+fn inject_git_credential_env(
+    extra_env: &mut BTreeMap<String, String>,
+    expose: bool,
+    token: Option<&str>,
+) {
+    if !expose {
+        return;
+    }
+    let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+    for (key, value) in intent_git::auth::scoped_credential_env(token, inherited.as_deref()) {
+        extra_env.entry(key).or_insert(value);
+    }
 }
 
 /// Read the provider path from the `providers.paths` map setting, if set.
@@ -6698,6 +6741,51 @@ mod rebuild_spawn_opts_tests {
         opts.rules_file = Some("/caller/rules.md");
         let rebuilt = rebuild_spawn_opts(&opts, Some("/tmp/generated.md"), None, None);
         assert_eq!(rebuilt.rules_file, Some("/caller/rules.md"));
+    }
+
+    /// monorepo#884 on/off/no-token matrix for the provider-spawn credential
+    /// seam: setting on + usable token adds exactly the two helper pairs (and
+    /// never raw `GITHUB_TOKEN`/`GH_TOKEN`, with no token bytes in the config
+    /// value); setting off or no token leaves the env untouched.
+    #[test]
+    fn inject_git_credential_env_on_off_no_token_matrix() {
+        let token = "ghp_secret1234567890";
+
+        let mut env = BTreeMap::new();
+        inject_git_credential_env(&mut env, true, Some(token));
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                intent_git::auth::GIT_CONFIG_PARAMETERS_ENV,
+                intent_git::auth::TOKEN_ENV,
+            ]
+        );
+        assert_eq!(env.get(intent_git::auth::TOKEN_ENV).unwrap(), token);
+        assert!(
+            !env[intent_git::auth::GIT_CONFIG_PARAMETERS_ENV].contains(token),
+            "config value must not embed the token"
+        );
+
+        let mut env = BTreeMap::new();
+        inject_git_credential_env(&mut env, false, Some(token));
+        assert!(env.is_empty(), "setting off must not inject");
+
+        let mut env = BTreeMap::new();
+        inject_git_credential_env(&mut env, true, None);
+        assert!(env.is_empty(), "no token must not inject");
+    }
+
+    /// Pre-existing caller-set extra_env keys survive the injection — the
+    /// helper only fills vacant slots, never clobbers.
+    #[test]
+    fn inject_git_credential_env_preserves_existing_keys() {
+        let mut env = BTreeMap::from([(
+            intent_git::auth::TOKEN_ENV.to_string(),
+            "caller-set".to_string(),
+        )]);
+        inject_git_credential_env(&mut env, true, Some("ghp_secret1234567890"));
+        assert_eq!(env[intent_git::auth::TOKEN_ENV], "caller-set");
+        assert!(env.contains_key(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV));
     }
 }
 

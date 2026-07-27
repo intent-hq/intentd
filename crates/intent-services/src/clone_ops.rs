@@ -330,19 +330,21 @@ fn classified(detail: &str) -> Option<CloneErrorCategory> {
 /// Build the `git clone` command: argv, credential-helper config, and
 /// environment. Factored out of [`run_clone`] so tests can assert the
 /// secret-safety invariants directly — the token (when usable) is offered via
-/// a github.com-scoped `-c credential.…helper` whose config string carries no
-/// token bytes, with the value travelling through [`intent_git::auth::TOKEN_ENV`]
-/// only (monorepo#825).
-fn build_clone_command(url: &str, target_path: &Path, token: Option<&str>) -> Command {
+/// the shared [`intent_git::auth::scoped_credential_env`] builder: a
+/// github.com-scoped helper carried in `GIT_CONFIG_PARAMETERS` (appended after
+/// `inherited_config_parameters` so existing setups keep winning) whose config
+/// string carries no token bytes, with the value travelling through
+/// [`intent_git::auth::TOKEN_ENV`] only (monorepo#825, monorepo#884).
+fn build_clone_command(
+    url: &str,
+    target_path: &Path,
+    token: Option<&str>,
+    inherited_config_parameters: Option<&str>,
+) -> Command {
     let mut cmd = Command::new("git");
-    // Offer the resolved token as an extra credential helper scoped to
-    // github.com HTTPS only, appended after any configured helpers so an
-    // existing credential setup still wins (same chain as
-    // `intent_git::fetch`). The helper reads the secret from the environment
-    // — the argv below carries no token bytes.
-    if let Some(token) = intent_git::auth::usable_token(token) {
-        cmd.arg("-c").arg(intent_git::auth::token_helper_config());
-        cmd.env(intent_git::auth::TOKEN_ENV, token);
+    for (key, value) in intent_git::auth::scoped_credential_env(token, inherited_config_parameters)
+    {
+        cmd.env(key, value);
     }
     cmd.arg("clone")
         .arg("--progress")
@@ -380,7 +382,14 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
         }
     }
 
-    let mut cmd = build_clone_command(&url, &target_path, token.as_deref());
+    let inherited_config_parameters =
+        std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+    let mut cmd = build_clone_command(
+        &url,
+        &target_path,
+        token.as_deref(),
+        inherited_config_parameters.as_deref(),
+    );
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1151,7 +1160,8 @@ mod tests {
     /// Regression for monorepo#825: a usable token is offered to the clone
     /// child via the env-backed github.com-scoped credential helper — the
     /// token bytes never appear in argv (process listings / logs), only in
-    /// the child environment under `TOKEN_ENV`.
+    /// the child environment under `TOKEN_ENV`, with the helper config
+    /// carried by `GIT_CONFIG_PARAMETERS` (monorepo#884).
     #[test]
     fn build_clone_command_injects_token_via_env_not_argv() {
         let token = "ghp_secret1234567890";
@@ -1159,6 +1169,7 @@ mod tests {
             "https://github.com/acme/private.git",
             Path::new("/tmp/x"),
             Some(token),
+            None,
         );
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -1170,9 +1181,8 @@ mod tests {
             "token must never appear in argv: {args:?}"
         );
         assert!(
-            args.iter()
-                .any(|a| a.starts_with("credential.https://github.com.helper=")),
-            "credential helper config present: {args:?}"
+            args.iter().all(|a| !a.contains("credential.")),
+            "helper config travels via the environment, not argv: {args:?}"
         );
         let env: Vec<(String, Option<String>)> = std_cmd
             .get_envs()
@@ -1183,6 +1193,19 @@ mod tests {
                 )
             })
             .collect();
+        let params = env
+            .iter()
+            .find(|(k, _)| k == intent_git::auth::GIT_CONFIG_PARAMETERS_ENV)
+            .and_then(|(_, v)| v.clone())
+            .expect("GIT_CONFIG_PARAMETERS must carry the helper config");
+        assert!(
+            params.contains("credential.https://github.com.helper="),
+            "github.com-scoped helper present: {params}"
+        );
+        assert!(
+            !params.contains(token),
+            "helper config must not embed the token"
+        );
         assert!(
             env.iter()
                 .any(|(k, v)| k == intent_git::auth::TOKEN_ENV && v.as_deref() == Some(token)),
@@ -1196,8 +1219,32 @@ mod tests {
         );
     }
 
+    /// An inherited `GIT_CONFIG_PARAMETERS` value survives token injection:
+    /// the helper entry is appended after it, never replacing it.
+    #[test]
+    fn build_clone_command_appends_helper_to_inherited_parameters() {
+        let cmd = build_clone_command(
+            "https://github.com/acme/private.git",
+            Path::new("/tmp/x"),
+            Some("tok"),
+            Some("'foo.bar=baz'"),
+        );
+        let params = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| k.to_string_lossy() == intent_git::auth::GIT_CONFIG_PARAMETERS_ENV)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+            .expect("GIT_CONFIG_PARAMETERS must be set");
+        assert!(
+            params.starts_with("'foo.bar=baz' "),
+            "inherited entries keep precedence: {params}"
+        );
+        assert!(params.contains("credential.https://github.com.helper="));
+    }
+
     /// No token (or an unusable one) leaves the command untouched: no helper
-    /// config in argv, no token env var.
+    /// config anywhere, no token env var, no `GIT_CONFIG_PARAMETERS`
+    /// override (any inherited value passes through untouched).
     #[test]
     fn build_clone_command_without_token_adds_no_helper() {
         for token in [None, Some(""), Some("  "), Some("bad\ntoken")] {
@@ -1205,6 +1252,7 @@ mod tests {
                 "https://github.com/acme/repo.git",
                 Path::new("/tmp/x"),
                 token,
+                None,
             );
             let std_cmd = cmd.as_std();
             let args: Vec<String> = std_cmd
@@ -1216,10 +1264,12 @@ mod tests {
                 "no helper config without a usable token: {args:?}"
             );
             assert!(
-                std_cmd
-                    .get_envs()
-                    .all(|(k, _)| k.to_string_lossy() != intent_git::auth::TOKEN_ENV),
-                "no token env var without a usable token"
+                std_cmd.get_envs().all(|(k, _)| {
+                    let k = k.to_string_lossy();
+                    k != intent_git::auth::TOKEN_ENV
+                        && k != intent_git::auth::GIT_CONFIG_PARAMETERS_ENV
+                }),
+                "no token / config-parameters env vars without a usable token"
             );
         }
     }

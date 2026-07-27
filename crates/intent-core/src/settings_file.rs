@@ -307,6 +307,11 @@ pub struct GithubSettings {
     /// `sourceControl.github.oauthClientId` — OAuth App client id for the
     /// device flow (public, not a secret).
     pub oauth_client_id: String,
+    /// `sourceControl.github.exposeGitCredentialToChildren` — inject the
+    /// daemon-managed GitHub credential into child process environments as a
+    /// github.com-scoped credential helper (never raw
+    /// `GITHUB_TOKEN`/`GH_TOKEN`).
+    pub expose_git_credential_to_children: bool,
 }
 
 impl Default for GithubSettings {
@@ -315,6 +320,7 @@ impl Default for GithubSettings {
             token_source: GithubTokenSource::Auto,
             api_base_url: "https://api.github.com".to_string(),
             oauth_client_id: DEFAULT_GITHUB_OAUTH_CLIENT_ID.to_string(),
+            expose_git_credential_to_children: true,
         }
     }
 }
@@ -767,6 +773,10 @@ apiBaseUrl = "https://api.github.com"
 # GitHub OAuth client ID -- OAuth App client id for the device flow (public,
 # not a secret).
 oauthClientId = "Ov23li8bvmPsd4B4pW38"
+# Expose Git credential to terminals and agents -- inject the daemon-managed
+# GitHub credential into child process environments as a scoped
+# github.com-only credential helper (never raw GITHUB_TOKEN/GH_TOKEN).
+exposeGitCredentialToChildren = true
 
 [accounts.sentry]
 # Sentry organization -- Sentry organization slug (non-secret companion of the
@@ -869,6 +879,7 @@ mod tests {
             d.source_control.github.oauth_client_id,
             DEFAULT_GITHUB_OAUTH_CLIENT_ID
         );
+        assert!(d.source_control.github.expose_git_credential_to_children);
         assert_eq!(d.accounts.sentry.organization, None);
         assert!(d.context.enabled);
         assert!(d.context.allow_indexing);

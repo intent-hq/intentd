@@ -1008,6 +1008,15 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "sourceControl",
             Some(intent_core::settings_file::DEFAULT_GITHUB_OAUTH_CLIENT_ID),
         ),
+        boolean(
+            "sourceControl.github.exposeGitCredentialToChildren",
+            "Expose Git credential to terminals and agents",
+            "Inject the daemon-managed GitHub credential into child process \
+             environments as a scoped github.com-only credential helper — \
+             never as a raw GITHUB_TOKEN/GH_TOKEN",
+            "sourceControl",
+            true,
+        ),
         // --- Group A: Linear integration --------------------------------------
         secret(
             "linear.token",
@@ -1936,6 +1945,74 @@ mod tests {
             None,
             "TOML-backed keys must never write a SQLite settings row"
         );
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// monorepo#884: `sourceControl.github.exposeGitCredentialToChildren`
+    /// gates whether daemon-managed GitHub credentials are injected into
+    /// child process environments — a non-sensitive TOML-backed boolean,
+    /// default `true` (opt-out), that round-trips through `settings.update`
+    /// / `settings.reset` with config.toml persistence and `origin`.
+    #[tokio::test]
+    async fn expose_git_credential_to_children_is_a_toml_backed_boolean() {
+        let path = "sourceControl.github.exposeGitCredentialToChildren";
+        let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+        assert!(matches!(def.ty, SettingType::Boolean));
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "sourceControl");
+        assert_eq!(def.default_value, Some(json!(true)));
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-gitcred-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-gitcred-{tag}.toml"));
+        // Start from an empty file (not the commented default template) so
+        // origins read `default` until the key is explicitly written.
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        // Default-on with `default` origin.
+        let got = svc.get(path).await.expect("get default");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
+
+        // Opt-out persists to config.toml with `file` origin, never SQLite.
+        svc.update(&json!([{ "path": path, "value": false }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get updated");
+        assert_eq!(got["value"], json!(false));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("exposeGitCredentialToChildren"), "{text}");
+        assert_eq!(
+            store.get_setting(path).await.expect("read settings table"),
+            None,
+            "TOML-backed keys must never write a SQLite settings row"
+        );
+
+        // Reset restores the default and strips the key from the file.
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], json!(true));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !text.contains("exposeGitCredentialToChildren = false"),
+            "{text}"
+        );
+        let got = svc.get(path).await.expect("get after reset");
+        assert_eq!(got["value"], json!(true));
+        assert_eq!(got["origin"], json!("default"));
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

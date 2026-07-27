@@ -48,6 +48,60 @@ pub fn token_helper_config() -> String {
     )
 }
 
+/// Environment variable git reads for command-line-scoped config entries —
+/// the same mechanism `git -c` uses to reach child processes. Entries here
+/// rank as "command line" config: applied after every config file, so an
+/// appended helper never displaces a user-configured one.
+pub const GIT_CONFIG_PARAMETERS_ENV: &str = "GIT_CONFIG_PARAMETERS";
+
+/// Build the environment pairs a spawn site injects to offer `token` as a
+/// github.com-scoped credential helper (monorepo#884): the sq-quoted
+/// [`token_helper_config`] entry **appended** to any
+/// `inherited_config_parameters` (the caller's pre-existing
+/// [`GIT_CONFIG_PARAMETERS_ENV`] value, so inherited entries — and the user's
+/// configured helpers, which git applies first — keep winning), plus
+/// [`TOKEN_ENV`] carrying the token itself. The config value never contains
+/// token bytes; the token travels only under [`TOKEN_ENV`]. Returns no pairs
+/// when the token is unusable (see [`usable_token`]), leaving the child env
+/// untouched.
+pub fn scoped_credential_env(
+    token: Option<&str>,
+    inherited_config_parameters: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(token) = usable_token(token) else {
+        return Vec::new();
+    };
+    let entry = sq_quote(&token_helper_config());
+    let params = match inherited_config_parameters {
+        Some(prev) if !prev.trim().is_empty() => format!("{prev} {entry}"),
+        _ => entry,
+    };
+    vec![
+        (GIT_CONFIG_PARAMETERS_ENV.to_string(), params),
+        (TOKEN_ENV.to_string(), token.to_string()),
+    ]
+}
+
+/// Single-quote `src` for `GIT_CONFIG_PARAMETERS`, mirroring git's own
+/// `sq_quote_buf` (quote.c): wrap in `'…'` and escape embedded `'` and `!`
+/// as `'\''` / `'\!'` — the exact forms git's `sq_dequote` parser accepts.
+fn sq_quote(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 2);
+    out.push('\'');
+    for c in src.chars() {
+        if c == '\'' || c == '!' {
+            out.push('\'');
+            out.push('\\');
+            out.push(c);
+            out.push('\'');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Whether `url` is an HTTPS remote on `github.com` (the only host the
 /// resolved-token fallback applies to). Handles optional userinfo and port in
 /// the authority; subdomains and other hosts do not match. Exposed so callers
@@ -397,5 +451,85 @@ mod tests {
         }
         // (`Ok` is only reachable when the developer's credential helper
         // answers for this host — environment-dependent, so not asserted.)
+    }
+
+    /// The env builder yields exactly the two pairs: `GIT_CONFIG_PARAMETERS`
+    /// carrying the sq-quoted github.com-scoped helper (no token bytes), and
+    /// `TOKEN_ENV` carrying the token — and real git parses the quoting back
+    /// to the exact helper string.
+    #[test]
+    fn scoped_credential_env_builds_parseable_helper_without_token_bytes() {
+        let token = "ghp_secret1234567890";
+        let pairs = scoped_credential_env(Some(token), None);
+        assert_eq!(pairs.len(), 2);
+        let (k0, params) = &pairs[0];
+        assert_eq!(k0, GIT_CONFIG_PARAMETERS_ENV);
+        assert!(
+            !params.contains(token),
+            "config value must not embed the token"
+        );
+        assert_eq!(pairs[1], (TOKEN_ENV.to_string(), token.to_string()));
+
+        // Round-trip through real git: the command-line-scoped entry must
+        // dequote back to the exact helper snippet.
+        let out = std::process::Command::new("git")
+            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+            .args(["config", "--get", "credential.https://github.com.helper"])
+            .output()
+            .expect("git must be runnable");
+        assert!(out.status.success(), "git must parse the quoted parameters");
+        let value = String::from_utf8_lossy(&out.stdout);
+        let expected = token_helper_config();
+        let expected_value = expected
+            .strip_prefix("credential.https://github.com.helper=")
+            .unwrap();
+        assert_eq!(value.trim_end_matches('\n'), expected_value);
+    }
+
+    /// A pre-existing `GIT_CONFIG_PARAMETERS` value is preserved and the
+    /// helper entry is appended after it (space-separated), so inherited
+    /// entries keep their precedence and both remain parseable by git.
+    #[test]
+    fn scoped_credential_env_appends_to_inherited_parameters() {
+        let inherited = "'foo.bar=baz'";
+        let pairs = scoped_credential_env(Some("tok"), Some(inherited));
+        let params = &pairs[0].1;
+        assert!(
+            params.starts_with("'foo.bar=baz' '"),
+            "inherited entry must come first: {params}"
+        );
+        let out = std::process::Command::new("git")
+            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+            .args(["config", "--get", "foo.bar"])
+            .output()
+            .expect("git must be runnable");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "baz");
+
+        // Blank inherited values are treated as absent — no stray separator.
+        let pairs = scoped_credential_env(Some("tok"), Some("   "));
+        assert!(
+            pairs[0].1.starts_with('\''),
+            "no leading junk: {}",
+            pairs[0].1
+        );
+    }
+
+    /// No usable token → no pairs at all, so the spawn site leaves the child
+    /// environment (including any inherited `GIT_CONFIG_PARAMETERS`) alone.
+    #[test]
+    fn scoped_credential_env_empty_without_usable_token() {
+        for token in [None, Some(""), Some("   "), Some("bad\ntoken")] {
+            assert!(scoped_credential_env(token, Some("'foo.bar=baz'")).is_empty());
+        }
+    }
+
+    /// The sq-quoting matches git's `sq_quote_buf`: `'` and `!` escape as
+    /// `'\''` / `'\!'` — the helper snippet contains both.
+    #[test]
+    fn sq_quote_escapes_like_git() {
+        assert_eq!(sq_quote("plain"), "'plain'");
+        assert_eq!(sq_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sq_quote("!f"), "''\\!'f'");
     }
 }
