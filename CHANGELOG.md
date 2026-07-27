@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.9] - 2026-07-27
+
+### 🚀 Features
+
+- Add provider dimension to usage stats and byProvider in stats.getUsage ([#594](https://github.com/intent-hq/intentd/pull/594))
+
+
 ## [0.2.8] - 2026-07-27
 
 ### 🚀 Features
