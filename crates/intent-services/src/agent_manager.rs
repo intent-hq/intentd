@@ -960,6 +960,11 @@ pub struct AgentManager {
     /// session row would close this; not done here to keep parity with the
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
+    /// Daemon-owned singleton Unsloth server (spec "Proposed design" §4,
+    /// monorepo#878): started on demand when an `unsloth`-provider agent
+    /// spawns, reused while the served model matches, restarted on model
+    /// switch, and killed on daemon [`AgentManager::shutdown`].
+    unsloth: Arc<crate::unsloth_server::UnslothServerManager>,
 }
 
 impl AgentManager {
@@ -1022,6 +1027,7 @@ impl AgentManager {
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
+            unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
         }
     }
 
@@ -3725,7 +3731,7 @@ impl AgentManager {
     ) -> Result<String> {
         let session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
-        let resolved = resolve_spawn(
+        let mut resolved = resolve_spawn(
             &session,
             workspace.as_ref(),
             &self.services.effective_settings(),
@@ -3778,6 +3784,39 @@ impl AgentManager {
                 tracing::warn!(agent_id = %agent_id, "cached agent child is dead; respawning before turn");
                 self.kill_child_only(agent_id).await;
             }
+        }
+        // unsloth spawn gate (spec "Proposed design" §4): before the child
+        // spawns, make sure the daemon-managed Unsloth server is running and
+        // ready for the session's model, and thread the resulting endpoint
+        // (baseURL/apiKey/limits) into the OPENCODE_CONFIG_CONTENT injection.
+        // Only needed when a fresh child will actually spawn — a reused live
+        // child already carries the endpoint it was spawned with.
+        if resolved.provider.id == "unsloth" && !self.contains(agent_id) {
+            let repo_id = resolved.model.clone().ok_or_else(|| {
+                Error::InvalidParams(
+                    "unsloth provider requires a model (pick one from the unsloth catalog)"
+                        .to_string(),
+                )
+            })?;
+            // Progress callback: surface download/loading status as
+            // `agent:stream:status` turn-startup hints (D4 — first use can
+            // mean a multi-GB download; the FE shows the phase message next
+            // to the pre-first-token spinner).
+            let services = self.services.clone();
+            let ws = workspace_id.clone();
+            let aid = agent_id.clone();
+            let status_cb = move |message: String| {
+                let services = services.clone();
+                let ws = ws.clone();
+                let aid = aid.clone();
+                tokio::spawn(async move {
+                    services
+                        .publish_status_event(&ws, &aid, "launch", &message, "info")
+                        .await;
+                });
+            };
+            let endpoint = self.unsloth.ensure_endpoint(&repo_id, &status_cb).await?;
+            resolved.unsloth_endpoint = Some(endpoint);
         }
         let mut opts = SpawnOptions::new(&resolved.provider);
         opts.cwd = Some(&resolved.cwd);
@@ -3924,6 +3963,9 @@ impl AgentManager {
             }
         }
         kill_child_trees(children).await;
+        // The daemon-managed Unsloth server is not an agent child — tear it
+        // down explicitly so a clean shutdown never orphans it.
+        self.unsloth.shutdown().await;
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
@@ -4431,8 +4473,11 @@ struct ResolvedSpawn {
     npx_fallback_binary: Option<PathBuf>,
     /// The package name to pass to npx when npx_fallback_binary is set.
     npx_fallback_package: Option<&'static str>,
-    /// Unsloth-managed server endpoint for the `unsloth` provider (see
-    /// [`resolve_unsloth_endpoint`]). Always `None` for other providers.
+    /// Unsloth-managed server endpoint for the `unsloth` provider, filled in
+    /// by [`AgentManager::ensure_started`] via
+    /// [`crate::unsloth_server::UnslothServerManager::ensure_endpoint`]
+    /// before a fresh child spawns. Always `None` for other providers (and
+    /// straight out of [`resolve_spawn`], which never starts the server).
     unsloth_endpoint: Option<intent_providers::UnslothEndpoint>,
 }
 
@@ -4617,7 +4662,9 @@ fn resolve_spawn(
     }
 
     let provider = *intent_providers::provider_config(&provider_id);
-    let unsloth_endpoint = resolve_unsloth_endpoint(&provider_id);
+    // Filled by `ensure_started` (unsloth spawn gate) — pure resolution here
+    // never starts the managed server.
+    let unsloth_endpoint = None;
 
     // npx-only providers (claude-code) are spawned exclusively via
     // `npx -y <pinned package>`; local-binary discovery (settings path /
@@ -4683,18 +4730,6 @@ fn resolve_spawn(
         npx_fallback_package,
         unsloth_endpoint,
     })
-}
-
-/// Resolve the Unsloth-managed server endpoint for an `unsloth` spawn. The
-/// managed-server lifecycle (which starts the local Unsloth Studio server and
-/// owns its baseURL/apiKey/model) is not built yet, so this returns `None`
-/// and the unsloth child spawns with permission-only config — the seam is
-/// here so the lifecycle only has to fill in this one function.
-fn resolve_unsloth_endpoint(provider_id: &str) -> Option<intent_providers::UnslothEndpoint> {
-    if provider_id != "unsloth" {
-        return None;
-    }
-    None
 }
 
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the

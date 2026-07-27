@@ -92,6 +92,7 @@ mod settings;
 mod settings_registry;
 mod terminal_ops;
 pub mod tool_block;
+mod unsloth_server;
 mod workspace_aggregates;
 
 #[cfg(test)]
