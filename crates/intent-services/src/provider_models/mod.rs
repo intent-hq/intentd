@@ -27,10 +27,15 @@
 //! - `grok` — native CLI: `grok models` parsed via
 //!   [`intent_providers::parse_grok_models_command_output`] (auth markers +
 //!   JSON payload + text rows; the exit code is never trusted).
+//! - `unsloth` — HTTP fetch of the Hugging Face `unsloth` org's GGUF repos
+//!   (`https://huggingface.co/api/models?author=unsloth&filter=gguf`), one
+//!   wire row per repo (never per-quant), filtered to repos estimated to fit
+//!   within ~70% of total system RAM (a parsed parameter count × a
+//!   Q4-class bytes/param estimate). See [`parse::build_unsloth_rows`].
 //!
 //! auggie (existing CLI path in `agent_ops`) and cortex (static catalog) are
 //! deliberately NOT implemented here — they live in [`crate::model_catalog`],
-//! whose provider→source registry wires these six sources into `models.list`
+//! whose provider→source registry wires these sources into `models.list`
 //! alongside them.
 
 use std::path::{Path, PathBuf};
@@ -49,6 +54,16 @@ const OPENCODE_CLI_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for the one-shot `grok models` CLI invocation.
 const GROK_CLI_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for the Hugging Face `unsloth` catalog HTTP fetch.
+const UNSLOTH_HF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hugging Face `models` list API, scoped to the `unsloth` org's GGUF repos.
+/// `limit=1000` covers the org's full catalog (~350 repos as of 2026-07) in
+/// one request — HF's default page size (~50) would otherwise require
+/// pagination we don't need.
+const UNSLOTH_HF_API_URL: &str =
+    "https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000";
 
 /// Result of a provider model-catalog fetch.
 ///
@@ -100,6 +115,7 @@ pub async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFetch {
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
         "grok" => fetch_grok_models().await,
+        "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
 }
@@ -486,6 +502,73 @@ async fn run_grok_models_cli(
         Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("failed to run grok models: {e}")),
         Err(_) => Err("grok models timed out".to_string()),
+    }
+}
+
+/// unsloth: fetch the Hugging Face `unsloth` org's GGUF repos and build one
+/// wire row per repo, filtered to repos estimated to fit within ~70% of
+/// total system RAM. On a platform where RAM detection is unsupported
+/// ([`crate::agent_manager::total_memory_bytes`] returns `None`), the fit
+/// filter is skipped and every repo is returned — never mis-filtered.
+pub async fn fetch_unsloth_models() -> ProviderModelsFetch {
+    let body = match fetch_unsloth_hf_catalog(UNSLOTH_HF_TIMEOUT).await {
+        Ok(body) => body,
+        Err(reason) => return ProviderModelsFetch::unavailable("unsloth", reason),
+    };
+    unsloth_fetch_outcome(&body, crate::agent_manager::total_memory_bytes())
+}
+
+/// GET [`UNSLOTH_HF_API_URL`] with a hard timeout, returning the raw JSON
+/// response body. The timeout is injectable for tests (this function is not
+/// itself unit-tested against the network; see [`unsloth_fetch_outcome`] for
+/// the pure, fixture-driven parsing/filtering logic).
+async fn fetch_unsloth_hf_catalog(timeout: Duration) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let resp = client
+        .get(UNSLOTH_HF_API_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("huggingface request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("huggingface returned {status}"));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("failed to read huggingface response: {e}"))
+}
+
+/// Map one fetched HF catalog response onto the fetch contract (the pure
+/// seam unit tests drive with a recorded fixture, no network). A response
+/// that parses to zero repos, or whose fit filter hides every repo, degrades
+/// to "no models reported" rather than an empty success — matching the
+/// opencode/grok "no models reported" convention so an empty catalog is
+/// never silently cached as valid.
+fn unsloth_fetch_outcome(body: &str, total_ram_bytes: Option<u64>) -> ProviderModelsFetch {
+    let repos = parse::parse_hf_unsloth_response(body);
+    if repos.is_empty() {
+        return ProviderModelsFetch::unavailable("unsloth", "no models reported");
+    }
+    let (rows, hidden) = parse::build_unsloth_rows(&repos, total_ram_bytes);
+    if rows.is_empty() {
+        return ProviderModelsFetch::unavailable(
+            "unsloth",
+            format!("no models reported (all {hidden} repos too large for available memory)"),
+        );
+    }
+    if hidden > 0 {
+        ProviderModelsFetch {
+            models: Some(rows),
+            warning: Some(format!(
+                "unsloth: {hidden} repo(s) hidden (estimated to exceed available memory)"
+            )),
+        }
+    } else {
+        ProviderModelsFetch::ok(rows)
     }
 }
 

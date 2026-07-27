@@ -19,8 +19,9 @@
 //!
 //! The registry lists every provider with a daemon-side model source: auggie
 //! (rich CLI fetch), cortex (feature-code-gated static catalog), the
-//! ACP-probe sources (claude-code/codex/pi/droid), and the native-CLI
-//! sources (opencode, grok) via [`crate::provider_models`].
+//! ACP-probe sources (claude-code/codex/pi/droid), the native-CLI sources
+//! (opencode, grok), and the HTTP-fetch source (unsloth) via
+//! [`crate::provider_models`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -203,6 +204,12 @@ fn grok_fetch() -> BoxFuture<'static, ModelFetchResult> {
     provider_models_fetch("grok")
 }
 
+/// unsloth source: Hugging Face `unsloth` org GGUF catalog (no adapter pin —
+/// the fetch is a plain HTTP call, not a spawned/pinned adapter).
+fn unsloth_fetch() -> BoxFuture<'static, ModelFetchResult> {
+    provider_models_fetch("unsloth")
+}
+
 /// The provider→source registry: every provider with a daemon-side model
 /// source.
 static SOURCES: &[ModelSource] = &[
@@ -245,6 +252,11 @@ static SOURCES: &[ModelSource] = &[
         provider_id: "grok",
         version_key: no_version,
         fetch: grok_fetch,
+    },
+    ModelSource {
+        provider_id: "unsloth",
+        version_key: no_version,
+        fetch: unsloth_fetch,
     },
 ];
 

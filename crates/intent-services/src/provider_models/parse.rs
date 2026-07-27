@@ -220,6 +220,198 @@ fn title_case_model(model_id: &str) -> String {
         .join(" ")
 }
 
+/// One public (non-private) repo entry from the Hugging Face `models` list
+/// API, trimmed to the fields the unsloth catalog source needs.
+pub(super) struct HfRepo {
+    /// Full HF repo id, e.g. `unsloth/Qwen3.6-35B-A3B-GGUF`.
+    pub id: String,
+    pub downloads: u64,
+    pub trending_score: f64,
+}
+
+/// Parse the raw JSON array returned by
+/// `https://huggingface.co/api/models?author=unsloth&filter=gguf&limit=1000`
+/// into [`HfRepo`] rows. Private repos are dropped (the API should never
+/// return them for an unauthenticated request, but the check is cheap
+/// insurance); entries missing a non-empty `id` are skipped. Malformed JSON
+/// (not an array) yields an empty list rather than an error — the caller
+/// treats an empty result as "no models reported".
+pub(super) fn parse_hf_unsloth_response(body: &str) -> Vec<HfRepo> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.get("private").and_then(Value::as_bool) != Some(true))
+        .filter_map(|entry| {
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())?
+                .to_string();
+            let downloads = entry.get("downloads").and_then(Value::as_u64).unwrap_or(0);
+            let trending_score = entry
+                .get("trendingScore")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            Some(HfRepo {
+                id,
+                downloads,
+                trending_score,
+            })
+        })
+        .collect()
+}
+
+/// Bytes-per-parameter estimate for a Q4-class GGUF quant (the middle of the
+/// unsloth catalog's typical quant range): ~0.6 bytes/param, close to Q4_K_M.
+const BYTES_PER_PARAM_Q4: f64 = 0.6;
+
+/// Fixed headroom (KV cache, context, runtime overhead) added on top of the
+/// raw weights estimate. 1 GiB is a conservative single value across model
+/// sizes — exact KV-cache cost scales with context length and is not worth
+/// modeling precisely here.
+const FIT_HEADROOM_BYTES: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Fraction of total system RAM a model's estimated footprint must fit
+/// within, leaving room for the OS, the daemon, and other agent processes.
+const RAM_FIT_FRACTION: f64 = 0.7;
+
+/// Estimate a model's resident-memory footprint in bytes from its total
+/// parameter count (in billions): raw Q4-class weights plus a fixed
+/// headroom for KV cache / runtime overhead.
+pub(super) fn estimate_model_bytes(params_billion: f64) -> f64 {
+    params_billion * 1_000_000_000_f64 * BYTES_PER_PARAM_Q4 + FIT_HEADROOM_BYTES
+}
+
+/// Whether a model with `params_billion` total parameters is estimated to
+/// fit within [`RAM_FIT_FRACTION`] of `total_ram_bytes`.
+pub(super) fn fits_within_ram(params_billion: f64, total_ram_bytes: u64) -> bool {
+    estimate_model_bytes(params_billion) <= (total_ram_bytes as f64) * RAM_FIT_FRACTION
+}
+
+/// Parse the total parameter count (in billions) out of an HF repo id's model
+/// name, tolerating both dense names (`27B`) and MoE names that also carry an
+/// active-parameter suffix (`35B-A3B` — the total is `35B`; `A3B` is the
+/// active count and is skipped). Returns `None` when no size token is found
+/// (e.g. `grok-2-GGUF`, `Qwen3-Coder-Next-GGUF`) — the catalog treats an
+/// unparseable size as unknown and excludes it from the fit-filtered list
+/// rather than guessing.
+pub(super) fn parse_param_count_billions(repo_id: &str) -> Option<f64> {
+    let name = repo_id.rsplit('/').next().unwrap_or(repo_id);
+    name.split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .filter(|t| !t.is_empty())
+        .find_map(parse_size_token)
+}
+
+/// Parse one `-`/`_`-delimited name token as a total-parameter size
+/// (`27B`, `0.8B`, `270M`), skipping MoE active-parameter markers (`A3B`).
+fn parse_size_token(token: &str) -> Option<f64> {
+    let lower = token.to_ascii_lowercase();
+    let mut chars = lower.chars();
+    let unit = match chars.next_back()? {
+        'b' => 1_000_000_000_f64,
+        'm' => 1_000_000_f64,
+        _ => return None,
+    };
+    let digits: String = chars.collect();
+    if digits.is_empty() {
+        return None;
+    }
+    if let Some(rest) = digits.strip_prefix('a') {
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            // Active-parameter marker (e.g. "a3b" in "35B-A3B"): not the
+            // total, so let the dense/total token win instead.
+            return None;
+        }
+    }
+    if digits.matches('.').count() > 1 || !digits.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let value: f64 = digits.parse().ok()?;
+    Some(value * unit / 1_000_000_000_f64)
+}
+
+/// Strip a trailing `-GGUF` (case-insensitive) from a bare repo name.
+fn strip_gguf_suffix(name: &str) -> &str {
+    if name.len() >= 5 && name[name.len() - 5..].eq_ignore_ascii_case("-gguf") {
+        &name[..name.len() - 5]
+    } else {
+        name
+    }
+}
+
+/// Display name for an unsloth repo: the bare repo name (author prefix
+/// dropped) with the trailing `-GGUF` marker stripped.
+fn unsloth_display_name(repo_id: &str) -> String {
+    let name = repo_id.rsplit('/').next().unwrap_or(repo_id);
+    strip_gguf_suffix(name).to_string()
+}
+
+/// Group a non-negative integer's digits with `,` thousands separators
+/// (`811019` -> `811,019`).
+fn format_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().rev().enumerate() {
+        if i != 0 && i % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped.chars().rev().collect()
+}
+
+/// Build one unsloth wire row: `id` is the full HF repo id (never per-quant),
+/// `name` is the bare repo name, and `description` reports the HF download
+/// count (the ranking signal used to sort the catalog).
+fn unsloth_wire_row(repo: &HfRepo) -> Value {
+    let name = unsloth_display_name(&repo.id);
+    let description = format!("{} downloads", format_thousands(repo.downloads));
+    wire_row(&repo.id, &name, "unsloth", Some(&description))
+}
+
+/// Build the unsloth catalog's wire rows from parsed HF repos: sorted by
+/// downloads (ties broken by `trendingScore`, both descending) and filtered
+/// to repos whose estimated footprint fits [`RAM_FIT_FRACTION`] of
+/// `total_ram_bytes`. `total_ram_bytes: None` (RAM detection unsupported on
+/// this platform) skips the fit filter entirely — every repo is included.
+/// Returns the wire rows plus how many repos were hidden by the fit filter
+/// (too large, or of unknown/unparseable size).
+pub(super) fn build_unsloth_rows(
+    repos: &[HfRepo],
+    total_ram_bytes: Option<u64>,
+) -> (Vec<Value>, usize) {
+    let mut sorted: Vec<&HfRepo> = repos.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.downloads.cmp(&a.downloads).then_with(|| {
+            b.trending_score
+                .partial_cmp(&a.trending_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    let Some(total_ram_bytes) = total_ram_bytes else {
+        return (sorted.iter().map(|r| unsloth_wire_row(r)).collect(), 0);
+    };
+
+    let mut rows = Vec::with_capacity(sorted.len());
+    let mut hidden = 0usize;
+    for repo in sorted {
+        match parse_param_count_billions(&repo.id) {
+            Some(params_billion) if fits_within_ram(params_billion, total_ram_bytes) => {
+                rows.push(unsloth_wire_row(repo));
+            }
+            _ => hidden += 1,
+        }
+    }
+    (rows, hidden)
+}
+
 /// Whether a JSON-RPC error from an adapter signals "authentication
 /// required" (parity with the FE droid probe's `isAuthRequiredError`).
 pub(super) fn is_auth_required_error(code: i64, message: &str) -> bool {
