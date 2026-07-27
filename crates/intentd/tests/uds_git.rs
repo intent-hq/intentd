@@ -295,6 +295,35 @@ async fn uds_git_write_ops_round_trip() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32603));
 
+    // (i2) agent-initiated (no `files`, no `userRequested`) with no agent
+    // context: the FE/transport path never carries an agentId, so the
+    // attribution-filtered fallback (monorepo#939) refuses with -32603
+    // instead of sweeping the dirty worktree (other.txt is still untracked
+    // from step (h)).
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":30,"method":"git.agentCommit","params":{"workspaceId":"ws-git","message":"agent sweep"}}"#,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32603));
+    assert!(
+        resp["error"]["data"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be attributed"),
+        "refusal names the attribution gap: {resp}"
+    );
+    let resp = send(
+        &config.socket_path,
+        r#"{"jsonrpc":"2.0","id":31,"method":"git.status","params":{"workspaceId":"ws-git"}}"#,
+    )
+    .await;
+    let files = resp["result"]["files"].as_array().expect("files array");
+    assert!(
+        files.iter().any(|f| f["path"] == json!("other.txt")),
+        "refusal left the dirty worktree untouched: {files:?}"
+    );
+
     // (j) git.discard restores an unstaged tracked modification from the
     // index. After step (h) HEAD/index have seed.txt = "seed changed again\n"
     // (the userRequested checkpoint), so discard must restore to that content

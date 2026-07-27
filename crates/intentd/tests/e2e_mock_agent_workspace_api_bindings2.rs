@@ -592,6 +592,190 @@ async fn git_bindings_status_stage_commit() {
     let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
+/// Attribution-filtered `ws.git.agentCommit` fallback (monorepo#939): an
+/// agent-context `ws.file.write` records a `tracked_changes` attribution row,
+/// and a subsequent no-`files` `ws.git.agentCommit` commits only the agent's
+/// attributed path — a pre-existing unattributed dirty file stays in the
+/// worktree. This drives the full ingest → filter loop over the real MCP
+/// bridge (the same path idle auto-commit takes).
+#[tokio::test]
+async fn git_bindings_agent_commit_filters_to_attributed_paths() {
+    let Some(script) = gate() else { return };
+
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping git e2e: git not available");
+        return;
+    }
+
+    let repo_dir = std::env::temp_dir().join(format!("itd-e2e-gitattr-{}", uuid::Uuid::new_v4()));
+    let run_git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} failed to execute: {}", args.join(" "), e));
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+    run_git(&["init"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["config", "user.email", "test@test.com"]);
+    run_git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo_dir.join("README.md"), "initial").expect("write readme");
+    run_git(&["add", "README.md"]);
+    run_git(&["commit", "-m", "initial"]);
+
+    // Unattributed dirty file: written outside any agent context.
+    std::fs::write(repo_dir.join("unattributed.txt"), "someone else\n").expect("write dirty");
+
+    let db = std::env::temp_dir().join(format!("intentd-e2e-gitattr-{}.db", uuid::Uuid::new_v4()));
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone())
+        .with_workspaces_root(repo_dir.clone())
+        .with_event_bus(bus.clone());
+
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&ws, Some(repo_dir.clone())))
+        .await
+        .expect("insert ws");
+
+    let agent_val = services
+        .agent_create(
+            ws.clone(),
+            Some("E2E Git Attr".into()),
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .expect("create agent");
+    let agent_id = AgentId::from(agent_val["agent"]["id"].as_str().unwrap());
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    // The agent writes its own file, then agent-commits with no `files` list:
+    // the fallback must pick up only the attributed write.
+    let js = r#"
+        await ws.file.write('agent-file.txt', 'agent content\n');
+        const committed = await ws.git.agentCommit('agent scoped commit');
+        return { committed: committed };
+    "#;
+
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "attributed agentCommit e2e" }
+        },
+        "response": "scoped commit done",
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    let cwd = std::env::temp_dir();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+
+    manager
+        .create_agent(
+            agent_id.clone(),
+            ws.clone(),
+            "E2E Git Attr",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "scoped commit" }))
+            .unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .await
+        .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
+
+    // The ingest path recorded attribution for the agent's write.
+    let rows = store.list_tracked_changes(&ws).await.expect("rows");
+    let agent_row = rows
+        .iter()
+        .find(|r| r.path == "agent-file.txt")
+        .expect("attribution row for agent-file.txt");
+    assert_eq!(agent_row.agent_id.as_deref(), Some(agent_id.as_str()));
+    assert_eq!(
+        agent_row.stage, "committed",
+        "attribution row advanced to committed by the filtered commit"
+    );
+
+    // The commit contains only the attributed path.
+    let head_files = run_git(&["show", "--name-only", "--pretty=format:", "HEAD"]);
+    let head_files: Vec<&str> = head_files
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        head_files,
+        vec!["agent-file.txt"],
+        "only the attributed path landed in the commit"
+    );
+    let head_message = run_git(&["log", "-1", "--pretty=format:%B"]);
+    assert!(
+        head_message.contains(&format!("Agent-Id: {}", agent_id.as_str())),
+        "commit carries the Agent-Id trailer: {head_message}"
+    );
+
+    // The unattributed file survives, still dirty.
+    assert!(repo_dir.join("unattributed.txt").exists());
+    let porcelain = run_git(&["status", "--porcelain"]);
+    assert!(
+        porcelain.contains("unattributed.txt"),
+        "unattributed file still dirty: {porcelain}"
+    );
+
+    manager.shutdown().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    let _ = std::fs::remove_dir_all(&repo_dir);
+}
+
 //
 // Note bindings - deepen coverage beyond basic ws.note.add
 //

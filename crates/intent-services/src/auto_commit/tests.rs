@@ -415,6 +415,79 @@ async fn fallback_subject_uses_default_for_auto_named_non_task_agent() {
     assert!(message.starts_with("Agent changes"), "subject: {message}");
 }
 
+#[tokio::test]
+async fn idle_auto_commit_does_not_sweep_unattributed_changes() {
+    // monorepo#939 regression: the idle auto-commit path must only commit the
+    // paths attributed to the idle agent — another actor's dirty file stays
+    // in the worktree.
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    std::fs::write(repo.dir.join("unattributed.txt"), "someone else\n").unwrap();
+    let agent = session("agent-u1", &ws_id, None, false, "Scoped Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-u1").await;
+    let event = idle_event(&ws_id, "agent-u1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+
+    let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+    assert_eq!(commits.len(), 2, "exactly one auto-commit landed");
+    let head = &commits[0];
+    assert_eq!(
+        head.files.as_deref(),
+        Some(&["change.txt".to_string()][..]),
+        "only the attributed path was committed"
+    );
+    assert!(
+        repo.dir.join("unattributed.txt").exists(),
+        "unattributed file still on disk"
+    );
+    let status = intent_git::status::status(&repo.dir).unwrap();
+    let status = serde_json::to_value(&status).unwrap();
+    let files = status["files"].as_array().unwrap();
+    assert!(
+        files.iter().any(|f| f["path"] == json!("unattributed.txt")),
+        "unattributed file still dirty after auto-commit: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn idle_auto_commit_with_no_attributed_paths_is_silent_skip() {
+    // Dirty worktree but zero tracked-change rows for the idle agent: the
+    // attribution-filtered fallback yields an empty commit set, which the
+    // subscriber treats as a silent skip (no commit, no sweep).
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let agent = session("agent-e1", &ws_id, None, false, "Empty Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    // No attribute_dirty_change() call — nothing is attributed to agent-e1.
+    let event = idle_event(&ws_id, "agent-e1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+    assert_eq!(commits.len(), 1, "no commit beyond the seed");
+    let status = intent_git::status::status(&repo.dir).unwrap();
+    let status = serde_json::to_value(&status).unwrap();
+    let files = status["files"].as_array().unwrap();
+    assert!(
+        files.iter().any(|f| f["path"] == json!("change.txt")),
+        "dirty file untouched by the skip: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn idle_auto_commit_ignores_other_agents_attribution() {
+    // Attribution rows exist, but for a different agent: the idle agent's
+    // attributed set is still empty, so nothing is committed.
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let agent = session("agent-o1", &ws_id, None, false, "Other Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-somebody-else").await;
+    let event = idle_event(&ws_id, "agent-o1", "end_turn");
+    svc.handle_agent_idle_auto_commit(&event).await;
+    let commits = intent_git::history::history(&repo.dir, 5).unwrap();
+    assert_eq!(commits.len(), 1, "no commit beyond the seed");
+}
+
 #[test]
 fn parse_commit_message_extracts_tagged_output() {
     let output = "some preamble\n<<<COMMIT_MESSAGE>>>\nfeat: add feature\n\nBody text\n<<</COMMIT_MESSAGE>>>\ntrailing text";
