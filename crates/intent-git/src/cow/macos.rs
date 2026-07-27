@@ -263,7 +263,11 @@ pub fn clone(src: &Path, dst: &Path) -> Result<()> {
                     ))
                 })?;
             }
-            super::best_effort::clone_tree(src, dst, clone_file)
+            // clone_tree_fast doubles as the subtree fast path: each
+            // directory below the root is first cloned whole, and only
+            // subtrees whose directory-level clone fails are walked
+            // per-entry.
+            super::best_effort::clone_tree(src, dst, clone_file, Some(clone_tree_fast))
         }
         other => other,
     }
