@@ -3,9 +3,9 @@
 use intent_core::{Error, Result};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::CowSupport;
+use super::{CowCloneStats, CowSupport};
 
 // copyfile(3) flags from copyfile.h
 const COPYFILE_CLONE: u32 = 1 << 24;
@@ -239,8 +239,17 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
-pub fn clone(src: &Path, dst: &Path) -> Result<()> {
+pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
+    // A non-empty exclusion list rules out the whole-tree fast path (a single
+    // recursive clonefile cannot leave anything out), so walk directly.
+    if !excludes.is_empty() {
+        return walk(src, dst, excludes);
+    }
     match clone_tree_fast(src, dst) {
+        Ok(()) => Ok(CowCloneStats {
+            whole_tree: true,
+            ..CowCloneStats::default()
+        }),
         // The whole-tree clonefile fails with ENOTSUP when the tree contains
         // entries a reflink cannot carry (e.g. a live Unix socket or FIFO),
         // even though the volume pair supports cloning. Retry with the
@@ -263,14 +272,19 @@ pub fn clone(src: &Path, dst: &Path) -> Result<()> {
                     ))
                 })?;
             }
-            // clone_tree_fast doubles as the subtree fast path: each
-            // directory below the root is first cloned whole, and only
-            // subtrees whose directory-level clone fails are walked
-            // per-entry.
-            super::best_effort::clone_tree(src, dst, clone_file, Some(clone_tree_fast))
+            walk(src, dst, excludes)
         }
-        other => other,
+        Err(e) => Err(e),
     }
+}
+
+/// Best-effort per-entry walk with clone_tree_fast as the subtree fast path:
+/// each directory below the root is first cloned whole, and only subtrees
+/// whose directory-level clone fails (or which hold an excluded descendant)
+/// are walked per-entry.
+fn walk(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
+    super::best_effort::clone_tree(src, dst, clone_file, Some(clone_tree_fast), excludes)
+        .map(CowCloneStats::from)
 }
 
 /// Fast path: clone the whole tree with a single recursive copyfile(3).

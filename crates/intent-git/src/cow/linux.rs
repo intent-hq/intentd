@@ -68,12 +68,17 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
-pub fn clone(src: &Path, dst: &Path) -> Result<()> {
+pub fn clone(
+    src: &Path,
+    dst: &Path,
+    excludes: &[std::path::PathBuf],
+) -> Result<super::CowCloneStats> {
     // Best-effort tree walk shared with the macOS fallback: create the
     // directory structure, recreate symlinks, reflink regular files, and
     // skip genuinely non-clonable entries (sockets/FIFOs/devices, nested
     // mounts, per-entry unsupported errnos) with logging. Linux has no
     // whole-directory clone primitive (FICLONE is per-file), so there is
     // no subtree fast path here.
-    super::best_effort::clone_tree(src, dst, clone_file, None)
+    super::best_effort::clone_tree(src, dst, clone_file, None, excludes)
+        .map(super::CowCloneStats::from)
 }

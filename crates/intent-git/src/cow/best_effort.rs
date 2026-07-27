@@ -30,14 +30,15 @@
 use intent_core::{Error, Result};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Platform clone primitive: reflinks one path to another, mapping
 /// non-clonability errnos (ENOTSUP/EOPNOTSUPP/EXDEV) to `Error::Unsupported`.
 type CloneFn = fn(&Path, &Path) -> Result<()>;
 
 #[derive(Default)]
-struct WalkStats {
+pub(super) struct WalkStats {
     /// Regular files successfully reflinked one by one.
     cloned: u64,
     /// Directories cloned whole via the `clone_dir` fast path.
@@ -48,6 +49,11 @@ struct WalkStats {
     skipped_unsupported: u64,
     /// Directories on a different volume than the walk root (nested mounts).
     skipped_foreign_volume: u64,
+    /// Directories skipped because they matched a caller exclusion.
+    pub(super) skipped_excluded: u64,
+    /// Per-subtree fast-path clone durations (root-relative path, duration),
+    /// one entry per successful `clone_dir` call.
+    pub(super) subtree_timings: Vec<(PathBuf, Duration)>,
 }
 
 impl WalkStats {
@@ -62,14 +68,18 @@ impl WalkStats {
 /// `clone_dir` is the optional whole-directory clone primitive used as a
 /// subtree fast path (same errno mapping contract); the walk root itself is
 /// never retried with it — the caller already attempted (and failed) the
-/// whole-tree clone before falling back to this walk.
+/// whole-tree clone before falling back to this walk. `excludes` are
+/// root-relative directory paths (pre-sanitized by the caller) whose whole
+/// subtrees are skipped; a directory with an excluded descendant is never
+/// fast-cloned whole, so the exclusion always applies.
 pub(super) fn clone_tree(
     src: &Path,
     dst: &Path,
     clone_file: CloneFn,
     clone_dir: Option<CloneFn>,
-) -> Result<()> {
-    let stats = walk_tree(src, dst, clone_file, clone_dir)?;
+    excludes: &[PathBuf],
+) -> Result<WalkStats> {
+    let stats = walk_tree(src, dst, clone_file, clone_dir, excludes)?;
     // A successful subtree fast clone proves the clone primitive works here,
     // so the file-less-skeleton guard only applies when nothing was cloned
     // by either path.
@@ -89,7 +99,7 @@ pub(super) fn clone_tree(
             "cow_clone: best-effort clone skipped non-clonable entries"
         );
     }
-    Ok(())
+    Ok(stats)
 }
 
 fn walk_tree(
@@ -97,21 +107,35 @@ fn walk_tree(
     dst: &Path,
     clone_file: CloneFn,
     clone_dir: Option<CloneFn>,
+    excludes: &[PathBuf],
 ) -> Result<WalkStats> {
     let root_meta = fs::symlink_metadata(src)
         .map_err(|e| Error::Internal(format!("stat source failed: {e}")))?;
     let root_dev = root_meta.dev();
     let mut stats = WalkStats::default();
-    clone_entry(src, dst, root_dev, clone_file, clone_dir, true, &mut stats)?;
+    let ctx = WalkCtx {
+        root_dev,
+        clone_file,
+        clone_dir,
+        excludes,
+    };
+    clone_entry(src, dst, Path::new(""), &ctx, true, &mut stats)?;
     Ok(stats)
+}
+
+/// Walk-wide invariants threaded through the recursion.
+struct WalkCtx<'a> {
+    root_dev: u64,
+    clone_file: CloneFn,
+    clone_dir: Option<CloneFn>,
+    excludes: &'a [PathBuf],
 }
 
 fn clone_entry(
     src: &Path,
     dst: &Path,
-    root_dev: u64,
-    clone_file: CloneFn,
-    clone_dir: Option<CloneFn>,
+    rel: &Path,
+    ctx: &WalkCtx<'_>,
     is_root: bool,
     stats: &mut WalkStats,
 ) -> Result<()> {
@@ -127,7 +151,7 @@ fn clone_entry(
             .map_err(|e| Error::Internal(format!("create symlink failed: {e}")))?;
         Ok(())
     } else if file_type.is_dir() {
-        if metadata.dev() != root_dev {
+        if metadata.dev() != ctx.root_dev {
             tracing::debug!(
                 path = %src.display(),
                 "cow_clone: skipping directory on a different volume (nested mount)"
@@ -136,14 +160,30 @@ fn clone_entry(
             return Ok(());
         }
 
+        if !is_root && ctx.excludes.iter().any(|e| e == rel) {
+            tracing::debug!(
+                path = %src.display(),
+                "cow_clone: skipping excluded directory"
+            );
+            stats.skipped_excluded += 1;
+            return Ok(());
+        }
+
         // Subtree fast path: clone the whole directory in one shot. Skipped
         // for the walk root — the caller already attempted (and failed) the
-        // whole-tree clone before falling back here.
-        if !is_root {
-            if let Some(clone_dir_fn) = clone_dir {
+        // whole-tree clone before falling back here — and for directories
+        // with an excluded descendant, which a whole-subtree clone would
+        // carry along; those recurse per-entry so the exclusion applies.
+        let has_excluded_descendant = ctx.excludes.iter().any(|e| e.starts_with(rel) && e != rel);
+        if !is_root && !has_excluded_descendant {
+            if let Some(clone_dir_fn) = ctx.clone_dir {
+                let subtree_started = Instant::now();
                 match clone_dir_fn(src, dst) {
                     Ok(()) => {
                         stats.cloned_subtrees += 1;
+                        stats
+                            .subtree_timings
+                            .push((rel.to_path_buf(), subtree_started.elapsed()));
                         return Ok(());
                     }
                     Err(Error::Unsupported(reason)) => {
@@ -183,9 +223,8 @@ fn clone_entry(
             let entry = entry.map_err(|e| Error::Internal(format!("dir entry failed: {e}")))?;
             let src_path = entry.path();
             let dst_path = dst.join(entry.file_name());
-            clone_entry(
-                &src_path, &dst_path, root_dev, clone_file, clone_dir, false, stats,
-            )?;
+            let child_rel = rel.join(entry.file_name());
+            clone_entry(&src_path, &dst_path, &child_rel, ctx, false, stats)?;
         }
         // Applied after the children are cloned: a non-writable source dir
         // (e.g. 0555) must not block creating entries inside the copy.
@@ -193,7 +232,7 @@ fn clone_entry(
             .map_err(|e| Error::Internal(format!("set dir permissions failed: {e}")))?;
         Ok(())
     } else if file_type.is_file() {
-        match clone_file(src, dst) {
+        match (ctx.clone_file)(src, dst) {
             Ok(()) => {
                 stats.cloned += 1;
                 Ok(())
@@ -361,7 +400,7 @@ mod tests {
         let dst = base.join("dst");
         let _listener = build_tree_with_socket(&src);
 
-        let stats = walk_tree(&src, &dst, fake_clone_file, Some(fake_clone_dir)).unwrap();
+        let stats = walk_tree(&src, &dst, fake_clone_file, Some(fake_clone_dir), &[]).unwrap();
 
         assert_tree_cloned_without_socket(&dst);
         // a and c cloned whole via the fast path; b (and b/sub) fell back to
@@ -372,6 +411,16 @@ mod tests {
         assert_eq!(stats.skipped_special, 1);
         assert_eq!(stats.skipped_unsupported, 0);
         assert_eq!(stats.skipped_foreign_volume, 0);
+        assert_eq!(stats.skipped_excluded, 0);
+        // One timing entry per successful fast-path subtree clone.
+        assert_eq!(stats.subtree_timings.len(), 2);
+        let timed: Vec<_> = stats
+            .subtree_timings
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(timed.contains(&PathBuf::from("a")));
+        assert!(timed.contains(&PathBuf::from("c")));
 
         let successes = DIR_SUCCESSES.with(|v| v.borrow().clone());
         assert!(successes.contains(&src.join("a")));
@@ -393,7 +442,7 @@ mod tests {
         let dst = base.join("dst");
         let _listener = build_tree_with_socket(&src);
 
-        let stats = walk_tree(&src, &dst, fake_clone_file, None).unwrap();
+        let stats = walk_tree(&src, &dst, fake_clone_file, None, &[]).unwrap();
 
         assert_tree_cloned_without_socket(&dst);
         assert_eq!(stats.cloned_subtrees, 0);
@@ -417,6 +466,7 @@ mod tests {
             &dst,
             fake_clone_file,
             Some(partial_then_unsupported_clone_dir),
+            &[],
         )
         .unwrap();
 
@@ -434,7 +484,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("f.txt"), b"data").unwrap();
 
-        let result = clone_tree(&src, &dst, unsupported_clone_file, None);
+        let result = clone_tree(&src, &dst, unsupported_clone_file, None, &[]);
         assert!(matches!(result, Err(Error::Unsupported(_))));
 
         let _ = fs::remove_dir_all(&base);
@@ -453,10 +503,105 @@ mod tests {
         // `a` clones whole via the fast path; the per-entry reflink of
         // root.txt fails as unsupported. The clone must still succeed —
         // the fast-path success proves the primitive works.
-        clone_tree(&src, &dst, unsupported_clone_file, Some(fake_clone_dir)).unwrap();
+        clone_tree(
+            &src,
+            &dst,
+            unsupported_clone_file,
+            Some(fake_clone_dir),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(dst.join("a/f.txt")).unwrap(), "data");
         assert!(!dst.join("root.txt").exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Tree without special files for exclusion tests:
+    ///   src/a/f1.txt, src/a/nested/f2.txt
+    ///   src/b/keep.txt, src/b/heavy/big.bin
+    ///   src/top.txt
+    fn build_plain_tree(src: &Path) {
+        fs::create_dir_all(src.join("a/nested")).unwrap();
+        fs::create_dir_all(src.join("b/heavy")).unwrap();
+        fs::write(src.join("a/f1.txt"), b"f1").unwrap();
+        fs::write(src.join("a/nested/f2.txt"), b"f2").unwrap();
+        fs::write(src.join("b/keep.txt"), b"keep").unwrap();
+        fs::write(src.join("b/heavy/big.bin"), b"big").unwrap();
+        fs::write(src.join("top.txt"), b"top").unwrap();
+    }
+
+    #[test]
+    fn excluded_directory_is_skipped_and_counted() {
+        reset_recording();
+        let base = test_dir("excluded_dir");
+        let src = base.join("src");
+        let dst = base.join("dst");
+        build_plain_tree(&src);
+
+        let excludes = [PathBuf::from("b/heavy")];
+        let stats =
+            walk_tree(&src, &dst, fake_clone_file, Some(fake_clone_dir), &excludes).unwrap();
+
+        // The excluded subtree is absent; everything else is present.
+        assert!(!dst.join("b/heavy").exists());
+        assert_eq!(fs::read_to_string(dst.join("b/keep.txt")).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(dst.join("a/f1.txt")).unwrap(), "f1");
+        assert_eq!(
+            fs::read_to_string(dst.join("a/nested/f2.txt")).unwrap(),
+            "f2"
+        );
+        assert_eq!(fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
+        assert_eq!(stats.skipped_excluded, 1);
+
+        // `b` holds an excluded descendant, so it must never be fast-cloned
+        // whole (which would carry the exclusion along); `a` has none and
+        // stays on the fast path.
+        let attempts = DIR_ATTEMPTS.with(|v| v.borrow().clone());
+        assert!(!attempts.contains(&src.join("b")));
+        assert!(!attempts.contains(&src.join("b/heavy")));
+        assert!(attempts.contains(&src.join("a")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn non_matching_excludes_leave_clone_untouched() {
+        let base = test_dir("exclude_nomatch");
+        let src = base.join("src");
+        let dst = base.join("dst");
+        build_plain_tree(&src);
+
+        let excludes = [PathBuf::from("no/such/dir")];
+        let stats =
+            walk_tree(&src, &dst, fake_clone_file, Some(fake_clone_dir), &excludes).unwrap();
+
+        assert_eq!(stats.skipped_excluded, 0);
+        assert_eq!(fs::read_to_string(dst.join("a/f1.txt")).unwrap(), "f1");
+        assert_eq!(
+            fs::read_to_string(dst.join("b/heavy/big.bin")).unwrap(),
+            "big"
+        );
+        assert_eq!(fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exclusion_only_matches_directories_not_files() {
+        let base = test_dir("exclude_file");
+        let src = base.join("src");
+        let dst = base.join("dst");
+        build_plain_tree(&src);
+
+        // Excludes name a regular file: it is still cloned (exclusions are
+        // directory prefixes only).
+        let excludes = [PathBuf::from("top.txt")];
+        let stats = walk_tree(&src, &dst, fake_clone_file, None, &excludes).unwrap();
+
+        assert_eq!(stats.skipped_excluded, 0);
+        assert_eq!(fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
 
         let _ = fs::remove_dir_all(&base);
     }
