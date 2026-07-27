@@ -763,10 +763,12 @@ mod tests {
     // ---- credential injection helpers (no spawn) ----
 
     /// A registry backed by a throwaway config file, optionally overriding
-    /// the `exposeGitCredentialToChildren` gate.
-    fn registry_with_expose(value: Option<bool>) -> Arc<SettingsRegistry> {
-        let dir = tempfile::tempdir().expect("temp config dir").keep();
-        let registry = SettingsRegistry::load(dir.join("config.toml")).expect("load registry");
+    /// the `exposeGitCredentialToChildren` gate. The returned `TempDir` guard
+    /// must be held for the registry's lifetime (it self-cleans on drop).
+    fn registry_with_expose(value: Option<bool>) -> (Arc<SettingsRegistry>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let registry =
+            SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
         if let Some(v) = value {
             registry
                 .apply(&[(
@@ -775,7 +777,7 @@ mod tests {
                 )])
                 .expect("apply exposeGitCredentialToChildren");
         }
-        Arc::new(registry)
+        (Arc::new(registry), dir)
     }
 
     /// No registry (minimal/test compositions) reads as off; a wired registry
@@ -783,13 +785,13 @@ mod tests {
     #[test]
     fn expose_gate_defaults() {
         assert!(!expose_git_credential(None));
-        assert!(expose_git_credential(Some(&registry_with_expose(None))));
-        assert!(expose_git_credential(Some(&registry_with_expose(Some(
-            true
-        )))));
-        assert!(!expose_git_credential(Some(&registry_with_expose(Some(
-            false
-        )))));
+        assert!(expose_git_credential(Some(&registry_with_expose(None).0)));
+        assert!(expose_git_credential(Some(
+            &registry_with_expose(Some(true)).0
+        )));
+        assert!(!expose_git_credential(Some(
+            &registry_with_expose(Some(false)).0
+        )));
     }
 
     /// The gate short-circuits injection: no registry and setting-off both
@@ -797,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn git_credential_env_respects_gate() {
         assert!(git_credential_env(None).await.is_empty());
-        let off = registry_with_expose(Some(false));
+        let (off, _guard) = registry_with_expose(Some(false));
         assert!(git_credential_env(Some(&off)).await.is_empty());
     }
 
