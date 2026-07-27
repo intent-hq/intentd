@@ -364,13 +364,19 @@ async fn auto_commit_uses_generated_message_over_wss() {
     let auggie_dir = auggie_bin.parent().unwrap().to_path_buf();
     let (ws_id, _repo_dir) = seed_workspace_with_repo(&data_dir, Some(&auggie_bin)).await;
 
-    // Mock agent behavior: write a file then return (triggers agent:idle).
-    let js = "return await ws.file.write('change.txt', 'agent wrote this\\n');".to_string();
+    // Mock agent behavior: write a file via the ACP fs/write_text_file client
+    // service (the real attribution pipeline) then return (triggers agent:idle).
     let behavior = json!({
-        "toolCall": {
-            "name": "workspace_api",
-            "arguments": { "code": js, "summary": "write file" },
-        },
+        "clientCalls": [
+            {
+                "method": "fs/write_text_file",
+                "params": {
+                    "sessionId": "mock-session-1",
+                    "path": "change.txt",
+                    "content": "agent wrote this\n",
+                },
+            },
+        ],
         "response": "done",
     })
     .to_string();
@@ -540,13 +546,19 @@ async fn auto_commit_falls_back_when_auggie_missing() {
     let data_dir = temp_data_dir();
     let (ws_id, _repo_dir) = seed_workspace_with_repo(&data_dir, None).await;
 
-    // Mock agent behavior: write a file then return.
-    let js = "return await ws.file.write('fallback.txt', 'fallback test\\n');".to_string();
+    // Mock agent behavior: write a file via the ACP fs/write_text_file client
+    // service (the real attribution pipeline) then return.
     let behavior = json!({
-        "toolCall": {
-            "name": "workspace_api",
-            "arguments": { "code": js, "summary": "write file" },
-        },
+        "clientCalls": [
+            {
+                "method": "fs/write_text_file",
+                "params": {
+                    "sessionId": "mock-session-1",
+                    "path": "fallback.txt",
+                    "content": "fallback test\n",
+                },
+            },
+        ],
         "response": "done",
     })
     .to_string();
