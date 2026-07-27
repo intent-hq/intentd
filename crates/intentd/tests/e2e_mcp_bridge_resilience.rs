@@ -12,6 +12,14 @@
 //! in-flight and gap requests get the synthesized retryable `-32001` error
 //! (never silence), and once the listener is back the bridge reconnects and
 //! serves requests again over the SAME stdio session.
+//!
+//! Scenario 3 — startup race (monorepo#908): a bridge subprocess spawned
+//! before its listener is reachable BUFFERS stdin (notably the MCP
+//! `initialize` handshake) during the initial connect window instead of
+//! answering with `-32001`; once the listener appears inside the window the
+//! buffered request is forwarded and answered for real. On initial-window
+//! exhaustion the bridge exits non-zero without ever writing a `-32001` for
+//! the buffered requests.
 
 mod common;
 
@@ -403,6 +411,172 @@ async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
         .expect("bridge did not exit on stdin EOF")
         .expect("wait");
     assert!(status.success(), "bridge must exit cleanly: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+//
+// Scenario 3 — startup race: buffer stdin during the initial connect window
+// (monorepo#908).
+//
+
+/// Spawn a real `intentd mcp-bridge --connect <addr>` subprocess with a
+/// hermetic data dir, returning the child plus its piped stdin/stdout.
+fn spawn_bridge_subprocess(
+    addr: &std::net::SocketAddr,
+    data_dir: &std::path::Path,
+) -> (
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    BufReader<tokio::process::ChildStdout>,
+) {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .args(["mcp-bridge", "--connect", &addr.to_string()])
+        .env("INTENTD_DATA_DIR", data_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn mcp-bridge");
+    let stdin = child.stdin.take().expect("child stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+    (child, stdin, stdout)
+}
+
+/// Scenario 3 (monorepo#908): `initialize` written while nothing is listening
+/// yet is buffered through the initial connect window — never answered with
+/// `-32001` — and gets the real server response once the listener is rebound
+/// inside the window.
+#[tokio::test]
+async fn bridge_subprocess_buffers_initialize_during_startup_race() {
+    // Reserve an address, then DROP the listener so nothing is accepting.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let data_dir =
+        std::env::temp_dir().join(format!("itd-e2e-bridge-race-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let (mut child, mut stdin, mut stdout) = spawn_bridge_subprocess(&addr, &data_dir);
+
+    // Immediately write the MCP handshake — the bridge is now inside its
+    // initial connect window with nothing listening.
+    write_json_line(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        }),
+    )
+    .await;
+
+    // Rebind the SAME address ~1.5s in — well inside the ~5.5s default
+    // initial window — and accept the bridge's connection.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let listener = TcpListener::bind(addr).await.expect("rebind");
+    let (conn, _) = timeout(
+        common::test_timeout(Duration::from_secs(30)),
+        listener.accept(),
+    )
+    .await
+    .expect("bridge never connected after rebind")
+    .expect("accept");
+    let (read, mut write) = conn.into_split();
+    let mut lines = BufReader::new(read).lines();
+
+    // The buffered initialize is flushed to the fresh connection.
+    let fwd = timeout(
+        common::test_timeout(Duration::from_secs(30)),
+        lines.next_line(),
+    )
+    .await
+    .expect("buffered initialize never forwarded")
+    .expect("read forwarded")
+    .expect("conn open");
+    let fwd: serde_json::Value = serde_json::from_str(&fwd).expect("forwarded is JSON");
+    assert_eq!(fwd["id"], serde_json::json!(1));
+    assert_eq!(fwd["method"], serde_json::json!("initialize"));
+    write_json_line(
+        &mut write,
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{
+                "protocolVersion":"2024-11-05",
+                "capabilities":{"tools":{}},
+                "serverInfo":{"name":"workspace-mcp","version":"0.0.0"}
+            }
+        }),
+    )
+    .await;
+
+    // The FIRST id-1 message on stdout is the real response — a pre-fix
+    // bridge writes the -32001 reject here instead.
+    let resp = read_json_line(&mut stdout, "buffered initialize response").await;
+    assert_eq!(resp["id"], serde_json::json!(1));
+    assert!(
+        resp.get("error").is_none(),
+        "initialize must never be answered with an error: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["protocolVersion"],
+        serde_json::json!("2024-11-05")
+    );
+
+    // stdin EOF ends the bridge cleanly.
+    drop(stdin);
+    let status = timeout(common::test_timeout(Duration::from_secs(30)), child.wait())
+        .await
+        .expect("bridge did not exit on stdin EOF")
+        .expect("wait");
+    assert!(status.success(), "bridge must exit cleanly: {status:?}");
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Scenario 3 exhaustion (monorepo#908): against a never-rebound address the
+/// bridge exits NON-ZERO once the initial window is exhausted (~5.5s default)
+/// and writes no `-32001` response for the buffered `initialize`.
+#[tokio::test]
+async fn bridge_subprocess_initial_window_exhaustion_exits_nonzero_without_errors() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let data_dir =
+        std::env::temp_dir().join(format!("itd-e2e-bridge-exhaust-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let (mut child, mut stdin, mut stdout) = spawn_bridge_subprocess(&addr, &data_dir);
+
+    write_json_line(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}
+        }),
+    )
+    .await;
+
+    // The default initial window is ~5.5s of backoff; the process must exit
+    // non-zero within ~10s.
+    let status = timeout(common::test_timeout(Duration::from_secs(10)), child.wait())
+        .await
+        .expect("bridge did not exit after initial-window exhaustion")
+        .expect("wait");
+    assert!(
+        !status.success(),
+        "initial-window exhaustion must exit non-zero: {status:?}"
+    );
+
+    // Nothing — in particular no -32001 — was written for the buffered
+    // request.
+    let mut out = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut stdout, &mut out)
+        .await
+        .expect("drain stdout");
+    assert!(
+        !out.contains("-32001"),
+        "no -32001 may be written for buffered requests on exhaustion: {out}"
+    );
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }
