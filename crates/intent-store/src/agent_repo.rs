@@ -1422,6 +1422,34 @@ impl Store {
         Ok(n)
     }
 
+    /// Read one offset window of an agent's messages in chronological (`seq`
+    /// ascending) order — the rows at positions `offset..offset+limit` counted
+    /// from the oldest message, matching a `start..end` window from the
+    /// service-layer pagination contract (`page_window`). Unlike
+    /// [`Store::get_agent_messages`], which hydrates the whole log before the
+    /// caller slices it, this selects and decodes only the requested page.
+    /// Out-of-range windows (offset at/past the end, or an empty log) return
+    /// an empty vec. Negative inputs are clamped to zero.
+    pub async fn get_agent_messages_page(
+        &self,
+        agent_id: &AgentId,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        let sql = format!(
+            "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? \
+             ORDER BY seq ASC LIMIT ? OFFSET ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(&agent_id.0)
+            .bind(limit.max(0))
+            .bind(offset.max(0))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent messages page failed: {e}")))?;
+        rows.iter().map(map_message_row).collect()
+    }
+
     /// Atomically clear the agent's message log and reinsert `messages` under
     /// fresh 0-based monotonic `seq` values. Row ids are minted here (UUIDv7)
     /// so callers cannot smuggle stale ids across the swap; the returned
@@ -3508,6 +3536,109 @@ mod tests {
         let (count2, has_assistant2) = stats.get(&agent2.0).expect("agent2 stats");
         assert_eq!(*count2, 3, "agent2 should have 3 messages");
         assert!(has_assistant2, "agent2 should have assistant message");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `get_agent_messages_page` returns exactly the `offset..offset+limit`
+    /// window of the chronological log — matching what a caller would get by
+    /// slicing `get_agent_messages` — with correct boundary behavior (first
+    /// page, last partial page, out-of-range, empty log).
+    #[tokio::test]
+    async fn get_agent_messages_page_matches_full_read_windows() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-msg-page".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        for i in 0..5 {
+            store
+                .append_agent_message(
+                    &agent_id,
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &serde_json::json!([{"type": "text", "text": format!("msg-{i}")}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        let full = store
+            .get_agent_messages(&agent_id, None)
+            .await
+            .expect("full read");
+        assert_eq!(full.len(), 5);
+        assert_eq!(
+            store.count_agent_messages(&agent_id).await.expect("count"),
+            5
+        );
+
+        // Every window matches the equivalent slice of the full read
+        // (same rows, same chronological order).
+        for (offset, limit) in [(0, 2), (2, 2), (4, 2), (0, 5), (1, 3), (0, 100)] {
+            let page = store
+                .get_agent_messages_page(&agent_id, offset, limit)
+                .await
+                .expect("page read");
+            let start = (offset as usize).min(full.len());
+            let end = (start + limit as usize).min(full.len());
+            let expected: Vec<_> = full[start..end].iter().map(|m| (m.seq, &m.id)).collect();
+            let got: Vec<_> = page.iter().map(|m| (m.seq, &m.id)).collect();
+            assert_eq!(got, expected, "window offset={offset} limit={limit}");
+        }
+
+        // Out-of-range offsets and a zero limit yield empty pages.
+        for (offset, limit) in [(5, 2), (10, 3), (0, 0)] {
+            let page = store
+                .get_agent_messages_page(&agent_id, offset, limit)
+                .await
+                .expect("page read");
+            assert!(page.is_empty(), "offset={offset} limit={limit}");
+        }
+
+        // Negative inputs clamp to zero rather than erroring.
+        let page = store
+            .get_agent_messages_page(&agent_id, -1, 2)
+            .await
+            .expect("negative offset");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].seq, full[0].seq);
+        let page = store
+            .get_agent_messages_page(&agent_id, 0, -1)
+            .await
+            .expect("negative limit");
+        assert!(page.is_empty());
+
+        // An agent with no messages pages to empty.
+        let empty_agent = AgentId(format!("agent-{}", Uuid::new_v4()));
+        store
+            .insert_agent_session(&baseline_test_session(&empty_agent, &ws_id, &ts, None))
+            .await
+            .expect("insert empty session");
+        let page = store
+            .get_agent_messages_page(&empty_agent, 0, 10)
+            .await
+            .expect("empty page");
+        assert!(page.is_empty());
+        assert_eq!(
+            store
+                .count_agent_messages(&empty_agent)
+                .await
+                .expect("count empty"),
+            0
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
