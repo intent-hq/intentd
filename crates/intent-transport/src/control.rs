@@ -1,5 +1,5 @@
-//! System control fast-path: `system.status`, `system.shutdown`, and
-//! `system.importLegacy` (§5.7).
+//! System control fast-path: `system.status`, `system.shutdown`,
+//! `system.importLegacy` (§5.7), and `system.gitCredential` (monorepo#884).
 //!
 //! These control methods surface live daemon state, request graceful shutdown,
 //! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
@@ -60,6 +60,9 @@ pub struct SystemStatus {
     pub memory_bytes: u64,
 }
 
+/// A `(username, password)` pair resolved for `system.gitCredential`.
+pub type GitCredential = (String, String);
+
 /// Live daemon control surface implemented by the composition root (`intentd`).
 /// Lets a listener answer `system.status` from real state and trigger a
 /// graceful shutdown for `system.shutdown` without reaching into domain code.
@@ -74,13 +77,29 @@ pub trait SystemControl: Send + Sync {
         &self,
         force: bool,
     ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
+    /// Resolve the daemon-managed GitHub credential for the git-credential
+    /// helper (monorepo#884): `Some((username, password))` when the
+    /// `exposeGitCredentialToChildren` setting is on and a usable token
+    /// resolves, else `None`. `client_pid` is the helper's self-reported pid,
+    /// used only for audit logging — implementations must never log the token.
+    fn git_credential(
+        &self,
+        client_pid: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Option<GitCredential>> + Send + '_>>;
 }
 
-/// The two control methods, once classified.
+/// The control methods, once classified.
 pub(crate) enum SystemMethod {
     Status,
     Shutdown,
-    ImportLegacy { force: Result<bool, ()> },
+    ImportLegacy {
+        force: Result<bool, ()>,
+    },
+    GitCredential {
+        pid: Option<u64>,
+        protocol: Option<String>,
+        host: Option<String>,
+    },
 }
 
 /// A classified `system.*` request awaiting handling by the connection task.
@@ -120,6 +139,25 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
                 Some(_) => Err(()),
             };
             SystemMethod::ImportLegacy { force }
+        }
+        "system.gitCredential" => {
+            // Lenient pid extraction: it is audit-only metadata, so a missing
+            // or non-numeric value degrades to `None` rather than erroring.
+            // `protocol`/`host` feed the server-side scope gate in `handle`;
+            // a missing or non-string value simply fails that gate.
+            let params = obj.get("params").and_then(Value::as_object);
+            let pid = params.and_then(|p| p.get("pid")).and_then(Value::as_u64);
+            let text = |key: &str| {
+                params
+                    .and_then(|p| p.get(key))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            };
+            SystemMethod::GitCredential {
+                pid,
+                protocol: text("protocol"),
+                host: text("host"),
+            }
         }
         _ => return None,
     };
@@ -163,11 +201,23 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     })
 }
 
+/// The daemon-side scope gate for `system.gitCredential` (monorepo#884): only
+/// `protocol=https` + `host=github.com` (case-insensitive, exact host) may
+/// receive the credential. Mirrors the helper's own client-side gate.
+pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>) -> bool {
+    protocol.is_some_and(|p| p.eq_ignore_ascii_case("https"))
+        && host.is_some_and(|h| h.eq_ignore_ascii_case("github.com"))
+}
+
 /// Handle a classified `system.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `system.shutdown` triggers the
-/// graceful teardown before acknowledging; like `system.importLegacy` it is
-/// UDS-only, so remote (TCP/WSS) callers get -32001 and remote shutdown
-/// notifications are ignored.
+/// graceful teardown before acknowledging; like `system.importLegacy` and
+/// `system.gitCredential` it is UDS-only, so remote (TCP/WSS) callers get
+/// -32001 and remote shutdown notifications are ignored. `system.gitCredential`
+/// returns `{ credential: { username, password } }` when a credential is
+/// available and `{ credential: null }` otherwise (scope gate failed / setting
+/// off / no token) — the distinction between those cases is never surfaced on
+/// the wire.
 pub(crate) async fn handle(
     req: SystemRequest,
     control: &dyn SystemControl,
@@ -195,6 +245,32 @@ pub(crate) async fn handle(
             .import_legacy(force)
             .await
             .map_err(|message| (-32603, message)),
+        SystemMethod::GitCredential { .. } if !is_uds => Err((
+            -32001,
+            "system.gitCredential is available over UDS only".to_string(),
+        )),
+        SystemMethod::GitCredential {
+            pid,
+            protocol,
+            host,
+        } => {
+            // Defense in depth (monorepo#884): the daemon re-checks the
+            // helper's scope gate, so an arbitrary local UDS caller cannot
+            // obtain the credential for anything but https://github.com. A
+            // scope miss is indistinguishable from "no token" on the wire.
+            if !git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
+                tracing::debug!(
+                    client_pid = pid,
+                    "git credential request denied (scope is not https://github.com)"
+                );
+                Ok(json!({ "credential": Value::Null }))
+            } else {
+                let credential = control.git_credential(pid).await.map(
+                    |(username, password)| json!({ "username": username, "password": password }),
+                );
+                Ok(json!({ "credential": credential }))
+            }
+        }
     };
     if !req.id_present {
         return None;

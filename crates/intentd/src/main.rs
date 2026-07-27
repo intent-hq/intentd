@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 mod client;
+mod git_credential;
 mod import;
 mod legacy_import;
 use client::rpc_call;
@@ -141,6 +142,18 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         svg: Option<PathBuf>,
     },
+    /// Daemon-backed git credential helper (monorepo#884): speaks the
+    /// git-credential protocol on stdin/stdout and answers `get` for HTTPS
+    /// github.com from the running daemon over UDS (`system.gitCredential`).
+    /// Silent (exit 0, no output) on `store`/`erase`, other hosts, a
+    /// stopped daemon, or when no credential is available, so git falls
+    /// through to its remaining helpers. Wired up via git config as e.g.
+    /// `credential.https://github.com.helper=!intentd git-credential`.
+    #[command(hide = true)]
+    GitCredential {
+        /// The git-credential operation: `get`, `store`, or `erase`.
+        operation: String,
+    },
     /// WSAPI-1 spike: evaluate an `(async () => { <code> })()` snippet in an
     /// isolated QuickJS context with a wall-clock timeout, and print the
     /// JSON-serialized result. Present only when built with `--features js-engine`.
@@ -194,6 +207,7 @@ async fn main() -> ExitCode {
         } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
         Command::Token { rotate } => to_exit(cmd_token(rotate).await),
         Command::Pair { png, svg } => to_exit(cmd_pair(png.as_deref(), svg.as_deref()).await),
+        Command::GitCredential { operation } => cmd_git_credential(&operation).await,
         #[cfg(feature = "js-engine")]
         Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
     }
@@ -301,6 +315,17 @@ async fn cmd_pair(png: Option<&Path>, svg: Option<&Path>) -> anyhow::Result<()> 
         eprintln!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// Run the daemon-backed git credential helper (monorepo#884). ALWAYS exits 0:
+/// git interprets a non-zero helper exit as a hard error and aborts the whole
+/// credential search, whereas a silent zero-exit lets it fall through to the
+/// remaining helpers/prompt rules. Even a config-resolution failure is silent.
+async fn cmd_git_credential(operation: &str) -> ExitCode {
+    if let Ok(config) = resolve_config() {
+        let _ = git_credential::run(operation, &config.socket_path).await;
+    }
+    ExitCode::SUCCESS
 }
 
 /// Write an exported pairing image with owner-only (0600) permissions: the QR
@@ -974,6 +999,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         legacy_import_store,
         legacy_import_assets_root: assets_root,
         legacy_import_lock: tokio::sync::Mutex::new(()),
+        settings_registry: settings_registry.clone(),
     });
 
     // Populate the runtime control OnceLock so runtime-toggled WSS listeners can
@@ -1215,6 +1241,9 @@ struct DaemonControl {
     legacy_import_assets_root: PathBuf,
     /// Prevent overlapping import runs from racing workspace inserts/copies.
     legacy_import_lock: tokio::sync::Mutex<()>,
+    /// Settings registry backing the `system.gitCredential` gate + token
+    /// source (monorepo#884).
+    settings_registry: Arc<intent_services::SettingsRegistry>,
 }
 
 /// Latest own-process resource sample for `system.status`, written by the
@@ -1451,6 +1480,31 @@ impl SystemControl for DaemonControl {
                 "compatibilityFailures": compatibility_failures,
                 "markerWritten": marker_written,
             }))
+        })
+    }
+
+    fn git_credential(
+        &self,
+        client_pid: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let credential =
+                intent_services::github_git_credential(Some(&self.settings_registry)).await;
+            // Audit trail (monorepo#884): record every grant/denial with the
+            // helper's self-reported pid. The token value is never logged.
+            match &credential {
+                Some(_) => {
+                    tracing::info!(client_pid, "git credential granted to helper over UDS");
+                }
+                None => {
+                    tracing::debug!(
+                        client_pid,
+                        "git credential request denied (gate off or no token)"
+                    );
+                }
+            }
+            credential
         })
     }
 }

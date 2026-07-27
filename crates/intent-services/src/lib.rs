@@ -5719,6 +5719,52 @@ async fn github_git_token_for_url(
     intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
 }
 
+/// Resolve the daemon-managed GitHub credential for the `system.gitCredential`
+/// UDS RPC backing the `intentd git-credential` helper (monorepo#884):
+/// `Some((username, password))` only when the
+/// `sourceControl.github.exposeGitCredentialToChildren` gate is on and a
+/// usable token resolves per [`github_token_source`] (see
+/// [`intent_git::auth::usable_token`] — control characters would corrupt the
+/// line-oriented git-credential protocol). The token value is never logged.
+pub async fn github_git_credential(
+    registry: Option<&SettingsRegistry>,
+) -> Option<(String, String)> {
+    if !terminal_ops::expose_git_credential(registry) {
+        return None;
+    }
+    let token = intent_sourcecontrol::token::resolve(&github_token_source(registry)).await;
+    let token = intent_git::auth::usable_token(token.as_deref())?;
+    Some((
+        intent_git::auth::TOKEN_USERNAME.to_string(),
+        token.to_string(),
+    ))
+}
+
+/// The running daemon's own binary path, for spawn sites that configure the
+/// `intentd git-credential` helper in child environments (monorepo#884 Phase
+/// 2.2). `None` when `current_exe` fails or the path is not valid UTF-8
+/// (logged at debug) — a lossy conversion would point the helper at a
+/// nonexistent binary, so the spawn simply proceeds without the helper,
+/// never failing on it.
+pub(crate) fn daemon_exe_path() -> Option<String> {
+    match std::env::current_exe() {
+        Ok(path) => match path.into_os_string().into_string() {
+            Ok(path) => Some(path),
+            Err(path) => {
+                tracing::debug!(
+                    path = %std::path::Path::new(&path).display(),
+                    "current_exe is not valid UTF-8; spawning without git credential helper"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!("current_exe unresolved; spawning without git credential helper: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod github_token_source_tests {
     use super::*;
