@@ -2128,6 +2128,11 @@ fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle
         "merge-pending retry sweep enabled"
     );
     tokio::spawn(async move {
+        // Crash recovery: a daemon that died mid-merge leaves sandboxes
+        // stranded `merging` — invisible to the sweep. No merge can be in
+        // flight on a fresh daemon, so reset them to `merge_pending` before
+        // the first tick picks them up.
+        services.recover_stranded_merging_sandboxes().await;
         let mut ticker = tokio::time::interval(SANDBOX_MERGE_SWEEP_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

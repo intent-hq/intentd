@@ -2553,7 +2553,7 @@ impl Services {
         use intent_store::SandboxStatus;
 
         // Load sandbox record
-        let _sandbox = match self.store.get_sandbox(workspace_id, agent_id).await {
+        let sandbox = match self.store.get_sandbox(workspace_id, agent_id).await {
             Ok(Some(s)) => s,
             Ok(None) => {
                 tracing::warn!(
@@ -2576,18 +2576,44 @@ impl Services {
         const MAX_RETRIES: i64 = 2;
         let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
 
-        // Update sandbox status to Merging
-        let now = now_iso();
-        if let Err(e) = self
+        // Claim the merge atomically (current status → merging) so this path
+        // never merges concurrently with the sandbox.merge RPC or the
+        // background retry sweep. Losing the claim (or finding the sandbox
+        // already merging) means another path owns the merge; propagate
+        // completion normally rather than double-merging.
+        if sandbox.status == SandboxStatus::Merging {
+            tracing::info!(
+                agent = %agent_id.0,
+                "sandbox merge already in progress; propagating completion without merging"
+            );
+            return true;
+        }
+        match self
             .store
-            .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merging, &now)
+            .try_transition_sandbox_status(
+                workspace_id,
+                agent_id,
+                sandbox.status,
+                SandboxStatus::Merging,
+                &now_iso(),
+            )
             .await
         {
-            tracing::error!(
-                agent = %agent_id.0,
-                error = %e,
-                "failed to update sandbox status to merging"
-            );
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    agent = %agent_id.0,
+                    "sandbox claimed by another merge path; propagating completion without merging"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent = %agent_id.0,
+                    error = %e,
+                    "failed to update sandbox status to merging"
+                );
+            }
         }
 
         // Attempt merge
@@ -2901,6 +2927,65 @@ impl Services {
         self.clear_sandbox_retry_count(workspace_id, agent_id).await;
     }
 
+    /// Crash-recovery for sandboxes stranded `merging`: every merge path
+    /// (completion interception, `sandbox.merge` RPC, retry sweep) transits
+    /// through `merging`, so a daemon crash mid-merge leaves the row there —
+    /// invisible to the sweep and unclaimable by the RPC. On a fresh daemon
+    /// no merge can be in flight, so resetting `merging → merge_pending` is
+    /// safe by construction. The daemon calls this once at startup, before
+    /// the first sweep tick.
+    pub async fn recover_stranded_merging_sandboxes(&self) -> usize {
+        use intent_store::SandboxStatus;
+
+        let stranded = match self
+            .store
+            .list_sandboxes_by_status(SandboxStatus::Merging)
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "merging-sandbox recovery: listing failed");
+                return 0;
+            }
+        };
+
+        let mut recovered = 0;
+        for sandbox in stranded {
+            match self
+                .store
+                .try_transition_sandbox_status(
+                    &sandbox.workspace_id,
+                    &sandbox.agent_id,
+                    SandboxStatus::Merging,
+                    SandboxStatus::MergePending,
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    recovered += 1;
+                    tracing::info!(
+                        sandbox = %sandbox.id,
+                        agent = %sandbox.agent_id.0,
+                        workspace = %sandbox.workspace_id.0,
+                        "recovered sandbox stranded merging by a previous daemon; reset to merge_pending"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox = %sandbox.id,
+                        agent = %sandbox.agent_id.0,
+                        workspace = %sandbox.workspace_id.0,
+                        error = %e,
+                        "merging-sandbox recovery: reset failed"
+                    );
+                }
+            }
+        }
+        recovered
+    }
+
     /// Background retry sweep for `merge_pending` sandboxes. Merge-back
     /// otherwise only triggers on agent completion or the manual
     /// `sandbox.merge` RPC, so a sandbox stranded `merge_pending` (daemon
@@ -2958,6 +3043,11 @@ impl Services {
                 continue;
             }
 
+            // Best-effort politeness check; not a correctness guard. If the
+            // agent starts a turn right after this check, the turn's own
+            // completion-path merge still cannot collide with the sweep: it
+            // goes through the same CAS claim below and loses to the sweep's
+            // `merging` claim.
             if self.agent_is_busy(agent_id.clone()) {
                 summary.skipped_busy += 1;
                 tracing::debug!(
@@ -14491,8 +14581,51 @@ impl WorkspaceApi for Services {
             use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
             use intent_store::SandboxStatus;
 
-            // Attempt merge
-            let outcome = merge_sandbox(&store, &workspace_id, &sandbox_id).await?;
+            // Claim the merge atomically (current status → merging) so the RPC
+            // never merges concurrently with the completion path or the
+            // background retry sweep — every merge path goes through the same
+            // compare-and-swap claim protocol.
+            let sandbox = store
+                .get_sandbox(&workspace_id, &sandbox_id)
+                .await?
+                .ok_or_else(|| Error::Internal("Sandbox not found".to_string()))?;
+            if sandbox.status == SandboxStatus::Merging {
+                return Err(Error::Internal(
+                    "Sandbox merge already in progress".to_string(),
+                ));
+            }
+            let claimed = store
+                .try_transition_sandbox_status(
+                    &workspace_id,
+                    &sandbox_id,
+                    sandbox.status,
+                    SandboxStatus::Merging,
+                    &now_iso(),
+                )
+                .await?;
+            if !claimed {
+                return Err(Error::Internal(
+                    "Sandbox merge already in progress".to_string(),
+                ));
+            }
+
+            // Attempt merge. On a hard error return the sandbox to
+            // merge_pending so it stays visible to the retry sweep and
+            // retryable via this RPC rather than stranded `merging`.
+            let outcome = match merge_sandbox(&store, &workspace_id, &sandbox_id).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let _ = store
+                        .update_sandbox_status(
+                            &workspace_id,
+                            &sandbox_id,
+                            SandboxStatus::MergePending,
+                            &now_iso(),
+                        )
+                        .await;
+                    return Err(e);
+                }
+            };
 
             match outcome {
                 MergeOutcome::Merged {
