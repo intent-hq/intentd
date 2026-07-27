@@ -17,8 +17,9 @@ pub mod discover;
 pub mod models;
 
 pub use args::{
-    apply_codex_config_args, build_provider_args, build_provider_env, enhanced_path,
-    upsert_codex_config_args, ArgInputs,
+    apply_codex_config_args, build_provider_args, build_provider_env,
+    build_provider_env_with_unsloth, enhanced_path, upsert_codex_config_args, ArgInputs,
+    UnslothEndpoint,
 };
 pub use config::{
     all_provider_ids, always_enabled_providers, auth_error_message, default_provider_config,

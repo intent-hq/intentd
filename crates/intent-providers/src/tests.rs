@@ -15,6 +15,7 @@ fn registry_default_and_lookups() {
             "codex",
             "cortex",
             "opencode",
+            "unsloth",
             "pi",
             "droid",
             "grok",
@@ -147,6 +148,22 @@ fn registry_field_parity() {
     let mock = find_provider("mock").unwrap();
     assert_eq!(mock.command, "node");
     assert_eq!(mock.requires_env_var, Some("MOCK_AGENT_SCRIPT_PATH"));
+
+    // unsloth rides the opencode binary as its ACP runtime: same command,
+    // base args, runtime, and env-config injection as opencode — but its own
+    // id (the custom `provider.unsloth` block keys off it) and no CLI auth
+    // probe (the injected config carries its own apiKey).
+    let unsloth = find_provider("unsloth").unwrap();
+    assert_eq!(unsloth.display_name, "Unsloth");
+    assert_eq!(unsloth.command, "opencode");
+    assert_eq!(unsloth.base_args, &["acp"]);
+    assert_eq!(unsloth.injection_mechanism, InjectionMechanism::EnvConfig);
+    assert!(unsloth.model_flag.is_none());
+    assert!(!unsloth.supports_mcp_config && !unsloth.supports_session_mcp_servers);
+    assert!(unsloth.can_be_disabled);
+    assert_eq!(unsloth.auth_check_args, None);
+    assert_eq!(unsloth.npx_only_package, None);
+    assert_eq!(unsloth.fallback_npx_package, None);
 }
 
 /// Exactly claude-code, codex, droid, and grok consume MCP servers from the
@@ -414,6 +431,7 @@ fn provider_runtimes() {
     assert_eq!(runtime("auggie"), ProviderRuntime::Node);
     assert_eq!(runtime("claude-code"), ProviderRuntime::Node);
     assert_eq!(runtime("opencode"), ProviderRuntime::Node);
+    assert_eq!(runtime("unsloth"), ProviderRuntime::Node);
     assert_eq!(runtime("mock"), ProviderRuntime::Node);
     assert_eq!(runtime("cortex"), ProviderRuntime::Electron);
     assert_eq!(runtime("codex"), ProviderRuntime::Native);
@@ -592,7 +610,14 @@ fn v8_runtime_node_options_heap_cap() {
 
     // Default cap is 8192 for every Node/Electron provider.
     assert_eq!(args::max_old_space_mb(), 8192);
-    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+    for id in [
+        "auggie",
+        "claude-code",
+        "opencode",
+        "unsloth",
+        "cortex",
+        "mock",
+    ] {
         assert_eq!(
             env_for(id).get("NODE_OPTIONS").map(String::as_str),
             Some("--max-old-space-size=8192"),
@@ -610,7 +635,14 @@ fn v8_runtime_node_options_heap_cap() {
     // Override seam produces the requested cap for all V8 providers.
     std::env::set_var("INTENTD_ACP_NODE_MAX_OLD_SPACE_MB", "4096");
     assert_eq!(args::max_old_space_mb(), 4096);
-    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+    for id in [
+        "auggie",
+        "claude-code",
+        "opencode",
+        "unsloth",
+        "cortex",
+        "mock",
+    ] {
         assert_eq!(
             env_for(id).get("NODE_OPTIONS").map(String::as_str),
             Some("--max-old-space-size=4096"),
@@ -625,7 +657,14 @@ fn v8_runtime_node_options_heap_cap() {
 
     // Parent NODE_OPTIONS is appended to, not clobbered.
     std::env::set_var("NODE_OPTIONS", "--enable-source-maps");
-    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+    for id in [
+        "auggie",
+        "claude-code",
+        "opencode",
+        "unsloth",
+        "cortex",
+        "mock",
+    ] {
         assert_eq!(
             env_for(id).get("NODE_OPTIONS").map(String::as_str),
             Some("--enable-source-maps --max-old-space-size=8192"),
@@ -635,7 +674,14 @@ fn v8_runtime_node_options_heap_cap() {
 
     // Parent already caps old-space → left alone (no double flag).
     std::env::set_var("NODE_OPTIONS", "--max-old-space-size=2048");
-    for id in ["auggie", "claude-code", "opencode", "cortex", "mock"] {
+    for id in [
+        "auggie",
+        "claude-code",
+        "opencode",
+        "unsloth",
+        "cortex",
+        "mock",
+    ] {
         assert!(
             !env_for(id).contains_key("NODE_OPTIONS"),
             "provider {id} must respect a user-set --max-old-space-size"
@@ -889,6 +935,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "codex",
             "cortex",
             "opencode",
+            "unsloth",
             "pi",
             "droid",
             "grok",
@@ -1081,6 +1128,167 @@ fn opencode_env_escapes_json_in_instructions_path() {
         env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
         Some(r#"{"permission":{"task":"deny"},"instructions":["/tmp/\"rules\".md"]}"#)
     );
+}
+
+/// The endpoint fixture matching the spike's working config
+/// (`http://127.0.0.1:8752/v1` + Bearer apiKey + one served model).
+fn unsloth_endpoint() -> UnslothEndpoint {
+    UnslothEndpoint {
+        base_url: "http://127.0.0.1:8752/v1".to_string(),
+        api_key: "sk-unsloth-key".to_string(),
+        model_id: "stub-model-1".to_string(),
+        model_display_name: Some("Stub Model 1".to_string()),
+    }
+}
+
+#[test]
+fn unsloth_env_injects_provider_block_matching_spike_shape() {
+    // With an endpoint and no session model: the provider.unsloth block plus
+    // the `unsloth/<model>` default, permission.task=deny first — the exact
+    // shape the spike proved against opencode 1.18.3.
+    let unsloth = find_provider("unsloth").unwrap();
+    let ep = unsloth_endpoint();
+    let env = build_provider_env_with_unsloth(unsloth, None, None, None, Some(&ep));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(
+            r#"{"permission":{"task":"deny"},"provider":{"unsloth":{"npm":"@ai-sdk/openai-compatible","name":"Unsloth (local)","options":{"baseURL":"http://127.0.0.1:8752/v1","apiKey":"sk-unsloth-key"},"models":{"stub-model-1":{"name":"Stub Model 1"}}}},"model":"unsloth/stub-model-1"}"#
+        )
+    );
+}
+
+#[test]
+fn unsloth_env_session_model_overrides_endpoint_model() {
+    // A session model (not the sentinel) wins over the endpoint's served
+    // model and is registered in the provider's `models` map so the
+    // top-level `model` keeps matching a key (spike constraint).
+    let unsloth = find_provider("unsloth").unwrap();
+    let ep = unsloth_endpoint();
+    let env = build_provider_env_with_unsloth(unsloth, Some("other-model"), None, None, Some(&ep));
+    let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+    assert!(
+        config.contains(r#""model":"unsloth/other-model""#),
+        "session model must win: {config}"
+    );
+    assert!(
+        config.contains(r#""other-model":{"name":"other-model"}"#),
+        "session model must be registered in the models map: {config}"
+    );
+    assert!(
+        config.contains(r#""stub-model-1":{"name":"Stub Model 1"}"#),
+        "served model stays in the models map: {config}"
+    );
+
+    // The "default" sentinel falls back to the endpoint's served model.
+    let env = build_provider_env_with_unsloth(unsloth, Some("default"), None, None, Some(&ep));
+    let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+    assert!(
+        config.contains(r#""model":"unsloth/stub-model-1""#),
+        "sentinel model must fall back to the endpoint model: {config}"
+    );
+}
+
+#[test]
+fn unsloth_env_without_endpoint_is_permission_only() {
+    // No endpoint (managed-server lifecycle not yet run): permission-only
+    // config, no provider block, no model key.
+    let unsloth = find_provider("unsloth").unwrap();
+    let env = build_provider_env(unsloth, None, None, None);
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"}}"#)
+    );
+    // Even with a session model — without the provider block there is no
+    // `unsloth/<model>` key to reference, so the model is dropped.
+    let env = build_provider_env(unsloth, Some("stub-model-1"), None, None);
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"}}"#)
+    );
+}
+
+#[test]
+fn unsloth_env_merges_instructions_and_mcp_after_provider_block() {
+    // Rules file + MCP block ride alongside the provider block, in the same
+    // positions opencode's own assembly puts them (instructions then mcp).
+    let unsloth = find_provider("unsloth").unwrap();
+    let ep = unsloth_endpoint();
+    let mcp = r#"{"workspace-mcp":{"type":"local","command":["intentd","mcp-bridge","--connect","127.0.0.1:9999"],"enabled":true,"environment":{}}}"#;
+    let env =
+        build_provider_env_with_unsloth(unsloth, None, Some("/tmp/rules.md"), Some(mcp), Some(&ep));
+    let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+    assert!(
+        config.starts_with(r#"{"permission":{"task":"deny"},"provider":{"unsloth":"#),
+        "permission then provider block first: {config}"
+    );
+    assert!(
+        config.contains(r#""instructions":["/tmp/rules.md"]"#),
+        "instructions must survive: {config}"
+    );
+    assert!(
+        config.ends_with(&format!(r#""mcp":{mcp}}}"#)),
+        "mcp block spliced last: {config}"
+    );
+}
+
+#[test]
+fn unsloth_env_escapes_endpoint_values() {
+    // Endpoint values are user/lifecycle-supplied strings — quotes and
+    // backslashes must be JSON-escaped, and the emitted value must parse.
+    let unsloth = find_provider("unsloth").unwrap();
+    let ep = UnslothEndpoint {
+        base_url: r#"http://127.0.0.1:8752/v1"x"#.to_string(),
+        api_key: r"key\with\slashes".to_string(),
+        model_id: "m1".to_string(),
+        model_display_name: None,
+    };
+    let env = build_provider_env_with_unsloth(unsloth, None, None, None, Some(&ep));
+    let config = env.get("OPENCODE_CONFIG_CONTENT").unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(config).expect("emitted config must be valid JSON");
+    assert_eq!(
+        parsed["provider"]["unsloth"]["options"]["apiKey"],
+        ep.api_key
+    );
+    assert!(
+        config.contains(r#""baseURL":"http://127.0.0.1:8752/v1\"x""#),
+        "baseURL must be escaped: {config}"
+    );
+    assert!(
+        config.contains(r#""apiKey":"key\\with\\slashes""#),
+        "apiKey must be escaped: {config}"
+    );
+    // Display name falls back to the model id.
+    assert!(
+        config.contains(r#""m1":{"name":"m1"}"#),
+        "display name falls back to model id: {config}"
+    );
+}
+
+#[test]
+fn non_unsloth_providers_ignore_unsloth_endpoint() {
+    // The endpoint is unsloth-only: opencode keeps its plain shape and
+    // non-env-config providers emit nothing.
+    let ep = unsloth_endpoint();
+    let opencode = find_provider("opencode").unwrap();
+    let env = build_provider_env_with_unsloth(opencode, Some("gpt-4"), None, None, Some(&ep));
+    assert_eq!(
+        env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
+        Some(r#"{"permission":{"task":"deny"},"model":"gpt-4"}"#)
+    );
+    for id in ["auggie", "claude-code", "codex", "droid", "grok"] {
+        let env = build_provider_env_with_unsloth(
+            find_provider(id).unwrap(),
+            None,
+            None,
+            None,
+            Some(&ep),
+        );
+        assert!(
+            !env.contains_key("OPENCODE_CONFIG_CONTENT"),
+            "{id} unexpectedly emitted OPENCODE_CONFIG_CONTENT"
+        );
+    }
 }
 
 #[test]

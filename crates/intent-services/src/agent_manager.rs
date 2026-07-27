@@ -167,8 +167,11 @@ pub fn default_process_cap() -> usize {
     }
 }
 
+/// Total system RAM in bytes (Linux/macOS only). Shared beyond this module by
+/// [`crate::provider_models`]'s unsloth catalog fit filter, which compares a
+/// model's estimated footprint against a fraction of this value.
 #[cfg(target_os = "linux")]
-fn total_memory_bytes() -> Option<u64> {
+pub(crate) fn total_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
@@ -179,8 +182,9 @@ fn total_memory_bytes() -> Option<u64> {
     None
 }
 
+/// See the Linux doc comment above.
 #[cfg(target_os = "macos")]
-fn total_memory_bytes() -> Option<u64> {
+pub(crate) fn total_memory_bytes() -> Option<u64> {
     use std::mem;
     use std::ptr;
 
@@ -205,8 +209,9 @@ fn total_memory_bytes() -> Option<u64> {
     }
 }
 
+/// See the Linux doc comment above.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn total_memory_bytes() -> Option<u64> {
+pub(crate) fn total_memory_bytes() -> Option<u64> {
     None
 }
 
@@ -3781,6 +3786,7 @@ impl AgentManager {
         opts.npx_fallback_binary = resolved.npx_fallback_binary.as_deref();
         opts.npx_fallback_package = resolved.npx_fallback_package;
         opts.extra_env = resolved.extra_env.clone();
+        opts.unsloth_endpoint = resolved.unsloth_endpoint.as_ref();
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -4425,6 +4431,9 @@ struct ResolvedSpawn {
     npx_fallback_binary: Option<PathBuf>,
     /// The package name to pass to npx when npx_fallback_binary is set.
     npx_fallback_package: Option<&'static str>,
+    /// Unsloth-managed server endpoint for the `unsloth` provider (see
+    /// [`resolve_unsloth_endpoint`]). Always `None` for other providers.
+    unsloth_endpoint: Option<intent_providers::UnslothEndpoint>,
 }
 
 /// Resolve the provider config, model, cwd, and extra env for spawning an
@@ -4603,10 +4612,12 @@ fn resolve_spawn(
             extra_env,
             npx_fallback_binary: None,
             npx_fallback_package: None,
+            unsloth_endpoint: None,
         });
     }
 
     let provider = *intent_providers::provider_config(&provider_id);
+    let unsloth_endpoint = resolve_unsloth_endpoint(&provider_id);
 
     // npx-only providers (claude-code) are spawned exclusively via
     // `npx -y <pinned package>`; local-binary discovery (settings path /
@@ -4628,6 +4639,7 @@ fn resolve_spawn(
             extra_env,
             npx_fallback_binary: Some(npx_binary),
             npx_fallback_package: Some(npx_package),
+            unsloth_endpoint,
         });
     }
 
@@ -4669,7 +4681,20 @@ fn resolve_spawn(
         extra_env,
         npx_fallback_binary,
         npx_fallback_package,
+        unsloth_endpoint,
     })
+}
+
+/// Resolve the Unsloth-managed server endpoint for an `unsloth` spawn. The
+/// managed-server lifecycle (which starts the local Unsloth Studio server and
+/// owns its baseURL/apiKey/model) is not built yet, so this returns `None`
+/// and the unsloth child spawns with permission-only config — the seam is
+/// here so the lifecycle only has to fill in this one function.
+fn resolve_unsloth_endpoint(provider_id: &str) -> Option<intent_providers::UnslothEndpoint> {
+    if provider_id != "unsloth" {
+        return None;
+    }
+    None
 }
 
 /// Resolve the npx spawn inputs for an npx-only provider. `npx_path` is the
@@ -4728,6 +4753,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.tools_to_remove = opts.tools_to_remove.clone();
     spawn_opts.mcp_config_file = mcp_config_path;
     spawn_opts.env_mcp_config = env_mcp_config;
+    spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts
 }
 

@@ -297,6 +297,19 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
     },
     ProviderConfig {
+        // Rides the opencode binary (`opencode acp`) as its ACP runtime: the
+        // Unsloth-managed local OpenAI-compatible server is injected as a
+        // custom `provider.unsloth` block via `OPENCODE_CONFIG_CONTENT`
+        // (`build_provider_env`, args.rs). Endpoint/apiKey/model come from
+        // the managed-server lifecycle at spawn time (`UnslothEndpoint`);
+        // no CLI auth probe — the injected config carries its own apiKey.
+        runtime: ProviderRuntime::Node,
+        base_args: &["acp"],
+        can_be_disabled: true,
+        injection_mechanism: InjectionMechanism::EnvConfig,
+        ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
+    },
+    ProviderConfig {
         runtime: ProviderRuntime::Node,
         can_be_disabled: true,
         // pi-acp (0.0.31) has no `_meta` system-prompt path and no rules/MCP
