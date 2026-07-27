@@ -16184,15 +16184,21 @@ mod last_activity_events {
     async fn dismiss_attention_idempotent() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
+        let mut sub = subscribe(&h);
 
-        // Raise first so we have something to dismiss.
+        // Raise first so we have something to dismiss, and consume both of
+        // its events explicitly (immediate attention-changed + debounced
+        // workspace:updated). A sleep-based drain is racy: under CI load the
+        // debounce timer can fire late, leaking the raise's stale
+        // workspace:updated into the dismiss assertions below (monorepo#905).
         h.services
             .raise_attention(&h.ws, WorkspaceAttention::Unread)
             .await
             .expect("raise");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let mut sub = subscribe(&h);
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:attention-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
 
         // Dismiss (should emit both events).
         h.services
