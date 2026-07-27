@@ -14030,9 +14030,11 @@ mod file_ops_service {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    /// Wire-contract test: agent.delegate returns effectiveIsolation field when
-    /// isolation is requested, reporting "cow" on successful provisioning or "direct"
-    /// on unsupported fallback.
+    /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
+    /// when an eligible CoW provisioning kicks off (monorepo#871 — the clone
+    /// runs in a background task, off the delegate critical path). The settled
+    /// outcome is observable on the child's session: sandbox fields present on
+    /// success, absent on the shared-mode fallback.
     #[tokio::test]
     async fn delegate_returns_effective_isolation_in_result() {
         use intent_core::AgentDelegateInput;
@@ -14074,13 +14076,11 @@ mod file_ops_service {
         ws.skip_worktree = true;
         store.insert_workspace(&ws).await.expect("insert ws");
 
-        // Probe CoW support to determine expected outcome
+        // Probe CoW support to determine the expected SETTLED outcome (the
+        // session's sandbox fields; the delegate result itself is "pending").
         fs::create_dir_all(&workspaces_root).unwrap();
         let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
-        let expected_isolation = match probe {
-            CowSupport::Supported => "cow",
-            CowSupport::Unsupported => "direct",
-        };
+        let expect_sandbox = matches!(probe, CowSupport::Supported);
 
         // Create services with workspaces_root configured
         let mut svc = Services::new(store.clone());
@@ -14098,20 +14098,48 @@ mod file_ops_service {
             .await
             .expect("delegate");
 
-        // Assert effectiveIsolation field is present and correct
+        // Assert effectiveIsolation reports "pending" — provisioning runs in
+        // a background task, off the delegate critical path (monorepo#871).
         let effective_iso = result
             .get("effectiveIsolation")
             .expect("effectiveIsolation field must be present when isolation is requested");
         assert_eq!(
             effective_iso.as_str().unwrap(),
-            expected_isolation,
-            "effectiveIsolation must report actual provisioning outcome"
+            "pending",
+            "delegate returns immediately with pending provisioning"
         );
 
         // Also verify agentId and name are present (baseline delegate result shape)
         assert!(result.get("ok").unwrap().as_bool().unwrap());
         assert!(result.get("agentId").is_some());
         assert!(result.get("name").is_some());
+
+        // Await settlement (the same gate the child's turn worker blocks on)
+        // and assert the settled outcome on the session: sandbox fields when
+        // CoW is supported, none on the shared-mode fallback.
+        let agent_id = AgentId::from(result.get("agentId").unwrap().as_str().unwrap());
+        svc.await_sandbox_provisioning(&agent_id).await;
+        let session = store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("child session");
+        if expect_sandbox {
+            let sandbox_path = session
+                .sandbox_path
+                .as_deref()
+                .expect("sandbox_path settled on the session");
+            assert!(
+                std::path::Path::new(sandbox_path).exists(),
+                "provisioned sandbox exists at {sandbox_path}"
+            );
+            assert!(session.sandbox_branch.is_some());
+            assert!(session.sandbox_id.is_some());
+        } else {
+            assert!(
+                session.sandbox_path.is_none(),
+                "shared-mode fallback keeps no sandbox fields"
+            );
+        }
 
         // Clean up
         let _ = fs::remove_dir_all(&test_root);

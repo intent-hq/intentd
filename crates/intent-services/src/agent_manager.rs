@@ -3884,6 +3884,14 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
+        // A delegate with CoW isolation provisions the sandbox in a background
+        // task, off the delegate critical path (monorepo#871). Await
+        // settlement BEFORE reading the session so the child never spawns
+        // against a half-copied sandbox (the spawn cwd is
+        // `session.sandbox_path`) and the session read below observes the
+        // settled sandbox fields. No-op when no provisioning is in flight —
+        // the common case for every turn after the first.
+        self.services.await_sandbox_provisioning(agent_id).await;
         let session = self.services.store.get_agent_session(agent_id).await?;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let settings = self.services.effective_settings();

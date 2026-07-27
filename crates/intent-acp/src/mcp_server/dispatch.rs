@@ -21,6 +21,26 @@ use super::WorkspaceMcpServer;
 /// [`WorkspaceMcpServer::with_workspace_api_timeout`].
 pub(super) const WORKSPACE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The effective default budget: `INTENTD_WORKSPACE_API_TIMEOUT_MS` when set
+/// to a positive integer (defensive knob, monorepo#871), else
+/// [`WORKSPACE_API_TIMEOUT`]. Read at server construction time.
+pub(super) fn default_workspace_api_timeout() -> Duration {
+    workspace_api_timeout_from(
+        std::env::var("INTENTD_WORKSPACE_API_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Parse an override in milliseconds; anything unset, non-numeric, or
+/// non-positive keeps the [`WORKSPACE_API_TIMEOUT`] default.
+fn workspace_api_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(WORKSPACE_API_TIMEOUT)
+}
+
 impl WorkspaceMcpServer {
     /// WSAPI-2 dispatch: evaluate agent-supplied JavaScript against the
     /// workspace API and shape the MCP tool result in-line (reference parity
@@ -314,4 +334,37 @@ fn extract_missing_prop(msg: &str) -> Option<String> {
     let rest = &msg[start..];
     let end = rest.find('\'')?;
     Some(rest[..end].to_string())
+}
+
+#[cfg(test)]
+mod timeout_override_tests {
+    use super::*;
+
+    #[test]
+    fn unset_keeps_default() {
+        assert_eq!(workspace_api_timeout_from(None), WORKSPACE_API_TIMEOUT);
+    }
+
+    #[test]
+    fn positive_millis_override() {
+        assert_eq!(
+            workspace_api_timeout_from(Some("120000")),
+            Duration::from_millis(120_000)
+        );
+        assert_eq!(
+            workspace_api_timeout_from(Some(" 500 ")),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn invalid_values_keep_default() {
+        for raw in ["0", "-5", "abc", "", "1.5"] {
+            assert_eq!(
+                workspace_api_timeout_from(Some(raw)),
+                WORKSPACE_API_TIMEOUT,
+                "raw={raw:?}"
+            );
+        }
+    }
 }

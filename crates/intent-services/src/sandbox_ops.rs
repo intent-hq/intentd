@@ -2,12 +2,54 @@
 //! CoW-checkout workspaces).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
 use intent_git::{cow_clone, cow_probe, CowSupport};
 use intent_store::{Sandbox, SandboxStatus, Store};
 
 use crate::now_iso;
+
+/// Test hook: artificial delay (milliseconds) at the top of
+/// [`provision_sandbox`], standing in for a slow CoW clone of a large
+/// checkout. Lets e2e tests prove provisioning runs off the delegate
+/// critical path (monorepo#871). NOTE: this seam is compiled into release
+/// binaries too (release-mode e2e runs need it); it is inert unless the
+/// namespaced env var is set to a positive integer.
+pub const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
+
+/// Test hook: force [`provision_sandbox`] to fail with an internal error
+/// (after the optional delay above), exercising the fallback-to-shared-mode
+/// path on provisioning failure. Inert unless set to `1`.
+pub const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
+
+/// Parse the delay override in milliseconds; anything unset, non-numeric, or
+/// non-positive disables the hook.
+fn test_provision_delay_from(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// Apply the test-only provisioning seams: sleep out the configured delay,
+/// then fail if the error hook is armed. No-op when neither env var is set.
+async fn apply_test_provision_hooks() -> Result<()> {
+    if let Some(delay) =
+        test_provision_delay_from(std::env::var(TEST_PROVISION_DELAY_MS_ENV).ok().as_deref())
+    {
+        tracing::warn!(
+            delay_ms = delay.as_millis() as u64,
+            "provision_sandbox: artificial delay (test seam)"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    if std::env::var(TEST_PROVISION_ERROR_ENV).is_ok_and(|v| v == "1") {
+        return Err(Error::Internal(
+            "forced provisioning failure (test seam)".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Outcome of sandbox provisioning.
 #[derive(Debug, Clone)]
@@ -70,6 +112,10 @@ pub async fn provision_sandbox(
     agent_id: &AgentId,
     config: &ProvisionConfig,
 ) -> Result<ProvisionOutcome> {
+    // Test seams: artificial delay (slow-clone stand-in) and forced failure.
+    // Inert unless the namespaced env vars are set.
+    apply_test_provision_hooks().await?;
+
     // Load workspace
     let workspace = store.get_workspace(workspace_id).await?;
 
@@ -190,7 +236,13 @@ pub async fn provision_sandbox(
         created_at: now.clone(),
         updated_at: now,
     };
-    store.insert_sandbox(&sandbox).await?;
+    if let Err(e) = store.insert_sandbox(&sandbox).await {
+        // The agent session row can vanish mid-clone (`agent.delete` races
+        // the background provisioning; the sandbox FK cascades) — don't
+        // strand the just-cloned directory when the record insert fails.
+        let _ = std::fs::remove_dir_all(&sandbox_path);
+        return Err(e);
+    }
 
     Ok(ProvisionOutcome::Supported {
         path: sandbox_path,
@@ -923,6 +975,35 @@ fn get_conflicting_paths(index: &git2::Index) -> Result<Vec<String>> {
     }
 
     Ok(paths)
+}
+
+#[cfg(test)]
+mod test_hook_tests {
+    use super::*;
+
+    #[test]
+    fn unset_disables_delay() {
+        assert_eq!(test_provision_delay_from(None), None);
+    }
+
+    #[test]
+    fn positive_millis_enable_delay() {
+        assert_eq!(
+            test_provision_delay_from(Some("10000")),
+            Some(Duration::from_millis(10_000))
+        );
+        assert_eq!(
+            test_provision_delay_from(Some(" 500 ")),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn invalid_values_disable_delay() {
+        for raw in ["0", "-5", "abc", "", "1.5"] {
+            assert_eq!(test_provision_delay_from(Some(raw)), None, "raw={raw:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1754,6 +1835,57 @@ mod tests {
         };
         let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
         assert!(sandbox.is_none());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn provision_cleans_up_clone_when_record_insert_fails() {
+        // agent.delete can race the background clone (monorepo#871): with no
+        // agent_session row the sandbox record insert fails its FK
+        // (ON DELETE CASCADE reference), and the just-cloned directory must
+        // not be stranded on disk.
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("insert-fk-race");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        // No agent session inserted: mirrors a hard agent.delete completing
+        // while the clone ran.
+        let agent_id = AgentId::new();
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let err = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("insert sandbox failed"),
+            "expected FK insert failure, got: {err}"
+        );
+
+        // The cloned sandbox directory must have been removed.
+        let sandbox_parent = workspaces_root
+            .join(&ws.id.0)
+            .join("sandboxes")
+            .join(&agent_id.0);
+        let leftover: Vec<_> = fs::read_dir(&sandbox_parent)
+            .map(|entries| entries.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "cloned sandbox directory must be cleaned up on insert failure: {leftover:?}"
+        );
 
         let _ = fs::remove_dir_all(&test_root);
     }

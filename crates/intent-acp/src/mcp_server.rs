@@ -72,7 +72,7 @@ impl WorkspaceMcpServer {
             version: env!("CARGO_PKG_VERSION").to_string(),
             caller_agent_id: None,
             is_chief,
-            workspace_api_timeout: dispatch::WORKSPACE_API_TIMEOUT,
+            workspace_api_timeout: dispatch::default_workspace_api_timeout(),
             turn_attachments: None,
         }
     }
