@@ -7,11 +7,10 @@
 //! (`Agent-Id:` / `Linked-Note-Id:`) parsed from the commit body. Returned to the
 //! wire as `CommitWithAttribution[]` by `intent-services` (M4.8).
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use git2::{Commit, Patch, Repository, Sort};
+use git2::{Commit, Oid, Patch, Repository, Sort};
 use intent_core::{iso_from_unix_secs, Error, Result};
 
 use crate::map_git_err;
@@ -62,9 +61,7 @@ pub fn history_since(
     }
 
     let branch = current_branch(&repo);
-    let unpushed_started = Instant::now();
-    let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
-    let unpushed_elapsed = unpushed_started.elapsed();
+    let upstream = upstream_tip(&repo, &branch);
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -78,6 +75,7 @@ pub fn history_since(
 
     let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let mut diff_elapsed = Duration::ZERO;
+    let mut pushed_elapsed = Duration::ZERO;
     let mut out = Vec::new();
     for oid in walk {
         if out.len() >= limit {
@@ -90,7 +88,11 @@ pub fn history_since(
             continue;
         }
         let hash = oid.to_string();
-        let is_pushed = has_upstream && !unpushed.contains(&hash);
+        let pushed_started = timing_enabled.then(Instant::now);
+        let is_pushed = is_pushed(&repo, upstream, oid);
+        if let Some(t) = pushed_started {
+            pushed_elapsed += t.elapsed();
+        }
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
         let files = if include_files {
             let diff_started = timing_enabled.then(Instant::now);
@@ -123,11 +125,11 @@ pub fn history_since(
         limit,
         base_ref = base_ref.unwrap_or(""),
         include_files,
-        unpushed_ms = unpushed_elapsed.as_millis() as u64,
+        pushed_check_ms = pushed_elapsed.as_millis() as u64,
         per_commit_diff_ms = diff_elapsed.as_millis() as u64,
         other_ms = total
             .saturating_sub(diff_elapsed)
-            .saturating_sub(unpushed_elapsed)
+            .saturating_sub(pushed_elapsed)
             .as_millis() as u64,
         total_ms = total.as_millis() as u64,
         "history_since: revwalk + per-commit tree diffs"
@@ -135,34 +137,27 @@ pub fn history_since(
     Ok(out)
 }
 
-/// The set of commit hashes in `origin/<branch>..HEAD` (the unpushed commits),
-/// plus whether the upstream ref exists. With no upstream every commit is
-/// treated as unpushed (the TS `hasUpstream` fallback).
-fn unpushed_hashes(repo: &Repository, branch: &str) -> (HashSet<String>, bool) {
-    let empty = (HashSet::new(), false);
+/// The tip of `refs/remotes/origin/<branch>`, or `None` when the branch is
+/// unknown or has no such remote-tracking ref (the TS `hasUpstream` fallback:
+/// every commit is then treated as unpushed).
+fn upstream_tip(repo: &Repository, branch: &str) -> Option<Oid> {
     if branch.is_empty() {
-        return empty;
+        return None;
     }
     let upstream = format!("refs/remotes/origin/{branch}");
-    let Some(upstream_oid) = repo.find_reference(&upstream).ok().and_then(|r| r.target()) else {
-        return empty;
-    };
-    let Ok(mut walk) = repo.revwalk() else {
-        return empty;
-    };
-    if walk.push_head().is_err() || walk.hide(upstream_oid).is_err() {
-        return empty;
+    repo.find_reference(&upstream).ok().and_then(|r| r.target())
+}
+
+/// Whether `oid` is already on the upstream (pushed): it is the upstream tip
+/// itself or an ancestor of it. Checked per emitted commit instead of
+/// pre-walking the whole `origin/<branch>..HEAD` range, so the cost is bounded
+/// by the caller's page size rather than the branch divergence (#963). An
+/// ancestry-check error is treated as unpushed.
+fn is_pushed(repo: &Repository, upstream_tip: Option<Oid>, oid: Oid) -> bool {
+    match upstream_tip {
+        Some(tip) => oid == tip || repo.graph_descendant_of(tip, oid).unwrap_or(false),
+        None => false,
     }
-    let mut set = HashSet::new();
-    for oid in walk {
-        match oid {
-            Ok(oid) => {
-                set.insert(oid.to_string());
-            }
-            Err(_) => return empty,
-        }
-    }
-    (set, true)
 }
 
 /// The files changed by `commit` vs its first parent (name-only), mirroring
@@ -356,9 +351,7 @@ pub fn history_bounded(
     }
 
     let branch = current_branch(&repo);
-    let unpushed_started = Instant::now();
-    let (unpushed, has_upstream) = unpushed_hashes(&repo, &branch);
-    let unpushed_elapsed = unpushed_started.elapsed();
+    let upstream = upstream_tip(&repo, &branch);
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -381,6 +374,7 @@ pub fn history_bounded(
 
     let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let mut diff_elapsed = Duration::ZERO;
+    let mut pushed_elapsed = Duration::ZERO;
     let mut out = Vec::new();
     for oid in walk {
         if out.len() >= limit {
@@ -393,7 +387,11 @@ pub fn history_bounded(
             continue;
         }
         let hash = oid.to_string();
-        let is_pushed = has_upstream && !unpushed.contains(&hash);
+        let pushed_started = timing_enabled.then(Instant::now);
+        let is_pushed = is_pushed(&repo, upstream, oid);
+        if let Some(t) = pushed_started {
+            pushed_elapsed += t.elapsed();
+        }
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
         let files = if include_files {
             let diff_started = timing_enabled.then(Instant::now);
@@ -427,11 +425,11 @@ pub fn history_bounded(
         include_older,
         include_files,
         bounded = boundary_sha.is_some(),
-        unpushed_ms = unpushed_elapsed.as_millis() as u64,
+        pushed_check_ms = pushed_elapsed.as_millis() as u64,
         per_commit_diff_ms = diff_elapsed.as_millis() as u64,
         other_ms = total
             .saturating_sub(diff_elapsed)
-            .saturating_sub(unpushed_elapsed)
+            .saturating_sub(pushed_elapsed)
             .as_millis() as u64,
         total_ms = total.as_millis() as u64,
         "history_bounded: revwalk + per-commit tree diffs"
@@ -517,6 +515,106 @@ mod tests {
             assert!(!c.message.is_empty());
             assert!(!c.date.is_empty());
         }
+    }
+
+    /// Point `refs/remotes/origin/<branch>` (the current branch) at `target`.
+    fn set_upstream_ref(worktree: &Path, target: &str) {
+        let repo = Repository::open(worktree).unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        let oid = git2::Oid::from_str(target).unwrap();
+        repo.reference(
+            &format!("refs/remotes/origin/{branch}"),
+            oid,
+            true,
+            "test upstream",
+        )
+        .unwrap();
+    }
+
+    /// Like `commit_file` but with an explicit commit timestamp, so `Sort::TIME`
+    /// walks return a deterministic newest-first order (same-second commits tie).
+    fn commit_file_at(worktree: &Path, rel: &str, contents: &str, unix_secs: i64) {
+        crate::testutil::write_file(worktree, rel, contents);
+        let repo = Repository::open(worktree).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(rel)).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = git2::Signature::new("Test", "test@example.com", &git2::Time::new(unix_secs, 0))
+            .unwrap();
+        let parents = match repo.head().ok().and_then(|h| h.target()) {
+            Some(oid) => vec![repo.find_commit(oid).unwrap()],
+            None => Vec::new(),
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "commit", &tree, &parent_refs)
+            .unwrap();
+    }
+
+    const T0: i64 = 1_700_000_000;
+
+    #[test]
+    fn is_pushed_reflects_upstream_tip_and_ancestors() {
+        let dir = init_repo("history-pushed");
+        commit_file_at(dir.path(), "a.txt", "one\n", T0);
+        commit_file_at(dir.path(), "b.txt", "two\n", T0 + 1);
+        let pushed_tip = history(dir.path(), 50).unwrap()[0].hash.clone();
+        set_upstream_ref(dir.path(), &pushed_tip);
+        commit_file_at(dir.path(), "c.txt", "three\n", T0 + 2);
+
+        let commits = history(dir.path(), 50).unwrap();
+        assert_eq!(commits.len(), 3);
+        // Newest commit is ahead of the upstream tip → unpushed.
+        assert!(!commits[0].is_pushed);
+        // The upstream tip itself and its ancestor are pushed.
+        assert_eq!(commits[1].hash, pushed_tip);
+        assert!(commits[1].is_pushed);
+        assert!(commits[2].is_pushed);
+    }
+
+    #[test]
+    fn is_pushed_diverged_upstream_marks_only_common_ancestors() {
+        let dir = init_repo("history-diverged");
+        commit_file_at(dir.path(), "a.txt", "base\n", T0);
+        let default_branch = current_branch(&Repository::open(dir.path()).unwrap());
+        // A side branch diverges from the base commit; its tip becomes the
+        // upstream of the default branch.
+        crate::testutil::create_branch(dir.path(), "side");
+        crate::testutil::checkout_branch(dir.path(), "side");
+        commit_file_at(dir.path(), "remote.txt", "remote-only\n", T0 + 1);
+        let side_tip = history(dir.path(), 50).unwrap()[0].hash.clone();
+        crate::testutil::checkout_branch(dir.path(), &default_branch);
+        set_upstream_ref(dir.path(), &side_tip);
+        commit_file_at(dir.path(), "local.txt", "local-only\n", T0 + 2);
+
+        let commits = history(dir.path(), 50).unwrap();
+        assert_eq!(commits.len(), 2);
+        // Local-only commit is not an ancestor of the diverged upstream tip.
+        assert!(!commits[0].is_pushed);
+        // The common base is an ancestor of the upstream tip → pushed.
+        assert!(commits[1].is_pushed);
+    }
+
+    #[test]
+    fn large_divergence_page_has_correct_flags() {
+        let dir = init_repo("history-large-divergence");
+        commit_file_at(dir.path(), "base.txt", "base\n", T0);
+        let pushed_tip = history(dir.path(), 50).unwrap()[0].hash.clone();
+        set_upstream_ref(dir.path(), &pushed_tip);
+        for i in 0..60 {
+            commit_file_at(dir.path(), "churn.txt", &format!("rev {i}\n"), T0 + 1 + i);
+        }
+
+        let page = history_since(dir.path(), None, 10, false).unwrap();
+        assert_eq!(page.len(), 10);
+        assert!(page.iter().all(|c| !c.is_pushed));
+
+        let all = history_since(dir.path(), None, 100, false).unwrap();
+        assert_eq!(all.len(), 61);
+        assert!(all[..60].iter().all(|c| !c.is_pushed));
+        assert_eq!(all[60].hash, pushed_tip);
+        assert!(all[60].is_pushed);
     }
 
     #[test]
