@@ -170,6 +170,51 @@ impl Store {
         rows.iter().map(sandbox_from_row).collect()
     }
 
+    /// List all sandbox records in a given status (across every workspace).
+    /// Used by the daemon's merge retry sweep to find `merge_pending` sandboxes.
+    pub async fn list_sandboxes_by_status(&self, status: SandboxStatus) -> Result<Vec<Sandbox>> {
+        let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE status = ?");
+        let rows = sqlx::query(&sql)
+            .bind(status.to_db())
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| {
+                intent_core::Error::Internal(format!("list sandboxes by status failed: {e}"))
+            })?;
+        rows.iter().map(sandbox_from_row).collect()
+    }
+
+    /// Atomically transition a sandbox status from `from` to `to`. Returns
+    /// `true` when the row was still in the expected `from` status and was
+    /// updated (the caller acquired the transition), `false` when another
+    /// path already moved it — the compare-and-swap that lets the merge
+    /// retry sweep claim `merge_pending → merging` without double-merging
+    /// against a concurrent `sandbox.merge` RPC or a second sweep.
+    pub async fn try_transition_sandbox_status(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        from: SandboxStatus,
+        to: SandboxStatus,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE sandbox SET status = ?, updated_at = ? \
+             WHERE workspace_id = ? AND agent_id = ? AND status = ?",
+        )
+        .bind(to.to_db())
+        .bind(updated_at)
+        .bind(&workspace_id.0)
+        .bind(&agent_id.0)
+        .bind(from.to_db())
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("transition sandbox status failed: {e}"))
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Get the retry count for a sandbox.
     pub async fn get_sandbox_retry_count(
         &self,

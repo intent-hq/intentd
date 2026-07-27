@@ -871,6 +871,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         idempotency_store,
         intent_core::agent_logs_root(&config.data_dir),
     );
+    // Merge-pending retry sweep: periodically retry merge-back for sandboxes
+    // stranded `merge_pending` (daemon restart mid-merge, historical failures
+    // like the pre-#592 fetch bug). First tick fires immediately so stuck
+    // sandboxes self-heal on startup. Aborted on clean shutdown.
+    let merge_retry_task = spawn_sandbox_merge_retry_loop(services.clone());
     // External MCP servers (§18.3): start every enabled, non-disabled server,
     // then run the health monitor (periodic ping + auto-restart pushing
     // `mcp.servers:status-changed`). The hub is reaped on shutdown so no orphan
@@ -1156,6 +1161,7 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         retention_task.abort();
     }
     idempotency_reap_task.abort();
+    merge_retry_task.abort();
     // Stop the MCP health monitor and reap every external MCP server's process
     // group so no orphan stdio servers survive the daemon (§18.3).
     mcp_monitor.abort();
@@ -2099,6 +2105,45 @@ fn spawn_idempotency_reap_loop(
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!(error = %e, "agent stderr log sweep failed"),
                 Err(e) => tracing::warn!(error = %e, "agent stderr log sweep task failed"),
+            }
+        }
+    })
+}
+
+/// Interval between merge-pending retry sweeps.
+const SANDBOX_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Spawn the periodic merge-pending retry sweep. Merge-back otherwise only
+/// triggers on agent completion or the manual `sandbox.merge` RPC, so a
+/// sandbox stranded `merge_pending` (daemon restart mid-merge, or historical
+/// failures like the pre-#592 fetch bug) never self-heals. Each tick calls
+/// [`Services::sweep_merge_pending_sandboxes`]: retries every `merge_pending`
+/// sandbox (up to the per-sandbox retry cap), skipping agents that are
+/// mid-turn. The first tick fires immediately so stuck sandboxes recover on
+/// startup; a no-op sweep is silent, an active one logs its tally. Aborted on
+/// clean shutdown.
+fn spawn_sandbox_merge_retry_loop(services: Services) -> tokio::task::JoinHandle<()> {
+    tracing::info!(
+        interval_secs = SANDBOX_MERGE_SWEEP_INTERVAL.as_secs(),
+        "merge-pending retry sweep enabled"
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SANDBOX_MERGE_SWEEP_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let summary = services.sweep_merge_pending_sandboxes().await;
+            if !summary.is_empty() {
+                tracing::info!(
+                    merged = summary.merged,
+                    conflicts = summary.conflicts,
+                    blocked = summary.blocked,
+                    skipped_capped = summary.skipped_capped,
+                    skipped_busy = summary.skipped_busy,
+                    skipped_raced = summary.skipped_raced,
+                    errors = summary.errors,
+                    "merge-pending retry sweep completed"
+                );
             }
         }
     })
