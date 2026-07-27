@@ -3672,6 +3672,9 @@ mod mcp_bridge_tests {
                 reconnect_window: Duration::from_secs(2),
                 backoff_start: Duration::from_millis(10),
                 backoff_cap: Duration::from_millis(20),
+                // Generous so gated test connectors (monorepo#906 regressions)
+                // never hit the per-attempt bound.
+                connect_timeout: Duration::from_secs(5),
             }
         }
 
@@ -4024,9 +4027,21 @@ mod mcp_bridge_tests {
             .expect("bridge never started the reconnect attempt");
 
             // This request races the pending attempt: it must be held, not
-            // rejected with -32001.
+            // rejected with -32001. While the gate keeps the attempt pending,
+            // stdout must stay silent — a pre-fix bridge writes the reject in
+            // this window (this wait also gives the bridge time to consume
+            // the line before the gate opens, so the race is exercised).
             bridge.send_request(2).await;
-            sleep(Duration::from_millis(50)).await;
+            let mut peek = String::new();
+            let silent = timeout(
+                Duration::from_millis(200),
+                bridge.stdout.read_line(&mut peek),
+            )
+            .await;
+            assert!(
+                silent.is_err(),
+                "no reject may be written while the attempt is pending, got: {peek}"
+            );
             gate.notify_one();
 
             let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
@@ -4107,8 +4122,20 @@ mod mcp_bridge_tests {
             .await
             .expect("bridge never started the reconnect attempt");
 
+            // Held while the gated attempt is pending: stdout stays silent
+            // until the attempt fails (this wait also gives the bridge time
+            // to consume the line before the gate opens).
             bridge.send_request(2).await;
-            sleep(Duration::from_millis(50)).await;
+            let mut peek = String::new();
+            let silent = timeout(
+                Duration::from_millis(200),
+                bridge.stdout.read_line(&mut peek),
+            )
+            .await;
+            assert!(
+                silent.is_err(),
+                "no reject may be written while the attempt is pending, got: {peek}"
+            );
             gate.notify_one();
 
             let resp = bridge.read_response().await;

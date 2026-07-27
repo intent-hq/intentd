@@ -232,6 +232,12 @@ pub(crate) struct BridgeRetryConfig {
     pub backoff_start: Duration,
     /// Upper bound on the (doubling) backoff delay.
     pub backoff_cap: Duration,
+    /// Per-attempt cap on how long a single connect may stay pending. The
+    /// bridge only ever dials loopback, where connects resolve immediately,
+    /// so this is a defensive bound: it keeps a pathologically hanging
+    /// attempt from stalling held stdin lines (monorepo#906) or the
+    /// `reconnect_window` deadline for the OS connect timeout.
+    pub connect_timeout: Duration,
 }
 
 impl Default for BridgeRetryConfig {
@@ -241,6 +247,7 @@ impl Default for BridgeRetryConfig {
             reconnect_window: Duration::from_secs(30),
             backoff_start: Duration::from_millis(50),
             backoff_cap: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -399,20 +406,24 @@ where
     let mut overflowed = false;
     loop {
         attempts += 1;
-        // Service stdin while the connect itself is pending (not just during
-        // the backoff sleep) so a blackholed address cannot leave requests
-        // unserviced for the OS connect timeout. Initial-window lines keep
-        // buffering; mid-session lines are held for this attempt's outcome
-        // (see above) instead of being rejected against possibly stale
-        // readiness (monorepo#906).
+        // Service stdin while the connect itself is pending, holding lines
+        // for the attempt's outcome (see above) instead of rejecting them
+        // against possibly stale readiness (monorepo#906). `connect_timeout`
+        // bounds the attempt so a blackholed address cannot stall held lines
+        // (or the reconnect deadline) for the OS connect timeout.
         let mut held: Vec<String> = Vec::new();
         let mut held_bytes: usize = 0;
-        let attempt = connect();
+        let attempt = tokio::time::timeout(cfg.connect_timeout, connect());
         tokio::pin!(attempt);
         let connected = loop {
             tokio::select! {
                 biased;
-                result = &mut attempt => break result,
+                result = &mut attempt => break result.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "mcp bridge connect attempt timed out",
+                    ))
+                }),
                 line = input.next_line() => match line? {
                     Some(line) => {
                         if initial {
