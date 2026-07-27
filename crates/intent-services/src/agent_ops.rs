@@ -1211,6 +1211,13 @@ impl Services {
     /// The served page strips those blocks (and their paired `tool_result`s)
     /// non-destructively — the stored rows are untouched, so the read is
     /// idempotent and covers old rows and restored backups alike.
+    ///
+    /// Pagination happens SQL-side (monorepo#958): the window is resolved
+    /// against the row count and only the requested page is selected and
+    /// decoded, so a `limit=N` read touches at most N rows regardless of
+    /// transcript size. The token contract is unchanged from the in-memory
+    /// implementation (`page_window` over the same oldest→newest indexing),
+    /// so previously minted tokens still resolve to the same rows.
     pub(crate) async fn agent_get_conversation_op(
         &self,
         agent_id: AgentId,
@@ -1218,7 +1225,8 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         page_token: Option<String>,
     ) -> Result<Value> {
-        let session = self.store.get_agent_session(&agent_id).await?;
+        // Metadata-only scope check — the transcript is never hydrated here.
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
         if let Some(ws) = workspace_id.as_ref() {
             if session.workspace_id != *ws {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
@@ -1230,16 +1238,13 @@ impl Services {
         let is_busy = self.agent_is_busy(session.id.clone());
         let (turn_in_flight, last_stream_activity_at) =
             self.live_turn_liveness_for(&session, is_busy);
-        let messages = session.messages;
-        let total = messages.len();
+        let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
-        // The messages vec is owned, so the page is consumed in place — no
-        // clone; `strip_anonymous_tool_blocks` is a cheap pass-through for the
-        // common (well-formed) case.
-        let page: Vec<AgentMessage> = messages
+        let page: Vec<AgentMessage> = self
+            .store
+            .get_agent_messages_page(&agent_id, win.start as i64, (win.end - win.start) as i64)
+            .await?
             .into_iter()
-            .skip(win.start)
-            .take(win.end - win.start)
             .map(strip_anonymous_tool_blocks)
             .collect();
         Ok(json!({

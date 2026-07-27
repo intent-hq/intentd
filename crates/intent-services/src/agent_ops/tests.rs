@@ -1846,6 +1846,48 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
+/// monorepo#958: `agent.getConversation` paginates in SQL — a `limit=N` read
+/// decodes at most N rows regardless of transcript size. Rows outside the
+/// requested page are corrupted in place (invalid content JSON) so decoding
+/// any of them fails: a successful newest-page read proves the store touched
+/// only the requested window (the previous implementation hydrated the full
+/// log and would error here).
+#[tokio::test]
+async fn get_conversation_reads_only_the_requested_page_from_store() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Bounded").await;
+    for i in 0..5 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    // Corrupt every row outside the newest-2 page.
+    sqlx::query("UPDATE agent_message SET content = 'not-json' WHERE agent_id = ? AND seq < 3")
+        .bind(&id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .expect("corrupt older rows");
+
+    let res = svc
+        .agent_get_conversation_op(id.clone(), Some(2), None, None)
+        .await
+        .expect("newest page must not decode rows outside its window");
+    assert_eq!(res["totalMessages"], 5);
+    assert_eq!(res["truncated"], true);
+    let messages = res["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["contentBlocks"][0]["text"], "m3");
+    assert_eq!(messages[1]["contentBlocks"][0]["text"], "m4");
+    // Following the token into the corrupted region decodes those rows and
+    // fails — confirming the corruption is real and only page rows decode.
+    let t = res["nextToken"].as_str().expect("token").to_string();
+    svc.agent_get_conversation_op(id, Some(2), None, Some(t))
+        .await
+        .expect_err("older page decodes the corrupted rows");
+}
+
 /// STAB-124 loading tolerance: rows persisted by pre-fix daemons can carry an
 /// anonymous `tool_use` block (`name: ""`) plus its paired errored
 /// `tool_result` at the head of an interrupt turn's assistant message.
