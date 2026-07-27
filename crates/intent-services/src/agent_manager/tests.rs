@@ -3782,6 +3782,123 @@ async fn send_message_still_redrives_ordinary_error_session() {
     );
 }
 
+/// monorepo#940: `agent.retry` of a POISONED session (Error + session-fatal
+/// provider block) must arm `force_recreate` so the redrive's
+/// `start_session` skips `session/load` and opens a fresh `session/new` —
+/// resuming would replay the exact context the provider rejects.
+#[tokio::test]
+async fn retry_arms_force_recreate_for_poisoned_session() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retry-poison"),
+        AgentId::from("a-retry-poison"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("retry");
+    assert_eq!(result["ok"], json!(true));
+    assert_eq!(result["redriven"], json!(false), "queue is empty");
+    assert!(
+        mgr.force_recreate.lock().unwrap().contains(&id),
+        "poisoned retry arms force_recreate for a fresh session/new"
+    );
+}
+
+/// monorepo#940 guard: `agent.retry` of an ORDINARY Error session (no fatal
+/// stop_reason, no streak) must NOT arm `force_recreate` — the redrive keeps
+/// today's `session/load` resume behavior exactly.
+#[tokio::test]
+async fn retry_does_not_arm_force_recreate_for_ordinary_error() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retry-plain"),
+        AgentId::from("a-retry-plain"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some("spawn failed: connection reset by peer".into())),
+        )
+        .await
+        .expect("park session in ordinary error");
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("retry");
+    assert_eq!(result["ok"], json!(true));
+    assert!(
+        !mgr.force_recreate.lock().unwrap().contains(&id),
+        "ordinary error retry must keep the resume path (no force_recreate)"
+    );
+}
+
+/// monorepo#940 ordering: the poisoned check in `agent_retry` must read the
+/// identical-failure streak BEFORE `clear_failure_streak` wipes it — a
+/// streak-poisoned session (no fatal stop_reason) still arms
+/// `force_recreate`, and the streak is cleared afterwards as before.
+#[tokio::test]
+async fn retry_poison_check_reads_streak_before_clear() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-retry-streak"),
+        AgentId::from("a-retry-streak"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+        .await
+        .expect("park session in error");
+    // Poisoned only via the streak: three consecutive identical failures.
+    mgr.services.record_terminal_failure(&id, "boom");
+    mgr.services.record_terminal_failure(&id, "boom");
+    mgr.services.record_terminal_failure(&id, "boom");
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("retry");
+    assert_eq!(result["ok"], json!(true));
+    assert!(
+        mgr.force_recreate.lock().unwrap().contains(&id),
+        "streak-poisoned retry arms force_recreate (check ran before the clear)"
+    );
+    assert_eq!(
+        mgr.services.failure_streak_count(&id),
+        0,
+        "retry still clears the streak after the poisoned check"
+    );
+}
+
 /// monorepo#564 regression: `send_message` to a nonexistent agent id (e.g. a
 /// truncated id) must fail closed with InvalidParams naming the id — NOT
 /// claim the slot, NOT queue a phantom message, NOT persist a transcript row.
