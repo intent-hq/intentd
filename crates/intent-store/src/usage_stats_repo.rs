@@ -1,9 +1,11 @@
 //! Usage-stats repository: the global, time-bucketed `usage_stats_hourly`
 //! counters behind the agentic usage-stats cards.
 //!
-//! One row per `(bucket_utc, model)` — `bucket_utc` is the RFC-3339 UTC hour
-//! floor (e.g. `"2026-07-25T14:00:00Z"`), `model` the canonical display name
-//! produced by the services-layer normalizer. Writers fold additive
+//! One row per `(bucket_utc, model, provider)` — `bucket_utc` is the RFC-3339
+//! UTC hour floor (e.g. `"2026-07-25T14:00:00Z"`), `model` the canonical
+//! display name produced by the services-layer normalizer, `provider` the
+//! resolved agent-provider id (`"unknown"` when unknowable, and for rows
+//! written before the provider migration). Writers fold additive
 //! [`UsageStatsDelta`]s into the bucket via [`Store::add_usage_stats`]; every
 //! counter sums EXCEPT `longest_run_ms`, which takes the MAX (longest single
 //! completed prompt-turn wall-clock duration in the bucket). Stats aggregate
@@ -20,7 +22,7 @@ use sqlx::Row;
 
 use crate::Store;
 
-/// One additive contribution to a `(bucket_utc, model)` bucket. All counters
+/// One additive contribution to a `(bucket_utc, model, provider)` bucket. All counters
 /// default to 0, so writers set only the fields their path owns (turn end:
 /// tokens + runs + longest_run_ms; session start: sessions_started;
 /// lines-changed: lines_added/lines_deleted). `longest_run_ms` is folded in
@@ -58,6 +60,7 @@ pub struct LocalStamp {
 pub struct UsageStatsRow {
     pub bucket_utc: String,
     pub model: String,
+    pub provider: String,
     pub local_date: Option<String>,
     pub local_hour: Option<u8>,
     pub input_tokens: u64,
@@ -75,29 +78,31 @@ const COUNTER_COLUMNS: &str = "input_tokens, output_tokens, cache_read_tokens, \
     cache_creation_tokens, runs, sessions_started, longest_run_ms, lines_added, lines_deleted";
 
 impl Store {
-    /// Fold one [`UsageStatsDelta`] into the `(bucket_utc, model)` bucket,
-    /// creating the row when absent: additive counters are summed while
-    /// `longest_run_ms` takes `MAX(existing, delta)`. `bucket_utc` MUST be a
-    /// UTC hour floor and `model` an already-normalized display name — this
-    /// layer stores what it is given. `local` stamps the row on INSERT only:
-    /// the conflict-update deliberately leaves `local_date` / `local_hour`
-    /// untouched, so an existing bucket keeps its first-writer's stamp.
-    /// `None` (local offset indeterminate at record time) persists NULLs,
-    /// which readers treat like pre-D12 rows.
+    /// Fold one [`UsageStatsDelta`] into the `(bucket_utc, model, provider)`
+    /// bucket, creating the row when absent: additive counters are summed
+    /// while `longest_run_ms` takes `MAX(existing, delta)`. `bucket_utc` MUST
+    /// be a UTC hour floor, `model` an already-normalized display name, and
+    /// `provider` an already-resolved provider key (`"unknown"` when
+    /// unknowable) — this layer stores what it is given. `local` stamps the
+    /// row on INSERT only: the conflict-update deliberately leaves
+    /// `local_date` / `local_hour` untouched, so an existing bucket keeps its
+    /// first-writer's stamp. `None` (local offset indeterminate at record
+    /// time) persists NULLs, which readers treat like pre-D12 rows.
     pub async fn add_usage_stats(
         &self,
         bucket_utc: &str,
         model: &str,
+        provider: &str,
         local: Option<&LocalStamp>,
         delta: &UsageStatsDelta,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO usage_stats_hourly (
-                bucket_utc, model, local_date, local_hour, input_tokens, output_tokens,
+                bucket_utc, model, provider, local_date, local_hour, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens, runs, sessions_started,
                 longest_run_ms, lines_added, lines_deleted
-             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(bucket_utc, model) DO UPDATE SET
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(bucket_utc, model, provider) DO UPDATE SET
                 input_tokens = input_tokens + excluded.input_tokens,
                 output_tokens = output_tokens + excluded.output_tokens,
                 cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
@@ -110,6 +115,7 @@ impl Store {
         )
         .bind(bucket_utc)
         .bind(model)
+        .bind(provider)
         .bind(local.map(|l| l.date.as_str()))
         .bind(local.map(|l| i64::from(l.hour)))
         .bind(delta.input_tokens as i64)
@@ -127,14 +133,14 @@ impl Store {
         Ok(())
     }
 
-    /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model)` —
-    /// the read surface the `stats.getUsage` aggregation (and tests) build on;
-    /// period filtering/grouping happens in the service layer.
+    /// List every `usage_stats_hourly` row ordered by `(bucket_utc, model,
+    /// provider)` — the read surface the `stats.getUsage` aggregation (and
+    /// tests) build on; period filtering/grouping happens in the service layer.
     pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
         let rows = sqlx::query(&format!(
-            "SELECT bucket_utc, model, local_date, local_hour, {COUNTER_COLUMNS}
+            "SELECT bucket_utc, model, provider, local_date, local_hour, {COUNTER_COLUMNS}
              FROM usage_stats_hourly
-             ORDER BY bucket_utc ASC, model ASC"
+             ORDER BY bucket_utc ASC, model ASC, provider ASC"
         ))
         .fetch_all(self.read_pool())
         .await
@@ -144,6 +150,7 @@ impl Store {
             .map(|row| UsageStatsRow {
                 bucket_utc: row.get("bucket_utc"),
                 model: row.get("model"),
+                provider: row.get("provider"),
                 local_date: row.get("local_date"),
                 local_hour: row
                     .get::<Option<i64>, _>("local_hour")
@@ -198,7 +205,7 @@ mod tests {
     }
 
     /// First write creates the bucket row; a second write into the same
-    /// `(bucket_utc, model)` sums every additive counter while
+    /// `(bucket_utc, model, provider)` sums every additive counter while
     /// `longest_run_ms` keeps the MAX — a shorter later run must not
     /// regress it, a longer one must raise it.
     #[tokio::test]
@@ -217,7 +224,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", Some(&local), &first)
+            .add_usage_stats(bucket, "Opus 4.8", "claude-code", Some(&local), &first)
             .await
             .expect("first add");
         let second = UsageStatsDelta {
@@ -228,7 +235,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", Some(&local), &second)
+            .add_usage_stats(bucket, "Opus 4.8", "claude-code", Some(&local), &second)
             .await
             .expect("second add");
 
@@ -237,6 +244,7 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row.bucket_utc, bucket);
         assert_eq!(row.model, "Opus 4.8");
+        assert_eq!(row.provider, "claude-code");
         assert_eq!(row.input_tokens, 150);
         assert_eq!(row.output_tokens, 50);
         assert_eq!(row.cache_read_tokens, 20);
@@ -259,7 +267,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", Some(&local), &third)
+            .add_usage_stats(bucket, "Opus 4.8", "claude-code", Some(&local), &third)
             .await
             .expect("third add");
         let rows = store.list_usage_stats_hourly().await.expect("list");
@@ -267,10 +275,11 @@ mod tests {
         assert_eq!(rows[0].runs, 3);
     }
 
-    /// Different hour buckets and different models land in separate rows,
-    /// and the listing is ordered by (bucket, model).
+    /// Different hour buckets, different models, and different providers land
+    /// in separate rows, and the listing is ordered by (bucket, model,
+    /// provider).
     #[tokio::test]
-    async fn buckets_and_models_are_isolated() {
+    async fn buckets_models_and_providers_are_isolated() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let delta = UsageStatsDelta {
@@ -280,29 +289,59 @@ mod tests {
         };
         let local = stamp("2026-07-25", 8);
         store
-            .add_usage_stats("2026-07-25T15:00:00Z", "Sonnet 5", Some(&local), &delta)
+            .add_usage_stats(
+                "2026-07-25T15:00:00Z",
+                "Sonnet 5",
+                "claude-code",
+                Some(&local),
+                &delta,
+            )
             .await
             .expect("add");
         store
-            .add_usage_stats("2026-07-25T14:00:00Z", "Sonnet 5", Some(&local), &delta)
+            .add_usage_stats(
+                "2026-07-25T14:00:00Z",
+                "Sonnet 5",
+                "claude-code",
+                Some(&local),
+                &delta,
+            )
             .await
             .expect("add");
         store
-            .add_usage_stats("2026-07-25T14:00:00Z", "Opus 4.8", Some(&local), &delta)
+            .add_usage_stats(
+                "2026-07-25T14:00:00Z",
+                "Opus 4.8",
+                "claude-code",
+                Some(&local),
+                &delta,
+            )
+            .await
+            .expect("add");
+        // Same bucket + model via a different provider → its own row.
+        store
+            .add_usage_stats(
+                "2026-07-25T14:00:00Z",
+                "Opus 4.8",
+                "auggie",
+                Some(&local),
+                &delta,
+            )
             .await
             .expect("add");
 
         let rows = store.list_usage_stats_hourly().await.expect("list");
-        let keys: Vec<(&str, &str)> = rows
+        let keys: Vec<(&str, &str, &str)> = rows
             .iter()
-            .map(|r| (r.bucket_utc.as_str(), r.model.as_str()))
+            .map(|r| (r.bucket_utc.as_str(), r.model.as_str(), r.provider.as_str()))
             .collect();
         assert_eq!(
             keys,
             vec![
-                ("2026-07-25T14:00:00Z", "Opus 4.8"),
-                ("2026-07-25T14:00:00Z", "Sonnet 5"),
-                ("2026-07-25T15:00:00Z", "Sonnet 5"),
+                ("2026-07-25T14:00:00Z", "Opus 4.8", "auggie"),
+                ("2026-07-25T14:00:00Z", "Opus 4.8", "claude-code"),
+                ("2026-07-25T14:00:00Z", "Sonnet 5", "claude-code"),
+                ("2026-07-25T15:00:00Z", "Sonnet 5", "claude-code"),
             ]
         );
         assert!(rows.iter().all(|r| r.input_tokens == 1 && r.runs == 1));
@@ -322,11 +361,23 @@ mod tests {
             ..Default::default()
         };
         store
-            .add_usage_stats(bucket, "Opus 4.8", Some(&stamp("2026-11-01", 1)), &delta)
+            .add_usage_stats(
+                bucket,
+                "Opus 4.8",
+                "claude-code",
+                Some(&stamp("2026-11-01", 1)),
+                &delta,
+            )
             .await
             .expect("first add");
         store
-            .add_usage_stats(bucket, "Opus 4.8", Some(&stamp("2026-11-01", 0)), &delta)
+            .add_usage_stats(
+                bucket,
+                "Opus 4.8",
+                "claude-code",
+                Some(&stamp("2026-11-01", 0)),
+                &delta,
+            )
             .await
             .expect("second add");
 
@@ -363,6 +414,7 @@ mod tests {
             .add_usage_stats(
                 "2026-07-25T16:00:00Z",
                 "Opus 4.8",
+                "claude-code",
                 None,
                 &UsageStatsDelta {
                     input_tokens: 1,
@@ -375,6 +427,7 @@ mod tests {
         let rows = store.list_usage_stats_hourly().await.expect("list");
         assert_eq!(rows[0].local_date, None);
         assert_eq!(rows[0].local_hour, None);
+        assert_eq!(rows[0].provider, "unknown", "raw INSERT takes the default");
         assert_eq!(rows[1].local_date.as_deref(), Some("2026-07-25"));
         assert_eq!(rows[1].local_hour, None, "hour 99 must not surface");
         assert_eq!(rows[2].local_date, None, "None writes NULL stamps");
@@ -406,6 +459,7 @@ mod tests {
             .add_usage_stats(
                 "2026-07-25T14:00:00Z",
                 "Opus 4.8",
+                "claude-code",
                 Some(&stamp("2026-07-26", 3)),
                 &UsageStatsDelta::default(),
             )
@@ -466,5 +520,112 @@ mod tests {
                 "{bucket}"
             );
         }
+    }
+
+    /// The 0059 provider migration rebuilds the table (SQLite cannot alter a
+    /// PK) and must preserve pre-existing rows with `provider = 'unknown'`.
+    /// Fresh DBs run the migration against an empty table, so recreate the
+    /// pre-0059 shape, seed rows, and re-execute the migration's embedded SQL.
+    #[tokio::test]
+    async fn provider_migration_preserves_rows_as_unknown() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        // Recreate the pre-0059 table shape (0056 schema + the 0057 ALTERs).
+        sqlx::query("DROP TABLE usage_stats_hourly")
+            .execute(store.write_pool())
+            .await
+            .expect("drop rebuilt table");
+        sqlx::query(
+            "CREATE TABLE usage_stats_hourly (
+              bucket_utc            TEXT NOT NULL,
+              model                 TEXT NOT NULL,
+              input_tokens          INTEGER NOT NULL DEFAULT 0,
+              output_tokens         INTEGER NOT NULL DEFAULT 0,
+              cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+              cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+              runs                  INTEGER NOT NULL DEFAULT 0,
+              sessions_started      INTEGER NOT NULL DEFAULT 0,
+              longest_run_ms        INTEGER NOT NULL DEFAULT 0,
+              lines_added           INTEGER NOT NULL DEFAULT 0,
+              lines_deleted         INTEGER NOT NULL DEFAULT 0,
+              local_date            TEXT,
+              local_hour            INTEGER,
+              PRIMARY KEY (bucket_utc, model)
+            )",
+        )
+        .execute(store.write_pool())
+        .await
+        .expect("recreate pre-0059 table");
+        sqlx::query(
+            "INSERT INTO usage_stats_hourly
+                (bucket_utc, model, input_tokens, runs, longest_run_ms, local_date, local_hour)
+             VALUES ('2026-07-25T14:00:00Z', 'Opus 4.8', 100, 2, 5000, '2026-07-25', 7),
+                    ('2026-07-25T15:00:00Z', 'Sonnet 5', 7, 1, 0, NULL, NULL)",
+        )
+        .execute(store.write_pool())
+        .await
+        .expect("seed pre-0059 rows");
+
+        // Re-run the rebuild exactly as embedded in the 0059 migration.
+        let migration = crate::MIGRATOR
+            .migrations
+            .iter()
+            .find(|m| m.version == 59)
+            .expect("migration 0059 present");
+        // Strip comment lines BEFORE splitting on ';' — comment prose may
+        // itself contain semicolons.
+        let sql: String = migration
+            .sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for statement in sql.split(';') {
+            let body = statement.trim();
+            if body.is_empty() {
+                continue;
+            }
+            sqlx::query(body)
+                .execute(store.write_pool())
+                .await
+                .expect("run migration statement");
+        }
+
+        let rows = store.list_usage_stats_hourly().await.expect("list");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].model, "Opus 4.8");
+        assert_eq!(rows[0].provider, "unknown");
+        assert_eq!(rows[0].input_tokens, 100);
+        assert_eq!(rows[0].runs, 2);
+        assert_eq!(rows[0].longest_run_ms, 5_000);
+        assert_eq!(rows[0].local_date.as_deref(), Some("2026-07-25"));
+        assert_eq!(rows[0].local_hour, Some(7));
+        assert_eq!(rows[1].model, "Sonnet 5");
+        assert_eq!(rows[1].provider, "unknown");
+        assert_eq!(rows[1].input_tokens, 7);
+        assert_eq!(rows[1].local_date, None);
+
+        // The rebuilt PK includes provider: the same (bucket, model) under a
+        // real provider creates a second row instead of folding into
+        // 'unknown'.
+        store
+            .add_usage_stats(
+                "2026-07-25T14:00:00Z",
+                "Opus 4.8",
+                "claude-code",
+                None,
+                &UsageStatsDelta {
+                    input_tokens: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("add attributed row");
+        let rows = store.list_usage_stats_hourly().await.expect("list");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].provider, "claude-code");
+        assert_eq!(rows[0].input_tokens, 1);
+        assert_eq!(rows[1].provider, "unknown");
+        assert_eq!(rows[1].input_tokens, 100, "pre-migration row untouched");
     }
 }
