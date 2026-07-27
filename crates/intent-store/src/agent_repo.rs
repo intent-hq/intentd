@@ -713,8 +713,10 @@ impl Store {
     /// does not match.
     ///
     /// Provider immutability is enforced only after the first real use (once
-    /// `acp_session_id` is set), allowing cross-provider model switches before
-    /// the first turn.
+    /// `acp_session_id` is set), catching accidental provider drift from
+    /// general session writers. The one intentional provider change — a
+    /// cross-provider `agent.setModel` — goes through the narrow
+    /// [`Store::set_agent_session_model`] instead (monorepo#882).
     pub async fn update_agent_session(
         &self,
         workspace_id: &WorkspaceId,
@@ -801,6 +803,42 @@ impl Store {
         .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
+        }
+        Ok(())
+    }
+
+    /// Persist a model switch (`agent.setModel`): a narrow write of `model`,
+    /// `provider`, and `updated_at` only. This is the ONE writer allowed to
+    /// change `provider` after first real use — an intentional cross-provider
+    /// model switch must reconcile `provider` to the compound id's prefix so
+    /// the next spawn tears down the old child and runs the new provider's
+    /// binary (monorepo#882). Accidental provider drift from every other
+    /// writer is still rejected by [`Store::update_agent_session`]'s
+    /// immutability guard. Scoped to `workspace_id` (defense-in-depth).
+    /// `NotFound` if the session is absent or the workspace does not match.
+    pub async fn set_agent_session_model(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        model: &str,
+        provider: Option<&str>,
+        updated_at: &str,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET model=?, provider=?, updated_at=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(model)
+        .bind(provider)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session model failed: {e}")))?
+        .rows_affected();
+        if rows == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(())
     }
@@ -3248,6 +3286,73 @@ mod tests {
         session.name = "New Name".to_string();
         let result4 = store.update_agent_session(&ws_id, &session).await;
         assert!(result4.is_ok(), "name change should succeed");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The narrow `set_agent_session_model` writer (`agent.setModel`,
+    /// monorepo#882): a cross-provider switch lands even after first real use
+    /// (`acp_session_id` set) — the case `update_agent_session`'s
+    /// immutability guard rejects — while `acp_session_id` and unrelated
+    /// columns stay untouched. Wrong-workspace writes are `NotFound` and
+    /// mutate nothing.
+    #[tokio::test]
+    async fn set_agent_session_model_allows_cross_provider_after_first_use() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-setmodel".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("mock".to_string());
+        session.model = Some("mock:default".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        // Wrong workspace → NotFound, nothing written.
+        let err = store
+            .set_agent_session_model(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                "grok:grok-4-fast",
+                Some("grok"),
+                &now_iso(),
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.model.as_deref(), Some("mock:default"));
+        assert_eq!(unchanged.provider.as_deref(), Some("mock"));
+
+        // Cross-provider switch AFTER first real use (acp_session_id set).
+        let updated_at = now_iso();
+        store
+            .set_agent_session_model(
+                &ws_id,
+                &agent_id,
+                "grok:grok-4-fast",
+                Some("grok"),
+                &updated_at,
+            )
+            .await
+            .expect("intentional cross-provider switch");
+        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        assert_eq!(after.model.as_deref(), Some("grok:grok-4-fast"));
+        assert_eq!(after.provider.as_deref(), Some("grok"));
+        assert_eq!(after.updated_at, updated_at);
+        assert_eq!(
+            after.acp_session_id.as_deref(),
+            Some("acp-live"),
+            "acp session id untouched"
+        );
+        assert_eq!(after.name, "Baseline", "unrelated columns untouched");
 
         let _ = std::fs::remove_file(&tmp);
     }

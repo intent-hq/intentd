@@ -1918,6 +1918,47 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
     assert_eq!(session.provider.as_deref(), Some("opencode"));
 }
 
+/// Cross-provider `agent.setModel` still lands AFTER the first real use
+/// (`acp_session_id` persisted): the intentional switch goes through the
+/// narrow `set_agent_session_model` writer instead of tripping
+/// `update_agent_session`'s provider-immutability guard (monorepo#882).
+#[tokio::test]
+async fn set_model_reconciles_provider_after_first_real_use() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("SwitchLate".into()),
+            Some("auggie:sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    svc.store()
+        .set_acp_session_id(&ws, &id, "acp-first-use")
+        .await
+        .expect("persist first-use acp session id");
+    svc.agent_set_model_op(id.clone(), "opencode:opencode-go/kimi-k3".into())
+        .await
+        .expect("cross-provider setModel after first use");
+    let session = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(
+        session.model.as_deref(),
+        Some("opencode:opencode-go/kimi-k3")
+    );
+    assert_eq!(session.provider.as_deref(), Some("opencode"));
+    assert_eq!(
+        session.acp_session_id.as_deref(),
+        Some("acp-first-use"),
+        "acp session id untouched by the switch"
+    );
+}
+
 /// `agent.setModel` leaves session.provider unchanged when the new model is
 /// a bare id (no `:` prefix) or a compound id for the same provider.
 #[tokio::test]

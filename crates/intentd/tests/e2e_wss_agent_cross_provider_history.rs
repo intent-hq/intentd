@@ -20,12 +20,11 @@
 //!
 //! Gated on `node` + the mock script; skips cleanly otherwise.
 //!
-//! KNOWN DEFECT (monorepo#882): the test is `#[ignore]`d because the switch
-//! itself currently fails — once the first turn persisted `acp_session_id`,
-//! the store's provider-immutability guard rejects `agent_set_model_op`'s
-//! provider reconciliation with `-32603` ("agent provider is immutable once
-//! set (first real use)"), making the whole cross-provider respawn → recreate
-//! → replay path unreachable over the wire. Un-ignore when #882 is fixed.
+//! Regression for monorepo#882: the store's provider-immutability guard used
+//! to reject `agent_set_model_op`'s provider reconciliation with `-32603`
+//! once the first turn persisted `acp_session_id`, making this whole path
+//! unreachable over the wire. The intentional switch now lands via the
+//! narrow `Store::set_agent_session_model` writer.
 
 #![cfg(unix)]
 
@@ -220,36 +219,6 @@ where
     }
 }
 
-/// Like [`wss_rpc`] but returns the FULL response frame (result or error)
-/// instead of panicking on an error envelope — for asserting error shapes.
-async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    ws.send(Message::Text(frame.to_string()))
-        .await
-        .expect("send rpc frame");
-    loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["id"] == json!(id) {
-                    return v;
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => continue,
-            other => panic!("expected text frame, got {other:?}"),
-        }
-    }
-}
-
 /// Read one `events.event` notification from a subscriber connection (bounded).
 async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
@@ -362,13 +331,8 @@ fn seed_grok_path_override(data_dir: &Path, wrapper: &Path) {
 /// to `grok:grok-4-fast` must respawn onto the (hermetically wrapped) grok
 /// binary, open a fresh `session/new` there, and prepend the prior
 /// conversation as `<supervisor>` XML to the first prompt of the recreated
-/// session — with the history replay firing exactly once.
-///
-/// Ignored pending monorepo#882: after the first turn the store's
-/// provider-immutability guard rejects the cross-provider `agent.setModel`
-/// with `-32603`, so the asserted contract is currently unreachable. Run
-/// explicitly with `cargo test ... -- --ignored` to reproduce the defect.
-#[ignore = "blocked on monorepo#882: cross-provider setModel rejected after first turn"]
+/// session — with the history replay firing exactly once. Regression for
+/// monorepo#882 (the switch used to be rejected after the first turn).
 #[tokio::test]
 async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
     let Some(script) = gate("WSS cross-provider history E2E") else {
@@ -493,6 +457,39 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
         "agent.get shows the cross-provider model: {got}"
     );
 
+    // The switched turn persists the informational model-change transcript
+    // notice: a `role: "system"` row with `model_changed` metadata naming
+    // both provider identities (mock → grok).
+    let full = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let messages = full["session"]["messages"]
+        .as_array()
+        .expect("session messages");
+    let notices: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["metadata"]["type"] == "model_changed")
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one model-change notice: {messages:?}"
+    );
+    let notice = notices[0];
+    assert_eq!(notice["role"], "system", "notice is a system row: {notice}");
+    assert_eq!(
+        notice["metadata"]["fromProvider"], "mock",
+        "notice names the old provider: {notice}"
+    );
+    assert_eq!(
+        notice["metadata"]["toProvider"], "grok",
+        "notice names the new provider: {notice}"
+    );
+
     // Both children appended to the same prompt log; each fresh process starts
     // its own turn counter at 1.
     let log = read_prompt_log(&prompt_log);
@@ -556,126 +553,4 @@ async fn cross_provider_set_model_replays_history_as_supervisor_xml() {
             "history replay must fire exactly once; repeated on turn {turn}: {text:?}"
         );
     }
-}
-
-/// Defect marker for monorepo#882 (runs in CI, unlike the ignored contract
-/// test above): after the agent's FIRST turn persisted `acp_session_id`, a
-/// cross-provider `agent.setModel` is rejected by the store's
-/// provider-immutability guard with `-32603` and the session keeps its old
-/// model/provider. When #882 is fixed this test FAILS — delete it and
-/// un-ignore `cross_provider_set_model_replays_history_as_supervisor_xml`.
-#[tokio::test]
-async fn cross_provider_set_model_after_first_turn_currently_rejected() {
-    let Some(script) = gate("WSS cross-provider defect-marker E2E") else {
-        return;
-    };
-
-    let data_dir = temp_data_dir();
-    let behavior = json!({ "response": "ok" }).to_string();
-    let env: [(&str, &str); 4] = [
-        ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
-        ("MOCK_AGENT_SCRIPT_PATH", &script),
-        ("MOCK_AGENT_BEHAVIOR", &behavior),
-    ];
-    let child = spawn_serve(&data_dir, &env);
-    let _daemon = Daemon {
-        child,
-        data_dir: data_dir.clone(),
-    };
-    let socket = data_dir.join("intentd.sock");
-    assert!(await_uds(&socket).await, "daemon did not start");
-    let status = common::await_wss_status(&socket).await;
-    let port = status["result"]["port"].as_u64().expect("port") as u16;
-    let fingerprint = status["result"]["fingerprint"]
-        .as_str()
-        .expect("fingerprint")
-        .to_string();
-    let cfg = client_config(&fingerprint);
-
-    let mut sub = connect_ws(port, cfg.clone()).await;
-    let ws_result = wss_rpc(
-        &mut sub,
-        1,
-        "workspace.create",
-        json!({ "title": "XProv Defect Marker", "noPrompt": true }),
-    )
-    .await;
-    let ws_id = ws_result["workspace"]["id"]
-        .as_str()
-        .expect("workspace id")
-        .to_string();
-    let sub_resp = wss_rpc(
-        &mut sub,
-        2,
-        "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
-    )
-    .await;
-    assert!(
-        sub_resp["subscriptionId"].is_string(),
-        "subscribed: {sub_resp}"
-    );
-
-    let mut rpc = connect_ws(port, cfg.clone()).await;
-    let created = wss_rpc(
-        &mut rpc,
-        10,
-        "agent.create",
-        json!({ "workspaceId": ws_id, "name": "XProvMarker", "model": "mock:default" }),
-    )
-    .await;
-    let agent_id = created["agent"]["id"]
-        .as_str()
-        .expect("agent id")
-        .to_string();
-
-    // First turn persists acp_session_id — the immutability trigger.
-    let sent = wss_rpc(
-        &mut rpc,
-        11,
-        "agent.sendMessage",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
-    )
-    .await;
-    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    await_stream_end(&mut sub, &agent_id).await;
-
-    // Cross-provider switch to a registered provider (grok) → today's defect:
-    // -32603 from the store guard, NOT the documented -32602 validation error.
-    let resp = wss_rpc_raw(
-        &mut rpc,
-        12,
-        "agent.setModel",
-        json!({ "workspaceId": ws_id, "agentId": agent_id, "modelId": "grok:grok-4-fast" }),
-    )
-    .await;
-    let err = resp.get("error").unwrap_or_else(|| {
-        panic!(
-            "monorepo#882 appears FIXED (setModel succeeded: {resp}) — delete this defect \
-             marker and un-ignore cross_provider_set_model_replays_history_as_supervisor_xml"
-        )
-    });
-    assert_eq!(err["code"], json!(-32603), "store-guard error code: {err}");
-    assert!(
-        err["data"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("provider is immutable"),
-        "immutability guard message surfaced in error data: {err}"
-    );
-
-    // The failed switch must not have mutated the session.
-    let got = wss_rpc(
-        &mut rpc,
-        13,
-        "agent.get",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
-    assert_eq!(
-        got["agent"]["model"].as_str(),
-        Some("mock:default"),
-        "session model unchanged after the rejected switch: {got}"
-    );
 }
