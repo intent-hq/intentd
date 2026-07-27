@@ -2,12 +2,54 @@
 //! CoW-checkout workspaces).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
 use intent_git::{cow_clone, cow_probe, CowSupport};
 use intent_store::{Sandbox, SandboxStatus, Store};
 
 use crate::now_iso;
+
+/// Test hook: artificial delay (milliseconds) at the top of
+/// [`provision_sandbox`], standing in for a slow CoW clone of a large
+/// checkout. Lets e2e tests prove provisioning runs off the delegate
+/// critical path (monorepo#871). NOTE: this seam is compiled into release
+/// binaries too (release-mode e2e runs need it); it is inert unless the
+/// namespaced env var is set to a positive integer.
+pub const TEST_PROVISION_DELAY_MS_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS";
+
+/// Test hook: force [`provision_sandbox`] to fail with an internal error
+/// (after the optional delay above), exercising the fallback-to-shared-mode
+/// path on provisioning failure. Inert unless set to `1`.
+pub const TEST_PROVISION_ERROR_ENV: &str = "INTENTD_TEST_SANDBOX_PROVISION_ERROR";
+
+/// Parse the delay override in milliseconds; anything unset, non-numeric, or
+/// non-positive disables the hook.
+fn test_provision_delay_from(raw: Option<&str>) -> Option<Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
+}
+
+/// Apply the test-only provisioning seams: sleep out the configured delay,
+/// then fail if the error hook is armed. No-op when neither env var is set.
+async fn apply_test_provision_hooks() -> Result<()> {
+    if let Some(delay) =
+        test_provision_delay_from(std::env::var(TEST_PROVISION_DELAY_MS_ENV).ok().as_deref())
+    {
+        tracing::warn!(
+            delay_ms = delay.as_millis() as u64,
+            "provision_sandbox: artificial delay (test seam)"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    if std::env::var(TEST_PROVISION_ERROR_ENV).is_ok_and(|v| v == "1") {
+        return Err(Error::Internal(
+            "forced provisioning failure (test seam)".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Outcome of sandbox provisioning.
 #[derive(Debug, Clone)]
@@ -70,6 +112,10 @@ pub async fn provision_sandbox(
     agent_id: &AgentId,
     config: &ProvisionConfig,
 ) -> Result<ProvisionOutcome> {
+    // Test seams: artificial delay (slow-clone stand-in) and forced failure.
+    // Inert unless the namespaced env vars are set.
+    apply_test_provision_hooks().await?;
+
     // Load workspace
     let workspace = store.get_workspace(workspace_id).await?;
 
@@ -923,6 +969,35 @@ fn get_conflicting_paths(index: &git2::Index) -> Result<Vec<String>> {
     }
 
     Ok(paths)
+}
+
+#[cfg(test)]
+mod test_hook_tests {
+    use super::*;
+
+    #[test]
+    fn unset_disables_delay() {
+        assert_eq!(test_provision_delay_from(None), None);
+    }
+
+    #[test]
+    fn positive_millis_enable_delay() {
+        assert_eq!(
+            test_provision_delay_from(Some("10000")),
+            Some(Duration::from_millis(10_000))
+        );
+        assert_eq!(
+            test_provision_delay_from(Some(" 500 ")),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn invalid_values_disable_delay() {
+        for raw in ["0", "-5", "abc", "", "1.5"] {
+            assert_eq!(test_provision_delay_from(Some(raw)), None, "raw={raw:?}");
+        }
+    }
 }
 
 #[cfg(test)]
