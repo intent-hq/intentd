@@ -360,3 +360,26 @@ fn error_role_renders_as_error_tag_within_current_exchange() {
     // Error messages render with the `<error>` tag (not `agent_response_…`).
     assert!(xml.contains("  <error>\n    <text>boom</text>\n  </error>\n"));
 }
+
+#[test]
+fn system_model_changed_notice_is_excluded_from_replay() {
+    // The `model_changed` informational row is persisted as `role: "system"`
+    // — the formatter only renders user/assistant/error, so the notice must
+    // never leak into a provider prompt via supervisor-XML replay.
+    let messages = vec![
+        msg("user", json!([{ "type": "text", "text": "hello" }])),
+        msg("assistant", json!([{ "type": "text", "text": "hi" }])),
+        msg(
+            "system",
+            json!([{ "type": "text", "text": "Model changed from auggie (default model) to claude-code:sonnet." }]),
+        ),
+        msg("user", json!([{ "type": "text", "text": "again" }])),
+        msg("assistant", json!([{ "type": "text", "text": "sure" }])),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS);
+    assert!(!xml.contains("Model changed"), "notice must not render");
+    assert!(
+        xml.contains("hello") && xml.contains("again"),
+        "real turns render"
+    );
+}

@@ -24,7 +24,7 @@ use tokio::time::{timeout, Duration};
 use super::{
     compute_process_cap, derive_agent_type, is_cancel_transport_closed, resolve_npx_only,
     resolve_spawn, text_prompt, AgentHandle, AgentManager, BusEventSink, KillFn, ProcessRegistry,
-    DEFAULT_AGENT_TYPE,
+    ResolvedSpawn, DEFAULT_AGENT_TYPE,
 };
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
@@ -6685,5 +6685,222 @@ mod harness_wake_tests {
             .unwrap();
         assert_eq!(messages.len(), 1, "only the consumed note persisted");
         assert_eq!(messages[0].content[0]["text"], json!("pre-race output"));
+    }
+}
+
+mod model_change_notice_tests {
+    //! Unit tests for the model-change transcript notice: a turn starting
+    //! under a different model/provider than the last committed turn persists
+    //! one informational `role: "system"` row with
+    //! `{ type: "model_changed", from, to, fromProvider, toProvider }`
+    //! metadata and emits `agent:message`; first turns and unchanged turns
+    //! persist nothing; picker toggles reverted before any message never
+    //! produce a notice (the comparison is against the last COMMITTED turn).
+
+    use super::*;
+    use intent_core::events::AGENT_MESSAGE;
+
+    fn resolved(provider_id: &str, model: Option<&str>) -> ResolvedSpawn {
+        ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider_id),
+            model: model.map(str::to_string),
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: Default::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        }
+    }
+
+    /// First turn: no committed prior identity → no notice, but the identity
+    /// commits so the NEXT turn has a baseline to compare against.
+    #[tokio::test]
+    async fn first_turn_commits_baseline_without_notice() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc1"), AgentId::from("a-mc1"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "first turn must not persist a notice");
+        let (m, p) = mgr
+            .services
+            .store
+            .get_agent_session_last_turn_model(&ws, &id)
+            .await
+            .unwrap();
+        assert_eq!(m.as_deref(), Some("gpt-5"));
+        assert_eq!(p.as_deref(), Some("auggie"));
+    }
+
+    /// A committed switch persists exactly one system row with the
+    /// `model_changed` metadata shape and emits `agent:message`; a repeat
+    /// turn under the same identity persists nothing further.
+    #[tokio::test]
+    async fn committed_switch_persists_notice_once_and_emits_event() {
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc2"), AgentId::from("a-mc2"));
+        seed_agent(&mgr, &ws, &id).await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![AGENT_MESSAGE.to_string()],
+            ..Default::default()
+        });
+
+        // Turn 1 commits the baseline; turn 2 switches model + provider.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "exactly one notice row");
+        let notice = &messages[0];
+        assert_eq!(notice.role, "system");
+        let md = notice.metadata.as_ref().expect("notice carries metadata");
+        assert_eq!(md["type"], json!("model_changed"));
+        assert_eq!(md["from"], json!("gpt-5"));
+        assert_eq!(md["to"], json!("sonnet"));
+        assert_eq!(md["fromProvider"], json!("auggie"));
+        assert_eq!(md["toProvider"], json!("claude-code"));
+        assert!(notice.content[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Model changed"));
+
+        // The persist emitted `agent:message` with the row id + system role.
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv")
+            .expect("open");
+        let event = batch
+            .iter()
+            .find(|e| e.event_type == AGENT_MESSAGE)
+            .expect("agent:message event");
+        assert_eq!(event.data["agentId"], json!(id.0));
+        assert_eq!(event.data["role"], json!("system"));
+        assert_eq!(event.data["messageId"], json!(notice.id));
+
+        // Turn 3 under the unchanged identity: no second notice.
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "unchanged turn persists nothing");
+    }
+
+    /// Deferred commit: `agent.setModel` toggles that are reverted before any
+    /// message never produce a notice — the next turn's identity equals the
+    /// last committed one, and nothing was written in between.
+    #[tokio::test]
+    async fn switch_and_revert_before_send_produces_no_notice() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc3"), AgentId::from("a-mc3"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+        // (setModel A→B→A happened between turns; nothing committed.)
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert!(
+            messages.is_empty(),
+            "reverted toggle must not produce a notice"
+        );
+    }
+
+    /// Default-model (None) ↔ explicit-model transitions are real switches:
+    /// the `from`/`to` metadata carries `null` for the provider default.
+    #[tokio::test]
+    async fn default_model_transition_is_a_switch_with_null_metadata() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc4"), AgentId::from("a-mc4"));
+        seed_agent(&mgr, &ws, &id).await;
+
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", None))
+            .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("auggie", Some("gpt-5")))
+            .await;
+
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["from"], json!(null));
+        assert_eq!(md["to"], json!("gpt-5"));
+    }
+
+    /// The recreate-replay body must exclude BOTH the current user message and
+    /// the turn-start notice that trails it: `build_turn_body` truncates at
+    /// the last user row, so a `model_changed` system row appended after the
+    /// current user persist never reaches the provider prompt.
+    #[tokio::test]
+    async fn build_turn_body_excludes_trailing_notice_and_current_message() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-mc5"), AgentId::from("a-mc5"));
+        seed_agent(&mgr, &ws, &id).await;
+        let store = &mgr.services.store;
+        for (role, text) in [
+            ("user", "first ask"),
+            ("assistant", "first answer"),
+            ("user", "current ask"),
+        ] {
+            store
+                .append_agent_message(
+                    &id,
+                    role,
+                    &json!([{ "type": "text", "text": text }]),
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+        // The turn-start notice lands AFTER the current user row.
+        mgr.services
+            .store
+            .set_agent_session_last_turn_model(&ws, &id, Some("gpt-5"), "auggie")
+            .await
+            .unwrap();
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("claude-code", Some("sonnet")))
+            .await;
+        mgr.recreated.lock().unwrap().insert(id.clone());
+
+        let body = mgr.build_turn_body(&id, "current ask").await;
+
+        assert!(body.contains("first ask") && body.contains("first answer"));
+        assert!(
+            !body.contains("Model changed"),
+            "notice must not reach the provider prompt"
+        );
+        // The current message appears once as the live content, never in the
+        // replayed history.
+        assert_eq!(body.matches("current ask").count(), 1);
     }
 }
