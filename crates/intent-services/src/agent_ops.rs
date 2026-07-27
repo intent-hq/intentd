@@ -1776,6 +1776,9 @@ impl Services {
         // daemon's lifetime.
         self.clear_failure_streak(&agent_id);
         self.clear_failure_wake_dedup_all_roles(&agent_id);
+        // Drop the deleted agent's event subscriptions (monorepo#937): the
+        // wake target is gone, so matching/batching for it is pure leak.
+        self.remove_event_subscriptions_for_agent(&agent_id).await;
         if let Some(workspace_id) = session_workspace_id {
             crate::publish_event(
                 &self.event_bus,
@@ -3877,8 +3880,9 @@ impl Services {
     }
 
     /// `agent.cancelSubscriptions`: remove every completion watch registered by
-    /// `agent_id` and drop any delegation groups it parents. Idempotent — always
-    /// returns `{ "success": true }` (TS shape).
+    /// `agent_id`, drop any delegation groups it parents, and drop its event
+    /// subscriptions (monorepo#937). Idempotent — always returns
+    /// `{ "success": true }` (TS shape).
     pub(crate) async fn agent_cancel_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -3886,6 +3890,7 @@ impl Services {
     ) -> Result<Value> {
         self.remove_all_for_parent(&agent_id);
         self.remove_groups_for_parent(&agent_id);
+        self.remove_event_subscriptions_for_agent(&agent_id).await;
         Ok(json!({ "success": true }))
     }
 

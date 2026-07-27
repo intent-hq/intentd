@@ -7287,6 +7287,7 @@ mod wsapi4_bindings_tests {
         fn agent_subscribe(
             &self,
             _ws: WorkspaceId,
+            _subscriber: Option<AgentId>,
             event_types: Vec<String>,
             exclude_self: Option<bool>,
             batch_window: Option<i64>,
@@ -7381,6 +7382,7 @@ mod wsapi4_bindings_tests {
         fn event_subscribe(
             &self,
             _ws: WorkspaceId,
+            _subscriber: Option<AgentId>,
             event_types: Vec<String>,
             exclude_self: Option<bool>,
             batch_window: Option<i64>,

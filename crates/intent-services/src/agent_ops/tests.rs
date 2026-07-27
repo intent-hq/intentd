@@ -5170,7 +5170,7 @@ async fn models_list_legacy_and_provider_id_paths_share_one_cache() {
 async fn subscribe_then_unsubscribe_roundtrips() {
     let (_t, svc, ws) = setup().await;
     let sub = svc
-        .agent_subscribe(ws.clone(), vec!["agent:*".into()], None, None)
+        .agent_subscribe(ws.clone(), None, vec!["agent:*".into()], None, None)
         .await
         .expect("subscribe");
     let id = sub["subscriptionId"].as_str().unwrap().to_string();
@@ -5181,6 +5181,313 @@ async fn subscribe_then_unsubscribe_roundtrips() {
         .await
         .expect_err("missing");
     assert!(matches!(err, Error::Internal(_)));
+}
+
+/// monorepo#937 (review): fail closed on invalid subscribers — an unknown
+/// agent id, a deleted agent, and an empty eventTypes array must all be
+/// rejected before anything registers or persists.
+#[tokio::test]
+async fn event_subscription_rejects_invalid_subscriber_and_empty_types() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(AgentId::from("agent-nope")),
+            vec!["agent:*".into()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("unknown subscriber must fail");
+    assert!(matches!(err, Error::InvalidParams(m) if m.contains("not found")));
+
+    svc.agent_delete_op(subscriber.clone(), None)
+        .await
+        .expect("delete");
+    let err = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber),
+            vec!["agent:*".into()],
+            None,
+            None,
+        )
+        .await
+        .expect_err("deleted subscriber must fail");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("deleted") || m.contains("not found")),
+        "unexpected error: {err:?}"
+    );
+
+    let err = svc
+        .agent_subscribe(ws.clone(), None, vec![], None, None)
+        .await
+        .expect_err("empty eventTypes must fail");
+    assert!(matches!(err, Error::Internal(m) if m.contains("eventTypes is required")));
+
+    let rows = svc
+        .store()
+        .list_event_subscriptions()
+        .await
+        .expect("list rows");
+    assert!(
+        rows.is_empty(),
+        "nothing may persist on rejected subscribes"
+    );
+}
+
+/// monorepo#937: an agent-owned `event.subscribe` delivers a batched wake to
+/// the subscriber when a matching event is published by another actor.
+#[tokio::test]
+async fn event_subscription_delivers_batched_wake_to_subscriber() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    let other = create_agent(&svc, &ws, "Worker").await;
+
+    let sub = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["agent:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe");
+    assert!(sub["subscriptionId"].is_string());
+
+    // Two matching events from another actor coalesce into ONE wake batch.
+    for _ in 0..2 {
+        bus.publish(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: now_iso(),
+            event_type: AGENT_IDLE.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(other.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(other.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({ "agentId": other.0 }),
+        })
+        .await
+        .expect("publish");
+    }
+
+    // Wait for the batch window + delivery to land on the subscriber session.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let session = svc
+            .store()
+            .get_agent_session(&subscriber)
+            .await
+            .expect("subscriber session");
+        if !session.messages.is_empty() {
+            assert_eq!(session.messages.len(), 1, "one wake per batch");
+            let text = serde_json::to_string(&session.messages[0]).unwrap();
+            assert!(text.contains("WORKSPACE EVENTS"));
+            assert!(text.contains("2 event(s)"));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscriber never received the batched wake"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// monorepo#937: `excludeSelf` (default true) drops the subscriber's own
+/// events, and `event.unsubscribe` stops delivery entirely.
+#[tokio::test]
+async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    let other = create_agent(&svc, &ws, "Worker").await;
+
+    let sub = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["agent:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe");
+    let sub_id = sub["subscriptionId"].as_str().unwrap().to_string();
+
+    let publish = |actor_id: String| {
+        let bus = bus.clone();
+        let ws = ws.clone();
+        async move {
+            bus.publish(&NewEvent {
+                workspace_id: ws,
+                timestamp: now_iso(),
+                event_type: AGENT_IDLE.to_string(),
+                actor: EventActor {
+                    actor_type: ActorType::Agent,
+                    id: Some(actor_id.clone()),
+                    ..Default::default()
+                },
+                session_id: Some(actor_id),
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: json!({}),
+            })
+            .await
+            .expect("publish");
+        }
+    };
+
+    // The subscriber's own event is dropped (excludeSelf default true).
+    publish(subscriber.0.clone()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let session = svc
+        .store()
+        .get_agent_session(&subscriber)
+        .await
+        .expect("session");
+    assert!(
+        session.messages.is_empty(),
+        "own events must not wake the subscriber"
+    );
+
+    // After unsubscribe, even another actor's event delivers nothing.
+    let r = svc
+        .agent_unsubscribe(ws.clone(), sub_id)
+        .await
+        .expect("unsub");
+    assert_eq!(r["success"], true);
+    publish(other.0.clone()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let session = svc
+        .store()
+        .get_agent_session(&subscriber)
+        .await
+        .expect("session");
+    assert!(
+        session.messages.is_empty(),
+        "unsubscribed subscriptions must not deliver"
+    );
+}
+
+/// monorepo#937: agent-owned subscriptions persist and rehydrate on startup;
+/// rows whose subscriber agent is gone are pruned.
+#[tokio::test]
+async fn event_subscriptions_survive_restart_and_prune_orphans() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (subscriber, other, sub_id) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        let subscriber = create_agent(&svc, &ws, "Watcher").await;
+        let other = create_agent(&svc, &ws, "Worker").await;
+        let sub = svc
+            .agent_subscribe(
+                ws.clone(),
+                Some(subscriber.clone()),
+                vec!["agent:*".into()],
+                None,
+                Some(50),
+            )
+            .await
+            .expect("subscribe");
+        // The write-through persist is async; wait for the row to appear.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let rows = svc
+                .store()
+                .list_event_subscriptions()
+                .await
+                .expect("list rows");
+            if rows.len() == 1 {
+                assert_eq!(rows[0].subscriber_agent_id, subscriber);
+                assert_eq!(rows[0].event_types, vec!["agent:*".to_string()]);
+                assert!(rows[0].exclude_self);
+                assert_eq!(rows[0].batch_window_ms, 50);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscription row never persisted"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        (
+            subscriber,
+            other,
+            sub["subscriptionId"].as_str().unwrap().to_string(),
+        )
+    };
+
+    // "Restart": fresh Services over the same database.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new(store).with_event_bus(bus.clone());
+    let loaded = svc
+        .heal_event_subscriptions_on_startup()
+        .await
+        .expect("heal");
+    assert_eq!(loaded, 1);
+
+    // The rehydrated subscription still delivers.
+    bus.publish(&NewEvent {
+        workspace_id: ws.clone(),
+        timestamp: now_iso(),
+        event_type: AGENT_IDLE.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some(other.0.clone()),
+            ..Default::default()
+        },
+        session_id: Some(other.0.clone()),
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: json!({}),
+    })
+    .await
+    .expect("publish");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let session = svc
+            .store()
+            .get_agent_session(&subscriber)
+            .await
+            .expect("session");
+        if !session.messages.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rehydrated subscription never delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Delete the subscriber: its subscription is removed (in memory and, on
+    // the next heal, the row is pruned even if the async delete lost a race).
+    svc.agent_delete_op(subscriber.clone(), None)
+        .await
+        .expect("delete subscriber");
+    assert!(
+        !svc.remove_event_subscription(&sub_id).await,
+        "subscription should already be gone after subscriber delete"
+    );
+    let loaded = svc
+        .heal_event_subscriptions_on_startup()
+        .await
+        .expect("heal after delete");
+    assert_eq!(loaded, 0, "orphaned rows must be pruned, not rehydrated");
 }
 
 /// Report-time wake: a delegated caller's `reportToParent` delivers an

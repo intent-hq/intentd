@@ -62,6 +62,7 @@ mod crdt_notes;
 mod drafts;
 mod enhance_ops;
 mod event_ops;
+mod event_subscriptions;
 pub mod events;
 mod file_ops;
 mod git_ops;
@@ -156,10 +157,12 @@ pub struct Services {
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
     assets_root: Option<PathBuf>,
-    /// Live ids minted by the deprecated `event.subscribe` alias so that
-    /// `event.unsubscribe` can report found/not-found. This is the service-style
-    /// surface only; WS streaming is the separate `events.*` fast-path (§6).
-    event_subscriptions: Arc<Mutex<HashSet<String>>>,
+    /// Live subscriptions minted by the deprecated `event.subscribe` /
+    /// `agent.subscribe` aliases: each entry carries the subscriber, filter,
+    /// batch window, and its running bus delivery task (monorepo#937). This
+    /// is the service-style surface only; WS streaming is the separate
+    /// `events.*` fast-path (§6).
+    event_subscriptions: Arc<Mutex<HashMap<String, event_subscriptions::EventSubscriptionEntry>>>,
     /// Shared event bus that CRUD mutations publish change events onto (§10).
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
@@ -458,7 +461,7 @@ impl Services {
         Self {
             store,
             assets_root: None,
-            event_subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -12804,24 +12807,36 @@ impl WorkspaceApi for Services {
 
     fn event_subscribe(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
+        subscriber_agent_id: Option<AgentId>,
         event_types: Vec<String>,
-        _exclude_self: Option<bool>,
-        _batch_window: Option<i64>,
+        exclude_self: Option<bool>,
+        batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
-        let subs = self.event_subscriptions.clone();
         Box::pin(async move {
             if event_types.is_empty() {
                 return Err(Error::Internal(
                     "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
                 ));
             }
-            // Bare `*` expands to the category wildcards (`resolveSubscriptionEventTypes`).
-            let resolved = events::resolve_event_types(&event_types);
-            let subscription_id = uuid::Uuid::new_v4().to_string();
-            subs.lock()
-                .expect("event subscription registry poisoned")
-                .insert(subscription_id.clone());
+            // Fail closed on a phantom subscriber before registering
+            // (monorepo#568 precedent for agent.watchCompletion).
+            if let Some(subscriber) = &subscriber_agent_id {
+                self.validate_event_subscriber(&workspace_id, subscriber)
+                    .await?;
+            }
+            // Registers the subscription with a live bus delivery task
+            // (matching + batching + subscriber wake, monorepo#937); bare `*`
+            // expands to the category wildcards inside registration.
+            let (subscription_id, resolved) = self
+                .register_event_subscription(
+                    &workspace_id,
+                    subscriber_agent_id,
+                    &event_types,
+                    exclude_self,
+                    batch_window,
+                )
+                .await;
             Ok(EventSubscribeResult {
                 subscription_id,
                 event_types: resolved,
@@ -12834,16 +12849,11 @@ impl WorkspaceApi for Services {
         _workspace_id: WorkspaceId,
         subscription_id: String,
     ) -> BoxFuture<'_, Result<EventUnsubscribeResult>> {
-        let subs = self.event_subscriptions.clone();
         Box::pin(async move {
             if subscription_id.is_empty() {
                 return Err(Error::Internal("subscriptionId is required".to_string()));
             }
-            let removed = subs
-                .lock()
-                .expect("event subscription registry poisoned")
-                .remove(&subscription_id);
-            if !removed {
+            if !self.remove_event_subscription(&subscription_id).await {
                 return Err(Error::Internal("Subscription not found".to_string()));
             }
             Ok(EventUnsubscribeResult {
@@ -14861,18 +14871,37 @@ impl WorkspaceApi for Services {
 
     fn agent_subscribe(
         &self,
-        _workspace_id: WorkspaceId,
+        workspace_id: WorkspaceId,
+        subscriber_agent_id: Option<AgentId>,
         event_types: Vec<String>,
-        _exclude_self: Option<bool>,
-        _batch_window: Option<i64>,
+        exclude_self: Option<bool>,
+        batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let subs = self.event_subscriptions.clone();
         Box::pin(async move {
-            let resolved = events::resolve_event_types(&event_types);
-            let subscription_id = uuid::Uuid::new_v4().to_string();
-            subs.lock()
-                .expect("event subscription registry poisoned")
-                .insert(subscription_id.clone());
+            // Same empty-types guard as `event.subscribe`: an empty filter
+            // would match EVERY event (and persist that across restarts).
+            if event_types.is_empty() {
+                return Err(Error::Internal(
+                    "eventTypes is required. Specify category wildcards like \"agent:*\", \"file:*\" or specific types like \"agent:idle\".".to_string(),
+                ));
+            }
+            // Fail closed on a phantom subscriber before registering
+            // (monorepo#568 precedent for agent.watchCompletion).
+            if let Some(subscriber) = &subscriber_agent_id {
+                self.validate_event_subscriber(&workspace_id, subscriber)
+                    .await?;
+            }
+            // Shares the one real implementation with `event.subscribe`
+            // (registration + live bus delivery, monorepo#937).
+            let (subscription_id, resolved) = self
+                .register_event_subscription(
+                    &workspace_id,
+                    subscriber_agent_id,
+                    &event_types,
+                    exclude_self,
+                    batch_window,
+                )
+                .await;
             Ok(serde_json::json!({
                 "subscriptionId": subscription_id,
                 "eventTypes": resolved,
@@ -14885,13 +14914,8 @@ impl WorkspaceApi for Services {
         _workspace_id: WorkspaceId,
         subscription_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let subs = self.event_subscriptions.clone();
         Box::pin(async move {
-            let removed = subs
-                .lock()
-                .expect("event subscription registry poisoned")
-                .remove(&subscription_id);
-            if !removed {
+            if !self.remove_event_subscription(&subscription_id).await {
                 return Err(Error::Internal("Subscription not found".to_string()));
             }
             Ok(serde_json::json!({ "success": true, "subscriptionId": subscription_id }))

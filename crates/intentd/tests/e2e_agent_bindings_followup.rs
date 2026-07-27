@@ -98,7 +98,13 @@ async fn agent_subscribe_creates_event_subscription() {
 
     // Call agent.subscribe
     let result = services
-        .agent_subscribe(ws.clone(), vec!["agent:*".to_string()], Some(false), None)
+        .agent_subscribe(
+            ws.clone(),
+            None,
+            vec!["agent:*".to_string()],
+            Some(false),
+            None,
+        )
         .await
         .expect("subscribe");
 

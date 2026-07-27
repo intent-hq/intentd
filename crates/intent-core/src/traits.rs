@@ -1889,14 +1889,24 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `agent.subscribe` (deprecated alias): service-style subscription result;
     /// not the WS streaming surface (use `events.subscribe`) (PROTOCOL §5.5/§6).
+    /// `subscriber_agent_id` is the agent that receives batched wake messages
+    /// when matching events fire; `None` (front-door caller with no agent
+    /// identity) registers a match-only subscription with no wake target.
     fn agent_subscribe(
         &self,
         workspace_id: WorkspaceId,
+        subscriber_agent_id: Option<AgentId>,
         event_types: Vec<String>,
         exclude_self: Option<bool>,
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, event_types, exclude_self, batch_window);
+        let _ = (
+            workspace_id,
+            subscriber_agent_id,
+            event_types,
+            exclude_self,
+            batch_window,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_subscribe not implemented".to_string(),
@@ -2186,14 +2196,24 @@ pub trait WorkspaceApi: Send + Sync {
     /// `event.subscribe` (deprecated alias): service-style subscription result;
     /// does NOT wire WS streaming (use `events.subscribe`) (PROTOCOL §5.10/§6).
     /// `exclude_self`/`batch_window` mirror the TS shim's forwarded options.
+    /// `subscriber_agent_id` is the agent that receives batched wake messages
+    /// when matching events fire; `None` registers a match-only subscription
+    /// with no wake target.
     fn event_subscribe(
         &self,
         workspace_id: WorkspaceId,
+        subscriber_agent_id: Option<AgentId>,
         event_types: Vec<String>,
         exclude_self: Option<bool>,
         batch_window: Option<i64>,
     ) -> BoxFuture<'_, Result<EventSubscribeResult>> {
-        let _ = (workspace_id, event_types, exclude_self, batch_window);
+        let _ = (
+            workspace_id,
+            subscriber_agent_id,
+            event_types,
+            exclude_self,
+            batch_window,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::event_subscribe not implemented".to_string(),

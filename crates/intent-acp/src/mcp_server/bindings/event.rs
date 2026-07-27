@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{EventQueryParams, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, EventQueryParams, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
@@ -50,6 +50,7 @@ pub(crate) const PRELUDE: &str = r#"
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -59,7 +60,7 @@ pub(crate) async fn dispatch(
         "workspaceSummary" => workspace_summary(api, ws, args).await,
         "directoryChanges" => directory_changes(api, ws, args).await,
         "query" => query(api, ws, args).await,
-        "subscribe" => subscribe(api, ws, args).await,
+        "subscribe" => subscribe(api, ws, caller, args).await,
         "unsubscribe" => unsubscribe(api, ws, args).await,
         other => Err(format!("host: unknown method `event.{other}`")),
     }
@@ -138,6 +139,7 @@ async fn query(
 async fn subscribe(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
+    caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let event_types = opt_vec_str(args, "eventTypes").ok_or_else(|| {
@@ -152,6 +154,7 @@ async fn subscribe(
     let r = api
         .event_subscribe(
             ws.clone(),
+            caller.cloned(),
             resolved,
             opt_bool(args, "excludeSelf"),
             args.get("batchWindow").and_then(Value::as_i64),

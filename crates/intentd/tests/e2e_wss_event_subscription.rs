@@ -1,0 +1,228 @@
+//! WSS end-to-end for `agent.subscribe` / `agent.unsubscribe` real delivery
+//! (monorepo#937): a subscription registered over the wire with a subscriber
+//! `agentId` must actually deliver — a matching workspace event published by
+//! another actor wakes the subscriber with a batched `[WORKSPACE EVENTS]`
+//! message (visible in `agent.getConversation`), and `agent.unsubscribe`
+//! stops delivery. Drives a real [`WsApiServer`] over plain `ws://`
+//! (insecure dev mode) so the WebSocket-upgrade → JSON-RPC → router →
+//! services → store round-trip is exercised end-to-end.
+
+#![cfg(unix)]
+
+mod common;
+
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use intent_core::WorkspaceApi;
+use intent_services::{EventBus, Services};
+use intent_store::Store;
+use intent_transport::{WsApiServer, WsOptions};
+use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+type PlainWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct TempDir(PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Fixture {
+    _ws: WsApiServer,
+    port: u16,
+    _dir: TempDir,
+}
+
+async fn boot() -> Fixture {
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let dir = std::env::temp_dir().join(format!("intentd-evsub-{}", &short[..8]));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("intentd.db")).await.expect("store");
+    let bus = EventBus::new(store.clone());
+    let workspaces_root = dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
+    let services = Services::new(store)
+        .with_workspaces_root(workspaces_root)
+        .with_event_bus(bus.clone());
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services);
+    let opts = WsOptions {
+        base_port: 0,
+        bind_address: Ipv4Addr::LOCALHOST.into(),
+        ..Default::default()
+    };
+    let ws = WsApiServer::new_insecure(api, bus, opts, None);
+    let port = ws.start().await.expect("start");
+    Fixture {
+        _ws: ws,
+        port,
+        _dir: TempDir(dir),
+    }
+}
+
+async fn connect(port: u16) -> PlainWs {
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let (sock, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("plain ws handshake");
+    sock
+}
+
+async fn wss_rpc(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+    let v = wss_rpc_raw(ws, id, method, params).await;
+    assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
+    v["result"].clone()
+}
+
+async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> Value {
+    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(req.to_string())).await.unwrap();
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(text) => {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v.get("id") == Some(&json!(id)) {
+                        return v;
+                    }
+                }
+                Message::Ping(_) | Message::Pong(_) => {}
+                _ => panic!("unexpected message"),
+            }
+        }
+    })
+    .await
+    .expect("response timeout")
+}
+
+async fn create_agent(rpc: &mut PlainWs, id: i64, ws_id: &str, name: &str) -> String {
+    let created = wss_rpc(
+        rpc,
+        id,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": name }),
+    )
+    .await;
+    created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string()
+}
+
+/// Serialized conversation text for an agent (empty string when no messages).
+async fn conversation_text(rpc: &mut PlainWs, id: i64, ws_id: &str, agent_id: &str) -> String {
+    let convo = wss_rpc(
+        rpc,
+        id,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    convo.to_string()
+}
+
+/// Subscribe over the wire with a subscriber `agentId`, drive a matching
+/// `agent:*` event from another actor (an `agent.create` emits
+/// `agent:created`), and assert the subscriber is woken with the batched
+/// `[WORKSPACE EVENTS]` message. Then unsubscribe and assert a further
+/// matching event delivers nothing.
+#[tokio::test]
+async fn agent_subscribe_delivers_batched_wake_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "Event sub e2e", "path": "." }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+
+    let subscriber = create_agent(&mut rpc, 2, &ws_id, "Watcher").await;
+
+    // Subscribe with the subscriber identity and a short batch window
+    // (PROTOCOL §5.5 request shape + monorepo#937 `agentId`).
+    let sub = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.subscribe",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": subscriber,
+            "eventTypes": ["agent:*"],
+            "batchWindow": 50,
+        }),
+    )
+    .await;
+    let sub_id = sub["subscriptionId"].as_str().expect("subscriptionId");
+    assert_eq!(sub["eventTypes"], json!(["agent:*"]));
+
+    // Another actor's event: creating a second agent publishes
+    // `agent:created` in this workspace, which matches `agent:*` and is not
+    // the subscriber's own actor id.
+    let _other = create_agent(&mut rpc, 4, &ws_id, "Worker").await;
+
+    // Await the batched wake landing in the subscriber's conversation.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut req_id = 5;
+    loop {
+        let text = conversation_text(&mut rpc, req_id, &ws_id, &subscriber).await;
+        req_id += 1;
+        if text.contains("WORKSPACE EVENTS") {
+            assert!(text.contains("agent:created"), "wake names the event type");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscriber never received the batched wake; conversation: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Unsubscribe (PROTOCOL §5.5 response shape) …
+    let un = wss_rpc(
+        &mut rpc,
+        100,
+        "agent.unsubscribe",
+        json!({ "workspaceId": ws_id, "subscriptionId": sub_id }),
+    )
+    .await;
+    assert_eq!(un["success"], json!(true));
+    assert_eq!(un["subscriptionId"], json!(sub_id));
+
+    // … and a further matching event no longer delivers. Settle first so any
+    // batch already in flight when the delivery task was aborted lands
+    // before the baseline read (review: flake window).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let baseline = conversation_text(&mut rpc, 101, &ws_id, &subscriber).await;
+    let _third = create_agent(&mut rpc, 102, &ws_id, "Worker2").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = conversation_text(&mut rpc, 103, &ws_id, &subscriber).await;
+    assert_eq!(
+        baseline, after,
+        "no wake may be delivered after unsubscribe"
+    );
+
+    // Unknown id → error (kept response contract).
+    let err = wss_rpc_raw(
+        &mut rpc,
+        104,
+        "agent.unsubscribe",
+        json!({ "workspaceId": ws_id, "subscriptionId": "missing" }),
+    )
+    .await;
+    assert!(
+        err.get("error").is_some(),
+        "unknown subscription must error"
+    );
+}

@@ -1109,7 +1109,7 @@ impl Services {
     /// Whether an agent session row exists and is not `Deleted`. Store errors
     /// other than NotFound are treated as live (conservative: never prune a
     /// watch on a transient store error).
-    async fn agent_is_live(&self, agent_id: &AgentId) -> bool {
+    pub(crate) async fn agent_is_live(&self, agent_id: &AgentId) -> bool {
         match self.store.get_agent_session(agent_id).await {
             Ok(session) => !matches!(session.status, intent_core::AgentStatus::Deleted),
             Err(intent_store::Error::NotFound(_)) => false,
