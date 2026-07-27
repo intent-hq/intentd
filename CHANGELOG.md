@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+<<<<<<< Updated upstream
+=======
+## [0.2.10] - 2026-07-27
+
+### 🚀 Features
+
+- Daemon-managed Unsloth server lifecycle ([#597](https://github.com/intent-hq/intentd/pull/597))
+- *(unsloth)* Select best-fitting GGUF quant variant at spawn time ([#610](https://github.com/intent-hq/intentd/pull/610))
+- CoW provisioning phase timings + configurable clone exclusions ([#614](https://github.com/intent-hq/intentd/pull/614))
+- Model-change transcript notice + cross-provider replay e2e coverage (monorepo#882) ([#598](https://github.com/intent-hq/intentd/pull/598))
+- Inject scoped GitHub credential helper into terminal and agent spawn environments ([#601](https://github.com/intent-hq/intentd/pull/601))
+- BE-owned Workspace.displayStatus with change event ([#600](https://github.com/intent-hq/intentd/pull/600))
+- Background retry sweep for merge_pending sandboxes ([#608](https://github.com/intent-hq/intentd/pull/608))
+- Daemon-backed git credential helper for terminal and agent spawns ([#618](https://github.com/intent-hq/intentd/pull/618))
+
+### 🐛 Bug Fixes
+
+- *(acp)* Hold stdin lines racing a pending mcp-bridge reconnect ([#620](https://github.com/intent-hq/intentd/pull/620))
+- *(acp)* Make mcp-bridge resilient to daemon restarts and TCP drops ([#871](https://github.com/intent-hq/intentd/pull/871)) ([#595](https://github.com/intent-hq/intentd/pull/595))
+- Allow cross-provider agent.setModel after first turn (monorepo#882) ([#604](https://github.com/intent-hq/intentd/pull/604))
+- *(acp)* Buffer stdin during mcp-bridge initial connect window (monorepo#908) ([#611](https://github.com/intent-hq/intentd/pull/611))
+
+### 🧪 Testing
+
+- *(services)* Fix flaky dismiss_attention_idempotent event-order race (monorepo#905)
+
+
+## [0.2.9] - 2026-07-27
+
+### 🚀 Features
+
+- Unsloth provider registry entry + HF GGUF catalog with memory-fit filtering ([#593](https://github.com/intent-hq/intentd/pull/593))
+
+### 🐛 Bug Fixes
+
+- Robust sandbox merge-back and faster best-effort CoW clone ([#592](https://github.com/intent-hq/intentd/pull/592))
+
+### ⚙️ Miscellaneous Tasks
+
+- Fail PRs containing committed git conflict markers (#588 incident) ([#591](https://github.com/intent-hq/intentd/pull/591))
+
+
+>>>>>>> Stashed changes
 ## [0.2.8] - 2026-07-27
 
 ### 🚀 Features
