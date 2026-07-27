@@ -236,7 +236,13 @@ pub async fn provision_sandbox(
         created_at: now.clone(),
         updated_at: now,
     };
-    store.insert_sandbox(&sandbox).await?;
+    if let Err(e) = store.insert_sandbox(&sandbox).await {
+        // The agent session row can vanish mid-clone (`agent.delete` races
+        // the background provisioning; the sandbox FK cascades) — don't
+        // strand the just-cloned directory when the record insert fails.
+        let _ = std::fs::remove_dir_all(&sandbox_path);
+        return Err(e);
+    }
 
     Ok(ProvisionOutcome::Supported {
         path: sandbox_path,
@@ -1823,6 +1829,57 @@ mod tests {
         };
         let sandbox = store.get_sandbox(&ws.id, &agent_id).await.unwrap();
         assert!(sandbox.is_none());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn provision_cleans_up_clone_when_record_insert_fails() {
+        // agent.delete can race the background clone (monorepo#871): with no
+        // agent_session row the sandbox record insert fails its FK
+        // (ON DELETE CASCADE reference), and the just-cloned directory must
+        // not be stranded on disk.
+        let (store, _db) = temp_store().await;
+        let (test_root, repo_path) = temp_repo_in_target("insert-fk-race");
+        let workspaces_root = test_root.join("workspaces");
+
+        fs::create_dir_all(&workspaces_root).unwrap();
+        let probe = cow_probe(&repo_path, &workspaces_root).unwrap();
+        if probe == CowSupport::Unsupported {
+            eprintln!("Skipping test: CoW not supported");
+            let _ = fs::remove_dir_all(&test_root);
+            return;
+        }
+
+        let ws = workspace_for_repo(&repo_path);
+        store.insert_workspace(&ws).await.unwrap();
+        // No agent session inserted: mirrors a hard agent.delete completing
+        // while the clone ran.
+        let agent_id = AgentId::new();
+
+        let config = ProvisionConfig {
+            workspaces_root: workspaces_root.clone(),
+        };
+        let err = provision_sandbox(&store, &ws.id, &agent_id, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("insert sandbox failed"),
+            "expected FK insert failure, got: {err}"
+        );
+
+        // The cloned sandbox directory must have been removed.
+        let sandbox_parent = workspaces_root
+            .join(&ws.id.0)
+            .join("sandboxes")
+            .join(&agent_id.0);
+        let leftover: Vec<_> = fs::read_dir(&sandbox_parent)
+            .map(|entries| entries.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "cloned sandbox directory must be cleaned up on insert failure: {leftover:?}"
+        );
 
         let _ = fs::remove_dir_all(&test_root);
     }

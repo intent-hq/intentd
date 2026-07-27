@@ -3258,32 +3258,34 @@ impl Services {
                     // never spawns against a half-copied sandbox.
                     let settled = self.begin_sandbox_provisioning(&aid);
                     effective_isolation = Some("pending");
-                    let services = self.clone();
+                    // Drop guard: settles the gate even if provisioning
+                    // panics, so the gate map never accumulates stale
+                    // entries. Constructed BEFORE the spawn (and moved into
+                    // the task) so cleanup is unconditional even when the
+                    // runtime drops the task unpolled at shutdown. On the
+                    // normal path the guard drops AFTER
+                    // `provision_delegate_sandbox` returns — the session's
+                    // sandbox fields and the `sandbox:created` event are
+                    // already published, so a released waiter observes the
+                    // settled state. Dropping the held sender (also via the
+                    // guard) releases every waiter.
+                    struct SettleGuard {
+                        services: Services,
+                        aid: AgentId,
+                        _release: tokio::sync::watch::Sender<()>,
+                    }
+                    impl Drop for SettleGuard {
+                        fn drop(&mut self) {
+                            self.services.settle_sandbox_provisioning(&self.aid);
+                        }
+                    }
+                    let guard = SettleGuard {
+                        services: self.clone(),
+                        aid,
+                        _release: settled,
+                    };
                     let ws_id = workspace_id.clone();
                     tokio::spawn(async move {
-                        // Drop guard: settles the gate even if provisioning
-                        // panics, so the gate map never accumulates stale
-                        // entries. On the normal path the guard drops AFTER
-                        // `provision_delegate_sandbox` returns — the session's
-                        // sandbox fields and the `sandbox:created` event are
-                        // already published, so a released waiter observes the
-                        // settled state. Dropping the held sender (also via
-                        // the guard) releases every waiter.
-                        struct SettleGuard {
-                            services: Services,
-                            aid: AgentId,
-                            _release: tokio::sync::watch::Sender<()>,
-                        }
-                        impl Drop for SettleGuard {
-                            fn drop(&mut self) {
-                                self.services.settle_sandbox_provisioning(&self.aid);
-                            }
-                        }
-                        let guard = SettleGuard {
-                            services,
-                            aid,
-                            _release: settled,
-                        };
                         guard
                             .services
                             .provision_delegate_sandbox(&ws_id, &guard.aid, root)
@@ -3422,44 +3424,15 @@ impl Services {
                 base_commit_sha,
                 snapshot_commit_sha,
             }) => {
-                // Update the session with sandbox metadata
-                if let Ok(mut session) = self.store.get_agent_session(agent_id).await {
-                    session.sandbox_id = Some(format!(
-                        "sandbox-{}-{}",
-                        workspace_id.as_str(),
-                        agent_id.as_str()
-                    ));
-                    session.sandbox_path = Some(path.to_string_lossy().to_string());
-                    session.sandbox_branch = Some(branch.clone());
-                    let _ = self
-                        .store
-                        .update_agent_session(workspace_id, &session)
-                        .await;
-
-                    // Emit sandbox:created event
-                    crate::publish_event(
-                        &self.event_bus,
-                        intent_store::NewEvent {
-                            workspace_id: workspace_id.clone(),
-                            timestamp: crate::now_iso(),
-                            event_type: "sandbox:created".to_string(),
-                            actor: crate::system_actor(),
-                            session_id: Some(agent_id.0.clone()),
-                            correlation_id: None,
-                            parent_event_id: None,
-                            metadata: None,
-                            data: json!({
-                                "workspaceId": workspace_id.as_str(),
-                                "agentId": agent_id.as_str(),
-                                "sandboxPath": path.to_string_lossy(),
-                                "branch": branch,
-                                "baseCommitSha": base_commit_sha,
-                                "snapshotCommitSha": snapshot_commit_sha,
-                            }),
-                        },
-                    )
-                    .await;
-                }
+                self.settle_provisioned_sandbox(
+                    workspace_id,
+                    agent_id,
+                    path,
+                    branch,
+                    base_commit_sha,
+                    snapshot_commit_sha,
+                )
+                .await;
             }
             Ok(ProvisionOutcome::Unsupported) => {
                 // Fallback to shared mode (no action needed, session stays without sandbox fields)
@@ -3476,6 +3449,108 @@ impl Services {
                     error = %e,
                     "Sandbox provisioning failed; fallback to shared mode"
                 );
+            }
+        }
+    }
+
+    /// Settle a successfully provisioned sandbox onto the child's session:
+    /// persist the sandbox fields and emit `sandbox:created`. Because the
+    /// clone runs off the delegate critical path (monorepo#871),
+    /// `agent.delete` can race it — if the session is gone or soft-deleted
+    /// by settlement time, discard the just-provisioned sandbox (directory +
+    /// store record) instead of stranding a multi-GB clone on disk
+    /// (`gc_orphaned_sandboxes` has no runtime caller).
+    async fn settle_provisioned_sandbox(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        path: std::path::PathBuf,
+        branch: String,
+        base_commit_sha: String,
+        snapshot_commit_sha: Option<String>,
+    ) {
+        let session = match self.store.get_agent_session(agent_id).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id,
+                    agent = %agent_id,
+                    error = %e,
+                    "agent session lookup failed after sandbox provisioning"
+                );
+                None
+            }
+        };
+        match session {
+            Some(mut session) if session.status != AgentStatus::Deleted => {
+                // Update the session with sandbox metadata
+                session.sandbox_id = Some(format!(
+                    "sandbox-{}-{}",
+                    workspace_id.as_str(),
+                    agent_id.as_str()
+                ));
+                session.sandbox_path = Some(path.to_string_lossy().to_string());
+                session.sandbox_branch = Some(branch.clone());
+                let _ = self
+                    .store
+                    .update_agent_session(workspace_id, &session)
+                    .await;
+
+                // Emit sandbox:created event
+                crate::publish_event(
+                    &self.event_bus,
+                    intent_store::NewEvent {
+                        workspace_id: workspace_id.clone(),
+                        timestamp: crate::now_iso(),
+                        event_type: "sandbox:created".to_string(),
+                        actor: crate::system_actor(),
+                        session_id: Some(agent_id.0.clone()),
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: json!({
+                            "workspaceId": workspace_id.as_str(),
+                            "agentId": agent_id.as_str(),
+                            "sandboxPath": path.to_string_lossy(),
+                            "branch": branch,
+                            "baseCommitSha": base_commit_sha,
+                            "snapshotCommitSha": snapshot_commit_sha,
+                        }),
+                    },
+                )
+                .await;
+            }
+            _ => {
+                tracing::warn!(
+                    workspace = %workspace_id,
+                    agent = %agent_id,
+                    sandbox_path = %path.display(),
+                    "agent session missing or deleted after sandbox provisioning (agent.delete raced the clone); discarding the sandbox"
+                );
+                // Remove the directory via the in-hand path: a hard
+                // `agent.delete` already cascaded the sandbox row away
+                // (FK ON DELETE CASCADE), so a record lookup can't be
+                // relied on for the path.
+                if path.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&path) {
+                        tracing::warn!(
+                            workspace = %workspace_id,
+                            agent = %agent_id,
+                            error = %e,
+                            "failed to remove orphaned sandbox directory after agent deletion"
+                        );
+                    }
+                }
+                // Best-effort: drop the record too (still present on the
+                // soft-delete path; already gone after a hard delete).
+                if let Err(e) = self.store.delete_sandbox(workspace_id, agent_id).await {
+                    tracing::warn!(
+                        workspace = %workspace_id,
+                        agent = %agent_id,
+                        error = %e,
+                        "failed to delete orphaned sandbox record after agent deletion"
+                    );
+                }
             }
         }
     }

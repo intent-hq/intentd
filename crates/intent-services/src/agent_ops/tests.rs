@@ -11483,3 +11483,172 @@ async fn delete_clears_failure_wake_dedup_in_both_roles() {
         "parent-role entry swept"
     );
 }
+
+/// Simulate a completed CoW clone (on-disk dir + store record) for
+/// `settle_provisioned_sandbox` tests: the real `provision_sandbox` needs a
+/// CoW-capable filesystem, but settlement only needs the artifacts.
+async fn fake_provisioned_sandbox(
+    svc: &Services,
+    ws: &WorkspaceId,
+    aid: &AgentId,
+) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("intentd-orphan-sandbox-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create sandbox dir");
+    std::fs::write(dir.join("file.txt"), "x").expect("write sandbox file");
+    let sandbox = intent_store::Sandbox {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: ws.clone(),
+        agent_id: aid.clone(),
+        path: dir.to_string_lossy().to_string(),
+        branch: format!("sb/{}", aid.0),
+        base_commit_sha: "abc123".to_string(),
+        snapshot_commit_sha: None,
+        status: intent_store::SandboxStatus::Created,
+        retry_count: 0,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    svc.store()
+        .insert_sandbox(&sandbox)
+        .await
+        .expect("insert sandbox record");
+    dir
+}
+
+#[tokio::test]
+async fn settle_provisioned_sandbox_discards_when_session_missing() {
+    // agent.delete raced the background clone (monorepo#871): the hard
+    // delete cascades the sandbox row away (FK ON DELETE CASCADE), so by
+    // settlement time only the cloned directory remains — it must be
+    // removed and no sandbox:created event fires.
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let aid = create_agent(&svc, &ws, "Doomed").await;
+    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+    svc.store()
+        .delete_agent_session(&ws, &aid)
+        .await
+        .expect("hard delete session");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["sandbox:created".to_string()],
+        ..Default::default()
+    });
+
+    svc.settle_provisioned_sandbox(
+        &ws,
+        &aid,
+        dir.clone(),
+        format!("sb/{}", aid.0),
+        "abc123".to_string(),
+        None,
+    )
+    .await;
+
+    assert!(!dir.exists(), "sandbox directory must be removed");
+    assert!(
+        svc.store()
+            .get_sandbox(&ws, &aid)
+            .await
+            .expect("get sandbox")
+            .is_none(),
+        "sandbox record must be removed"
+    );
+    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    assert!(
+        res.is_err(),
+        "expected no sandbox:created emit for a deleted agent"
+    );
+}
+
+#[tokio::test]
+async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
+    // Same race, soft-delete flavor: the session row survives with
+    // status=deleted, so settlement must still discard rather than attach
+    // sandbox fields to a dead session.
+    let (_t, svc, ws) = setup().await;
+    let aid = create_agent(&svc, &ws, "Doomed").await;
+    let mut session = svc
+        .store()
+        .get_agent_session(&aid)
+        .await
+        .expect("agent session");
+    session.status = intent_core::AgentStatus::Deleted;
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("flag deleted");
+    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+
+    svc.settle_provisioned_sandbox(
+        &ws,
+        &aid,
+        dir.clone(),
+        format!("sb/{}", aid.0),
+        "abc123".to_string(),
+        None,
+    )
+    .await;
+
+    assert!(!dir.exists(), "sandbox directory must be removed");
+    assert!(
+        svc.store()
+            .get_sandbox(&ws, &aid)
+            .await
+            .expect("get sandbox")
+            .is_none(),
+        "sandbox record must be removed"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&aid)
+        .await
+        .expect("agent session");
+    assert!(
+        session.sandbox_id.is_none() && session.sandbox_path.is_none(),
+        "soft-deleted session must not gain sandbox fields"
+    );
+}
+
+#[tokio::test]
+async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
+    // Control: with a live session, settlement persists the sandbox fields.
+    let (_t, svc, ws) = setup().await;
+    let aid = create_agent(&svc, &ws, "Live").await;
+    let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
+
+    svc.settle_provisioned_sandbox(
+        &ws,
+        &aid,
+        dir.clone(),
+        format!("sb/{}", aid.0),
+        "abc123".to_string(),
+        None,
+    )
+    .await;
+
+    assert!(dir.exists(), "sandbox directory must be kept");
+    assert!(
+        svc.store()
+            .get_sandbox(&ws, &aid)
+            .await
+            .expect("get sandbox")
+            .is_some(),
+        "sandbox record must be kept"
+    );
+    let session = svc
+        .store()
+        .get_agent_session(&aid)
+        .await
+        .expect("agent session");
+    assert_eq!(
+        session.sandbox_path.as_deref(),
+        Some(dir.to_string_lossy().as_ref()),
+        "live session gains the sandbox path"
+    );
+    assert_eq!(
+        session.sandbox_branch.as_deref(),
+        Some(format!("sb/{}", aid.0).as_str()),
+        "live session gains the sandbox branch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
