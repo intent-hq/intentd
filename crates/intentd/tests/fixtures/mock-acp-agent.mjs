@@ -19,6 +19,12 @@ import { spawn } from 'node:child_process';
 
 const SESSION_ID = 'mock-session-1';
 
+// Whether the current provider session was established via `session/load`
+// (resume) rather than `session/new`. Per-process: a respawned child that the
+// daemon resumes into sees `true`; a fresh `session/new` resets it. Drives the
+// `failPromptIfLoadedRpcError` behavior (monorepo#940 poisoned-session e2e).
+let sessionFromLoad = false;
+
 // Per-process turn counter + the ids of prompts parked by `blockUntilCancel`.
 // These persist across messages within ONE child, so a follow-up prompt landing
 // with `promptCount > 1` proves the daemon resumed the SAME process (keep-alive)
@@ -367,6 +373,17 @@ async function handlePrompt(id, params) {
       return send({ jsonrpc: '2.0', id, error: behavior.promptRpcError });
     }
   }
+  // Poisoned-session shape (monorepo#940): deterministically fail EVERY prompt
+  // on a session established via `session/load` with the configured JSON-RPC
+  // error, while prompts on a fresh `session/new` succeed. Models a provider
+  // whose resumed context is corrupted — resuming replays the rejection
+  // forever; only a recreate (fresh session/new) recovers.
+  if (behavior.failPromptIfLoadedRpcError && sessionFromLoad) {
+    log(
+      `failing session/prompt on load-established session with JSON-RPC error ${behavior.failPromptIfLoadedRpcError.code}`,
+    );
+    return send({ jsonrpc: '2.0', id, error: behavior.failPromptIfLoadedRpcError });
+  }
   // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
   // with zero output. Send session/update with agent_status (thinking) to establish
   // the session without emitting assistant content, then park. The live-turn will
@@ -648,12 +665,17 @@ async function dispatch(msg) {
         log(`delaying initialize reply by ${behavior.initializeDelayMs}ms`);
         await new Promise((r) => setTimeout(r, behavior.initializeDelayMs));
       }
-      // `loadSession: true` behavior: advertise the capability and accept any
-      // session/load (see the session/load arm) — the worst-case provider that
-      // silently accepts a foreign session id (monorepo#907).
+      // Advertise the `loadSession` capability when either knob opts in:
+      // `loadSession: true` models the worst-case provider that silently
+      // accepts a foreign session id (monorepo#907); `advertiseLoadSession`
+      // makes the daemon's resume path (`session/load`) reachable for the
+      // poisoned-session e2e (monorepo#940). Default stays false so existing
+      // tests keep the no-resume behavior.
       return result(msg.id, {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: behavior.loadSession === true },
+        agentCapabilities: {
+          loadSession: behavior.loadSession === true || behavior.advertiseLoadSession === true,
+        },
       });
     case 'authenticate':
       return result(msg.id, {});
@@ -674,6 +696,7 @@ async function dispatch(msg) {
       sessionMcpServers = Array.isArray(msg.params && msg.params.mcpServers)
         ? msg.params.mcpServers
         : [];
+      sessionFromLoad = false;
       logSessionCall('session/new', SESSION_ID);
       return result(msg.id, { sessionId: SESSION_ID });
     }
@@ -686,8 +709,15 @@ async function dispatch(msg) {
       logSessionCall('session/load', msg.params && msg.params.sessionId);
       // With `loadSession: true` behavior, accept ANY session id — including a
       // foreign one — modelling the worst-case provider monorepo#907 guards
-      // against. Otherwise reject (capability was advertised false anyway).
-      if (behavior.loadSession === true) {
+      // against. With `advertiseLoadSession`, accept the resume (all
+      // LoadSessionResponse fields are optional) and mark this session as
+      // load-established so `failPromptIfLoadedRpcError` can fail the next
+      // prompt (monorepo#940). Otherwise reject (capability was advertised
+      // false anyway).
+      if (behavior.loadSession === true || behavior.advertiseLoadSession === true) {
+        if (behavior.advertiseLoadSession === true) {
+          sessionFromLoad = true;
+        }
         return result(msg.id, {});
       }
       return send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'no load' } });
