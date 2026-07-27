@@ -15,10 +15,17 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::client::rpc_call;
+
+/// Ceiling on the daemon round-trip for one `get`. A daemon that accepts the
+/// connection but never answers (wedged event loop, stalled token resolution)
+/// must not wedge the user's fetch/push with it — expiry is a silent miss so
+/// git falls through to its remaining helpers.
+const DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run the helper for `operation` against the daemon at `socket`. Always
 /// returns `Ok(())`: every failure mode is silent by design (git treats a
@@ -26,7 +33,9 @@ use crate::client::rpc_call;
 pub async fn run(operation: &str, socket: &Path) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let attrs = parse_attributes(stdin.lock());
-    if let Some((username, password)) = credential_for(operation, &attrs, socket).await {
+    if let Some((username, password)) =
+        credential_for(operation, &attrs, socket, DAEMON_RPC_TIMEOUT).await
+    {
         let mut stdout = std::io::stdout().lock();
         // A write failure (closed pipe) is as silent as every other miss.
         let _ = writeln!(stdout, "username={username}\npassword={password}");
@@ -36,18 +45,30 @@ pub async fn run(operation: &str, socket: &Path) -> anyhow::Result<()> {
 }
 
 /// Decide whether to answer, and fetch the credential from the daemon if so.
+/// `protocol`/`host` are forwarded so the daemon re-checks the scope gate
+/// server-side; the round-trip is bounded by `rpc_timeout` (expiry is a
+/// silent miss, like every other failure).
 async fn credential_for(
     operation: &str,
     attrs: &BTreeMap<String, String>,
     socket: &Path,
+    rpc_timeout: Duration,
 ) -> Option<(String, String)> {
     if !should_answer(operation, attrs) {
         return None;
     }
-    let params = json!({ "pid": std::process::id() });
-    let response = rpc_call(socket, "system.gitCredential", params)
-        .await
-        .ok()?;
+    let params = json!({
+        "pid": std::process::id(),
+        "protocol": attrs.get("protocol"),
+        "host": attrs.get("host"),
+    });
+    let response = tokio::time::timeout(
+        rpc_timeout,
+        rpc_call(socket, "system.gitCredential", params),
+    )
+    .await
+    .ok()?
+    .ok()?;
     extract_credential(&response)
 }
 
@@ -72,6 +93,9 @@ pub(crate) fn parse_attributes(reader: impl BufRead) -> BTreeMap<String, String>
 /// The answer gate: only a `get` operation for `protocol=https` on
 /// `host=github.com` (case-insensitive, exact host — no subdomains, no
 /// explicit port) is eligible. `store`/`erase` and anything else are no-ops.
+/// A git-supplied `username` (an explicit identity in the remote URL, e.g.
+/// `https://alice@github.com/...`) must match the daemon's fixed helper
+/// identity — otherwise stay silent so the user's own credentials/prompt win.
 pub(crate) fn should_answer(operation: &str, attrs: &BTreeMap<String, String>) -> bool {
     if operation != "get" {
         return false;
@@ -82,7 +106,10 @@ pub(crate) fn should_answer(operation: &str, attrs: &BTreeMap<String, String>) -
     let host_ok = attrs
         .get("host")
         .is_some_and(|h| h.eq_ignore_ascii_case("github.com"));
-    protocol_ok && host_ok
+    let username_ok = attrs
+        .get("username")
+        .is_none_or(|u| u == intent_git::auth::TOKEN_USERNAME);
+    protocol_ok && host_ok && username_ok
 }
 
 /// Pull `(username, password)` out of a `system.gitCredential` response

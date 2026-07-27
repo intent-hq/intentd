@@ -5742,11 +5742,22 @@ pub async fn github_git_credential(
 
 /// The running daemon's own binary path, for spawn sites that configure the
 /// `intentd git-credential` helper in child environments (monorepo#884 Phase
-/// 2.2). `None` when `current_exe` fails (logged at debug) — the spawn then
-/// simply proceeds without the helper, never failing on it.
+/// 2.2). `None` when `current_exe` fails or the path is not valid UTF-8
+/// (logged at debug) — a lossy conversion would point the helper at a
+/// nonexistent binary, so the spawn simply proceeds without the helper,
+/// never failing on it.
 pub(crate) fn daemon_exe_path() -> Option<String> {
     match std::env::current_exe() {
-        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Ok(path) => match path.into_os_string().into_string() {
+            Ok(path) => Some(path),
+            Err(path) => {
+                tracing::debug!(
+                    path = %std::path::Path::new(&path).display(),
+                    "current_exe is not valid UTF-8; spawning without git credential helper"
+                );
+                None
+            }
+        },
         Err(e) => {
             tracing::debug!("current_exe unresolved; spawning without git credential helper: {e}");
             None

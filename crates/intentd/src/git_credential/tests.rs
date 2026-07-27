@@ -69,6 +69,49 @@ fn should_answer_rejects_other_hosts_and_protocols() {
 }
 
 #[test]
+fn should_answer_defers_to_explicit_url_identity() {
+    // A remote URL that pins a username (https://alice@github.com/...) makes
+    // git send `username=alice`; the helper must stay silent so the user's
+    // own credentials/prompt win.
+    let pinned = attrs(&[
+        ("protocol", "https"),
+        ("host", "github.com"),
+        ("username", "alice"),
+    ]);
+    assert!(!should_answer("get", &pinned));
+    // The daemon's own fixed identity is fine.
+    let matching = attrs(&[
+        ("protocol", "https"),
+        ("host", "github.com"),
+        ("username", intent_git::auth::TOKEN_USERNAME),
+    ]);
+    assert!(should_answer("get", &matching));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hung_daemon_is_a_silent_miss_after_timeout() {
+    // A daemon that accepts the connection but never answers must not block
+    // git forever: the RPC times out and the helper treats it as a miss.
+    let sock = std::env::temp_dir().join(format!("itd-gitcred-hung-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind hung-daemon socket");
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let github = attrs(&[("protocol", "https"), ("host", "github.com")]);
+    let result = credential_for("get", &github, &sock, Duration::from_millis(200)).await;
+    assert_eq!(result, None);
+
+    hold.abort();
+    let _ = std::fs::remove_file(&sock);
+}
+
+#[test]
 fn extract_credential_reads_result_and_rejects_bad_shapes() {
     let ok = json!({ "jsonrpc": "2.0", "id": 1, "result": {
         "credential": { "username": "x-access-token", "password": "gho_abc" }

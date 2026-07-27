@@ -265,7 +265,7 @@ async fn git_credential_returns_credential_and_forwards_pid() {
     let control = FakeControl::with_credential("x-access-token", "gho_secret");
     let req = classify(&json!({
         "jsonrpc": "2.0", "id": 21, "method": "system.gitCredential",
-        "params": { "pid": 4242 }
+        "params": { "pid": 4242, "protocol": "https", "host": "github.com" }
     }))
     .unwrap();
     let parsed: Value =
@@ -279,9 +279,12 @@ async fn git_credential_returns_credential_and_forwards_pid() {
 #[tokio::test]
 async fn git_credential_none_yields_null_and_pid_is_lenient() {
     let control = FakeControl::new();
-    // No params at all → pid None; no credential → `credential: null`.
-    let req =
-        classify(&json!({ "jsonrpc": "2.0", "id": 22, "method": "system.gitCredential" })).unwrap();
+    // In-scope request but no credential available → `credential: null`.
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 22, "method": "system.gitCredential",
+        "params": { "protocol": "https", "host": "GitHub.COM" }
+    }))
+    .unwrap();
     let parsed: Value =
         serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["result"]["credential"], Value::Null);
@@ -290,12 +293,40 @@ async fn git_credential_none_yields_null_and_pid_is_lenient() {
     // A non-numeric pid degrades to None instead of erroring (audit-only).
     let req = classify(&json!({
         "jsonrpc": "2.0", "id": 23, "method": "system.gitCredential",
-        "params": { "pid": "nope" }
+        "params": { "pid": "nope", "protocol": "https", "host": "github.com" }
     }))
     .unwrap();
     let parsed: Value =
         serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
     assert_eq!(parsed["result"]["credential"], Value::Null);
+}
+
+#[tokio::test]
+async fn git_credential_out_of_scope_yields_null_without_resolver() {
+    // The daemon-side gate: anything but https://github.com gets
+    // `credential: null` and the resolver never runs — even when a
+    // credential would have been available.
+    let control = FakeControl::with_credential("x-access-token", "gho_secret");
+    for params in [
+        json!(null),
+        json!({}),
+        json!({ "pid": 1 }),
+        json!({ "protocol": "https", "host": "gitlab.com" }),
+        json!({ "protocol": "https", "host": "api.github.com" }),
+        json!({ "protocol": "http", "host": "github.com" }),
+        json!({ "protocol": "https" }),
+        json!({ "host": "github.com" }),
+        json!({ "protocol": 1, "host": "github.com" }),
+    ] {
+        let req = classify(&json!({
+            "jsonrpc": "2.0", "id": 25, "method": "system.gitCredential", "params": params
+        }))
+        .unwrap();
+        let parsed: Value =
+            serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+        assert_eq!(parsed["result"]["credential"], Value::Null);
+        assert_eq!(*control.credential_pid.lock().unwrap(), None);
+    }
 }
 
 #[tokio::test]
