@@ -8,7 +8,10 @@
 //! - `get` for HTTPS github.com prints `username=`/`password=` and exits 0;
 //! - non-github hosts, non-https protocols, and `store`/`erase` stay silent;
 //! - the `exposeGitCredentialToChildren = false` gate stays silent;
-//! - a stopped daemon stays silent (exit 0) so git falls through.
+//! - a stopped daemon stays silent (exit 0) so git falls through;
+//! - `github.revoke` applies to the very next `get` (Phase 2.2: the helper
+//!   resolves per-invocation, so revocation is immediate — no stale token in
+//!   any child environment).
 
 #![cfg(unix)]
 
@@ -191,4 +194,83 @@ async fn daemon_down_stays_silent() {
     assert!(ok, "helper must exit 0 when the daemon is unreachable");
     assert!(stdout.is_empty(), "no output without a daemon: {stdout:?}");
     let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Spawn `intentd serve` with the token seeded in the hermetic secrets store
+/// and `tokenSource = "explicit"` (config.toml written before boot), and
+/// **no** GITHUB_TOKEN/GH_TOKEN in the daemon env — the stored token is the
+/// only possible source, so `github.revoke` deleting it must leave the chain
+/// empty.
+fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    std::fs::write(
+        data_dir.join("secrets.json"),
+        format!("{{\"sourceControl.github.token\":\"{TEST_TOKEN}\"}}"),
+    )
+    .expect("seed secrets file");
+    std::fs::write(
+        data_dir.join("config.toml"),
+        "[sourceControl.github]\ntokenSource = \"explicit\"\n",
+    )
+    .expect("write config.toml");
+    Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("serve")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_SECRETS_FILE", data_dir.join("secrets.json"))
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn intentd serve")
+}
+
+/// Phase 2.2 revocation e2e: with the token stored in the secrets store
+/// (`tokenSource = "explicit"`), the helper answers `get`; after
+/// `intentd call github.revoke` deletes the stored token, the very next
+/// `get` stays silent — daemon-backed resolution is per-invocation, so a
+/// revocation applies immediately to every child.
+#[tokio::test]
+async fn revoke_applies_to_next_helper_get() {
+    let data_dir = temp_data_dir();
+    let _daemon = Daemon {
+        child: spawn_serve_with_stored_token(&data_dir),
+        data_dir: data_dir.clone(),
+    };
+    assert!(
+        await_uds(&data_dir.join("intentd.sock")).await,
+        "daemon did not start"
+    );
+
+    // Before revocation: the stored token flows through the helper.
+    let (ok, stdout) = run_helper(&data_dir, "get", GITHUB_GET);
+    assert!(ok);
+    assert_eq!(
+        stdout,
+        format!("username=x-access-token\npassword={TEST_TOKEN}\n")
+    );
+
+    // Revoke over the same UDS control plane the helper uses.
+    let revoke = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .args(["call", "github.revoke"])
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .expect("run intentd call github.revoke");
+    assert!(revoke.status.success(), "github.revoke must succeed");
+
+    // After revocation: no stored token, no env fallback (tokenSource is
+    // explicit) — the helper stays silent so git falls through.
+    let (ok, stdout) = run_helper(&data_dir, "get", GITHUB_GET);
+    assert!(ok, "silent exit 0 after revocation");
+    assert!(
+        stdout.is_empty(),
+        "no credential after revocation: {stdout:?}"
+    );
 }

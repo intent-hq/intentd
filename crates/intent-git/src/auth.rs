@@ -82,6 +82,57 @@ pub fn scoped_credential_env(
     ]
 }
 
+/// The `git -c` config entry offering the daemon-backed
+/// `intentd git-credential` helper for github.com (monorepo#884 Phase 2.2):
+/// `!<intentd> git-credential` — git runs the `!`-prefixed value through
+/// `sh -c` with the operation appended, so `intentd_path` is sh-quoted to
+/// survive spaces and quotes in the install path. No token bytes anywhere:
+/// the helper fetches the credential from the daemon over UDS on demand.
+pub fn daemon_helper_config(intentd_path: &str) -> String {
+    format!(
+        "credential.https://github.com.helper=!{} git-credential",
+        sh_quote(intentd_path)
+    )
+}
+
+/// Build the environment pairs a spawn site injects to offer the
+/// daemon-backed `intentd git-credential` helper to a child's git
+/// (monorepo#884 Phase 2.2): the single [`GIT_CONFIG_PARAMETERS_ENV`] pair
+/// carrying the sq-quoted [`daemon_helper_config`] entry **appended** to any
+/// `inherited_config_parameters` (the caller's pre-existing value, so
+/// inherited entries — and the user's configured helpers, which git applies
+/// first — keep winning). Unlike [`scoped_credential_env`] there is no token
+/// pair at all: no token bytes ever enter the child environment.
+pub fn daemon_helper_env(
+    intentd_path: &str,
+    inherited_config_parameters: Option<&str>,
+) -> Vec<(String, String)> {
+    let entry = sq_quote(&daemon_helper_config(intentd_path));
+    let params = match inherited_config_parameters {
+        Some(prev) if !prev.trim().is_empty() => format!("{prev} {entry}"),
+        _ => entry,
+    };
+    vec![(GIT_CONFIG_PARAMETERS_ENV.to_string(), params)]
+}
+
+/// Single-quote `src` for the POSIX shell git hands a `!`-prefixed helper
+/// value to: wrap in `'…'` and escape embedded `'` as `'\''`. Distinct from
+/// [`sq_quote`], which targets git's own `sq_dequote` parser (that layer is
+/// applied on top when the entry travels via `GIT_CONFIG_PARAMETERS`).
+fn sh_quote(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 2);
+    out.push('\'');
+    for c in src.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Single-quote `src` for `GIT_CONFIG_PARAMETERS`, mirroring git's own
 /// `sq_quote_buf` (quote.c): wrap in `'…'` and escape embedded `'` and `!`
 /// as `'\''` / `'\!'` — the exact forms git's `sq_dequote` parser accepts.
@@ -531,5 +582,108 @@ mod tests {
         assert_eq!(sq_quote("plain"), "'plain'");
         assert_eq!(sq_quote("a'b"), "'a'\\''b'");
         assert_eq!(sq_quote("!f"), "''\\!'f'");
+    }
+
+    /// The daemon-helper env builder yields exactly one pair — the
+    /// `GIT_CONFIG_PARAMETERS` entry — and real git dequotes it back to the
+    /// exact `!<path> git-credential` helper value, even for a binary path
+    /// with spaces and an embedded single quote.
+    #[test]
+    fn daemon_helper_env_builds_parseable_helper() {
+        for path in ["/usr/local/bin/intentd", "/Apps/In tent'd/bin/intentd"] {
+            let pairs = daemon_helper_env(path, None);
+            assert_eq!(pairs.len(), 1, "single env pair — no token pair");
+            let (key, params) = &pairs[0];
+            assert_eq!(key, GIT_CONFIG_PARAMETERS_ENV);
+
+            let out = std::process::Command::new("git")
+                .env(GIT_CONFIG_PARAMETERS_ENV, params)
+                .args(["config", "--get", "credential.https://github.com.helper"])
+                .output()
+                .expect("git must be runnable");
+            assert!(out.status.success(), "git must parse the quoted parameters");
+            let value = String::from_utf8_lossy(&out.stdout);
+            let expected = daemon_helper_config(path);
+            let expected_value = expected
+                .strip_prefix("credential.https://github.com.helper=")
+                .unwrap();
+            assert_eq!(
+                value.trim_end_matches('\n'),
+                expected_value,
+                "path {path:?}"
+            );
+        }
+    }
+
+    /// A pre-existing `GIT_CONFIG_PARAMETERS` value is preserved and the
+    /// daemon-helper entry is appended after it, mirroring the
+    /// [`scoped_credential_env`] composition rule; blank inherited values are
+    /// treated as absent.
+    #[test]
+    fn daemon_helper_env_appends_to_inherited_parameters() {
+        let pairs = daemon_helper_env("/usr/local/bin/intentd", Some("'foo.bar=baz'"));
+        let params = &pairs[0].1;
+        assert!(
+            params.starts_with("'foo.bar=baz' '"),
+            "inherited entry must come first: {params}"
+        );
+        let out = std::process::Command::new("git")
+            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+            .args(["config", "--get", "foo.bar"])
+            .output()
+            .expect("git must be runnable");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "baz");
+
+        let pairs = daemon_helper_env("/usr/local/bin/intentd", Some("   "));
+        assert!(
+            pairs[0].1.starts_with('\''),
+            "no leading junk: {}",
+            pairs[0].1
+        );
+    }
+
+    /// The `!`-prefixed helper value runs through `sh -c` with the operation
+    /// appended: a sh-quoted stand-in "binary" whose path contains a space
+    /// and a single quote must receive `git-credential <op>` as its argv.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_helper_shell_invocation_survives_quoted_path() {
+        use std::os::unix::fs::PermissionsExt;
+        // Guard-cleaned scratch dir (no tempfile dev-dep in this crate).
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir =
+            Scratch(std::env::temp_dir().join(format!("intent-git-helper-{}", std::process::id())));
+        let bin_dir = dir.0.join("in tent'd");
+        std::fs::create_dir_all(&bin_dir).expect("mkdir quoted bin dir");
+        let stub = bin_dir.join("intentd");
+        let capture = dir.0.join("capture");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                sh_quote(&capture.to_string_lossy())
+            ),
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = daemon_helper_config(&stub.to_string_lossy());
+        let helper_value = config
+            .strip_prefix("credential.https://github.com.helper=!")
+            .expect("shell-helper prefix");
+        // git invokes `sh -c '<value> "$@"' <value> get` for a `!` helper.
+        let status = std::process::Command::new("sh")
+            .args(["-c", &format!("{helper_value} \"$@\""), helper_value, "get"])
+            .status()
+            .expect("sh must run the helper snippet");
+        assert!(status.success());
+        let argv = std::fs::read_to_string(&capture).expect("stub captured argv");
+        assert_eq!(argv, "git-credential\nget\n");
     }
 }

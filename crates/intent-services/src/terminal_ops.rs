@@ -54,8 +54,8 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// overlay layered onto the daemon's inherited environment (`portable-pty`
 /// inherits by default), so callers can pass per-terminal variables through
 /// without dropping them. When the `exposeGitCredentialToChildren` setting is
-/// on and a GitHub token resolves, the github.com-scoped credential-helper
-/// env pairs are injected under the caller's overlay — caller-supplied keys
+/// on, the github.com-scoped daemon-backed credential-helper env pair is
+/// injected under the caller's overlay — caller-supplied keys
 /// always win (see [`git_credential_env`]). When `cwd` is omitted the PTY
 /// spawns in the workspace's worktree root (see [`default_cwd`]); an explicit
 /// `cwd` always wins.
@@ -82,7 +82,7 @@ pub(crate) async fn create(
         },
     };
     let user_env: Vec<(String, String)> = env.map(|m| m.into_iter().collect()).unwrap_or_default();
-    spec.env = overlay_credential_env(git_credential_env(settings.as_deref()).await, user_env);
+    spec.env = overlay_credential_env(git_credential_env(settings.as_deref()), user_env);
     let pty_id = pty.spawn(spec)?;
     let terminal_id = pty_id.to_string();
     spawn_output_stream(pty, bus, workspace_id, pty_id, terminal_id.clone());
@@ -114,26 +114,19 @@ async fn default_cwd(
 
 /// Environment pairs offering the daemon-managed GitHub credential to git
 /// run inside a spawned terminal, gated on
-/// `sourceControl.github.exposeGitCredentialToChildren` (monorepo#884): the
-/// github.com-scoped credential helper carried by `GIT_CONFIG_PARAMETERS`
-/// plus the token under `INTENT_GIT_GITHUB_TOKEN` — never raw
-/// `GITHUB_TOKEN`/`GH_TOKEN`. The token is resolved once at spawn time (no
-/// live refresh mid-session — a terminal spawned before a token existed keeps
-/// its env until respawned). Resolution never fails or blocks the spawn: no
-/// usable token simply yields no pairs (logged at debug).
-pub(crate) async fn git_credential_env(
-    settings: Option<&SettingsRegistry>,
-) -> Vec<(String, String)> {
+/// `sourceControl.github.exposeGitCredentialToChildren` (monorepo#884 Phase
+/// 2.2): the github.com-scoped `intentd git-credential` helper carried by
+/// `GIT_CONFIG_PARAMETERS` — **no token bytes in the child environment** (the
+/// helper fetches the credential from the daemon over UDS on each `get`, so
+/// tokens refresh live and revocation applies immediately; never raw
+/// `GITHUB_TOKEN`/`GH_TOKEN`). Building the pairs never fails or blocks the
+/// spawn: an unresolvable daemon binary path simply yields no pairs (logged
+/// at debug).
+pub(crate) fn git_credential_env(settings: Option<&SettingsRegistry>) -> Vec<(String, String)> {
     if !expose_git_credential(settings) {
         return Vec::new();
     }
-    let token = intent_sourcecontrol::token::resolve(&crate::github_token_source(settings)).await;
-    if token.is_none() {
-        tracing::debug!(
-            "no GitHub token resolved; spawning terminal without credential helper env"
-        );
-    }
-    credential_pairs(token.as_deref())
+    credential_pairs()
 }
 
 /// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
@@ -151,13 +144,17 @@ pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool
     })
 }
 
-/// Build the credential env pairs for `token` on top of the daemon's own
+/// Build the daemon-backed helper env pair on top of the daemon's own
 /// inherited `GIT_CONFIG_PARAMETERS` (the PTY child inherits the daemon env,
 /// so overwriting the variable without re-appending would drop inherited
-/// entries). Empty when `token` is unusable.
-fn credential_pairs(token: Option<&str>) -> Vec<(String, String)> {
+/// entries). The helper path is the running daemon's own binary
+/// (`current_exe`); an unresolvable path yields no pairs (logged at debug).
+fn credential_pairs() -> Vec<(String, String)> {
+    let Some(intentd) = crate::daemon_exe_path() else {
+        return Vec::new();
+    };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-    intent_git::auth::scoped_credential_env(token, inherited.as_deref())
+    intent_git::auth::daemon_helper_env(&intentd, inherited.as_deref())
 }
 
 /// Layer caller-supplied env over the injected credential pairs: a key the
@@ -521,7 +518,7 @@ impl TerminalHost for PtyTerminalHost {
         let pty = self.pty.clone();
         let settings = self.settings.clone();
         Box::pin(async move {
-            let credential = git_credential_env(settings.as_deref()).await;
+            let credential = git_credential_env(settings.as_deref());
             let mut spec = SpawnSpec::new(params.session_id, params.command);
             spec.args = params.args;
             spec.env = overlay_credential_env(credential, params.env);
@@ -796,30 +793,37 @@ mod tests {
     }
 
     /// The gate short-circuits injection: no registry and setting-off both
-    /// yield no pairs without attempting token resolution.
-    #[tokio::test]
-    async fn git_credential_env_respects_gate() {
-        assert!(git_credential_env(None).await.is_empty());
+    /// yield no pairs.
+    #[test]
+    fn git_credential_env_respects_gate() {
+        assert!(git_credential_env(None).is_empty());
         let (off, _guard) = registry_with_expose(Some(false));
-        assert!(git_credential_env(Some(&off)).await.is_empty());
+        assert!(git_credential_env(Some(&off)).is_empty());
     }
 
-    /// An unusable token yields no pairs; a usable one yields exactly the
-    /// `GIT_CONFIG_PARAMETERS` + token-env pair set from the shared builder.
+    /// Gate on ⇒ exactly the single daemon-backed helper pair: the
+    /// `GIT_CONFIG_PARAMETERS` entry names `git-credential` and **no**
+    /// `INTENT_GIT_GITHUB_TOKEN` pair exists — no token bytes can enter the
+    /// child environment (monorepo#884 Phase 2.2).
     #[test]
-    fn credential_pairs_shape() {
-        assert!(credential_pairs(None).is_empty());
-        assert!(credential_pairs(Some("")).is_empty());
-        let pairs = credential_pairs(Some("tok-123"));
+    fn credential_pairs_are_helper_only_without_token_env() {
+        let pairs = credential_pairs();
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            keys,
-            vec![
-                intent_git::auth::GIT_CONFIG_PARAMETERS_ENV,
-                intent_git::auth::TOKEN_ENV
-            ]
+        assert_eq!(keys, vec![intent_git::auth::GIT_CONFIG_PARAMETERS_ENV]);
+        assert!(
+            pairs[0].1.contains("credential.https://github.com.helper="),
+            "helper entry present: {}",
+            pairs[0].1
         );
-        assert_eq!(pairs[1].1, "tok-123");
+        assert!(
+            pairs[0].1.contains("git-credential"),
+            "daemon-backed helper subcommand named: {}",
+            pairs[0].1
+        );
+        assert!(
+            !keys.contains(&intent_git::auth::TOKEN_ENV),
+            "no token env pair may be injected"
+        );
     }
 
     /// Caller-supplied env wins: a colliding key drops the injected pair and

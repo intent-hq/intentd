@@ -5740,6 +5740,20 @@ pub async fn github_git_credential(
     ))
 }
 
+/// The running daemon's own binary path, for spawn sites that configure the
+/// `intentd git-credential` helper in child environments (monorepo#884 Phase
+/// 2.2). `None` when `current_exe` fails (logged at debug) — the spawn then
+/// simply proceeds without the helper, never failing on it.
+pub(crate) fn daemon_exe_path() -> Option<String> {
+    match std::env::current_exe() {
+        Ok(path) => Some(path.to_string_lossy().into_owned()),
+        Err(e) => {
+            tracing::debug!("current_exe unresolved; spawning without git credential helper: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod github_token_source_tests {
     use super::*;
