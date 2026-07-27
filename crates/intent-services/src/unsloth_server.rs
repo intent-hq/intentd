@@ -773,7 +773,14 @@ impl UnslothServerManager {
                 )))
             })?;
 
-        // Phase 1: socket up (any HTTP status).
+        // Phase 1: socket up (any HTTP status). No model download happens on
+        // this path — opening the HTTP listener is a fast, fixed-cost step
+        // of the server's own startup, not something a first-use download
+        // can legitimately stretch out. A timeout here means the process is
+        // wedged (terminal): unlike phases 2/3, this is NOT preserved for a
+        // retry to attach to, since a child that never opens its port will
+        // never satisfy a later retry's wait either — preserving it would
+        // leave a permanently-stuck process with no respawn path.
         self.wait_until(self.config.server_up_timeout, server, || async {
             let outcome = classify_probe(probe_status(&client, &probe_url, None).await);
             outcome != ProbeOutcome::Down
@@ -783,7 +790,7 @@ impl UnslothServerManager {
             WaitError::ChildExited => StartupFailure::terminal(Error::Internal(format!(
                 "unsloth server exited during startup (model {repo_id})"
             ))),
-            WaitError::TimedOut => StartupFailure::transient(Error::Internal(format!(
+            WaitError::TimedOut => StartupFailure::terminal(Error::Internal(format!(
                 "unsloth server did not open its HTTP port within {}s",
                 self.config.server_up_timeout.as_secs()
             ))),
@@ -875,6 +882,29 @@ impl UnslothServerManager {
                 "failed to run unsloth start opencode: {e}"
             )))
         })?;
+        // Drain stdout/stderr concurrently with the poll loop below, on
+        // background tasks: a mint that emits enough output (e.g. download
+        // progress) to fill the OS pipe buffer would otherwise block on
+        // write() while nothing reads the other end, making a live process
+        // look hung until `mint_timeout` kills it. `cmd.output()` (the
+        // pre-#878 code) drained concurrently for free; polling `try_wait()`
+        // does not, so the drain has to be made explicit.
+        let stdout_pipe = mint_child.stdout.take();
+        let stderr_pipe = mint_child.stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut out) = stdout_pipe {
+                let _ = out.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut err) = stderr_pipe {
+                let _ = err.read_to_end(&mut buf).await;
+            }
+            buf
+        });
 
         let deadline = tokio::time::Instant::now() + self.config.mint_timeout;
         let mut last_status = tokio::time::Instant::now();
@@ -882,11 +912,15 @@ impl UnslothServerManager {
             if self.is_shutting_down() {
                 let _ = mint_child.start_kill();
                 let _ = mint_child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
                 return Err(StartupFailure::terminal(shutting_down_error()));
             }
             if !server.is_alive() {
                 let _ = mint_child.start_kill();
                 let _ = mint_child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
                 return Err(StartupFailure::terminal(Error::Internal(format!(
                     "unsloth server exited while minting opencode auth for model {repo_id}"
                 ))));
@@ -895,14 +929,18 @@ impl UnslothServerManager {
                 Ok(Some(exit)) => break exit,
                 Ok(None) => {}
                 Err(e) => {
+                    stdout_task.abort();
+                    stderr_task.abort();
                     return Err(StartupFailure::terminal(Error::Internal(format!(
                         "failed to poll unsloth start opencode: {e}"
-                    ))))
+                    ))));
                 }
             }
             if tokio::time::Instant::now() >= deadline {
                 let _ = mint_child.start_kill();
                 let _ = mint_child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
                 // The managed server is still alive (checked above) — the
                 // mint deadline just elapsed, possibly because it's waiting
                 // behind a first-use download. Preserve the server so a
@@ -920,14 +958,8 @@ impl UnslothServerManager {
             }
             tokio::time::sleep(self.config.probe_interval).await;
         };
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut out) = mint_child.stdout.take() {
-            let _ = out.read_to_end(&mut stdout).await;
-        }
-        if let Some(mut err) = mint_child.stderr.take() {
-            let _ = err.read_to_end(&mut stderr).await;
-        }
+        let stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
         if !exit_status.success() {
             let stderr = String::from_utf8_lossy(&stderr);
             let stdout = String::from_utf8_lossy(&stdout);
@@ -1907,6 +1939,77 @@ mod tests {
             assert!(mgr.state.lock().await.is_none(), "state cleared on failure");
         }
 
+        /// Regression: a mint child that writes more than one OS pipe buffer
+        /// (~64KiB) of stdout — e.g. verbose download progress output —
+        /// before exiting must not appear to hang. `mint_endpoint` polls
+        /// `try_wait()` instead of blocking on `cmd.output()`, so if stdout
+        /// isn't drained concurrently the child blocks on `write()` once the
+        /// pipe fills, `try_wait()` never observes an exit, and a live
+        /// process is misreported as timed out.
+        #[tokio::test]
+        async fn mint_with_large_stdout_output_does_not_hang() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let cfg_dir = dir.path().join(".unsloth/studio/auth/agents/opencode");
+            let config = GENERATED_CONFIG_FIXTURE
+                .replace("127.0.0.1:8888", &format!("127.0.0.1:{port}"))
+                .replace('\'', "");
+            let binary_path = dir.path().join("unsloth");
+            let log = dir.path().join("stub.log");
+            // Write ~500KiB of stdout (several times the typical 64KiB pipe
+            // buffer) before writing the generated config, simulating a
+            // mint invocation that streams verbose download progress.
+            let script = format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\ncase \"$1\" in\n  run) sleep 300 ;;\n  start) yes 'downloading... progress line to fill the pipe buffer' | head -c 500000 && mkdir -p '{cfg}' && cat > '{cfg}/opencode.json' <<'EOF'\n{config}\nEOF\n  ;;\nesac\n",
+                log = log.display(),
+                cfg = cfg_dir.display(),
+            );
+            std::fs::write(&binary_path, script).expect("write stub");
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            let config = test_config(binary_path, dir.path().to_path_buf(), port);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let endpoint =
+                tokio::time::timeout(Duration::from_secs(5), mgr.ensure_endpoint(REPO, &|_| {}))
+                    .await
+                    .expect("mint must complete well within mint_timeout, not hang on a full pipe")
+                    .expect("mint succeeds despite large stdout output");
+            assert_eq!(endpoint.base_url, format!("http://127.0.0.1:{port}/v1"));
+
+            mgr.shutdown().await;
+        }
+
+        /// A phase-1 (server socket) timeout is terminal, unlike the mint and
+        /// model-ready phases: opening the HTTP listener is a fast, fixed
+        /// cost of the server's own startup, not something a first-use
+        /// download can stretch out. A child that never opens its port will
+        /// never satisfy a later retry's wait either, so preserving it would
+        /// leave a permanently-stuck process with no respawn path — the
+        /// timeout must tear it down so the next call starts clean.
+        #[tokio::test]
+        async fn server_up_timeout_tears_down_the_child_unlike_mint_and_model_ready_timeouts() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // The stub never answers HTTP on any port (no listener spawned),
+            // so phase 1 (`wait_until` on `probe_status`) never sees
+            // anything but `Down` and must time out.
+            let binary = write_stub_binary(dir.path(), dir.path(), 1, Some("sleep 300"));
+            let mut config = test_config(binary, dir.path().to_path_buf(), 1);
+            config.server_up_timeout = Duration::from_millis(200);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            assert!(
+                err.to_string().contains("did not open its HTTP port"),
+                "got: {err}"
+            );
+            assert!(
+                mgr.state.lock().await.is_none(),
+                "a phase-1 timeout must tear down the child, not preserve it \
+                 (it will never open its port for a later retry to attach to)"
+            );
+        }
+
         /// Regression for monorepo#878, bug 1: a mint step that outlives a
         /// short `mint_timeout` (simulating `unsloth start opencode
         /// --no-launch` blocking behind a first-use download) must time out
@@ -1944,8 +2047,9 @@ mod tests {
                 server.child.id().expect("pid")
             };
 
-            // The still-running mint child from the first attempt must not
-            // have been reaped by a respawn.
+            // The managed SERVER child from the first attempt (not the mint
+            // subprocess, which was killed on timeout) must not have been
+            // reaped by a respawn.
             let alive = unsafe { libc_kill_probe(pid_before) };
             assert!(alive, "preserved server child must still be running");
 
