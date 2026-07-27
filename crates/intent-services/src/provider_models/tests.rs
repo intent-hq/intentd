@@ -5,8 +5,8 @@ use serde_json::json;
 
 use super::finish;
 use super::parse::{
-    build_unsloth_rows, estimate_model_bytes, fits_within_ram, parse_hf_unsloth_response,
-    parse_param_count_billions,
+    build_unsloth_rows, estimate_model_bytes, fits_within_ram, gguf_bytes_fit_within_ram,
+    parse_hf_unsloth_response, parse_param_count_billions,
 };
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
@@ -1020,6 +1020,18 @@ fn fits_within_ram_applies_the_seventy_percent_threshold() {
     let exact = estimate_model_bytes(10.0);
     let total_ram = (exact / 0.7).ceil() as u64;
     assert!(fits_within_ram(10.0, total_ram));
+}
+
+#[test]
+fn gguf_bytes_fit_within_ram_shares_the_catalog_budget() {
+    // 15 GB of weights + 1 GiB headroom ≈ 16.07 GB, under 70% of 32 GiB
+    // (~24.05 GB) but over 70% of 16 GiB (~12.03 GB).
+    assert!(gguf_bytes_fit_within_ram(15_000_000_000, 32 * GIB));
+    assert!(!gguf_bytes_fit_within_ram(15_000_000_000, 16 * GIB));
+    // Boundary: exactly at the threshold must fit (<=, not <).
+    let model_bytes = 10 * GIB;
+    let total_ram = (((model_bytes + GIB) as f64) / 0.7).ceil() as u64;
+    assert!(gguf_bytes_fit_within_ram(model_bytes, total_ram));
 }
 
 #[test]

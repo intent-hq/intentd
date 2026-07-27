@@ -3,7 +3,11 @@
 //!
 //! intentd owns a singleton local Unsloth server (one loaded model at a time —
 //! llama.cpp constraint). On the first spawn of an unsloth-provider agent the
-//! daemon runs `unsloth run --model <repo>:<quant> --disable-tools -p <port>`,
+//! daemon picks the quant variant to serve — the best-fitting one from the
+//! repo's actual GGUF file sizes (Hugging Face per-repo listing, same RAM
+//! budget as the catalog's fit filter), falling back to the CLI-default
+//! variant when size metadata is unavailable — then runs
+//! `unsloth run --model <repo>:<quant> --disable-tools -p <port>`,
 //! waits for the HTTP surface to come up, mints the opencode auth material via
 //! `unsloth start opencode --no-launch --model <repo>` (which writes
 //! `~/.unsloth/studio/auth/agents/opencode/opencode.json` with the baseURL,
@@ -31,6 +35,7 @@
 //! network, no real binary. The full path is exercised manually with a real
 //! install (spec verification plan).
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -72,6 +77,15 @@ const MINT_TIMEOUT: Duration = Duration::from_secs(60);
 /// diagnostics when it dies during startup.
 const OUTPUT_TAIL_LINES: usize = 40;
 
+/// Hugging Face API base for the per-repo file listing used by the
+/// spawn-time quant-variant selection (overridable in tests).
+const HF_API_BASE: &str = "https://huggingface.co";
+
+/// Timeout for the per-repo Hugging Face file-listing fetch. Deliberately
+/// short: a slow or unreachable HF must never stall an agent spawn —
+/// selection falls back to the CLI-default quant instead.
+const HF_FILES_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Install hint appended to "binary not found" errors.
 const UNSLOTH_INSTALL_HINT: &str =
     "install the Unsloth CLI and ensure `unsloth` is on PATH (https://docs.unsloth.ai/)";
@@ -96,10 +110,10 @@ fn shutting_down_error() -> Error {
     Error::Internal("unsloth server startup aborted: daemon is shutting down".to_string())
 }
 
-/// Quant variant the daemon picks when starting the server, mirroring the
-/// Unsloth CLI's own `--gguf-variant` defaults (validated 2026-07-27):
-/// `UD-Q4_K_XL` for `unsloth/*` GGUF repos, `Q4_K_M` otherwise.
-pub(crate) fn select_quant_variant(repo_id: &str) -> &'static str {
+/// Fallback quant variant when per-repo size metadata is unavailable,
+/// mirroring the Unsloth CLI's own `--gguf-variant` defaults (validated
+/// 2026-07-27): `UD-Q4_K_XL` for `unsloth/*` GGUF repos, `Q4_K_M` otherwise.
+pub(crate) fn default_quant_variant(repo_id: &str) -> &'static str {
     if repo_id.starts_with("unsloth/") {
         "UD-Q4_K_XL"
     } else {
@@ -109,8 +123,143 @@ pub(crate) fn select_quant_variant(repo_id: &str) -> &'static str {
 
 /// `--model` argument for `unsloth run`: the repo id with the daemon-picked
 /// quant variant suffix (`<repo>:<quant>`).
-pub(crate) fn run_model_arg(repo_id: &str) -> String {
-    format!("{repo_id}:{}", select_quant_variant(repo_id))
+pub(crate) fn run_model_arg(repo_id: &str, quant: &str) -> String {
+    format!("{repo_id}:{quant}")
+}
+
+/// Lock a std mutex, recovering from poisoning: the guarded data here is a
+/// plain map with no cross-field invariants, so a panic in another holder
+/// can't have left it inconsistent — and an agent spawn must never crash
+/// over a poisoned cache lock.
+fn lock_ignore_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Full-precision GGUF export tags. Valid files in unsloth repos, but never
+/// auto-selected: at a comparable fit a Q8-class quant is practically
+/// lossless and far cheaper to serve.
+const FULL_PRECISION_TAGS: [&str; 3] = ["BF16", "F16", "F32"];
+
+/// Whether an (uppercased) trailing filename token is a GGUF variant tag:
+/// a quant family (`Q4_K_M`, `IQ2_XXS`, `TQ1_0`, …) or a full-precision
+/// export tag.
+fn is_variant_token(tag: &str) -> bool {
+    if FULL_PRECISION_TAGS.contains(&tag) {
+        return true;
+    }
+    let rest = tag
+        .strip_prefix("IQ")
+        .or_else(|| tag.strip_prefix("TQ"))
+        .or_else(|| tag.strip_prefix("Q"));
+    matches!(rest, Some(r) if r.starts_with(|c: char| c.is_ascii_digit())
+        && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Extract the (uppercased) quant-variant tag from a GGUF file path, e.g.
+/// `gemma-4-it-UD-Q4_K_XL.gguf` → `UD-Q4_K_XL` and
+/// `Q8_0/gemma-4-it-Q8_0-00001-of-00002.gguf` → `Q8_0`. Multi-part
+/// suffixes (`-NNNNN-of-NNNNN`) are stripped before the tag is read. When
+/// the filename carries no recognizable trailing tag, the parent directory
+/// name is tried (some repos use `Q8_0/model-00001-of-00002.gguf`
+/// layouts); paths that are not `.gguf` files or carry no tag in either
+/// place return `None`.
+pub(crate) fn quant_tag_from_gguf_path(path: &str) -> Option<String> {
+    let (dir, file) = match path.rsplit_once('/') {
+        Some((dir, file)) => (Some(dir), file),
+        None => (None, path),
+    };
+    let stem = file
+        .strip_suffix(".gguf")
+        .or_else(|| file.strip_suffix(".GGUF"))?;
+    let mut tokens: Vec<&str> = stem.split('-').collect();
+    let all_digits = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
+    if tokens.len() >= 3
+        && tokens[tokens.len() - 2].eq_ignore_ascii_case("of")
+        && all_digits(tokens[tokens.len() - 1])
+        && all_digits(tokens[tokens.len() - 3])
+    {
+        tokens.truncate(tokens.len() - 3);
+    }
+    let tag = tokens.pop()?.to_ascii_uppercase();
+    if is_variant_token(&tag) {
+        return if tokens.last().is_some_and(|t| t.eq_ignore_ascii_case("UD")) {
+            Some(format!("UD-{tag}"))
+        } else {
+            Some(tag)
+        };
+    }
+    let dir_name = dir?.rsplit('/').next()?.to_ascii_uppercase();
+    let fits = is_variant_token(dir_name.strip_prefix("UD-").unwrap_or(&dir_name));
+    fits.then_some(dir_name)
+}
+
+/// Parse a Hugging Face per-repo file listing
+/// (`/api/models/<repo>?blobs=true` — `siblings` entries carry `rfilename`
+/// and `size`) into total bytes per quant-variant tag. Multi-part GGUFs
+/// sum all their parts; non-GGUF files and entries without a size are
+/// skipped. Malformed JSON yields an empty map — the caller treats "no
+/// size data" as "use the CLI default". Vision repos' `mmproj-*.gguf`
+/// projector files are summed into their tag's total; that slightly
+/// overestimates a quant's footprint, which is the conservative direction
+/// (and the projector is resident at runtime anyway).
+pub(crate) fn parse_repo_quant_sizes(body: &str) -> BTreeMap<String, u64> {
+    let mut sizes = BTreeMap::new();
+    let Ok(root) = serde_json::from_str::<Value>(body) else {
+        return sizes;
+    };
+    let Some(siblings) = root.get("siblings").and_then(Value::as_array) else {
+        return sizes;
+    };
+    for entry in siblings {
+        let Some(path) = entry.get("rfilename").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(size) = entry.get("size").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(tag) = quant_tag_from_gguf_path(path) else {
+            continue;
+        };
+        *sizes.entry(tag).or_insert(0) += size;
+    }
+    sizes
+}
+
+/// Pick the quant variant to serve from a repo's actual per-variant file
+/// sizes: the highest-quality (largest) quant that fits within the same
+/// RAM budget as the catalog's fit filter
+/// ([`crate::provider_models::gguf_bytes_fit_within_ram`] — ~70% of total
+/// RAM with KV-cache headroom). Full-precision exports (BF16/F16/F32) are
+/// never picked. When nothing fits, the smallest quant gives the repo its
+/// best chance to run (the user explicitly picked it). Size ties prefer
+/// Unsloth's `UD-*` dynamic quants (better quality per byte). Returns
+/// `None` — "use the CLI default" — when the map has no quant candidates
+/// or total RAM is unknown on this platform.
+pub(crate) fn best_fitting_quant(
+    sizes: &BTreeMap<String, u64>,
+    total_ram_bytes: Option<u64>,
+) -> Option<String> {
+    let total_ram = total_ram_bytes?;
+    let is_full_precision =
+        |tag: &str| FULL_PRECISION_TAGS.contains(&tag.strip_prefix("UD-").unwrap_or(tag));
+    let candidates: Vec<(&str, u64)> = sizes
+        .iter()
+        .filter(|(tag, _)| !is_full_precision(tag))
+        .map(|(tag, size)| (tag.as_str(), *size))
+        .collect();
+    let fitting = candidates
+        .iter()
+        .filter(|(_, size)| crate::provider_models::gguf_bytes_fit_within_ram(*size, total_ram))
+        .max_by_key(|(tag, size)| (*size, tag.starts_with("UD-")));
+    if let Some((tag, _)) = fitting {
+        return Some((*tag).to_string());
+    }
+    candidates
+        .iter()
+        .min_by_key(|(tag, size)| (*size, !tag.starts_with("UD-")))
+        .map(|(tag, _)| (*tag).to_string())
 }
 
 /// Outcome of one readiness probe attempt against the managed server.
@@ -276,7 +425,7 @@ impl ManagedServer {
 }
 
 /// Injectable configuration seams (tests override every external surface:
-/// binary resolution, home dir, port, timeouts).
+/// binary resolution, home dir, port, timeouts, HF metadata fetch, RAM).
 pub(crate) struct UnslothConfig {
     /// Resolve the `unsloth` binary; `None` = not installed.
     pub resolve_binary: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
@@ -288,6 +437,13 @@ pub(crate) struct UnslothConfig {
     pub model_ready_timeout: Duration,
     pub probe_interval: Duration,
     pub mint_timeout: Duration,
+    /// Hugging Face API base for the per-repo file listing the quant
+    /// selection uses (tests point this at a loopback stub).
+    pub hf_api_base: String,
+    /// Timeout for that per-repo file-listing fetch.
+    pub hf_files_timeout: Duration,
+    /// Total system RAM probe; `None` = detection unsupported.
+    pub total_memory_bytes: Box<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 
 impl Default for UnslothConfig {
@@ -305,6 +461,9 @@ impl Default for UnslothConfig {
             model_ready_timeout: MODEL_READY_TIMEOUT,
             probe_interval: PROBE_INTERVAL,
             mint_timeout: MINT_TIMEOUT,
+            hf_api_base: HF_API_BASE.to_string(),
+            hf_files_timeout: HF_FILES_TIMEOUT,
+            total_memory_bytes: Box::new(crate::agent_manager::total_memory_bytes),
         }
     }
 }
@@ -316,6 +475,12 @@ impl Default for UnslothConfig {
 pub struct UnslothServerManager {
     state: TokioMutex<Option<ManagedServer>>,
     config: UnslothConfig,
+    /// Quant variants already selected this daemon lifetime, keyed by repo
+    /// id. File sizes and total RAM don't change while the daemon runs, so
+    /// a successful selection is worth exactly one HF round-trip per repo;
+    /// default fallbacks (failed fetch, malformed listing, no usable size
+    /// data) are NOT cached, so transient HF issues retry on the next spawn.
+    quant_cache: Mutex<HashMap<String, String>>,
     /// Terminal shutdown latch. [`Self::shutdown`] sets it BEFORE taking the
     /// state lock so an in-flight startup (which can legitimately sit in its
     /// probe loop for many minutes during a first-use model download) notices
@@ -335,6 +500,7 @@ impl UnslothServerManager {
         Self {
             state: TokioMutex::new(None),
             config,
+            quant_cache: Mutex::new(HashMap::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -381,7 +547,14 @@ impl UnslothServerManager {
         let binary = (self.config.resolve_binary)().ok_or_else(missing_binary_error)?;
 
         status(format!("Starting Unsloth server for {repo_id}…"));
-        let server = self.start_server(&binary, repo_id)?;
+        let quant = self.resolve_quant_variant(repo_id).await;
+        // Re-check the latch: the HF fetch above can take up to
+        // [`UnslothConfig::hf_files_timeout`], and shutdown may have been
+        // requested meanwhile — don't spawn a child nobody will reap.
+        if self.is_shutting_down() {
+            return Err(shutting_down_error());
+        }
+        let server = self.start_server(&binary, repo_id, &quant)?;
         *state = Some(server);
 
         match self
@@ -409,13 +582,80 @@ impl UnslothServerManager {
         }
     }
 
+    /// Resolve the quant variant to serve for `repo_id`: the best-fitting
+    /// one from the repo's actual GGUF file sizes when the HF listing is
+    /// reachable ([`best_fitting_quant`]), the CLI-default variant
+    /// otherwise. A slow or failing HF fetch degrades to the default within
+    /// [`UnslothConfig::hf_files_timeout`] — it never fails the spawn. Only
+    /// real selections are cached: default fallbacks (fetch failure, no
+    /// usable size data, unknown RAM) retry the lookup on the next spawn.
+    async fn resolve_quant_variant(&self, repo_id: &str) -> String {
+        // The cache mutex guards a plain HashMap (no invariants can be
+        // violated mid-panic), so a poisoned lock is safe to keep using —
+        // never crash an agent spawn over it.
+        if let Some(quant) = lock_ignore_poison(&self.quant_cache).get(repo_id) {
+            return quant.clone();
+        }
+        let selected = match self.fetch_repo_file_listing(repo_id).await {
+            Ok(body) => {
+                let sizes = parse_repo_quant_sizes(&body);
+                best_fitting_quant(&sizes, (self.config.total_memory_bytes)())
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    repo = %repo_id,
+                    reason = %reason,
+                    "unsloth quant-variant lookup failed; using CLI default"
+                );
+                None
+            }
+        };
+        match selected {
+            Some(quant) => {
+                tracing::info!(repo = %repo_id, quant = %quant, "selected unsloth quant variant");
+                lock_ignore_poison(&self.quant_cache).insert(repo_id.to_string(), quant.clone());
+                quant
+            }
+            None => default_quant_variant(repo_id).to_string(),
+        }
+    }
+
+    /// GET the Hugging Face per-repo file listing
+    /// (`/api/models/<repo>?blobs=true`) with a hard timeout, returning the
+    /// raw JSON body. Mirrors the catalog fetch in
+    /// [`crate::provider_models`]; errors are strings because the caller
+    /// only logs them and falls back.
+    async fn fetch_repo_file_listing(&self, repo_id: &str) -> std::result::Result<String, String> {
+        let url = format!(
+            "{}/api/models/{repo_id}?blobs=true",
+            self.config.hf_api_base
+        );
+        let client = reqwest::Client::builder()
+            .timeout(self.config.hf_files_timeout)
+            .build()
+            .map_err(|e| format!("failed to build http client: {e}"))?;
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("huggingface request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("huggingface returned {status}"));
+        }
+        resp.text()
+            .await
+            .map_err(|e| format!("failed to read huggingface response: {e}"))
+    }
+
     /// Spawn `unsloth run --model <repo>:<quant> --disable-tools -p <port>`
     /// as its own process-group leader with captured output.
-    fn start_server(&self, binary: &Path, repo_id: &str) -> Result<ManagedServer> {
+    fn start_server(&self, binary: &Path, repo_id: &str, quant: &str) -> Result<ManagedServer> {
         let mut cmd = Command::new(binary);
         cmd.arg("run")
             .arg("--model")
-            .arg(run_model_arg(repo_id))
+            .arg(run_model_arg(repo_id, quant))
             .arg("--disable-tools")
             .arg("-p")
             .arg(self.config.port.to_string())
@@ -440,7 +680,7 @@ impl UnslothServerManager {
             drain_tasks.push(tokio::spawn(drain_into_tail(stderr, output_tail.clone())));
         }
 
-        tracing::info!(repo = %repo_id, port = self.config.port, "spawned managed unsloth server");
+        tracing::info!(repo = %repo_id, quant = %quant, port = self.config.port, "spawned managed unsloth server");
         Ok(ManagedServer {
             child,
             repo_id: repo_id.to_string(),
@@ -744,24 +984,183 @@ mod tests {
 
     const REPO: &str = "unsloth/gemma-4-26B-A4B-it-GGUF";
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Recorded shape of the Hugging Face per-repo file listing
+    /// (`/api/models/<repo>?blobs=true` — `siblings` with `size`), covering
+    /// flat single-file quants, a `UD-*` dynamic quant, a directory-nested
+    /// multi-part quant, full-precision exports, non-GGUF files, and an
+    /// entry without a size.
+    const HF_REPO_FILES_FIXTURE: &str = r#"{
+      "_id": "6851e1f6f0e2e9a8c7b41c2d",
+      "id": "unsloth/gemma-4-26B-A4B-it-GGUF",
+      "siblings": [
+        { "rfilename": ".gitattributes", "size": 1519 },
+        { "rfilename": "README.md", "size": 18213 },
+        { "rfilename": "config.json", "size": 855 },
+        { "rfilename": "gemma-4-26B-A4B-it-Q2_K.gguf", "blobId": "b1", "size": 9600000000 },
+        { "rfilename": "gemma-4-26B-A4B-it-Q4_K_M.gguf", "blobId": "b2", "size": 15800000000 },
+        { "rfilename": "UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL-00001-of-00002.gguf", "blobId": "b3", "size": 9000000000 },
+        { "rfilename": "UD-Q4_K_XL/gemma-4-26B-A4B-it-UD-Q4_K_XL-00002-of-00002.gguf", "blobId": "b4", "size": 8200000000 },
+        { "rfilename": "gemma-4-26B-A4B-it-Q6_K.gguf", "blobId": "b5", "size": 21400000000 },
+        { "rfilename": "gemma-4-26B-A4B-it-Q8_0.gguf", "blobId": "b6", "size": 27700000000 },
+        { "rfilename": "BF16/gemma-4-26B-A4B-it-BF16-00001-of-00002.gguf", "blobId": "b7", "size": 30000000000 },
+        { "rfilename": "BF16/gemma-4-26B-A4B-it-BF16-00002-of-00002.gguf", "blobId": "b8", "size": 22100000000 },
+        { "rfilename": "gemma-4-26B-A4B-it-IQ1_S.gguf" }
+      ]
+    }"#;
+
     // --- quant selection ---
 
     #[test]
-    fn quant_variant_defaults_ud_q4_for_unsloth_repos() {
+    fn default_quant_variant_matches_cli_defaults() {
         assert_eq!(
-            select_quant_variant("unsloth/gemma-4-26B-A4B-it-GGUF"),
+            default_quant_variant("unsloth/gemma-4-26B-A4B-it-GGUF"),
             "UD-Q4_K_XL"
         );
-        assert_eq!(select_quant_variant("other-org/model-GGUF"), "Q4_K_M");
+        assert_eq!(default_quant_variant("other-org/model-GGUF"), "Q4_K_M");
     }
 
     #[test]
     fn run_model_arg_appends_quant_suffix() {
         assert_eq!(
-            run_model_arg("unsloth/gemma-4-26B-A4B-it-GGUF"),
+            run_model_arg("unsloth/gemma-4-26B-A4B-it-GGUF", "UD-Q4_K_XL"),
             "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL"
         );
-        assert_eq!(run_model_arg("meta/llama-GGUF"), "meta/llama-GGUF:Q4_K_M");
+        assert_eq!(
+            run_model_arg("meta/llama-GGUF", "Q6_K"),
+            "meta/llama-GGUF:Q6_K"
+        );
+    }
+
+    #[test]
+    fn quant_tag_extraction_from_gguf_paths() {
+        assert_eq!(
+            quant_tag_from_gguf_path("gemma-4-26B-A4B-it-Q4_K_M.gguf").as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(
+            quant_tag_from_gguf_path("gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf").as_deref(),
+            Some("UD-Q4_K_XL")
+        );
+        // Directory-nested multi-part files resolve to the same tag.
+        assert_eq!(
+            quant_tag_from_gguf_path("Q8_0/gemma-4-26B-A4B-it-Q8_0-00001-of-00002.gguf").as_deref(),
+            Some("Q8_0")
+        );
+        // Lowercase tags normalize to the CLI's uppercase convention.
+        assert_eq!(
+            quant_tag_from_gguf_path("model-iq2_xxs.gguf").as_deref(),
+            Some("IQ2_XXS")
+        );
+        assert_eq!(
+            quant_tag_from_gguf_path("model-TQ1_0.gguf").as_deref(),
+            Some("TQ1_0")
+        );
+        assert_eq!(
+            quant_tag_from_gguf_path("BF16/model-BF16-00002-of-00002.gguf").as_deref(),
+            Some("BF16")
+        );
+        // Tag only in the parent directory (bartowski-style layout).
+        assert_eq!(
+            quant_tag_from_gguf_path("Q8_0/model-00001-of-00002.gguf").as_deref(),
+            Some("Q8_0")
+        );
+        assert_eq!(
+            quant_tag_from_gguf_path("UD-Q4_K_XL/model-00001-of-00002.gguf").as_deref(),
+            Some("UD-Q4_K_XL")
+        );
+        // Non-GGUF files and stems without a recognizable trailing tag.
+        assert_eq!(quant_tag_from_gguf_path("README.md"), None);
+        assert_eq!(quant_tag_from_gguf_path("config.json"), None);
+        assert_eq!(quant_tag_from_gguf_path("model-instruct.gguf"), None);
+        assert_eq!(quant_tag_from_gguf_path("Qwen-model.gguf"), None);
+        // Non-tag directory names don't rescue an untagged filename.
+        assert_eq!(
+            quant_tag_from_gguf_path("weights/model-00001-of-00002.gguf"),
+            None
+        );
+    }
+
+    #[test]
+    fn repo_quant_sizes_sums_multipart_and_skips_non_gguf() {
+        let sizes = parse_repo_quant_sizes(HF_REPO_FILES_FIXTURE);
+        assert_eq!(sizes.get("Q2_K"), Some(&9_600_000_000));
+        assert_eq!(sizes.get("Q4_K_M"), Some(&15_800_000_000));
+        // Multi-part quants sum all their parts.
+        assert_eq!(sizes.get("UD-Q4_K_XL"), Some(&17_200_000_000));
+        assert_eq!(sizes.get("Q6_K"), Some(&21_400_000_000));
+        assert_eq!(sizes.get("Q8_0"), Some(&27_700_000_000));
+        assert_eq!(sizes.get("BF16"), Some(&52_100_000_000));
+        // The sizeless IQ1_S entry and non-GGUF files contribute nothing.
+        assert_eq!(sizes.get("IQ1_S"), None);
+        assert_eq!(sizes.len(), 6);
+    }
+
+    #[test]
+    fn repo_quant_sizes_tolerates_malformed_bodies() {
+        assert!(parse_repo_quant_sizes("not json").is_empty());
+        assert!(parse_repo_quant_sizes("{}").is_empty());
+        assert!(parse_repo_quant_sizes(r#"{ "siblings": "nope" }"#).is_empty());
+    }
+
+    #[test]
+    fn best_fitting_quant_prefers_largest_that_fits() {
+        let sizes = parse_repo_quant_sizes(HF_REPO_FILES_FIXTURE);
+        // 64 GiB: Q8_0 fits (BF16 is never picked, regardless of RAM).
+        assert_eq!(
+            best_fitting_quant(&sizes, Some(64 * GIB)).as_deref(),
+            Some("Q8_0")
+        );
+        // 32 GiB: Q8_0 no longer fits; the next-largest quant wins.
+        assert_eq!(
+            best_fitting_quant(&sizes, Some(32 * GIB)).as_deref(),
+            Some("Q6_K")
+        );
+        // 16 GiB: only the smallest quant fits.
+        assert_eq!(
+            best_fitting_quant(&sizes, Some(16 * GIB)).as_deref(),
+            Some("Q2_K")
+        );
+    }
+
+    #[test]
+    fn best_fitting_quant_falls_back_to_smallest_when_nothing_fits() {
+        let sizes = parse_repo_quant_sizes(HF_REPO_FILES_FIXTURE);
+        assert_eq!(
+            best_fitting_quant(&sizes, Some(8 * GIB)).as_deref(),
+            Some("Q2_K")
+        );
+    }
+
+    #[test]
+    fn best_fitting_quant_prefers_ud_dynamic_quants_on_size_ties() {
+        let mut sizes = BTreeMap::new();
+        sizes.insert("Q4_K_M".to_string(), 15_800_000_000);
+        sizes.insert("UD-Q4_K_XL".to_string(), 15_800_000_000);
+        assert_eq!(
+            best_fitting_quant(&sizes, Some(64 * GIB)).as_deref(),
+            Some("UD-Q4_K_XL")
+        );
+        // The smallest-quant fallback applies the same tie preference.
+        assert_eq!(
+            best_fitting_quant(&sizes, Some(4 * GIB)).as_deref(),
+            Some("UD-Q4_K_XL")
+        );
+    }
+
+    #[test]
+    fn best_fitting_quant_returns_none_without_usable_data() {
+        let sizes = parse_repo_quant_sizes(HF_REPO_FILES_FIXTURE);
+        // RAM detection unsupported: never guess, use the CLI default.
+        assert_eq!(best_fitting_quant(&sizes, None), None);
+        // No quant candidates at all.
+        assert_eq!(best_fitting_quant(&BTreeMap::new(), Some(64 * GIB)), None);
+        // Full-precision-only repos yield no candidate either.
+        let mut fp_only = BTreeMap::new();
+        fp_only.insert("BF16".to_string(), 52_100_000_000);
+        fp_only.insert("F16".to_string(), 52_100_000_000);
+        assert_eq!(best_fitting_quant(&fp_only, Some(1024 * GIB)), None);
     }
 
     // --- readiness classification ---
@@ -879,6 +1278,7 @@ mod tests {
         use super::*;
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         /// Minimal HTTP responder on an ephemeral loopback port: 200 when the
@@ -941,7 +1341,81 @@ mod tests {
             path
         }
 
+        /// Stub Hugging Face API on an ephemeral loopback port: answers every
+        /// request with 200 + `body` and counts hits (for cache assertions).
+        async fn spawn_stub_hf(body: &'static str) -> (u16, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().unwrap().port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits2 = hits.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    hits2.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            (port, hits)
+        }
+
+        /// Stub HF API that answers every request with a bare status line
+        /// and empty body (e.g. `404` for a gated/missing repo).
+        async fn spawn_stub_hf_status(status_line: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let resp = format!("HTTP/1.1 {status_line}\r\ncontent-length: 0\r\n\r\n");
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            port
+        }
+
+        /// Stub HF API that accepts connections but never responds —
+        /// exercises the `hf_files_timeout` budget.
+        async fn spawn_stub_hf_stalled() -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let mut socks = Vec::new();
+                loop {
+                    let Ok((sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    socks.push(sock);
+                }
+            });
+            port
+        }
+
         /// Fast test config pointing at the stub binary + fake home + port.
+        /// The HF base points at a closed loopback port (instant connection
+        /// refusal → CLI-default quant); tests covering the selection path
+        /// override it with a [`spawn_stub_hf`] port.
         fn test_config(binary: PathBuf, home: PathBuf, port: u16) -> UnslothConfig {
             UnslothConfig {
                 resolve_binary: Box::new(move || Some(binary.clone())),
@@ -951,6 +1425,9 @@ mod tests {
                 model_ready_timeout: Duration::from_secs(10),
                 probe_interval: Duration::from_millis(50),
                 mint_timeout: Duration::from_secs(5),
+                hf_api_base: "http://127.0.0.1:1".to_string(),
+                hf_files_timeout: Duration::from_secs(2),
+                total_memory_bytes: Box::new(|| Some(32 * GIB)),
             }
         }
 
@@ -1001,6 +1478,8 @@ mod tests {
                 "progress status surfaced"
             );
             let log = stub_log(dir.path());
+            // The test config's HF base is unreachable, so quant selection
+            // falls back to the CLI default without failing the spawn.
             assert!(
                 log.contains(&format!(
                     "run --model {REPO}:UD-Q4_K_XL --disable-tools -p {port}"
@@ -1034,6 +1513,125 @@ mod tests {
             assert_eq!(log.matches("run --model").count(), runs_before + 1);
 
             mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn spawn_uses_best_fitting_quant_from_hf_listing() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let (hf_port, _) = spawn_stub_hf(HF_REPO_FILES_FIXTURE).await;
+            let binary = write_stub_binary(dir.path(), dir.path(), port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), port);
+            config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
+            let mgr = UnslothServerManager::with_config(config);
+
+            mgr.ensure_endpoint(REPO, &|_| {}).await.expect("starts");
+            let log = stub_log(dir.path());
+            // 32 GiB total RAM: Q6_K is the largest quant in the listing
+            // that fits the catalog's RAM budget (Q8_0 does not).
+            assert!(
+                log.contains(&format!(
+                    "run --model {REPO}:Q6_K --disable-tools -p {port}"
+                )),
+                "server spawned with the best-fitting quant: {log}"
+            );
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn quant_selection_is_cached_per_repo() {
+            let (hf_port, hits) = spawn_stub_hf(HF_REPO_FILES_FIXTURE).await;
+            let mut config = test_config(
+                PathBuf::from("/nonexistent/unsloth"),
+                PathBuf::from("/nonexistent"),
+                1,
+            );
+            config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
+            let mgr = UnslothServerManager::with_config(config);
+
+            assert_eq!(mgr.resolve_quant_variant(REPO).await, "Q6_K");
+            assert_eq!(mgr.resolve_quant_variant(REPO).await, "Q6_K");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "second resolution must hit the cache, not HF"
+            );
+        }
+
+        #[tokio::test]
+        async fn quant_lookup_failure_falls_back_to_cli_default() {
+            // The default test config points HF at a closed port.
+            let mgr = UnslothServerManager::with_config(test_config(
+                PathBuf::from("/nonexistent/unsloth"),
+                PathBuf::from("/nonexistent"),
+                1,
+            ));
+            assert_eq!(mgr.resolve_quant_variant(REPO).await, "UD-Q4_K_XL");
+            assert_eq!(
+                mgr.resolve_quant_variant("other-org/model-GGUF").await,
+                "Q4_K_M"
+            );
+        }
+
+        #[tokio::test]
+        async fn quant_lookup_non_2xx_falls_back_to_cli_default() {
+            // Gated/missing repos answer the listing with an HTTP error.
+            let hf_port = spawn_stub_hf_status("404 Not Found").await;
+            let mut config = test_config(
+                PathBuf::from("/nonexistent/unsloth"),
+                PathBuf::from("/nonexistent"),
+                1,
+            );
+            config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
+            let mgr = UnslothServerManager::with_config(config);
+            assert_eq!(mgr.resolve_quant_variant(REPO).await, "UD-Q4_K_XL");
+        }
+
+        #[tokio::test]
+        async fn quant_lookup_stalled_hf_degrades_within_the_timeout_budget() {
+            // HF accepts the connection but never answers: resolution must
+            // return the CLI default within hf_files_timeout, not hang.
+            let hf_port = spawn_stub_hf_stalled().await;
+            let mut config = test_config(
+                PathBuf::from("/nonexistent/unsloth"),
+                PathBuf::from("/nonexistent"),
+                1,
+            );
+            config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
+            config.hf_files_timeout = Duration::from_millis(200);
+            let mgr = UnslothServerManager::with_config(config);
+            let started = std::time::Instant::now();
+            let quant =
+                tokio::time::timeout(Duration::from_secs(5), mgr.resolve_quant_variant(REPO))
+                    .await
+                    .expect("resolution must not hang past the timeout budget");
+            assert_eq!(quant, "UD-Q4_K_XL");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "degraded well within budget, took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn quant_default_fallback_is_not_cached() {
+            // A 200 body with no usable size data falls back to the CLI
+            // default without caching it — the next spawn retries HF.
+            let (hf_port, hits) = spawn_stub_hf("{}").await;
+            let mut config = test_config(
+                PathBuf::from("/nonexistent/unsloth"),
+                PathBuf::from("/nonexistent"),
+                1,
+            );
+            config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
+            let mgr = UnslothServerManager::with_config(config);
+            assert_eq!(mgr.resolve_quant_variant(REPO).await, "UD-Q4_K_XL");
+            assert_eq!(mgr.resolve_quant_variant(REPO).await, "UD-Q4_K_XL");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                2,
+                "default fallbacks must not populate the cache"
+            );
         }
 
         #[tokio::test]
