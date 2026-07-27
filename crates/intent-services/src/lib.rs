@@ -7570,7 +7570,8 @@ impl WorkspaceApi for Services {
             // auto-commit) never sees the agent's edit. FE/user writes (no
             // agent caller) stay unattributed.
             if let Some(agent) = caller_agent_id.as_ref() {
-                record_agent_file_write(&store, &workspace_id, agent, &root, &path).await;
+                record_agent_file_mutation(&store, &workspace_id, agent, &root, &path, "modified")
+                    .await;
             }
             Ok(result)
         })
@@ -7600,7 +7601,14 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::delete(&root, &path)
+            let result = file_ops::delete(&root, &path)?;
+            // Attribution (monorepo#939): agent-context deletes land on
+            // `tracked_changes` like the ACP `file:changed` delete action does.
+            if let Some(agent) = caller_agent_id.as_ref() {
+                record_agent_file_mutation(&store, &workspace_id, agent, &root, &path, "deleted")
+                    .await;
+            }
+            Ok(result)
         })
     }
 
@@ -7629,7 +7637,30 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::rename(&root, &old_path, &new_path)
+            let result = file_ops::rename(&root, &old_path, &new_path)?;
+            // Attribution (monorepo#939): an agent-context file rename records
+            // both sides (old path deleted, new path added), matching what the
+            // ACP `file:changed` pipeline would attribute for the equivalent
+            // delete + create. Directory renames are skipped — attribution
+            // rows are per-file and a directory path has no diff entry.
+            let is_directory = result
+                .get("isDirectory")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if let (Some(agent), false) = (caller_agent_id.as_ref(), is_directory) {
+                record_agent_file_mutation(
+                    &store,
+                    &workspace_id,
+                    agent,
+                    &root,
+                    &old_path,
+                    "deleted",
+                )
+                .await;
+                record_agent_file_mutation(&store, &workspace_id, agent, &root, &new_path, "added")
+                    .await;
+            }
+            Ok(result)
         })
     }
 
@@ -18738,17 +18769,20 @@ struct AcExtras {
 type AttributionByPath = HashMap<String, (Option<String>, Option<String>, Option<i64>)>;
 
 /// Record a `tracked_changes` attribution row for an agent's workspace-api
-/// `file.write` (monorepo#939), mirroring the agent event sink's handling of
-/// ACP `file:changed` (`agent_manager`'s `record_agent_file_change`): stage
-/// `unstaged`, best-effort diff stats + blob SHAs via
-/// [`crate::diffs::compute_and_store`], then the metrics / usage-stats
-/// recomputes. Best-effort throughout — a tracking miss never fails the write.
-async fn record_agent_file_write(
+/// file mutation (`file.write`/`file.delete`/`file.rename`, monorepo#939),
+/// mirroring the agent event sink's handling of ACP `file:changed`
+/// (`agent_manager`'s `record_agent_file_change`): stage `unstaged`,
+/// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
+/// then the metrics / usage-stats recomputes. The status is inferred from the
+/// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Best-effort throughout — a tracking miss never fails the mutation.
+async fn record_agent_file_mutation(
     store: &Store,
     workspace_id: &WorkspaceId,
     agent: &AgentId,
     root: &str,
     path: &str,
+    fallback_status: &str,
 ) {
     let ws = match store.get_workspace(workspace_id).await {
         Ok(ws) => ws,
@@ -18780,7 +18814,8 @@ async fn record_agent_file_write(
     let status = match summary.as_ref() {
         Some(s) if s.old_blob_sha.is_none() => "added",
         Some(s) if s.new_blob_sha.is_none() => "deleted",
-        _ => "modified",
+        Some(_) => "modified",
+        None => fallback_status,
     };
     let change = intent_store::NewTrackedChange {
         workspace_id: workspace_id.clone(),

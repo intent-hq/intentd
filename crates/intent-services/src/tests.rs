@@ -8904,6 +8904,117 @@ mod file_tracking {
         assert!(repo.dir.join("user-edit.txt").exists(), "file was written");
     }
 
+    /// An agent-context `file.delete` records a `deleted` attribution row for
+    /// the caller (monorepo#939); a no-agent-context delete records none.
+    #[tokio::test]
+    async fn file_delete_agent_context_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        commit_file(&repo.dir, "doomed.txt", "to be deleted\n", "add doomed");
+        commit_file(&repo.dir, "user-doomed.txt", "user file\n", "add user file");
+
+        svc.file_delete(
+            ws.clone(),
+            "doomed.txt".to_string(),
+            Some(AgentId::from("agent-d1")),
+        )
+        .await
+        .unwrap();
+        svc.file_delete(ws.clone(), "user-doomed.txt".to_string(), None)
+            .await
+            .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.path == "doomed.txt")
+            .expect("attribution row recorded for agent delete");
+        assert_eq!(row.stage, "unstaged");
+        assert_eq!(row.status, "deleted");
+        assert_eq!(row.agent_id.as_deref(), Some("agent-d1"));
+        assert!(
+            !rows.iter().any(|r| r.path == "user-doomed.txt"),
+            "no attribution for a userless delete: {rows:?}"
+        );
+    }
+
+    /// An agent-context `file.rename` records both sides — old path `deleted`,
+    /// new path `added` — attributed to the caller (monorepo#939), and the
+    /// attribution-filtered fallback commits the rename. A no-agent-context
+    /// rename records none.
+    #[tokio::test]
+    async fn file_rename_agent_context_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        commit_file(&repo.dir, "old-name.txt", "contents\n", "add old-name");
+
+        svc.file_rename(
+            ws.clone(),
+            "old-name.txt".to_string(),
+            "new-name.txt".to_string(),
+            Some(AgentId::from("agent-r1")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let old_row = rows
+            .iter()
+            .find(|r| r.path == "old-name.txt")
+            .expect("old-path attribution row recorded");
+        assert_eq!(old_row.status, "deleted");
+        assert_eq!(old_row.agent_id.as_deref(), Some("agent-r1"));
+        let new_row = rows
+            .iter()
+            .find(|r| r.path == "new-name.txt")
+            .expect("new-path attribution row recorded");
+        assert_eq!(new_row.status, "added");
+        assert_eq!(new_row.agent_id.as_deref(), Some("agent-r1"));
+
+        // The attribution-filtered fallback commits both sides of the rename.
+        let r = svc
+            .git_agent_commit(
+                ws.clone(),
+                "agent rename".to_string(),
+                Some(AgentId::from("agent-r1")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.files.contains(&"old-name.txt".to_string())
+                && r.files.contains(&"new-name.txt".to_string()),
+            "both rename sides committed: {:?}",
+            r.files
+        );
+    }
+
+    /// A `file.rename` without an agent caller context records no attribution.
+    #[tokio::test]
+    async fn file_rename_without_agent_context_records_no_attribution() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        commit_file(&repo.dir, "before.txt", "contents\n", "add before");
+
+        svc.file_rename(
+            ws.clone(),
+            "before.txt".to_string(),
+            "after.txt".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "no attribution for a userless rename: {rows:?}"
+        );
+        assert!(repo.dir.join("after.txt").exists(), "file was renamed");
+    }
+
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
     /// `CommitSummary`, walking older pages via the opaque continuation
     /// token; attribution trailers populate `agentId`/`linkedNoteId`. The
