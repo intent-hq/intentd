@@ -139,8 +139,9 @@ pub(crate) async fn git_credential_env(
 /// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
 /// minimal/test compositions) reads as **off** so bare spawns never trigger
 /// token resolution; the production composition root always wires the
-/// registry, where the schema default (`true`) applies.
-fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
+/// registry, where the schema default (`true`) applies. Shared with the
+/// `system.gitCredential` UDS RPC (see [`crate::github_git_credential`]).
+pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
     settings.is_some_and(|r| {
         r.snapshot()
             .effective

@@ -2,13 +2,13 @@
 //!
 //! The protocol version is independent of the daemon crate version and is
 //! exposed on the wire in `client.hello` → `server.protocolVersion` and
-//! `system.status` → `protocolVersion`. Version 2.4 adds the
-//! `github.repoConfig.get` router method, covering 301 dispatchable method
-//! names (266 router + 33 fast-path + 2 aliases) + 1 notification + 4
-//! reverse RPCs.
+//! `system.status` → `protocolVersion`. Version 2.5 adds the
+//! `system.gitCredential` UDS-only fast-path method (monorepo#884), covering
+//! 302 dispatchable method names (266 router + 34 fast-path + 2 aliases)
+//! + 1 notification + 4 reverse RPCs.
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "2.4";
+pub const PROTOCOL_VERSION: &str = "2.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

@@ -10,6 +10,8 @@ struct FakeControl {
     status: SystemStatus,
     shutdown_called: AtomicBool,
     import_force: std::sync::Mutex<Option<bool>>,
+    credential: Option<(String, String)>,
+    credential_pid: std::sync::Mutex<Option<Option<u64>>>,
 }
 
 impl FakeControl {
@@ -34,6 +36,15 @@ impl FakeControl {
             },
             shutdown_called: AtomicBool::new(false),
             import_force: std::sync::Mutex::new(None),
+            credential: None,
+            credential_pid: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn with_credential(username: &str, password: &str) -> Self {
+        Self {
+            credential: Some((username.to_string(), password.to_string())),
+            ..Self::new()
         }
     }
 }
@@ -59,6 +70,15 @@ impl SystemControl for FakeControl {
             }))
         })
     }
+    fn git_credential(
+        &self,
+        client_pid: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Option<(String, String)>> + Send + '_>> {
+        Box::pin(async move {
+            *self.credential_pid.lock().unwrap() = Some(client_pid);
+            self.credential.clone()
+        })
+    }
 }
 
 #[test]
@@ -67,6 +87,9 @@ fn classify_only_matches_system_methods() {
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.shutdown" })).is_some());
     assert!(
         classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.importLegacy" })).is_some()
+    );
+    assert!(
+        classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "system.gitCredential" })).is_some()
     );
     // Non-system methods fall through.
     assert!(classify(&json!({ "jsonrpc": "2.0", "id": 1, "method": "workspace.list" })).is_none());
@@ -93,14 +116,14 @@ fn status_json_local_vs_remote_locality() {
     assert_eq!(local["cpuPercent"], 12.5);
     assert_eq!(local["memoryBytes"], 104_857_600u64);
     assert_eq!(local["fingerprint"], "AB:CD");
-    assert_eq!(local["protocolVersion"], "2.4");
+    assert_eq!(local["protocolVersion"], "2.5");
     assert_eq!(local["host"]["os"], "macos");
     assert_eq!(local["host"]["arch"], "aarch64");
     assert_eq!(local["host"]["hasDisplay"], true);
 
     let remote = status_json(&status, false);
     assert_eq!(remote["host"]["locality"], "remote");
-    assert_eq!(remote["protocolVersion"], "2.4");
+    assert_eq!(remote["protocolVersion"], "2.5");
 }
 
 #[test]
@@ -235,4 +258,60 @@ async fn import_legacy_rejects_invalid_force_and_remote_transport() {
         serde_json::from_str(&handle(remote, &control, false, false).await.unwrap()).unwrap();
     assert_eq!(parsed["error"]["code"], -32001);
     assert_eq!(*control.import_force.lock().unwrap(), None);
+}
+
+#[tokio::test]
+async fn git_credential_returns_credential_and_forwards_pid() {
+    let control = FakeControl::with_credential("x-access-token", "gho_secret");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 21, "method": "system.gitCredential",
+        "params": { "pid": 4242 }
+    }))
+    .unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+    assert_eq!(parsed["id"], 21);
+    assert_eq!(parsed["result"]["credential"]["username"], "x-access-token");
+    assert_eq!(parsed["result"]["credential"]["password"], "gho_secret");
+    assert_eq!(*control.credential_pid.lock().unwrap(), Some(Some(4242)));
+}
+
+#[tokio::test]
+async fn git_credential_none_yields_null_and_pid_is_lenient() {
+    let control = FakeControl::new();
+    // No params at all → pid None; no credential → `credential: null`.
+    let req =
+        classify(&json!({ "jsonrpc": "2.0", "id": 22, "method": "system.gitCredential" })).unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+    assert_eq!(parsed["result"]["credential"], Value::Null);
+    assert_eq!(*control.credential_pid.lock().unwrap(), Some(None));
+
+    // A non-numeric pid degrades to None instead of erroring (audit-only).
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 23, "method": "system.gitCredential",
+        "params": { "pid": "nope" }
+    }))
+    .unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, true, true).await.unwrap()).unwrap();
+    assert_eq!(parsed["result"]["credential"], Value::Null);
+}
+
+#[tokio::test]
+async fn git_credential_remote_rejects_with_uds_only_error() {
+    let control = FakeControl::with_credential("x-access-token", "gho_secret");
+    let req = classify(&json!({
+        "jsonrpc": "2.0", "id": 24, "method": "system.gitCredential", "params": {}
+    }))
+    .unwrap();
+    let parsed: Value =
+        serde_json::from_str(&handle(req, &control, false, false).await.unwrap()).unwrap();
+    assert_eq!(parsed["error"]["code"], -32001);
+    assert_eq!(
+        parsed["error"]["message"],
+        "system.gitCredential is available over UDS only"
+    );
+    // The resolver must never run for a remote caller.
+    assert_eq!(*control.credential_pid.lock().unwrap(), None);
 }

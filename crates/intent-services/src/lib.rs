@@ -5719,6 +5719,27 @@ async fn github_git_token_for_url(
     intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
 }
 
+/// Resolve the daemon-managed GitHub credential for the `system.gitCredential`
+/// UDS RPC backing the `intentd git-credential` helper (monorepo#884):
+/// `Some((username, password))` only when the
+/// `sourceControl.github.exposeGitCredentialToChildren` gate is on and a
+/// usable token resolves per [`github_token_source`] (see
+/// [`intent_git::auth::usable_token`] — control characters would corrupt the
+/// line-oriented git-credential protocol). The token value is never logged.
+pub async fn github_git_credential(
+    registry: Option<&SettingsRegistry>,
+) -> Option<(String, String)> {
+    if !terminal_ops::expose_git_credential(registry) {
+        return None;
+    }
+    let token = intent_sourcecontrol::token::resolve(&github_token_source(registry)).await;
+    let token = intent_git::auth::usable_token(token.as_deref())?;
+    Some((
+        intent_git::auth::TOKEN_USERNAME.to_string(),
+        token.to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod github_token_source_tests {
     use super::*;
