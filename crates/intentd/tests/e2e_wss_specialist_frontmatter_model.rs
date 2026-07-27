@@ -355,6 +355,125 @@ async fn specialist_hidden_round_trips_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for config-scalar inheritance across tiers (PROTOCOL §5.11,
+/// monorepo#718): a user-tier override that omits `model`/`agentType`
+/// inherits the bundled tier's values on `specialist.get` and
+/// `specialist.list`, an explicit empty value (`model: ""`) clears the
+/// inherited one, and `roleReminder` stays winner-takes-all (not inherited).
+#[tokio::test]
+async fn specialist_config_scalars_inherit_over_wss() {
+    let data_dir = temp_data_dir();
+    let socket = data_dir.join("intentd.sock");
+
+    // Bundled tier via the INTENTD_BUNDLED_SPECIALISTS_DIR seam.
+    let bundled_dir = data_dir.join("bundled-specialists");
+    std::fs::create_dir_all(&bundled_dir).expect("mkdir bundled dir");
+    std::fs::write(
+        bundled_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"Bundled\"\nmodel: \"auggie:opus\"\nagentType: \"zeta-type\"\nroleReminder: \"Bundled reminder.\"\n---\n\nBundled body.",
+    )
+    .expect("write bundled zeta");
+    std::fs::write(
+        bundled_dir.join("omega.md"),
+        "---\nname: \"Omega\"\ndescription: \"Bundled\"\nmodel: \"auggie:opus\"\n---\n\nBundled body.",
+    )
+    .expect("write bundled omega");
+
+    // Hermetic user tier: HOME=data_dir so the daemon reads
+    // $HOME/.intent/specialists/.
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    // Omits model/agentType/roleReminder: the config scalars inherit from the
+    // bundled tier; the reminder does not.
+    std::fs::write(
+        specialists_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"User override\"\n---\n\nUser body.",
+    )
+    .expect("write user zeta");
+    // Explicit empty model: the explicit-clear that stops inheritance.
+    std::fs::write(
+        specialists_dir.join("omega.md"),
+        "---\nname: \"Omega\"\ndescription: \"User override\"\nmodel: \"\"\n---\n\nUser body.",
+    )
+    .expect("write user omega");
+
+    let bundled_dir_str = bundled_dir
+        .to_str()
+        .expect("bundled dir to str")
+        .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        data_dir: data_dir.clone(),
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+
+    let cfg = client_config(&fp);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // get — omitted scalars inherit the bundled values; roleReminder does not.
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
+    let def = &got["specialist"];
+    assert_eq!(def["source"], "user", "user tier wins the merge");
+    assert_eq!(
+        def["model"], "auggie:opus",
+        "omitted model inherits the bundled value on specialist.get over WSS"
+    );
+    assert_eq!(
+        def["agentType"], "zeta-type",
+        "omitted agentType inherits the bundled value on specialist.get over WSS"
+    );
+    assert!(
+        def.get("roleReminder").is_none(),
+        "roleReminder is not inherited over WSS"
+    );
+
+    // get — an explicit empty value clears the inherited model.
+    let got = wss_rpc(&mut ws, 3, "specialist.get", json!({ "id": "omega" })).await;
+    assert!(
+        got["specialist"].get("model").is_none(),
+        "explicit empty model clears the inherited value on specialist.get over WSS"
+    );
+
+    // list — the same fold applies to the list projection.
+    let list = wss_rpc(&mut ws, 4, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let zeta = specs
+        .iter()
+        .find(|s| s["id"] == "zeta")
+        .expect("zeta listed");
+    assert_eq!(
+        zeta["model"], "auggie:opus",
+        "omitted model inherits in specialist.list over WSS"
+    );
+    assert_eq!(
+        zeta["agentType"], "zeta-type",
+        "omitted agentType inherits in specialist.list over WSS"
+    );
+    let omega = specs
+        .iter()
+        .find(|s| s["id"] == "omega")
+        .expect("omega listed");
+    assert!(
+        omega.get("model").is_none(),
+        "explicit empty model clears in specialist.list over WSS"
+    );
+
+    drop(daemon);
+}
+
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
     use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();

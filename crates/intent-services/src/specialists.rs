@@ -206,10 +206,15 @@ fn parse_frontmatter(content: &str) -> (Map<String, Value>, String) {
 /// `SpecialistFileFrontmatter`'s optional fields: `codingAgent`, `model`,
 /// `modelTier`, `roleReminder`, `agentType`).
 ///
-/// NOTE: these scalars resolve winner-takes-all across tiers — the highest
-/// tier's file wins wholesale and an omitted key drops any lower-tier value.
-/// Only `hidden` has inherit-on-omit semantics (PROTOCOL §5.11). Whether the
-/// scalars should also inherit is tracked in intent-hq/monorepo#718.
+/// NOTE: the config scalars `codingAgent`/`model`/`modelTier`/`agentType`
+/// ([`INHERITED_CONFIG_KEYS`]) resolve with inherit-on-omit semantics across
+/// tiers, like `hidden` (PROTOCOL §5.11, intent-hq/monorepo#718): an omitted
+/// key keeps the lower tiers' effective value, an explicit empty value
+/// (`model: ""`) clears it, and an explicit non-empty value overrides it.
+/// `roleReminder` stays winner-takes-all — it is carried through only when
+/// present in the winning file (an omitted key falls back to auto-derivation
+/// from the winning body, so inheriting a lower tier's reminder would pin a
+/// stale summary of a body that no longer exists).
 const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
     "codingAgent",
     "model",
@@ -217,6 +222,10 @@ const OPTIONAL_FRONTMATTER_KEYS: &[&str] = &[
     "roleReminder",
     "agentType",
 ];
+
+/// The subset of [`OPTIONAL_FRONTMATTER_KEYS`] with inherit-on-omit semantics
+/// across tiers; each key inherits independently.
+const INHERITED_CONFIG_KEYS: &[&str] = &["codingAgent", "model", "modelTier", "agentType"];
 
 /// Tri-state read of a frontmatter/spec `hidden` value: `Some(true)`/`Some(false)`
 /// when explicitly set, `None` when absent — an absent key **inherits** the
@@ -252,25 +261,30 @@ fn effective_hidden(def: &Value) -> bool {
 /// they round-trip losslessly, and the optional boolean `hidden` is emitted as
 /// `true` when the effective value resolves to true (absent otherwise,
 /// PROTOCOL §5.11). This wrapper is the no-inheritance form — it passes
-/// `inherited_hidden = false` to [`build_def_inheriting`], so only an explicit
-/// frontmatter `hidden: true` emits the field; callers merging across tiers
-/// use [`build_def_inheriting`] directly to carry the lower tiers' value.
+/// `inherited = None` to [`build_def_inheriting`], so only explicit
+/// frontmatter values are emitted; callers merging across tiers use
+/// [`build_def_inheriting`] directly to carry the lower tiers' resolved def.
 /// `behaviorPrompt` mirrors `prompt` and `isCustomized` is `true` for any
 /// non-`bundled` source (port of `serializeSpecialist`).
 fn build_def(id: &str, content: &str, source: &str, path: &Path) -> Value {
-    build_def_inheriting(id, content, source, path, false)
+    build_def_inheriting(id, content, source, path, None)
 }
 
-/// [`build_def`] with tier-inheritance for `hidden` (PROTOCOL §5.11): when the
-/// file's frontmatter omits the key, `inherited_hidden` — the effective value
-/// resolved from lower tiers — applies; an explicit `hidden: true`/`false`
-/// overrides it. The field is emitted only when the effective value is true.
+/// [`build_def`] with tier-inheritance (PROTOCOL §5.11): `inherited` is the
+/// already-resolved def folded from the lower tiers. When the file's
+/// frontmatter omits `hidden`, the lower tiers' effective value applies; an
+/// explicit `hidden: true`/`false` overrides it, and the field is emitted only
+/// when the effective value is true. The config scalars
+/// ([`INHERITED_CONFIG_KEYS`]) inherit independently per key: an omitted key
+/// keeps the lower tiers' effective value, an explicit empty value clears it,
+/// and an explicit non-empty value overrides it. `roleReminder` does not
+/// inherit — it is emitted only when present in this file.
 fn build_def_inheriting(
     id: &str,
     content: &str,
     source: &str,
     path: &Path,
-    inherited_hidden: bool,
+    inherited: Option<&Value>,
 ) -> Value {
     let (fm, body) = parse_frontmatter(content);
     let name = fm
@@ -289,16 +303,31 @@ fn build_def_inheriting(
     def.insert("name".into(), json!(name));
     def.insert("description".into(), json!(description));
     for &key in OPTIONAL_FRONTMATTER_KEYS {
-        if let Some(v) = fm.get(key).and_then(Value::as_str) {
-            if !v.is_empty() {
+        match fm.get(key).and_then(Value::as_str) {
+            Some(v) if !v.is_empty() => {
                 def.insert(key.into(), json!(v));
             }
+            // Explicit empty value: clears any inherited value (nothing
+            // emitted). For `roleReminder` this matches the absent case.
+            Some(_) => {}
+            // Absent key: the config scalars inherit the lower tiers'
+            // effective value; `roleReminder` does not.
+            None if INHERITED_CONFIG_KEYS.contains(&key) => {
+                if let Some(v) = inherited
+                    .and_then(|d| d.get(key))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    def.insert(key.into(), json!(v));
+                }
+            }
+            None => {}
         }
     }
     // Optional boolean: emitted only when the effective value is true so
     // pickers can filter hidden specialists (absent ⇒ not hidden, PROTOCOL
     // §5.11). A file that omits the key inherits from lower tiers.
-    if hidden_state(fm.get("hidden")).unwrap_or(inherited_hidden) {
+    if hidden_state(fm.get("hidden")).unwrap_or_else(|| inherited.is_some_and(effective_hidden)) {
         def.insert("hidden".into(), json!(true));
     }
     def.insert("prompt".into(), json!(body));
@@ -321,9 +350,13 @@ fn build_def_inheriting(
 /// order, then `hidden: true`/`false` when the spec sets it explicitly (an
 /// omitted `hidden` writes no key, which inherits from lower tiers at
 /// resolution time — explicit false is the opt-out, PROTOCOL §5.11), then
-/// the prompt body. The body is taken from `prompt`, falling back to the
-/// `behaviorPrompt` alias (mirroring `SpecialistProposalPayload`). Only
-/// documented fields are written so parse→write→parse round-trips losslessly.
+/// the prompt body. For the config scalars ([`INHERITED_CONFIG_KEYS`]) an
+/// explicit empty string writes `key: ""` — the explicit-clear that stops
+/// inheritance — while an absent key writes nothing (inherits); an empty
+/// `roleReminder` is skipped like an absent one. The body is taken from
+/// `prompt`, falling back to the `behaviorPrompt` alias (mirroring
+/// `SpecialistProposalPayload`). Only documented fields are written so
+/// parse→write→parse round-trips losslessly.
 fn render_file(id: &str, spec: &Value) -> String {
     let name = spec.get("name").and_then(Value::as_str).unwrap_or(id);
     let description = spec
@@ -336,7 +369,7 @@ fn render_file(id: &str, spec: &Value) -> String {
     ];
     for &key in OPTIONAL_FRONTMATTER_KEYS {
         if let Some(v) = spec.get(key).and_then(Value::as_str) {
-            if !v.is_empty() {
+            if !v.is_empty() || INHERITED_CONFIG_KEYS.contains(&key) {
                 fm.push(format!("{key}: \"{}\"", escape_yaml(v)));
             }
         }
@@ -445,25 +478,27 @@ impl SpecialistsService {
     }
 
     /// Load one specialist file from `dir` as `source`, if it exists and reads;
-    /// `inherited_hidden` is the effective `hidden` resolved from lower tiers.
-    fn load_from_dir(dir: &Path, id: &str, source: &str, inherited_hidden: bool) -> Option<Value> {
+    /// `inherited` is the def resolved from lower tiers, whose effective
+    /// `hidden` and config scalars apply when this file omits them.
+    fn load_from_dir(
+        dir: &Path,
+        id: &str,
+        source: &str,
+        inherited: Option<&Value>,
+    ) -> Option<Value> {
         let path = dir.join(format!("{id}.md"));
         let content = std::fs::read_to_string(&path).ok()?;
-        Some(build_def_inheriting(
-            id,
-            &content,
-            source,
-            &path,
-            inherited_hidden,
-        ))
+        Some(build_def_inheriting(id, &content, source, &path, inherited))
     }
 
     /// Resolve a single id through the 3-tier order project > user > bundled.
     /// Within the bundled tier an on-disk file wins over the embedded copy;
     /// the compile-time [`EMBEDDED_BUNDLED`] set is the always-available floor.
-    /// Tiers are folded from the floor upward so `hidden` inherits across them:
-    /// a higher-tier file that omits the key keeps the lower tiers' effective
-    /// value, while an explicit `hidden: false` unhides (PROTOCOL §5.11).
+    /// Tiers are folded from the floor upward so `hidden` and the config
+    /// scalars ([`INHERITED_CONFIG_KEYS`]) inherit across them: a higher-tier
+    /// file that omits a key keeps the lower tiers' effective value, while an
+    /// explicit `hidden: false` unhides and an explicit empty scalar clears
+    /// (PROTOCOL §5.11).
     /// SECURITY: validates the id before file access to prevent path traversal
     /// (review thread PRRT_kwDOS9Wxuc6SIlcV).
     fn resolve(&self, id: &str, workspace_path: Option<&Path>) -> Option<Value> {
@@ -480,19 +515,24 @@ impl SpecialistsService {
         ];
         for (dir, source) in tiers {
             let Some(dir) = dir else { continue };
-            let inherited = resolved.as_ref().is_some_and(effective_hidden);
-            if let Some(def) = Self::load_from_dir(dir, id, source, inherited) {
+            if let Some(def) = Self::load_from_dir(dir, id, source, resolved.as_ref()) {
                 resolved = Some(def);
             }
         }
         resolved
     }
 
-    /// The effective `hidden` inherited from the tiers **below** `scope` — the
-    /// same fold [`Self::resolve`] applies, stopped before `scope` — so that
+    /// The def inherited from the tiers **below** `scope` — the same fold
+    /// [`Self::resolve`] applies, stopped before `scope` — so that
     /// `specialist.create`/`edit` responses agree with an immediately-following
-    /// `specialist.get` when the written spec omits the key (PROTOCOL §5.11).
-    fn inherited_hidden_below(&self, id: &str, scope: &str, workspace_path: Option<&Path>) -> bool {
+    /// `specialist.get` when the written spec omits `hidden` or a config
+    /// scalar (PROTOCOL §5.11).
+    fn inherited_below(
+        &self,
+        id: &str,
+        scope: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<Value> {
         let mut resolved = load_embedded(id);
         let project = workspace_path.map(project_dir);
         let tiers = [
@@ -505,12 +545,11 @@ impl SpecialistsService {
                 break;
             }
             let Some(dir) = dir else { continue };
-            let inherited = resolved.as_ref().is_some_and(effective_hidden);
-            if let Some(def) = Self::load_from_dir(dir, id, source, inherited) {
+            if let Some(def) = Self::load_from_dir(dir, id, source, resolved.as_ref()) {
                 resolved = Some(def);
             }
         }
-        resolved.as_ref().is_some_and(effective_hidden)
+        resolved
     }
 
     /// Resolve a specialist's `agentType` frontmatter scalar through the 3-tier
@@ -547,8 +586,9 @@ impl SpecialistsService {
 
     /// Enumerate every `<id>.md` in `dir`, inserting resolved defs into `acc`
     /// keyed by id (later tiers overwrite earlier — the precedence merge).
-    /// `hidden` inherits across the merge: a file that omits the key keeps the
-    /// accumulated effective value from lower tiers (PROTOCOL §5.11).
+    /// `hidden` and the config scalars ([`INHERITED_CONFIG_KEYS`]) inherit
+    /// across the merge: a file that omits a key keeps the accumulated
+    /// effective value from lower tiers (PROTOCOL §5.11).
     fn collect_dir(dir: &Path, source: &str, acc: &mut std::collections::BTreeMap<String, Value>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -562,19 +602,17 @@ impl SpecialistsService {
                 continue;
             };
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let inherited = acc.get(stem).is_some_and(effective_hidden);
-                acc.insert(
-                    stem.to_string(),
-                    build_def_inheriting(stem, &content, source, &path, inherited),
-                );
+                let def = build_def_inheriting(stem, &content, source, &path, acc.get(stem));
+                acc.insert(stem.to_string(), def);
             }
         }
     }
 
     /// `specialist.list` → `{ specialists: SpecialistDef[] }` resolved in tier
     /// order (embedded < bundled dir < user < project), higher tiers overriding
-    /// lower ones for the same id while `hidden` inherits across tiers
-    /// (PROTOCOL §5.11). `workspace_path` adds the project tier.
+    /// lower ones for the same id while `hidden` and the config scalars
+    /// inherit across tiers (PROTOCOL §5.11). `workspace_path` adds the
+    /// project tier.
     pub(crate) fn list(&self, workspace_path: Option<&Path>) -> Result<Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in EMBEDDED_BUNDLED {
@@ -699,9 +737,9 @@ impl SpecialistsService {
 
     /// `specialist.create` → write a new user/project file (default scope
     /// `user`); an existing id in that scope → `-32602` (PROTOCOL §5.11). The
-    /// returned def folds `hidden` from the tiers below `scope`
-    /// ([`Self::inherited_hidden_below`]) so it agrees with an
-    /// immediately-following `specialist.get` when the spec omits the key.
+    /// returned def folds `hidden` and the config scalars from the tiers below
+    /// `scope` ([`Self::inherited_below`]) so it agrees with an
+    /// immediately-following `specialist.get` when the spec omits a key.
     pub(crate) fn create(
         &self,
         id: &str,
@@ -724,17 +762,17 @@ impl SpecialistsService {
         let rendered = render_file(id, spec);
         std::fs::write(&path, &rendered)
             .map_err(|e| Error::Internal(format!("write specialist file failed: {e}")))?;
-        let inherited = self.inherited_hidden_below(id, scope, workspace_path);
+        let inherited = self.inherited_below(id, scope, workspace_path);
         Ok(json!({
-            "specialist": build_def_inheriting(id, &rendered, scope, &path, inherited)
+            "specialist": build_def_inheriting(id, &rendered, scope, &path, inherited.as_ref())
         }))
     }
 
     /// `specialist.edit` → overwrite an existing user/project file; a missing
     /// file (e.g. a `bundled`-only id) → `-32602` (PROTOCOL §5.11). The
-    /// returned def folds `hidden` from the tiers below `scope`
-    /// ([`Self::inherited_hidden_below`]) so it agrees with an
-    /// immediately-following `specialist.get` when the spec omits the key.
+    /// returned def folds `hidden` and the config scalars from the tiers below
+    /// `scope` ([`Self::inherited_below`]) so it agrees with an
+    /// immediately-following `specialist.get` when the spec omits a key.
     pub(crate) fn edit(
         &self,
         id: &str,
@@ -757,9 +795,9 @@ impl SpecialistsService {
         let rendered = render_file(id, spec);
         std::fs::write(&path, &rendered)
             .map_err(|e| Error::Internal(format!("write specialist file failed: {e}")))?;
-        let inherited = self.inherited_hidden_below(id, scope, workspace_path);
+        let inherited = self.inherited_below(id, scope, workspace_path);
         Ok(json!({
-            "specialist": build_def_inheriting(id, &rendered, scope, &path, inherited)
+            "specialist": build_def_inheriting(id, &rendered, scope, &path, inherited.as_ref())
         }))
     }
 
@@ -1349,6 +1387,233 @@ mod tests {
         assert!(
             got["specialist"].get("hidden").is_none(),
             "edit response agrees with the following get"
+        );
+    }
+
+    #[test]
+    fn user_override_omitting_scalars_inherits_bundled_values() {
+        // A user override that omits the config scalars (codingAgent, model,
+        // modelTier, agentType) inherits the bundled tier's effective values
+        // on get, list, and the spawn-time resolvers.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\ncodingAgent: \"claude\"\nmodel: \"opus4.5\"\nmodelTier: \"smart\"\nagentType: \"zeta-type\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user override\"\n---\n\nuser body",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        let def = &got["specialist"];
+        assert_eq!(def["source"], "user");
+        assert_eq!(def["codingAgent"], "claude", "codingAgent inherited on get");
+        assert_eq!(def["model"], "opus4.5", "model inherited on get");
+        assert_eq!(def["modelTier"], "smart", "modelTier inherited on get");
+        assert_eq!(def["agentType"], "zeta-type", "agentType inherited on get");
+        let list = svc.list(None).unwrap();
+        let specs = list["specialists"].as_array().unwrap();
+        let zeta = specs.iter().find(|s| s["id"] == "zeta").unwrap();
+        assert_eq!(
+            zeta["codingAgent"], "claude",
+            "codingAgent inherited in list"
+        );
+        assert_eq!(zeta["model"], "opus4.5", "model inherited in list");
+        assert_eq!(zeta["modelTier"], "smart", "modelTier inherited in list");
+        assert_eq!(
+            zeta["agentType"], "zeta-type",
+            "agentType inherited in list"
+        );
+        assert_eq!(svc.resolve_model("zeta", None).as_deref(), Some("opus4.5"));
+        assert_eq!(
+            svc.resolve_agent_type("zeta", None).as_deref(),
+            Some("zeta-type")
+        );
+    }
+
+    #[test]
+    fn user_override_of_embedded_inherits_scalars_at_spawn() {
+        // The embedded floor participates in the fold: a user ralph.md that
+        // omits agentType/modelTier keeps the embedded values at spawn time.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        user.write(
+            "ralph",
+            "---\nname: \"Custom Ralph\"\ndescription: \"d\"\n---\n\nCustom body",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        assert_eq!(
+            svc.resolve_agent_type("ralph", None).as_deref(),
+            Some("ralph-loop"),
+            "agentType inherited from the embedded floor"
+        );
+        let got = svc.get("ralph", None).unwrap();
+        assert_eq!(got["specialist"]["source"], "user");
+        assert_eq!(
+            got["specialist"]["modelTier"], "smart",
+            "modelTier inherited from the embedded floor"
+        );
+    }
+
+    #[test]
+    fn explicit_scalar_in_higher_tier_overrides_inherited() {
+        // An explicit non-empty value in the higher tier wins per key; the
+        // other scalars still inherit independently.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nmodel: \"opus4.5\"\nagentType: \"zeta-type\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nmodel: \"haiku\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(got["specialist"]["model"], "haiku", "explicit value wins");
+        assert_eq!(
+            got["specialist"]["agentType"], "zeta-type",
+            "omitted key still inherits independently"
+        );
+        assert_eq!(svc.resolve_model("zeta", None).as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn explicit_empty_scalar_clears_inherited_value() {
+        // An explicit empty value (`model: ""`) clears the inherited value:
+        // the resolved def carries no key and resolve_model returns None.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nmodel: \"opus4.5\"\nagentType: \"zeta-type\"\n---\n\nbody",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\nmodel: \"\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("model").is_none(),
+            "explicit empty clears the inherited model"
+        );
+        assert_eq!(
+            got["specialist"]["agentType"], "zeta-type",
+            "other scalars still inherit"
+        );
+        assert_eq!(svc.resolve_model("zeta", None), None);
+    }
+
+    #[test]
+    fn role_reminder_does_not_inherit_across_tiers() {
+        // roleReminder stays winner-takes-all: a higher tier that omits it
+        // drops the lower tier's value and the auto-derive fallback applies.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nroleReminder: \"Bundled reminder.\"\n---\n\nBundled body.",
+        );
+        user.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"user\"\n---\n\nUser first line.",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("roleReminder").is_none(),
+            "roleReminder is not inherited"
+        );
+        let (_, reminder) = svc.resolve_role_reminder("zeta", None).unwrap();
+        assert_eq!(
+            reminder, "User first line.",
+            "auto-derive fallback applies instead of the lower tier's reminder"
+        );
+    }
+
+    #[test]
+    fn create_and_edit_responses_fold_scalars_from_lower_tiers() {
+        // The create/edit response must agree with an immediately-following
+        // get when the written spec omits (or explicitly clears) a scalar.
+        let user = TempSpecialistsDir::new();
+        let bundled = TempSpecialistsDir::new();
+        bundled.write(
+            "zeta",
+            "---\nname: \"Zeta\"\ndescription: \"d\"\nmodel: \"opus4.5\"\nagentType: \"zeta-type\"\n---\n\nbody",
+        );
+        let svc = SpecialistsService::new(Some(user.path.clone()), Some(bundled.path.clone()));
+        let spec = json!({ "name": "Zeta", "description": "user", "prompt": "body" });
+        let created = svc.create("zeta", &spec, Some("user"), None).unwrap();
+        assert_eq!(
+            created["specialist"]["model"], "opus4.5",
+            "create response inherits model from the bundled tier"
+        );
+        assert_eq!(
+            created["specialist"]["agentType"], "zeta-type",
+            "create response inherits agentType from the bundled tier"
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert_eq!(
+            got["specialist"]["model"], created["specialist"]["model"],
+            "create response agrees with the following get"
+        );
+        let spec = json!({
+            "name": "Zeta",
+            "description": "user",
+            "model": "",
+            "prompt": "body"
+        });
+        let edited = svc.edit("zeta", &spec, "user", None).unwrap();
+        assert!(
+            edited["specialist"].get("model").is_none(),
+            "edit response honors the explicit-empty clear"
+        );
+        assert_eq!(
+            edited["specialist"]["agentType"], "zeta-type",
+            "edit response still inherits the untouched scalar"
+        );
+        let got = svc.get("zeta", None).unwrap();
+        assert!(
+            got["specialist"].get("model").is_none(),
+            "edit response agrees with the following get"
+        );
+    }
+
+    #[test]
+    fn render_file_writes_explicit_empty_scalar_for_clear() {
+        // A wire spec that explicitly carries `""` for a config scalar writes
+        // `key: ""` (the explicit-clear form); an absent key writes nothing,
+        // and roleReminder rendering is unchanged (empty is skipped).
+        let spec = json!({ "name": "Zeta", "description": "d", "model": "", "prompt": "body" });
+        let rendered = render_file("zeta", &spec);
+        assert!(
+            rendered.contains("model: \"\""),
+            "explicit empty is written"
+        );
+        let (fm, _) = parse_frontmatter(&rendered);
+        assert_eq!(
+            fm.get("model").unwrap(),
+            "",
+            "round-trips as an explicit-clear (Some(\"\"))"
+        );
+        let spec = json!({ "name": "Zeta", "description": "d", "prompt": "body" });
+        assert!(
+            !render_file("zeta", &spec).contains("model"),
+            "absent key writes nothing"
+        );
+        let spec = json!({
+            "name": "Zeta",
+            "description": "d",
+            "roleReminder": "",
+            "prompt": "body"
+        });
+        assert!(
+            !render_file("zeta", &spec).contains("roleReminder"),
+            "empty roleReminder is still skipped"
         );
     }
 }
