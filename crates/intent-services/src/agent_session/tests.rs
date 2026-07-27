@@ -1677,6 +1677,38 @@ async fn resume_survives_same_provider_model_switch() {
     assert_eq!(opened.session_id, ACP_SID);
 }
 
+/// Legacy default-provider aliases (`acp`/`augment`/`default`) spawn the same
+/// default binary as the canonical id, so an alias-vs-canonical difference
+/// between the persisted row and the committed `last_turn_provider` must not
+/// read as a cross-provider switch: both sides canonicalize through the
+/// registry before the monorepo#907 comparison.
+#[tokio::test]
+async fn resume_survives_default_provider_alias_mismatch() {
+    let (_tmp, services, bus, agent_id, ws) = setup().await;
+    let (conn, _rx, _agent) = connect();
+    // Legacy row: bare model + alias provider → resolve_provider_id yields
+    // the alias verbatim ("acp"), while the turn-start commit always stores
+    // the spawn-resolved canonical id ("auggie").
+    bus.store()
+        .set_agent_session_model(&ws, &agent_id, "opus4.7", Some("acp"), &now_iso())
+        .await
+        .unwrap();
+    bus.store()
+        .set_acp_session_id(&ws, &agent_id, ACP_SID)
+        .await
+        .unwrap();
+    bus.store()
+        .set_agent_session_last_turn_model(&ws, &agent_id, Some("opus4.7"), "auggie")
+        .await
+        .unwrap();
+    let opened = services
+        .resume_acp_session(&conn, &init_caps(true), &agent_id, "/tmp/ws", Vec::new())
+        .await
+        .unwrap()
+        .expect("alias-vs-canonical default provider ids keep resume");
+    assert_eq!(opened.session_id, ACP_SID);
+}
+
 #[tokio::test]
 async fn recreate_acp_session_replaces_stored_id() {
     let (_tmp, services, bus, agent_id, ws) = setup().await;

@@ -1007,12 +1007,24 @@ impl Services {
         // resolves to, skip resume so the caller falls into the recreate +
         // history-replay branch. `None` (no committed turn yet — legacy rows
         // or a crash before the identity commit) keeps today's behavior.
+        // One crash window errs on the safe side: a cross-provider turn that
+        // reached `recreate_acp_session` (stored id already the NEW
+        // provider's) but died before the identity commit still carries the
+        // OLD `last_turn_provider` on restart, so this guard skips a resume
+        // that would have been legitimate — a redundant recreate + replay,
+        // never a foreign load or context loss.
+        // Both sides are canonicalized through the registry before comparing:
+        // the commit stores the spawn-resolved `provider.id`, but the resolved
+        // id here may be a legacy default alias (`acp`/`augment`/`default`)
+        // from a persisted row — an alias spawns the same default binary, so
+        // it must not read as a provider change.
         let (_, last_turn_provider) = self
             .store
             .get_agent_session_last_turn_model(&workspace_id, agent_id)
             .await?;
         if let Some(owner) = last_turn_provider {
-            if owner != provider_id {
+            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            if canonical(&owner) != canonical(&provider_id) {
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
