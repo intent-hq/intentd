@@ -163,6 +163,13 @@ pub struct ProviderConfig {
     /// bin, PATH scan) is skipped entirely, so the adapter version is under our
     /// release cadence (claude-code's [`CLAUDE_AGENT_ACP_NPX_PACKAGE`]).
     pub npx_only_package: Option<&'static str>,
+    /// When set, discovery (`discover_providers`) only reports this provider
+    /// as `installed` when BOTH `command` AND this secondary CLI resolve.
+    /// Unsloth rides the `opencode` binary as its ACP runtime (`command`) but
+    /// also requires the `unsloth` CLI itself (the daemon-managed server
+    /// lifecycle, `unsloth_server.rs`) — reporting availability off
+    /// `opencode` alone is misleading when the Unsloth CLI isn't installed.
+    pub requires_secondary_binary: Option<&'static str>,
 }
 
 impl ProviderConfig {
@@ -202,6 +209,7 @@ impl ProviderConfig {
             login_docs_url: None,
             fallback_npx_package: None,
             npx_only_package: None,
+            requires_secondary_binary: None,
         }
     }
 }
@@ -307,6 +315,11 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         base_args: &["acp"],
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::EnvConfig,
+        // Availability requires BOTH `opencode` (the ACP runtime, `command`
+        // above) AND the `unsloth` CLI itself — the daemon-managed server
+        // lifecycle (`unsloth_server.rs`) shells out to `unsloth run` /
+        // `unsloth start opencode` directly, independent of the ACP spawn.
+        requires_secondary_binary: Some("unsloth"),
         ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
     },
     ProviderConfig {
