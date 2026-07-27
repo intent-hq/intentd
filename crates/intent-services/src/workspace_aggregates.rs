@@ -11,9 +11,12 @@
 //! - **Blocking pool**: all rollups/probes run under `spawn_blocking`, never
 //!   inline on tokio worker threads.
 //! - **Bounded concurrency**: a global semaphore caps concurrent rollups.
-//! - **Single-flight + short TTL cache**: one rollup per worktree at a time;
-//!   completed rollups are cached briefly so FE list polling doesn't redo the
-//!   same diff every call.
+//! - **Single-flight + adaptive TTL cache**: one rollup per worktree at a
+//!   time; completed rollups are cached so FE list polling doesn't redo the
+//!   same diff every call. The freshness window scales with the last observed
+//!   compute duration (clamped to [`DIFF_SUMMARY_TTL`]..[`DIFF_SUMMARY_TTL_MAX`]),
+//!   so a worktree whose rollup takes tens of seconds is not recomputed every
+//!   few seconds.
 //! - **Per-call budget**: a list/get call waits at most [`AGGREGATE_BUDGET`]
 //!   for a rollup, then serves the last completed value (possibly stale) or
 //!   omits the aggregate — the wire shape keeps both fields optional. The
@@ -35,10 +38,30 @@ use std::time::{Duration, Instant};
 
 use intent_core::{now_iso, WorkspaceDiffSummary};
 
-/// How long a completed diff rollup stays fresh. Card aggregates are advisory
-/// (workspace cards, not the Changes panel), so brief staleness is acceptable
-/// in exchange for not re-diffing every FE list poll.
+/// Minimum freshness window for a completed diff rollup. Card aggregates are
+/// advisory (workspace cards, not the Changes panel), so brief staleness is
+/// acceptable in exchange for not re-diffing every FE list poll.
 const DIFF_SUMMARY_TTL: Duration = Duration::from_secs(5);
+
+/// Multiplier applied to the last observed rollup duration when deriving the
+/// adaptive TTL: a rollup that took `d` stays fresh for `d × N`, so a worktree
+/// spends at most ~1/N of wall-clock time recomputing its rollup.
+const DIFF_TTL_COMPUTE_MULTIPLIER: u32 = 5;
+
+/// Upper bound on the adaptive TTL, so even a pathologically slow rollup is
+/// retried within a bounded window.
+const DIFF_SUMMARY_TTL_MAX: Duration = Duration::from_secs(300);
+
+/// Adaptive freshness window for a diff cache entry: the last compute duration
+/// scaled by [`DIFF_TTL_COMPUTE_MULTIPLIER`], clamped to `base..=max` (a
+/// `max` below `base` is treated as `base`). Cheap rollups keep the short
+/// base TTL; expensive ones back off proportionally, e.g. a 60 s rollup is
+/// re-run at most ~once per 5 min.
+fn adaptive_ttl(base: Duration, max: Duration, compute_duration: Duration) -> Duration {
+    compute_duration
+        .saturating_mul(DIFF_TTL_COMPUTE_MULTIPLIER)
+        .clamp(base, max.max(base))
+}
 
 /// Wall-clock budget one list/get call spends waiting for a single aggregate
 /// before degrading to the last known value / omission.
@@ -58,6 +81,9 @@ pub(crate) const MAX_CONCURRENT_ENRICHMENTS: usize = 8;
 /// result so those worktrees aren't re-scanned every call within the TTL.
 struct DiffCacheEntry {
     computed_at: Instant,
+    /// How long the rollup took, used to scale this entry's freshness window
+    /// (see [`adaptive_ttl`]).
+    compute_duration: Duration,
     summary: Option<WorkspaceDiffSummary>,
 }
 
@@ -79,7 +105,10 @@ pub(crate) struct WorkspaceAggregateCache {
     cow_in_flight: Arc<Mutex<HashSet<PathBuf>>>,
     /// Serializes live CoW probes (shared `.cow_probe_temp` collision guard).
     cow_probe_gate: tokio::sync::Mutex<()>,
+    /// Minimum (base) diff TTL; entries never expire faster than this.
     ttl: Duration,
+    /// Upper clamp on the adaptive diff TTL.
+    max_ttl: Duration,
     budget: Duration,
 }
 
@@ -114,12 +143,13 @@ fn try_begin<K: Eq + Hash + Clone>(
 
 impl WorkspaceAggregateCache {
     pub(crate) fn new() -> Self {
-        Self::with_timing(DIFF_SUMMARY_TTL, AGGREGATE_BUDGET)
+        Self::with_timing(DIFF_SUMMARY_TTL, DIFF_SUMMARY_TTL_MAX, AGGREGATE_BUDGET)
     }
 
-    /// Construct with explicit TTL/budget (tests shrink both to exercise the
-    /// recompute and over-budget degradation paths deterministically).
-    pub(crate) fn with_timing(ttl: Duration, budget: Duration) -> Self {
+    /// Construct with explicit TTL bounds/budget (tests shrink these to
+    /// exercise the recompute and over-budget degradation paths
+    /// deterministically; passing `max_ttl == ttl` pins a fixed TTL).
+    pub(crate) fn with_timing(ttl: Duration, max_ttl: Duration, budget: Duration) -> Self {
         Self {
             diff: Mutex::new(HashMap::new()),
             diff_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -128,6 +158,7 @@ impl WorkspaceAggregateCache {
             cow_in_flight: Arc::new(Mutex::new(HashSet::new())),
             cow_probe_gate: tokio::sync::Mutex::new(()),
             ttl,
+            max_ttl,
             budget,
         }
     }
@@ -185,12 +216,16 @@ impl WorkspaceAggregateCache {
 
     /// Cache lookup. Outer `Option` distinguishes "entry present" from a miss;
     /// the inner value is the cached summary (which may itself be `None`).
-    /// `fresh_only` enforces the TTL; stale entries are served on the
-    /// degradation paths above.
+    /// `fresh_only` enforces the entry's adaptive TTL; stale entries are
+    /// served on the degradation paths above.
     fn lookup_diff(&self, key: &str, fresh_only: bool) -> Option<Option<WorkspaceDiffSummary>> {
         let map = self.diff.lock().unwrap();
         map.get(key)
-            .filter(|e| !fresh_only || e.computed_at.elapsed() < self.ttl)
+            .filter(|e| {
+                !fresh_only
+                    || e.computed_at.elapsed()
+                        < adaptive_ttl(self.ttl, self.max_ttl, e.compute_duration)
+            })
             .map(|e| e.summary.clone())
     }
 
@@ -213,16 +248,19 @@ impl WorkspaceAggregateCache {
                     return None;
                 }
             };
+        let compute_duration = started.elapsed();
         tracing::debug!(
             worktree = %key,
             files = summary.as_ref().map(|s| s.total_files).unwrap_or(0),
-            total_ms = started.elapsed().as_millis() as u64,
+            total_ms = compute_duration.as_millis() as u64,
+            ttl_ms = adaptive_ttl(self.ttl, self.max_ttl, compute_duration).as_millis() as u64,
             "workspace aggregates: head diff rollup"
         );
         self.diff.lock().unwrap().insert(
             key.to_string(),
             DiffCacheEntry {
                 computed_at: Instant::now(),
+                compute_duration,
                 summary: summary.clone(),
             },
         );
@@ -396,6 +434,7 @@ mod tests {
         let dir = seeded_dirty_repo();
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
             Duration::from_secs(60),
+            Duration::from_secs(60),
             Duration::from_secs(30),
         ));
         let first = cache
@@ -416,8 +455,9 @@ mod tests {
     #[tokio::test]
     async fn diff_summary_recomputes_after_ttl_expiry() {
         let dir = seeded_dirty_repo();
-        // Zero TTL: every call recomputes.
+        // Zero TTL (max_ttl == ttl pins it): every call recomputes.
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::ZERO,
             Duration::ZERO,
             Duration::from_secs(30),
         ));
@@ -433,6 +473,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.total_files, 2);
+    }
+
+    #[test]
+    fn adaptive_ttl_scales_with_compute_duration_and_clamps() {
+        let base = Duration::from_secs(5);
+        let max = Duration::from_secs(300);
+        // Cheap rollups keep the base TTL.
+        assert_eq!(adaptive_ttl(base, max, Duration::ZERO), base);
+        assert_eq!(adaptive_ttl(base, max, Duration::from_millis(200)), base);
+        // Past the base threshold the TTL scales linearly with compute time.
+        assert_eq!(
+            adaptive_ttl(base, max, Duration::from_secs(2)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            adaptive_ttl(base, max, Duration::from_secs(30)),
+            Duration::from_secs(150)
+        );
+        // A 60 s rollup hits the 5 min cap: re-run at most ~once per 5 min.
+        assert_eq!(adaptive_ttl(base, max, Duration::from_secs(60)), max);
+        assert_eq!(adaptive_ttl(base, max, Duration::from_secs(3_600)), max);
+        // A max below base degenerates to a fixed base TTL instead of
+        // panicking in `clamp`.
+        assert_eq!(
+            adaptive_ttl(base, Duration::ZERO, Duration::from_secs(60)),
+            base
+        );
+    }
+
+    /// Freshness is per-entry: with a zero base TTL, an entry whose rollup was
+    /// slow stays fresh (scaled TTL) while a fast entry expires immediately.
+    #[test]
+    fn lookup_diff_freshness_scales_with_entry_compute_duration() {
+        let cache = WorkspaceAggregateCache::with_timing(
+            Duration::ZERO,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+        );
+        let entry = |compute_duration| DiffCacheEntry {
+            computed_at: Instant::now(),
+            compute_duration,
+            summary: None,
+        };
+        {
+            let mut map = cache.diff.lock().unwrap();
+            map.insert("slow".into(), entry(Duration::from_secs(60)));
+            map.insert("fast".into(), entry(Duration::ZERO));
+        }
+        assert!(cache.lookup_diff("slow", true).is_some());
+        assert!(cache.lookup_diff("fast", true).is_none());
+        // Stale lookups still serve both entries.
+        assert!(cache.lookup_diff("fast", false).is_some());
     }
 
     /// Claim every rollup permit so an in-flight rollup cannot complete,
@@ -455,6 +547,7 @@ mod tests {
         // Zero budget: the first call times out and omits the aggregate,
         // while the detached rollup completes and fills the cache for later calls.
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::from_secs(60),
             Duration::from_secs(60),
             Duration::ZERO,
         ));
@@ -481,6 +574,7 @@ mod tests {
         // that sees a stale entry and an over-budget rollup must serve the
         // stale value rather than omit.
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::ZERO,
             Duration::ZERO,
             Duration::ZERO,
         ));
@@ -512,6 +606,7 @@ mod tests {
     async fn diff_summary_single_flight_non_winner_serves_last_known() {
         let dir = seeded_dirty_repo();
         let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::from_secs(60),
             Duration::from_secs(60),
             Duration::from_secs(30),
         ));
