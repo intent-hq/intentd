@@ -17694,4 +17694,43 @@ mod display_status_events {
         h.services.maybe_emit_display_status_changed(&h.ws).await;
         assert_silent(&mut sub).await;
     }
+
+    /// When `taskStats` is unavailable (transient notes-read failure), the
+    /// enrich path leaves `displayStatus` absent — clients fall back to local
+    /// derivation on a missing field — and never seeds the last-observed
+    /// cache from the stats-free compute.
+    #[tokio::test]
+    async fn enrich_omits_display_status_when_task_stats_unavailable() {
+        let h = harness().await;
+        // Hermetic root: enrichment probes the workspaces root for
+        // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+        let root = tempfile::tempdir().expect("temp workspaces root");
+        let services = h
+            .services
+            .clone()
+            .with_workspaces_root(root.path().to_path_buf());
+        h.store
+            .insert_note(&task_note(&h.ws, "t1", TaskStatus::InProgress))
+            .await
+            .expect("insert task");
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("get ws");
+        // Force list_notes to fail so taskStats is not computable.
+        sqlx::query("DROP TABLE note")
+            .execute(h.store.write_pool())
+            .await
+            .expect("drop note table");
+
+        services.enrich_workspace_aggregates(&mut ws).await;
+        assert!(ws.task_stats.is_none(), "taskStats must be absent");
+        assert!(ws.display_status.is_none(), "displayStatus must be absent");
+        let seeded = services
+            .last_display_statuses
+            .lock()
+            .expect("lock cache")
+            .contains_key(&h.ws);
+        assert!(
+            !seeded,
+            "cache must not be seeded from a stats-free compute"
+        );
+    }
 }

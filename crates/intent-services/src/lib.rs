@@ -929,19 +929,25 @@ impl Services {
         // machine/filesystem capability regardless of checkout mode.
         ws.cow_supported = self.compute_cow_supported().await;
         // Derived "current cycle" display status over the active/latest PR and
-        // the taskStats computed above; never persisted. Seed the last-observed
-        // cache when absent so the first post-read mutation compares against
-        // this baseline (a seed never emits; see
-        // [`Services::maybe_emit_display_status_changed`]).
-        let display_status = compute_display_status(
-            ws.active_pull_request.as_ref(),
-            ws.pull_requests.as_deref().unwrap_or_default(),
-            ws.task_stats.as_ref(),
-        );
-        if let Ok(mut map) = self.last_display_statuses.lock() {
-            map.entry(ws.id.clone()).or_insert(display_status);
+        // the taskStats computed above; never persisted. Only populated when
+        // taskStats was computable: on a transient notes-read failure the field
+        // stays absent (clients fall back to local derivation on a missing
+        // field) and the last-observed cache is left untouched, so a
+        // None-compute can never misreport `not_started`/`pr_*` or pollute the
+        // baseline. Seed the last-observed cache when absent so the first
+        // post-read mutation compares against this baseline (a seed never
+        // emits; see [`Services::maybe_emit_display_status_changed`]).
+        if ws.task_stats.is_some() {
+            let display_status = compute_display_status(
+                ws.active_pull_request.as_ref(),
+                ws.pull_requests.as_deref().unwrap_or_default(),
+                ws.task_stats.as_ref(),
+            );
+            if let Ok(mut map) = self.last_display_statuses.lock() {
+                map.entry(ws.id.clone()).or_insert(display_status);
+            }
+            ws.display_status = Some(display_status);
         }
-        ws.display_status = Some(display_status);
     }
 
     /// Recompute a workspace's derived `displayStatus` and publish
