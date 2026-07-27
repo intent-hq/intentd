@@ -13712,19 +13712,33 @@ impl WorkspaceApi for Services {
                 }
             };
             if to_commit.is_empty() {
-                return Err(Error::Internal(
-                    "No uncommitted changes found for this agent".to_string(),
-                ));
+                return Err(Error::Internal(if user_requested {
+                    "No staged changes found to commit".to_string()
+                } else {
+                    "No uncommitted changes found for this agent".to_string()
+                }));
             }
-            if needs_stage {
-                intent_git::stage::stage(&worktree, &to_commit)?;
-            }
-            let outcome = intent_git::commit::commit_with_trailers(
-                &worktree,
-                &message,
-                agent_id.as_ref().map(AgentId::as_str),
-                linked_note_id.as_ref().map(NoteId::as_str),
-            )?;
+            // With an explicit commit set (named `files` or the attribution
+            // filter), commit exactly those paths (`git commit -- <paths>`
+            // semantics) so paths another actor pre-staged are never swept
+            // into this commit. The `userRequested` staged-only checkpoint
+            // commits the index as-is.
+            let outcome = if needs_stage {
+                intent_git::commit::commit_paths_with_trailers(
+                    &worktree,
+                    &message,
+                    agent_id.as_ref().map(AgentId::as_str),
+                    linked_note_id.as_ref().map(NoteId::as_str),
+                    &to_commit,
+                )?
+            } else {
+                intent_git::commit::commit_with_trailers(
+                    &worktree,
+                    &message,
+                    agent_id.as_ref().map(AgentId::as_str),
+                    linked_note_id.as_ref().map(NoteId::as_str),
+                )?
+            };
             if attribution_filtered {
                 // Mirror `ac_commit`: move the committed paths' attribution
                 // rows (staged/unstaged → committed) so the audit trail stays
@@ -18794,11 +18808,25 @@ async fn record_agent_file_mutation(
     let Some(worktree) = git_ops::worktree_path(&ws) else {
         return;
     };
-    let rel_path = file_ops::workspace_relative(root, path)
-        .unwrap_or_else(|| crate::file_tracking::normalize_path(path));
-    if rel_path.is_empty() {
-        return;
-    }
+    // Resolve to a worktree-relative path with `.`/`..` segments collapsed —
+    // the attribution-filtered commit set is intersected against
+    // `all_changed_paths` (worktree-relative), so a non-canonical path here
+    // would silently drop the file from the agent's commits. When the mutation
+    // root is a sandbox (or empty), fall back to resolving against the
+    // worktree itself; if neither resolves, skip rather than record a row
+    // that can never match.
+    let rel_path = match file_ops::workspace_relative(root, path)
+        .or_else(|| file_ops::workspace_relative(&worktree.to_string_lossy(), path))
+    {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            tracing::warn!(
+                path,
+                "file-tracking: could not resolve a workspace-relative path; skipping attribution"
+            );
+            return;
+        }
+    };
     // Diff compute is best-effort: a missing repo / clean worktree still
     // records the attribution row (with zero stats) so provenance is kept.
     let summary =

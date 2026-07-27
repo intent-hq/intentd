@@ -8735,6 +8735,53 @@ mod file_tracking {
         assert_eq!(stage_of("b.txt"), "unstaged");
     }
 
+    /// A path another actor already staged is not swept into the
+    /// attribution-filtered commit — the commit tree is built from exactly
+    /// the attributed paths (`git commit -- <paths>` semantics), and the
+    /// pre-staged entry survives in the index afterwards.
+    #[tokio::test]
+    async fn agent_commit_does_not_sweep_prestaged_unattributed_paths() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("prestaged.txt"), "other actor\n").unwrap();
+        intent_git::stage::stage(&repo.dir, &["prestaged.txt".to_string()]).unwrap();
+        std::fs::write(repo.dir.join("a.txt"), "agent a\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "a.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "agent a only".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["a.txt".to_string()]);
+        assert_eq!(r.file_count, 1);
+
+        // The commit's actual delta matches the response.
+        let head = intent_git::history::history(&repo.dir, 1).unwrap();
+        assert_eq!(
+            head[0].files.as_deref(),
+            Some(&["a.txt".to_string()][..]),
+            "commit contains only the attributed path"
+        );
+        // The other actor's staged entry is still pending.
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        let entry = st
+            .files
+            .iter()
+            .find(|f| f.path == "prestaged.txt")
+            .expect("prestaged.txt still pending");
+        assert!(entry.staged, "prestaged.txt still staged: {st:?}");
+    }
+
     /// A stale attribution row (its file is unchanged in the worktree) commits
     /// nothing — the intersection with the actual worktree changes is empty,
     /// surfacing the "No uncommitted changes found for this agent" error the
