@@ -2115,7 +2115,11 @@ dependencies = [
 
 [[package]]
 name = "intentd"
+<<<<<<< Updated upstream
 version = "0.2.8"
+=======
+version = "0.2.10"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "async-trait",
