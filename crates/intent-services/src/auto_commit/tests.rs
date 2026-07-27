@@ -171,6 +171,7 @@ fn session(
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
     }
 }
 

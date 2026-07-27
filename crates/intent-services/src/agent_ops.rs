@@ -1087,6 +1087,10 @@ impl Services {
             self.agent_activity_flags_for(&session);
         let (turn_in_flight, last_stream_activity_at) =
             self.live_turn_liveness_for(&session, is_responding);
+        // monorepo#940: derived on emit (never persisted) so a client
+        // rehydrating via agent.list/agent.get after the failure event still
+        // sees the corrupted flag.
+        let session_corrupted = self.session_poisoned(&session);
         let mut lite = project_lite(session);
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
@@ -1094,6 +1098,7 @@ impl Services {
         lite.waiting_for_agent_ids = waiting_for_agent_ids;
         lite.turn_in_flight = turn_in_flight;
         lite.last_stream_activity_at = last_stream_activity_at;
+        lite.session_corrupted = session_corrupted;
         lite
     }
 
@@ -1579,6 +1584,7 @@ impl Services {
             is_background,
             metadata,
             stop_reason: None,
+            session_corrupted: false,
             created_at: now.clone(),
             updated_at: now,
             sandbox_id: None,
@@ -1806,7 +1812,11 @@ impl Services {
     /// caller can rehydrate the full session shape from the daemon. Emits no
     /// events (a pure read). `NotFound` when the session is unknown.
     pub(crate) async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
-        self.store.get_agent_session(&agent_id).await
+        let mut session = self.store.get_agent_session(&agent_id).await?;
+        // monorepo#940: derived on emit (never persisted); see
+        // `project_lite_with_flags`.
+        session.session_corrupted = self.session_poisoned(&session);
+        Ok(session)
     }
 
     /// `agent.update` (PROTOCOL §5.5). Partial update from a `changes` object —

@@ -5687,9 +5687,14 @@ async fn persist_error_and_requeue(
     // `session_poisoned` sees a consistent (status, streak) pair as soon as
     // the Error status lands.
     let streak = mgr.services.record_terminal_failure(agent_id, error_text);
-    if streak >= crate::POISONED_FAILURE_STREAK_THRESHOLD
+    // monorepo#940: the same classification that quarantines the session
+    // (`session_poisoned`) is surfaced on the wire as `sessionCorrupted` so
+    // clients get a structured "retry will recreate" signal, not just the raw
+    // stopReason string.
+    let session_corrupted = streak >= crate::POISONED_FAILURE_STREAK_THRESHOLD
         || crate::is_session_fatal_stop_reason(error_text)
-    {
+        || crate::is_deterministic_prompt_rejection(error_text);
+    if session_corrupted {
         tracing::warn!(
             agent = %agent_id,
             streak,
@@ -5716,6 +5721,17 @@ async fn persist_error_and_requeue(
         tracing::warn!(agent = %agent_id, error = %e, "failed to persist error status + stop_reason");
     } else {
         // Emit agent:status-changed with stopReason so live subscribers get the canonical field.
+        // `sessionCorrupted: true` is included only when the failure classifies as
+        // corrupted/poisoned (absent otherwise, matching the serialized projections).
+        let mut data = json!({
+            "agentId": agent_id.0,
+            "status": "error",
+            "isActive": false,
+            "stopReason": error_text,
+        });
+        if session_corrupted {
+            data["sessionCorrupted"] = json!(true);
+        }
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: ts,
@@ -5725,12 +5741,7 @@ async fn persist_error_and_requeue(
             correlation_id: None,
             parent_event_id: None,
             metadata: None,
-            data: json!({
-                "agentId": agent_id.0,
-                "status": "error",
-                "isActive": false,
-                "stopReason": error_text,
-            }),
+            data,
         };
         crate::publish_event(&mgr.services.event_bus, event).await;
     }
@@ -6061,6 +6072,7 @@ mod role_reminder_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 
@@ -7262,6 +7274,7 @@ mod agent_retry_tests {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         }
     }
 

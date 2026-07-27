@@ -376,6 +376,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         })
         .await
         .unwrap();
@@ -412,6 +413,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         })
         .await
         .unwrap();
@@ -462,6 +464,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         })
         .await
         .unwrap();
@@ -541,6 +544,7 @@ async fn process_cap_events_queued_resumed_evicted() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         })
         .await
         .unwrap();
@@ -1457,6 +1461,7 @@ async fn seed_agent(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
     };
     mgr.services
         .store
@@ -3093,6 +3098,7 @@ fn session_with_specialist(specialist: Option<&str>) -> AgentSession {
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
     }
 }
 
@@ -3344,6 +3350,7 @@ async fn insert_extra_session(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId
         sandbox_path: None,
         sandbox_branch: None,
         stop_reason: None,
+        session_corrupted: false,
     };
     mgr.services
         .store
@@ -3896,6 +3903,95 @@ async fn retry_poison_check_reads_streak_before_clear() {
         mgr.services.failure_streak_count(&id),
         0,
         "retry still clears the streak after the poisoned check"
+    );
+}
+
+/// monorepo#940: the `agent:status-changed` event emitted on a terminal
+/// failure that classifies as session-fatal (here the #940-shaped
+/// deterministic `session/prompt` 400 rejection) carries
+/// `sessionCorrupted: true` alongside `stopReason`.
+#[tokio::test]
+async fn terminal_failure_event_carries_session_corrupted_when_poisoned() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-940-corrupt"),
+        AgentId::from("a-940-corrupt"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["agent:status-changed".to_string()],
+        ..Default::default()
+    });
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "do work",
+        &super::TurnOptions::default(),
+        true,
+        "session/prompt failed: 400 Bad Request {\"apiStatus\":\"invalidArgument\",\"requestId\":\"req-1\"}",
+    )
+    .await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let ev = batch
+        .iter()
+        .find(|e| e.event_type == "agent:status-changed")
+        .expect("status-changed event");
+    assert_eq!(ev.data["status"], json!("error"));
+    assert_eq!(
+        ev.data["sessionCorrupted"],
+        json!(true),
+        "poisoned failure carries sessionCorrupted (got {:?})",
+        ev.data
+    );
+}
+
+/// monorepo#940 guard: an ORDINARY terminal failure (unrecognized error,
+/// streak below threshold) emits `agent:status-changed` WITHOUT the
+/// `sessionCorrupted` field — absent, not `false`.
+#[tokio::test]
+async fn terminal_failure_event_omits_session_corrupted_for_ordinary_error() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-940-plain"),
+        AgentId::from("a-940-plain"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["agent:status-changed".to_string()],
+        ..Default::default()
+    });
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "do work",
+        &super::TurnOptions::default(),
+        true,
+        "connection reset by peer",
+    )
+    .await;
+
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    let ev = batch
+        .iter()
+        .find(|e| e.event_type == "agent:status-changed")
+        .expect("status-changed event");
+    assert_eq!(ev.data["status"], json!("error"));
+    assert_eq!(ev.data["stopReason"], json!("connection reset by peer"));
+    assert!(
+        ev.data.get("sessionCorrupted").is_none(),
+        "ordinary error omits sessionCorrupted (got {:?})",
+        ev.data
     );
 }
 

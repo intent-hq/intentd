@@ -1316,6 +1316,81 @@ async fn create_then_list_and_get_projects_agent_lite() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
+/// monorepo#940: `sessionCorrupted` is derived on emit over the persisted
+/// (status, stop_reason) — a client rehydrating via `agent.get`/`agent.list`/
+/// `agent.getSession` after the failure event still sees the flag, and an
+/// ordinary error session omits it from the wire entirely.
+#[tokio::test]
+async fn projections_derive_session_corrupted_after_rehydration() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Poisoned").await;
+
+    // Park the session in Error with a session-fatal provider block —
+    // persisted via the store, so the read path below is a genuine
+    // rehydration round-trip (nothing in memory carries the flag).
+    svc.store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            intent_core::AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let lite = svc.agent_get_op(id.clone(), None).await.expect("get");
+    assert!(lite.session_corrupted, "agent.get derives the flag");
+    let v = serde_json::to_value(&lite).unwrap();
+    assert_eq!(v["sessionCorrupted"], json!(true));
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert!(
+        agents.iter().any(|a| a.id == id && a.session_corrupted),
+        "agent.list derives the flag"
+    );
+
+    let session = svc
+        .agent_get_session_op(id.clone())
+        .await
+        .expect("getSession");
+    assert!(
+        session.session_corrupted,
+        "agent.getSession derives the flag"
+    );
+    let v = serde_json::to_value(&session).unwrap();
+    assert_eq!(v["sessionCorrupted"], json!(true));
+
+    // Ordinary error: flag absent from the serialized wire shape (not false).
+    let plain = create_agent(&svc, &ws, "Plain").await;
+    svc.store
+        .set_agent_session_status(
+            &ws,
+            &plain,
+            intent_core::AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some("connection reset by peer".into())),
+        )
+        .await
+        .expect("park session in ordinary error");
+    let lite = svc.agent_get_op(plain.clone(), None).await.expect("get");
+    assert!(!lite.session_corrupted);
+    let v = serde_json::to_value(&lite).unwrap();
+    assert!(
+        v.get("sessionCorrupted").is_none(),
+        "false is omitted from the wire (got {v:?})"
+    );
+    let session = svc.agent_get_session_op(plain).await.expect("getSession");
+    let v = serde_json::to_value(&session).unwrap();
+    assert!(v.get("sessionCorrupted").is_none());
+}
+
 #[tokio::test]
 async fn agent_create_mints_server_assigned_agent_id() {
     // Agent ids are server-assigned: every create mints a fresh

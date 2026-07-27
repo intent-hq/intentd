@@ -2880,6 +2880,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         is_background: false,
         metadata: None,
         stop_reason: None,
+        session_corrupted: false,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,

@@ -295,6 +295,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store
             .insert_agent_session(&session1)
@@ -343,6 +344,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             sandbox_path: None,
             sandbox_branch: None,
             stop_reason: None,
+            session_corrupted: false,
         };
         store
             .insert_agent_session(&session2)
