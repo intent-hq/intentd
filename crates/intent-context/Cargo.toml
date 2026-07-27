@@ -1,6 +1,10 @@
 [package]
 name = "intent-context"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +12,11 @@ license.workspace = true
 description = "ContextEngine implementation (AuggieContextEngine) + discovery"
 
 [dependencies]
+<<<<<<< Updated upstream
 intent-core = { path = "../intent-core", version = "0.1.0" }
+=======
+intent-core = { path = "../intent-core", version = "0.2.11" }
+>>>>>>> Stashed changes
 async-trait = "0.1"
 tokio = { workspace = true }
 serde_json = { workspace = true }
