@@ -61,7 +61,7 @@ pub fn history_since(
     }
 
     let branch = current_branch(&repo);
-    let upstream = upstream_tip(&repo, &branch);
+    let mut pushed = PushedCheck::new(upstream_tip(&repo, &branch));
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -89,7 +89,7 @@ pub fn history_since(
         }
         let hash = oid.to_string();
         let pushed_started = timing_enabled.then(Instant::now);
-        let is_pushed = is_pushed(&repo, upstream, oid);
+        let is_pushed = pushed.check(&repo, oid);
         if let Some(t) = pushed_started {
             pushed_elapsed += t.elapsed();
         }
@@ -157,15 +157,41 @@ fn upstream_tip(repo: &Repository, branch: &str) -> Option<Oid> {
     repo.find_reference(&upstream).ok().and_then(|r| r.target())
 }
 
-/// Whether `oid` is already on the upstream (pushed): it is the upstream tip
-/// itself or an ancestor of it. Checked per emitted commit instead of
-/// pre-walking the whole `origin/<branch>..HEAD` range, so the cost is bounded
-/// by the caller's page size rather than the branch divergence (#963). An
-/// ancestry-check error is treated as unpushed.
-fn is_pushed(repo: &Repository, upstream_tip: Option<Oid>, oid: Oid) -> bool {
-    match upstream_tip {
-        Some(tip) => oid == tip || repo.graph_descendant_of(tip, oid).unwrap_or(false),
-        None => false,
+/// Pushed-ness checker for one first-parent history walk. A commit is pushed
+/// iff it is the upstream tip itself or an ancestor of it, checked per emitted
+/// commit instead of pre-walking the whole `origin/<branch>..HEAD` range, so
+/// the cost is bounded by the caller's page size rather than the branch
+/// divergence (#963). The walk emits a linear first-parent chain
+/// newest-to-oldest, so pushed status is monotone along it (every ancestor of
+/// a pushed commit is also an ancestor of the upstream tip): after the first
+/// pushed commit the remaining checks short-circuit, keeping the
+/// behind-upstream case (every commit pushed) at one ancestry query per walk.
+/// An ancestry-check error is treated as unpushed. With no upstream every
+/// commit is unpushed (the TS `hasUpstream` fallback).
+struct PushedCheck {
+    upstream_tip: Option<Oid>,
+    chain_pushed: bool,
+}
+
+impl PushedCheck {
+    fn new(upstream_tip: Option<Oid>) -> Self {
+        Self {
+            upstream_tip,
+            chain_pushed: false,
+        }
+    }
+
+    /// Whether `oid` — the next (older) commit on the walk's first-parent
+    /// chain — is pushed.
+    fn check(&mut self, repo: &Repository, oid: Oid) -> bool {
+        let Some(tip) = self.upstream_tip else {
+            return false;
+        };
+        if self.chain_pushed {
+            return true;
+        }
+        self.chain_pushed = oid == tip || repo.graph_descendant_of(tip, oid).unwrap_or(false);
+        self.chain_pushed
     }
 }
 
@@ -360,7 +386,7 @@ pub fn history_bounded(
     }
 
     let branch = current_branch(&repo);
-    let upstream = upstream_tip(&repo, &branch);
+    let mut pushed = PushedCheck::new(upstream_tip(&repo, &branch));
 
     let mut walk = repo.revwalk().map_err(map_git_err)?;
     walk.push_head().map_err(map_git_err)?;
@@ -397,7 +423,7 @@ pub fn history_bounded(
         }
         let hash = oid.to_string();
         let pushed_started = timing_enabled.then(Instant::now);
-        let is_pushed = is_pushed(&repo, upstream, oid);
+        let is_pushed = pushed.check(&repo, oid);
         if let Some(t) = pushed_started {
             pushed_elapsed += t.elapsed();
         }
@@ -633,6 +659,50 @@ mod tests {
         assert!(all[..60].iter().all(|c| !c.is_pushed));
         assert_eq!(all[60].hash, pushed_tip);
         assert!(all[60].is_pushed);
+    }
+
+    #[test]
+    fn behind_upstream_all_page_commits_are_pushed() {
+        let dir = init_repo("history-behind");
+        for i in 0..5 {
+            commit_file_at(dir.path(), "a.txt", &format!("rev {i}\n"), T0 + i);
+        }
+        let remote_tip = history(dir.path(), 50).unwrap()[0].hash.clone();
+        set_upstream_ref(dir.path(), &remote_tip);
+        // Rewind HEAD two commits so the branch is behind origin by 2
+        // (fetch-without-pull): every local commit is an ancestor of the tip.
+        let repo = Repository::open(dir.path()).unwrap();
+        let target = repo.revparse_single("HEAD~2").unwrap();
+        repo.reset(&target, git2::ResetType::Hard, None).unwrap();
+
+        let commits = history(dir.path(), 50).unwrap();
+        assert_eq!(commits.len(), 3);
+        assert!(commits.iter().all(|c| c.is_pushed));
+    }
+
+    #[test]
+    fn pushed_check_short_circuits_after_first_pushed_commit() {
+        let dir = init_repo("pushed-check-short-circuit");
+        commit_file_at(dir.path(), "a.txt", "one\n", T0);
+        let repo = Repository::open(dir.path()).unwrap();
+        let tip = repo.head().unwrap().target().unwrap();
+        // An oid the ancestry query can never resolve: it checks as unpushed
+        // unless the chain already short-circuited.
+        let bogus = Oid::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+
+        let mut fresh = PushedCheck::new(Some(tip));
+        assert!(!fresh.check(&repo, bogus));
+
+        // Once a commit on the chain checks as pushed, subsequent (older)
+        // commits are marked pushed without an ancestry query.
+        let mut chain = PushedCheck::new(Some(tip));
+        assert!(chain.check(&repo, tip));
+        assert!(chain.check(&repo, bogus));
+
+        // No upstream never reports pushed, short-circuit or not.
+        let mut none = PushedCheck::new(None);
+        assert!(!none.check(&repo, tip));
+        assert!(!none.check(&repo, tip));
     }
 
     #[test]
