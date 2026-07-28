@@ -1,6 +1,10 @@
 [package]
 name = "intent-core"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
