@@ -5363,13 +5363,18 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
     let subscriber = create_agent(&svc, &ws, "Watcher").await;
     let other = create_agent(&svc, &ws, "Worker").await;
 
+    // The batch window is deliberately wide: with a tight window (50ms) a
+    // scheduling stall between the two publishes under full parallel-suite
+    // load can split them into two wake batches, flaking the len()==1
+    // assertion below (monorepo#972). Both publishes land back-to-back, so a
+    // wide window still coalesces them into exactly one batch.
     let sub = svc
         .agent_subscribe(
             ws.clone(),
             Some(subscriber.clone()),
             vec!["agent:*".into()],
             None,
-            Some(50),
+            Some(2000),
         )
         .await
         .expect("subscribe");
@@ -5396,8 +5401,9 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
         .expect("publish");
     }
 
-    // Wait for the batch window + delivery to land on the subscriber session.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    // Wait for the batch window + delivery to land on the subscriber session
+    // (generous deadline: the 2s batch window plus load-tolerant slack).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let session = svc
             .store()

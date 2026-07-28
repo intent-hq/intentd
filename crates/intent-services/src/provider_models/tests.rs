@@ -518,6 +518,12 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     // the child's $PATH — the enhanced-path contract shared with the ACP
     // probe spawns. The temp dir is not on the process PATH, so the run only
     // succeeds when the spawn sets the child's PATH explicitly.
+    //
+    // The timeout is deliberately generous (not the 10s production
+    // `OPENCODE_CLI_TIMEOUT`): this test asserts PATH composition, not the
+    // timeout path, and under full parallel-suite load (plus a first-exec
+    // Gatekeeper scan on macOS) the spawn alone can take seconds
+    // (monorepo#921).
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("opencode");
@@ -527,7 +533,7 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
     );
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let stdout = super::run_opencode_models_cli(bin, super::OPENCODE_CLI_TIMEOUT)
+    let stdout = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(60))
         .await
         .expect("exit 0 when the child PATH carries the binary dir");
     assert!(stdout.contains("anthropic/claude-3"));
@@ -537,7 +543,8 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 #[tokio::test]
 async fn grok_models_cli_child_path_includes_binary_dir() {
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
-    // only succeeds when its own parent dir is on the child's $PATH.
+    // only succeeds when its own parent dir is on the child's $PATH. Same
+    // generous timeout rationale as the opencode analog above (monorepo#921).
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("grok");
@@ -547,7 +554,7 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
     );
     std::fs::write(&bin, script).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let output = super::run_grok_models_cli(bin, super::GROK_CLI_TIMEOUT)
+    let output = super::run_grok_models_cli(bin, std::time::Duration::from_secs(60))
         .await
         .expect("spawn succeeds");
     assert!(output.status.success());

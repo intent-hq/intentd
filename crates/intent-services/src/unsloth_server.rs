@@ -2225,11 +2225,16 @@ mod tests {
                 resolve_binary: Box::new(move || Some(binary.clone())),
                 home_dir: Some(home),
                 port,
-                server_up_timeout: Duration::from_secs(5),
-                model_ready_timeout: Duration::from_secs(10),
+                // Generous "should not elapse" budgets: the success paths
+                // complete in milliseconds, but under full parallel-suite
+                // load a tight budget (e.g. 5s) can spuriously expire
+                // (monorepo#972). Tests that exercise a timeout ACTUALLY
+                // firing override the relevant field explicitly.
+                server_up_timeout: Duration::from_secs(60),
+                model_ready_timeout: Duration::from_secs(60),
                 probe_interval: Duration::from_millis(50),
-                mint_timeout: Duration::from_secs(5),
-                adopt_mint_timeout: Duration::from_secs(5),
+                mint_timeout: Duration::from_secs(60),
+                adopt_mint_timeout: Duration::from_secs(60),
                 hf_api_base: "http://127.0.0.1:1".to_string(),
                 hf_files_timeout: Duration::from_secs(2),
                 total_memory_bytes: Box::new(|| Some(32 * GIB)),
@@ -2737,7 +2742,20 @@ mod tests {
             let m2 = mgr.clone();
             let startup =
                 tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Wait until the startup has actually registered the starting
+            // server (identity mirror set) rather than sleeping a fixed
+            // 200ms: under full parallel-suite load the spawned task may not
+            // have progressed that far yet, making `stop()` report `false`
+            // (monorepo#972). Reads only the lock-free identity mirror — the
+            // in-flight startup holds `state`'s lock for its whole window.
+            let registered = tokio::time::Instant::now() + Duration::from_secs(30);
+            while lock_ignore_poison(&mgr.identity).is_none() {
+                assert!(
+                    tokio::time::Instant::now() < registered,
+                    "startup never registered a starting server"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
 
             let start = tokio::time::Instant::now();
             assert!(
@@ -2973,7 +2991,11 @@ mod tests {
             std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
             let mut config = test_config(binary_path, dir.path().to_path_buf(), port);
-            config.mint_timeout = Duration::from_millis(200);
+            // Short enough to keep the test quick, wide enough that the mint
+            // child's `echo` logging line has reliably executed before the
+            // deadline kills it under full parallel-suite load — the log
+            // count assertions below depend on it (monorepo#972).
+            config.mint_timeout = Duration::from_secs(2);
             let mgr = UnslothServerManager::with_config(config);
 
             // Attempt 1: mint times out; server preserved (bug 1's fix).
@@ -3033,16 +3055,23 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let port = spawn_stub_http("sk-unsloth-test-key").await;
 
-            // The FIRST model (old) starts and becomes ready normally.
+            // The FIRST model (old) starts and becomes ready normally, under
+            // `test_config`'s generous mint budget — the old model's mint
+            // must SUCCEED, so it must not race a short deadline under full
+            // parallel-suite load (monorepo#972). The short `mint_timeout`
+            // that drives the switch/retry timeouts is applied after.
             let binary = write_stub_binary(dir.path(), dir.path(), port, None);
-            let mut config = test_config(binary.clone(), dir.path().to_path_buf(), port);
-            config.mint_timeout = Duration::from_millis(200);
-            let mgr = UnslothServerManager::with_config(config);
+            let config = test_config(binary.clone(), dir.path().to_path_buf(), port);
+            let mut mgr = UnslothServerManager::with_config(config);
 
             let old_repo = "unsloth/qwen-old-model-GGUF";
             mgr.ensure_endpoint(old_repo, 0, &|_, _| {})
                 .await
                 .expect("old model cold-starts fine");
+            // Same 2s rationale as the previous test: the timeout must fire
+            // (the switch stub's `start` hangs), but only after the mint
+            // child's `echo` line has reliably reached the log.
+            mgr.config.mint_timeout = Duration::from_secs(2);
 
             // Rewrite the SAME binary path (resolved fresh on every spawn) to
             // one whose `run` and `start` both hang past `mint_timeout`
