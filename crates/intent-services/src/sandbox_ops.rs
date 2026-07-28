@@ -119,14 +119,78 @@ pub async fn provision_sandbox(
     // Load workspace
     let workspace = store.get_workspace(workspace_id).await?;
 
+    // The CoW probe/clone + git2 setup are synchronous and can run for tens
+    // of seconds on large checkouts; run them on the blocking pool so they
+    // never occupy a core runtime worker (monorepo#954).
+    let outcome = {
+        let workspace_id = workspace_id.clone();
+        let agent_id = agent_id.clone();
+        let workspaces_root = config.workspaces_root.clone();
+        tokio::task::spawn_blocking(move || {
+            provision_sandbox_blocking(&workspace, &workspace_id, &agent_id, &workspaces_root)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("sandbox provisioning task failed: {e}")))??
+    };
+
+    let ProvisionOutcome::Supported {
+        path: sandbox_path,
+        branch: branch_name,
+        base_commit_sha,
+        snapshot_commit_sha,
+    } = outcome
+    else {
+        return Ok(ProvisionOutcome::Unsupported);
+    };
+
+    // Persist the sandbox record
+    let now = now_iso();
+    let sandbox = Sandbox {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.clone(),
+        agent_id: agent_id.clone(),
+        path: sandbox_path.to_string_lossy().to_string(),
+        branch: branch_name.clone(),
+        base_commit_sha: base_commit_sha.clone(),
+        snapshot_commit_sha: snapshot_commit_sha.clone(),
+        status: SandboxStatus::Created,
+        retry_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    if let Err(e) = store.insert_sandbox(&sandbox).await {
+        // The agent session row can vanish mid-clone (`agent.delete` races
+        // the background provisioning; the sandbox FK cascades) — don't
+        // strand the just-cloned directory when the record insert fails.
+        let cleanup_path = sandbox_path.clone();
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleanup_path)).await;
+        return Err(e);
+    }
+
+    Ok(ProvisionOutcome::Supported {
+        path: sandbox_path,
+        branch: branch_name,
+        base_commit_sha,
+        snapshot_commit_sha,
+    })
+}
+
+/// Synchronous half of [`provision_sandbox`]: filesystem probe, CoW clone,
+/// and git2 branch/snapshot setup. Runs on the blocking pool — no store or
+/// event-bus interaction happens here.
+fn provision_sandbox_blocking(
+    workspace: &Workspace,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    workspaces_root: &std::path::Path,
+) -> Result<ProvisionOutcome> {
     // Resolve the canonical directory (direct mode: the user's repo folder;
     // CoW checkout: the workspace checkout). Worktree mode is rejected.
-    let user_dir = resolve_user_directory(&workspace)?;
+    let user_dir = resolve_user_directory(workspace)?;
 
     // Construct sandbox path: <workspaces_root>/<workspaceId>/sandboxes/<agentId>/<repo-slug>
-    let repo_slug = repo_slug_from_workspace(&workspace);
-    let sandbox_parent = config
-        .workspaces_root
+    let repo_slug = repo_slug_from_workspace(workspace);
+    let sandbox_parent = workspaces_root
         .join(&workspace_id.0)
         .join("sandboxes")
         .join(&agent_id.0);
@@ -172,77 +236,48 @@ pub async fn provision_sandbox(
     }
 
     // Open the sandbox repo and record the base commit SHA
-    // Scope git2 objects to ensure they're dropped before any await points
-    let (base_commit_sha, branch_name, snapshot_commit_sha) = {
-        let sandbox_repo = git2::Repository::open(&sandbox_path)
-            .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
-        let base_commit_sha = sandbox_repo
-            .head()
-            .ok()
-            .and_then(|h| h.target())
-            .map(|oid| oid.to_string())
-            .ok_or_else(|| Error::Internal("sandbox has no HEAD commit".to_string()))?;
+    let sandbox_repo = git2::Repository::open(&sandbox_path)
+        .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
+    let base_commit_sha = sandbox_repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .map(|oid| oid.to_string())
+        .ok_or_else(|| Error::Internal("sandbox has no HEAD commit".to_string()))?;
 
-        // Create branch sb/<agentId> in the sandbox
-        let branch_name = format!("sb/{}", agent_id.0);
-        let head_commit = sandbox_repo
-            .head()
-            .map_err(|e| Error::Internal(format!("get HEAD failed: {e}")))?
-            .peel_to_commit()
-            .map_err(|e| Error::Internal(format!("peel HEAD to commit failed: {e}")))?;
-        sandbox_repo
-            .branch(&branch_name, &head_commit, false)
-            .map_err(|e| Error::Internal(format!("create branch failed: {e}")))?;
+    // Create branch sb/<agentId> in the sandbox
+    let branch_name = format!("sb/{}", agent_id.0);
+    let head_commit = sandbox_repo
+        .head()
+        .map_err(|e| Error::Internal(format!("get HEAD failed: {e}")))?
+        .peel_to_commit()
+        .map_err(|e| Error::Internal(format!("peel HEAD to commit failed: {e}")))?;
+    sandbox_repo
+        .branch(&branch_name, &head_commit, false)
+        .map_err(|e| Error::Internal(format!("create branch failed: {e}")))?;
 
-        // Check out the new branch
-        let refname = format!("refs/heads/{}", branch_name);
-        sandbox_repo
-            .set_head(&refname)
-            .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
+    // Check out the new branch
+    let refname = format!("refs/heads/{}", branch_name);
+    sandbox_repo
+        .set_head(&refname)
+        .map_err(|e| Error::Internal(format!("set HEAD failed: {e}")))?;
 
-        // The best-effort clone can skip a TRACKED regular file (per-entry
-        // unsupported errno, or a tracked file under a skipped nested mount).
-        // Unlike `provision_cow_checkout` there is no hard reset here to heal
-        // it, and left alone the missing file would read as a deletion that
-        // `create_snapshot_commit` records — and a later merge-back could
-        // propagate to the user's tree. Restore just the index-tracked paths
-        // missing from the worktree before the dirty check; genuinely dirty
-        // state is untouched.
-        restore_missing_tracked_files(&sandbox_repo, &sandbox_path)?;
+    // The best-effort clone can skip a TRACKED regular file (per-entry
+    // unsupported errno, or a tracked file under a skipped nested mount).
+    // Unlike `provision_cow_checkout` there is no hard reset here to heal
+    // it, and left alone the missing file would read as a deletion that
+    // `create_snapshot_commit` records — and a later merge-back could
+    // propagate to the user's tree. Restore just the index-tracked paths
+    // missing from the worktree before the dirty check; genuinely dirty
+    // state is untouched.
+    restore_missing_tracked_files(&sandbox_repo, &sandbox_path)?;
 
-        // Check for dirty state and create a snapshot commit if needed
-        let snapshot_commit_sha = if is_dirty(&sandbox_repo)? {
-            Some(create_snapshot_commit(&sandbox_repo, agent_id)?)
-        } else {
-            None
-        };
-
-        // Return the values we need, git2 objects will be dropped here
-        (base_commit_sha, branch_name, snapshot_commit_sha)
+    // Check for dirty state and create a snapshot commit if needed
+    let snapshot_commit_sha = if is_dirty(&sandbox_repo)? {
+        Some(create_snapshot_commit(&sandbox_repo, agent_id)?)
+    } else {
+        None
     };
-
-    // Persist the sandbox record
-    let now = now_iso();
-    let sandbox = Sandbox {
-        id: uuid::Uuid::new_v4().to_string(),
-        workspace_id: workspace_id.clone(),
-        agent_id: agent_id.clone(),
-        path: sandbox_path.to_string_lossy().to_string(),
-        branch: branch_name.clone(),
-        base_commit_sha: base_commit_sha.clone(),
-        snapshot_commit_sha: snapshot_commit_sha.clone(),
-        status: SandboxStatus::Created,
-        retry_count: 0,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    if let Err(e) = store.insert_sandbox(&sandbox).await {
-        // The agent session row can vanish mid-clone (`agent.delete` races
-        // the background provisioning; the sandbox FK cascades) — don't
-        // strand the just-cloned directory when the record insert fails.
-        let _ = std::fs::remove_dir_all(&sandbox_path);
-        return Err(e);
-    }
 
     Ok(ProvisionOutcome::Supported {
         path: sandbox_path,
