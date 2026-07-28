@@ -111,43 +111,109 @@ pub struct InterruptedAgent {
 
 /// Per-session message inputs for the `AgentLite` projection (monorepo#958):
 /// everything the projection needs from `agent_message` without hydrating the
-/// full transcript. `last_assistant` / `last_user` are the highest-`seq` rows
-/// of their role (decoded), `None` when the session has no such message.
-/// Returned by [`Store::get_agent_session_message_projections`] (workspace-wide)
-/// and [`Store::get_agent_session_message_projection`] (single session).
-#[derive(Debug, Clone, Default)]
+/// full transcript. The last-rows fields carry only the capped `text`-block
+/// strings of each session's highest-`seq` `user` / `assistant` row —
+/// extracted and length-capped inside SQLite (monorepo#1010 P1b), so message
+/// bodies and `metadata` are never fetched or decoded — and are `None` when
+/// the session has no such message (an existing message with no text blocks
+/// yields `Some(vec![])`). Returned by
+/// [`Store::get_agent_session_message_projections`] (workspace-wide) and
+/// [`Store::get_agent_session_message_projection`] (single session).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionMessageProjection {
     pub message_count: u64,
-    pub last_assistant: Option<AgentMessage>,
-    pub last_user: Option<AgentMessage>,
+    pub last_assistant_text_blocks: Option<Vec<String>>,
+    pub last_user_text_blocks: Option<Vec<String>>,
+}
+
+/// Per-block character cap applied inside SQLite when extracting projection
+/// text (monorepo#1010 P1b). Assistant blocks keep their TAIL — the
+/// `AgentLite` preview is the last non-empty line and the `<agent_digest>`
+/// span is appended at the end — while user blocks keep their HEAD
+/// (`lastUserMessage` reads from the start). Sized so the digest and
+/// suggested-prompts markers plus the final response line survive intact for
+/// any realistic message.
+pub const PROJECTION_TEXT_BLOCK_CAP: u32 = 4096;
+
+/// SQL scalar expression projecting one winner row's `content` into a JSON
+/// array of capped `text`-block strings, `NULL` when the content is not a
+/// valid JSON array (matching the tolerant services-side block extraction,
+/// which yields no blocks for non-array content). Every `json_*` call is
+/// guarded by a lazily-evaluated CASE: `json_each` only runs on valid JSON
+/// arrays and per-element extraction only touches object elements, so
+/// malformed or non-block content can never error the statement. Assistant
+/// rows keep each block's tail, user rows its head
+/// (see [`PROJECTION_TEXT_BLOCK_CAP`]).
+fn projection_text_blocks_expr() -> String {
+    format!(
+        "CASE WHEN json_valid(m.content) AND json_type(m.content) = 'array' THEN \
+            (SELECT json_group_array(t) FROM ( \
+                SELECT CASE WHEN b.type = 'object' \
+                        AND json_extract(b.value, '$.type') = 'text' \
+                        AND json_type(b.value, '$.text') = 'text' \
+                    THEN CASE WHEN m.role = 'assistant' \
+                        THEN substr(json_extract(b.value, '$.text'), -{cap}) \
+                        ELSE substr(json_extract(b.value, '$.text'), 1, {cap}) END \
+                    END AS t \
+                FROM json_each(m.content) b) \
+            WHERE t IS NOT NULL) \
+        END",
+        cap = PROJECTION_TEXT_BLOCK_CAP
+    )
 }
 
 /// Last-rows window query for the workspace-wide projection (monorepo#1010).
 /// The windowed subquery selects only row keys `(agent_id, seq)` — never
 /// `content`/`metadata` — so it runs entirely on the covering index
-/// `idx_agent_message_agent_role_seq` (0064); message bodies are fetched by
-/// joining the `rn = 1` winners back to `agent_message` via
-/// `UNIQUE(agent_id, seq)`.
-const LAST_MESSAGES_BY_WORKSPACE_SQL: &str =
-    "SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at FROM ( \
-        SELECT m.agent_id, m.seq, \
-        ROW_NUMBER() OVER (PARTITION BY m.agent_id, m.role ORDER BY m.seq DESC) AS rn \
-        FROM agent_message m \
-        JOIN agent_session s ON s.id = m.agent_id \
-        WHERE s.workspace_id = ? AND m.role IN ('user', 'assistant')) w \
-    JOIN agent_message m ON m.agent_id = w.agent_id AND m.seq = w.seq \
-    WHERE w.rn = 1";
+/// `idx_agent_message_agent_role_seq` (0064); the `rn = 1` winners are joined
+/// back to `agent_message` via `UNIQUE(agent_id, seq)` and only the capped
+/// text-block projection of their `content` (P1b, see
+/// [`projection_text_blocks_expr`]) crosses out of SQLite — full bodies and
+/// `metadata` are never fetched or decoded.
+fn last_messages_by_workspace_sql() -> String {
+    format!(
+        "SELECT m.agent_id, m.role, {expr} AS text_blocks FROM ( \
+            SELECT m.agent_id, m.seq, \
+            ROW_NUMBER() OVER (PARTITION BY m.agent_id, m.role ORDER BY m.seq DESC) AS rn \
+            FROM agent_message m \
+            JOIN agent_session s ON s.id = m.agent_id \
+            WHERE s.workspace_id = ? AND m.role IN ('user', 'assistant')) w \
+        JOIN agent_message m ON m.agent_id = w.agent_id AND m.seq = w.seq \
+        WHERE w.rn = 1",
+        expr = projection_text_blocks_expr()
+    )
+}
 
-/// Single-session variant of [`LAST_MESSAGES_BY_WORKSPACE_SQL`]: `agent_id = ?`
-/// instead of the workspace join, same keys-only window + winner join-back.
-const LAST_MESSAGES_BY_AGENT_SQL: &str =
-    "SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at FROM ( \
-        SELECT agent_id, seq, \
-        ROW_NUMBER() OVER (PARTITION BY role ORDER BY seq DESC) AS rn \
-        FROM agent_message \
-        WHERE agent_id = ? AND role IN ('user', 'assistant')) w \
-    JOIN agent_message m ON m.agent_id = w.agent_id AND m.seq = w.seq \
-    WHERE w.rn = 1";
+/// Single-session variant of [`last_messages_by_workspace_sql`]:
+/// `agent_id = ?` instead of the workspace join, same keys-only window +
+/// winner join-back + capped text-block projection.
+fn last_messages_by_agent_sql() -> String {
+    format!(
+        "SELECT m.agent_id, m.role, {expr} AS text_blocks FROM ( \
+            SELECT agent_id, seq, \
+            ROW_NUMBER() OVER (PARTITION BY role ORDER BY seq DESC) AS rn \
+            FROM agent_message \
+            WHERE agent_id = ? AND role IN ('user', 'assistant')) w \
+        JOIN agent_message m ON m.agent_id = w.agent_id AND m.seq = w.seq \
+        WHERE w.rn = 1",
+        expr = projection_text_blocks_expr()
+    )
+}
+
+/// Decode one projection winner row into `(agent_id, role, text_blocks)`.
+/// `text_blocks` is the JSON string array built by
+/// [`projection_text_blocks_expr`]; a NULL column (non-array content) maps to
+/// an empty vec.
+fn map_projection_text_row(row: &SqliteRow) -> Result<(String, String, Vec<String>)> {
+    let agent_id: String = col(row, "agent_id")?;
+    let role: String = col(row, "role")?;
+    let blocks = match col::<Option<String>>(row, "text_blocks")? {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|e| Error::Internal(format!("decode projection text blocks failed: {e}")))?,
+        None => Vec::new(),
+    };
+    Ok((agent_id, role, blocks))
+}
 
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
@@ -461,10 +527,11 @@ impl Store {
     /// count 0) and one window query returning only each session's newest
     /// `user` and newest `assistant` rows. The window ranks row keys on the
     /// covering `(agent_id, role, seq DESC)` index and only the `rn = 1`
-    /// winners are joined back for their bodies (monorepo#1010), so neither
-    /// SQLite nor this code ever materializes or decodes `content`/`metadata`
-    /// beyond those rows. Returns a map keyed by agent_id with one entry per
-    /// session in the workspace.
+    /// winners are joined back (monorepo#1010) — and even then only their
+    /// capped text-block projection is returned (P1b), so neither SQLite's
+    /// result set nor this code ever materializes or decodes full
+    /// `content`/`metadata`. Returns a map keyed by agent_id with one entry
+    /// per session in the workspace.
     pub async fn get_agent_session_message_projections(
         &self,
         workspace_id: &WorkspaceId,
@@ -494,7 +561,7 @@ impl Store {
             );
         }
 
-        let last_rows = sqlx::query(LAST_MESSAGES_BY_WORKSPACE_SQL)
+        let last_rows = sqlx::query(&last_messages_by_workspace_sql())
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -502,13 +569,13 @@ impl Store {
                 Error::Internal(format!("last session message projections failed: {e}"))
             })?;
         for row in &last_rows {
-            let message = map_message_row(row)?;
-            let Some(entry) = projections.get_mut(&message.agent_id.0) else {
+            let (agent_id, role, blocks) = map_projection_text_row(row)?;
+            let Some(entry) = projections.get_mut(&agent_id) else {
                 continue;
             };
-            match message.role.as_str() {
-                "assistant" => entry.last_assistant = Some(message),
-                _ => entry.last_user = Some(message),
+            match role.as_str() {
+                "assistant" => entry.last_assistant_text_blocks = Some(blocks),
+                _ => entry.last_user_text_blocks = Some(blocks),
             }
         }
         Ok(projections)
@@ -518,10 +585,10 @@ impl Store {
     /// (monorepo#981): the per-session variant of
     /// [`Store::get_agent_session_message_projections`] — the same keys-only
     /// last-rows window query (monorepo#1010) with `agent_id = ?` instead of
-    /// the workspace join, plus a single-agent message count. Only the
-    /// returned newest user/assistant rows have their `content`/`metadata`
-    /// fetched and decoded — never the rest of the transcript. A session with
-    /// no messages returns the zero projection.
+    /// the workspace join, plus a single-agent message count. Only the capped
+    /// text-block projection of the newest user/assistant rows leaves SQLite
+    /// (P1b) — never full `content`/`metadata`, never the rest of the
+    /// transcript. A session with no messages returns the zero projection.
     pub async fn get_agent_session_message_projection(
         &self,
         agent_id: &AgentId,
@@ -531,16 +598,16 @@ impl Store {
             ..Default::default()
         };
 
-        let last_rows = sqlx::query(LAST_MESSAGES_BY_AGENT_SQL)
+        let last_rows = sqlx::query(&last_messages_by_agent_sql())
             .bind(&agent_id.0)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("last session message projection failed: {e}")))?;
         for row in &last_rows {
-            let message = map_message_row(row)?;
-            match message.role.as_str() {
-                "assistant" => projection.last_assistant = Some(message),
-                _ => projection.last_user = Some(message),
+            let (_, role, blocks) = map_projection_text_row(row)?;
+            match role.as_str() {
+                "assistant" => projection.last_assistant_text_blocks = Some(blocks),
+                _ => projection.last_user_text_blocks = Some(blocks),
             }
         }
         Ok(projection)
@@ -3913,9 +3980,9 @@ mod tests {
             }
         }
         // Park a NON-last user row with malformed content JSON between the
-        // real rows (seq 5 < the final user/assistant appends below). If the
-        // projection query decoded anything beyond the last user/assistant
-        // rows, map_message_row would fail and the call below would error.
+        // real rows (seq 5 < the final user/assistant appends below): the
+        // projection must never touch content beyond the last user/assistant
+        // rows.
         sqlx::query(
             "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
              VALUES (?,?,?,?,?,?)",
@@ -3929,24 +3996,17 @@ mod tests {
         .execute(store.write_pool())
         .await
         .expect("insert malformed row");
-        let last_user = store
-            .append_agent_message(
-                &full,
-                "user",
-                &serde_json::json!([{"type": "text", "text": "q3"}]),
-                &ts,
-            )
-            .await
-            .expect("append last user");
-        let last_assistant = store
-            .append_agent_message(
-                &full,
-                "assistant",
-                &serde_json::json!([{"type": "text", "text": "a3"}]),
-                &ts,
-            )
-            .await
-            .expect("append last assistant");
+        for (role, text) in [("user", "q3"), ("assistant", "a3")] {
+            store
+                .append_agent_message(
+                    &full,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append last rows");
+        }
 
         let projections = store
             .get_agent_session_message_projections(&ws_id)
@@ -3960,34 +4020,30 @@ mod tests {
 
         let p = projections.get(&empty.0).expect("empty entry");
         assert_eq!(p.message_count, 0);
-        assert!(p.last_assistant.is_none());
-        assert!(p.last_user.is_none());
+        assert!(p.last_assistant_text_blocks.is_none());
+        assert!(p.last_user_text_blocks.is_none());
 
         let p = projections.get(&user_only.0).expect("user-only entry");
         assert_eq!(p.message_count, 1);
-        assert!(p.last_assistant.is_none());
-        let u = p.last_user.as_ref().expect("last user");
+        assert!(p.last_assistant_text_blocks.is_none());
         assert_eq!(
-            u.content,
-            serde_json::json!([{"type": "text", "text": "only"}])
+            p.last_user_text_blocks,
+            Some(vec!["only".to_string()]),
+            "last user text blocks"
         );
 
         let p = projections.get(&full.0).expect("full entry");
         // 5 appended + 1 malformed + last user + last assistant (tool rows count).
         assert_eq!(p.message_count, 8);
-        let u = p.last_user.as_ref().expect("last user");
-        assert_eq!(u.id, last_user.id);
-        assert_eq!(u.seq, last_user.seq);
         assert_eq!(
-            u.content,
-            serde_json::json!([{"type": "text", "text": "q3"}])
+            p.last_user_text_blocks,
+            Some(vec!["q3".to_string()]),
+            "last user text blocks"
         );
-        let a = p.last_assistant.as_ref().expect("last assistant");
-        assert_eq!(a.id, last_assistant.id);
-        assert_eq!(a.seq, last_assistant.seq);
         assert_eq!(
-            a.content,
-            serde_json::json!([{"type": "text", "text": "a3"}])
+            p.last_assistant_text_blocks,
+            Some(vec!["a3".to_string()]),
+            "last assistant text blocks"
         );
 
         let _ = std::fs::remove_file(&tmp);
@@ -4049,8 +4105,8 @@ mod tests {
                 .await
                 .expect("append");
         }
-        // Malformed non-last user row: decoded content beyond the last
-        // user/assistant rows would fail map_message_row and error the call.
+        // Malformed non-last user row: the projection must never touch
+        // content beyond the last user/assistant rows.
         sqlx::query(
             "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
              VALUES (?,?,?,?,?,?)",
@@ -4090,28 +4146,7 @@ mod tests {
                 per_session.message_count, expected.message_count,
                 "message_count mismatch for {agent:?}"
             );
-            for (got, want, label) in [
-                (
-                    &per_session.last_assistant,
-                    &expected.last_assistant,
-                    "last_assistant",
-                ),
-                (&per_session.last_user, &expected.last_user, "last_user"),
-            ] {
-                match (got, want) {
-                    (None, None) => {}
-                    (Some(g), Some(w)) => {
-                        assert_eq!(g.id, w.id, "{label} id mismatch for {agent:?}");
-                        assert_eq!(g.agent_id, w.agent_id);
-                        assert_eq!(g.seq, w.seq);
-                        assert_eq!(g.role, w.role);
-                        assert_eq!(g.content, w.content);
-                        assert_eq!(g.metadata, w.metadata);
-                        assert_eq!(g.created_at, w.created_at);
-                    }
-                    (g, w) => panic!("{label} presence mismatch for {agent:?}: {g:?} vs {w:?}"),
-                }
-            }
+            assert_eq!(per_session, *expected, "projection mismatch for {agent:?}");
         }
 
         let _ = std::fs::remove_file(&tmp);
@@ -4131,8 +4166,8 @@ mod tests {
         let store = Store::open(&tmp).await.expect("create test store");
 
         for (label, sql) in [
-            ("workspace", LAST_MESSAGES_BY_WORKSPACE_SQL),
-            ("agent", LAST_MESSAGES_BY_AGENT_SQL),
+            ("workspace", last_messages_by_workspace_sql()),
+            ("agent", last_messages_by_agent_sql()),
         ] {
             let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .bind("x")
@@ -4160,7 +4195,8 @@ mod tests {
             );
         }
 
-        let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {LAST_MESSAGES_BY_AGENT_SQL}"))
+        let per_agent_sql = last_messages_by_agent_sql();
+        let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {per_agent_sql}"))
             .bind("x")
             .fetch_all(store.read_pool())
             .await
@@ -4174,6 +4210,137 @@ mod tests {
             !per_agent_plan.contains("USE TEMP B-TREE"),
             "per-agent window must be fully index-ordered:\n{per_agent_plan}"
         );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// P1b: the projection never returns unbounded text. Multi-MB winner
+    /// text blocks come back capped at [`PROJECTION_TEXT_BLOCK_CAP`] — the
+    /// user block's HEAD and the assistant block's TAIL (so the final
+    /// response line and trailing `<agent_digest>` span survive) — while
+    /// short blocks pass through unchanged. Non-text / non-object blocks are
+    /// skipped, and a winner row whose content is not a JSON array (or not
+    /// valid JSON at all) degrades to empty text blocks instead of erroring.
+    #[tokio::test]
+    async fn projection_text_blocks_bounded_and_tolerant() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-proj-bounded".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        let big = AgentId("agent-proj-big".to_string());
+        let malformed = AgentId("agent-proj-malformed".to_string());
+        let non_array = AgentId("agent-proj-non-array".to_string());
+        for id in [&big, &malformed, &non_array] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+
+        let cap = PROJECTION_TEXT_BLOCK_CAP as usize;
+        let big_user = format!("user-head-{}", "u".repeat(2 * 1024 * 1024));
+        let big_assistant = format!(
+            "{}\nFinal answer line\n<agent_digest>big digest</agent_digest>",
+            "a".repeat(2 * 1024 * 1024)
+        );
+        store
+            .append_agent_message(
+                &big,
+                "user",
+                &serde_json::json!([
+                    {"type": "text", "text": big_user},
+                    {"type": "tool_use", "name": "t", "toolCallId": "c1"},
+                    "bare-string-block",
+                    {"type": "text"},
+                    {"type": "text", "text": "short tail block"},
+                ]),
+                &ts,
+            )
+            .await
+            .expect("append big user");
+        store
+            .append_agent_message(
+                &big,
+                "assistant",
+                &serde_json::json!([{"type": "text", "text": big_assistant}]),
+                &ts,
+            )
+            .await
+            .expect("append big assistant");
+
+        sqlx::query(
+            "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&malformed.0)
+        .bind(0_i64)
+        .bind("user")
+        .bind("{not-valid-json")
+        .bind(&ts)
+        .execute(store.write_pool())
+        .await
+        .expect("insert malformed winner");
+        store
+            .append_agent_message(&non_array, "user", &serde_json::json!("plain string"), &ts)
+            .await
+            .expect("append non-array");
+
+        let projections = store
+            .get_agent_session_message_projections(&ws_id)
+            .await
+            .expect("projections");
+
+        let p = projections.get(&big.0).expect("big entry");
+        let user_blocks = p.last_user_text_blocks.as_ref().expect("user blocks");
+        assert_eq!(user_blocks.len(), 2, "only text blocks with string text");
+        assert_eq!(user_blocks[0].chars().count(), cap, "user block capped");
+        assert!(
+            user_blocks[0].starts_with("user-head-"),
+            "user block keeps its head"
+        );
+        assert_eq!(user_blocks[1], "short tail block");
+        let assistant_blocks = p
+            .last_assistant_text_blocks
+            .as_ref()
+            .expect("assistant blocks");
+        assert_eq!(assistant_blocks.len(), 1);
+        assert_eq!(
+            assistant_blocks[0].chars().count(),
+            cap,
+            "assistant block capped"
+        );
+        assert!(
+            assistant_blocks[0].ends_with("</agent_digest>"),
+            "assistant block keeps its tail"
+        );
+        assert!(
+            assistant_blocks[0].contains("Final answer line"),
+            "final response line survives the cap"
+        );
+
+        for (id, label) in [(&malformed, "malformed"), (&non_array, "non-array")] {
+            let p = projections.get(&id.0).expect(label);
+            assert_eq!(p.message_count, 1, "{label} count");
+            assert_eq!(
+                p.last_user_text_blocks,
+                Some(vec![]),
+                "{label} winner degrades to no text blocks"
+            );
+            let per_agent = store
+                .get_agent_session_message_projection(id)
+                .await
+                .expect("per-agent projection");
+            assert_eq!(per_agent, *p, "{label} per-agent parity");
+        }
 
         let _ = std::fs::remove_file(&tmp);
     }

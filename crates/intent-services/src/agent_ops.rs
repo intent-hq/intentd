@@ -347,32 +347,39 @@ pub(crate) fn last_response_and_digest(
         if msg.role != "assistant" {
             continue;
         }
-        let blocks = text_blocks(&msg.content);
-        let mut digest: Option<String> = None;
-        let mut last_response: Option<String> = None;
-        for block in &blocks {
-            let text = block.trim();
-            if text.is_empty() {
-                continue;
-            }
-            if digest.is_none() {
-                if let Some(d) = strip_spans_capture(text, "<agent_digest>", "</agent_digest>") {
-                    digest = Some(d.trim().to_string());
-                }
-            }
-            let cleaned = clean_response_text(text);
-            if !cleaned.is_empty() {
-                let line = cleaned
-                    .lines()
-                    .rfind(|l| !l.trim().is_empty())
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_else(|| cleaned.chars().take(200).collect());
-                last_response = Some(line);
-            }
-        }
-        return (last_response, digest);
+        return last_response_and_digest_from_blocks(&text_blocks(&msg.content));
     }
     (None, None)
+}
+
+/// [`last_response_and_digest`] over pre-extracted text-block strings — the
+/// shared core also fed by the store's text-only projection (P1b), whose
+/// capped blocks keep their tails so the last-line/digest extraction here is
+/// unaffected by the cap.
+fn last_response_and_digest_from_blocks(blocks: &[String]) -> (Option<String>, Option<String>) {
+    let mut digest: Option<String> = None;
+    let mut last_response: Option<String> = None;
+    for block in blocks {
+        let text = block.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if digest.is_none() {
+            if let Some(d) = strip_spans_capture(text, "<agent_digest>", "</agent_digest>") {
+                digest = Some(d.trim().to_string());
+            }
+        }
+        let cleaned = clean_response_text(text);
+        if !cleaned.is_empty() {
+            let line = cleaned
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .unwrap_or_else(|| cleaned.chars().take(200).collect());
+            last_response = Some(line);
+        }
+    }
+    (last_response, digest)
 }
 
 /// Derive `lastUserMessage` from the most-recent `user` message's text blocks
@@ -382,10 +389,20 @@ pub(crate) fn last_user_message(messages: &[AgentMessage]) -> Option<String> {
         if msg.role != "user" {
             continue;
         }
-        let text = text_blocks(&msg.content).join("\n").trim().to_string();
-        return if text.is_empty() { None } else { Some(text) };
+        return user_text_from_blocks(&text_blocks(&msg.content));
     }
     None
+}
+
+/// [`last_user_message`] over pre-extracted text-block strings — the shared
+/// core also fed by the store's text-only projection (P1b).
+fn user_text_from_blocks(blocks: &[String]) -> Option<String> {
+    let text = blocks.join("\n").trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Capture the first `start..end` span's inner text (for digest extraction).
@@ -955,21 +972,23 @@ fn project_lite(session: AgentSession) -> AgentLite {
 /// [`intent_store::SessionMessageProjection`] into [`AgentLite`] — the
 /// transcript-free equivalent of [`project_lite`] (monorepo#958). The derived
 /// fields (`lastAgentResponse`/digest/`lastUserMessage`) only ever read the
-/// newest assistant/user rows, so feeding them the projection's last rows
-/// yields output identical to a full-transcript projection of the same data.
+/// newest assistant/user rows' text blocks, so feeding them the projection's
+/// SQL-extracted capped blocks (P1b) yields output identical to a
+/// full-transcript projection of the same data for any message within the
+/// cap.
 fn project_lite_from_projection(
     session: AgentSession,
     projection: &intent_store::SessionMessageProjection,
 ) -> AgentLite {
     let (last_response, digest) = projection
-        .last_assistant
-        .as_ref()
-        .map(|m| last_response_and_digest(std::slice::from_ref(m)))
+        .last_assistant_text_blocks
+        .as_deref()
+        .map(last_response_and_digest_from_blocks)
         .unwrap_or((None, None));
     let last_user = projection
-        .last_user
-        .as_ref()
-        .and_then(|m| last_user_message(std::slice::from_ref(m)));
+        .last_user_text_blocks
+        .as_deref()
+        .and_then(user_text_from_blocks);
     AgentLite::from_session(
         session,
         projection.message_count,
