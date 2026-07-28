@@ -21,6 +21,12 @@ use serde_json::Value;
 /// Model key used when an agent session has no recorded model (§5.23 fallback).
 pub const UNKNOWN_MODEL: &str = "unknown";
 
+/// Provider key used when a session's provider is unknowable (§5.36 fallback).
+/// Same `"unknown"` sentinel as [`UNKNOWN_MODEL`] — the two usage-stats
+/// dimensions share the value, but the alias keeps provider-side call sites
+/// readable.
+pub const UNKNOWN_PROVIDER: &str = UNKNOWN_MODEL;
+
 /// One agent's contribution to the workspace tally: its `agent-{uuid}` id, the
 /// effective model name, and the summed per-turn counters.
 #[derive(Debug, Clone, PartialEq, Eq)]

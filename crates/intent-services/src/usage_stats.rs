@@ -14,7 +14,7 @@ use intent_core::{AgentId, TokenUsageTotals, WorkspaceId};
 use intent_store::{LocalStamp, Store, UsageStatsDelta};
 use time::{OffsetDateTime, UtcOffset};
 
-use crate::token_usage::UNKNOWN_MODEL;
+use crate::token_usage::{UNKNOWN_MODEL, UNKNOWN_PROVIDER};
 
 /// Floor `t` to its UTC hour and render the bucket key used by
 /// `usage_stats_hourly.bucket_utc`: `"YYYY-MM-DDTHH:00:00Z"`. Buckets are
@@ -248,7 +248,7 @@ pub fn stats_provider_key(provider_id: Option<&str>) -> String {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(|p| p.to_ascii_lowercase())
-        .unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+        .unwrap_or_else(|| UNKNOWN_PROVIDER.to_string())
 }
 
 /// Record one agent-session start (D2: *sessions* = agent sessions) into the
@@ -553,6 +553,16 @@ mod tests {
             stats_model_key(Some("default"), None, Some("  ")),
             UNKNOWN_MODEL
         );
+    }
+
+    #[test]
+    fn stats_provider_key_normalizes_and_falls_back_to_unknown() {
+        assert_eq!(stats_provider_key(Some(" Claude-Code ")), "claude-code");
+        assert_eq!(stats_provider_key(None), UNKNOWN_PROVIDER);
+        assert_eq!(stats_provider_key(Some("  ")), UNKNOWN_PROVIDER);
+        // Pin the wire value literally, independent of the constant chain
+        // (migration 0059 / PROTOCOL.md §5.36).
+        assert_eq!(stats_provider_key(None), "unknown");
     }
 
     #[test]
