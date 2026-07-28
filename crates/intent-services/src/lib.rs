@@ -8690,6 +8690,7 @@ impl WorkspaceApi for Services {
                         base_commit_sha: input.base_commit_sha,
                         status: WorkspaceStatus::Active,
                         status_message: input.status_message,
+                        status_image_asset_id: None,
                         // Derived, read-only; never persisted (§9.9).
                         activity: WorkspaceActivity::Idle,
                         attention: WorkspaceAttention::None,
@@ -9425,6 +9426,14 @@ impl WorkspaceApi for Services {
                 normalised.status_message = Some(String::new());
             }
         }
+        // A whitespace/empty `statusImageAssetId` persists as a clear (the
+        // apply path below folds it to `None`), so the delta must carry the
+        // `null` clear signal — not the raw whitespace — for §6.5 mirroring.
+        if let Some(Some(raw)) = normalised.status_image_asset_id.as_ref() {
+            if raw.trim().is_empty() {
+                normalised.status_image_asset_id = Some(None);
+            }
+        }
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
             let mut ws = if id.is_chief() {
@@ -9441,6 +9450,13 @@ impl WorkspaceApi for Services {
                 // `ws.workspace.details()` and every downstream reader see `None`
                 // instead of `Some("")` for a cleared value.
                 ws.status_message = if v.trim().is_empty() { None } else { Some(v) };
+            }
+            // Clearable status-screenshot asset id (intent-hq/monorepo#997):
+            // wire `null` (`Some(None)`) clears, `Some(Some(id))` sets,
+            // missing leaves untouched — same double-option contract as the
+            // PR fields below.
+            if let Some(v) = update.status_image_asset_id {
+                ws.status_image_asset_id = v.filter(|s| !s.trim().is_empty());
             }
             if let Some(v) = update.branch {
                 ws.branch = v;
@@ -10098,6 +10114,7 @@ impl WorkspaceApi for Services {
                 base_commit_sha: None,
                 status: WorkspaceStatus::Active,
                 status_message: None,
+                status_image_asset_id: None,
                 activity: WorkspaceActivity::Idle,
                 attention: WorkspaceAttention::None,
                 created_at: now.clone(),

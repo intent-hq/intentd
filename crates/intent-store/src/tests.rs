@@ -49,6 +49,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
             WorkspaceStatus::Active
         },
         status_message: Some("working".to_string()),
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::Unread,
         created_at: ts.clone(),
@@ -4248,6 +4249,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     base_commit_sha: None,
                     status: WorkspaceStatus::Active,
                     status_message: None,
+                    status_image_asset_id: None,
                     activity: WorkspaceActivity::Idle,
                     attention: WorkspaceAttention::Unread,
                     created_at: ts.clone(),

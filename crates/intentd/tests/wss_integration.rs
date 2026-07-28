@@ -137,6 +137,11 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 /// since `note.create` mints a fresh `NoteId` by design. `auggie_bin`
 /// optionally pins the auggie binary `agent.enhancePrompt` spawns (§5.31) to a
 /// deterministic fixture script.
+/// Note: the event bus is attached to `Services` (`with_event_bus`), so
+/// service-emitted events (`workspace:updated`, note events, …) flow to
+/// `events.subscribe` subscribers in EVERY test built on this harness — tests
+/// that read frames in a loop should match on `id`/`method` rather than
+/// assume the next frame is their RPC response.
 async fn make_services(
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
@@ -152,7 +157,8 @@ async fn make_services(
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
     let mut services = Services::new(store.clone())
         .with_assets_root(dir.join("assets"))
-        .with_workspaces_root(workspaces_root);
+        .with_workspaces_root(workspaces_root)
+        .with_event_bus(bus.clone());
     if let Some(bin) = auggie_bin {
         services = services.with_auggie_bin(bin);
     }
@@ -2537,6 +2543,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: None,
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::None,
         created_at: ts.clone(),
@@ -2740,6 +2747,181 @@ async fn wss_task_list_empty_workspace_emits_zero_stats() {
     assert_eq!(result["stats"]["total"], 0);
     assert_eq!(result["stats"]["completed"], 0);
     assert_eq!(result["stats"]["inProgress"], 0);
+
+    srv.ws.stop().await;
+}
+
+/// `workspace.update` with the clearable `statusImageAssetId` field
+/// (intent-hq/monorepo#997 part 1) over the real WSS wire: setting an asset id
+/// persists it, surfaces it on `workspace.get`, and emits a self-sufficient
+/// `workspace:updated` event whose `changes` delta carries the new value;
+/// a wire `null` clears the stored id (and the cleared field is omitted from
+/// the returned `Workspace` payload per `skip_serializing_if`).
+#[tokio::test]
+async fn wss_workspace_update_status_image_asset_id_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let ws_id = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws_id))
+        .await
+        .expect("insert workspace");
+
+    // One persistent connection: subscribe first so the `workspace:updated`
+    // notification from the mutation below is delivered to this client.
+    let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
+    let rpc = |id: i64, method: &str, params: Value| {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .to_string()
+    };
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame)).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+
+    let sub = send_and_wait(
+        &mut ws,
+        rpc(
+            1,
+            "events.subscribe",
+            serde_json::json!({
+                "eventTypes": ["workspace:updated"],
+                "workspaceId": ws_id.as_str(),
+            }),
+        ),
+        1,
+    )
+    .await;
+    assert!(
+        sub["result"]["subscriptionId"].is_string(),
+        "subscribe: {sub}"
+    );
+
+    // Set: camelCase wire field lands on the row and echoes in the response.
+    let resp = send_and_wait(
+        &mut ws,
+        rpc(
+            2,
+            "workspace.update",
+            serde_json::json!({
+                "workspaceId": ws_id.as_str(),
+                "statusImageAssetId": "asset-abc123",
+            }),
+        ),
+        2,
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "update errored: {resp}");
+    assert_eq!(
+        resp["result"]["workspace"]["statusImageAssetId"], "asset-abc123",
+        "response workspace carries the new asset id: {resp}"
+    );
+
+    // The `workspace:updated` event's `changes` delta is self-sufficient
+    // (§6.5): subscribers see the new asset id without a follow-up read.
+    let evt = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "workspace:updated"
+                    {
+                        return v["params"]["event"].clone();
+                    }
+                }
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = ws.send(Message::Pong(p)).await;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for workspace:updated");
+    assert_eq!(evt["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        evt["data"]["changes"]["statusImageAssetId"], "asset-abc123",
+        "event delta carries the asset id: {evt}"
+    );
+
+    // Read-back proves persistence through the store.
+    let got = send_and_wait(
+        &mut ws,
+        rpc(
+            3,
+            "workspace.get",
+            serde_json::json!({ "workspaceId": ws_id.as_str() }),
+        ),
+        3,
+    )
+    .await;
+    assert_eq!(
+        got["result"]["workspace"]["statusImageAssetId"],
+        "asset-abc123"
+    );
+
+    // Clear: wire `null` (double-option `Some(None)`) empties the column and
+    // the cleared field is omitted from the returned payload.
+    let cleared = send_and_wait(
+        &mut ws,
+        rpc(
+            4,
+            "workspace.update",
+            serde_json::json!({
+                "workspaceId": ws_id.as_str(),
+                "statusImageAssetId": Value::Null,
+            }),
+        ),
+        4,
+    )
+    .await;
+    assert!(cleared.get("error").is_none(), "clear errored: {cleared}");
+    // `skip_serializing_if` contract: the cleared field must be OMITTED from
+    // the payload, not serialized as an explicit `null` (index-based `is_null`
+    // can't tell the two apart, `get` can).
+    assert!(
+        cleared["result"]["workspace"]
+            .as_object()
+            .expect("workspace object")
+            .get("statusImageAssetId")
+            .is_none(),
+        "cleared asset id must be omitted, not null: {cleared}"
+    );
+    let got = send_and_wait(
+        &mut ws,
+        rpc(
+            5,
+            "workspace.get",
+            serde_json::json!({ "workspaceId": ws_id.as_str() }),
+        ),
+        5,
+    )
+    .await;
+    assert!(
+        got["result"]["workspace"]
+            .as_object()
+            .expect("workspace object")
+            .get("statusImageAssetId")
+            .is_none(),
+        "clear persists as an omitted field: {got}"
+    );
 
     srv.ws.stop().await;
 }

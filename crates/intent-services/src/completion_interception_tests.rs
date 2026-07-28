@@ -89,6 +89,7 @@ mod tests {
             base_commit_sha: None,
             status: WorkspaceStatus::Active,
             status_message: None,
+            status_image_asset_id: None,
             activity: intent_core::WorkspaceActivity::Idle,
             attention: intent_core::WorkspaceAttention::None,
             created_at: now.clone(),

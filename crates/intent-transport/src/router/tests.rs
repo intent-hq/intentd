@@ -27,6 +27,7 @@ fn sample_ws() -> Workspace {
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: None,
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::None,
         created_at: "t0".to_string(),

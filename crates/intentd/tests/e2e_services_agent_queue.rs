@@ -37,6 +37,7 @@ fn workspace(id: &WorkspaceId, path: PathBuf) -> Workspace {
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: None,
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::None,
         created_at: ts.clone(),

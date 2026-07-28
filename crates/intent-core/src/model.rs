@@ -137,6 +137,13 @@ pub struct Workspace {
     pub status: WorkspaceStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
+    /// Asset id of the agent-authored workspace status screenshot
+    /// (intent-hq/monorepo#997). Points at a content-addressed asset stored
+    /// via the `note.saveAsset` machinery; clients render it with
+    /// `note.readAsset` / `workspace-asset://<workspaceId>/<assetId>`.
+    /// Omitted (not `null`) until an agent sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_image_asset_id: Option<String>,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -253,6 +260,7 @@ pub fn chief_workspace() -> Workspace {
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: None,
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::None,
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
@@ -669,6 +677,15 @@ pub struct WorkspaceUpdate {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
+    /// Clearable status-screenshot asset id (intent-hq/monorepo#997): a wire
+    /// `null` (`Some(None)`) clears the stored value, `Some(Some(id))` sets
+    /// it, missing (`None`) leaves it untouched.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub status_image_asset_id: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2868,6 +2885,7 @@ mod tests {
             base_commit_sha: None,
             status: WorkspaceStatus::Active,
             status_message: None,
+            status_image_asset_id: None,
             activity: WorkspaceActivity::Idle,
             attention: WorkspaceAttention::None,
             created_at: ts.clone(),

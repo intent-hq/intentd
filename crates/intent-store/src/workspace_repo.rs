@@ -11,17 +11,17 @@ use crate::agent_repo::fetch_agent_usage_rows;
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
-    status_message, attention, path, repository_path, repository_owner, repository_name, \
-    worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, pr_status, \
-    active_pull_request, pull_requests, archived, archived_at, tags, created_at, updated_at, \
-    last_activity, token_usage, setup_script, checkout_mode";
+    status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
+    repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
+    pr_url, pr_status, active_pull_request, pull_requests, archived, archived_at, tags, \
+    created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode";
 
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -31,6 +31,7 @@ impl Store {
             .bind(&ws.base_commit_sha)
             .bind(enum_to_db(&ws.status)?)
             .bind(&ws.status_message)
+            .bind(&ws.status_image_asset_id)
             .bind(enum_to_db(&ws.attention)?)
             .bind(&ws.path)
             .bind(&ws.repository_path)
@@ -80,12 +81,12 @@ impl Store {
     pub async fn update_workspace(&self, ws: &Workspace) -> Result<()> {
         let res = sqlx::query(
             "UPDATE workspace SET title=?, branch=?, base_ref=?, base_commit_sha=?, status=?, \
-             status_message=?, attention=?, path=?, repository_path=?, repository_owner=?, \
-             repository_name=?, worktree_path=?, scope=?, skip_worktree=?, is_remote=?, \
-             default_model=?, pr_number=?, pr_url=?, pr_status=?, active_pull_request=?, \
-             pull_requests=?, archived=?, archived_at=?, tags=?, created_at=?, updated_at=?, \
-             last_activity=?, token_usage=?, setup_script=?, checkout_mode=? \
-             WHERE id=?",
+             status_message=?, status_image_asset_id=?, attention=?, path=?, repository_path=?, \
+             repository_owner=?, repository_name=?, worktree_path=?, scope=?, skip_worktree=?, \
+             is_remote=?, default_model=?, pr_number=?, pr_url=?, pr_status=?, \
+             active_pull_request=?, pull_requests=?, archived=?, archived_at=?, tags=?, \
+             created_at=?, updated_at=?, last_activity=?, token_usage=?, setup_script=?, \
+             checkout_mode=? WHERE id=?",
         )
         .bind(&ws.title)
         .bind(&ws.branch)
@@ -93,6 +94,7 @@ impl Store {
         .bind(&ws.base_commit_sha)
         .bind(enum_to_db(&ws.status)?)
         .bind(&ws.status_message)
+        .bind(&ws.status_image_asset_id)
         .bind(enum_to_db(&ws.attention)?)
         .bind(&ws.path)
         .bind(&ws.repository_path)
@@ -449,6 +451,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         base_commit_sha: col(row, "base_commit_sha")?,
         status: enum_from_db::<WorkspaceStatus>(&col::<String>(row, "status")?)?,
         status_message: col(row, "status_message")?,
+        status_image_asset_id: col(row, "status_image_asset_id")?,
         // Derived, read-only; never persisted (§9.9).
         activity: WorkspaceActivity::Idle,
         attention: enum_from_db::<WorkspaceAttention>(&col::<String>(row, "attention")?)?,

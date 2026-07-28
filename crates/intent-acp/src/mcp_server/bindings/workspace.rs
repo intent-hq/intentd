@@ -25,6 +25,8 @@ pub(crate) const PRELUDE: &str = r#"
         setTitle: (title) => host({ method: 'workspace.setTitle', args: { title } }),
         setStatusMessage: (statusMessage) =>
             host({ method: 'workspace.setStatusMessage', args: { statusMessage } }),
+        setStatusImage: (image) =>
+            host({ method: 'workspace.setStatusImage', args: { image } }),
         setAgentName: (name) => host({ method: 'workspace.setAgentName', args: { name } }),
         archive: () => host({ method: 'workspace.archive' }),
         unarchive: () => host({ method: 'workspace.unarchive' }),
@@ -50,6 +52,7 @@ pub(crate) async fn dispatch(
         "details" => details(api, ws).await,
         "setTitle" => set_title(api, ws, args).await,
         "setStatusMessage" => set_status_message(api, ws, args).await,
+        "setStatusImage" => set_status_image(api, ws, args).await,
         "setAgentName" => set_agent_name(api, caller_agent_id, args).await,
         "archive" => archive(api, ws, caller_agent_id).await,
         "unarchive" => unarchive(api, ws).await,
@@ -102,6 +105,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
                 "hasTitle": has_title,
                 "status": w.status,
                 "statusMessage": status_message,
+                "statusImageAssetId": w.status_image_asset_id,
                 "branch": w.branch,
                 "repositoryName": w.repository_name,
                 "tags": w.tags,
@@ -113,6 +117,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
             "hasTitle": false,
             "status": WorkspaceStatus::Active,
             "statusMessage": Value::Null,
+            "statusImageAssetId": Value::Null,
             "branch": Value::Null,
             "repositoryName": Value::Null,
             "tags": Vec::<String>::new(),
@@ -194,6 +199,84 @@ async fn set_status_message(
         .map(Value::String)
         .unwrap_or(Value::Null);
     Ok(json!({ "ok": true, "statusMessage": out }))
+}
+
+/// `ws.workspace.setStatusImage({ data, mimeType, originalName? } | null)`
+/// (intent-hq/monorepo#997 part 1): store an agent-authored status screenshot
+/// through the content-addressed asset machinery (`note.saveAsset`) and point
+/// `Workspace.statusImageAssetId` at it; `null` clears the reference. The
+/// asset write happens BEFORE the workspace update so a failed save never
+/// leaves a dangling asset id on the row.
+async fn set_status_image(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    chief_guard(ws, "setStatusImage")?;
+    // Missing vs explicit `null` matters: a clear is destructive, so a no-arg
+    // call (the prelude's JSON.stringify drops `undefined` keys) errors
+    // instead of silently clearing — only an explicit `null` clears.
+    let Some(image) = args.get("image") else {
+        return Err(
+            "image is required: pass { data, mimeType, originalName? } to set or null to clear"
+                .to_string(),
+        );
+    };
+    if image.is_null() {
+        let update = WorkspaceUpdate {
+            status_image_asset_id: Some(None),
+            ..Default::default()
+        };
+        api.update_workspace(ws.clone(), update)
+            .await
+            .map_err(map_err)?;
+        return Ok(json!({ "ok": true, "statusImageAssetId": Value::Null }));
+    }
+    let Some(obj) = image.as_object() else {
+        return Err(
+            "image must be an object { data, mimeType, originalName? } or null".to_string(),
+        );
+    };
+    let data = obj
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "image.data (base64) is required".to_string())?;
+    let mime_type = obj
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "image.mimeType is required".to_string())?;
+    if !mime_type.starts_with("image/") {
+        return Err(format!(
+            "image.mimeType must be an image/* type, got `{mime_type}`"
+        ));
+    }
+    let original_name = obj
+        .get("originalName")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let saved = api
+        .save_asset(
+            ws.clone(),
+            data.to_string(),
+            mime_type.to_string(),
+            original_name,
+        )
+        .await
+        .map_err(map_err)?;
+    let update = WorkspaceUpdate {
+        status_image_asset_id: Some(Some(saved.asset_id.clone())),
+        ..Default::default()
+    };
+    api.update_workspace(ws.clone(), update)
+        .await
+        .map_err(map_err)?;
+    Ok(json!({
+        "ok": true,
+        "statusImageAssetId": saved.asset_id,
+        "url": saved.url,
+    }))
 }
 
 async fn set_agent_name(
