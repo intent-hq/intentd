@@ -154,8 +154,9 @@ pub struct TurnOptions {
     pub prepend_file_blocks: Option<serde_json::Value>,
     /// Turn correlation id (monorepo#1022): identifies the logical turn across
     /// terminal-failure requeues and redrives. Drained turns carry the queue
-    /// entry's `turn_id`; direct sends have one minted at
-    /// [`AgentManager::spawn_worker`] (the single worker-spawn choke point).
+    /// entry's `turn_id`; direct sends mint one in `send_message` (before the
+    /// user-row persist, so the RPC result and `agent:message` echo carry it),
+    /// with [`AgentManager::spawn_worker`] as the fallback mint site.
     /// `persist_error_and_requeue` threads it onto the requeued entry so a
     /// retry of the same logical turn keeps the original id.
     pub turn_id: Option<String>,
@@ -3145,16 +3146,17 @@ impl AgentManager {
                 self.services.queue_snapshot(&agent_id),
             )
             .await;
-        // Drain-start signal (monorepo#1022): the entry just flipped to
-        // in-flight; its `turnId` covers redrives that skip the user-row
-        // append below.
-        self.services
-            .publish_queue_processing(&agent_id, &workspace_id, &next)
-            .await;
         // Stale-redrive check (#576) BEFORE the transcript append so the
         // annotated content reaches both the persisted user row and the
         // provider prompt.
         let stale = self.annotate_stale_redrive(&agent_id, &mut next).await;
+        // Drain-start signal (monorepo#1022): the entry just flipped to
+        // in-flight; its `turnId` covers redrives that skip the user-row
+        // append below. Emitted AFTER the stale-redrive annotation so the
+        // payload's `content` matches what is persisted/sent to the provider.
+        self.services
+            .publish_queue_processing(&agent_id, &workspace_id, &next)
+            .await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
         // began; otherwise persist now (with `persist_user`'s bounded retry).
@@ -5489,16 +5491,18 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
-            // Drain-start signal (monorepo#1022): covers redrives that skip
-            // the user-row append below.
-            mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
-                .await;
             // Stale-redrive check (#576) BEFORE the transcript append so the
             // annotated content reaches both the persisted user row and the
             // provider prompt. Runs before the next iteration's report clear,
             // so `completion_report_timestamp` is still visible here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Drain-start signal (monorepo#1022): covers redrives that skip
+            // the user-row append below. Emitted AFTER the stale-redrive
+            // annotation so the payload's `content` matches what is
+            // persisted/sent to the provider.
+            mgr.services
+                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             // A terminal-failure requeue whose user row already reached the
@@ -5561,15 +5565,16 @@ async fn run_message_worker(
                     mgr.services.queue_snapshot(&agent_id),
                 )
                 .await;
-            // Drain-start signal (monorepo#1022): same contract as the
-            // pre-release drain arm.
-            mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, &next)
-                .await;
             // Stale-redrive check (#576): same contract as the pre-release
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Drain-start signal (monorepo#1022): same contract as the
+            // pre-release drain arm — emitted AFTER the stale-redrive
+            // annotation so the payload's `content` matches the turn.
+            mgr.services
+                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             user_persisted = if next.persisted {
