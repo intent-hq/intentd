@@ -4645,6 +4645,34 @@ fn initialize_repository_blocking(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `workspace.create` wrapper around [`initialize_repository_blocking`]:
+/// runs the blocking init off the async runtime and re-labels failures as
+/// `workspace.create: repository initialization failed: <detail>` (typed
+/// `-32603`, PROTOCOL §5.1). A no-op when the target already has a
+/// resolvable HEAD.
+async fn initialize_repository_for_create(repo_path: PathBuf) -> Result<()> {
+    tokio::task::spawn_blocking(move || initialize_repository_blocking(&repo_path))
+        .await
+        .map_err(|e| {
+            Error::Internal(format!(
+                "workspace.create: repository initialization task failed: {e}"
+            ))
+        })?
+        .map_err(|e| {
+            let detail = match e {
+                Error::Internal(msg) => msg,
+                other => other.to_string(),
+            };
+            let detail = detail
+                .strip_prefix("workspace.initializeRepository: ")
+                .map(str::to_string)
+                .unwrap_or(detail);
+            Error::Internal(format!(
+                "workspace.create: repository initialization failed: {detail}"
+            ))
+        })
+}
+
 /// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
 /// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
 /// does git-metadata work only: capture the checked-out branch, detach the
@@ -8429,37 +8457,42 @@ impl WorkspaceApi for Services {
                             // fails the whole create pre-insert (no row
                             // persisted, no `workspace:created`), matching the
                             // clone-failure rule (PROTOCOL §5.1). Skipped when
-                            // a `githubUrl` clone is in play (above) or the
-                            // path already carries a `.git` (existing_repo).
-                            if let Some(repo_path) = input
+                            // a `githubUrl` clone is in play (above). A
+                            // missing/empty `repositoryPath` is a client bug —
+                            // reject with `-32602` rather than fall through to
+                            // the silent row-only path #962 eliminates.
+                            let repo_path = input
                                 .repository_path
                                 .as_deref()
                                 .filter(|p| !p.is_empty())
                                 .map(PathBuf::from)
-                            {
-                                tokio::task::spawn_blocking(move || {
-                                    initialize_repository_blocking(&repo_path)
-                                })
-                                .await
-                                .map_err(|e| {
-                                    Error::Internal(format!(
-                                        "workspace.create: repository initialization task failed: {e}"
-                                    ))
-                                })?
-                                .map_err(|e| {
-                                    let detail = match e {
-                                        Error::Internal(msg) => msg,
-                                        other => other.to_string(),
-                                    };
-                                    let detail = detail
-                                        .strip_prefix("workspace.initializeRepository: ")
-                                        .map(str::to_string)
-                                        .unwrap_or(detail);
-                                    Error::Internal(format!(
-                                        "workspace.create: repository initialization failed: {detail}"
-                                    ))
+                                .ok_or_else(|| {
+                                    Error::InvalidParams(
+                                        "repositoryPath is required when isNewRepo is true"
+                                            .to_string(),
+                                    )
                                 })?;
-                            }
+                            initialize_repository_for_create(repo_path).await?;
+                        }
+                    } else if input.is_new_repo.unwrap_or(false)
+                        && input
+                            .github_url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .is_none()
+                    {
+                        // Half-initialized recovery (#962 review): a mid-init
+                        // failure can leave `.git` without a resolvable HEAD,
+                        // which the bare `.git`-existence gate above counts as
+                        // an existing repo — a retried create would then skip
+                        // init and fail downstream provisioning on the base
+                        // ref. Re-run the init for `isNewRepo` creates: it
+                        // no-ops when HEAD already resolves, so healthy repos
+                        // are untouched, and the clone arm plus legacy
+                        // (non-`isNewRepo`) behavior stay unchanged.
+                        if let Some(repo_path) = existing_repo.clone() {
+                            initialize_repository_for_create(repo_path).await?;
                         }
                     }
                     // Repository owner/name derivation from origin remote (STAB-64):

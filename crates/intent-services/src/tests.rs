@@ -12982,6 +12982,84 @@ mod worktree_provisioning {
         }
     }
 
+    /// intent-hq/monorepo#962 review hardening: `isNewRepo: true` without a
+    /// usable `repositoryPath` is a client bug — reject with `-32602` instead
+    /// of minting a silent row-only workspace.
+    #[tokio::test]
+    async fn create_with_is_new_repo_missing_repository_path_is_invalid_params() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-newrepo-noparam-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        for repository_path in [None, Some(String::new())] {
+            let err = svc
+                .create_workspace(
+                    WorkspaceCreate {
+                        repository_path,
+                        is_new_repo: Some(true),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect_err("create must reject isNewRepo without repositoryPath");
+            assert!(
+                matches!(&err, Error::InvalidParams(msg)
+                    if msg == "repositoryPath is required when isNewRepo is true"),
+                "got: {err}"
+            );
+            assert_eq!(err.code(), -32602);
+        }
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+    }
+
+    /// intent-hq/monorepo#962 review hardening: a mid-init failure can leave
+    /// `.git` without a resolvable HEAD; a retried `isNewRepo` create must
+    /// finish the initialization instead of treating the dir as an existing
+    /// repo and failing provisioning downstream on the base ref.
+    #[tokio::test]
+    async fn create_with_is_new_repo_recovers_half_initialized_dir() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let repo_dir = unique_dir("intentd-newrepo-halfinit");
+        // Simulate a crash after `git init` but before the initial commit:
+        // `.git` exists, HEAD is unborn.
+        let out = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo_dir.0)
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init failed");
+        let root = unique_dir("intentd-newrepo-halfinit-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create recovers the half-initialized dir")
+            .workspace;
+
+        let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
+        let head = src.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap().trim(), "Initial commit");
+        assert!(
+            ws.worktree_path.is_some(),
+            "provisioning runs after recovery"
+        );
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(head.id().to_string().as_str())
+        );
+    }
+
     /// Build Services with the `workspace.cowIsolation` setting applied.
     fn services_with_cow_isolation(
         store: Store,
