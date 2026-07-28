@@ -3540,16 +3540,24 @@ impl Services {
                 // Remove the directory via the in-hand path: a hard
                 // `agent.delete` already cascaded the sandbox row away
                 // (FK ON DELETE CASCADE), so a record lookup can't be
-                // relied on for the path.
+                // relied on for the path. The directory is a full CoW
+                // checkout (same size class as the clone), so removal runs
+                // on the blocking pool (monorepo#954).
                 if path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&path) {
-                        tracing::warn!(
-                            workspace = %workspace_id,
-                            agent = %agent_id,
-                            error = %e,
-                            "failed to remove orphaned sandbox directory after agent deletion"
-                        );
-                    }
+                    let dir = path.clone();
+                    let workspace_id = workspace_id.clone();
+                    let agent_id = agent_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(e) = std::fs::remove_dir_all(&dir) {
+                            tracing::warn!(
+                                workspace = %workspace_id,
+                                agent = %agent_id,
+                                error = %e,
+                                "failed to remove orphaned sandbox directory after agent deletion"
+                            );
+                        }
+                    })
+                    .await;
                 }
                 // Best-effort: drop the record too (still present on the
                 // soft-delete path; already gone after a hard delete).

@@ -162,8 +162,21 @@ pub async fn provision_sandbox(
         // The agent session row can vanish mid-clone (`agent.delete` races
         // the background provisioning; the sandbox FK cascades) — don't
         // strand the just-cloned directory when the record insert fails.
+        // Best-effort, but log failures so a leaked clone is observable.
         let cleanup_path = sandbox_path.clone();
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleanup_path)).await;
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleanup_path)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(remove_err)) => tracing::warn!(
+                sandbox_path = %sandbox_path.display(),
+                error = %remove_err,
+                "failed to remove sandbox directory after record insert failure"
+            ),
+            Err(join_err) => tracing::warn!(
+                sandbox_path = %sandbox_path.display(),
+                error = %join_err,
+                "sandbox cleanup task failed after record insert failure"
+            ),
+        }
         return Err(e);
     }
 
@@ -223,7 +236,15 @@ fn provision_sandbox_blocking(
     // itself is still unsupported (e.g. a nested cross-volume mount inside the
     // tree); degrade to shared mode instead of failing the agent start.
     if let Err(e) = cow_clone(&user_dir, &sandbox_path) {
-        let _ = std::fs::remove_dir_all(&sandbox_path);
+        if let Err(remove_err) = std::fs::remove_dir_all(&sandbox_path) {
+            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    sandbox_path = %sandbox_path.display(),
+                    error = %remove_err,
+                    "failed to remove partial sandbox directory after clone failure"
+                );
+            }
+        }
         if matches!(e, Error::Unsupported(_)) {
             tracing::warn!(
                 user_dir = %user_dir.display(),
