@@ -4667,7 +4667,19 @@ impl Services {
             Some(caller) => self.store.get_agent_session(caller).await.ok(),
             None => None,
         };
-        if let Some(session) = caller_session.as_ref() {
+        // monorepo#994: a Deleted caller can never receive the wake (the
+        // `agent_watch_completion_op` deleted-parent rationale), so it gets
+        // neither the pre-gate nor a SUB-1 watch — mirroring
+        // `agent_delegate_op`'s deleted-parent guard. A failed lookup (`None`)
+        // keeps the fallback-anchor behavior and still registers a watch.
+        let caller_deleted = caller_session
+            .as_ref()
+            .map(|s| s.status == AgentStatus::Deleted)
+            .unwrap_or(false);
+        if let Some(session) = caller_session
+            .as_ref()
+            .filter(|s| s.status != AgentStatus::Deleted)
+        {
             crate::agent_subscriptions::check_watch_scope(&session.workspace_id, &workspace_id)?;
         }
 
@@ -4828,7 +4840,12 @@ impl Services {
             // ungrouped watch for this pair; for the queued branch, extend
             // its 5-minute leak-guard by respawning the cleanup timer against
             // the reused subscription id.
-            if let Some(caller) = input.caller_agent_id.clone() {
+            //
+            // monorepo#994: skipped entirely for a Deleted caller (see
+            // `caller_deleted` at the pre-gate) — the response then keeps the
+            // caller-less shape (no `subscriptionId` / `message`), mirroring
+            // `agent_delegate_op`'s deleted-parent guard.
+            if let Some(caller) = input.caller_agent_id.clone().filter(|_| !caller_deleted) {
                 // SUB-2: only reuse a live ungrouped watch when its
                 // `one_shot` mode matches this call. A queued wake needs a
                 // non-oneShot watch (it must survive the assignee's current
@@ -5062,7 +5079,11 @@ impl Services {
         // for the pair — always a fresh oneShot registration (no SUB-2 reuse
         // and no queued leak-guard: a brand-new agent has no in-flight turn
         // for the context message to queue behind).
-        if let Some(caller) = input.caller_agent_id.clone() {
+        //
+        // monorepo#994: skipped entirely for a Deleted caller (see
+        // `caller_deleted` at the pre-gate), mirroring `agent_delegate_op`'s
+        // deleted-parent guard.
+        if let Some(caller) = input.caller_agent_id.clone().filter(|_| !caller_deleted) {
             // monorepo#932: reuse the single pre-gate session lookup so the
             // gating decision and this anchor resolution cannot diverge.
             let caller_name = caller_session
