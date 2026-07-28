@@ -2058,8 +2058,10 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
 /// the ephemeral families. Tool calls are the dominant share of the event
 /// table (87% of live data on the dev seat) and no consumer reads them beyond
 /// bounded recent windows — replay uses `agent_message`, live streaming uses
-/// the in-memory bus — so 24h is comfortably conservative.
-const TOOL_CALL_RETENTION_HOURS: u32 = 24;
+/// the in-memory bus — so 6h comfortably covers every durable reader
+/// (`event.agentActivity` / `event.workspaceSummary` default to ≤60-minute
+/// windows) while capping steady-state storage at a quarter of the old 24h.
+const TOOL_CALL_RETENTION_HOURS: u32 = 6;
 
 /// Upper bound on pages released per `PRAGMA incremental_vacuum(N)` call in
 /// the retention loop. 2000 pages ≈ 8 MiB at the 4 KiB default page size —

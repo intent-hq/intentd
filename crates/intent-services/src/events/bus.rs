@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use intent_core::{Error, Event, Result};
 use intent_store::{NewEvent, Store};
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -42,6 +43,23 @@ const WRITER_BATCH_SIZE: usize = 64;
 
 /// Max time the writer task waits to accumulate events before flushing (ms).
 const WRITER_BATCH_WINDOW_MS: u64 = 20;
+
+/// Byte cap on the persisted `data_json` of `agent:tool:call` events. Payloads
+/// at or under the cap persist verbatim; larger ones have their free-form
+/// fields (`output`, `input`, `registeredAttachments`) replaced with a bounded
+/// preview + original byte count before the row is written. 16 KiB sits at the
+/// low end of the 16–64 KiB range considered: on the dev seat the mean payload
+/// is ~3 KiB (so >96% of events persist untouched) while the ~3% of rows above
+/// 16 KiB carried ~33% of all tool-call bytes — the cap bounds those outliers
+/// (historically multi-MB tool outputs) without losing signal for any reader.
+/// No consumer reads persisted `input`/`output` back: conversation replay uses
+/// `agent_message` rows, `event.agentActivity`/`event.workspaceSummary` read
+/// only `data.filesModified`, and the FE synthesizes live tool blocks from the
+/// broadcast, which keeps the FULL payload — only the durable row is capped.
+pub(crate) const TOOL_CALL_PERSIST_CAP_BYTES: usize = 16 * 1024;
+
+/// Serialized-JSON prefix retained as `preview` on each truncated field.
+const TOOL_CALL_FIELD_PREVIEW_BYTES: usize = 2 * 1024;
 
 /// Request sent to the writer task: the event to persist and a oneshot to
 /// return the result (or error).
@@ -224,19 +242,28 @@ async fn writer_task(
 }
 
 /// Helper: batch-insert pending events, resolve oneshots, and broadcast in order.
+/// Oversized `agent:tool:call` payloads are bounded in the persisted copy only
+/// ([`TOOL_CALL_PERSIST_CAP_BYTES`]); the broadcast (and the publisher's
+/// returned event) keeps the original full payload so live consumers (§7.1
+/// tool-block synthesis) are unaffected.
 async fn flush_batch(
     store: &Store,
     pending: &mut Vec<WriterRequest>,
     broadcast_tx: &broadcast::Sender<Arc<Event>>,
 ) {
-    let events: Vec<NewEvent> = pending.iter().map(|(ev, _)| ev.clone()).collect();
+    let events: Vec<NewEvent> = pending
+        .iter()
+        .map(|(ev, _)| truncate_tool_call_for_persist(ev).unwrap_or_else(|| ev.clone()))
+        .collect();
     let result = store.insert_events(&events).await;
 
     match result {
         Ok(stored) => {
             // Resolve each oneshot with its corresponding event.
-            for (i, (_, tx)) in pending.drain(..).enumerate() {
-                let evt = stored[i].clone();
+            for (i, (orig, tx)) in pending.drain(..).enumerate() {
+                let mut evt = stored[i].clone();
+                // Restore the original payload (identical when not truncated).
+                evt.data = orig.data;
                 let _ = tx.send(Ok(evt.clone()));
                 // Broadcast in insertion order (append-then-broadcast semantics).
                 let _ = broadcast_tx.send(Arc::new(evt));
@@ -303,4 +330,91 @@ async fn delivery_task(
             }
         }
     }
+}
+
+/// Returns a persistence copy of `ev` with its `data` bounded to
+/// [`TOOL_CALL_PERSIST_CAP_BYTES`], or `None` when the event is not an
+/// `agent:tool:call` or its payload already fits (persist the original as-is).
+///
+/// Oversized payloads have each free-form field (`output`, `input`,
+/// `registeredAttachments`) replaced with a marker object:
+/// `{ "truncated": true, "originalBytes": N, "preview": "…" }` where `preview`
+/// is the first [`TOOL_CALL_FIELD_PREVIEW_BYTES`] bytes of the field's
+/// serialized JSON. If the payload is still over the cap afterwards (e.g. an
+/// unexpectedly huge scalar field), everything except identity fields is
+/// dropped and a top-level `"truncated": true` is set.
+fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
+    if ev.event_type != intent_core::events::AGENT_TOOL_CALL {
+        return None;
+    }
+    if json_byte_len(&ev.data) <= TOOL_CALL_PERSIST_CAP_BYTES {
+        return None;
+    }
+    let mut data = ev.data.clone();
+    if let Some(obj) = data.as_object_mut() {
+        for field in ["output", "input", "registeredAttachments"] {
+            if let Some(v) = obj.get(field) {
+                let serialized = v.to_string();
+                if serialized.len() > TOOL_CALL_FIELD_PREVIEW_BYTES {
+                    obj.insert(
+                        field.to_string(),
+                        json!({
+                            "truncated": true,
+                            "originalBytes": serialized.len(),
+                            "preview": utf8_prefix(&serialized, TOOL_CALL_FIELD_PREVIEW_BYTES),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    // Defensive fallback: some other field is unexpectedly huge. Keep only
+    // identity fields (plus `filesModified`, the one field `event.agentActivity`
+    // reads back from these rows) so the row stays bounded.
+    if json_byte_len(&data) > TOOL_CALL_PERSIST_CAP_BYTES {
+        if let Some(obj) = data.as_object_mut() {
+            let keep = [
+                "toolCallId",
+                "toolName",
+                "title",
+                "status",
+                "agentId",
+                "toolKind",
+                "filesModified",
+            ];
+            obj.retain(|k, _| keep.contains(&k.as_str()));
+            obj.insert("truncated".to_string(), Value::Bool(true));
+        }
+    }
+    Some(NewEvent {
+        workspace_id: ev.workspace_id.clone(),
+        timestamp: ev.timestamp.clone(),
+        event_type: ev.event_type.clone(),
+        actor: ev.actor.clone(),
+        session_id: ev.session_id.clone(),
+        correlation_id: ev.correlation_id.clone(),
+        parent_event_id: ev.parent_event_id.clone(),
+        metadata: ev.metadata.clone(),
+        data,
+    })
+}
+
+/// Byte length of a value's serialized JSON (what `insert_events` writes).
+fn json_byte_len(v: &Value) -> usize {
+    serde_json::to_string(v)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// The longest prefix of `s` that is at most `max_bytes` bytes and ends on a
+/// UTF-8 character boundary.
+fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
