@@ -197,9 +197,14 @@ pub fn not_installed_detail(
             match (primary_resolved, secondary_resolved) {
                 (true, false) => format!("{secondary} not on PATH; {command} found"),
                 (false, true) => format!("{command} not on PATH; {secondary} found"),
-                // Both missing (the both-present combination never reaches
-                // here — the provider would be installed).
-                _ => format!("{command} and {secondary} not on PATH"),
+                (false, false) => format!("{command} and {secondary} not on PATH"),
+                // Inconsistent input — a not-installed provider never has
+                // both binaries resolved. Handled explicitly (this is a pub
+                // helper) so a future caller can't print a false "not on
+                // PATH" diagnosis.
+                (true, true) => {
+                    format!("{command} and {secondary} found, but provider reported not installed")
+                }
             }
         }
         None => format!("{command} not on PATH"),
@@ -741,6 +746,11 @@ mod find_provider_binary_tests {
         assert_eq!(
             not_installed_detail("opencode", false, Some(("unsloth", false))),
             "opencode and unsloth not on PATH"
+        );
+        // Inconsistent input (both resolved) must never claim "not on PATH".
+        assert_eq!(
+            not_installed_detail("opencode", true, Some(("unsloth", true))),
+            "opencode and unsloth found, but provider reported not installed"
         );
     }
 
