@@ -1344,6 +1344,13 @@ impl Services {
                         data["report"] = Value::String(report);
                     }
                 }
+                // `isWaitingForOtherAgents` is computed at emit time from the
+                // idle agent's pending completion watches (same derivation as
+                // the `AgentLite` flag) so notification clients can suppress
+                // alerts snapshot-consistently — a follow-up `agent.list`
+                // read can race the child's completion consuming the watch.
+                data["isWaitingForOtherAgents"] =
+                    Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
                 // DURABLE-BEFORE-OBSERVABLE: record delegation-group completion
                 // BEFORE publishing the idle event so the persisted state is
                 // correct if the daemon is killed immediately after the event.
@@ -1532,6 +1539,10 @@ impl Services {
                 data["report"] = Value::String(report);
             }
         }
+        // Same emit-time waiting flag as the prompt-turn idle (see
+        // `run_prompt_turn`) so wake-turn subscribers get the identical signal.
+        data["isWaitingForOtherAgents"] =
+            Value::Bool(!self.list_watches_for_parent(agent_id).is_empty());
         self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
             .await;
         self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
