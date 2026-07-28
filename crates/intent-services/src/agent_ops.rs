@@ -1311,6 +1311,10 @@ impl Services {
         let is_busy = self.agent_is_busy(session.id.clone());
         let (turn_in_flight, last_stream_activity_at) =
             self.live_turn_liveness_for(&session, is_busy);
+        // Count + page are two separate reads; consistent because the message
+        // log is insert-only (appends only extend the tail, so existing row
+        // positions never shift — a racing `replace_agent_messages` degrades
+        // no worse than an already-stale page token).
         let total = self.store.count_agent_messages(&agent_id).await?.max(0) as usize;
         let win = crate::pagination::page_window(total, limit, page_token.as_deref());
         let page: Vec<AgentMessage> = self
