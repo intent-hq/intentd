@@ -152,6 +152,13 @@ pub struct TurnOptions {
     /// `file_blocks`), emitted as ACP content blocks AHEAD of this turn's own
     /// attachments. Prompt-only, like `prepend_content`.
     pub prepend_file_blocks: Option<serde_json::Value>,
+    /// Turn correlation id (monorepo#1022): identifies the logical turn across
+    /// terminal-failure requeues and redrives. Drained turns carry the queue
+    /// entry's `turn_id`; direct sends have one minted at
+    /// [`AgentManager::spawn_worker`] (the single worker-spawn choke point).
+    /// `persist_error_and_requeue` threads it onto the requeued entry so a
+    /// retry of the same logical turn keeps the original id.
+    pub turn_id: Option<String>,
 }
 
 impl TurnOptions {
@@ -3155,6 +3162,7 @@ impl AgentManager {
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
+            turn_id: Some(next.turn_id.clone()),
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -3638,9 +3646,16 @@ impl AgentManager {
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         content: String,
-        options: TurnOptions,
+        mut options: TurnOptions,
         user_persisted: bool,
     ) {
+        // Every worker spawn flows through here, so this is the single mint
+        // point for the turn correlation id (monorepo#1022): direct sends get
+        // a fresh id; callers that already carry one (a drained queue entry's
+        // preserved `turn_id`) keep it.
+        if options.turn_id.is_none() {
+            options.turn_id = Some(new_message_id());
+        }
         let mgr = self.clone();
         let id = agent_id.clone();
         let handle = tokio::spawn(async move {
@@ -5452,6 +5467,7 @@ async fn run_message_worker(
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
+                turn_id: Some(next.turn_id.clone()),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -5513,6 +5529,7 @@ async fn run_message_worker(
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
+                turn_id: Some(next.turn_id.clone()),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -6014,9 +6031,14 @@ async fn persist_error_and_requeue(
     // on retry); direct sends have no prior timestamp and stamp `now_iso()`.
     // The combined-delivery `prepend_*` fields (monorepo#1014) ride along so
     // a failed zero-output interrupt turn's retry still delivers the
-    // preempted message ahead of the interrupt message.
+    // preempted message ahead of the interrupt message. The entry gets a NEW
+    // `id` but keeps the failed turn's ORIGINAL `turn_id` (monorepo#1022) so
+    // the retry correlates with the turn it redrives; a missing option (bare
+    // test wiring — spawn_worker always mints one) falls back to the new id.
+    let id = new_message_id();
     let queued = crate::agent_ops::QueuedMessage {
-        id: new_message_id(),
+        turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
+        id,
         content: content.to_string(),
         image_blocks: options.image_blocks.clone(),
         file_blocks: options.file_blocks.clone(),

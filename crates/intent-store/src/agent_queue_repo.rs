@@ -19,6 +19,9 @@ pub struct AgentQueueRow {
     pub position: i64,
     pub payload: serde_json::Value,
     pub created_at: String,
+    /// Turn correlation id (monorepo#1022): stable across terminal-failure
+    /// requeues. Legacy rows (NULL column) load as the row `id`.
+    pub turn_id: String,
 }
 
 impl Store {
@@ -40,11 +43,19 @@ impl Store {
         }
         let pool = self.write_pool();
         let agent_id = agent_id.clone();
-        let owned: Vec<(String, i64, String, String)> = rows
+        let owned: Vec<(String, i64, String, String, String)> = rows
             .iter()
             .map(|r| {
                 serde_json::to_string(&r.payload)
-                    .map(|payload| (r.id.clone(), r.position, payload, r.created_at.clone()))
+                    .map(|payload| {
+                        (
+                            r.id.clone(),
+                            r.position,
+                            payload,
+                            r.created_at.clone(),
+                            r.turn_id.clone(),
+                        )
+                    })
                     .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
             })
             .collect::<Result<_>>()?;
@@ -59,16 +70,17 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("replace agent queue clear failed: {e}")))?;
-            for (id, position, payload, created_at) in &owned {
+            for (id, position, payload, created_at, turn_id) in &owned {
                 sqlx::query(
-                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at) \
-                     VALUES (?,?,?,?,?)",
+                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at, turn_id) \
+                     VALUES (?,?,?,?,?,?)",
                 )
                 .bind(id)
                 .bind(&agent_id.0)
                 .bind(position)
                 .bind(payload)
                 .bind(created_at)
+                .bind(turn_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("replace agent queue insert failed: {e}")))?;
@@ -105,11 +117,19 @@ impl Store {
         let pool = self.write_pool();
         let from = from.clone();
         let to = to.clone();
-        let owned: Vec<(String, i64, String, String)> = rows
+        let owned: Vec<(String, i64, String, String, String)> = rows
             .iter()
             .map(|r| {
                 serde_json::to_string(&r.payload)
-                    .map(|payload| (r.id.clone(), r.position, payload, r.created_at.clone()))
+                    .map(|payload| {
+                        (
+                            r.id.clone(),
+                            r.position,
+                            payload,
+                            r.created_at.clone(),
+                            r.turn_id.clone(),
+                        )
+                    })
                     .map_err(|e| Error::Internal(format!("encode agent queue payload failed: {e}")))
             })
             .collect::<Result<_>>()?;
@@ -125,16 +145,17 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("move agent queue clear failed: {e}")))?;
-            for (id, position, payload, created_at) in &owned {
+            for (id, position, payload, created_at, turn_id) in &owned {
                 sqlx::query(
-                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at) \
-                     VALUES (?,?,?,?,?)",
+                    "INSERT INTO agent_queue (id, agent_id, position, payload, created_at, turn_id) \
+                     VALUES (?,?,?,?,?,?)",
                 )
                 .bind(id)
                 .bind(&to.0)
                 .bind(position)
                 .bind(payload)
                 .bind(created_at)
+                .bind(turn_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("move agent queue insert failed: {e}")))?;
@@ -153,10 +174,12 @@ impl Store {
     /// cascade should already have removed them). A row whose stored payload
     /// is not valid JSON comes back as `Value::Null` rather than failing the
     /// whole load — rehydration is best-effort and the caller skips entries
-    /// it cannot decode.
+    /// it cannot decode. Legacy rows with a NULL `turn_id` (pre-monorepo#1022)
+    /// load with `turn_id` defaulted to the row `id`.
     pub async fn load_all_agent_queues(&self) -> Result<Vec<AgentQueueRow>> {
         let rows = sqlx::query(
-            "SELECT q.id, q.agent_id, q.position, q.payload, q.created_at \
+            "SELECT q.id, q.agent_id, q.position, q.payload, q.created_at, \
+                    COALESCE(q.turn_id, q.id) AS turn_id \
              FROM agent_queue q JOIN agent_session s ON s.id = q.agent_id \
              ORDER BY q.agent_id, q.position",
         )
@@ -174,6 +197,7 @@ impl Store {
                     position: row.get("position"),
                     payload,
                     created_at: row.get("created_at"),
+                    turn_id: row.get("turn_id"),
                 }
             })
             .collect())

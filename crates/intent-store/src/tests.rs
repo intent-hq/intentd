@@ -94,7 +94,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
         ]
     );
     assert_eq!(
@@ -102,7 +102,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65
         ]
     );
 }
@@ -4561,7 +4561,8 @@ async fn agent_message_append_refreshes_updated_at() {
 }
 
 fn queue_row(agent_id: &AgentId, position: i64, content: &str) -> AgentQueueRow {
-    // Matches production, where the row id is the queued message id.
+    // Matches production, where the row id is the queued message id and a
+    // fresh enqueue's turn_id equals its id (monorepo#1022).
     let id = uuid::Uuid::new_v4().to_string();
     AgentQueueRow {
         id: id.clone(),
@@ -4569,6 +4570,7 @@ fn queue_row(agent_id: &AgentId, position: i64, content: &str) -> AgentQueueRow 
         position,
         payload: json!({
             "id": id,
+            "turnId": id,
             "content": content,
             "queuedAt": now_iso(),
             "editing": false,
@@ -4577,6 +4579,7 @@ fn queue_row(agent_id: &AgentId, position: i64, content: &str) -> AgentQueueRow 
             "messageMetadata": { "source": "test" },
         }),
         created_at: now_iso(),
+        turn_id: id,
     }
 }
 
@@ -4611,8 +4614,10 @@ async fn agent_queue_replace_load_delete_round_trip() {
     assert_eq!(loaded[0].payload["content"], "first");
     assert_eq!(loaded[0].payload["persisted"], json!(true));
     assert_eq!(loaded[0].payload["messageMetadata"]["source"], "test");
+    assert_eq!(loaded[0].turn_id, rows[0].turn_id, "turn_id round-trips");
     assert_eq!(loaded[1].position, 1);
     assert_eq!(loaded[1].payload["content"], "second");
+    assert_eq!(loaded[1].turn_id, rows[1].turn_id, "turn_id round-trips");
 
     // Replace is a whole-queue snapshot: a shorter snapshot drops the rest.
     store
@@ -4821,6 +4826,47 @@ async fn agent_queue_load_survives_corrupt_payload() {
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0].payload, serde_json::Value::Null);
     assert_eq!(loaded[1].payload["content"], "good");
+}
+
+/// Legacy rows persisted before migration 0065 have a NULL `turn_id` column;
+/// the load query defaults them to the row `id` (monorepo#1022).
+#[tokio::test]
+async fn agent_queue_load_defaults_null_turn_id_to_row_id() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent = AgentId::new();
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .expect("insert session");
+
+    // Insert a legacy-shaped row directly (no turn_id column value), the way
+    // a pre-0065 daemon would have left it.
+    sqlx::query(
+        "INSERT INTO agent_queue (id, agent_id, position, payload, created_at) \
+         VALUES (?,?,?,?,?)",
+    )
+    .bind("legacy-row")
+    .bind(&agent.0)
+    .bind(0i64)
+    .bind(r#"{"id":"legacy-row","content":"old","queuedAt":"2026-01-01T00:00:00Z"}"#)
+    .bind(now_iso())
+    .execute(store.write_pool())
+    .await
+    .expect("insert legacy row");
+
+    let loaded = store.load_all_agent_queues().await.expect("load queues");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].id, "legacy-row");
+    assert_eq!(
+        loaded[0].turn_id, "legacy-row",
+        "NULL turn_id must default to the row id"
+    );
 }
 
 /// Guard against duplicate migration version numbers: two files sharing a

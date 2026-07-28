@@ -209,6 +209,14 @@ fn ensure_bare_model_matches_provider(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
     pub id: String,
+    /// Turn correlation id (monorepo#1022): stable across terminal-failure
+    /// requeues so retries of the same logical turn share one id. Fresh
+    /// enqueues set `turn_id = id`; `persist_error_and_requeue` mints a new
+    /// entry `id` but carries the failed turn's original `turn_id` forward.
+    /// `#[serde(default)]` keeps legacy persisted payloads decodable —
+    /// rehydration backfills an empty `turn_id` with the entry `id`.
+    #[serde(default)]
+    pub turn_id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
@@ -266,6 +274,9 @@ impl QueuedMessage {
     /// marker for terminal-failure requeues). `messageMetadata` is only present
     /// when the entry was enqueued with metadata (e.g. a parent wake's
     /// `event_notification` payload) — entries without it keep the legacy shape.
+    /// `turnId` is only present when set (monorepo#1022: correlation id stable
+    /// across requeues; entries rehydrated from legacy payloads always have one
+    /// backfilled).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -273,6 +284,9 @@ impl QueuedMessage {
             "queuedAt": self.queued_at,
             "position": position,
         });
+        if !self.turn_id.is_empty() {
+            v["turnId"] = Value::String(self.turn_id.clone());
+        }
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
         }
@@ -5437,8 +5451,10 @@ impl Services {
         prepend: Option<QueuedPrepend>,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
+        let id = new_message_id();
         let queued = QueuedMessage {
-            id: new_message_id(),
+            turn_id: id.clone(),
+            id,
             content,
             image_blocks,
             file_blocks,
@@ -5585,6 +5601,7 @@ impl Services {
                         position: i as i64,
                         payload: serde_json::to_value(m).unwrap_or(Value::Null),
                         created_at: m.queued_at.clone(),
+                        turn_id: m.turn_id.clone(),
                     })
                     .collect()
             })
@@ -5598,6 +5615,8 @@ impl Services {
     /// preserved so a later drain does not double-append transcript rows
     /// (STAB-112/STAB-52). Rehydration never kicks `try_drain_queue`: messages
     /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
+    /// Legacy payloads without a `turnId` (pre-monorepo#1022) rehydrate with
+    /// `turn_id = id` so every in-memory entry carries a correlation id.
     /// Returns the number of messages actually inserted into the in-memory
     /// map (agents that already hold a live queue are skipped, not counted).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
@@ -5607,6 +5626,9 @@ impl Services {
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
                     message.editing = false;
+                    if message.turn_id.is_empty() {
+                        message.turn_id = message.id.clone();
+                    }
                     map.entry(row.agent_id).or_default().push(message);
                 }
                 Err(e) => {

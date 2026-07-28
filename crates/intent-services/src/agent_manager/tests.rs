@@ -2263,6 +2263,56 @@ async fn busy_queue_fallback_preserves_prepend_fields() {
     mgr.end_turn(&id).await;
 }
 
+/// Turn correlation across retries (monorepo#1022): a terminal-failure
+/// requeue mints a NEW entry `id` but preserves the failed turn's ORIGINAL
+/// `turn_id`, so the retry redrives the same logical turn.
+#[tokio::test]
+async fn terminal_failure_requeue_preserves_turn_id() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-tid-rq"), AgentId::from("a-tid-rq"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-original".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(&mgr, &id, &ws, "retry me", &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.turn_id, "turn-original",
+        "original turn_id preserved"
+    );
+    assert_ne!(queued.id, queued.turn_id, "entry id is newly minted");
+    // Wire shape (`agent.getQueue`) carries the correlation id.
+    assert_eq!(queued.to_value(0)["turnId"], json!("turn-original"));
+}
+
+/// Bare wiring without a minted `turn_id` (options constructed directly in
+/// tests): the requeue falls back to the new entry `id` so every entry always
+/// carries a correlation id.
+#[tokio::test]
+async fn terminal_failure_requeue_defaults_turn_id_to_new_id() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-tid-def"), AgentId::from("a-tid-def"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions::default();
+    super::persist_error_and_requeue(&mgr, &id, &ws, "retry me", &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.turn_id, queued.id,
+        "fallback turn_id equals entry id"
+    );
+}
+
 // --- First-turn workspace-naming instruction ---------------------------------
 
 /// Seed an agent whose workspace already carries `title` (used by naming-instruction
@@ -4984,8 +5034,9 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     // Queue an unpersisted message, then hide the transcript table so every
     // pre-turn `persist_user` attempt (initial + bounded retries) fails.
-    mgr.services
-        .enqueue_message(&id, "boom".to_string(), None, None, None, None);
+    let (enqueued, _) =
+        mgr.services
+            .enqueue_message(&id, "boom".to_string(), None, None, None, None);
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -5029,6 +5080,10 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     assert!(
         requeued.requeued_after_failure,
         "requeue is a terminal-failure requeue (STAB-112)"
+    );
+    assert_eq!(
+        requeued.turn_id, enqueued.turn_id,
+        "drain → failure → requeue preserves the original turn_id (monorepo#1022)"
     );
     mgr.services.requeue_front(&id, requeued);
 
@@ -6598,6 +6653,7 @@ mod stale_redrive_tests {
     fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
             id: "qm-stale-test".to_string(),
+            turn_id: "qm-stale-test".to_string(),
             content: content.to_string(),
             image_blocks: None,
             file_blocks: None,
