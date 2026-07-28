@@ -9378,6 +9378,14 @@ impl WorkspaceApi for Services {
                 normalised.status_message = Some(String::new());
             }
         }
+        // A whitespace/empty `statusImageAssetId` persists as a clear (the
+        // apply path below folds it to `None`), so the delta must carry the
+        // `null` clear signal — not the raw whitespace — for §6.5 mirroring.
+        if let Some(Some(raw)) = normalised.status_image_asset_id.as_ref() {
+            if raw.trim().is_empty() {
+                normalised.status_image_asset_id = Some(None);
+            }
+        }
         let changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
             let mut ws = if id.is_chief() {

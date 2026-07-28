@@ -137,6 +137,11 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 /// since `note.create` mints a fresh `NoteId` by design. `auggie_bin`
 /// optionally pins the auggie binary `agent.enhancePrompt` spawns (§5.31) to a
 /// deterministic fixture script.
+/// Note: the event bus is attached to `Services` (`with_event_bus`), so
+/// service-emitted events (`workspace:updated`, note events, …) flow to
+/// `events.subscribe` subscribers in EVERY test built on this harness — tests
+/// that read frames in a loop should match on `id`/`method` rather than
+/// assume the next frame is their RPC response.
 async fn make_services(
     auggie_bin: Option<std::path::PathBuf>,
     models_cache_dir: Option<std::path::PathBuf>,
@@ -2888,9 +2893,16 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
     )
     .await;
     assert!(cleared.get("error").is_none(), "clear errored: {cleared}");
+    // `skip_serializing_if` contract: the cleared field must be OMITTED from
+    // the payload, not serialized as an explicit `null` (index-based `is_null`
+    // can't tell the two apart, `get` can).
     assert!(
-        cleared["result"]["workspace"]["statusImageAssetId"].is_null(),
-        "cleared asset id must not serialize: {cleared}"
+        cleared["result"]["workspace"]
+            .as_object()
+            .expect("workspace object")
+            .get("statusImageAssetId")
+            .is_none(),
+        "cleared asset id must be omitted, not null: {cleared}"
     );
     let got = send_and_wait(
         &mut ws,
@@ -2903,8 +2915,12 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
     )
     .await;
     assert!(
-        got["result"]["workspace"]["statusImageAssetId"].is_null(),
-        "clear persists: {got}"
+        got["result"]["workspace"]
+            .as_object()
+            .expect("workspace object")
+            .get("statusImageAssetId")
+            .is_none(),
+        "clear persists as an omitted field: {got}"
     );
 
     srv.ws.stop().await;

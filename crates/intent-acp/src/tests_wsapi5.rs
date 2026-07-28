@@ -678,6 +678,19 @@ async fn workspace_set_status_image_null_clears() {
 }
 
 #[tokio::test]
+async fn workspace_set_status_image_no_arg_errors_instead_of_clearing() {
+    // A clear is destructive: the prelude's JSON.stringify drops `undefined`
+    // keys, so a bare `setStatusImage()` must error — only explicit `null`
+    // clears.
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.workspace.setStatusImage();").await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("image is required"));
+    assert!(api.save_asset_calls.lock().unwrap().is_empty());
+    assert!(api.update_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn workspace_set_status_image_requires_data() {
     let (srv, api) = server();
     let code = "return await ws.workspace.setStatusImage({ mimeType: 'image/png' });";

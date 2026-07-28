@@ -213,7 +213,15 @@ async fn set_status_image(
     args: &Value,
 ) -> Result<Value, String> {
     chief_guard(ws, "setStatusImage")?;
-    let image = args.get("image").unwrap_or(&Value::Null);
+    // Missing vs explicit `null` matters: a clear is destructive, so a no-arg
+    // call (the prelude's JSON.stringify drops `undefined` keys) errors
+    // instead of silently clearing — only an explicit `null` clears.
+    let Some(image) = args.get("image") else {
+        return Err(
+            "image is required: pass { data, mimeType, originalName? } to set or null to clear"
+                .to_string(),
+        );
+    };
     if image.is_null() {
         let update = WorkspaceUpdate {
             status_image_asset_id: Some(None),
