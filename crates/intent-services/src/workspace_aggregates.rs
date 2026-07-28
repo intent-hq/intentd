@@ -67,6 +67,10 @@ fn adaptive_ttl(base: Duration, max: Duration, compute_duration: Duration) -> Du
 /// before degrading to the last known value / omission.
 const AGGREGATE_BUDGET: Duration = Duration::from_millis(1_500);
 
+/// Threshold above which a cache-miss rollup compute logs one warn-level line
+/// so slow aggregates on large repos are visible in production (#963).
+const SLOW_ROLLUP_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+
 /// Cap on concurrent blocking diff rollups across all callers, so a burst of
 /// list calls over many large repos cannot exhaust the blocking pool.
 const MAX_CONCURRENT_ROLLUPS: usize = 4;
@@ -185,9 +189,12 @@ impl WorkspaceAggregateCache {
         };
         let cache = Arc::clone(self);
         let task_key = key.clone();
+        let task_workspace_id = workspace_id.to_owned();
         let handle = tokio::spawn(async move {
             let _guard = guard;
-            cache.rollup_and_store(&task_key, worktree).await
+            cache
+                .rollup_and_store(&task_workspace_id, &task_key, worktree)
+                .await
         });
         match tokio::time::timeout(self.budget, handle).await {
             Ok(Ok(summary)) => summary,
@@ -231,7 +238,12 @@ impl WorkspaceAggregateCache {
 
     /// Run one bounded, offloaded rollup and record the result. Failures
     /// (blocking-task panic) are not cached so the next call retries.
-    async fn rollup_and_store(&self, key: &str, worktree: PathBuf) -> Option<WorkspaceDiffSummary> {
+    async fn rollup_and_store(
+        &self,
+        workspace_id: &str,
+        key: &str,
+        worktree: PathBuf,
+    ) -> Option<WorkspaceDiffSummary> {
         let _permit = self.gate.acquire().await.ok()?;
         let started = Instant::now();
         let summary =
@@ -249,13 +261,23 @@ impl WorkspaceAggregateCache {
                 }
             };
         let compute_duration = started.elapsed();
+        let ttl = adaptive_ttl(self.ttl, self.max_ttl, compute_duration);
         tracing::debug!(
             worktree = %key,
             files = summary.as_ref().map(|s| s.total_files).unwrap_or(0),
             total_ms = compute_duration.as_millis() as u64,
-            ttl_ms = adaptive_ttl(self.ttl, self.max_ttl, compute_duration).as_millis() as u64,
+            ttl_ms = ttl.as_millis() as u64,
             "workspace aggregates: head diff rollup"
         );
+        if compute_duration >= SLOW_ROLLUP_WARN_THRESHOLD {
+            tracing::warn!(
+                workspace_id,
+                worktree = %key,
+                total_ms = compute_duration.as_millis() as u64,
+                ttl_ms = ttl.as_millis() as u64,
+                "workspace aggregates: slow diff rollup on cache miss"
+            );
+        }
         self.diff.lock().unwrap().insert(
             key.to_string(),
             DiffCacheEntry {

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use git2::{Commit, Oid, Patch, Repository, Sort};
 use intent_core::{iso_from_unix_secs, Error, Result};
 
-use crate::map_git_err;
 use crate::status::current_branch;
+use crate::{map_git_err, SLOW_GIT_WARN_THRESHOLD};
 
 /// One commit's history record, the BE shape behind `CommitWithAttribution`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +134,15 @@ pub fn history_since(
         total_ms = total.as_millis() as u64,
         "history_since: revwalk + per-commit tree diffs"
     );
+    if total >= SLOW_GIT_WARN_THRESHOLD {
+        tracing::warn!(
+            worktree = %worktree_path.display(),
+            limit,
+            commits = out.len(),
+            total_ms = total.as_millis() as u64,
+            "history_since: slow history read"
+        );
+    }
     Ok(out)
 }
 
@@ -434,6 +443,15 @@ pub fn history_bounded(
         total_ms = total.as_millis() as u64,
         "history_bounded: revwalk + per-commit tree diffs"
     );
+    if total >= SLOW_GIT_WARN_THRESHOLD {
+        tracing::warn!(
+            worktree = %worktree_path.display(),
+            limit,
+            commits = out.len(),
+            total_ms = total.as_millis() as u64,
+            "history_bounded: slow history read"
+        );
+    }
     Ok(out)
 }
 

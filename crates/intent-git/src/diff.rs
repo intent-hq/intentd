@@ -6,11 +6,12 @@
 //! only pays for the files it actually expands.
 
 use std::path::Path;
+use std::time::Instant;
 
 use git2::{Delta, DiffOptions, Oid, Patch, Repository};
 use intent_core::{Error, Result};
 
-use crate::map_git_err;
+use crate::{map_git_err, SLOW_GIT_WARN_THRESHOLD};
 
 /// The kind of a diff line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +295,7 @@ pub fn diff_commit(repo_path: &Path, commit_hash: &str) -> Result<Vec<FileDiff>>
 /// loaded (no `show_untracked_content`), so untracked entries are counted
 /// without reading their bytes.
 pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
+    let started = Instant::now();
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Some(head_tree) = repo
         .head()
@@ -332,6 +334,15 @@ pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
         }
     }
 
+    let total = started.elapsed();
+    if total >= SLOW_GIT_WARN_THRESHOLD {
+        tracing::warn!(
+            repo_path = %repo_path.display(),
+            total_files,
+            total_ms = total.as_millis() as u64,
+            "head_diff_rollup: slow HEAD→workdir diff rollup"
+        );
+    }
     Ok((total_files, total_additions, total_deletions))
 }
 
