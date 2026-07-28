@@ -157,6 +157,35 @@ fn stop_requested_error() -> Error {
     Error::Internal("unsloth server startup aborted: unsloth.stop was called".to_string())
 }
 
+/// The error for an unresolvable port conflict: the configured port is busy,
+/// the occupant is not an adoptable Unsloth server serving the requested
+/// model, and no free port could be picked. `InvalidInput` (not `Internal`)
+/// for the same reason as [`missing_binary_error`]: this is an environment
+/// problem the user must resolve, and the message must survive the JSON-RPC
+/// envelope.
+fn port_conflict_error(port: u16) -> Error {
+    Error::InvalidInput(format!(
+        "port {port} is already in use by another process and no free port could be \
+         found — stop the process occupying port {port} and retry"
+    ))
+}
+
+/// Whether the daemon could bind `port` on loopback right now (the managed
+/// server binds it moments later — the gap is an inherent, acceptable
+/// TOCTOU: a lost race surfaces as the child's own bind failure).
+fn loopback_port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Pick a free loopback port (OS-assigned ephemeral); `None` when even an
+/// ephemeral bind fails.
+fn pick_free_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .ok()
+}
+
 /// Fallback quant variant when per-repo size metadata is unavailable,
 /// mirroring the Unsloth CLI's own `--gguf-variant` defaults (validated
 /// 2026-07-27): `UD-Q4_K_XL` for `unsloth/*` GGUF repos, `Q4_K_M` otherwise.
@@ -316,9 +345,12 @@ pub(crate) fn best_fitting_quant(
 pub struct UnslothStatus {
     /// Full HF repo id currently served (or being started).
     pub repo_id: String,
-    /// Port the managed server listens on.
+    /// Port the server actually listens on — may differ from the configured
+    /// port when the daemon re-ported around a conflict, and is the
+    /// occupant's port for an adopted (externally started) server.
     pub port: u16,
-    /// OS pid of the managed server child, when known.
+    /// OS pid of the managed server child, when known. `None` for an
+    /// adopted server (the daemon does not own the occupant's process).
     pub pid: Option<u32>,
     /// Seconds since the child was spawned.
     pub uptime_secs: u64,
@@ -470,12 +502,17 @@ struct ServerIdentity {
     repo_id: String,
     pid: Option<u32>,
     started_at: Instant,
+    /// The port the server actually listens on (see [`ManagedServer::port`]).
+    port: u16,
 }
 
 /// One managed server child: the process handle plus what it was started
 /// with, so reuse/restart decisions compare against the live state.
 struct ManagedServer {
-    child: Child,
+    /// The spawned server process, or `None` for an ADOPTED server — a
+    /// compatible Unsloth server someone else started on the configured
+    /// port that the daemon reuses but does not own (and must never kill).
+    child: Option<Child>,
     /// Full HF repo id the server was started with (no quant suffix).
     repo_id: String,
     /// The resolved endpoint, once minted+ready. `None` while starting.
@@ -489,6 +526,10 @@ struct ManagedServer {
     drain_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// When the child was spawned; feeds `unsloth.status`'s uptime field.
     started_at: Instant,
+    /// The port the server actually listens on: the configured port
+    /// normally, a picked free port after a re-port around a conflict, or
+    /// the occupant's (configured) port for an adopted server.
+    port: u16,
 }
 
 /// How long [`ManagedServer::tail`] waits for the drain tasks to consume the
@@ -496,9 +537,19 @@ struct ManagedServer {
 const DRAIN_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl ManagedServer {
-    /// Whether the child process is still running (`try_wait` probe).
+    /// Whether the child process is still running (`try_wait` probe). An
+    /// adopted server (no child handle) is always reported alive here — its
+    /// liveness is only observable through the HTTP readiness probes.
     fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => true,
+        }
+    }
+
+    /// OS pid of the owned child; `None` for an adopted server.
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|c| c.id())
     }
 
     /// Snapshot the retained output tail as one newline-joined string. Waits
@@ -533,6 +584,12 @@ pub(crate) struct UnslothConfig {
     pub hf_files_timeout: Duration,
     /// Total system RAM probe; `None` = detection unsupported.
     pub total_memory_bytes: Box<dyn Fn() -> Option<u64> + Send + Sync>,
+    /// Whether a given loopback port can be bound right now (port-conflict
+    /// detection; tests override to simulate a busy configured port).
+    pub port_is_free: Box<dyn Fn(u16) -> bool + Send + Sync>,
+    /// Pick a free loopback port for a re-port around a conflict; `None` =
+    /// no port available (tests override to force the unrecoverable path).
+    pub pick_free_port: Box<dyn Fn() -> Option<u16> + Send + Sync>,
 }
 
 impl Default for UnslothConfig {
@@ -553,6 +610,8 @@ impl Default for UnslothConfig {
             hf_api_base: HF_API_BASE.to_string(),
             hf_files_timeout: HF_FILES_TIMEOUT,
             total_memory_bytes: Box::new(crate::agent_manager::total_memory_bytes),
+            port_is_free: Box::new(loopback_port_is_free),
+            pick_free_port: Box::new(pick_free_loopback_port),
         }
     }
 }
@@ -671,7 +730,7 @@ impl UnslothServerManager {
         };
         Some(UnslothStatus {
             repo_id: identity.repo_id,
-            port: self.config.port,
+            port: identity.port,
             pid: identity.pid,
             uptime_secs: identity.started_at.elapsed().as_secs(),
             phase,
@@ -698,7 +757,9 @@ impl UnslothServerManager {
             let mut state = self.state.lock().await;
             if let Some(mut server) = state.take() {
                 tracing::info!(repo = %server.repo_id, "stopping managed unsloth server (unsloth.stop)");
-                kill_server_child(&mut server.child).await;
+                if let Some(child) = server.child.as_mut() {
+                    kill_server_child(child).await;
+                }
                 self.set_phase(None);
                 self.set_identity(None);
             }
@@ -753,19 +814,25 @@ impl UnslothServerManager {
 
         // Live child serving the requested repo: reuse the minted endpoint
         // outright, or — if it's still starting — attach to it instead of
-        // tearing it down.
-        let attach = if let Some(server) = state.as_mut() {
+        // tearing it down. An ADOPTED server (no owned child) is re-verified
+        // with one authed probe before reuse: the daemon cannot observe the
+        // occupant's process, so HTTP is the only liveness signal — a
+        // vanished occupant falls through to the normal teardown + port
+        // logic instead of being reused forever.
+        let mut attach = false;
+        if let Some(server) = state.as_mut() {
             if server.repo_id == repo_id && server.is_alive() {
-                if let Some(ep) = &server.endpoint {
-                    return Ok(ep.clone());
+                match server.endpoint.clone() {
+                    Some(ep) => {
+                        let owned = server.child.is_some();
+                        if owned || self.adopted_endpoint_still_ready(server.port, &ep).await {
+                            return Ok(ep);
+                        }
+                    }
+                    None => attach = true,
                 }
-                true
-            } else {
-                false
             }
-        } else {
-            false
-        };
+        }
 
         if attach {
             tracing::info!(
@@ -777,8 +844,14 @@ impl UnslothServerManager {
             // A LIVE server being replaced for a different repo with agent
             // sessions still attached is user-visible disruption — warn
             // before the kill so clients can surface it (a dead child's
-            // teardown has nothing left to disrupt).
-            if old.repo_id != repo_id && old.is_alive() && attached_agents > 0 {
+            // teardown has nothing left to disrupt, and dropping an ADOPTED
+            // server never kills the occupant — it keeps running for its
+            // owner, so there is nothing to warn about either).
+            if old.child.is_some()
+                && old.repo_id != repo_id
+                && old.is_alive()
+                && attached_agents > 0
+            {
                 let plural = if attached_agents == 1 { "" } else { "s" };
                 status(
                     StatusLevel::Warning,
@@ -793,7 +866,9 @@ impl UnslothServerManager {
                 new_repo = %repo_id,
                 "stopping managed unsloth server (model switch or dead child)"
             );
-            kill_server_child(&mut old.child).await;
+            if let Some(child) = old.child.as_mut() {
+                kill_server_child(child).await;
+            }
             self.set_phase(None);
             self.set_identity(None);
         }
@@ -805,6 +880,56 @@ impl UnslothServerManager {
                 StatusLevel::Info,
                 format!("Starting Unsloth server for {repo_id}…"),
             );
+            // Resolve the listen port BEFORE any spawn work: the configured
+            // port may be held by a user-run unsloth studio (adoptable) or
+            // an unrelated process (re-port around it) — either way the
+            // daemon must not spawn a child doomed to fail its bind.
+            let configured = self.config.port;
+            let port = if (self.config.port_is_free)(configured) {
+                configured
+            } else {
+                if let Some((server, endpoint)) =
+                    self.try_adopt(&binary, repo_id, configured, status).await
+                {
+                    status(
+                        StatusLevel::Info,
+                        format!(
+                            "Reusing the Unsloth server already running on port {configured} — it serves {repo_id}"
+                        ),
+                    );
+                    tracing::info!(
+                        port = configured,
+                        repo = %repo_id,
+                        "adopted existing unsloth server on the configured port"
+                    );
+                    self.set_identity(Some(ServerIdentity {
+                        repo_id: server.repo_id.clone(),
+                        pid: None,
+                        started_at: server.started_at,
+                        port: configured,
+                    }));
+                    *state = Some(server);
+                    self.set_phase(Some("ready"));
+                    return Ok(endpoint);
+                }
+                match (self.config.pick_free_port)() {
+                    Some(picked) => {
+                        status(
+                            StatusLevel::Info,
+                            format!(
+                                "Port {configured} is in use by another process; starting the Unsloth server on port {picked} instead"
+                            ),
+                        );
+                        tracing::info!(
+                            configured_port = configured,
+                            picked_port = picked,
+                            "configured unsloth port is busy; re-porting to a free one"
+                        );
+                        picked
+                    }
+                    None => return Err(port_conflict_error(configured)),
+                }
+            };
             let quant = self.resolve_quant_variant(repo_id).await;
             // Re-check the latch: the HF fetch above can take up to
             // [`UnslothConfig::hf_files_timeout`], and shutdown may have
@@ -812,11 +937,12 @@ impl UnslothServerManager {
             if self.is_shutting_down() {
                 return Err(shutting_down_error());
             }
-            let server = self.start_server(&binary, repo_id, &quant)?;
+            let server = self.start_server(&binary, repo_id, &quant, port)?;
             self.set_identity(Some(ServerIdentity {
                 repo_id: server.repo_id.clone(),
-                pid: server.child.id(),
+                pid: server.pid(),
                 started_at: server.started_at,
+                port: server.port,
             }));
             *state = Some(server);
             self.set_phase(Some("starting"));
@@ -863,7 +989,9 @@ impl UnslothServerManager {
                 self.set_identity(None);
                 self.stop_requested
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                kill_server_child(&mut failed.child).await;
+                if let Some(child) = failed.child.as_mut() {
+                    kill_server_child(child).await;
+                }
                 let tail = redact_key_material(&failed.tail().await);
                 if tail.is_empty() {
                     Err(failure.error)
@@ -945,15 +1073,23 @@ impl UnslothServerManager {
     }
 
     /// Spawn `unsloth run --model <repo>:<quant> --disable-tools -p <port>`
-    /// as its own process-group leader with captured output.
-    fn start_server(&self, binary: &Path, repo_id: &str, quant: &str) -> Result<ManagedServer> {
+    /// as its own process-group leader with captured output. `port` is the
+    /// resolved listen port (the configured one, or a picked free one when
+    /// the configured port was busy).
+    fn start_server(
+        &self,
+        binary: &Path,
+        repo_id: &str,
+        quant: &str,
+        port: u16,
+    ) -> Result<ManagedServer> {
         let mut cmd = Command::new(binary);
         cmd.arg("run")
             .arg("--model")
             .arg(run_model_arg(repo_id, quant))
             .arg("--disable-tools")
             .arg("-p")
-            .arg(self.config.port.to_string())
+            .arg(port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -975,15 +1111,91 @@ impl UnslothServerManager {
             drain_tasks.push(tokio::spawn(drain_into_tail(stderr, output_tail.clone())));
         }
 
-        tracing::info!(repo = %repo_id, quant = %quant, port = self.config.port, "spawned managed unsloth server");
+        tracing::info!(repo = %repo_id, quant = %quant, port, "spawned managed unsloth server");
         Ok(ManagedServer {
-            child,
+            child: Some(child),
             repo_id: repo_id.to_string(),
             endpoint: None,
             output_tail,
             drain_tasks,
             started_at: Instant::now(),
+            port,
         })
+    }
+
+    /// Try to adopt the server occupying the (busy) configured port: probe
+    /// `/v1/models` unauthenticated — 401/403 means an auth-requiring
+    /// Unsloth-like server ([`classify_probe`]'s convention, spec Status
+    /// section) — then mint the opencode auth material against it and
+    /// verify with an authed probe that it actually answers 200 (i.e. it
+    /// serves the requested model, ready). `None` on any mismatch: a
+    /// non-Unsloth occupant, a mint failure (e.g. it serves a different
+    /// model), or a not-ready occupant — the caller then re-ports instead.
+    /// Deliberately conservative: adoption only takes a READY server, so a
+    /// mid-startup occupant is treated as busy rather than waited on (the
+    /// daemon does not own it and cannot observe its process).
+    async fn try_adopt(
+        &self,
+        binary: &Path,
+        repo_id: &str,
+        port: u16,
+        status: &StatusCallback,
+    ) -> Option<(ManagedServer, UnslothEndpoint)> {
+        let probe_url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::builder()
+            .timeout(PROBE_REQUEST_TIMEOUT)
+            .build()
+            .ok()?;
+        match classify_probe(probe_status(&client, &probe_url, None).await) {
+            // 401/403 (or any non-200 HTTP answer) — an Unsloth-like server
+            // is answering; try to mint against it.
+            ProbeOutcome::UpNotReady => {}
+            // 200 unauthenticated is NOT the managed server's shape (it
+            // requires auth even on /v1/models) — treat as foreign.
+            ProbeOutcome::Ready => return None,
+            // The port is bind-busy but nothing answers HTTP: not an
+            // Unsloth server (e.g. a raw TCP service).
+            ProbeOutcome::Down => return None,
+        }
+
+        let mut server = ManagedServer {
+            child: None,
+            repo_id: repo_id.to_string(),
+            endpoint: None,
+            output_tail: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            drain_tasks: Vec::new(),
+            started_at: Instant::now(),
+            port,
+        };
+        let endpoint = self
+            .mint_endpoint(binary, repo_id, &mut server, status)
+            .await
+            .ok()?;
+        // The minted key must prove the occupant serves the requested model
+        // NOW (200, ready) — adoption never waits on a foreign server's
+        // download: if it isn't ready, re-port and own the startup instead.
+        if classify_probe(probe_status(&client, &probe_url, Some(&endpoint.api_key)).await)
+            != ProbeOutcome::Ready
+        {
+            return None;
+        }
+        server.endpoint = Some(endpoint.clone());
+        Some((server, endpoint))
+    }
+
+    /// One authed probe against an adopted server's `/v1/models`, used to
+    /// re-verify it before reusing its cached endpoint: with no owned child
+    /// process, HTTP is the only liveness signal the daemon has for it.
+    async fn adopted_endpoint_still_ready(&self, port: u16, endpoint: &UnslothEndpoint) -> bool {
+        let probe_url = format!("http://127.0.0.1:{port}/v1/models");
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(PROBE_REQUEST_TIMEOUT)
+            .build()
+        else {
+            return false;
+        };
+        classify_probe(probe_status(&client, &probe_url, Some(&endpoint.api_key)).await)
+            == ProbeOutcome::Ready
     }
 
     /// Startup sequence after the child is spawned: wait for the HTTP socket,
@@ -999,7 +1211,7 @@ impl UnslothServerManager {
         server: &mut ManagedServer,
         status: &StatusCallback,
     ) -> std::result::Result<UnslothEndpoint, StartupFailure> {
-        let probe_url = format!("http://127.0.0.1:{}/v1/models", self.config.port);
+        let probe_url = format!("http://127.0.0.1:{}/v1/models", server.port);
         let client = reqwest::Client::builder()
             .timeout(PROBE_REQUEST_TIMEOUT)
             .build()
@@ -1117,10 +1329,10 @@ impl UnslothServerManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if self.config.port != DEFAULT_PORT {
+        if server.port != DEFAULT_PORT {
             cmd.env(
                 "UNSLOTH_STUDIO_URL",
-                format!("http://127.0.0.1:{}", self.config.port),
+                format!("http://127.0.0.1:{}", server.port),
             );
         }
         let mut mint_child = cmd.spawn().map_err(|e| {
@@ -1291,7 +1503,9 @@ impl UnslothServerManager {
         let mut state = self.state.lock().await;
         if let Some(mut server) = state.take() {
             tracing::info!(repo = %server.repo_id, "shutting down managed unsloth server");
-            kill_server_child(&mut server.child).await;
+            if let Some(child) = server.child.as_mut() {
+                kill_server_child(child).await;
+            }
             self.set_phase(None);
             self.set_identity(None);
         }
@@ -1934,7 +2148,10 @@ mod tests {
         /// Fast test config pointing at the stub binary + fake home + port.
         /// The HF base points at a closed loopback port (instant connection
         /// refusal → CLI-default quant); tests covering the selection path
-        /// override it with a [`spawn_stub_hf`] port.
+        /// override it with a [`spawn_stub_hf`] port. `port_is_free` always
+        /// reports free because lifecycle tests point `port` at an
+        /// already-listening loopback stub standing in for the managed
+        /// server itself; port-conflict tests override it.
         fn test_config(binary: PathBuf, home: PathBuf, port: u16) -> UnslothConfig {
             UnslothConfig {
                 resolve_binary: Box::new(move || Some(binary.clone())),
@@ -1947,6 +2164,8 @@ mod tests {
                 hf_api_base: "http://127.0.0.1:1".to_string(),
                 hf_files_timeout: Duration::from_secs(2),
                 total_memory_bytes: Box::new(|| Some(32 * GIB)),
+                port_is_free: Box::new(|_| true),
+                pick_free_port: Box::new(pick_free_loopback_port),
             }
         }
 
@@ -2324,7 +2543,7 @@ mod tests {
                 let mut state = mgr.state.lock().await;
                 let server = state.as_mut().expect("server tracked");
                 assert!(server.is_alive(), "child alive before shutdown");
-                server.child.id().expect("pid")
+                server.pid().expect("pid")
             };
             mgr.shutdown().await;
             assert!(mgr.state.lock().await.is_none(), "state cleared");
@@ -2650,7 +2869,7 @@ mod tests {
                      (monorepo#878: killing here discards an in-flight download)",
                 );
                 assert!(server.is_alive(), "managed server left running");
-                server.child.id().expect("pid")
+                server.pid().expect("pid")
             };
 
             // The managed SERVER child from the first attempt (not the mint
@@ -2697,8 +2916,7 @@ mod tests {
                 .await
                 .as_mut()
                 .expect("server preserved after attempt 1")
-                .child
-                .id()
+                .pid()
                 .expect("pid");
 
             // Attempt 2 ("the retry"): must attach to the same server, not
@@ -2711,8 +2929,7 @@ mod tests {
                 .await
                 .as_mut()
                 .expect("server still preserved after attempt 2")
-                .child
-                .id()
+                .pid()
                 .expect("pid");
             assert_eq!(
                 pid1, pid2,
@@ -2779,8 +2996,7 @@ mod tests {
                 .await
                 .as_mut()
                 .expect("old server running before switch")
-                .child
-                .id()
+                .pid()
                 .expect("pid");
 
             let err1 = mgr
@@ -2793,7 +3009,7 @@ mod tests {
                 let server = state
                     .as_mut()
                     .expect("new (switched-to) server preserved after mint timeout");
-                (server.child.id().expect("pid"), server.repo_id.clone())
+                (server.pid().expect("pid"), server.repo_id.clone())
             };
             assert_ne!(
                 old_pid, new_pid,
@@ -2821,8 +3037,7 @@ mod tests {
                 .await
                 .as_mut()
                 .expect("new server still preserved after the retry")
-                .child
-                .id()
+                .pid()
                 .expect("pid");
             assert_eq!(
                 new_pid, retry_pid,
@@ -2842,6 +3057,197 @@ mod tests {
             );
 
             mgr.shutdown().await;
+        }
+
+        // --- port-conflict detection: adopt a compatible occupant, re-port
+        // around a foreign one, or fail with a clear error ---
+
+        #[tokio::test]
+        async fn busy_port_with_compatible_unsloth_server_is_adopted() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // The occupant: an auth-requiring server already on the
+            // configured port (401 unauth, 200 with the minted key) —
+            // exactly the managed server's own /v1/models shape.
+            let occupant_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), occupant_port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), occupant_port);
+            config.port_is_free = Box::new(|_| false);
+            config.pick_free_port =
+                Box::new(|| panic!("a compatible occupant must be adopted, never re-ported"));
+            let mgr = UnslothServerManager::with_config(config);
+
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("adopts the compatible occupant");
+            assert_eq!(ep.base_url, format!("http://127.0.0.1:{occupant_port}/v1"));
+
+            let log = stub_log(dir.path());
+            assert!(
+                !log.contains("run --model"),
+                "adoption must not spawn a second server: {log}"
+            );
+
+            let status = mgr
+                .status_snapshot()
+                .await
+                .expect("adopted server is tracked");
+            assert_eq!(status.port, occupant_port, "status reports the actual port");
+            assert!(
+                status.pid.is_none(),
+                "an adopted server has no owned child pid"
+            );
+            assert_eq!(status.phase, "ready");
+
+            // shutdown must not try to kill the occupant (no child to kill).
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn adopted_server_is_reused_across_calls_without_respawning() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let occupant_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), occupant_port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), occupant_port);
+            config.port_is_free = Box::new(|_| false);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let ep1 = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("adopts");
+            // The second call re-verifies the still-listening occupant with
+            // one authed probe and reuses the cached endpoint — no re-mint,
+            // and still no spawn.
+            let ep2 = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("reuses the adopted server");
+            assert_eq!(ep1.api_key, ep2.api_key);
+            assert_eq!(ep1.base_url, ep2.base_url);
+
+            let log = stub_log(dir.path());
+            assert!(!log.contains("run --model"), "never spawned: {log}");
+            assert_eq!(
+                log.matches("start opencode").count(),
+                1,
+                "the reuse path must not re-mint: {log}"
+            );
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn busy_port_with_foreign_occupant_re_ports_to_a_free_one() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Where the re-ported managed server will "listen".
+            let managed_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), managed_port, None);
+            // Configured port 1: reported busy, but nothing answers HTTP
+            // (connect refused → ProbeOutcome::Down → not unsloth-like).
+            let mut config = test_config(binary, dir.path().to_path_buf(), 1);
+            config.port_is_free = Box::new(|_| false);
+            config.pick_free_port = Box::new(move || Some(managed_port));
+            let mgr = UnslothServerManager::with_config(config);
+
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("re-ports around the foreign occupant");
+            assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
+
+            let log = stub_log(dir.path());
+            assert!(
+                log.contains(&format!("-p {managed_port}")),
+                "the server must be spawned on the picked port, not the busy configured one: {log}"
+            );
+
+            let status = mgr.status_snapshot().await.expect("server tracked");
+            assert_eq!(
+                status.port, managed_port,
+                "status reports the actual (picked) port, not the configured one"
+            );
+            assert!(status.pid.is_some(), "re-ported server is daemon-owned");
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn busy_port_serving_a_different_model_re_ports_instead_of_adopting() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // The occupant answers 401 unauthenticated (unsloth-like) but
+            // rejects the key the adopt-mint produces — the authed
+            // verification probe never sees 200, standing in for an
+            // occupant serving a different model.
+            let occupant_port = spawn_stub_http("sk-occupant-of-another-model").await;
+            let managed_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), managed_port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), occupant_port);
+            config.port_is_free = Box::new(|_| false);
+            config.pick_free_port = Box::new(move || Some(managed_port));
+            let mgr = UnslothServerManager::with_config(config);
+
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("declines adoption and starts its own server on a free port");
+            assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
+
+            let log = stub_log(dir.path());
+            assert!(
+                log.contains(&format!("-p {managed_port}")),
+                "spawned on the picked port: {log}"
+            );
+            let status = mgr.status_snapshot().await.expect("server tracked");
+            assert_eq!(status.port, managed_port);
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn busy_port_answering_200_unauthenticated_is_not_adopted() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // An occupant answering 200 WITHOUT auth is not the managed
+            // server's shape (it requires auth even on /v1/models) — treat
+            // as foreign and re-port.
+            let (open_port, _hits) = spawn_stub_hf("{}").await;
+            let managed_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), managed_port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), open_port);
+            config.port_is_free = Box::new(|_| false);
+            config.pick_free_port = Box::new(move || Some(managed_port));
+            let mgr = UnslothServerManager::with_config(config);
+
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("re-ports around the auth-less occupant");
+            assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn busy_port_with_no_free_port_fails_with_a_clear_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let binary = write_stub_binary(dir.path(), dir.path(), 1, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), 1);
+            config.port_is_free = Box::new(|_| false);
+            config.pick_free_port = Box::new(|| None);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput(_)),
+                "an unrecoverable port conflict is an environment problem \
+                 (InvalidInput survives the JSON-RPC envelope), got: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("port 1 is already in use"), "got: {msg}");
+            assert!(
+                mgr.state.lock().await.is_none(),
+                "no server tracked after the conflict error"
+            );
+            assert!(
+                !stub_log(dir.path()).contains("run --model"),
+                "must not spawn a child doomed to fail its bind"
+            );
         }
     }
 }
