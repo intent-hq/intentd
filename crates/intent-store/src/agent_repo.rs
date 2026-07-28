@@ -141,14 +141,16 @@ pub const PROJECTION_TEXT_BLOCK_CAP: u32 = 4096;
 /// which yields no blocks for non-array content). Every `json_*` call is
 /// guarded by a lazily-evaluated CASE: `json_each` only runs on valid JSON
 /// arrays and per-element extraction only touches object elements, so
-/// malformed or non-block content can never error the statement. Assistant
-/// rows keep each block's tail, user rows its head
+/// malformed or non-block content can never error the statement. Block order
+/// is pinned to the array index via the aggregate `ORDER BY` (SQLite 3.44+)
+/// rather than relying on `json_each` emission order. Assistant rows keep
+/// each block's tail, user rows its head
 /// (see [`PROJECTION_TEXT_BLOCK_CAP`]).
 fn projection_text_blocks_expr() -> String {
     format!(
         "CASE WHEN json_valid(m.content) AND json_type(m.content) = 'array' THEN \
-            (SELECT json_group_array(t) FROM ( \
-                SELECT CASE WHEN b.type = 'object' \
+            (SELECT json_group_array(t ORDER BY k) FROM ( \
+                SELECT b.key AS k, CASE WHEN b.type = 'object' \
                         AND json_extract(b.value, '$.type') = 'text' \
                         AND json_type(b.value, '$.text') = 'text' \
                     THEN CASE WHEN m.role = 'assistant' \
@@ -4157,7 +4159,10 @@ mod tests {
     /// and fetch winner bodies via the `UNIQUE(agent_id, seq)` index —
     /// never a full `agent_message` scan, and never a temp b-tree over
     /// message bodies (the workspace variant's residual window sort orders
-    /// keys only; the per-agent variant needs no sort at all).
+    /// keys only; the per-agent variant needs no sort at all). The only
+    /// allowed temp b-tree is the `json_group_array(ORDER BY)` block-order
+    /// pin inside the correlated text-blocks subquery, which sorts at most a
+    /// winner row's few capped block strings.
     #[tokio::test]
     async fn projection_last_rows_query_plans_use_role_seq_index() {
         use std::path::PathBuf;
@@ -4206,8 +4211,11 @@ mod tests {
             .map(|r| r.get::<String, _>("detail"))
             .collect::<Vec<_>>()
             .join("\n");
+        let disallowed_btree = per_agent_plan
+            .lines()
+            .any(|l| l.contains("USE TEMP B-TREE") && !l.contains("json_group_array"));
         assert!(
-            !per_agent_plan.contains("USE TEMP B-TREE"),
+            !disallowed_btree,
             "per-agent window must be fully index-ordered:\n{per_agent_plan}"
         );
 
