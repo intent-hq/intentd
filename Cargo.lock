@@ -1882,7 +1882,11 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "agent-client-protocol",
  "git2",
@@ -1902,7 +1906,11 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "directories",
@@ -1915,7 +1923,11 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "directories",
@@ -1932,7 +1944,11 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "git2",
  "intent-core",
@@ -1944,7 +1960,11 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -1954,7 +1974,11 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "intent-core",
@@ -1968,7 +1992,11 @@ dependencies = [
 
 [[package]]
 name = "intent-providers"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "intent-core",
  "serde_json",
@@ -1977,7 +2005,11 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -1987,7 +2019,11 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "globset",
  "grep",
@@ -2001,7 +2037,11 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2015,7 +2055,11 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2053,7 +2097,11 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "base64",
@@ -2071,7 +2119,11 @@ dependencies = [
 
 [[package]]
 name = "intent-store"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "intent-core",
  "rand 0.9.5",
@@ -2085,7 +2137,11 @@ dependencies = [
 
 [[package]]
 name = "intent-transport"
+<<<<<<< Updated upstream
 version = "0.1.0"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "base64",
  "futures",
@@ -2115,7 +2171,11 @@ dependencies = [
 
 [[package]]
 name = "intentd"
+<<<<<<< Updated upstream
 version = "0.2.9"
+=======
+version = "0.2.11"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "async-trait",
