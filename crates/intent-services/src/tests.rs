@@ -12825,6 +12825,241 @@ mod worktree_provisioning {
         );
     }
 
+    /// New-project flow (intent-hq/monorepo#962): `isNewRepo: true` on a
+    /// non-git `repositoryPath` initializes the directory (`git init -b main`
+    /// + seeded `.gitignore`/`README.md` + initial commit) and then provisions
+    /// the checkout normally — no more silent row-only workspace.
+    #[tokio::test]
+    async fn create_with_is_new_repo_initializes_repo_then_provisions() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let repo_dir = unique_dir("intentd-newrepo-src");
+        let root = unique_dir("intentd-newrepo-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        // The source dir became a real repo: initial commit on `main`, seeded
+        // starter files.
+        let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
+        assert_eq!(src.head().unwrap().shorthand().unwrap(), "main");
+        let head = src.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap().trim(), "Initial commit");
+        assert!(repo_dir.0.join(".gitignore").exists());
+        assert!(repo_dir.0.join("README.md").exists());
+
+        // ...and the workspace got a real checkout off it.
+        let wt = ws.worktree_path.as_deref().expect("worktree path set");
+        let wt_repo = git2::Repository::open(wt).expect("worktree opens as a git repo");
+        assert!(wt_repo.is_worktree());
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(head.id().to_string().as_str())
+        );
+        assert_eq!(ws.checkout_mode, Some(intent_core::CheckoutMode::Worktree));
+    }
+
+    /// intent-hq/monorepo#962: an `isNewRepo` initialization failure fails the
+    /// whole create with a typed `-32603` carrying the detail — and persists
+    /// no row (no silent row-only workspace).
+    #[tokio::test]
+    async fn create_with_is_new_repo_init_failure_is_typed_with_no_row() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let parent = unique_dir("intentd-newrepo-fail");
+        // A repositoryPath nested under a regular file makes `mkdir -p` fail.
+        let file = parent.0.join("not-a-dir");
+        std::fs::write(&file, "plain file\n").unwrap();
+        let root = unique_dir("intentd-newrepo-fail-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(file.join("sub").to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("create must fail when initialization fails");
+        assert!(
+            matches!(&err, Error::Internal(msg)
+                if msg.starts_with("workspace.create: repository initialization failed: ")),
+            "got: {err}"
+        );
+        assert_eq!(err.code(), -32603);
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+    }
+
+    /// intent-hq/monorepo#962: `isNewRepo: true` on an already-initialized
+    /// repo is a no-op — no re-init, no extra commit, and provisioning behaves
+    /// exactly like an ordinary create off a local repo.
+    #[tokio::test]
+    async fn create_with_is_new_repo_on_existing_repo_is_a_noop() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let (repo_dir, head_sha, _) = seed_repo("intentd-newrepo-noop");
+        let root = unique_dir("intentd-newrepo-noop-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+
+        // Source repo untouched: same head commit, original README content.
+        let src = git2::Repository::open(&repo_dir.0).expect("open source repo");
+        assert_eq!(
+            src.head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            head_sha,
+            "existing repo must not gain a new commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.0.join("README.md")).unwrap(),
+            "init\n",
+            "existing files must not be overwritten"
+        );
+        assert!(ws.worktree_path.is_some(), "provisioning still runs");
+        assert_eq!(ws.base_commit_sha.as_deref(), Some(head_sha.as_str()));
+    }
+
+    /// intent-hq/monorepo#962 guard: without `isNewRepo`, a non-git
+    /// `repositoryPath` keeps the documented legacy behavior — the create
+    /// succeeds row-only (no worktree, no init) and the dir stays non-git.
+    #[tokio::test]
+    async fn create_without_is_new_repo_keeps_row_only_skip_for_non_git_paths() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let repo_dir = unique_dir("intentd-newrepo-absent");
+        let root = unique_dir("intentd-newrepo-absent-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        for is_new_repo in [None, Some(false)] {
+            let ws = svc
+                .create_workspace(
+                    WorkspaceCreate {
+                        repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                        is_new_repo,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("create")
+                .workspace;
+            assert_eq!(ws.worktree_path, None, "provisioning stays skipped");
+            assert_eq!(ws.base_commit_sha, None);
+            assert!(
+                !repo_dir.0.join(".git").exists(),
+                "absent/false isNewRepo must not initialize the dir"
+            );
+        }
+    }
+
+    /// intent-hq/monorepo#962 review hardening: `isNewRepo: true` without a
+    /// usable `repositoryPath` is a client bug — reject with `-32602` instead
+    /// of minting a silent row-only workspace.
+    #[tokio::test]
+    async fn create_with_is_new_repo_missing_repository_path_is_invalid_params() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-newrepo-noparam-root");
+        let svc = Services::new(store.clone()).with_workspaces_root(root.0.clone());
+
+        for repository_path in [None, Some(String::new())] {
+            let err = svc
+                .create_workspace(
+                    WorkspaceCreate {
+                        repository_path,
+                        is_new_repo: Some(true),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect_err("create must reject isNewRepo without repositoryPath");
+            assert!(
+                matches!(&err, Error::InvalidParams(msg)
+                    if msg == "repositoryPath is required when isNewRepo is true"),
+                "got: {err}"
+            );
+            assert_eq!(err.code(), -32602);
+        }
+        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+    }
+
+    /// intent-hq/monorepo#962 review hardening: a mid-init failure can leave
+    /// `.git` without a resolvable HEAD; a retried `isNewRepo` create must
+    /// finish the initialization instead of treating the dir as an existing
+    /// repo and failing provisioning downstream on the base ref.
+    #[tokio::test]
+    async fn create_with_is_new_repo_recovers_half_initialized_dir() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let repo_dir = unique_dir("intentd-newrepo-halfinit");
+        // Simulate a crash after `git init` but before the initial commit:
+        // `.git` exists, HEAD is unborn.
+        let out = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo_dir.0)
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init failed");
+        let root = unique_dir("intentd-newrepo-halfinit-root");
+        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    is_new_repo: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create recovers the half-initialized dir")
+            .workspace;
+
+        let src = git2::Repository::open(&repo_dir.0).expect("source dir is a git repo");
+        let head = src.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap().trim(), "Initial commit");
+        assert!(
+            ws.worktree_path.is_some(),
+            "provisioning runs after recovery"
+        );
+        assert_eq!(
+            ws.base_commit_sha.as_deref(),
+            Some(head.id().to_string().as_str())
+        );
+    }
+
     /// Build Services with the `workspace.cowIsolation` setting applied.
     fn services_with_cow_isolation(
         store: Store,

@@ -601,6 +601,14 @@ pub struct WorkspaceCreate {
     /// Optional clone target directory used when `githubUrl` is set. Defaults
     /// to `<workspaces_root>/clones/<repo-name>` when omitted.
     pub clone_path: Option<String>,
+    /// New-project flow (PROTOCOL §5.1, intent-hq/monorepo#962): when `true`,
+    /// `repositoryPath` is set, no `githubUrl` clone is in play, and the path
+    /// is not already a local git repository, the daemon initializes the
+    /// directory as a git repository (`git init -b main` + seeded initial
+    /// commit) before branch naming and worktree provisioning. Absent/false
+    /// keeps the legacy behavior (non-git paths skip provisioning); `true` on
+    /// an existing git repo is a no-op.
+    pub is_new_repo: Option<bool>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
 }
@@ -2589,6 +2597,31 @@ mod tests {
         );
         let back: Event = serde_json::from_value(wire).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn workspace_create_parses_is_new_repo_wire_name() {
+        // `isNewRepo` (camelCase) is the wire name for the new-project flow
+        // flag (intent-hq/monorepo#962); absent keeps `None` so legacy
+        // callers are unaffected.
+        let with_flag: WorkspaceCreate =
+            serde_json::from_value(json!({ "repositoryPath": "/tmp/new", "isNewRepo": true }))
+                .unwrap();
+        assert_eq!(with_flag.is_new_repo, Some(true));
+        assert_eq!(with_flag.repository_path.as_deref(), Some("/tmp/new"));
+
+        let explicit_false: WorkspaceCreate =
+            serde_json::from_value(json!({ "isNewRepo": false })).unwrap();
+        assert_eq!(explicit_false.is_new_repo, Some(false));
+
+        let absent: WorkspaceCreate = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(absent.is_new_repo, None);
+
+        // snake_case is not a wire name — the unknown key is ignored and the
+        // field stays `None` (camelCase only).
+        let snake: WorkspaceCreate =
+            serde_json::from_value(json!({ "is_new_repo": true })).unwrap();
+        assert_eq!(snake.is_new_repo, None);
     }
 
     #[test]
