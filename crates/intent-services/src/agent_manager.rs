@@ -3972,19 +3972,30 @@ impl AgentManager {
             // mean a multi-GB download; the FE shows the phase message next
             // to the pre-first-token spinner). The callback's level maps
             // straight onto the event's `level` field, so a model-switch
-            // disruption warning arrives as `level: "warning"`.
-            let services = self.services.clone();
-            let ws = workspace_id.clone();
-            let aid = agent_id.clone();
-            let status_cb = move |level: crate::unsloth_server::StatusLevel, message: String| {
-                let services = services.clone();
-                let ws = ws.clone();
-                let aid = aid.clone();
+            // disruption warning arrives as `level: "warning"`. Messages
+            // are funneled through a single ordered channel + drainer task
+            // (not one task per message): clients keep only the latest
+            // message per agent, so publishes must preserve emission order
+            // or a restart warning could be clobbered by a later-emitted
+            // but earlier-published progress update.
+            let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                crate::unsloth_server::StatusLevel,
+                String,
+            )>();
+            {
+                let services = self.services.clone();
+                let ws = workspace_id.clone();
+                let aid = agent_id.clone();
                 tokio::spawn(async move {
-                    services
-                        .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
-                        .await;
+                    while let Some((level, message)) = status_rx.recv().await {
+                        services
+                            .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
+                            .await;
+                    }
                 });
+            }
+            let status_cb = move |level: crate::unsloth_server::StatusLevel, message: String| {
+                let _ = status_tx.send((level, message));
             };
             // Live-session snapshot for the restart-on-switch warning:
             // agents spawned with the unsloth provider are attached to the
