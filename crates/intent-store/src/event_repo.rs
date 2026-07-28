@@ -253,10 +253,13 @@ impl Store {
     /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
     /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
     /// `host:exec:*`, `script:output`, plus the high-churn state-notification
-    /// families listed in the body) whose `timestamp` is strictly older
+    /// families listed in the body — including `workspace:updated` and
+    /// `workspace:tokenUsage-changed`) whose `timestamp` is strictly older
     /// than `cutoff` (an RFC-3339 string), and return the number of rows
-    /// removed. Lifecycle/note/task/workspace events are preserved regardless
-    /// of age (`agent:tool:call` has its own TTL via
+    /// removed. Lifecycle/audit events (`workspace:created`/`deleted`/
+    /// `archived`, `agent:created`/`deleted`/`completed`/`failed`, note/task/
+    /// comment/git families, ...) are preserved regardless of age
+    /// (`agent:tool:call` has its own TTL via
     /// [`Store::delete_tool_call_events_before`]). This is deliberately scoped
     /// to high-volume families that can be safely trimmed so the log stays the
     /// source of truth for everything else. Each family is deleted separately
