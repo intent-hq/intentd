@@ -83,6 +83,7 @@ mod pagination;
 mod pr_ops;
 mod primitive_ops;
 pub mod provider_auth;
+pub mod provider_catalog;
 pub mod provider_models;
 pub mod repo_config;
 mod rtk;
@@ -7295,6 +7296,10 @@ impl WorkspaceApi for Services {
             }
             Ok(serde_json::Value::Object(caps))
         })
+    }
+
+    fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
     }
 
     fn unsloth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {

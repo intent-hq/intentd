@@ -97,9 +97,22 @@ pub fn resolve_on_path(command: &str) -> Option<PathBuf> {
 }
 
 /// Why a provider is gated off, or `None` when it is eligible for probing.
-fn gated_reason(provider: &ProviderConfig) -> Option<String> {
+/// This is the single source of the env-var/feature-code gate shared by
+/// discovery (`gatedOff`), `providers.catalog` (`visible`), and the
+/// `models.list` cortex gate.
+pub fn gated_reason(provider: &ProviderConfig) -> Option<String> {
+    gated_reason_with_env(provider, &|var| std::env::var_os(var).is_some())
+}
+
+/// [`gated_reason`] with an injectable env-var presence probe, so callers'
+/// unit tests can exercise both sides of the `requires_env_var` gate without
+/// mutating the (process-global) real environment.
+pub fn gated_reason_with_env(
+    provider: &ProviderConfig,
+    env_has: &dyn Fn(&str) -> bool,
+) -> Option<String> {
     if let Some(var) = provider.requires_env_var {
-        if std::env::var_os(var).is_none() {
+        if !env_has(var) {
             return Some(format!("requires env var {var}"));
         }
     }

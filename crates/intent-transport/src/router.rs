@@ -2543,6 +2543,12 @@ async fn dispatch(
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "providers.catalog" => {
+            // The static provider registry (monorepo#928); no params, no
+            // workspaceId — the registry is compiled-in daemon data.
+            let r = api.providers_catalog().await.map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.
