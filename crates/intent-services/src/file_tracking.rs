@@ -21,33 +21,47 @@ use intent_store::{NewTrackedChange, Store};
 /// the git/filesystem/tool path sources.
 ///
 /// Returns the `(lines_added, lines_deleted)` **delta** this recording
-/// represents: the row's new cumulative per-file counters minus the replaced
-/// row's, clamped ≥ 0 per counter so a shrinking diff (e.g. an agent reverting
-/// its own lines) never yields a negative delta. A fresh row baselines against
-/// the max counters any sibling row (same workspace/path/stage, other agent)
-/// already recorded — each row carries the file's **full** diff, so a second
-/// agent's first row must not replay lines a sibling already fed into the
-/// usage stats (monorepo#1009); 0 when the path is new. The upsert and the
-/// sibling read are not transactional: if two agents' *first* rows for the
-/// same brand-new path raced, each would baseline against the other and the
-/// initial lines would go unrecorded — acceptable for this best-effort
-/// recording, and the pipeline effectively serializes per workspace. Callers
-/// feed this growth into the global usage-stats recording (D5).
+/// represents: the row's new cumulative per-file counters minus a baseline,
+/// clamped ≥ 0 per counter so a shrinking diff (e.g. an agent reverting its
+/// own lines) never yields a negative delta. The baseline is the max, per
+/// counter, of the replaced row's counters (0 for a fresh row) and the max any
+/// sibling row (same workspace/path/stage, other agent) already recorded —
+/// each row carries the file's **full** diff, so neither a second agent's
+/// first row (monorepo#1009) nor a later update to its row (monorepo#1023) may
+/// replay lines a sibling already fed into the usage stats: growth on a shared
+/// path records once per `(workspace, path, stage)` regardless of which
+/// agent's row carries it. The upsert and the sibling read are not
+/// transactional: if two agents' *first* rows for the same brand-new path
+/// raced — or two agents' updates raced carrying the same growth — each would
+/// baseline against the other's already-written counters and the lines would
+/// go unrecorded — acceptable for this best-effort recording (prefer
+/// undercounting to double counting), and the pipeline effectively serializes
+/// per workspace. The sibling max is also a high-water mark: after a
+/// shared-path shrink, re-growth records as 0 until the diff exceeds a stale
+/// sibling's historical max (inherent to cumulative full-diff counters).
+/// Callers feed this growth into the global usage-stats recording (D5).
 pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result<(u64, u64)> {
     change.path = normalize_path(&change.path);
     let prev = store.upsert_tracked_change(&change).await?;
-    let (prev_additions, prev_deletions) = match prev {
-        Some(prev) => prev,
-        None => store
-            .max_sibling_tracked_change_counters(
-                &change.workspace_id,
-                &change.path,
-                &change.stage,
-                change.agent_id.as_deref(),
-            )
-            .await?
-            .unwrap_or((0, 0)),
-    };
+    let (own_additions, own_deletions) = prev.unwrap_or((0, 0));
+    if change.additions <= own_additions && change.deletions <= own_deletions {
+        // The baseline is ≥ the row's own previous counters, so the delta
+        // clamps to zero regardless of siblings — skip the sibling read.
+        return Ok((0, 0));
+    }
+    let (sibling_additions, sibling_deletions) = store
+        .max_sibling_tracked_change_counters(
+            &change.workspace_id,
+            &change.path,
+            &change.stage,
+            change.agent_id.as_deref(),
+        )
+        .await?
+        .unwrap_or((0, 0));
+    let (prev_additions, prev_deletions) = (
+        own_additions.max(sibling_additions),
+        own_deletions.max(sibling_deletions),
+    );
     Ok((
         (change.additions - prev_additions).max(0) as u64,
         (change.deletions - prev_deletions).max(0) as u64,

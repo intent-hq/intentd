@@ -9912,6 +9912,92 @@ mod usage_stats_recording {
         assert_eq!(lines_for(&svc, "unknown").await, (14, 5));
     }
 
+    /// Regression (monorepo#1023): an **update** to an existing row baselines
+    /// against `max(own prev, sibling max)`, so growth a sibling row already
+    /// recorded is not replayed when another agent's row on the shared path is
+    /// subsequently updated — the growth lands once per
+    /// `(workspace, path, stage)`, not once per agent row.
+    #[tokio::test]
+    async fn updated_row_on_shared_path_does_not_re_record_sibling_growth() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        // Step 1: agent A's row at (10, 0); agent B's fresh row and an
+        // unattributed fresh row replay the same full-file diff → zero deltas
+        // (monorepo#1009 behavior).
+        let first =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-a"), 10, 0))
+                .await
+                .expect("first");
+        assert_eq!(first, (10, 0));
+        let fresh =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-b"), 10, 0))
+                .await
+                .expect("fresh");
+        assert_eq!(fresh, (0, 0));
+        let fresh_unattributed =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", None, 10, 0))
+                .await
+                .expect("fresh unattributed");
+        assert_eq!(fresh_unattributed, (0, 0));
+        // Step 2: the file grows to (14, 3); A edits → the growth records,
+        // pushing both counters through the sibling-max baseline.
+        let growth =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-a"), 14, 3))
+                .await
+                .expect("growth");
+        assert_eq!(growth, (4, 3));
+        // Step 3: B later edits (its row updates (10, 0) → (14, 3)). The
+        // sibling max is already (14, 3), so the delta is (0, 0) — not (4, 3)
+        // recorded again.
+        let update =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-b"), 14, 3))
+                .await
+                .expect("update");
+        assert_eq!(
+            update,
+            (0, 0),
+            "sibling-recorded growth must not replay on a row update"
+        );
+        // The unattributed (NULL agent) row's update baselines against its
+        // attributed siblings the same way (`agent_id IS NOT ?` semantics).
+        let update_unattributed =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", None, 14, 3))
+                .await
+                .expect("update unattributed");
+        assert_eq!(update_unattributed, (0, 0));
+        // A lone agent's update on an unshared path still records its growth.
+        let solo_first = crate::file_tracking::track_change(
+            store,
+            change(&ws, "solo.ts", Some("agent-a"), 3, 1),
+        )
+        .await
+        .expect("solo first");
+        assert_eq!(solo_first, (3, 1));
+        let solo_growth = crate::file_tracking::track_change(
+            store,
+            change(&ws, "solo.ts", Some("agent-a"), 7, 2),
+        )
+        .await
+        .expect("solo growth");
+        assert_eq!(solo_growth, (4, 1));
+
+        // End-to-end: recording every delta accrues the shared file's true
+        // totals once (14/3) plus the solo file's (7/2).
+        for (agent, (added, deleted)) in [
+            (Some("agent-a"), first),
+            (Some("agent-b"), fresh),
+            (None, fresh_unattributed),
+            (Some("agent-a"), growth),
+            (Some("agent-b"), update),
+            (None, update_unattributed),
+            (Some("agent-a"), solo_first),
+            (Some("agent-a"), solo_growth),
+        ] {
+            crate::usage_stats::record_lines_changed(store, &ws, agent, added, deleted).await;
+        }
+        assert_eq!(lines_for(&svc, "unknown").await, (21, 5));
+    }
+
     /// The recorded delta lands in `usage_stats_hourly` under the acting
     /// agent's normalized model, keeps accruing across recordings, and is
     /// untouched by clearing the workspace/agent metrics aggregates
