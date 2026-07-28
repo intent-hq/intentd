@@ -6,11 +6,12 @@
 //! only pays for the files it actually expands.
 
 use std::path::Path;
+use std::time::Instant;
 
-use git2::{DiffOptions, Oid, Patch, Repository};
+use git2::{Delta, DiffOptions, Oid, Patch, Repository};
 use intent_core::{Error, Result};
 
-use crate::map_git_err;
+use crate::{map_git_err, SLOW_GIT_WARN_THRESHOLD};
 
 /// The kind of a diff line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,7 +290,12 @@ pub fn diff_commit(repo_path: &Path, commit_hash: &str) -> Result<Vec<FileDiff>>
 /// changes only (untracked content excluded, matching `git diff --numstat HEAD`).
 /// An unborn `HEAD` (no commit) has no diff base — like the TS `git diff HEAD`
 /// failing — so `(0, 0, 0)` is returned and callers omit the summary.
+///
+/// Cost: a single tree→workdir traversal; untracked file content is never
+/// loaded (no `show_untracked_content`), so untracked entries are counted
+/// without reading their bytes.
 pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
+    let started = Instant::now();
     let repo = Repository::open(repo_path).map_err(map_git_err)?;
     let Some(head_tree) = repo
         .head()
@@ -301,28 +307,42 @@ pub fn head_diff_rollup(repo_path: &Path) -> Result<(usize, usize, usize)> {
         return Ok((0, 0, 0));
     };
 
-    // Tracked changes vs HEAD (staged + unstaged); untracked excluded — line stats.
-    let tracked = repo
-        .diff_tree_to_workdir_with_index(Some(&head_tree), None)
+    // Single traversal: tracked changes vs HEAD plus untracked entries.
+    // `show_untracked_content` stays off, so untracked file content is never
+    // read — those deltas contribute to the file count only.
+    let mut opts = DiffOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))
         .map_err(map_git_err)?;
+
+    let total_files = diff.deltas().len();
     let mut total_additions = 0usize;
     let mut total_deletions = 0usize;
-    for i in 0..tracked.deltas().len() {
-        if let Some(patch) = Patch::from_diff(&tracked, i).map_err(map_git_err)? {
+    for i in 0..total_files {
+        let delta = diff.get_delta(i).expect("delta index in range");
+        // Untracked files count toward `total_files` but are excluded from the
+        // line totals (matching `git diff --numstat HEAD`); skipping the patch
+        // also avoids materializing their content.
+        if delta.status() == Delta::Untracked {
+            continue;
+        }
+        if let Some(patch) = Patch::from_diff(&diff, i).map_err(map_git_err)? {
             let (_ctx, adds, dels) = patch.line_stats().map_err(map_git_err)?;
             total_additions += adds;
             total_deletions += dels;
         }
     }
 
-    // Same diff including untracked files → unique changed-file count.
-    let mut opts = DiffOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
-    let with_untracked = repo
-        .diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))
-        .map_err(map_git_err)?;
-    let total_files = with_untracked.deltas().len();
-
+    let total = started.elapsed();
+    if total >= SLOW_GIT_WARN_THRESHOLD {
+        tracing::warn!(
+            repo_path = %repo_path.display(),
+            total_files,
+            total_ms = total.as_millis() as u64,
+            "head_diff_rollup: slow HEAD→workdir diff rollup"
+        );
+    }
     Ok((total_files, total_additions, total_deletions))
 }
 
@@ -554,6 +574,16 @@ mod tests {
         assert_eq!(total_files, 2);
         assert_eq!(total_additions, 2);
         assert_eq!(total_deletions, 1);
+    }
+
+    #[test]
+    fn head_diff_rollup_untracked_only_counts_files_not_lines() {
+        // Untracked files count toward total_files but contribute no line
+        // stats (their content is never diffed).
+        let dir = init_repo("diff-rollup-untracked-only");
+        commit_file(dir.path(), "a.txt", "seed\n");
+        write_file(dir.path(), "new.txt", "hello\nworld\nthree\n");
+        assert_eq!(head_diff_rollup(dir.path()).unwrap(), (1, 0, 0));
     }
 
     #[test]

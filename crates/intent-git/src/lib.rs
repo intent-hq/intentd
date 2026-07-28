@@ -43,6 +43,10 @@ pub mod worktree;
 #[cfg(test)]
 mod testutil;
 
+/// Threshold above which a single git read operation logs one warn-level line
+/// so slow git work on large repos is visible in production (#963).
+pub(crate) const SLOW_GIT_WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Map a libgit2 error into the domain [`Error::Internal`] (`-32603`).
 pub(crate) fn map_git_err(e: git2::Error) -> Error {
     Error::Internal(e.message().to_string())
