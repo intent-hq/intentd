@@ -3886,6 +3886,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.catalog`: the static provider registry (monorepo#928) —
+    /// `{ providers: [...], defaultProviderId }`, one row per registered
+    /// provider in registry order, so clients no longer need a local copy of
+    /// the provider config. Each row is `{ id, displayName, shortName,
+    /// command, isDefault, canBeDisabled, loginCommandHint?, loginDocsUrl?,
+    /// authErrorPatterns?, requiresEnvVar?, requiresFeatureCode?, visible,
+    /// modelTiers? }`; `visible` is the daemon-evaluated gating result (env
+    /// var present / no feature code required) while the raw gating fields
+    /// are passed through when set. No params, no workspaceId — static data.
+    fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::providers_catalog not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `unsloth.status`: observe the daemon-managed singleton Unsloth server
     /// (monorepo#878) — `{ running: boolean, repoId?, port?, pid?, uptimeSecs?,
     /// phase?, cpuPercent?, memoryBytes?, attachedAgentCount? }`. `running:

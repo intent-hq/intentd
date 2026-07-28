@@ -344,7 +344,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.5",
+        sess[0]["result"]["protocolVersion"], "2.6",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -1373,6 +1373,111 @@ async fn wss_system_capabilities_reports_cow_supported() {
         result.get("cowSupported").is_some_and(Value::is_boolean),
         "cowSupported present as a boolean when the probe ran (hermetic root exists): {resp}"
     );
+    srv.ws.stop().await;
+}
+
+/// `providers.catalog` (monorepo#928): no params, no workspaceId — the
+/// provider registry is compiled-in daemon data. Asserts the documented
+/// result shape: one row per `ACP_PROVIDERS` entry in registry order,
+/// `defaultProviderId`, daemon-evaluated `visible` with the raw gating
+/// fields passed through (cortex's feature code always gates —
+/// default-deny), and `modelTiers` only for static-tier providers.
+#[tokio::test]
+async fn wss_providers_catalog_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"providers.catalog","params":{}}"#,
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 1);
+    let result = resp["result"].as_object().expect("result is an object");
+    assert_eq!(
+        result["defaultProviderId"].as_str(),
+        Some("auggie"),
+        "defaultProviderId mirrors the registry's is_default entry: {resp}"
+    );
+
+    let providers = result["providers"].as_array().expect("providers array");
+    let ids: Vec<&str> = providers
+        .iter()
+        .map(|p| p["id"].as_str().expect("provider id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "auggie",
+            "claude-code",
+            "codex",
+            "cortex",
+            "opencode",
+            "unsloth",
+            "pi",
+            "droid",
+            "grok",
+            "mock"
+        ],
+        "one row per registry entry, registry order: {resp}"
+    );
+
+    // Row shape: required fields present on every row.
+    for p in providers {
+        for field in ["displayName", "shortName", "command"] {
+            assert!(p[field].is_string(), "{field} on {}: {resp}", p["id"]);
+        }
+        for field in ["isDefault", "canBeDisabled", "visible"] {
+            assert!(p[field].is_boolean(), "{field} on {}: {resp}", p["id"]);
+        }
+    }
+
+    // Gating: cortex's feature code always gates (the daemon stores no
+    // feature-code enablement — default-deny), with the raw field passed
+    // through; ungated providers are visible.
+    let cortex = &providers[3];
+    assert_eq!(cortex["shortName"], "Cortex");
+    assert_eq!(cortex["visible"], Value::Bool(false));
+    assert_eq!(cortex["requiresFeatureCode"].as_str(), Some("cortex"));
+    let auggie = &providers[0];
+    assert_eq!(auggie["shortName"], "Auggie");
+    assert_eq!(auggie["visible"], Value::Bool(true));
+    assert_eq!(auggie["isDefault"], Value::Bool(true));
+
+    // mock's env-var gate passes the raw field through regardless of the
+    // daemon environment.
+    let mock = &providers[9];
+    assert_eq!(
+        mock["requiresEnvVar"].as_str(),
+        Some("MOCK_AGENT_SCRIPT_PATH")
+    );
+
+    // modelTiers: present with all three tiers for static-tier providers,
+    // omitted for dynamic-model providers.
+    for idx in [0usize, 1, 2, 3] {
+        let tiers = &providers[idx]["modelTiers"];
+        assert!(
+            tiers.is_object(),
+            "modelTiers on {}: {resp}",
+            providers[idx]["id"]
+        );
+        for tier in ["fast", "balanced", "smart"] {
+            assert!(
+                tiers[tier].is_string(),
+                "modelTiers.{tier} on {}: {resp}",
+                providers[idx]["id"]
+            );
+        }
+    }
+    for idx in [4usize, 5, 6, 7, 8, 9] {
+        assert!(
+            providers[idx].get("modelTiers").is_none(),
+            "dynamic-model provider {} must omit modelTiers: {resp}",
+            providers[idx]["id"]
+        );
+    }
+
     srv.ws.stop().await;
 }
 

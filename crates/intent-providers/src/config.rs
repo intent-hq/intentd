@@ -85,6 +85,9 @@ pub struct ProviderConfig {
     pub runtime: ProviderRuntime,
     /// Display name shown in UI (e.g., `Augment Auggie`).
     pub display_name: &'static str,
+    /// Short display name shown in compact UI (e.g., `Auggie`). Port of the
+    /// TS `shortName`.
+    pub short_name: &'static str,
     /// CLI command to spawn the agent.
     pub command: &'static str,
     /// Default arguments for ACP mode.
@@ -180,6 +183,9 @@ impl ProviderConfig {
             // injection. V8-backed providers override this per entry.
             runtime: ProviderRuntime::Native,
             display_name,
+            // Registry entries override this with the FE's `shortName`;
+            // falling back to the full display name keeps `empty()` total.
+            short_name: display_name,
             command,
             base_args: &[],
             model_flag: None,
@@ -247,6 +253,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "please run `auggie login`",
         ]),
         login_command_hint: Some("auggie login"),
+        short_name: "Auggie",
         ..ProviderConfig::empty("auggie", "Augment Auggie", "auggie")
     },
     ProviderConfig {
@@ -267,6 +274,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
             "https://code.claude.com/docs/en/quickstart#step-2-log-in-to-your-account",
         ),
         npx_only_package: Some(CLAUDE_AGENT_ACP_NPX_PACKAGE),
+        short_name: "Claude Code",
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {
@@ -284,6 +292,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         auth_check_args: Some(&["login", "status"]),
         login_docs_url: Some("https://developers.openai.com/codex/cli#cli-setup"),
         fallback_npx_package: Some(CODEX_ACP_NPX_PACKAGE),
+        short_name: "Codex",
         ..ProviderConfig::empty("codex", "OpenAI Codex", "codex-acp")
     },
     ProviderConfig {
@@ -293,6 +302,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         requires_feature_code: Some("cortex"),
+        short_name: "Cortex",
         ..ProviderConfig::empty("cortex", "Snowflake Cortex", "cortex-acp")
     },
     ProviderConfig {
@@ -302,6 +312,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         injection_mechanism: InjectionMechanism::EnvConfig,
         auth_check_args: Some(&["models"]),
         login_docs_url: Some("https://opencode.ai/docs#configure"),
+        short_name: "OpenCode",
         ..ProviderConfig::empty("opencode", "OpenCode", "opencode")
     },
     ProviderConfig {
@@ -320,6 +331,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // lifecycle (`unsloth_server.rs`) shells out to `unsloth run` /
         // `unsloth start opencode` directly, independent of the ACP spawn.
         requires_secondary_binary: Some("unsloth"),
+        short_name: "Unsloth",
         ..ProviderConfig::empty("unsloth", "Unsloth", "opencode")
     },
     ProviderConfig {
@@ -342,6 +354,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         supports_config_option_model: true,
         login_docs_url: Some("https://pi.dev/docs/latest/quickstart"),
         npx_only_package: Some(PI_ACP_NPX_PACKAGE),
+        short_name: "Pi",
         ..ProviderConfig::empty("pi", "Pi", "pi-acp")
     },
     ProviderConfig {
@@ -357,6 +370,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // ACP request is the only spawn-scoped delivery mechanism.
         supports_session_mcp_servers: true,
         login_docs_url: Some("https://docs.factory.ai/cli/getting-started/overview"),
+        short_name: "Droid",
         ..ProviderConfig::empty("droid", "Factory Droid", "droid")
     },
     ProviderConfig {
@@ -379,6 +393,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // using ACP `authenticate` (see `models::parse_grok_models_command_output`).
         auth_check_args: Some(&["models"]),
         login_docs_url: Some("https://docs.x.ai/build/enterprise#authentication"),
+        short_name: "Grok",
         ..ProviderConfig::empty("grok", "Grok Build", "grok")
     },
     ProviderConfig {
@@ -387,6 +402,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         can_be_disabled: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
         requires_env_var: Some("MOCK_AGENT_SCRIPT_PATH"),
+        short_name: "Mock",
         ..ProviderConfig::empty("mock", "Mock (E2E)", "node")
     },
 ];
