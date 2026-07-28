@@ -8642,6 +8642,7 @@ impl WorkspaceApi for Services {
                         base_commit_sha: input.base_commit_sha,
                         status: WorkspaceStatus::Active,
                         status_message: input.status_message,
+                        status_image_asset_id: None,
                         // Derived, read-only; never persisted (§9.9).
                         activity: WorkspaceActivity::Idle,
                         attention: WorkspaceAttention::None,
@@ -9394,6 +9395,13 @@ impl WorkspaceApi for Services {
                 // instead of `Some("")` for a cleared value.
                 ws.status_message = if v.trim().is_empty() { None } else { Some(v) };
             }
+            // Clearable status-screenshot asset id (intent-hq/monorepo#997):
+            // wire `null` (`Some(None)`) clears, `Some(Some(id))` sets,
+            // missing leaves untouched — same double-option contract as the
+            // PR fields below.
+            if let Some(v) = update.status_image_asset_id {
+                ws.status_image_asset_id = v.filter(|s| !s.trim().is_empty());
+            }
             if let Some(v) = update.branch {
                 ws.branch = v;
             }
@@ -10050,6 +10058,7 @@ impl WorkspaceApi for Services {
                 base_commit_sha: None,
                 status: WorkspaceStatus::Active,
                 status_message: None,
+                status_image_asset_id: None,
                 activity: WorkspaceActivity::Idle,
                 attention: WorkspaceAttention::None,
                 created_at: now.clone(),

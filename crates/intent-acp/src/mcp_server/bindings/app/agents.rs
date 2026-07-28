@@ -454,6 +454,7 @@ mod tests {
             base_commit_sha: None,
             status: WorkspaceStatus::Active,
             status_message: None,
+            status_image_asset_id: None,
             activity: WorkspaceActivity::Idle,
             attention: WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".to_string(),

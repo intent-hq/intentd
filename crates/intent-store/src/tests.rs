@@ -49,6 +49,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
             WorkspaceStatus::Active
         },
         status_message: Some("working".to_string()),
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::Unread,
         created_at: ts.clone(),
@@ -93,7 +94,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
         ]
     );
     assert_eq!(
@@ -101,7 +102,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
         ]
     );
 }
@@ -4248,6 +4249,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     base_commit_sha: None,
                     status: WorkspaceStatus::Active,
                     status_message: None,
+                    status_image_asset_id: None,
                     activity: WorkspaceActivity::Idle,
                     attention: WorkspaceAttention::Unread,
                     created_at: ts.clone(),

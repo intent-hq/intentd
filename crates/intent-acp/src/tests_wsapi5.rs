@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use intent_core::{
     AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, FileStatus,
     GitAgentCommitResult, GitCommitResult, GitFileStatus, GitMergeConflicts, GitStatus, NoteId,
-    Result, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus, WorkspaceUpdate, CHIEF_WORKSPACE_ID,
+    Result, SaveAssetResult, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate, CHIEF_WORKSPACE_ID,
 };
 use serde_json::{json, Value};
 
@@ -52,6 +52,8 @@ struct FakeApi {
     // `Some(Some(x))` or `Some(None)` = the value the last `update_workspace`
     // call landed on after empty/whitespace-clear normalization.
     status_message_state: Mutex<Option<Option<String>>>,
+    /// Recorded `save_asset` calls: (data, mime_type, original_name).
+    save_asset_calls: Mutex<Vec<(String, String, Option<String>)>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -76,6 +78,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         base_commit_sha: None,
         status: WorkspaceStatus::Active,
         status_message: Some("hi".to_string()),
+        status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -157,6 +160,26 @@ impl WorkspaceApi for FakeApi {
                 w.status_message = sm;
             }
             Ok(w)
+        })
+    }
+
+    fn save_asset(
+        &self,
+        _workspace_id: WorkspaceId,
+        data: String,
+        mime_type: String,
+        original_name: Option<String>,
+    ) -> BoxFuture<'_, Result<SaveAssetResult>> {
+        self.save_asset_calls
+            .lock()
+            .unwrap()
+            .push((data, mime_type, original_name));
+        Box::pin(async {
+            Ok(SaveAssetResult {
+                asset_id: "asset-123".to_string(),
+                path: "/tmp/assets/asset-123.png".to_string(),
+                url: "workspace-asset://asset-123".to_string(),
+            })
         })
     }
 
@@ -620,6 +643,64 @@ async fn workspace_set_status_message_counts_chars_not_bytes() {
 }
 
 #[tokio::test]
+async fn workspace_set_status_image_saves_asset_and_updates_workspace() {
+    let (srv, api) = server();
+    let code = "return await ws.workspace.setStatusImage({ data: 'aGVsbG8=', mimeType: 'image/png', originalName: 'shot.png' });";
+    let resp = call(&srv, code).await;
+    let v = body(&resp);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["statusImageAssetId"], json!("asset-123"));
+    assert_eq!(v["url"], json!("workspace-asset://asset-123"));
+    let saves = api.save_asset_calls.lock().unwrap();
+    assert_eq!(saves.len(), 1);
+    assert_eq!(saves[0].0, "aGVsbG8=");
+    assert_eq!(saves[0].1, "image/png");
+    assert_eq!(saves[0].2.as_deref(), Some("shot.png"));
+    let updates = api.update_calls.lock().unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(
+        updates[0].status_image_asset_id,
+        Some(Some("asset-123".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn workspace_set_status_image_null_clears() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.workspace.setStatusImage(null);").await;
+    let v = body(&resp);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v["statusImageAssetId"], Value::Null);
+    assert!(api.save_asset_calls.lock().unwrap().is_empty());
+    let updates = api.update_calls.lock().unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].status_image_asset_id, Some(None));
+}
+
+#[tokio::test]
+async fn workspace_set_status_image_requires_data() {
+    let (srv, api) = server();
+    let code = "return await ws.workspace.setStatusImage({ mimeType: 'image/png' });";
+    let resp = call(&srv, code).await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("image.data (base64) is required"));
+    assert!(api.save_asset_calls.lock().unwrap().is_empty());
+    assert!(api.update_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_set_status_image_rejects_non_image_mime() {
+    let (srv, api) = server();
+    let code =
+        "return await ws.workspace.setStatusImage({ data: 'aGVsbG8=', mimeType: 'text/plain' });";
+    let resp = call(&srv, code).await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("must be an image/* type"));
+    assert!(api.save_asset_calls.lock().unwrap().is_empty());
+    assert!(api.update_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn workspace_set_agent_name_requires_caller_context() {
     let (srv, _api) = server();
     let resp = call(&srv, "return await ws.workspace.setAgentName('Fresh');").await;
@@ -799,6 +880,18 @@ async fn workspace_unarchive_refuses_in_chief_workspace() {
     assert_eq!(resp["result"]["isError"], json!(true));
     assert!(text(&resp).contains("chief-of-staff"));
     assert!(api.unarchive_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_set_status_image_refuses_in_chief_workspace() {
+    let (srv, api) = chief_server();
+    let code =
+        "return await ws.workspace.setStatusImage({ data: 'aGVsbG8=', mimeType: 'image/png' });";
+    let resp = call(&srv, code).await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("chief-of-staff"));
+    assert!(api.save_asset_calls.lock().unwrap().is_empty());
+    assert!(api.update_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
