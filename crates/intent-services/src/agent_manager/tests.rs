@@ -2135,6 +2135,134 @@ async fn terminal_failure_requeue_carries_prepend_fields() {
     assert!(wire.get("prependFileBlocks").is_none());
 }
 
+/// Quarantine-park interaction (monorepo#1034): `send_message` to a poisoned
+/// session parks the message in the queue; the parked entry must carry the
+/// caller's combined-delivery `prepend_*` fields so the `agent.retry` redrive
+/// still delivers the preempted message ahead of the interrupt message.
+#[tokio::test]
+async fn quarantine_park_preserves_prepend_fields() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-prep-park"),
+        AgentId::from("a-prep-park"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_file_blocks: Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent update".to_string(),
+            None,
+            options,
+        )
+        .await
+        .expect("quarantined send parks in queue");
+    assert_eq!(result["queued"], json!(true));
+    assert_eq!(result["quarantined"], json!(true));
+
+    let queued = mgr.services.dequeue_message(&id).expect("parked message");
+    assert_eq!(queued.content, "urgent update");
+    assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+    );
+    assert_eq!(
+        queued.prepend_file_blocks,
+        Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ]))
+    );
+    // The wire shape (`agent.getQueue`) does not leak the prompt-only fields.
+    let wire = queued.to_value(0);
+    assert!(wire.get("prependContent").is_none());
+    assert!(wire.get("prependImageBlocks").is_none());
+    assert!(wire.get("prependFileBlocks").is_none());
+}
+
+/// Concurrent-send slot race (monorepo#1034): an interrupt during the "slot
+/// claimed but no cancellable session yet" window falls through to
+/// `send_message`, which loses `try_begin` and queues instead. The queued
+/// entry must carry the `prepend_*` fields — before the fix they were
+/// hard-coded `None` and the preempted message silently vanished from the
+/// eventual drain's prompt.
+#[tokio::test]
+async fn busy_queue_fallback_preserves_prepend_fields() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-prep-busy"),
+        AgentId::from("a-prep-busy"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    // Claim the slot without a session handle: `is_busy` is true but the
+    // turn is not cancellable (no handle + no acpSessionId), so the
+    // interrupt skips preemption and the inner send loses `try_begin`.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_file_blocks: Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent update".to_string(),
+            None,
+            options,
+        )
+        .await
+        .expect("busy interrupt queues behind the starting turn");
+    assert_eq!(result["queued"], json!(true), "parked, not streamed");
+
+    let queued = mgr.services.dequeue_message(&id).expect("queued message");
+    assert_eq!(queued.content, "urgent update");
+    assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+    );
+    assert_eq!(
+        queued.prepend_file_blocks,
+        Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ]))
+    );
+
+    mgr.end_turn(&id).await;
+}
+
 // --- First-turn workspace-naming instruction ---------------------------------
 
 /// Seed an agent whose workspace already carries `title` (used by naming-instruction
@@ -3797,7 +3925,7 @@ async fn try_drain_queue_no_op_when_already_busy() {
     let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
     // Queue a ready message so the only barrier is the busy flag.
     mgr.services
-        .enqueue_message(&id, "queued".to_string(), None, None, None);
+        .enqueue_message(&id, "queued".to_string(), None, None, None, None);
     assert!(mgr.try_begin(&id, &ws).await);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -3840,7 +3968,7 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
         .expect("park session in error");
     // A ready-to-send message is waiting (the terminal-failure requeue).
     mgr.services
-        .enqueue_message(&id, "requeued".to_string(), None, None, None);
+        .enqueue_message(&id, "requeued".to_string(), None, None, None, None);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
 
@@ -4381,7 +4509,7 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
     // Queue an unpersisted message, then hide the transcript table so the
     // drain's pre-turn `persist_user` append fails.
     mgr.services
-        .enqueue_message(&id, "boom".to_string(), None, None, None);
+        .enqueue_message(&id, "boom".to_string(), None, None, None, None);
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -4586,7 +4714,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     // Queue an unpersisted message, then hide the transcript table so every
     // pre-turn `persist_user` attempt (initial + bounded retries) fails.
     mgr.services
-        .enqueue_message(&id, "boom".to_string(), None, None, None);
+        .enqueue_message(&id, "boom".to_string(), None, None, None, None);
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -4744,7 +4872,7 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         .expect("set mock provider");
 
     mgr.services
-        .enqueue_message(&id, "blip".to_string(), None, None, None);
+        .enqueue_message(&id, "blip".to_string(), None, None, None, None);
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -5215,8 +5343,14 @@ async fn queue_dequeue_round_trip_preserves_image_and_file_blocks() {
     let files = Some(json!([
         {"data": "F", "mimeType": "text/plain", "fileName": "r.txt"}
     ]));
-    mgr.services
-        .enqueue_message(&id, "msg".to_string(), images.clone(), files.clone(), None);
+    mgr.services.enqueue_message(
+        &id,
+        "msg".to_string(),
+        images.clone(),
+        files.clone(),
+        None,
+        None,
+    );
     let drained = mgr
         .services
         .dequeue_message(&id)
@@ -6471,7 +6605,7 @@ mod stale_redrive_tests {
         // exact incident ordering (message queued while the reporting turn
         // was still in flight).
         mgr.services
-            .enqueue_message(&id, "stale wake".to_string(), None, None, None);
+            .enqueue_message(&id, "stale wake".to_string(), None, None, None, None);
         tokio::time::sleep(Duration::from_millis(20)).await;
         set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
 
@@ -6539,7 +6673,7 @@ mod stale_redrive_tests {
         set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         mgr.services
-            .enqueue_message(&id, "fresh work".to_string(), None, None, None);
+            .enqueue_message(&id, "fresh work".to_string(), None, None, None, None);
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         timeout(Duration::from_secs(10), async {
@@ -7003,8 +7137,14 @@ mod harness_wake_tests {
 
         // The racing user send goes to the queue (slot busy), which also
         // preempts the settle window — the wake turn finalizes first.
-        mgr.services
-            .enqueue_message(&id, "racing user message".to_string(), None, None, None);
+        mgr.services.enqueue_message(
+            &id,
+            "racing user message".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(mgr.services.has_ready_to_send(&id));
 
         let events = collect_until(&mut sub, |seen| {

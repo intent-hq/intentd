@@ -10123,7 +10123,7 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
         "msg-live",
         vec![json!({ "type": "text", "text": "streaming…" })],
     );
-    svc.enqueue_message(&c, "queued follow-up".to_string(), None, None, None);
+    svc.enqueue_message(&c, "queued follow-up".to_string(), None, None, None, None);
     assert!(svc.live_turn(&a).is_some(), "live-turn slot seeded");
     assert!(svc.has_ready_to_send(&c), "queue seeded");
     assert_eq!(svc.find_watches_for_child(&b).len(), 1);
@@ -10651,6 +10651,7 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
         None,
         None,
         Some(metadata.clone()),
+        None,
     );
     assert_eq!(queued.to_value(position)["messageMetadata"], metadata);
     svc.publish_queue_updated(&id).await;
@@ -10673,7 +10674,7 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
     assert_eq!(evt.data["queue"][0]["messageMetadata"], metadata);
 
     // Legacy shape: an entry enqueued without metadata omits the key.
-    let (plain, plain_pos) = svc.enqueue_message(&id, "plain".to_string(), None, None, None);
+    let (plain, plain_pos) = svc.enqueue_message(&id, "plain".to_string(), None, None, None, None);
     let v = plain.to_value(plain_pos);
     assert!(
         v.get("messageMetadata").is_none(),
@@ -11366,7 +11367,7 @@ async fn migrate_queue_missing_poisoned_session_is_idempotent() {
 async fn migrate_queue_rejects_unknown_target_without_draining() {
     let (_t, svc, ws) = setup().await;
     let poisoned = create_agent(&svc, &ws, "Poisoned").await;
-    svc.enqueue_message(&poisoned, "parked".into(), None, None, None);
+    svc.enqueue_message(&poisoned, "parked".into(), None, None, None, None);
     let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
 
     let err = svc
