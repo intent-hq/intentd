@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.11] - 2026-07-28
+
+### 🚀 Features
+
+- *(services)* Warn live unsloth agents before a model-switch restart ([#647](https://github.com/intent-hq/intentd/pull/647))
+- *(services)* Port-conflict detection for the managed unsloth server ([#660](https://github.com/intent-hq/intentd/pull/660))
+- *(unsloth)* Add unsloth.status and unsloth.stop daemon RPCs ([#623](https://github.com/intent-hq/intentd/pull/623))
+- *(services)* Real event.subscribe delivery with batching and restart persistence (monorepo#937) ([#632](https://github.com/intent-hq/intentd/pull/632))
+- Event-subscription introspection + workspace-delete cleanup (monorepo#947) ([#644](https://github.com/intent-hq/intentd/pull/644))
+- Add isWaitingForOtherAgents to the agent:idle payload ([#651](https://github.com/intent-hq/intentd/pull/651))
+- *(services)* Expose secondary-binary status in host.providerDiscovery ([#668](https://github.com/intent-hq/intentd/pull/668))
+- Remove model.workspaceOverrides setting layer ([#669](https://github.com/intent-hq/intentd/pull/669))
+- Workspace status screenshot — statusImageAssetId + ws.workspace.setStatusImage ([#671](https://github.com/intent-hq/intentd/pull/671))
+- *(store)* Sweep high-churn state-notification event families (72h retention) ([#677](https://github.com/intent-hq/intentd/pull/677))
+
+### 🐛 Bug Fixes
+
+- Report the platform file manager as always installed on macOS/Windows ([#655](https://github.com/intent-hq/intentd/pull/655))
+- Renumber duplicate migration version 0062 to 0063 ([#674](https://github.com/intent-hq/intentd/pull/674))
+- Default interactive terminal TERM for Backspace erase ([#952](https://github.com/intent-hq/intentd/pull/952)) ([#638](https://github.com/intent-hq/intentd/pull/638))
+- Demote agentCommit unattributed-dirty skip log to debug ([#645](https://github.com/intent-hq/intentd/pull/645))
+- Pre-gate wakeOrCreate watch scope before side effects (monorepo#932)
+- *(services)* Skip wakeOrCreate SUB-1 watch and pre-gate for a deleted caller ([#667](https://github.com/intent-hq/intentd/pull/667))
+- *(metrics)* Stop double counting shared paths across agent attribution rows (monorepo#1009) ([#683](https://github.com/intent-hq/intentd/pull/683))
+- *(usage-stats)* Stop re-recording shared-path growth on row updates (monorepo#1023) ([#689](https://github.com/intent-hq/intentd/pull/689))
+- *(acp)* Unwrap codex nested MCP tool-call arguments in session mapping
+- Stamp sender attribution on wakeOrCreate context message (monorepo#1015) ([#681](https://github.com/intent-hq/intentd/pull/681))
+- Recreate ACP session on retry of poisoned session (monorepo#940)
+- Decouple CoW sandbox provisioning from the delegate critical path ([#636](https://github.com/intent-hq/intentd/pull/636))
+- Filter agent-initiated agentCommit to the agent's attributed paths (intent-hq/monorepo#939)
+- Honor isNewRepo in workspace.create — initialize repository before provisioning
+- Doctor names the actually-missing binary for dual-binary providers ([#653](https://github.com/intent-hq/intentd/pull/653))
+- Multi-agent attribution rows + directory-rename attribution (monorepo#957) ([#670](https://github.com/intent-hq/intentd/pull/670))
+- Deliver preempted message combined with interrupt on zero-output interrupt ([#685](https://github.com/intent-hq/intentd/pull/685))
+- Annotate suspected-stall completions in parent wakes (monorepo#1016) ([#688](https://github.com/intent-hq/intentd/pull/688))
+
+### 🔧 Refactor
+
+- *(services)* Use UNKNOWN_PROVIDER alias for the stats provider fallback ([#654](https://github.com/intent-hq/intentd/pull/654))
+
+### ⚡ Performance
+
+- *(store)* Index + keys-only window for agent message projections (monorepo#1010) ([#673](https://github.com/intent-hq/intentd/pull/673))
+- *(store)* Per-session message projection for agent.get (monorepo#981) ([#659](https://github.com/intent-hq/intentd/pull/659))
+- *(services)* Run CoW sandbox clone on the blocking pool ([#656](https://github.com/intent-hq/intentd/pull/656))
+- *(store)* Bound agent.list projection payload via SQL text-block extraction ([#679](https://github.com/intent-hq/intentd/pull/679))
+- Eliminate multi-core CPU burn on large repos (diff rollup, adaptive TTL, pushed-check) ([#648](https://github.com/intent-hq/intentd/pull/648))
+- Bound agent read paths — stop hydrating full transcripts (monorepo#958)
+- Cap persisted agent:tool:call payloads at 16KiB and drop TTL to 6h ([#680](https://github.com/intent-hq/intentd/pull/680))
+
+### 🧪 Testing
+
+- Make flaky card-aggregates ordering and token-usage scan tests deterministic ([#658](https://github.com/intent-hq/intentd/pull/658))
+- Make flaky provider-models CLI and agent-ops/unsloth timing tests deterministic under load ([#663](https://github.com/intent-hq/intentd/pull/663))
+- *(intentd)* Quiesce activity before paired lastActivity reads (monorepo#1004) ([#682](https://github.com/intent-hq/intentd/pull/682))
+
+
 ## [0.2.10] - 2026-07-27
 
 ### 🚀 Features
