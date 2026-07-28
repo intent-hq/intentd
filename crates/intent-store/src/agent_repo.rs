@@ -113,7 +113,8 @@ pub struct InterruptedAgent {
 /// everything the projection needs from `agent_message` without hydrating the
 /// full transcript. `last_assistant` / `last_user` are the highest-`seq` rows
 /// of their role (decoded), `None` when the session has no such message.
-/// Returned by [`Store::get_agent_session_message_projections`].
+/// Returned by [`Store::get_agent_session_message_projections`] (workspace-wide)
+/// and [`Store::get_agent_session_message_projection`] (single session).
 #[derive(Debug, Clone, Default)]
 pub struct SessionMessageProjection {
     pub message_count: u64,
@@ -489,6 +490,43 @@ impl Store {
             }
         }
         Ok(projections)
+    }
+
+    /// Bounded `AgentLite` projection inputs for a single session
+    /// (monorepo#981): the per-session variant of
+    /// [`Store::get_agent_session_message_projections`] — the same last-rows
+    /// window query with `m.agent_id = ?` instead of the workspace join, plus
+    /// a single-agent message count. Only the returned newest user/assistant
+    /// rows have their `content`/`metadata` JSON decoded — never the rest of
+    /// the transcript. A session with no messages returns the zero projection.
+    pub async fn get_agent_session_message_projection(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<SessionMessageProjection> {
+        let mut projection = SessionMessageProjection {
+            message_count: self.count_agent_messages(agent_id).await? as u64,
+            ..Default::default()
+        };
+
+        let last_sql = "SELECT id, agent_id, seq, role, content, metadata, created_at FROM ( \
+            SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at, \
+            ROW_NUMBER() OVER (PARTITION BY m.agent_id, m.role ORDER BY m.seq DESC) AS rn \
+            FROM agent_message m \
+            WHERE m.agent_id = ? AND m.role IN ('user', 'assistant')) \
+            WHERE rn = 1";
+        let last_rows = sqlx::query(last_sql)
+            .bind(&agent_id.0)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("last session message projection failed: {e}")))?;
+        for row in &last_rows {
+            let message = map_message_row(row)?;
+            match message.role.as_str() {
+                "assistant" => projection.last_assistant = Some(message),
+                _ => projection.last_user = Some(message),
+            }
+        }
+        Ok(projection)
     }
 
     /// Get the agent_message watermark for a workspace: the count of messages
@@ -3926,6 +3964,130 @@ mod tests {
             a.content,
             serde_json::json!([{"type": "text", "text": "a3"}])
         );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `get_agent_session_message_projection` (per-session, monorepo#981)
+    /// returns the same shape/values as the workspace-wide variant's entry
+    /// for that agent — for an empty session, a user-only session, and a full
+    /// session with mixed traffic (including a malformed non-last content row
+    /// proving nothing beyond the last user/assistant rows is decoded).
+    #[tokio::test]
+    async fn per_session_message_projection_matches_workspace_variant() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-proj-single".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        let empty = AgentId("agent-single-empty".to_string());
+        let user_only = AgentId("agent-single-user-only".to_string());
+        let full = AgentId("agent-single-full".to_string());
+        for id in [&empty, &user_only, &full] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+
+        store
+            .append_agent_message(
+                &user_only,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "only"}]),
+                &ts,
+            )
+            .await
+            .expect("append");
+
+        for (role, text) in [
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("tool", "t1"),
+            ("user", "q2"),
+            ("assistant", "a2"),
+        ] {
+            store
+                .append_agent_message(
+                    &full,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+        // Malformed non-last user row: decoded content beyond the last
+        // user/assistant rows would fail map_message_row and error the call.
+        sqlx::query(
+            "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&full.0)
+        .bind(5_i64)
+        .bind("user")
+        .bind("{not-valid-json")
+        .bind(&ts)
+        .execute(store.write_pool())
+        .await
+        .expect("insert malformed row");
+        for (role, text) in [("user", "q3"), ("assistant", "a3")] {
+            store
+                .append_agent_message(
+                    &full,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        let workspace_wide = store
+            .get_agent_session_message_projections(&ws_id)
+            .await
+            .expect("workspace projections");
+        for agent in [&empty, &user_only, &full] {
+            let per_session = store
+                .get_agent_session_message_projection(agent)
+                .await
+                .expect("per-session projection");
+            let expected = workspace_wide.get(&agent.0).expect("workspace entry");
+            assert_eq!(
+                per_session.message_count, expected.message_count,
+                "message_count mismatch for {agent:?}"
+            );
+            for (got, want, label) in [
+                (
+                    &per_session.last_assistant,
+                    &expected.last_assistant,
+                    "last_assistant",
+                ),
+                (&per_session.last_user, &expected.last_user, "last_user"),
+            ] {
+                match (got, want) {
+                    (None, None) => {}
+                    (Some(g), Some(w)) => {
+                        assert_eq!(g.id, w.id, "{label} id mismatch for {agent:?}");
+                        assert_eq!(g.agent_id, w.agent_id);
+                        assert_eq!(g.seq, w.seq);
+                        assert_eq!(g.role, w.role);
+                        assert_eq!(g.content, w.content);
+                        assert_eq!(g.metadata, w.metadata);
+                        assert_eq!(g.created_at, w.created_at);
+                    }
+                    (g, w) => panic!("{label} presence mismatch for {agent:?}: {g:?} vs {w:?}"),
+                }
+            }
+        }
 
         let _ = std::fs::remove_file(&tmp);
     }
