@@ -197,7 +197,7 @@ async fn task_bindings_update_status_and_get() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "update task" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
@@ -336,7 +336,7 @@ async fn comment_bindings_add_and_list() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "add comment" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(

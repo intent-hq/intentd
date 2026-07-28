@@ -187,7 +187,7 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "please add" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(

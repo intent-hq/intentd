@@ -4152,6 +4152,10 @@ async fn queue_lifecycle_add_get_edit_remove() {
     assert!(added["queuedMessage"]["queuedAt"].is_string());
     assert!(added["queuedMessage"].get("createdAt").is_none());
     assert!(added["queuedMessage"].get("agentId").is_none());
+    // Turn correlation (monorepo#1022): the response and the entry both name
+    // the turn (fresh enqueues mint turn_id = entry id).
+    assert_eq!(added["turnId"], added["queuedMessage"]["turnId"]);
+    assert_eq!(added["turnId"].as_str().unwrap(), mid);
 
     let q = svc
         .agent_get_queue_op(id.clone(), None)
@@ -10642,8 +10646,10 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
 
     // Simulate a terminal-failure requeue by directly calling requeue_front with
     // persisted=true (matching persist_error_and_requeue's behavior).
+    let message_id = new_message_id();
     let queued = QueuedMessage {
-        id: new_message_id(),
+        turn_id: message_id.clone(),
+        id: message_id,
         content: "failed message".to_string(),
         image_blocks: None,
         file_blocks: None,
@@ -11145,6 +11151,60 @@ async fn queue_mutations_write_through_to_store() {
     assert!(persisted_queue(&svc, &id).await.is_empty());
 }
 
+/// Fresh enqueues mint `turn_id == id` (monorepo#1022), the wire shape carries
+/// `turnId`, and a requeue-shaped entry with a DIFFERENT `turn_id` round-trips
+/// through the durable snapshot into a restarted daemon intact.
+#[tokio::test]
+async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
+    let (tmp, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "TurnId").await;
+
+    // Fresh enqueue: turn_id == id, surfaced as `turnId` on the wire.
+    let (queued, position) = svc.enqueue_message(&id, "fresh".to_string(), None, None, None, None);
+    assert_eq!(
+        queued.turn_id, queued.id,
+        "fresh enqueue mints turn_id = id"
+    );
+    assert_eq!(queued.to_value(position)["turnId"], json!(queued.id));
+
+    // Requeue-shaped entry: new id, preserved (different) turn_id.
+    let requeue_id = crate::agent_ops::new_message_id();
+    svc.requeue_front(
+        &id,
+        crate::agent_ops::QueuedMessage {
+            id: requeue_id.clone(),
+            turn_id: "turn-before-failure".to_string(),
+            content: "requeued".to_string(),
+            image_blocks: None,
+            file_blocks: None,
+            queued_at: now_iso(),
+            editing: false,
+            persisted: true,
+            requeued_after_failure: true,
+            message_metadata: None,
+            prepend_content: None,
+            prepend_image_blocks: None,
+            prepend_file_blocks: None,
+        },
+    );
+    svc.publish_queue_updated(&id).await;
+
+    // Restart: both entries rehydrate with their turn ids intact.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let restarted = Services::new(store);
+    let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    assert_eq!(rehydrated, 2);
+    let front = restarted.dequeue_message(&id).expect("dequeue requeued");
+    assert_eq!(front.id, requeue_id);
+    assert_eq!(
+        front.turn_id, "turn-before-failure",
+        "non-identity turn_id survives restart"
+    );
+    let back = restarted.dequeue_message(&id).expect("dequeue fresh");
+    assert_eq!(back.id, queued.id);
+    assert_eq!(back.turn_id, queued.id, "identity turn_id survives restart");
+}
+
 #[tokio::test]
 async fn clear_queue_write_through_empties_persisted_snapshot() {
     let (_t, svc, ws) = setup().await;
@@ -11166,6 +11226,8 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
     let id = create_agent(&svc, &ws, "Restored").await;
     // Seed persisted rows the way a pre-shutdown daemon would have left them:
     // entry 0 mid-edit, entry 1 a persisted interrupt-requeue with metadata.
+    // Payloads are LEGACY-shaped (no `turnId`, pre-monorepo#1022) so the
+    // rehydration backfill (`turn_id = id`) is exercised too.
     svc.store()
         .replace_agent_queue(
             &id,
@@ -11181,6 +11243,7 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
                         "editing": true,
                     }),
                     created_at: now_iso(),
+                    turn_id: "q-0".into(),
                 },
                 intent_store::AgentQueueRow {
                     id: "q-1".into(),
@@ -11196,6 +11259,7 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
                         "messageMetadata": { "source": "event_notification" },
                     }),
                     created_at: now_iso(),
+                    turn_id: "q-1".into(),
                 },
             ],
         )
@@ -11224,14 +11288,17 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
 
     // Internal flags round-trip: editing reset makes q-0 dequeuable first;
     // q-1 keeps `persisted` so a drain will not double-append the transcript row.
+    // Legacy payloads (no `turnId`) rehydrate with `turn_id = id` (monorepo#1022).
     let first = restarted.dequeue_message(&id).expect("dequeue q-0");
     assert_eq!(first.id, "q-0");
     assert!(!first.editing);
     assert!(!first.persisted);
+    assert_eq!(first.turn_id, "q-0", "legacy row defaults turn_id = id");
     let second = restarted.dequeue_message(&id).expect("dequeue q-1");
     assert_eq!(second.id, "q-1");
     assert!(second.persisted);
     assert!(second.requeued_after_failure);
+    assert_eq!(second.turn_id, "q-1", "legacy row defaults turn_id = id");
     assert!(restarted.dequeue_message(&id).is_none());
 }
 
@@ -11272,6 +11339,7 @@ async fn rehydrate_preserves_live_map() {
 fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
         id: id.to_string(),
+        turn_id: id.to_string(),
         content: content.to_string(),
         image_blocks: Some(json!([{ "type": "image", "data": id }])),
         file_blocks: Some(json!([{ "type": "file", "name": format!("{id}.txt") }])),

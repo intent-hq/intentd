@@ -10,7 +10,8 @@
 use std::collections::{HashMap, HashSet};
 
 use intent_core::events::{
-    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_UPDATED, AGENT_UPDATED,
+    AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE, AGENT_QUEUE_PROCESSING,
+    AGENT_QUEUE_UPDATED, AGENT_UPDATED,
 };
 use intent_core::{
     now_iso, parse_iso, ActorType, AgentCreateExtra, AgentId, AgentLite, AgentMessage,
@@ -209,6 +210,14 @@ fn ensure_bare_model_matches_provider(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
     pub id: String,
+    /// Turn correlation id (monorepo#1022): stable across terminal-failure
+    /// requeues so retries of the same logical turn share one id. Fresh
+    /// enqueues set `turn_id = id`; `persist_error_and_requeue` mints a new
+    /// entry `id` but carries the failed turn's original `turn_id` forward.
+    /// `#[serde(default)]` keeps legacy persisted payloads decodable —
+    /// rehydration backfills an empty `turn_id` with the entry `id`.
+    #[serde(default)]
+    pub turn_id: String,
     pub content: String,
     pub image_blocks: Option<Value>,
     pub file_blocks: Option<Value>,
@@ -266,6 +275,9 @@ impl QueuedMessage {
     /// marker for terminal-failure requeues). `messageMetadata` is only present
     /// when the entry was enqueued with metadata (e.g. a parent wake's
     /// `event_notification` payload) — entries without it keep the legacy shape.
+    /// `turnId` is only present when set (monorepo#1022: correlation id stable
+    /// across requeues; entries rehydrated from legacy payloads always have one
+    /// backfilled).
     pub(crate) fn to_value(&self, position: usize) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -273,6 +285,9 @@ impl QueuedMessage {
             "queuedAt": self.queued_at,
             "position": position,
         });
+        if !self.turn_id.is_empty() {
+            v["turnId"] = Value::String(self.turn_id.clone());
+        }
         if let Some(blocks) = &self.image_blocks {
             v["imageBlocks"] = blocks.clone();
         }
@@ -824,8 +839,14 @@ pub(crate) fn new_message_id() -> String {
 /// the row carries a client-minted `userAppMessageId` (lifted from the row
 /// metadata at append time) — the echo the FE dedup guard matches its
 /// optimistic user message against. Rows without a client id keep the
-/// pre-existing three-field shape (backward compatible).
-pub(crate) fn agent_message_event_payload(agent_id: &AgentId, message: &AgentMessage) -> Value {
+/// pre-existing three-field shape (backward compatible). `turn_id` is the
+/// turn correlation id (monorepo#1022) — present on user-row echoes emitted
+/// by a turn that carries one, omitted otherwise (never `null`).
+pub(crate) fn agent_message_event_payload(
+    agent_id: &AgentId,
+    message: &AgentMessage,
+    turn_id: Option<&str>,
+) -> Value {
     let mut payload = json!({
         "agentId": agent_id.0,
         "messageId": message.id,
@@ -833,6 +854,9 @@ pub(crate) fn agent_message_event_payload(agent_id: &AgentId, message: &AgentMes
     });
     if let Some(app_id) = &message.app_message_id {
         payload["appMessageId"] = json!(app_id);
+    }
+    if let Some(tid) = turn_id {
+        payload["turnId"] = json!(tid);
     }
     payload
 }
@@ -2142,7 +2166,7 @@ impl Services {
             &session.workspace_id,
             &agent_id,
             AGENT_MESSAGE,
-            agent_message_event_payload(&agent_id, &message),
+            agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
         Ok(json!({ "success": true, "message": message }))
@@ -2489,7 +2513,11 @@ impl Services {
         let session = self.require_agent_session(&agent_id).await?;
         let (queued, position) =
             self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
-        let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
+        let result = json!({
+            "success": true,
+            "queuedMessage": queued.to_value(position),
+            "turnId": queued.turn_id,
+        });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
             manager
@@ -2690,7 +2718,7 @@ impl Services {
                     &session.workspace_id,
                     &agent_id,
                     AGENT_MESSAGE,
-                    agent_message_event_payload(&agent_id, &message),
+                    agent_message_event_payload(&agent_id, &message, None),
                 )
                 .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
@@ -2717,6 +2745,7 @@ impl Services {
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
+                    "turnId": queued.turn_id,
                 });
                 self.publish_queue_updated(&agent_id).await;
                 Ok(result)
@@ -2798,7 +2827,7 @@ impl Services {
             &session.workspace_id,
             &agent_id,
             AGENT_MESSAGE,
-            agent_message_event_payload(&agent_id, &message),
+            agent_message_event_payload(&agent_id, &message, None),
         )
         .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
@@ -5295,11 +5324,13 @@ impl Services {
             self.schedule_last_activity_event(workspace_id.clone());
         }
         // Publish agent:message event using the store-returned message id.
+        // Wake deliveries carry no user retry record, so no turnId (spec
+        // non-goal — the worker still mints one internally at spawn).
         self.publish_agent_mutation_event(
             workspace_id,
             agent_id,
             AGENT_MESSAGE,
-            agent_message_event_payload(agent_id, &message),
+            agent_message_event_payload(agent_id, &message, None),
         )
         .await;
         manager.clone().finish_prepersisted_turn_spawn(
@@ -5349,7 +5380,7 @@ impl Services {
                     workspace_id,
                     agent_id,
                     AGENT_MESSAGE,
-                    agent_message_event_payload(agent_id, &message),
+                    agent_message_event_payload(agent_id, &message, None),
                 )
                 .await;
                 Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
@@ -5437,8 +5468,10 @@ impl Services {
         prepend: Option<QueuedPrepend>,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
+        let id = new_message_id();
         let queued = QueuedMessage {
-            id: new_message_id(),
+            turn_id: id.clone(),
+            id,
             content,
             image_blocks,
             file_blocks,
@@ -5520,6 +5553,21 @@ impl Services {
             .unwrap_or(false)
     }
 
+    /// The `turn_id` of the oldest **ready-to-send** queued message, without
+    /// removing it (the same entry [`Services::dequeue_message`] would pop).
+    /// `agent.retry` reads it before kicking the drain so its RPC response
+    /// carries the redriven turn's correlation id (monorepo#1022). `None`
+    /// when no ready-to-send entry exists or the entry has no turn id.
+    pub(crate) fn peek_ready_turn_id(&self, agent_id: &AgentId) -> Option<String> {
+        let guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get(agent_id)?;
+        let entry = queue.iter().find(|m| !m.editing)?;
+        (!entry.turn_id.is_empty()).then(|| entry.turn_id.clone())
+    }
+
     /// Drop all queued messages for an agent (used by `agent.editAndRegenerate`,
     /// which supersedes the queue with the regenerated message). Returns `true`
     /// iff the queue previously held at least one message — the caller uses this
@@ -5585,6 +5633,7 @@ impl Services {
                         position: i as i64,
                         payload: serde_json::to_value(m).unwrap_or(Value::Null),
                         created_at: m.queued_at.clone(),
+                        turn_id: m.turn_id.clone(),
                     })
                     .collect()
             })
@@ -5598,6 +5647,8 @@ impl Services {
     /// preserved so a later drain does not double-append transcript rows
     /// (STAB-112/STAB-52). Rehydration never kicks `try_drain_queue`: messages
     /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
+    /// Legacy payloads without a `turnId` (pre-monorepo#1022) rehydrate with
+    /// `turn_id = id` so every in-memory entry carries a correlation id.
     /// Returns the number of messages actually inserted into the in-memory
     /// map (agents that already hold a live queue are skipped, not counted).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
@@ -5607,6 +5658,9 @@ impl Services {
             match serde_json::from_value::<QueuedMessage>(row.payload) {
                 Ok(mut message) => {
                     message.editing = false;
+                    if message.turn_id.is_empty() {
+                        message.turn_id = message.id.clone();
+                    }
                     map.entry(row.agent_id).or_default().push(message);
                 }
                 Err(e) => {
@@ -5701,6 +5755,44 @@ impl Services {
                 "agentId": agent_id.0,
                 "queue": queue,
             }),
+        };
+        crate::publish_event(&self.event_bus, event).await;
+    }
+
+    /// Publish `agent:queue:processing` for a queue entry the drain loop just
+    /// flipped to in-flight (PROTOCOL §6.5): the drain-start signal that
+    /// covers redrives which skip the duplicate user-row append — the FE
+    /// keys the turn start off `turnId` here (monorepo#1022). Payload:
+    /// `{ agentId, messageId, content, turnId }` (`turnId` omitted only for
+    /// legacy entries without one; every enqueue path mints one today).
+    pub(crate) async fn publish_queue_processing(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        message: &QueuedMessage,
+    ) {
+        let mut data = json!({
+            "agentId": agent_id.0,
+            "messageId": message.id,
+            "content": message.content,
+        });
+        if !message.turn_id.is_empty() {
+            data["turnId"] = Value::String(message.turn_id.clone());
+        }
+        let event = intent_store::NewEvent {
+            workspace_id: workspace_id.clone(),
+            timestamp: now_iso(),
+            event_type: AGENT_QUEUE_PROCESSING.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some(agent_id.0.clone()),
+                ..Default::default()
+            },
+            session_id: Some(agent_id.0.clone()),
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
         };
         crate::publish_event(&self.event_bus, event).await;
     }

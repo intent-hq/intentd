@@ -152,6 +152,14 @@ pub struct TurnOptions {
     /// `file_blocks`), emitted as ACP content blocks AHEAD of this turn's own
     /// attachments. Prompt-only, like `prepend_content`.
     pub prepend_file_blocks: Option<serde_json::Value>,
+    /// Turn correlation id (monorepo#1022): identifies the logical turn across
+    /// terminal-failure requeues and redrives. Drained turns carry the queue
+    /// entry's `turn_id`; direct sends mint one in `send_message` (before the
+    /// user-row persist, so the RPC result and `agent:message` echo carry it),
+    /// with [`AgentManager::spawn_worker`] as the fallback mint site.
+    /// `persist_error_and_requeue` threads it onto the requeued entry so a
+    /// retry of the same logical turn keeps the original id.
+    pub turn_id: Option<String>,
 }
 
 impl TurnOptions {
@@ -2298,12 +2306,15 @@ impl AgentManager {
     /// Drive one `session/prompt` turn for `agent_id`, marking it active for the
     /// duration so the registry never evicts a streaming process. Streams
     /// updates onto the event bus via the M3.4 router (`run_prompt_turn`).
+    /// `turn_id` is the turn correlation id (monorepo#1022) stamped on the
+    /// failure-arm `agent:failed`; bare callers (tests) may pass `None`.
     pub async fn run_turn(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
         prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
     ) -> Result<StopReason> {
         let (conn, notes) = {
             let map = self.handles.lock().unwrap();
@@ -2323,6 +2334,7 @@ impl AgentManager {
                 workspace_id,
                 acp_session_id,
                 prompt,
+                turn_id,
             )
             .await;
         self.registry.mark_idle(agent_id);
@@ -2878,7 +2890,7 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         message_id: Option<String>,
-        options: TurnOptions,
+        mut options: TurnOptions,
     ) -> Result<Value> {
         // Validate the caller-supplied id length BEFORE any state change
         // (mirrors `agent_send_message_op`'s unconditional guard — the row id
@@ -2923,6 +2935,7 @@ impl AgentManager {
                 "queued": true,
                 "quarantined": true,
                 "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
             });
             self.services.publish_queue_updated(&agent_id).await;
             // Close the check-then-park race: a concurrent `agent.retry` may
@@ -2953,11 +2966,24 @@ impl AgentManager {
                 "success": true,
                 "queued": true,
                 "queuedMessage": queued.to_value(position),
+                "turnId": queued.turn_id,
             });
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(result);
         }
         let message_id = message_id.unwrap_or_else(new_message_id);
+        // Mint the turn correlation id (monorepo#1022) BEFORE the persist so
+        // the user-row `agent:message` echo, the RPC result, and the turn
+        // worker (via `options`) all carry the SAME id. `spawn_worker` keeps
+        // an already-set id, so this is the direct-send mint point.
+        let turn_id = match options.turn_id.clone() {
+            Some(id) => id,
+            None => {
+                let id = new_message_id();
+                options.turn_id = Some(id.clone());
+                id
+            }
+        };
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(
@@ -3019,6 +3045,7 @@ impl AgentManager {
                     "success": true,
                     "queued": true,
                     "queuedMessage": queued.to_value(position),
+                    "turnId": queued.turn_id,
                 });
                 self.services.publish_queue_updated(&agent_id).await;
                 self.clone().try_drain_queue(agent_id, workspace_id).await;
@@ -3036,11 +3063,16 @@ impl AgentManager {
                 &workspace_id,
                 &agent_id,
                 intent_core::events::AGENT_MESSAGE,
-                crate::agent_ops::agent_message_event_payload(&agent_id, &message),
+                crate::agent_ops::agent_message_event_payload(&agent_id, &message, Some(&turn_id)),
             )
             .await;
         self.spawn_worker(agent_id, workspace_id, content, options, true);
-        Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
+        Ok(json!({
+            "success": true,
+            "queued": false,
+            "messageId": message.id,
+            "turnId": turn_id,
+        }))
     }
 
     /// Self-drain entrypoint (PROTOCOL §5.5). Invoked from `agent.queueMessage`
@@ -3118,6 +3150,13 @@ impl AgentManager {
         // annotated content reaches both the persisted user row and the
         // provider prompt.
         let stale = self.annotate_stale_redrive(&agent_id, &mut next).await;
+        // Drain-start signal (monorepo#1022): the entry just flipped to
+        // in-flight; its `turnId` covers redrives that skip the user-row
+        // append below. Emitted AFTER the stale-redrive annotation so the
+        // payload's `content` matches what is persisted/sent to the provider.
+        self.services
+            .publish_queue_processing(&agent_id, &workspace_id, &next)
+            .await;
         // Skip the transcript append for a terminal-failure requeue whose
         // user row already reached the transcript before the failed turn
         // began; otherwise persist now (with `persist_user`'s bounded retry).
@@ -3137,6 +3176,7 @@ impl AgentManager {
                 next.image_blocks.as_ref(),
                 next.file_blocks.as_ref(),
                 next.message_metadata.as_ref(),
+                Some(&next.turn_id),
             )
             .await
         };
@@ -3155,6 +3195,7 @@ impl AgentManager {
             prepend_content: next.prepend_content.clone(),
             prepend_image_blocks: next.prepend_image_blocks.clone(),
             prepend_file_blocks: next.prepend_file_blocks.clone(),
+            turn_id: Some(next.turn_id.clone()),
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -3257,6 +3298,7 @@ impl AgentManager {
         // the entry's captured attachments and metadata ride along, same as
         // `try_drain_queue`.
         let mut options = TurnOptions {
+            turn_id: Some(entry.turn_id.clone()),
             image_blocks: entry.image_blocks.clone(),
             file_blocks: entry.file_blocks.clone(),
             message_metadata: entry.message_metadata.clone(),
@@ -3326,13 +3368,23 @@ impl AgentManager {
                     &workspace_id,
                     &agent_id,
                     intent_core::events::AGENT_MESSAGE,
-                    crate::agent_ops::agent_message_event_payload(&agent_id, &message),
+                    crate::agent_ops::agent_message_event_payload(
+                        &agent_id,
+                        &message,
+                        Some(entry.turn_id.as_str()),
+                    ),
                 )
                 .await;
         }
         let entry_id = entry.id.clone();
+        let turn_id = entry.turn_id.clone();
         self.spawn_worker(agent_id, workspace_id, entry.content, options, true);
-        Ok(json!({ "success": true, "queued": false, "messageId": entry_id }))
+        Ok(json!({
+            "success": true,
+            "queued": false,
+            "messageId": entry_id,
+            "turnId": turn_id,
+        }))
     }
 
     /// `agent.editAndRegenerate` runtime path (§5.5): edit a past user message
@@ -3638,9 +3690,16 @@ impl AgentManager {
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         content: String,
-        options: TurnOptions,
+        mut options: TurnOptions,
         user_persisted: bool,
     ) {
+        // Every worker spawn flows through here, so this is the single mint
+        // point for the turn correlation id (monorepo#1022): direct sends get
+        // a fresh id; callers that already carry one (a drained queue entry's
+        // preserved `turn_id`) keep it.
+        if options.turn_id.is_none() {
+            options.turn_id = Some(new_message_id());
+        }
         let mgr = self.clone();
         let id = agent_id.clone();
         let handle = tokio::spawn(async move {
@@ -3879,14 +3938,22 @@ impl AgentManager {
                 .await?;
         }
 
-        // Start the drain loop to redrive the requeued message
+        // Start the drain loop to redrive the requeued message. Peek the
+        // head entry's turn correlation id BEFORE the drain pops it so the
+        // response names the turn being redriven (monorepo#1022).
+        let mut turn_id = None;
         if redriven {
+            turn_id = self.services.peek_ready_turn_id(&agent_id);
             self.clone()
                 .try_drain_queue(agent_id, workspace_id.clone())
                 .await;
         }
 
-        Ok(json!({ "ok": true, "redriven": redriven }))
+        let mut result = json!({ "ok": true, "redriven": redriven });
+        if let Some(tid) = turn_id {
+            result["turnId"] = json!(tid);
+        }
+        Ok(result)
     }
 
     /// Persist an `agent.retry` status transition (clearing any persisted
@@ -4039,7 +4106,7 @@ impl AgentManager {
                             workspace_id,
                             agent_id,
                             intent_core::events::AGENT_MESSAGE,
-                            crate::agent_ops::agent_message_event_payload(agent_id, &message),
+                            crate::agent_ops::agent_message_event_payload(agent_id, &message, None),
                         )
                         .await;
                 }
@@ -5316,7 +5383,13 @@ async fn run_message_worker(
                     .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                     .await;
                 match mgr
-                    .run_turn(&agent_id, &workspace_id, &acp_session_id, prompt)
+                    .run_turn(
+                        &agent_id,
+                        &workspace_id,
+                        &acp_session_id,
+                        prompt,
+                        options.turn_id.as_deref(),
+                    )
                     .await
                 {
                     Ok(_stop_reason) => {
@@ -5423,6 +5496,13 @@ async fn run_message_worker(
             // provider prompt. Runs before the next iteration's report clear,
             // so `completion_report_timestamp` is still visible here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Drain-start signal (monorepo#1022): covers redrives that skip
+            // the user-row append below. Emitted AFTER the stale-redrive
+            // annotation so the payload's `content` matches what is
+            // persisted/sent to the provider.
+            mgr.services
+                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             // A terminal-failure requeue whose user row already reached the
@@ -5439,6 +5519,7 @@ async fn run_message_worker(
                     next_image_blocks.as_ref(),
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
+                    Some(&next.turn_id),
                 )
                 .await
             };
@@ -5452,6 +5533,7 @@ async fn run_message_worker(
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
+                turn_id: Some(next.turn_id.clone()),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -5487,6 +5569,12 @@ async fn run_message_worker(
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            // Drain-start signal (monorepo#1022): same contract as the
+            // pre-release drain arm — emitted AFTER the stale-redrive
+            // annotation so the payload's `content` matches the turn.
+            mgr.services
+                .publish_queue_processing(&agent_id, &workspace_id, &next)
+                .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             user_persisted = if next.persisted {
@@ -5500,6 +5588,7 @@ async fn run_message_worker(
                     next_image_blocks.as_ref(),
                     next_file_blocks.as_ref(),
                     next.message_metadata.as_ref(),
+                    Some(&next.turn_id),
                 )
                 .await
             };
@@ -5513,6 +5602,7 @@ async fn run_message_worker(
                 prepend_content: next.prepend_content.clone(),
                 prepend_image_blocks: next.prepend_image_blocks.clone(),
                 prepend_file_blocks: next.prepend_file_blocks.clone(),
+                turn_id: Some(next.turn_id.clone()),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -5567,6 +5657,7 @@ async fn run_message_worker(
 /// [`persist_retry_backoff_ms`]); on exhaustion the drain call sites fail
 /// closed — they do NOT start the turn, park the agent in `Error`, and
 /// requeue with `persisted: false` so `agent.retry` re-attempts the append.
+#[allow(clippy::too_many_arguments)]
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -5575,6 +5666,7 @@ async fn persist_user(
     image_blocks: Option<&Value>,
     file_blocks: Option<&Value>,
     message_metadata: Option<&Value>,
+    turn_id: Option<&str>,
 ) -> bool {
     let created_at = now_iso();
     let mut blocks = user_message_blocks(content, image_blocks, file_blocks);
@@ -5648,7 +5740,7 @@ async fn persist_user(
             workspace_id,
             agent_id,
             intent_core::events::AGENT_MESSAGE,
-            crate::agent_ops::agent_message_event_payload(agent_id, &message),
+            crate::agent_ops::agent_message_event_payload(agent_id, &message, turn_id),
         )
         .await;
     true
@@ -5904,24 +5996,21 @@ async fn publish_terminal_failure_events(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     error_msg: &str,
+    turn_id: Option<&str>,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
+    let mut failed_data = json!({ "agentId": agent_id.0, "error": error_msg });
+    let mut end_data = json!({ "agentId": agent_id.0 });
+    if let Some(tid) = turn_id {
+        failed_data["turnId"] = json!(tid);
+        end_data["turnId"] = json!(tid);
+    }
     mgr.services
-        .publish_agent_event(
-            workspace_id,
-            agent_id,
-            AGENT_FAILED,
-            json!({ "agentId": agent_id.0, "error": error_msg }),
-        )
+        .publish_agent_event(workspace_id, agent_id, AGENT_FAILED, failed_data)
         .await;
     mgr.services
-        .publish_agent_event(
-            workspace_id,
-            agent_id,
-            AGENT_STREAM_END,
-            json!({ "agentId": agent_id.0 }),
-        )
+        .publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
         .await;
 }
 
@@ -6014,9 +6103,14 @@ async fn persist_error_and_requeue(
     // on retry); direct sends have no prior timestamp and stamp `now_iso()`.
     // The combined-delivery `prepend_*` fields (monorepo#1014) ride along so
     // a failed zero-output interrupt turn's retry still delivers the
-    // preempted message ahead of the interrupt message.
+    // preempted message ahead of the interrupt message. The entry gets a NEW
+    // `id` but keeps the failed turn's ORIGINAL `turn_id` (monorepo#1022) so
+    // the retry correlates with the turn it redrives; a missing option (bare
+    // test wiring — spawn_worker always mints one) falls back to the new id.
+    let id = new_message_id();
     let queued = crate::agent_ops::QueuedMessage {
-        id: new_message_id(),
+        turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
+        id,
         content: content.to_string(),
         image_blocks: options.image_blocks.clone(),
         file_blocks: options.file_blocks.clone(),
@@ -6055,7 +6149,14 @@ async fn handle_terminal_spawn_failure(
     error: &Error,
 ) {
     let error_text = error.to_string();
-    publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
+    publish_terminal_failure_events(
+        mgr,
+        agent_id,
+        workspace_id,
+        &error_text,
+        options.turn_id.as_deref(),
+    )
+    .await;
     persist_error_and_requeue(
         mgr,
         agent_id,
@@ -6083,7 +6184,14 @@ async fn handle_drain_persist_failure(
 ) {
     let error_text = "failed to persist user message to transcript; turn not started".to_string();
     tracing::warn!(agent = %agent_id, "queue drain failed closed: {error_text}");
-    publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
+    publish_terminal_failure_events(
+        mgr,
+        agent_id,
+        workspace_id,
+        &error_text,
+        options.turn_id.as_deref(),
+    )
+    .await;
     persist_error_and_requeue(
         mgr,
         agent_id,
@@ -6221,7 +6329,14 @@ async fn handle_terminal_turn_failure(
 
     let error_text = error.to_string();
     if !turn_failure_events_already_emitted(error) {
-        publish_terminal_failure_events(mgr, agent_id, workspace_id, &error_text).await;
+        publish_terminal_failure_events(
+            mgr,
+            agent_id,
+            workspace_id,
+            &error_text,
+            options.turn_id.as_deref(),
+        )
+        .await;
     }
     persist_error_and_requeue(
         mgr,

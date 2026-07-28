@@ -1101,7 +1101,11 @@ impl Services {
     /// Drive a `session/prompt` turn: stream `session/update`s onto the bus and
     /// accumulate the transcript while the turn runs, then append the assistant
     /// message and emit the single terminal `agent:stream:end`. Returns the
-    /// agent's [`StopReason`] (§6.5/§6.6).
+    /// agent's [`StopReason`] (§6.5/§6.6). `turn_id` is the turn correlation
+    /// id (monorepo#1022), stamped on the failure-arm `agent:failed` when
+    /// present; bare callers (tests, harness paths) may pass `None` and the
+    /// field is omitted.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_turn(
         &self,
         conn: &Connection,
@@ -1110,6 +1114,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
         prompt: Vec<ContentBlock>,
+        turn_id: Option<&str>,
     ) -> Result<StopReason> {
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
@@ -1299,6 +1304,11 @@ impl Services {
             if !trailing_blocks.is_empty() {
                 end_data["trailingBlocks"] = Value::Array(trailing_blocks);
             }
+            // Turn correlation (monorepo#1022): the terminal stream:end names
+            // the logical turn it closes, same contract as `agent:failed`.
+            if let Some(tid) = turn_id {
+                end_data["turnId"] = json!(tid);
+            }
             self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
                 .await;
         }
@@ -1380,13 +1390,12 @@ impl Services {
                 );
             }
             Err(e) => {
-                self.publish_agent_event(
-                    workspace_id,
-                    agent_id,
-                    AGENT_FAILED,
-                    json!({ "agentId": agent_id.0, "error": e.to_string() }),
-                )
-                .await;
+                let mut data = json!({ "agentId": agent_id.0, "error": e.to_string() });
+                if let Some(tid) = turn_id {
+                    data["turnId"] = json!(tid);
+                }
+                self.publish_agent_event(workspace_id, agent_id, AGENT_FAILED, data)
+                    .await;
             }
         }
         result.map_err(|e| {

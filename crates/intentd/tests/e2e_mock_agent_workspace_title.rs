@@ -179,7 +179,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "please rename" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
