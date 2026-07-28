@@ -10558,6 +10558,9 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
         persisted: true,
         requeued_after_failure: true, // Terminal-failure requeue marker
         message_metadata: None,
+        prepend_content: None,
+        prepend_image_blocks: None,
+        prepend_file_blocks: None,
     };
 
     svc.requeue_front(&id, queued);
@@ -11182,6 +11185,9 @@ fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
         persisted: true,
         requeued_after_failure: true,
         message_metadata: Some(json!({ "source": "event_notification", "of": id })),
+        prepend_content: None,
+        prepend_image_blocks: None,
+        prepend_file_blocks: None,
     }
 }
 

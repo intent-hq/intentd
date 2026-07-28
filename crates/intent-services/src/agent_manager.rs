@@ -2125,8 +2125,18 @@ impl AgentManager {
     ) -> Vec<ContentBlock> {
         // Combined interrupt delivery (monorepo#1014): the preempted
         // message's text precedes the interrupt message's own content.
+        // EXCEPT when the ACP session was recreated: `build_turn_body`'s
+        // history replay renders every row before the last user row — which
+        // includes the already-persisted preempted user row — so injecting
+        // the text again here would deliver it twice. The flag is peeked
+        // (not consumed); `build_turn_body` still takes it below. The
+        // prepend ATTACHMENTS are unaffected: the history XML is text-only,
+        // so `append_attachment_blocks` must still emit them.
+        let history_covers_prepend = self.recreated.lock().unwrap().contains(agent_id);
         let combined = match options.prepend_content.as_deref() {
-            Some(orig) if !orig.is_empty() => format!("{orig}\n\n{content}"),
+            Some(orig) if !orig.is_empty() && !history_covers_prepend => {
+                format!("{orig}\n\n{content}")
+            }
             _ => content.to_string(),
         };
         // Role reminder is rebuilt every turn (interval = 1, port of
@@ -3111,12 +3121,17 @@ impl AgentManager {
         // but the FE-supplied attachments and `messageMetadata` captured at
         // enqueue time do ride along so the drained turn receives the same
         // image + file blocks and a terminal-failure requeue keeps the tag.
+        // The `prepend_*` fields restore a failed zero-output interrupt's
+        // combined delivery on retry (monorepo#1014).
         let options = TurnOptions {
             image_blocks: next.image_blocks.clone(),
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
             queued_at: Some(next.queued_at.clone()),
+            prepend_content: next.prepend_content.clone(),
+            prepend_image_blocks: next.prepend_image_blocks.clone(),
+            prepend_file_blocks: next.prepend_file_blocks.clone(),
             ..TurnOptions::default()
         };
         if !user_persisted {
@@ -5259,6 +5274,9 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                prepend_content: next.prepend_content.clone(),
+                prepend_image_blocks: next.prepend_image_blocks.clone(),
+                prepend_file_blocks: next.prepend_file_blocks.clone(),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -5317,6 +5335,9 @@ async fn run_message_worker(
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
                 queued_at: Some(next.queued_at.clone()),
+                prepend_content: next.prepend_content.clone(),
+                prepend_image_blocks: next.prepend_image_blocks.clone(),
+                prepend_file_blocks: next.prepend_file_blocks.clone(),
                 ..TurnOptions::default()
             };
             // New message → fresh silent-redrive budget (monorepo#764).
@@ -5816,6 +5837,9 @@ async fn persist_error_and_requeue(
     // entry's ORIGINAL `queued_at` in `options` so the #576 staleness verdict
     // stays sticky across the requeue (a failed stale redrive is still stale
     // on retry); direct sends have no prior timestamp and stamp `now_iso()`.
+    // The combined-delivery `prepend_*` fields (monorepo#1014) ride along so
+    // a failed zero-output interrupt turn's retry still delivers the
+    // preempted message ahead of the interrupt message.
     let queued = crate::agent_ops::QueuedMessage {
         id: new_message_id(),
         content: content.to_string(),
@@ -5826,6 +5850,9 @@ async fn persist_error_and_requeue(
         persisted,
         requeued_after_failure: true,
         message_metadata: options.message_metadata.clone(),
+        prepend_content: options.prepend_content.clone(),
+        prepend_image_blocks: options.prepend_image_blocks.clone(),
+        prepend_file_blocks: options.prepend_file_blocks.clone(),
     };
     mgr.services.requeue_front(agent_id, queued);
 

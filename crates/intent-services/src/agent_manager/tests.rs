@@ -2027,6 +2027,111 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
     assert_eq!(arr[4]["resource"]["uri"], json!("file:///new.txt"));
 }
 
+/// Recreated-session interaction (monorepo#1014): when the ACP session was
+/// recreated, `build_turn_body`'s history replay already renders the
+/// preempted user row, so `prepend_content` must NOT be injected a second
+/// time. The prepend ATTACHMENTS still ride (the history XML is text-only).
+#[tokio::test]
+async fn build_turn_prompt_skips_prepend_text_when_session_recreated() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-prep-rec"),
+        AgentId::from("a-prep-rec"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    // Both user rows are persisted, as `interrupt_send_message` leaves them:
+    // the preempted "original ask" and the interrupt turn's own "urgent update".
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "original ask" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "urgent update" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // Arm the recreate flag: the next prompt replays prior history.
+    mgr.recreated.lock().unwrap().insert(id.clone());
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "urgent update", &options)
+        .await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    let text = arr[0]["text"].as_str().unwrap();
+    // Exactly one copy of the preempted text: the history replay's. A second
+    // copy would mean the prepend was injected on top of the replay.
+    assert_eq!(
+        text.matches("original ask").count(),
+        1,
+        "preempted text delivered once (via history replay): {text:?}"
+    );
+    // The recreate flag was consumed by `build_turn_body` (not left armed).
+    assert!(!mgr.recreated.lock().unwrap().contains(&id));
+    // Prepend attachments still delivered: history XML carries no blocks.
+    assert_eq!(arr[1]["type"], json!("image"));
+    assert_eq!(arr[1]["data"], json!("ORIG_IMG"));
+}
+
+/// Terminal-failure requeue interaction (monorepo#1014): a zero-output
+/// interrupt turn that fails terminally is requeued via
+/// `persist_error_and_requeue`; the rebuilt entry must carry the `prepend_*`
+/// fields so the retry still delivers the preempted message combined.
+#[tokio::test]
+async fn terminal_failure_requeue_carries_prepend_fields() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-prep-rq"), AgentId::from("a-prep-rq"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_file_blocks: Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(&mgr, &id, &ws, "urgent update", &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, "urgent update");
+    assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+    );
+    assert_eq!(
+        queued.prepend_file_blocks,
+        Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ]))
+    );
+    // The wire shape (`agent.getQueue`) does not leak the prompt-only fields.
+    let wire = queued.to_value(0);
+    assert!(wire.get("prependContent").is_none());
+    assert!(wire.get("prependImageBlocks").is_none());
+    assert!(wire.get("prependFileBlocks").is_none());
+}
+
 // --- First-turn workspace-naming instruction ---------------------------------
 
 /// Seed an agent whose workspace already carries `title` (used by naming-instruction
@@ -6090,6 +6195,9 @@ mod stale_redrive_tests {
             persisted,
             requeued_after_failure: false,
             message_metadata: None,
+            prepend_content: None,
+            prepend_image_blocks: None,
+            prepend_file_blocks: None,
         }
     }
 

@@ -236,6 +236,20 @@ pub(crate) struct QueuedMessage {
     /// and drain paths persist it on the user message row so the transcript
     /// carries the same metadata as a directly-delivered wake.
     pub message_metadata: Option<Value>,
+    /// Combined-delivery carry-over (monorepo#1014): the preempted message's
+    /// text captured by a zero-output interrupt whose turn later failed
+    /// terminally. The requeue threads it here so the retry's rebuilt
+    /// `TurnOptions` still delivers the preempted content ahead of the
+    /// interrupt message. Prompt-only (both user rows are already persisted);
+    /// not emitted on the `agent.getQueue` wire shape.
+    #[serde(default)]
+    pub prepend_content: Option<String>,
+    /// Preempted message's image attachments, carried like `prepend_content`.
+    #[serde(default)]
+    pub prepend_image_blocks: Option<Value>,
+    /// Preempted message's file attachments, carried like `prepend_content`.
+    #[serde(default)]
+    pub prepend_file_blocks: Option<Value>,
 }
 
 impl QueuedMessage {
@@ -5369,6 +5383,9 @@ impl Services {
             persisted: false,
             requeued_after_failure: false,
             message_metadata,
+            prepend_content: None,
+            prepend_image_blocks: None,
+            prepend_file_blocks: None,
         };
         let mut guard = self
             .agent_queues
