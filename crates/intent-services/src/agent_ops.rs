@@ -237,11 +237,14 @@ pub(crate) struct QueuedMessage {
     /// carries the same metadata as a directly-delivered wake.
     pub message_metadata: Option<Value>,
     /// Combined-delivery carry-over (monorepo#1014): the preempted message's
-    /// text captured by a zero-output interrupt whose turn later failed
-    /// terminally. The requeue threads it here so the retry's rebuilt
-    /// `TurnOptions` still delivers the preempted content ahead of the
-    /// interrupt message. Prompt-only (both user rows are already persisted);
-    /// not emitted on the `agent.getQueue` wire shape.
+    /// text captured by a zero-output interrupt. Populated on two paths: at
+    /// initial enqueue when the interrupt falls back to the queue instead of
+    /// streaming (quarantine park, concurrent-send slot race, append-failure
+    /// auto-queue — threaded via `QueuedPrepend`, monorepo#1034), and by the
+    /// terminal-failure requeue after the interrupt turn failed. Either way
+    /// the drain's rebuilt `TurnOptions` still delivers the preempted content
+    /// ahead of the interrupt message. Prompt-only (both user rows are
+    /// already persisted); not emitted on the `agent.getQueue` wire shape.
     #[serde(default)]
     pub prepend_content: Option<String>,
     /// Preempted message's image attachments, carried like `prepend_content`.
@@ -287,6 +290,18 @@ impl QueuedMessage {
         }
         v
     }
+}
+
+/// Combined-delivery carry-over bundle (monorepo#1014 / monorepo#1034): the
+/// preempted message's content threaded from the caller's `TurnOptions` into
+/// an enqueued entry, so the queue-fallback paths (concurrent-send slot race,
+/// quarantine park, append-failure auto-queue) still deliver the preempted
+/// message ahead of the interrupt message when the entry drains.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QueuedPrepend {
+    pub content: Option<String>,
+    pub image_blocks: Option<Value>,
+    pub file_blocks: Option<Value>,
 }
 
 /// Collect the `text` of every `type: "text"` content block in a message's
@@ -2473,7 +2488,7 @@ impl Services {
         // never drains (same fail-closed contract as `agent.sendMessage`).
         let session = self.require_agent_session(&agent_id).await?;
         let (queued, position) =
-            self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
+            self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
         let result = json!({ "success": true, "queuedMessage": queued.to_value(position) });
         self.publish_queue_updated(&agent_id).await;
         if let Some(manager) = self.agent_manager() {
@@ -2697,7 +2712,7 @@ impl Services {
                 // file_blocks when auto-queueing, matching the runtime-manager
                 // path's behavior.
                 let (queued, position) =
-                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None);
+                    self.enqueue_message(&agent_id, content, image_blocks, file_blocks, None, None);
                 let result = json!({
                     "success": true,
                     "queued": true,
@@ -5207,6 +5222,7 @@ impl Services {
                 None,
                 None,
                 message_metadata.cloned(),
+                None,
             );
             self.publish_queue_updated(agent_id).await;
             return Ok(json!({
@@ -5231,6 +5247,7 @@ impl Services {
                     None,
                     None,
                     message_metadata.cloned(),
+                    None,
                 );
                 self.publish_queue_updated(agent_id).await;
                 manager
@@ -5323,6 +5340,7 @@ impl Services {
                     None,
                     None,
                     message_metadata.cloned(),
+                    None,
                 );
                 let result = json!({
                     "success": true,
@@ -5383,7 +5401,11 @@ impl Services {
     /// entry to `editing = true` later via `agent.editQueuedMessage`.
     /// `message_metadata` carries an internal wake's `messageMetadata` (e.g.
     /// `event_notification`) so the drain can persist it on the user message
-    /// row; user-typed enqueues pass `None`.
+    /// row; user-typed enqueues pass `None`. `prepend` threads the caller's
+    /// combined-delivery `prepend_*` fields onto the entry (monorepo#1034) so
+    /// a queue-fallback interrupt still delivers the preempted message ahead
+    /// of the interrupt message on drain; sends without prepend content pass
+    /// `None`.
     pub(crate) fn enqueue_message(
         &self,
         agent_id: &AgentId,
@@ -5391,7 +5413,9 @@ impl Services {
         image_blocks: Option<Value>,
         file_blocks: Option<Value>,
         message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
     ) -> (QueuedMessage, usize) {
+        let prepend = prepend.unwrap_or_default();
         let queued = QueuedMessage {
             id: new_message_id(),
             content,
@@ -5402,9 +5426,9 @@ impl Services {
             persisted: false,
             requeued_after_failure: false,
             message_metadata,
-            prepend_content: None,
-            prepend_image_blocks: None,
-            prepend_file_blocks: None,
+            prepend_content: prepend.content,
+            prepend_image_blocks: prepend.image_blocks,
+            prepend_file_blocks: prepend.file_blocks,
         };
         let mut guard = self
             .agent_queues

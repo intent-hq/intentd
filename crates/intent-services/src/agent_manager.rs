@@ -156,6 +156,28 @@ pub struct TurnOptions {
     pub prepend_file_blocks: Option<serde_json::Value>,
 }
 
+impl TurnOptions {
+    /// Bundle the combined-delivery `prepend_*` fields for a queue fallback
+    /// (monorepo#1034): when `send_message` parks the message instead of
+    /// streaming it (quarantine park, concurrent-send slot race, append-
+    /// failure auto-queue), the preempted message's content rides the
+    /// `QueuedMessage` so the drain still delivers it ahead of the interrupt
+    /// message. `None` when no prepend content is riding (ordinary sends).
+    pub(crate) fn queued_prepend(&self) -> Option<crate::agent_ops::QueuedPrepend> {
+        if self.prepend_content.is_none()
+            && self.prepend_image_blocks.is_none()
+            && self.prepend_file_blocks.is_none()
+        {
+            return None;
+        }
+        Some(crate::agent_ops::QueuedPrepend {
+            content: self.prepend_content.clone(),
+            image_blocks: self.prepend_image_blocks.clone(),
+            file_blocks: self.prepend_file_blocks.clone(),
+        })
+    }
+}
+
 /// Conservative cap used when total system memory cannot be determined.
 const DEFAULT_PROCESS_CAP: usize = 8;
 
@@ -2896,6 +2918,7 @@ impl AgentManager {
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
                 options.message_metadata.clone(),
+                options.queued_prepend(),
             );
             let result = json!({
                 "success": true,
@@ -2926,6 +2949,7 @@ impl AgentManager {
                 options.image_blocks.clone(),
                 options.file_blocks.clone(),
                 options.message_metadata.clone(),
+                options.queued_prepend(),
             );
             let result = json!({
                 "success": true,
@@ -2991,6 +3015,7 @@ impl AgentManager {
                     options.image_blocks.clone(),
                     options.file_blocks.clone(),
                     options.message_metadata.clone(),
+                    options.queued_prepend(),
                 );
                 let result = json!({
                     "success": true,
@@ -7421,7 +7446,7 @@ mod agent_retry_tests {
 
         // A requeued message is waiting (the persist_error_and_requeue path).
         mgr.services
-            .enqueue_message(&agent_id, "requeued".to_string(), None, None, None);
+            .enqueue_message(&agent_id, "requeued".to_string(), None, None, None, None);
 
         let result = mgr
             .agent_retry(agent_id.clone(), ws.clone())
@@ -7457,8 +7482,14 @@ mod agent_retry_tests {
                 for _ in 0..yields {
                     tokio::task::yield_now().await;
                 }
-                mgr.services
-                    .enqueue_message(&agent_id, "raced".to_string(), None, None, None);
+                mgr.services.enqueue_message(
+                    &agent_id,
+                    "raced".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 mgr.clone()
                     .try_drain_queue(agent_id.clone(), ws.clone())
                     .await;
