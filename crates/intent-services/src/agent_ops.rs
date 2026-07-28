@@ -237,11 +237,14 @@ pub(crate) struct QueuedMessage {
     /// carries the same metadata as a directly-delivered wake.
     pub message_metadata: Option<Value>,
     /// Combined-delivery carry-over (monorepo#1014): the preempted message's
-    /// text captured by a zero-output interrupt whose turn later failed
-    /// terminally. The requeue threads it here so the retry's rebuilt
-    /// `TurnOptions` still delivers the preempted content ahead of the
-    /// interrupt message. Prompt-only (both user rows are already persisted);
-    /// not emitted on the `agent.getQueue` wire shape.
+    /// text captured by a zero-output interrupt. Populated on two paths: at
+    /// initial enqueue when the interrupt falls back to the queue instead of
+    /// streaming (quarantine park, concurrent-send slot race, append-failure
+    /// auto-queue — threaded via `QueuedPrepend`, monorepo#1034), and by the
+    /// terminal-failure requeue after the interrupt turn failed. Either way
+    /// the drain's rebuilt `TurnOptions` still delivers the preempted content
+    /// ahead of the interrupt message. Prompt-only (both user rows are
+    /// already persisted); not emitted on the `agent.getQueue` wire shape.
     #[serde(default)]
     pub prepend_content: Option<String>,
     /// Preempted message's image attachments, carried like `prepend_content`.
