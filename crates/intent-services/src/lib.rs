@@ -9602,6 +9602,14 @@ impl WorkspaceApi for Services {
                         .await;
                 }
             }
+            // Drop the workspace's event subscriptions (monorepo#947): their
+            // filter is workspace-scoped, so once the workspace is gone they
+            // can never match again — without this sweep their delivery
+            // tasks and persisted rows leak and rehydrate forever. Aborts
+            // the tasks and deletes the rows (chief-anchored subscriptions
+            // scoped to OTHER workspaces are untouched — this removes only
+            // subscriptions whose events came from the deleted workspace).
+            services.remove_event_subscriptions_for_workspace(&id).await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
             // the read fails, the background task simply skips the worktree

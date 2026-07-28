@@ -99,6 +99,25 @@ impl Store {
             })?;
         Ok(())
     }
+
+    /// Delete every event_subscription row scoped to `workspace_id`
+    /// (workspace deleted — the subscriptions can never match again, see
+    /// monorepo#947).
+    pub async fn delete_event_subscriptions_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM event_subscription WHERE workspace_id = ?")
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "delete event_subscriptions for workspace failed: {e}"
+                ))
+            })?;
+        Ok(())
+    }
 }
 
 fn decode_subscription_row(row: &sqlx::sqlite::SqliteRow) -> Result<PersistedEventSubscription> {

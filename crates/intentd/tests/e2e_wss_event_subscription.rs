@@ -226,3 +226,169 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
         "unknown subscription must error"
     );
 }
+
+/// The subscriber's event subscriptions of `agent.getSubscriptions` for the
+/// given agent, over the wire.
+async fn event_subscriptions_view(
+    rpc: &mut PlainWs,
+    id: i64,
+    ws_id: &str,
+    agent_id: &str,
+) -> Vec<Value> {
+    let subs = wss_rpc(
+        rpc,
+        id,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    subs["eventSubscriptions"]
+        .as_array()
+        .expect("eventSubscriptions array")
+        .clone()
+}
+
+/// monorepo#947 introspection + workspace-delete cleanup over the wire:
+/// `agent.subscribe` → `agent.getSubscriptions` lists the event subscription
+/// (additive `eventSubscriptions` field; existing fields intact) and
+/// `agent.diagnostics` reports it; `agent.unsubscribe` removes it from the
+/// view; a second subscription then disappears when its workspace is deleted
+/// (`workspace.delete` sweep).
+#[tokio::test]
+async fn event_subscriptions_introspection_and_workspace_delete_cleanup_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "Event sub introspection e2e", "path": "." }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"].as_str().unwrap().to_string();
+    let subscriber = create_agent(&mut rpc, 2, &ws_id, "Watcher").await;
+
+    // Baseline: existing fields intact, additive field present and empty.
+    let baseline = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.getSubscriptions",
+        json!({ "workspaceId": ws_id, "agentId": subscriber }),
+    )
+    .await;
+    assert!(baseline["subscriptions"].is_array());
+    assert!(baseline["delegationGroups"].is_array());
+    assert!(baseline["agentStatuses"].is_object());
+    assert_eq!(baseline["eventSubscriptions"], json!([]));
+
+    let sub = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.subscribe",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": subscriber,
+            "eventTypes": ["note:*"],
+            "excludeSelf": false,
+            "batchWindow": 75,
+        }),
+    )
+    .await;
+    let sub_id = sub["subscriptionId"].as_str().expect("subscriptionId");
+
+    // getSubscriptions now lists it with the documented wire fields.
+    let subs = event_subscriptions_view(&mut rpc, 5, &ws_id, &subscriber).await;
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["id"], json!(sub_id));
+    assert_eq!(subs[0]["workspaceId"], json!(ws_id));
+    assert_eq!(subs[0]["subscriberAgentId"], json!(subscriber));
+    assert_eq!(subs[0]["eventTypes"], json!(["note:*"]));
+    assert_eq!(subs[0]["excludeSelf"], json!(false));
+    assert_eq!(subs[0]["batchWindow"], json!(75));
+    assert!(subs[0]["createdAt"].is_string());
+
+    // agent.diagnostics reports it: snapshot array, summary count, and the
+    // per-agent eventSubscriptionCount.
+    let diag = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.diagnostics",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let d = &diag["diagnostics"];
+    assert_eq!(d["summary"]["eventSubscriptions"], json!(1));
+    assert_eq!(d["eventSubscriptions"][0]["id"], json!(sub_id));
+    assert_eq!(d["eventSubscriptions"][0]["orphaned"], json!(false));
+    let row = d["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(subscriber))
+        .expect("subscriber row");
+    assert_eq!(row["eventSubscriptionCount"], json!(1));
+    assert!(diag["text"]
+        .as_str()
+        .expect("text")
+        .contains("Event subscriptions: 1"));
+
+    // Unsubscribe removes it from the introspection view.
+    wss_rpc(
+        &mut rpc,
+        7,
+        "agent.unsubscribe",
+        json!({ "workspaceId": ws_id, "subscriptionId": sub_id }),
+    )
+    .await;
+    let subs = event_subscriptions_view(&mut rpc, 8, &ws_id, &subscriber).await;
+    assert_eq!(subs, Vec::<Value>::new());
+
+    // Re-subscribe, then delete the workspace: the sweep drops the
+    // subscription (registry + row), so a fresh daemon-side view is empty.
+    wss_rpc(
+        &mut rpc,
+        9,
+        "agent.subscribe",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": subscriber,
+            "eventTypes": ["agent:*"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        event_subscriptions_view(&mut rpc, 10, &ws_id, &subscriber)
+            .await
+            .len(),
+        1
+    );
+    let deleted = wss_rpc(
+        &mut rpc,
+        11,
+        "workspace.delete",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(deleted["success"], json!(true));
+    // The workspace (and its agents) are gone; assert via a second workspace
+    // that the daemon-global registry holds no leaked subscription for the
+    // deleted workspace — diagnostics on a fresh workspace shows zero, and
+    // resubscribing against the deleted workspace's id fails closed on the
+    // dead subscriber.
+    let err = wss_rpc_raw(
+        &mut rpc,
+        12,
+        "agent.subscribe",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": subscriber,
+            "eventTypes": ["agent:*"],
+        }),
+    )
+    .await;
+    assert!(
+        err.get("error").is_some(),
+        "subscribing for a deleted workspace's agent must fail: {err}"
+    );
+}

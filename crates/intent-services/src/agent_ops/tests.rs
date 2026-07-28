@@ -5565,6 +5565,254 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     assert_eq!(loaded, 0, "orphaned rows must be pruned, not rehydrated");
 }
 
+/// monorepo#947: `agent.getSubscriptions` lists the caller's live event
+/// subscriptions (additive `eventSubscriptions` field alongside the
+/// unchanged completion-watch payload), and unsubscribing removes the entry.
+#[tokio::test]
+async fn get_subscriptions_includes_event_subscriptions() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+
+    // Baseline: existing fields intact, no event subscriptions yet.
+    let before = svc
+        .agent_get_subscriptions_op(ws.clone(), subscriber.clone())
+        .await
+        .expect("getSubscriptions");
+    assert!(before["subscriptions"].is_array());
+    assert!(before["delegationGroups"].is_array());
+    assert!(before["agentStatuses"].is_object());
+    assert_eq!(before["eventSubscriptions"], json!([]));
+
+    let sub = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["note:*".into()],
+            Some(false),
+            Some(75),
+        )
+        .await
+        .expect("subscribe");
+    let sub_id = sub["subscriptionId"].as_str().unwrap().to_string();
+
+    let after = svc
+        .agent_get_subscriptions_op(ws.clone(), subscriber.clone())
+        .await
+        .expect("getSubscriptions");
+    let subs = after["eventSubscriptions"].as_array().expect("array");
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["id"], json!(sub_id));
+    assert_eq!(subs[0]["workspaceId"], json!(ws.0));
+    assert_eq!(subs[0]["subscriberAgentId"], json!(subscriber.0));
+    assert_eq!(subs[0]["eventTypes"], json!(["note:*"]));
+    assert_eq!(subs[0]["excludeSelf"], json!(false));
+    assert_eq!(subs[0]["batchWindow"], json!(75));
+    assert!(subs[0]["createdAt"].is_string());
+
+    // Another agent's view stays empty — the list is per-subscriber.
+    let other = create_agent(&svc, &ws, "Other").await;
+    let other_view = svc
+        .agent_get_subscriptions_op(ws.clone(), other)
+        .await
+        .expect("getSubscriptions");
+    assert_eq!(other_view["eventSubscriptions"], json!([]));
+
+    svc.agent_unsubscribe(ws.clone(), sub_id)
+        .await
+        .expect("unsub");
+    let cleared = svc
+        .agent_get_subscriptions_op(ws, subscriber)
+        .await
+        .expect("getSubscriptions");
+    assert_eq!(cleared["eventSubscriptions"], json!([]));
+}
+
+/// monorepo#947: `agent.diagnostics` reports event subscriptions — the
+/// snapshot array, the summary count, the per-agent `eventSubscriptionCount`,
+/// and the text rendering line.
+#[tokio::test]
+async fn diagnostics_reports_event_subscriptions() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+
+    svc.agent_subscribe(
+        ws.clone(),
+        Some(subscriber.clone()),
+        vec!["task:*".into()],
+        None,
+        Some(50),
+    )
+    .await
+    .expect("subscribe");
+
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .await
+        .expect("diagnostics");
+    let diag = &result["diagnostics"];
+    assert_eq!(diag["summary"]["eventSubscriptions"], json!(1));
+    let subs = diag["eventSubscriptions"].as_array().expect("array");
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["subscriberAgentId"], json!(subscriber.0));
+    assert_eq!(subs[0]["eventTypes"], json!(["task:*"]));
+    assert_eq!(subs[0]["orphaned"], json!(false));
+    let row = diag["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(subscriber.0))
+        .expect("subscriber row");
+    assert_eq!(row["eventSubscriptionCount"], json!(1));
+    let text = result["text"].as_str().expect("text");
+    assert!(text.contains("Event subscriptions: 1"), "text: {text}");
+
+    // The agentId filter scopes the event-subscription list too.
+    let other = create_agent(&svc, &ws, "Other").await;
+    let filtered = svc
+        .agent_diagnostics_op(ws.clone(), Some(other), None, None)
+        .await
+        .expect("diagnostics filtered");
+    assert_eq!(
+        filtered["diagnostics"]["eventSubscriptions"],
+        json!([]),
+        "another agent's filter must exclude the subscription"
+    );
+}
+
+/// monorepo#947: deleting a workspace drops its event subscriptions — the
+/// live registry entries (delivery tasks aborted) and the persisted rows —
+/// while subscriptions scoped to other workspaces survive.
+#[tokio::test]
+async fn workspace_delete_cleans_up_event_subscriptions() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new(store)
+        .with_event_bus(bus)
+        .with_workspaces_root(tmp.path.with_extension("workspaces"));
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    let other_subscriber = create_agent(&svc, &other_ws, "OtherWatcher").await;
+
+    let sub = svc
+        .agent_subscribe(
+            ws.clone(),
+            Some(subscriber.clone()),
+            vec!["agent:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe");
+    let sub_id = sub["subscriptionId"].as_str().unwrap().to_string();
+    svc.agent_subscribe(
+        other_ws.clone(),
+        Some(other_subscriber.clone()),
+        vec!["agent:*".into()],
+        None,
+        Some(50),
+    )
+    .await
+    .expect("subscribe other ws");
+
+    <Services as WorkspaceApi>::delete_workspace(&svc, ws.clone())
+        .await
+        .expect("delete workspace");
+
+    // The deleted workspace's subscription is gone in memory and on disk;
+    // the other workspace's subscription is untouched.
+    assert!(
+        !svc.remove_event_subscription(&sub_id).await,
+        "subscription must already be gone after workspace delete"
+    );
+    let rows = svc
+        .store()
+        .list_event_subscriptions()
+        .await
+        .expect("list rows");
+    assert_eq!(rows.len(), 1, "only the other workspace's row survives");
+    assert_eq!(rows[0].workspace_id, other_ws);
+    let view = svc
+        .agent_get_subscriptions_op(other_ws, other_subscriber)
+        .await
+        .expect("getSubscriptions");
+    assert_eq!(
+        view["eventSubscriptions"].as_array().map(Vec::len),
+        Some(1),
+        "the other workspace's subscription stays live"
+    );
+}
+
+/// monorepo#947: startup heal prunes persisted rows whose workspace no longer
+/// exists, but keeps rows anchored to the `__chief__` virtual workspace
+/// (which has no ordinary workspace row by design). Both subscriptions are
+/// owned by a LIVE chief agent (chief agents may subscribe cross-workspace),
+/// so the prune decision is driven purely by workspace existence — not the
+/// pre-existing subscriber-liveness prune.
+#[tokio::test]
+async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
+    let tmp = TempDb::new();
+    let gone_ws = WorkspaceId::new();
+    let chief = WorkspaceId::chief();
+    {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .insert_workspace(&workspace(&gone_ws))
+            .await
+            .expect("ws");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store).with_event_bus(bus);
+        let chief_sub = create_agent(&svc, &chief, "Chief").await;
+        svc.agent_subscribe(
+            gone_ws.clone(),
+            Some(chief_sub.clone()),
+            vec!["agent:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe gone ws");
+        svc.agent_subscribe(
+            chief.clone(),
+            Some(chief_sub),
+            vec!["workspace:*".into()],
+            None,
+            Some(50),
+        )
+        .await
+        .expect("subscribe chief");
+        // Drop the workspace row underneath the subscription (simulating a
+        // delete that raced the daemon shutdown before the sweep landed).
+        svc.store()
+            .delete_workspace(&gone_ws)
+            .await
+            .expect("drop ws row");
+    }
+
+    // "Restart": fresh Services over the same database.
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    let bus = EventBus::new(store.clone());
+    let svc = Services::new(store).with_event_bus(bus);
+    let loaded = svc
+        .heal_event_subscriptions_on_startup()
+        .await
+        .expect("heal");
+    assert_eq!(loaded, 1, "only the chief-anchored subscription rehydrates");
+    let rows = svc
+        .store()
+        .list_event_subscriptions()
+        .await
+        .expect("list rows");
+    assert_eq!(rows.len(), 1, "the orphan-workspace row must be pruned");
+    assert_eq!(rows[0].workspace_id, chief);
+}
+
 /// Report-time wake: a delegated caller's `reportToParent` delivers an
 /// immediate parent wake containing the report. The report is persisted on the
 /// child session (`completion_report`) and the TS-shaped result is returned.
