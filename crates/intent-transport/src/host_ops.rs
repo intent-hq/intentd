@@ -707,6 +707,8 @@ pub(crate) struct KnownEditor {
 /// Stays in sync with `cloudlands-fe/src/shared/editors/editor-registry.ts` —
 /// when an editor is added on the FE, mirror only the detection fields here.
 pub(crate) const KNOWN_EDITORS: &[KnownEditor] = &[
+    // The file-manager entry is special-cased in detection: always installed on
+    // macOS (Finder) and Windows (Explorer); Linux keeps the binary probe.
     KnownEditor {
         id: "finder",
         app_name: "Finder",
@@ -1086,13 +1088,28 @@ pub(crate) fn find_app_op(name: &str) -> Value {
     find_app_with(name, &macos_app_dirs(&home), cfg!(target_os = "macos"))
 }
 
+/// Catalog id of the platform file manager (Finder / Explorer / Linux FMs).
+const FILE_MANAGER_ID: &str = "finder";
+
+/// Finder's fixed bundle path on macOS — it lives in CoreServices, outside the
+/// `/Applications` dirs the bundle probe scans (monorepo#885).
+const MACOS_FINDER_BUNDLE: &str = "/System/Library/CoreServices/Finder.app";
+
 /// Detect a single editor's install state on macOS (`.app` bundle lookup).
+/// The file manager is special-cased as always installed: Finder ships with
+/// every macOS host but lives outside the probed app dirs (monorepo#885).
 fn detect_editor_macos(editor: &KnownEditor, dirs: &[PathBuf]) -> Value {
     match find_macos_app_bundle(editor.app_name, dirs) {
         Some(path) => json!({
             "id": editor.id,
             "installed": true,
             "path": path.to_string_lossy(),
+            "source": "macAppBundle",
+        }),
+        None if editor.id == FILE_MANAGER_ID => json!({
+            "id": editor.id,
+            "installed": true,
+            "path": MACOS_FINDER_BUNDLE,
             "source": "macAppBundle",
         }),
         None => json!({ "id": editor.id, "installed": false }),
@@ -1130,7 +1147,9 @@ fn detect_editor_linux(
 }
 
 /// Detect a single editor's install state on Windows: probe each candidate
-/// binary in turn via the resolver.
+/// binary in turn via the resolver. The file manager is special-cased as
+/// always installed: Explorer ships with every Windows host, so a missed PATH
+/// probe still reports it installed, launched by bare name (monorepo#885).
 fn detect_editor_windows(editor: &KnownEditor, binary_resolver: &dyn BinaryResolver) -> Value {
     for binary in editor.win_binaries {
         if let Some(path) = binary_resolver.find(binary) {
@@ -1141,6 +1160,14 @@ fn detect_editor_windows(editor: &KnownEditor, binary_resolver: &dyn BinaryResol
                 "source": "binary",
             });
         }
+    }
+    if editor.id == FILE_MANAGER_ID {
+        return json!({
+            "id": editor.id,
+            "installed": true,
+            "path": "explorer",
+            "source": "binary",
+        });
     }
     json!({ "id": editor.id, "installed": false })
 }
