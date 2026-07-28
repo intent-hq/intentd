@@ -6765,6 +6765,35 @@ async fn wake_or_create_scope_gate_allows_chief_caller_cross_workspace() {
     assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
 }
 
+/// monorepo#932 (skip branch): an unknown/unresolvable `callerAgentId` must
+/// not be rejected by the pre-gate — the op proceeds and the SUB-1 watch is
+/// registered with the fallback anchor (the call's workspace), preserving the
+/// pre-fix behavior for callers whose session lookup fails.
+#[tokio::test]
+async fn wake_or_create_unknown_caller_still_proceeds() {
+    let (_t, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Unknown caller").await;
+    let caller = AgentId::from("agent-ghost");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("unknown caller must skip the pre-gate, not be rejected");
+    assert_eq!(resp["action"], "created_new");
+    assert!(resp["subscriptionId"].as_str().is_some());
+
+    let watches = svc.list_watches_for_parent(&caller);
+    assert_eq!(watches.len(), 1);
+    assert_eq!(
+        watches[0].parent_workspace_id, ws,
+        "failed session lookup falls back to anchoring in the call's workspace"
+    );
+}
+
 /// Queued-to-active wake: the context message queues behind the assignee's
 /// in-flight turn, so the caller's watch is NON-oneShot (it must survive the
 /// current turn's `agent:idle`) and the response carries the queued text.
