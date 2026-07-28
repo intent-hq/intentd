@@ -2451,7 +2451,28 @@ impl Services {
                 .unwrap_or("")
                 .to_string()
         });
-        for watch in self.find_watches_for_child(child_id) {
+        let watches = self.find_watches_for_child(child_id);
+        // monorepo#1016: best-effort stall detection — an agent:idle with no
+        // completion report while the child's assigned task note is still
+        // incomplete gets its wake annotated (text + metadata). Store lookup
+        // failures fail open (no annotation); the wake always proceeds.
+        let stall = if watches.is_empty() {
+            None
+        } else {
+            self.stall_suspicion_for_completion(child_id, &event.event_type)
+                .await
+        };
+        let annotated_event;
+        let event = match &stall {
+            Some(s) => {
+                let mut e = event.clone();
+                s.annotate_event_data(&mut e.data);
+                annotated_event = e;
+                &annotated_event
+            }
+            None => event,
+        };
+        for watch in watches {
             let parent_ws = watch.parent_workspace_id.clone();
             if let Some(gid) = watch.group_id.clone() {
                 // Route the child's completion into the parent's after_all
@@ -2468,7 +2489,8 @@ impl Services {
                     .await
                     .ok()
                     .and_then(|s| s.completion_report);
-                let summary = format_group_child_line(child_id, event, report.as_deref());
+                let summary =
+                    format_group_child_line(child_id, event, report.as_deref(), stall.as_ref());
                 let newly_recorded = self
                     .record_group_child_completion(&gid, child_id, deleted, summary, event.clone())
                     .await;
@@ -2482,7 +2504,7 @@ impl Services {
                 // `newly_recorded` guard ensures a reprocessed duplicate
                 // `agent:failed` cannot deliver a second immediate wake.
                 if newly_recorded && event.event_type == AGENT_FAILED {
-                    let wake = format_completion_wake(child_id, event);
+                    let wake = format_completion_wake(child_id, event, None);
                     let metadata = build_event_notification_metadata(&[event]);
                     if let Err(e) = self
                         .deliver_parent_wake(
@@ -2556,7 +2578,7 @@ impl Services {
                     continue;
                 }
             }
-            let wake = format_completion_wake(child_id, event);
+            let wake = format_completion_wake(child_id, event, stall.as_ref());
             let metadata = build_event_notification_metadata(&[event]);
             if let Err(e) = self
                 .deliver_parent_wake(
@@ -3365,12 +3387,26 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut metadata = serde_json::json!({
         "type": "event_notification",
         "eventCount": events.len(),
         "eventTypes": event_types,
         "events": events_json,
-    })
+    });
+    // monorepo#1016: lift a per-event stall annotation to the top level so
+    // clients can flag the wake without scanning the event array. The first
+    // suspected-stall event supplies the taskStatus.
+    if let Some(stalled) = events
+        .iter()
+        .find(|e| e.data.get("stallSuspected") == Some(&serde_json::Value::Bool(true)))
+    {
+        let obj = metadata.as_object_mut().expect("metadata is an object");
+        obj.insert("stallSuspected".to_string(), serde_json::json!(true));
+        if let Some(status) = stalled.data.get("taskStatus") {
+            obj.insert("taskStatus".to_string(), status.clone());
+        }
+    }
+    metadata
 }
 
 /// Fetch a note scoped to `workspace_id`; `NotFound` if absent. Note identity
@@ -6352,7 +6388,11 @@ fn replace_uuid_tokens(text: &str) -> String {
 /// completion report wins over `lastResponseSummary` (SUB-2, mirroring
 /// `format_group_child_line`) so the single agent:idle-driven wake carries
 /// the child's `reportToParent` text end-to-end.
-fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
+fn format_completion_wake(
+    child_id: &AgentId,
+    event: &Event,
+    stall: Option<&StallSuspicion>,
+) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
         AGENT_FAILED => "failed",
@@ -6389,6 +6429,9 @@ fn format_completion_wake(child_id: &AgentId, event: &Event) -> String {
             msg.push_str(&format!(" Error: {err}"));
         }
     }
+    if let Some(stall) = stall {
+        msg.push_str(&stall.annotation_suffix());
+    }
     msg
 }
 
@@ -6403,6 +6446,7 @@ pub(crate) fn format_group_child_line(
     child_id: &AgentId,
     event: &Event,
     completion_report: Option<&str>,
+    stall: Option<&StallSuspicion>,
 ) -> String {
     let kind = match event.event_type.as_str() {
         AGENT_IDLE => "completed",
@@ -6443,7 +6487,97 @@ pub(crate) fn format_group_child_line(
             line.push_str(&format!(" Error: {err}"));
         }
     }
+    if let Some(stall) = stall {
+        line.push_str(&stall.annotation_suffix());
+    }
     line
+}
+
+/// A suspected-stall completion (monorepo#1016): the child went idle WITHOUT
+/// a completion report while its assigned task note is still incomplete —
+/// the "completed" wording alone would mislead the parent into believing the
+/// work finished. Carries just enough task context to render the annotation.
+#[derive(Debug, Clone)]
+pub(crate) struct StallSuspicion {
+    /// Title of the child's assigned task note.
+    pub(crate) task_title: String,
+    /// Wire (snake_case) form of the task's still-incomplete status.
+    pub(crate) task_status: String,
+}
+
+impl StallSuspicion {
+    /// The suffix appended to the wake text / per-child group line.
+    fn annotation_suffix(&self) -> String {
+        format!(
+            " No completion report and assigned task \"{}\" is still {} — the agent may have \
+             stalled rather than finished (monorepo#1016). Consider ws.agent.wakeOrCreate to \
+             resume it.",
+            self.task_title, self.task_status
+        )
+    }
+
+    /// Fields merged into the event's `data` so the FE metadata (and the
+    /// grouped raw_events) carry the machine-readable flag.
+    pub(crate) fn annotate_event_data(&self, data: &mut serde_json::Value) {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("stallSuspected".to_string(), serde_json::json!(true));
+            obj.insert(
+                "taskStatus".to_string(),
+                serde_json::json!(self.task_status),
+            );
+        }
+    }
+}
+
+impl Services {
+    /// Evaluate the monorepo#1016 stall predicate for a child completion:
+    /// `agent:idle` AND no persisted completion report AND the session has an
+    /// assigned task note whose status is not complete/cancelled. Every store
+    /// failure fails OPEN (returns `None`) — annotation is best-effort and
+    /// must never block, delay, or drop a wake.
+    pub(crate) async fn stall_suspicion_for_completion(
+        &self,
+        child_id: &AgentId,
+        event_type: &str,
+    ) -> Option<StallSuspicion> {
+        if event_type != AGENT_IDLE {
+            return None;
+        }
+        let session = self.store.get_agent_session(child_id).await.ok()?;
+        self.stall_suspicion_for_session(&session).await
+    }
+
+    /// Session-based variant of [`Self::stall_suspicion_for_completion`] for
+    /// callers that already hold the child's session (rehydration paths).
+    pub(crate) async fn stall_suspicion_for_session(
+        &self,
+        session: &AgentSession,
+    ) -> Option<StallSuspicion> {
+        if session
+            .completion_report
+            .as_deref()
+            .is_some_and(|r| !r.is_empty())
+        {
+            return None;
+        }
+        let task_note_id = session.task_note_id.as_ref()?;
+        let note = self
+            .store
+            .get_note(&session.workspace_id, task_note_id)
+            .await
+            .ok()?;
+        let task = note.metadata.task.as_ref()?;
+        if matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled) {
+            return None;
+        }
+        let task_status = serde_json::to_value(task.status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))?;
+        Some(StallSuspicion {
+            task_title: note.title.clone(),
+            task_status,
+        })
+    }
 }
 
 /// Build the single aggregated wake for a settled after_all delegation group: a
