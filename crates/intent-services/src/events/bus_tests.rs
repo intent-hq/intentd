@@ -418,6 +418,146 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
     );
 }
 
+/// A `NewEvent` for `agent:tool:call` with the given `output` payload.
+fn tool_call_event(output: serde_json::Value) -> NewEvent {
+    let mut ev = new_event("agent:tool:call", Some("agent-1"), ActorType::Agent);
+    ev.data = json!({
+        "toolCallId": "tc-1",
+        "toolName": "launch-process",
+        "title": "run tests",
+        "status": "completed",
+        "input": { "command": "cargo test" },
+        "output": output,
+    });
+    ev
+}
+
+#[tokio::test]
+async fn oversized_tool_call_payload_is_capped_in_store_but_full_on_broadcast() {
+    let (_tmp, bus) = bus().await;
+    let filter = SubscriptionFilter {
+        batch_window: None,
+        ..Default::default()
+    };
+    let mut sub = bus.subscribe(filter);
+
+    // Output alone (~64 KiB) pushes the payload well past the 16 KiB cap.
+    let big_output = "x".repeat(64 * 1024);
+    let stored = bus
+        .publish(&tool_call_event(json!(big_output)))
+        .await
+        .expect("publish");
+
+    // Publisher's returned event and the broadcast keep the FULL payload.
+    assert_eq!(stored.data["output"], json!(big_output));
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].data["output"], json!(big_output));
+
+    // The durable row is capped: output replaced with a truncation marker.
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1);
+    let data = &rows[0].data;
+    assert_eq!(data["output"]["truncated"], json!(true));
+    assert_eq!(data["output"]["originalBytes"], json!(64 * 1024 + 2)); // + JSON quotes
+    let preview = data["output"]["preview"].as_str().expect("preview string");
+    assert!(preview.len() <= 2 * 1024, "preview bounded to 2 KiB");
+    // Identity + small fields persist verbatim.
+    assert_eq!(data["toolCallId"], json!("tc-1"));
+    assert_eq!(data["toolName"], json!("launch-process"));
+    assert_eq!(data["status"], json!("completed"));
+    assert_eq!(data["input"], json!({ "command": "cargo test" }));
+    // Overall persisted payload is within the cap.
+    assert!(serde_json::to_string(data).unwrap().len() <= 16 * 1024);
+}
+
+#[tokio::test]
+async fn small_tool_call_payload_persists_verbatim() {
+    let (_tmp, bus) = bus().await;
+    let stored = bus
+        .publish(&tool_call_event(json!("short output")))
+        .await
+        .expect("publish");
+
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].data, stored.data, "under-cap payload is untouched");
+    assert_eq!(rows[0].data["output"], json!("short output"));
+}
+
+#[tokio::test]
+async fn oversized_non_tool_call_event_is_not_truncated() {
+    let (_tmp, bus) = bus().await;
+    let mut ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
+    let big = "y".repeat(32 * 1024);
+    ev.data = json!({ "content": big });
+    bus.publish(&ev).await.expect("publish");
+
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].data["content"].as_str().map(str::len),
+        Some(32 * 1024),
+        "only agent:tool:call payloads are capped"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_fallback_drops_unexpected_huge_fields() {
+    let (_tmp, bus) = bus().await;
+    // Huge payload in a field outside output/input/registeredAttachments:
+    // per-field truncation cannot bound it, so the fallback keeps only
+    // identity fields and sets a top-level truncated flag.
+    let mut ev = new_event("agent:tool:call", Some("agent-1"), ActorType::Agent);
+    ev.data = json!({
+        "toolCallId": "tc-2",
+        "toolName": "custom",
+        "status": "completed",
+        "unexpectedBlob": "z".repeat(64 * 1024),
+    });
+    bus.publish(&ev).await.expect("publish");
+
+    let rows = bus
+        .store()
+        .query_events(&EventQuery {
+            workspace_id: Some(WorkspaceId::from("ws-1")),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1);
+    let data = &rows[0].data;
+    assert_eq!(data["truncated"], json!(true));
+    assert_eq!(data["toolCallId"], json!("tc-2"));
+    assert_eq!(data["toolName"], json!("custom"));
+    assert!(data.get("unexpectedBlob").is_none(), "huge field dropped");
+    assert!(serde_json::to_string(data).unwrap().len() <= 16 * 1024);
+}
+
 #[tokio::test]
 async fn oneshot_receiver_drop_is_handled_gracefully() {
     let (_tmp, bus) = bus().await;
