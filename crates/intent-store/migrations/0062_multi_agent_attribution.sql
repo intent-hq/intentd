@@ -7,3 +7,7 @@
 -- upsert lookup and the attribution-filtered commit reads.
 CREATE INDEX idx_tracked_changes_ws_path_stage_agent
     ON tracked_changes(workspace_id, path, stage, agent_id);
+
+-- (workspace_id, path) from 0006 is a strict prefix of the new index —
+-- redundant, so drop it rather than maintain both on every write.
+DROP INDEX idx_tracked_changes_path;

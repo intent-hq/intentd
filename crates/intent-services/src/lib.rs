@@ -7853,7 +7853,22 @@ impl WorkspaceApi for Services {
                 .unwrap_or(false);
             if let Some(agent) = caller_agent_id.as_ref() {
                 if is_directory {
-                    for rel in file_ops::walk_files(&root, &new_path) {
+                    // Old-side rows for previously-untracked files never match
+                    // a git diff entry, so they stay `unstaged` forever — an
+                    // accepted trade-off (the commit intersection filters
+                    // them) to keep the enumeration git-free. Large trees pay
+                    // two diff computes per file inline in this request;
+                    // surface a warn so a pathological rename is traceable.
+                    let moved = file_ops::walk_files(&root, &new_path);
+                    if moved.len() > 500 {
+                        tracing::warn!(
+                            files = moved.len(),
+                            old = %old_path,
+                            new = %new_path,
+                            "file.rename: attributing a large directory move"
+                        );
+                    }
+                    for rel in moved {
                         record_agent_file_mutation(
                             &store,
                             &workspace_id,
