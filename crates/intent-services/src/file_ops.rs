@@ -336,6 +336,35 @@ pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value
     }))
 }
 
+/// Recursively list the regular files under `dir` (workspace-relative),
+/// returned as paths relative to `dir` itself, sorted. Used by the
+/// directory-rename attribution path (monorepo#957) to enumerate the moved
+/// tree. Best-effort: unreadable entries are skipped.
+pub(crate) fn walk_files(root: &str, dir: &str) -> Vec<String> {
+    let base = node_resolve(root, dir);
+    let mut out = Vec::new();
+    let mut stack = vec![base.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(t) if t.is_file() => {
+                    if let Ok(rel) = path.strip_prefix(&base) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

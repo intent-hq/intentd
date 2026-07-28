@@ -7843,24 +7843,56 @@ impl WorkspaceApi for Services {
             // Attribution (monorepo#939): an agent-context file rename records
             // both sides (old path deleted, new path added), matching what the
             // ACP `file:changed` pipeline would attribute for the equivalent
-            // delete + create. Directory renames are skipped — attribution
-            // rows are per-file and a directory path has no diff entry.
+            // delete + create. A DIRECTORY rename records per-file rows for
+            // every contained path (monorepo#957) — attribution rows are
+            // per-file and a directory path has no diff entry, so the moved
+            // tree is enumerated and both sides recorded for each file.
             let is_directory = result
                 .get("isDirectory")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            if let (Some(agent), false) = (caller_agent_id.as_ref(), is_directory) {
-                record_agent_file_mutation(
-                    &store,
-                    &workspace_id,
-                    agent,
-                    &root,
-                    &old_path,
-                    "deleted",
-                )
-                .await;
-                record_agent_file_mutation(&store, &workspace_id, agent, &root, &new_path, "added")
+            if let Some(agent) = caller_agent_id.as_ref() {
+                if is_directory {
+                    for rel in file_ops::walk_files(&root, &new_path) {
+                        record_agent_file_mutation(
+                            &store,
+                            &workspace_id,
+                            agent,
+                            &root,
+                            &format!("{old_path}/{rel}"),
+                            "deleted",
+                        )
+                        .await;
+                        record_agent_file_mutation(
+                            &store,
+                            &workspace_id,
+                            agent,
+                            &root,
+                            &format!("{new_path}/{rel}"),
+                            "added",
+                        )
+                        .await;
+                    }
+                } else {
+                    record_agent_file_mutation(
+                        &store,
+                        &workspace_id,
+                        agent,
+                        &root,
+                        &old_path,
+                        "deleted",
+                    )
                     .await;
+                    record_agent_file_mutation(
+                        &store,
+                        &workspace_id,
+                        agent,
+                        &root,
+                        &new_path,
+                        "added",
+                    )
+                    .await;
+                }
             }
             Ok(result)
         })
