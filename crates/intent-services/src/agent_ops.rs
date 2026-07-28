@@ -1103,9 +1103,10 @@ impl Services {
     /// the caller's workspace must match the session's; a mismatch surfaces as
     /// `NotFound` (defense-in-depth against bare-id probes across workspaces).
     ///
-    /// Uses the metadata-only session lookup plus the bounded message
-    /// projections (monorepo#958) — the transcript is never hydrated; only
-    /// the session's newest user/assistant rows are fetched and decoded.
+    /// Uses the metadata-only session lookup plus the bounded per-session
+    /// message projection (monorepo#958, monorepo#981) — the transcript is
+    /// never hydrated and no other session in the workspace is projected;
+    /// only this session's newest user/assistant rows are fetched and decoded.
     pub(crate) async fn agent_get_op(
         &self,
         agent_id: AgentId,
@@ -1117,11 +1118,10 @@ impl Services {
                 return Err(Error::NotFound(format!("agent session {agent_id}")));
             }
         }
-        let mut projections = self
+        let projection = self
             .store
-            .get_agent_session_message_projections(&session.workspace_id)
+            .get_agent_session_message_projection(&agent_id)
             .await?;
-        let projection = projections.remove(&agent_id.0).unwrap_or_default();
         Ok(self.project_lite_with_flags_from_projection(session, &projection))
     }
 
