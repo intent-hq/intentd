@@ -19582,6 +19582,21 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
             if let Some(pkg) = p.npx_only_package {
                 obj.insert("npxPackage".to_string(), serde_json::json!(pkg));
             }
+            // Secondary-binary attribution for dual-binary providers
+            // (unsloth: opencode + unsloth) so RPC/FE consumers can name the
+            // actually-missing binary, matching doctor (monorepo#991).
+            // Omitted when the provider has no secondary requirement or was
+            // gated off (never probed).
+            if let Some((secondary_command, secondary_resolved)) = p.secondary_binary {
+                obj.insert(
+                    "secondaryCommand".to_string(),
+                    serde_json::json!(secondary_command),
+                );
+                obj.insert(
+                    "secondaryResolved".to_string(),
+                    serde_json::json!(secondary_resolved),
+                );
+            }
             serde_json::Value::Object(obj)
         })
         .collect();
