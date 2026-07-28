@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.12] - 2026-07-28
+
+### 🚀 Features
+
+- Add providers.catalog RPC serving the intent-providers registry (monorepo#928) ([#694](https://github.com/intent-hq/intentd/pull/694))
+
+### 🐛 Bug Fixes
+
+- Thread combined-delivery prepend_* fields through enqueue_message (intent-hq/monorepo#1034) ([#693](https://github.com/intent-hq/intentd/pull/693))
+
+
 ## [0.2.11] - 2026-07-28
 
 ### 🚀 Features
