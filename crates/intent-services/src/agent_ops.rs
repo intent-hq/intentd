@@ -4651,6 +4651,29 @@ impl Services {
             }
         }
 
+        // monorepo#932: run the SUB-1 watch scope gate BEFORE any
+        // side-effectful work (agent create/wake, task assignment, poisoned
+        // queue migration, context-message delivery), mirroring
+        // `agent_delegate_op`'s pre-gate. Without this, the shared gate inside
+        // `register_completion_watch` would reject only AFTER those side
+        // effects, hiding the freshly created/woken `agentId` behind the
+        // error. The caller's home workspace is resolved exactly like the
+        // SUB-1 registration blocks on all three branches below (session
+        // lookup via `.ok()`, falling back to the call's workspace — a
+        // trivial pass — when the lookup fails), so a pass here guarantees
+        // the later shared gate cannot reject.
+        if let Some(caller) = input.caller_agent_id.as_ref() {
+            if let Some(caller_home_ws) = self
+                .store
+                .get_agent_session(caller)
+                .await
+                .ok()
+                .map(|s| s.workspace_id)
+            {
+                crate::agent_subscriptions::check_watch_scope(&caller_home_ws, &workspace_id)?;
+            }
+        }
+
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
             .await?;

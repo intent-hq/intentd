@@ -6646,6 +6646,125 @@ async fn wake_or_create_without_caller_registers_no_watch() {
     assert!(svc.find_watches_for_child(&target).is_empty());
 }
 
+/// monorepo#932: a scope-gate rejection on the create branch is side-effect
+/// free. The gate runs before any side-effectful work, so a non-chief caller
+/// waking a task outside its home workspace gets `-32602` with no agent
+/// created, no task assignment written, and no watch registered.
+#[tokio::test]
+async fn wake_or_create_scope_gate_rejection_create_branch_is_side_effect_free() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let caller = create_agent(&svc, &ws_a, "Out-of-scope caller").await;
+    let note_id = seed_task(&svc, &ws_b, "Cross-ws create").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let denied = svc
+        .agent_wake_or_create_op(ws_b.clone(), note_id.clone(), "kickoff".into(), input)
+        .await;
+    assert!(
+        matches!(denied, Err(Error::InvalidParams(_))),
+        "non-chief cross-workspace wakeOrCreate must be rejected with InvalidParams: {denied:?}"
+    );
+
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws_b)
+        .await
+        .expect("list ws-b sessions");
+    assert!(
+        sessions.is_empty(),
+        "rejection must not create an agent: {sessions:?}"
+    );
+    let task = svc
+        .get_my_task(ws_b.clone(), note_id)
+        .await
+        .expect("task read-back");
+    assert!(
+        task.assigned_agents.is_empty(),
+        "rejection must not write a task assignment: {:?}",
+        task.assigned_agents
+    );
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// monorepo#932: the same pre-gate covers the wake branch — a rejected
+/// out-of-scope caller must not deliver the context message to the assignee,
+/// must not touch the task's assignments, and must register no watch.
+#[tokio::test]
+async fn wake_or_create_scope_gate_rejection_wake_branch_is_side_effect_free() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let caller = create_agent(&svc, &ws_a, "Out-of-scope caller").await;
+    let target = create_agent(&svc, &ws_b, "Assignee").await;
+    let note_id = seed_task(&svc, &ws_b, "Cross-ws wake").await;
+    svc.assign_agent(ws_b.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+
+    let baseline = parent_message_count(&svc, &target).await;
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let denied = svc
+        .agent_wake_or_create_op(ws_b.clone(), note_id.clone(), "resume".into(), input)
+        .await;
+    assert!(
+        matches!(denied, Err(Error::InvalidParams(_))),
+        "non-chief cross-workspace wakeOrCreate must be rejected with InvalidParams: {denied:?}"
+    );
+
+    assert_eq!(
+        parent_message_count(&svc, &target).await,
+        baseline,
+        "rejection must not deliver the context message to the assignee"
+    );
+    let task = svc
+        .get_my_task(ws_b.clone(), note_id)
+        .await
+        .expect("task read-back");
+    assert_eq!(
+        task.assigned_agents,
+        vec![target.clone()],
+        "rejection must leave the existing assignment untouched"
+    );
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// monorepo#932 (chief parity): a chief-workspace caller passes the pre-gate
+/// and the cross-workspace wake still succeeds end-to-end with the SUB-1
+/// subscription attached.
+#[tokio::test]
+async fn wake_or_create_scope_gate_allows_chief_caller_cross_workspace() {
+    let (_t, svc, ws) = setup().await;
+    let chief_ws = WorkspaceId::chief();
+    let caller = create_agent(&svc, &chief_ws, "Chief").await;
+    let note_id = seed_task(&svc, &ws, "Chief cross-ws create").await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("chief cross-workspace wakeOrCreate is allowed");
+    assert_eq!(resp["action"], "created_new");
+    assert!(resp["subscriptionId"].as_str().is_some());
+    assert_eq!(svc.list_watches_for_parent(&caller).len(), 1);
+}
+
 /// Queued-to-active wake: the context message queues behind the assignee's
 /// in-flight turn, so the caller's watch is NON-oneShot (it must survive the
 /// current turn's `agent:idle`) and the response carries the queued text.
