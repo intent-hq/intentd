@@ -824,6 +824,13 @@ async fn agent_session_status_persists_idle_active_idle_over_wss() {
         json!(false),
         "agent:idle carries isBackground=false for a foreground agent: {idle}"
     );
+    // The emit-time waiting flag: this agent parents no pending completion
+    // watches, so the idle payload reports `false`.
+    assert_eq!(
+        idle["isWaitingForOtherAgents"],
+        json!(false),
+        "agent:idle carries isWaitingForOtherAgents=false with no pending watches: {idle}"
+    );
     assert!(
         transitions.contains(&("active".to_string(), true)),
         "saw active/isActive=true transition (got {transitions:?})"
@@ -2057,16 +2064,26 @@ async fn agent_waiting_for_agent_ids_reflects_pending_watch_over_wss() {
     // Wait for the parent to go idle (its turn finished — the MCP delegate
     // tool returned and the parent emitted `end_turn`). The child it spawned
     // is parked, so the parent→child completion watch is still pending.
-    let mut parent_idle = false;
+    let mut parent_idle_payload: Option<Value> = None;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 60).await;
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(parent_id) {
-            parent_idle = true;
+            parent_idle_payload = Some(ev["data"].clone());
             break;
         }
     }
-    assert!(parent_idle, "parent went idle after firing delegate tool");
+    let parent_idle = parent_idle_payload.expect("parent went idle after firing delegate tool");
+    // The idle payload itself carries the emit-time waiting flag — computed
+    // from the parent's pending completion watches at publish time, so
+    // notification clients can suppress the alert without a follow-up
+    // `agent.list` read (which can race the child's completion consuming
+    // the watch).
+    assert_eq!(
+        parent_idle["isWaitingForOtherAgents"],
+        json!(true),
+        "parent agent:idle carries isWaitingForOtherAgents=true while the child watch is pending: {parent_idle}"
+    );
 
     // The parent's `AgentLite` carries the BE-owned waiting-on id list (PROTOCOL
     // §5.5/§7.1): the bool is true, the array is the SINGLE distinct child id

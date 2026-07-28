@@ -624,6 +624,9 @@ async fn prompt_turn_streams_events_and_accumulates() {
     // along from the session row — `false` for this foreground session.
     assert_eq!(idle.data["agentName"], json!("Builder"));
     assert_eq!(idle.data["isBackground"], json!(false));
+    // Emit-time waiting flag: this session parents no pending completion
+    // watches, so the idle payload reports `false`.
+    assert_eq!(idle.data["isWaitingForOtherAgents"], json!(false));
     assert!(
         idle.data.get("report").is_none(),
         "no completion_report was set on this session"

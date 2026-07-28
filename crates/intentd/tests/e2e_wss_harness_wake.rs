@@ -495,6 +495,11 @@ async fn harness_wake_burst_streams_as_agent_initiated_turn_over_wss() {
                     "wake idle carries reason harness_wake_complete: {frame}"
                 );
                 assert_eq!(event["data"]["status"], "idle", "wake idle status: {frame}");
+                assert_eq!(
+                    event["data"]["isWaitingForOtherAgents"],
+                    json!(false),
+                    "wake idle carries the emit-time waiting flag (no pending watches): {frame}"
+                );
                 saw_idle = true;
             }
             Some("agent:failed") => panic!("agent:failed during wake turn: {frame}"),
