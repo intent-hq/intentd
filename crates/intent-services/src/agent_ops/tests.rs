@@ -6800,6 +6800,145 @@ async fn wake_or_create_unknown_caller_still_proceeds() {
     );
 }
 
+/// monorepo#994: flag an agent's session as `Deleted` in place (the
+/// soft-delete shape the wakeOrCreate deleted-caller guard checks).
+async fn flag_agent_deleted(svc: &Services, agent: &AgentId) {
+    let mut session = svc
+        .store()
+        .get_agent_session(agent)
+        .await
+        .expect("caller session");
+    session.status = intent_core::AgentStatus::Deleted;
+    svc.store()
+        .update_agent_session(&session.workspace_id.clone(), &session)
+        .await
+        .expect("flag deleted");
+}
+
+/// monorepo#994: the woke-existing branch must NOT register a SUB-1 watch for
+/// a Deleted caller (asymmetry with `agent_delegate_op`'s deleted-parent
+/// guard). The wake itself proceeds, but the response keeps the caller-less
+/// shape (no `subscriptionId` / `message`) and no watch is registered.
+#[tokio::test]
+async fn wake_or_create_skips_watch_when_caller_deleted_wake_branch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "Deleted caller wake").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+    flag_agent_deleted(&svc, &caller).await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "resume".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "woke_existing");
+    assert!(
+        resp.get("subscriptionId").is_none(),
+        "deleted caller must not receive a subscription id: {resp}"
+    );
+    assert!(resp.get("message").is_none());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+    assert!(svc.find_watches_for_child(&target).is_empty());
+}
+
+/// monorepo#994: the created_new branch must NOT register a SUB-1 watch for a
+/// Deleted caller either — parity with the wake branch guard above.
+#[tokio::test]
+async fn wake_or_create_skips_watch_when_caller_deleted_create_branch() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
+    let note_id = seed_task(&svc, &ws, "Deleted caller create").await;
+    flag_agent_deleted(&svc, &caller).await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "created_new");
+    assert!(
+        resp.get("subscriptionId").is_none(),
+        "deleted caller must not receive a subscription id: {resp}"
+    );
+    assert!(resp.get("message").is_none());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
+/// monorepo#994: the queued-to-active branch shares the wake-branch SUB-1
+/// block, so a Deleted caller gets neither the non-oneShot watch nor its
+/// 5-minute leak-guard timer.
+#[tokio::test]
+async fn wake_or_create_queued_skips_watch_when_caller_deleted() {
+    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let caller = create_agent(&svc, &ws, "Deleted coordinator").await;
+    let target = create_agent(&svc, &ws, "Busy assignee").await;
+    let note_id = seed_task(&svc, &ws, "Deleted caller queued").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone())
+        .await
+        .expect("assign");
+    flag_agent_deleted(&svc, &caller).await;
+    // Occupy the assignee's in-flight slot so `deliver_wake_message` takes the
+    // enqueue branch deterministically.
+    assert!(manager.try_begin_turn(&target, &ws).await, "claim slot");
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws.clone(), note_id, "follow up".into(), input)
+        .await
+        .expect("wake");
+    assert_eq!(resp["action"], "message_queued_to_active_agent");
+    assert!(
+        resp.get("subscriptionId").is_none(),
+        "deleted caller must not receive a subscription id: {resp}"
+    );
+    assert!(resp.get("message").is_none());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+    assert!(svc.find_watches_for_child(&target).is_empty());
+
+    manager.release_slot(&target).await;
+}
+
+/// monorepo#994: the #932 pre-gate is ALSO skipped for a Deleted caller —
+/// mirroring `agent_delegate_op`, where a deleted out-of-scope parent gates
+/// nothing. The cross-workspace wake proceeds and still registers no watch.
+#[tokio::test]
+async fn wake_or_create_deleted_out_of_scope_caller_skips_pre_gate() {
+    let (_t, svc, ws_a) = setup().await;
+    let ws_b = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&ws_b))
+        .await
+        .expect("ws-b");
+    let caller = create_agent(&svc, &ws_a, "Deleted out-of-scope caller").await;
+    let note_id = seed_task(&svc, &ws_b, "Deleted cross-ws caller").await;
+    flag_agent_deleted(&svc, &caller).await;
+
+    let input = AgentWakeOrCreateInput {
+        caller_agent_id: Some(caller.clone()),
+        ..Default::default()
+    };
+    let resp = svc
+        .agent_wake_or_create_op(ws_b.clone(), note_id, "kickoff".into(), input)
+        .await
+        .expect("deleted caller must skip the pre-gate, not be rejected");
+    assert_eq!(resp["action"], "created_new");
+    assert!(resp.get("subscriptionId").is_none());
+    assert!(svc.list_watches_for_parent(&caller).is_empty());
+}
+
 /// Queued-to-active wake: the context message queues behind the assignee's
 /// in-flight turn, so the caller's watch is NON-oneShot (it must survive the
 /// current turn's `agent:idle`) and the response carries the queued text.
