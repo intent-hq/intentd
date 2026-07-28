@@ -1304,6 +1304,11 @@ impl Services {
             if !trailing_blocks.is_empty() {
                 end_data["trailingBlocks"] = Value::Array(trailing_blocks);
             }
+            // Turn correlation (monorepo#1022): the terminal stream:end names
+            // the logical turn it closes, same contract as `agent:failed`.
+            if let Some(tid) = turn_id {
+                end_data["turnId"] = json!(tid);
+            }
             self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
                 .await;
         }
