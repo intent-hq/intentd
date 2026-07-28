@@ -679,11 +679,11 @@ impl Services {
     /// insert.
     ///
     /// Empty-blocks slots (turn started, nothing streamed yet) are a no-op
-    /// unless `allow_empty` is set — the STAB-114 zero-output requeue in
-    /// `interrupt_send_message` and the graceful-shutdown capture must never
-    /// see a phantom row. Only the plain `agent.stop` interrupt opts in, so a
-    /// pre-first-token stop durably records the interruption as an empty
-    /// assistant row the FE can key the Stopped indicator off.
+    /// unless `allow_empty` is set — the STAB-114 zero-output combined
+    /// delivery in `interrupt_send_message` and the graceful-shutdown capture
+    /// must never see a phantom row. Only the plain `agent.stop` interrupt
+    /// opts in, so a pre-first-token stop durably records the interruption as
+    /// an empty assistant row the FE can key the Stopped indicator off.
     ///
     /// Returns the persisted interrupted row's message id (`Some` only when
     /// this flush appended the row), so the interrupt path can carry

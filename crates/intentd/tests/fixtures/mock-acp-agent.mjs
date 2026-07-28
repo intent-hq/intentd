@@ -387,7 +387,8 @@ async function handlePrompt(id, params) {
   // STAB-114: Park BEFORE streaming any assistant content, so tests can interrupt
   // with zero output. Send session/update with agent_status (thinking) to establish
   // the session without emitting assistant content, then park. The live-turn will
-  // have zero assistant blocks, triggering the requeue path.
+  // have zero assistant blocks, triggering the combined-delivery path
+  // (monorepo#1014: preempted message rides the interrupt turn's prompt).
   if (behavior.parkBeforeFirstChunk && promptCount === 1) {
     note('session/update', {
       sessionId: SESSION_ID,

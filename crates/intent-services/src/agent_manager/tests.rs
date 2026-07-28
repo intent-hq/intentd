@@ -1978,6 +1978,163 @@ async fn build_turn_prompt_skips_malformed_attachments() {
     assert_eq!(arr[2]["resource"]["uri"], json!("file:///keep.txt"));
 }
 
+/// Combined interrupt delivery (STAB-114 / monorepo#1014): `prepend_content`
+/// precedes the turn's own `content` inside the single text block, and the
+/// preempted message's attachments (`prepend_image_blocks` /
+/// `prepend_file_blocks`) come BEFORE this turn's own attachments.
+#[tokio::test]
+async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-prep"), AgentId::from("a-prep"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_file_blocks: Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ])),
+        image_blocks: Some(json!([{"data": "NEW_IMG", "mimeType": "image/jpeg"}])),
+        file_blocks: Some(json!([
+            {"data": "bmV3", "mimeType": "text/plain", "fileName": "new.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "urgent update", &options)
+        .await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        5,
+        "text + orig img + orig file + new img + new file"
+    );
+    // The single text block carries both messages, original first.
+    assert_eq!(arr[0]["type"], json!("text"));
+    let text = arr[0]["text"].as_str().unwrap();
+    let orig_pos = text.find("original ask").expect("preempted text present");
+    let new_pos = text.find("urgent update").expect("interrupt text present");
+    assert!(
+        orig_pos < new_pos,
+        "preempted text precedes interrupt: {text:?}"
+    );
+    // Preempted attachments precede this turn's own.
+    assert_eq!(arr[1]["type"], json!("image"));
+    assert_eq!(arr[1]["data"], json!("ORIG_IMG"));
+    assert_eq!(arr[2]["type"], json!("resource"));
+    assert_eq!(arr[2]["resource"]["uri"], json!("file:///orig.txt"));
+    assert_eq!(arr[3]["type"], json!("image"));
+    assert_eq!(arr[3]["data"], json!("NEW_IMG"));
+    assert_eq!(arr[4]["type"], json!("resource"));
+    assert_eq!(arr[4]["resource"]["uri"], json!("file:///new.txt"));
+}
+
+/// Recreated-session interaction (monorepo#1014): when the ACP session was
+/// recreated, `build_turn_body`'s history replay already renders the
+/// preempted user row, so `prepend_content` must NOT be injected a second
+/// time. The prepend ATTACHMENTS still ride (the history XML is text-only).
+#[tokio::test]
+async fn build_turn_prompt_skips_prepend_text_when_session_recreated() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-prep-rec"),
+        AgentId::from("a-prep-rec"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    // Both user rows are persisted, as `interrupt_send_message` leaves them:
+    // the preempted "original ask" and the interrupt turn's own "urgent update".
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "original ask" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "urgent update" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // Arm the recreate flag: the next prompt replays prior history.
+    mgr.recreated.lock().unwrap().insert(id.clone());
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "urgent update", &options)
+        .await;
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let arr = wire.as_array().unwrap();
+    let text = arr[0]["text"].as_str().unwrap();
+    // Exactly one copy of the preempted text: the history replay's. A second
+    // copy would mean the prepend was injected on top of the replay.
+    assert_eq!(
+        text.matches("original ask").count(),
+        1,
+        "preempted text delivered once (via history replay): {text:?}"
+    );
+    // The recreate flag was consumed by `build_turn_body` (not left armed).
+    assert!(!mgr.recreated.lock().unwrap().contains(&id));
+    // Prepend attachments still delivered: history XML carries no blocks.
+    assert_eq!(arr[1]["type"], json!("image"));
+    assert_eq!(arr[1]["data"], json!("ORIG_IMG"));
+}
+
+/// Terminal-failure requeue interaction (monorepo#1014): a zero-output
+/// interrupt turn that fails terminally is requeued via
+/// `persist_error_and_requeue`; the rebuilt entry must carry the `prepend_*`
+/// fields so the retry still delivers the preempted message combined.
+#[tokio::test]
+async fn terminal_failure_requeue_carries_prepend_fields() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-prep-rq"), AgentId::from("a-prep-rq"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_file_blocks: Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(&mgr, &id, &ws, "urgent update", &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, "urgent update");
+    assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+    );
+    assert_eq!(
+        queued.prepend_file_blocks,
+        Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ]))
+    );
+    // The wire shape (`agent.getQueue`) does not leak the prompt-only fields.
+    let wire = queued.to_value(0);
+    assert!(wire.get("prependContent").is_none());
+    assert!(wire.get("prependImageBlocks").is_none());
+    assert!(wire.get("prependFileBlocks").is_none());
+}
+
 // --- First-turn workspace-naming instruction ---------------------------------
 
 /// Seed an agent whose workspace already carries `title` (used by naming-instruction
@@ -2704,18 +2861,19 @@ async fn force_message_persists_preempted_partial_turn_before_forced_row() {
     );
 }
 
-/// STAB-114/126 guard: a zero-output interrupt (live-turn slot open but no
-/// assistant blocks streamed yet) must NOT persist an assistant row — the
-/// flush is a no-op for empty blocks — so the requeue's "non-user messages
-/// after last user message" check still sees only the user row and re-queues
-/// the preempted message.
+/// STAB-114/126 guard, combined-delivery semantics (monorepo#1014): a
+/// zero-output interrupt (live-turn slot open but no assistant blocks
+/// streamed yet) must NOT persist an assistant row — the flush is a no-op for
+/// empty blocks — and must deliver the preempted message TOGETHER with the
+/// interrupt message in ONE `session/prompt` (original first), leaving the
+/// queue empty instead of re-queueing the original behind the interrupt.
 #[tokio::test]
-async fn interrupt_send_message_zero_output_persists_nothing_and_requeues() {
+async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-int-zero"));
     seed_agent(&mgr, &ws, &id).await;
-    let _agent = track_mock_agent(&mgr, &id, false);
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-zero")
@@ -2747,6 +2905,11 @@ async fn interrupt_send_message_zero_output_persists_nothing_and_requeues() {
         .await
         .expect("interrupt send");
     assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "combined delivery streams immediately: {result}"
+    );
 
     // No assistant row was flushed: only the original user row plus the
     // interrupt message's own user row exist.
@@ -2760,13 +2923,47 @@ async fn interrupt_send_message_zero_output_persists_nothing_and_requeues() {
         messages.iter().all(|m| m.role == "user"),
         "zero-output interrupt persists no assistant row: {messages:?}"
     );
-    // The preempted message was re-queued (STAB-114 semantics preserved).
+    // The queue stays EMPTY: the preempted message is delivered in the
+    // combined prompt, never re-queued behind the interrupt.
     let queue = mgr.services.queue_snapshot(&id);
     assert!(
-        queue
-            .iter()
-            .any(|m| m["content"].as_str().unwrap_or_default().contains("first")),
-        "zero-output interrupt re-queues the preempted message: {queue:?}"
+        queue.is_empty(),
+        "combined delivery leaves the queue empty: {queue:?}"
+    );
+
+    // The interrupt turn's `session/prompt` carries BOTH messages in original
+    // order: the preempted "first" precedes the interrupt "urgent" within the
+    // same text block. Poll the mock call log within a bounded window (the
+    // worker sends the prompt asynchronously).
+    let mut prompt_text = None;
+    for _ in 0..50 {
+        {
+            let log = log.lock().unwrap();
+            if let Some((_, params)) = log.iter().find(|(m, _)| m == "session/prompt") {
+                let text = params["prompt"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|b| b["type"] == json!("text"))
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                prompt_text = Some(text);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let prompt_text = prompt_text.expect("session/prompt sent for the interrupt turn");
+    let first_pos = prompt_text
+        .find("first")
+        .expect("combined prompt carries the preempted message");
+    let urgent_pos = prompt_text
+        .find("urgent")
+        .expect("combined prompt carries the interrupt message");
+    assert!(
+        first_pos < urgent_pos,
+        "preempted message precedes the interrupt message: {prompt_text:?}"
     );
 }
 
@@ -6004,6 +6201,9 @@ mod stale_redrive_tests {
             persisted,
             requeued_after_failure: false,
             message_metadata: None,
+            prepend_content: None,
+            prepend_image_blocks: None,
+            prepend_file_blocks: None,
         }
     }
 
