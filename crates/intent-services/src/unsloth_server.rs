@@ -108,10 +108,32 @@ const HF_FILES_TIMEOUT: Duration = Duration::from_secs(8);
 const UNSLOTH_INSTALL_HINT: &str =
     "install the Unsloth CLI and ensure `unsloth` is on PATH (https://docs.unsloth.ai/)";
 
+/// Severity of a [`StatusCallback`] message, mapping onto the
+/// `agent:stream:status` event's `level` field (`"info"` / `"warning"`).
+/// Progress updates are `Info`; `Warning` is reserved for disruptive
+/// transitions the user should notice (e.g. a model switch restarting the
+/// server out from under live agents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLevel {
+    Info,
+    Warning,
+}
+
+impl StatusLevel {
+    /// The wire-level `level` string for `agent:stream:status` events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusLevel::Info => "info",
+            StatusLevel::Warning => "warning",
+        }
+    }
+}
+
 /// Status callback: receives short human-readable progress messages
-/// ("starting server", "downloading/loading model…") the caller surfaces to
-/// the user (e.g. as `agent:stream:status` events).
-pub type StatusCallback = dyn Fn(String) + Send + Sync;
+/// ("starting server", "downloading/loading model…") plus a severity the
+/// caller surfaces to the user (e.g. as `agent:stream:status` events with
+/// the matching `level`).
+pub type StatusCallback = dyn Fn(StatusLevel, String) + Send + Sync;
 
 /// The error for a missing `unsloth` binary (graceful degradation: the
 /// provider is unavailable with a clear install message). `InvalidInput`
@@ -696,6 +718,15 @@ impl UnslothServerManager {
     /// messages while a (potentially multi-GB first-use download) startup is
     /// in flight.
     ///
+    /// `attached_agents` is the number of live agent sessions currently
+    /// spawned against the managed server (the caller's
+    /// `count_agents_with_provider("unsloth")` snapshot). When a model
+    /// switch is about to kill a LIVE server serving a different repo and
+    /// `attached_agents > 0`, a [`StatusLevel::Warning`] status message is
+    /// emitted BEFORE the restart so clients can surface that those
+    /// sessions are losing their model. A dead child's teardown never
+    /// warns — there is no live server to disrupt.
+    ///
     /// Retry reuse (monorepo#878): when a live server already serves
     /// `repo_id` but hasn't finished starting yet (no minted endpoint —
     /// e.g. a caller's spawn retry landed here while the FIRST attempt's
@@ -712,6 +743,7 @@ impl UnslothServerManager {
     pub async fn ensure_endpoint(
         &self,
         repo_id: &str,
+        attached_agents: usize,
         status: &StatusCallback,
     ) -> Result<UnslothEndpoint> {
         if self.is_shutting_down() {
@@ -742,6 +774,20 @@ impl UnslothServerManager {
             );
         } else if let Some(mut old) = state.take() {
             // Model switch or dead/half-started child: tear down and respawn.
+            // A LIVE server being replaced for a different repo with agent
+            // sessions still attached is user-visible disruption — warn
+            // before the kill so clients can surface it (a dead child's
+            // teardown has nothing left to disrupt).
+            if old.repo_id != repo_id && old.is_alive() && attached_agents > 0 {
+                let plural = if attached_agents == 1 { "" } else { "s" };
+                status(
+                    StatusLevel::Warning,
+                    format!(
+                        "Switching Unsloth model from {old} to {repo_id} restarts the local server — {attached_agents} live agent session{plural} on {old} will lose the loaded model",
+                        old = old.repo_id,
+                    ),
+                );
+            }
             tracing::info!(
                 old_repo = %old.repo_id,
                 new_repo = %repo_id,
@@ -755,7 +801,10 @@ impl UnslothServerManager {
         let binary = (self.config.resolve_binary)().ok_or_else(missing_binary_error)?;
 
         if !attach {
-            status(format!("Starting Unsloth server for {repo_id}…"));
+            status(
+                StatusLevel::Info,
+                format!("Starting Unsloth server for {repo_id}…"),
+            );
             let quant = self.resolve_quant_variant(repo_id).await;
             // Re-check the latch: the HF fetch above can take up to
             // [`UnslothConfig::hf_files_timeout`], and shutdown may have
@@ -772,9 +821,12 @@ impl UnslothServerManager {
             *state = Some(server);
             self.set_phase(Some("starting"));
         } else {
-            status(format!(
-                "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
-            ));
+            status(
+                StatusLevel::Info,
+                format!(
+                    "Unsloth server for {repo_id} is already starting; waiting for it to become ready…"
+                ),
+            );
         }
 
         match self
@@ -988,7 +1040,10 @@ impl UnslothServerManager {
         // (monorepo#878) showed this invocation can itself perform/wait on
         // the first-use model download, so it gets the same generous,
         // progress-aware deadline as the phase-3 readiness probe below.
-        status(format!("Unsloth server up; preparing model {repo_id}…"));
+        status(
+            StatusLevel::Info,
+            format!("Unsloth server up; preparing model {repo_id}…"),
+        );
         self.set_phase(Some("minting"));
         let endpoint = self.mint_endpoint(binary, repo_id, server, status).await?;
         self.set_phase(Some("loading"));
@@ -1002,9 +1057,12 @@ impl UnslothServerManager {
                 let refresh = last_status.elapsed() >= STATUS_UPDATE_INTERVAL;
                 if refresh {
                     last_status = tokio::time::Instant::now();
-                    status(format!(
-                        "Downloading/loading model {repo_id}… (first use may take several minutes)"
-                    ));
+                    status(
+                        StatusLevel::Info,
+                        format!(
+                            "Downloading/loading model {repo_id}… (first use may take several minutes)"
+                        ),
+                    );
                 }
                 let client = &client;
                 let url = &probe_url;
@@ -1147,9 +1205,10 @@ impl UnslothServerManager {
             }
             if last_status.elapsed() >= STATUS_UPDATE_INTERVAL {
                 last_status = tokio::time::Instant::now();
-                status(format!(
-                    "Preparing model {repo_id}… (first use may take several minutes)"
-                ));
+                status(
+                    StatusLevel::Info,
+                    format!("Preparing model {repo_id}… (first use may take several minutes)"),
+                );
             }
             tokio::time::sleep(self.config.probe_interval).await;
         };
@@ -1901,7 +1960,7 @@ mod tests {
                 resolve_binary: Box::new(|| None),
                 ..UnslothConfig::default()
             });
-            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("unsloth CLI not found"), "got: {msg}");
             assert!(msg.contains("docs.unsloth.ai"), "got: {msg}");
@@ -1926,7 +1985,7 @@ mod tests {
             let messages = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             let ep = mgr
-                .ensure_endpoint(REPO, &move |m| m2.lock().unwrap().push(m))
+                .ensure_endpoint(REPO, 0, &move |_, m| m2.lock().unwrap().push(m))
                 .await
                 .expect("cold start resolves endpoint");
             assert_eq!(ep.api_key, "sk-unsloth-test-key");
@@ -1953,7 +2012,10 @@ mod tests {
 
             // Reuse: same repo — no second `run` invocation.
             let runs_before = stub_log(dir.path()).matches("run --model").count();
-            let ep2 = mgr.ensure_endpoint(REPO, &|_| {}).await.expect("reuse");
+            let ep2 = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("reuse");
             assert_eq!(ep2, ep);
             assert_eq!(
                 stub_log(dir.path()).matches("run --model").count(),
@@ -1963,7 +2025,10 @@ mod tests {
 
             // Model switch: kill + respawn with the new repo.
             let other = "unsloth/other-model-GGUF";
-            let ep3 = mgr.ensure_endpoint(other, &|_| {}).await.expect("switch");
+            let ep3 = mgr
+                .ensure_endpoint(other, 0, &|_, _| {})
+                .await
+                .expect("switch");
             assert_eq!(ep3.model_id, other);
             let log = stub_log(dir.path());
             assert!(
@@ -1971,6 +2036,152 @@ mod tests {
                 "respawned with the new model: {log}"
             );
             assert_eq!(log.matches("run --model").count(), runs_before + 1);
+
+            mgr.shutdown().await;
+        }
+
+        /// Restart-on-switch with live agents attached: a `Warning`-level
+        /// status message names both repos and the attached-session count
+        /// BEFORE the old server is killed, and the switch still proceeds.
+        #[tokio::test]
+        async fn model_switch_with_live_agents_warns_before_restart() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), port, None);
+            let mgr = UnslothServerManager::with_config(test_config(
+                binary,
+                dir.path().to_path_buf(),
+                port,
+            ));
+
+            // Cold start with live agents attached must NOT warn — there is
+            // no old server to disrupt.
+            let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
+            let m2 = messages.clone();
+            mgr.ensure_endpoint(REPO, 2, &move |lvl, m| m2.lock().unwrap().push((lvl, m)))
+                .await
+                .expect("cold start");
+            assert!(
+                messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(lvl, _)| *lvl == StatusLevel::Info),
+                "cold start must not emit warnings: {:?}",
+                messages.lock().unwrap()
+            );
+
+            // Switch with 2 live agents attached: exactly one warning, before
+            // the new server's progress messages.
+            let other = "unsloth/other-model-GGUF";
+            messages.lock().unwrap().clear();
+            let m3 = messages.clone();
+            let ep = mgr
+                .ensure_endpoint(other, 2, &move |lvl, m| m3.lock().unwrap().push((lvl, m)))
+                .await
+                .expect("switch");
+            assert_eq!(ep.model_id, other);
+            let msgs = messages.lock().unwrap().clone();
+            let warnings: Vec<&String> = msgs
+                .iter()
+                .filter(|(lvl, _)| *lvl == StatusLevel::Warning)
+                .map(|(_, m)| m)
+                .collect();
+            assert_eq!(warnings.len(), 1, "exactly one warning: {msgs:?}");
+            let warning = warnings[0];
+            assert!(warning.contains(REPO), "names the old repo: {warning}");
+            assert!(warning.contains(other), "names the new repo: {warning}");
+            assert!(
+                warning.contains("2 live agent sessions"),
+                "carries the attached-session count: {warning}"
+            );
+            assert_eq!(
+                msgs.first().map(|(lvl, _)| *lvl),
+                Some(StatusLevel::Warning),
+                "warning must precede the restart's progress messages: {msgs:?}"
+            );
+            // The restart still happened.
+            let log = stub_log(dir.path());
+            assert!(
+                log.contains(&format!("run --model {other}")),
+                "switch respawned the server: {log}"
+            );
+
+            mgr.shutdown().await;
+        }
+
+        /// Restart-on-switch with NO live agents attached stays silent — the
+        /// warning only fires when there are sessions to disrupt.
+        #[tokio::test]
+        async fn model_switch_without_live_agents_does_not_warn() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), port, None);
+            let mgr = UnslothServerManager::with_config(test_config(
+                binary,
+                dir.path().to_path_buf(),
+                port,
+            ));
+
+            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("cold start");
+
+            let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
+            let m2 = messages.clone();
+            let other = "unsloth/other-model-GGUF";
+            mgr.ensure_endpoint(other, 0, &move |lvl, m| m2.lock().unwrap().push((lvl, m)))
+                .await
+                .expect("switch");
+            assert!(
+                messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(lvl, _)| *lvl == StatusLevel::Info),
+                "switch without live agents must not warn: {:?}",
+                messages.lock().unwrap()
+            );
+
+            mgr.shutdown().await;
+        }
+
+        /// A dead child's teardown-and-respawn (same repo) never warns even
+        /// with live agents attached — those sessions already lost the
+        /// server; there is nothing left to disrupt.
+        #[tokio::test]
+        async fn dead_child_respawn_does_not_warn_even_with_live_agents() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let port = spawn_stub_http("sk-unsloth-test-key").await;
+            // `run` exits shortly after startup completes, standing in for a
+            // server that crashed while agents were attached.
+            let binary = write_stub_binary(dir.path(), dir.path(), port, Some("sleep 0.3"));
+            let mgr = UnslothServerManager::with_config(test_config(
+                binary,
+                dir.path().to_path_buf(),
+                port,
+            ));
+
+            mgr.ensure_endpoint(REPO, 1, &|_, _| {})
+                .await
+                .expect("cold start");
+            // Wait for the stubbed server child to exit.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
+            let m2 = messages.clone();
+            mgr.ensure_endpoint(REPO, 1, &move |lvl, m| m2.lock().unwrap().push((lvl, m)))
+                .await
+                .expect("dead-child respawn");
+            assert!(
+                messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(lvl, _)| *lvl == StatusLevel::Info),
+                "dead-child respawn must not warn: {:?}",
+                messages.lock().unwrap()
+            );
 
             mgr.shutdown().await;
         }
@@ -1985,7 +2196,9 @@ mod tests {
             config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
             let mgr = UnslothServerManager::with_config(config);
 
-            mgr.ensure_endpoint(REPO, &|_| {}).await.expect("starts");
+            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("starts");
             let log = stub_log(dir.path());
             // 32 GiB total RAM: Q6_K is the largest quant in the listing
             // that fits the catalog's RAM budget (Q8_0 does not).
@@ -2104,7 +2317,9 @@ mod tests {
                 dir.path().to_path_buf(),
                 port,
             ));
-            mgr.ensure_endpoint(REPO, &|_| {}).await.expect("starts");
+            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("starts");
             let pid = {
                 let mut state = mgr.state.lock().await;
                 let server = state.as_mut().expect("server tracked");
@@ -2136,7 +2351,7 @@ mod tests {
             );
             let mgr =
                 UnslothServerManager::with_config(test_config(binary, dir.path().to_path_buf(), 1));
-            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("exited during startup"), "got: {msg}");
             assert!(
@@ -2161,7 +2376,8 @@ mod tests {
             let mgr = Arc::new(UnslothServerManager::with_config(config));
 
             let m2 = mgr.clone();
-            let startup = tokio::spawn(async move { m2.ensure_endpoint(REPO, &|_| {}).await });
+            let startup =
+                tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
             // Give the startup time to spawn the child and enter the loop.
             tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2176,7 +2392,7 @@ mod tests {
             assert!(mgr.state.lock().await.is_none(), "no server left tracked");
 
             // Post-shutdown spawns are refused outright.
-            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             assert!(err.to_string().contains("shutting down"), "got: {err}");
         }
 
@@ -2195,7 +2411,8 @@ mod tests {
             let mgr = Arc::new(UnslothServerManager::with_config(config));
 
             let m2 = mgr.clone();
-            let startup = tokio::spawn(async move { m2.ensure_endpoint(REPO, &|_| {}).await });
+            let startup =
+                tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
             // Give the startup time to spawn the child and enter the probe
             // loop (holding `state` for the remainder of the long timeout).
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2230,7 +2447,8 @@ mod tests {
             let mgr = Arc::new(UnslothServerManager::with_config(config));
 
             let m2 = mgr.clone();
-            let startup = tokio::spawn(async move { m2.ensure_endpoint(REPO, &|_| {}).await });
+            let startup =
+                tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
             tokio::time::sleep(Duration::from_millis(200)).await;
 
             let start = tokio::time::Instant::now();
@@ -2255,7 +2473,7 @@ mod tests {
                 dir2.path().to_path_buf(),
                 port,
             ));
-            mgr2.ensure_endpoint(REPO, &|_| {})
+            mgr2.ensure_endpoint(REPO, 0, &|_, _| {})
                 .await
                 .expect("stop is not terminal: a fresh manager still starts normally");
             mgr2.shutdown().await;
@@ -2281,7 +2499,9 @@ mod tests {
                 dir.path().to_path_buf(),
                 port,
             ));
-            mgr.ensure_endpoint(REPO, &|_| {}).await.expect("starts");
+            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("starts");
             let pid = mgr
                 .status_snapshot()
                 .await
@@ -2314,7 +2534,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 port,
             ));
-            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("No running Unsloth server found"),
@@ -2354,11 +2574,13 @@ mod tests {
             let config = test_config(binary_path, dir.path().to_path_buf(), port);
             let mgr = UnslothServerManager::with_config(config);
 
-            let endpoint =
-                tokio::time::timeout(Duration::from_secs(5), mgr.ensure_endpoint(REPO, &|_| {}))
-                    .await
-                    .expect("mint must complete well within mint_timeout, not hang on a full pipe")
-                    .expect("mint succeeds despite large stdout output");
+            let endpoint = tokio::time::timeout(
+                Duration::from_secs(5),
+                mgr.ensure_endpoint(REPO, 0, &|_, _| {}),
+            )
+            .await
+            .expect("mint must complete well within mint_timeout, not hang on a full pipe")
+            .expect("mint succeeds despite large stdout output");
             assert_eq!(endpoint.base_url, format!("http://127.0.0.1:{port}/v1"));
 
             mgr.shutdown().await;
@@ -2382,7 +2604,7 @@ mod tests {
             config.server_up_timeout = Duration::from_millis(200);
             let mgr = UnslothServerManager::with_config(config);
 
-            let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             assert!(
                 err.to_string().contains("did not open its HTTP port"),
                 "got: {err}"
@@ -2420,7 +2642,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let pid_before = {
-                let err = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+                let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
                 assert!(err.to_string().contains("timed out"), "got: {err}");
                 let mut state = mgr.state.lock().await;
                 let server = state.as_mut().expect(
@@ -2467,7 +2689,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             // Attempt 1: mint times out; server preserved (bug 1's fix).
-            let err1 = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err1 = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             assert!(err1.to_string().contains("timed out"), "got: {err1}");
             let pid1 = mgr
                 .state
@@ -2481,7 +2703,7 @@ mod tests {
 
             // Attempt 2 ("the retry"): must attach to the same server, not
             // kill + respawn it.
-            let err2 = mgr.ensure_endpoint(REPO, &|_| {}).await.unwrap_err();
+            let err2 = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
             assert!(err2.to_string().contains("timed out"), "got: {err2}");
             let pid2 = mgr
                 .state
@@ -2532,7 +2754,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let old_repo = "unsloth/qwen-old-model-GGUF";
-            mgr.ensure_endpoint(old_repo, &|_| {})
+            mgr.ensure_endpoint(old_repo, 0, &|_, _| {})
                 .await
                 .expect("old model cold-starts fine");
 
@@ -2561,7 +2783,10 @@ mod tests {
                 .id()
                 .expect("pid");
 
-            let err1 = mgr.ensure_endpoint(new_repo, &|_| {}).await.unwrap_err();
+            let err1 = mgr
+                .ensure_endpoint(new_repo, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(err1.to_string().contains("timed out"), "got: {err1}");
             let (new_pid, new_repo_seen) = {
                 let mut state = mgr.state.lock().await;
@@ -2585,7 +2810,10 @@ mod tests {
 
             // Retry for the SAME (new) repo must attach to that same new
             // server, not kill + respawn a third one.
-            let err2 = mgr.ensure_endpoint(new_repo, &|_| {}).await.unwrap_err();
+            let err2 = mgr
+                .ensure_endpoint(new_repo, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(err2.to_string().contains("timed out"), "got: {err2}");
             let retry_pid = mgr
                 .state

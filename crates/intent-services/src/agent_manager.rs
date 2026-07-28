@@ -3970,21 +3970,42 @@ impl AgentManager {
             // Progress callback: surface download/loading status as
             // `agent:stream:status` turn-startup hints (D4 — first use can
             // mean a multi-GB download; the FE shows the phase message next
-            // to the pre-first-token spinner).
-            let services = self.services.clone();
-            let ws = workspace_id.clone();
-            let aid = agent_id.clone();
-            let status_cb = move |message: String| {
-                let services = services.clone();
-                let ws = ws.clone();
-                let aid = aid.clone();
+            // to the pre-first-token spinner). The callback's level maps
+            // straight onto the event's `level` field, so a model-switch
+            // disruption warning arrives as `level: "warning"`. Messages
+            // are funneled through a single ordered channel + drainer task
+            // (not one task per message): clients keep only the latest
+            // message per agent, so publishes must preserve emission order
+            // or a restart warning could be clobbered by a later-emitted
+            // but earlier-published progress update.
+            let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                crate::unsloth_server::StatusLevel,
+                String,
+            )>();
+            {
+                let services = self.services.clone();
+                let ws = workspace_id.clone();
+                let aid = agent_id.clone();
                 tokio::spawn(async move {
-                    services
-                        .publish_status_event(&ws, &aid, "launch", &message, "info")
-                        .await;
+                    while let Some((level, message)) = status_rx.recv().await {
+                        services
+                            .publish_status_event(&ws, &aid, "launch", &message, level.as_str())
+                            .await;
+                    }
                 });
+            }
+            let status_cb = move |level: crate::unsloth_server::StatusLevel, message: String| {
+                let _ = status_tx.send((level, message));
             };
-            let endpoint = self.unsloth.ensure_endpoint(&repo_id, &status_cb).await?;
+            // Live-session snapshot for the restart-on-switch warning:
+            // agents spawned with the unsloth provider are attached to the
+            // managed server and lose the loaded model if a different-model
+            // spawn restarts it.
+            let attached_agents = self.count_agents_with_provider("unsloth");
+            let endpoint = self
+                .unsloth
+                .ensure_endpoint(&repo_id, attached_agents, &status_cb)
+                .await?;
             resolved.unsloth_endpoint = Some(endpoint);
         }
         let mut opts = SpawnOptions::new(&resolved.provider);
