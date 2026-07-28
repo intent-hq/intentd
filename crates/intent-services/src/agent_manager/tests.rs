@@ -2718,7 +2718,7 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
 /// keep-alive: the message streams immediately (`queued: false`) instead of
 /// queueing behind the turn, the preemption emits the terminal
 /// `agent:stream:end`, and the child handle survives — the agent is never
-/// killed (contrast `force_message`, which tears the child down).
+/// killed (contrast the hard `stop`, which tears the child down).
 #[tokio::test]
 async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     let (_tmp, mgr, bus) = manager_with_bus().await;
@@ -2928,33 +2928,316 @@ async fn stop_flushes_partial_live_turn_as_interrupted_assistant_row() {
     assert_eq!(metadata["stopReason"], "interrupted");
 }
 
-/// `agent.forceMessage` preempts via `stop()`, so the preempted turn's
-/// streamed-so-far output now persists as an interrupted assistant row BEFORE
-/// the forced message's user row — a deliberate transcript-shape change from
-/// the detach-path flush (previously the partial output was dropped).
+/// `agent.sendQueuedMessageNow` on an IDLE agent: the entry is atomically
+/// dequeued, the REST of the queue is preserved, the user row persists under
+/// the ENTRY id (the RPC result's `messageId`), and the turn starts
+/// (`queued: false`).
 #[tokio::test]
-async fn force_message_persists_preempted_partial_turn_before_forced_row() {
+async fn send_queued_message_now_delivers_entry_and_preserves_rest_of_queue() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
-    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-force-flush"));
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-idle"));
     seed_agent(&mgr, &ws, &id).await;
-    track(&mgr, &id);
-    assert!(mgr.try_begin(&id, &ws).await);
-    let blocks = vec![json!({ "type": "text", "id": "msg-force-flush:0", "text": "partial…" })];
+    let _agent = track_mock_agent(&mgr, &id, false);
+    let first = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "first queued".into(), None, None)
+        .await
+        .expect("queue first");
+    let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let second = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "second queued".into(), None, None)
+        .await
+        .expect("queue second");
+    let second_id = second["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    // Send the SECOND entry now — the first must stay queued.
+    let result = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), second_id.clone())
+        .await
+        .expect("send queued now");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(false));
+    assert_eq!(result["messageId"], json!(second_id));
+
+    let queue = mgr.services.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1, "rest of queue preserved: {queue:?}");
+    assert_eq!(queue[0]["id"], json!(first_id));
+
+    // The user row persists under the entry id.
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let row = messages
+        .iter()
+        .find(|m| m.id == second_id)
+        .expect("user row persisted under the entry id");
+    assert_eq!(row.role, "user");
+    assert!(serde_json::to_string(&row.content)
+        .unwrap()
+        .contains("second queued"));
+}
+
+/// `agent.sendQueuedMessageNow` with an unknown `messageId` is `-32602` with
+/// NO side effects: the queue is untouched and no transcript row appears
+/// (deliberately NOT idempotent, unlike `agent.removeQueuedMessage`).
+#[tokio::test]
+async fn send_queued_message_now_not_found_has_no_side_effects() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-missing"));
+    seed_agent(&mgr, &ws, &id).await;
     mgr.services
-        .set_live_turn(&id, "msg-force-flush", blocks.clone());
+        .agent_queue_message_op(id.clone(), "still queued".into(), None, None)
+        .await
+        .expect("queue");
+
+    let err = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), "no-such-entry".into())
+        .await
+        .expect_err("absent entry must error");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("queued message not found")),
+        "got {err:?}"
+    );
+    assert_eq!(mgr.services.queue_snapshot(&id).len(), 1, "queue untouched");
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    assert!(messages.is_empty(), "no transcript row appended");
+    assert!(!mgr.is_busy(&id), "no slot claimed");
+}
+
+/// `agent.sendQueuedMessageNow` on a BUSY agent preempts the turn keep-alive
+/// (same semantics as `agent.sendMessage` with `priority: "interrupt"`): the
+/// entry streams immediately (`queued: false`) and the child handle survives
+/// — the agent is never killed.
+#[tokio::test]
+async fn send_queued_message_now_preempts_busy_turn_without_kill() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-busy"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
+    // path (no session → the preemption would be skipped).
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-sqmn-busy")
+        .await
+        .unwrap();
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "urgent queued".into(), None, None)
+        .await
+        .expect("queue");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    // Claim the in-flight slot so the send sees a busy (mid-turn) agent.
+    assert!(mgr.try_begin(&id, &ws).await);
 
     let result = mgr
-        .force_message(
-            id.clone(),
-            ws.clone(),
-            "forced-mid".to_string(),
-            "urgent override".to_string(),
-            super::TurnOptions::default(),
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect("send queued now");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(
+        result["queued"],
+        json!(false),
+        "preemption streams immediately, never queues: {result}"
+    );
+    assert_eq!(result["messageId"], json!(entry_id));
+    assert!(
+        mgr.handles.lock().unwrap().contains_key(&id),
+        "the child handle survives the preemption (never killed)"
+    );
+    assert!(mgr.services.queue_snapshot(&id).is_empty());
+}
+
+/// Transactional guarantee: when the slot cannot be claimed (turn startup —
+/// busy but no cancellable turn), the dequeued entry is restored at the
+/// FRONT of the queue and the RPC reports `queued: true`; the message is
+/// never lost.
+#[tokio::test]
+async fn send_queued_message_now_restores_entry_when_slot_unavailable() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-slot"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Busy WITHOUT a live handle/`acpSessionId`: the turn-startup window
+    // where preemption is skipped and `try_begin` fails.
+    assert!(mgr.try_begin(&id, &ws).await);
+    let other = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "ahead".into(), None, None)
+        .await
+        .expect("queue other");
+    let other_id = other["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "send me now".into(), None, None)
+        .await
+        .expect("queue target");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+
+    let result = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect("send queued now");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(true), "honest queued outcome");
+    assert_eq!(result["queuedMessage"]["id"], json!(entry_id));
+
+    let queue = mgr.services.queue_snapshot(&id);
+    assert_eq!(queue.len(), 2, "nothing lost: {queue:?}");
+    assert_eq!(
+        queue[0]["id"],
+        json!(entry_id),
+        "restored entry is at the FRONT (next to deliver)"
+    );
+    assert_eq!(queue[1]["id"], json!(other_id));
+}
+
+/// Transactional guarantee: a user-persist failure (duplicate row id)
+/// restores the entry at the FRONT of the queue and surfaces the error — the
+/// message is never lost and the slot is released.
+#[tokio::test]
+async fn send_queued_message_now_persist_failure_requeues_front() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-persist"));
+    seed_agent(&mgr, &ws, &id).await;
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "doomed append".into(), None, None)
+        .await
+        .expect("queue");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    // Pre-insert a transcript row under the SAME id so the append hits the
+    // `agent_message.id` PK and fails.
+    mgr.services
+        .store
+        .append_agent_message_with_id(
+            &id,
+            &entry_id,
+            "user",
+            &json!([{ "type": "text", "text": "occupies the id" }]),
+            None,
+            &now_iso(),
         )
         .await
-        .expect("force message");
+        .expect("seed conflicting row");
+
+    let err = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect_err("append failure must surface");
+    let _ = err;
+
+    let queue = mgr.services.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1, "entry restored, never lost: {queue:?}");
+    assert_eq!(queue[0]["id"], json!(entry_id));
+    assert!(!mgr.is_busy(&id), "the slot was released");
+}
+
+/// monorepo#840 quarantine gate: `send_queued_message_now` on a poisoned
+/// session (Error + session-fatal provider block) must NOT redrive — the
+/// entry stays in the queue and the result reports
+/// `queued: true, quarantined: true`. An unknown entry id on a poisoned
+/// session is still `-32602`.
+#[tokio::test]
+async fn send_queued_message_now_leaves_entry_queued_when_quarantined() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-poison"));
+    seed_agent(&mgr, &ws, &id).await;
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "parked".into(), None, None)
+        .await
+        .expect("queue");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let result = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect("quarantined send-now succeeds as a no-op park");
     assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(true), "entry NOT delivered");
+    assert_eq!(result["quarantined"], json!(true));
+    assert_eq!(result["queuedMessage"]["id"], json!(entry_id));
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "entry stays in the queue for agent.retry"
+    );
+    assert!(!mgr.is_busy(&id), "no slot claim for a poisoned session");
+
+    let err = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), "no-such-entry".into())
+        .await
+        .expect_err("absent entry is still -32602 while quarantined");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("queued message not found")),
+        "got {err:?}"
+    );
+}
+
+/// Stale-redrive parity with the drain paths (#576): a delegated agent's
+/// entry whose `queued_at` predates the delivered completion report is
+/// annotated with the stale-redrive note before delivery.
+#[tokio::test]
+async fn send_queued_message_now_annotates_stale_redrive() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-stale"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "queued before report".into(), None, None)
+        .await
+        .expect("queue");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    // The completion report lands AFTER the enqueue → the entry is stale.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.parent_agent_id = Some(AgentId::from("agent-parent"));
+    session.completion_report = Some("work done".to_string());
+    session.completion_report_timestamp = Some(now_iso());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set delegated report");
+
+    let result = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect("send queued now");
+    assert_eq!(result["queued"], json!(false));
 
     let messages = mgr
         .services
@@ -2962,30 +3245,18 @@ async fn force_message_persists_preempted_partial_turn_before_forced_row() {
         .get_agent_messages(&id, None)
         .await
         .expect("messages");
-    let flushed = messages
+    let row = messages
         .iter()
-        .find(|m| m.id == "msg-force-flush")
-        .expect("preempted partial persisted as interrupted assistant row");
-    assert_eq!(flushed.role, "assistant");
-    assert_eq!(flushed.content, Value::Array(blocks));
-    let metadata = flushed.metadata.as_ref().expect("metadata");
-    assert_eq!(metadata["interrupted"], true);
-    let forced_pos = messages
-        .iter()
-        .position(|m| {
-            m.role == "user"
-                && serde_json::to_string(&m.content)
-                    .unwrap()
-                    .contains("urgent")
-        })
-        .expect("forced user row persisted");
-    let flushed_pos = messages
-        .iter()
-        .position(|m| m.id == "msg-force-flush")
-        .unwrap();
+        .find(|m| m.id == entry_id)
+        .expect("user row persisted under the entry id");
+    let text = serde_json::to_string(&row.content).unwrap();
     assert!(
-        flushed_pos < forced_pos,
-        "interrupted partial precedes the forced message: {messages:?}"
+        text.contains("queued before report"),
+        "original content preserved: {text}"
+    );
+    assert!(
+        text.contains("was already delivered"),
+        "stale-redrive note appended: {text}"
     );
 }
 

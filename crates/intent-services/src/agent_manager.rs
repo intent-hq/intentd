@@ -91,17 +91,15 @@ fn is_cancel_transport_closed(e: &intent_acp::AcpError) -> bool {
     matches!(e, intent_acp::AcpError::Transport(_))
 }
 
-/// Per-turn prompt-assembly hints threaded through `agent.sendMessage` /
-/// `agent.forceMessage` (PROTOCOL §5.5). `stdin_context` is prepended
-/// verbatim to the outbound prompt as a `Context:` block (reference-parity
-/// `acp-provider.ts`); `note_ids` and `context_references` are carried
-/// forward for downstream note-image / context-reference resolution and are
-/// otherwise inert today.
+/// Per-turn prompt-assembly hints threaded through `agent.sendMessage`
+/// (PROTOCOL §5.5). `stdin_context` is prepended verbatim to the outbound
+/// prompt as a `Context:` block (reference-parity `acp-provider.ts`);
+/// `note_ids` and `context_references` are carried forward for downstream
+/// note-image / context-reference resolution and are otherwise inert today.
 ///
-/// Only the FIRST turn triggered by a `sendMessage` / `forceMessage` call
-/// carries these options; queue-drained follow-up turns run with
-/// [`TurnOptions::default`] since a `QueuedMessage` has no per-turn hints of
-/// its own.
+/// Only the FIRST turn triggered by a `sendMessage` call carries these
+/// options; queue-drained follow-up turns run with [`TurnOptions::default`]
+/// since a `QueuedMessage` has no per-turn hints of its own.
 #[derive(Debug, Default, Clone)]
 pub struct TurnOptions {
     pub stdin_context: Option<String>,
@@ -117,7 +115,7 @@ pub struct TurnOptions {
     /// blocks; the `fileName` becomes the resource `uri` as `file:///<name>`
     /// so downstream consumers can reference it.
     pub file_blocks: Option<serde_json::Value>,
-    /// Opaque per-message payload from `agent.sendMessage` / `agent.forceMessage`
+    /// Opaque per-message payload from `agent.sendMessage`'s
     /// `messageMetadata` (PROTOCOL §5.5). Persisted verbatim on the user
     /// message row (via [`Store::append_agent_message_with_metadata`]). When a
     /// send is enqueued behind a running turn the metadata rides along on the
@@ -947,8 +945,8 @@ pub struct AgentManager {
     /// derived `WorkspaceActivity` (§9.9) even on the `stop` path, which only
     /// knows the agent id.
     agent_ws: Arc<Mutex<HashMap<AgentId, WorkspaceId>>>,
-    /// Abortable background turn workers, keyed by agent. `stop`/`forceMessage`
-    /// abort the in-flight worker (interrupting the current stream).
+    /// Abortable background turn workers, keyed by agent. `stop` aborts the
+    /// in-flight worker (interrupting the current stream).
     workers: Arc<Mutex<HashMap<AgentId, JoinHandle<()>>>>,
     /// Agents whose ACP session was recreated (the resume-impossible fallback in
     /// [`AgentManager::start_session`] replaced a lost `acpSessionId` with a fresh
@@ -3176,44 +3174,165 @@ impl AgentManager {
         );
     }
 
-    /// `agent.forceMessage` runtime path (§5.5): stop the current stream (abort
-    /// the worker + kill the child — the preempted turn's streamed-so-far
-    /// output persists as an interrupted assistant row via the `detach` flush),
-    /// discard the pending queue, then deliver the forced message immediately
-    /// as a fresh turn.
-    pub async fn force_message(
+    /// `agent.sendQueuedMessageNow` runtime path (§5.5): atomically remove
+    /// the queued entry named by `message_id` from the agent's queue and
+    /// deliver it immediately with interrupt priority, PRESERVING the rest of
+    /// the queue. An absent entry is `-32602` ("queued message not found")
+    /// with NO side effects — deliberately NOT idempotent (unlike
+    /// `agent.removeQueuedMessage`), so the client knows the atomic send did
+    /// not happen. A busy agent is preempted keep-alive (the same
+    /// `session/cancel` + worker-abort as `agent.sendMessage` with
+    /// `priority: "interrupt"`; the child is never killed); an idle agent
+    /// starts the turn directly.
+    ///
+    /// Transactional guarantee: once the entry leaves the queue it is either
+    /// delivered or restored. When the slot cannot be claimed (turn startup /
+    /// a concurrent send won the race) or the user-row append fails, the
+    /// entry is restored at the FRONT of the queue (`persisted` untouched, so
+    /// a retry drain does not double-append) — the message is never lost.
+    ///
+    /// A quarantined (poisoned, monorepo#840) session is NOT redriven: the
+    /// entry stays in the queue untouched and the result reports
+    /// `queued: true, quarantined: true` — `agent.retry` is the deliberate
+    /// redrive. An ORDINARY `Error` session (no fatal reason / streak) IS
+    /// redriven — the explicit "send now" is a user action, same spirit as
+    /// the documented fresh-`agent.sendMessage` recovery path (the STAB-52
+    /// drain gate does not apply here by design).
+    pub async fn send_queued_message_now(
         self: &Arc<Self>,
         agent_id: AgentId,
         workspace_id: WorkspaceId,
         message_id: String,
-        content: String,
-        options: TurnOptions,
     ) -> Result<Value> {
-        self.stop(&agent_id).await;
-        if self.services.clear_queue(&agent_id) {
+        // monorepo#564: fail closed on a nonexistent target BEFORE touching
+        // the queue.
+        let session = self.services.require_agent_session(&agent_id).await?;
+        // Quarantine gate (monorepo#840): a provably-poisoned session must
+        // not be redriven by delivery — every replay deterministically
+        // fails. The entry STAYS in the queue (no side effects); the absent
+        // case is still `-32602` so the contract holds.
+        if self.services.session_poisoned(&session) {
+            let entry = self
+                .services
+                .queue_snapshot(&agent_id)
+                .into_iter()
+                .find(|m| m["id"].as_str() == Some(message_id.as_str()))
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!("queued message not found: {message_id}"))
+                })?;
+            tracing::warn!(
+                agent = %agent_id,
+                stop_reason = session.stop_reason.as_deref().unwrap_or(""),
+                "session is quarantined (poisoned); sendQueuedMessageNow leaves the entry queued"
+            );
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "quarantined": true,
+                "queuedMessage": entry,
+            }));
+        }
+        // Atomic dequeue under the queue lock: no concurrent drain can
+        // deliver the same entry twice.
+        let mut entry = self
+            .services
+            .take_queued_message(&agent_id, &message_id)
+            .ok_or_else(|| {
+                Error::InvalidParams(format!("queued message not found: {message_id}"))
+            })?;
+        // Stale-redrive parity with the drain paths (#576): a delegated
+        // agent's entry that predates the delivered completion report is
+        // annotated and keeps the report queryable.
+        let stale = self.annotate_stale_redrive(&agent_id, &mut entry).await;
+        // Publish the shrunk snapshot (write-through persist inside) so
+        // clients see the entry leave the queue before the turn starts.
+        self.services
+            .publish_queue_updated_for(
+                &agent_id,
+                &workspace_id,
+                self.services.queue_snapshot(&agent_id),
+            )
+            .await;
+        // Queue-drained turns carry no per-turn prompt hints of their own;
+        // the entry's captured attachments and metadata ride along, same as
+        // `try_drain_queue`.
+        let mut options = TurnOptions {
+            image_blocks: entry.image_blocks.clone(),
+            file_blocks: entry.file_blocks.clone(),
+            message_metadata: entry.message_metadata.clone(),
+            suppress_report_clear: stale,
+            queued_at: Some(entry.queued_at.clone()),
+            prepend_content: entry.prepend_content.clone(),
+            prepend_image_blocks: entry.prepend_image_blocks.clone(),
+            prepend_file_blocks: entry.prepend_file_blocks.clone(),
+            ..TurnOptions::default()
+        };
+        // Preempt a cancellable in-flight turn keep-alive (no-op when idle
+        // or during turn startup, where preemption would kill the child).
+        self.preempt_busy_turn(&agent_id, &mut options).await;
+        if !self.try_begin(&agent_id, &workspace_id).await {
+            // The slot is still held (turn startup, or a concurrent send won
+            // the race): restore the entry at the FRONT so it is the next
+            // message delivered, and report the queued outcome honestly.
+            let restored = entry.to_value(0);
+            self.services.requeue_front(&agent_id, entry);
+            self.services.publish_queue_updated(&agent_id).await;
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "queuedMessage": restored,
+            }));
+        }
+        // Skip the transcript append for a terminal-failure requeue whose
+        // user row already reached the transcript (STAB-112) — the entry id
+        // already names that row.
+        if !entry.persisted {
+            // STAB-133: persist the entry's attachments alongside the text
+            // block, under the entry id so the RPC result's `messageId` and
+            // the `agent:message` event both name the actual transcript row.
+            let blocks = user_message_blocks(
+                &entry.content,
+                entry.image_blocks.as_ref(),
+                entry.file_blocks.as_ref(),
+            );
+            let message = match self
+                .services
+                .store
+                .append_agent_message_with_id(
+                    &agent_id,
+                    &entry.id,
+                    "user",
+                    &blocks,
+                    entry.message_metadata.as_ref(),
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(message) => message,
+                Err(append_err) => {
+                    // Transactional guarantee: release the slot and restore
+                    // the entry at the FRONT (`persisted: false`, so a retry
+                    // re-attempts the append), then surface the failure.
+                    self.end_turn(&agent_id).await;
+                    self.services.requeue_front(&agent_id, entry);
+                    self.services.publish_queue_updated(&agent_id).await;
+                    return Err(append_err);
+                }
+            };
+            // Emit `agent:message` (role=user) with the persisted row id,
+            // mirroring the `send_message` direct-send branch (§5.5).
             self.services
-                .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
+                .publish_agent_mutation_event(
+                    &workspace_id,
+                    &agent_id,
+                    intent_core::events::AGENT_MESSAGE,
+                    crate::agent_ops::agent_message_event_payload(&agent_id, &message),
+                )
                 .await;
         }
-        // STAB-133: persist FE-supplied attachments alongside the text block.
-        let blocks = user_message_blocks(
-            &content,
-            options.image_blocks.as_ref(),
-            options.file_blocks.as_ref(),
-        );
-        self.services
-            .store
-            .append_agent_message_with_metadata(
-                &agent_id,
-                "user",
-                &blocks,
-                options.message_metadata.as_ref(),
-                &now_iso(),
-            )
-            .await?;
-        self.try_begin(&agent_id, &workspace_id).await;
-        self.spawn_worker(agent_id, workspace_id, content, options, true);
-        Ok(json!({ "success": true, "queued": false, "messageId": message_id }))
+        let entry_id = entry.id.clone();
+        self.spawn_worker(agent_id, workspace_id, entry.content, options, true);
+        Ok(json!({ "success": true, "queued": false, "messageId": entry_id }))
     }
 
     /// `agent.editAndRegenerate` runtime path (§5.5): edit a past user message
@@ -3222,8 +3341,8 @@ impl AgentManager {
     /// 1. Validate `message_id` refers to an existing **user** message
     ///    (read-only, BEFORE any state changes — a bad id surfaces `-32602`
     ///    without stopping the turn or touching the transcript).
-    /// 2. Stop any in-flight turn (same hard-cancel + queue-discard semantics
-    ///    as [`AgentManager::force_message`]).
+    /// 2. Stop any in-flight turn (hard-cancel: abort the worker + kill the
+    ///    child) and discard the pending queue.
     /// 3. Optionally switch the model (the `model` param, via `agent.setModel`
     ///    semantics) before the regenerated turn spawns.
     /// 4. Truncate the transcript to just before the edited message (emits
@@ -3299,7 +3418,7 @@ impl AgentManager {
     /// in-flight turn instead of queueing behind it, then deliver `content`
     /// immediately as a fresh turn on the SAME live session. The preemption is
     /// the keep-alive [`AgentManager::interrupt`] (`session/cancel` + worker
-    /// abort) — unlike [`AgentManager::force_message`], the child process is
+    /// abort) — unlike a hard `stop`, the child process is
     /// never killed and the pending queue is preserved, so the interrupted
     /// agent keeps processing (the queue drains after the interrupt turn). An
     /// idle agent falls through to the normal [`AgentManager::send_message`]
@@ -3355,145 +3474,159 @@ impl AgentManager {
             }
             ids.insert(agent_id.clone(), mid.to_string());
         }
-        if self.is_busy(&agent_id) {
-            // Preempt only when a cancellable turn is live (handle +
-            // `acpSessionId`); during turn startup the keep-alive interrupt
-            // would fall back to the `stop` kill path, so skip it and let
-            // `send_message` queue behind the starting turn instead.
-            let cancellable = self.contains(&agent_id)
-                && self
-                    .services
-                    .store
-                    .get_agent_session(&agent_id)
-                    .await
-                    .ok()
-                    .and_then(|s| s.acp_session_id)
-                    .is_some();
-            if cancellable {
-                // STAB-114: Check if the current turn has produced zero output
-                // (no assistant content chunks) BEFORE we cancel. Use the live-turn
-                // slot (not persisted transcript) to detect zero output: assistant
-                // rows are only persisted at turn END, so an interrupted mid-stream
-                // turn would incorrectly look like zero output if we checked the
-                // transcript. The LiveTurn.blocks are assistant blocks by construction
-                // (see Transcript::snapshot_blocks), so non-empty means output exists.
-                let has_output = self
-                    .services
-                    .live_turn(&agent_id)
-                    .map(|live| !live.blocks.is_empty())
-                    .unwrap_or(false);
-
-                // Cancel the turn IMMEDIATELY to prevent it from finishing while
-                // we prepare the re-queue logic below. This releases the in-flight
-                // slot and aborts the draining worker. The STAB-28 synthetic
-                // `agent:idle` is suppressed: this interrupt carries a
-                // follow-up message (the child is being preempted, not
-                // settling), so completion watches must not report "child
-                // settled" to the parent here.
-                self.interrupt_inner(&agent_id, true).await;
-
-                if !has_output {
-                    // Zero-output condition: the provider dropped the preempted
-                    // message on `session/cancel`, so deliver it TOGETHER with
-                    // the interrupt message in ONE combined prompt (original
-                    // first) instead of re-queueing it behind the interrupt
-                    // (which inverted the user's intended order, monorepo#1014).
-                    // Fetch last 10 transcript messages (bounded work) to find
-                    // the user message + its attachments. If any non-user
-                    // messages (assistant/tool/system) exist after the last
-                    // user message, the turn has already progressed and we
-                    // should NOT re-deliver (avoids duplicate tool calls or
-                    // re-running side effects).
-                    if let Ok(messages) = self
-                        .services
-                        .store
-                        .get_agent_messages(&agent_id, Some(10))
-                        .await
-                    {
-                        if let Some(last_user_msg) =
-                            messages.iter().rev().find(|m| m.role == "user")
-                        {
-                            let last_user_idx = messages
-                                .iter()
-                                .rposition(|m| m.id == last_user_msg.id)
-                                .unwrap();
-                            let has_non_user_after = messages
-                                .iter()
-                                .skip(last_user_idx + 1)
-                                .any(|m| m.role != "user");
-
-                            if !has_non_user_after {
-                                // Extract text from content blocks (JSON array).
-                                let text_content = if let Some(blocks) =
-                                    last_user_msg.content.as_array()
-                                {
-                                    blocks
-                                        .iter()
-                                        .filter(|b| {
-                                            b.get("type").and_then(Value::as_str) == Some("text")
-                                        })
-                                        .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                        .collect::<Vec<&str>>()
-                                        .join("\n")
-                                } else {
-                                    String::new()
-                                };
-
-                                // Extract image_blocks and file_blocks from content.
-                                let image_blocks =
-                                    last_user_msg.content.as_array().and_then(|blocks| {
-                                        let imgs: Vec<Value> = blocks
-                                            .iter()
-                                            .filter(|b| {
-                                                b.get("type").and_then(Value::as_str)
-                                                    == Some("image")
-                                            })
-                                            .cloned()
-                                            .collect();
-                                        if imgs.is_empty() {
-                                            None
-                                        } else {
-                                            Some(Value::Array(imgs))
-                                        }
-                                    });
-
-                                let file_blocks =
-                                    last_user_msg.content.as_array().and_then(|blocks| {
-                                        let files: Vec<Value> = blocks
-                                            .iter()
-                                            .filter(|b| {
-                                                b.get("type").and_then(Value::as_str)
-                                                    == Some("file")
-                                            })
-                                            .cloned()
-                                            .collect();
-                                        if files.is_empty() {
-                                            None
-                                        } else {
-                                            Some(Value::Array(files))
-                                        }
-                                    });
-
-                                // Prompt-only prepend: both user rows are
-                                // already persisted, so nothing is appended to
-                                // the transcript and the queue is untouched.
-                                if !text_content.is_empty() {
-                                    options.prepend_content = Some(text_content);
-                                }
-                                options.prepend_image_blocks = image_blocks;
-                                options.prepend_file_blocks = file_blocks;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.preempt_busy_turn(&agent_id, &mut options).await;
         // The slot was just released (or was never held): the send path claims
         // it and streams the interrupt message right away rather than queueing.
         // If a concurrent send wins the race the message queues instead — it is
         // still delivered by that worker's drain loop, never dropped.
         self.send_message(agent_id, workspace_id, content, message_id, options)
             .await
+    }
+
+    /// Shared keep-alive preemption for the interrupt-priority delivery paths
+    /// ([`AgentManager::interrupt_send_message`] and
+    /// [`AgentManager::send_queued_message_now`]): cancel the in-flight turn
+    /// without killing the child, threading a zero-output turn's preempted
+    /// user message into `options.prepend_*` for combined delivery
+    /// (monorepo#1014). A no-op when the agent is idle, or during turn
+    /// startup (no live handle / `acpSessionId` yet) where the keep-alive
+    /// interrupt would fall back to the `stop` kill path — the caller's send
+    /// then queues behind the starting turn instead.
+    async fn preempt_busy_turn(self: &Arc<Self>, agent_id: &AgentId, options: &mut TurnOptions) {
+        if !self.is_busy(agent_id) {
+            return;
+        }
+        // Preempt only when a cancellable turn is live (handle +
+        // `acpSessionId`); during turn startup the keep-alive interrupt
+        // would fall back to the `stop` kill path, so skip it and let
+        // the caller queue behind the starting turn instead.
+        let cancellable = self.contains(agent_id)
+            && self
+                .services
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .and_then(|s| s.acp_session_id)
+                .is_some();
+        if !cancellable {
+            return;
+        }
+        // STAB-114: Check if the current turn has produced zero output
+        // (no assistant content chunks) BEFORE we cancel. Use the live-turn
+        // slot (not persisted transcript) to detect zero output: assistant
+        // rows are only persisted at turn END, so an interrupted mid-stream
+        // turn would incorrectly look like zero output if we checked the
+        // transcript. The LiveTurn.blocks are assistant blocks by construction
+        // (see Transcript::snapshot_blocks), so non-empty means output exists.
+        let has_output = self
+            .services
+            .live_turn(agent_id)
+            .map(|live| !live.blocks.is_empty())
+            .unwrap_or(false);
+
+        // Cancel the turn IMMEDIATELY to prevent it from finishing while
+        // we prepare the re-queue logic below. This releases the in-flight
+        // slot and aborts the draining worker. The STAB-28 synthetic
+        // `agent:idle` is suppressed: this interrupt carries a
+        // follow-up message (the child is being preempted, not
+        // settling), so completion watches must not report "child
+        // settled" to the parent here.
+        self.interrupt_inner(agent_id, true).await;
+
+        if !has_output {
+            // Zero-output condition: the provider dropped the preempted
+            // message on `session/cancel`, so deliver it TOGETHER with
+            // the interrupt message in ONE combined prompt (original
+            // first) instead of re-queueing it behind the interrupt
+            // (which inverted the user's intended order, monorepo#1014).
+            // Fetch last 10 transcript messages (bounded work) to find
+            // the user message + its attachments. If any non-user
+            // messages (assistant/tool/system) exist after the last
+            // user message, the turn has already progressed and we
+            // should NOT re-deliver (avoids duplicate tool calls or
+            // re-running side effects).
+            if let Ok(messages) = self
+                .services
+                .store
+                .get_agent_messages(agent_id, Some(10))
+                .await
+            {
+                if let Some(last_user_msg) = messages.iter().rev().find(|m| m.role == "user") {
+                    let last_user_idx = messages
+                        .iter()
+                        .rposition(|m| m.id == last_user_msg.id)
+                        .unwrap();
+                    let has_non_user_after = messages
+                        .iter()
+                        .skip(last_user_idx + 1)
+                        .any(|m| m.role != "user");
+
+                    if !has_non_user_after {
+                        // Extract text from content blocks (JSON array).
+                        let text_content = if let Some(blocks) = last_user_msg.content.as_array() {
+                            blocks
+                                .iter()
+                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                .collect::<Vec<&str>>()
+                                .join("\n")
+                        } else {
+                            String::new()
+                        };
+
+                        // Extract image_blocks and file_blocks from content.
+                        let image_blocks = last_user_msg.content.as_array().and_then(|blocks| {
+                            let imgs: Vec<Value> = blocks
+                                .iter()
+                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+                                .cloned()
+                                .collect();
+                            if imgs.is_empty() {
+                                None
+                            } else {
+                                Some(Value::Array(imgs))
+                            }
+                        });
+
+                        let file_blocks = last_user_msg.content.as_array().and_then(|blocks| {
+                            let files: Vec<Value> = blocks
+                                .iter()
+                                .filter(|b| b.get("type").and_then(Value::as_str) == Some("file"))
+                                .cloned()
+                                .collect();
+                            if files.is_empty() {
+                                None
+                            } else {
+                                Some(Value::Array(files))
+                            }
+                        });
+
+                        // Prompt-only prepend: both user rows are
+                        // already persisted, so nothing is appended to
+                        // the transcript and the queue is untouched.
+                        // MERGE with any entry-carried prepend payload
+                        // (a monorepo#1014-requeued entry delivered via
+                        // `send_queued_message_now` already carries its
+                        // own `prepend_*`): the entry's older prepend
+                        // stays first, the just-preempted message follows
+                        // — transcript order, nothing clobbered.
+                        if !text_content.is_empty() {
+                            options.prepend_content = Some(match options.prepend_content.take() {
+                                Some(existing) if !existing.is_empty() => {
+                                    format!("{existing}\n\n{text_content}")
+                                }
+                                _ => text_content,
+                            });
+                        }
+                        options.prepend_image_blocks =
+                            merge_block_arrays(options.prepend_image_blocks.take(), image_blocks);
+                        options.prepend_file_blocks =
+                            merge_block_arrays(options.prepend_file_blocks.take(), file_blocks);
+                    }
+                }
+            }
+        }
     }
 
     /// Spawn (and track) the background turn worker for an agent. The caller must
@@ -4699,6 +4832,23 @@ fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOption
     push_file_blocks(blocks, options.prepend_file_blocks.as_ref());
     push_image_blocks(blocks, options.image_blocks.as_ref());
     push_file_blocks(blocks, options.file_blocks.as_ref());
+}
+
+/// Merge two optional JSON block arrays, `first`'s entries preceding
+/// `second`'s (the older payload stays first — transcript order). Used by the
+/// zero-output preemption path to combine an entry-carried `prepend_*`
+/// payload with the just-preempted message's attachments instead of
+/// clobbering one with the other.
+fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
+    match (first, second) {
+        (Some(Value::Array(mut a)), Some(Value::Array(b))) => {
+            a.extend(b);
+            Some(Value::Array(a))
+        }
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (Some(a), Some(_)) => Some(a),
+        (None, None) => None,
+    }
 }
 
 /// Push one `image` content block per well-formed `{ data, mimeType }` entry.

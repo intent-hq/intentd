@@ -4741,27 +4741,36 @@ async fn send_message_op_persists_attachment_blocks_in_transcript() {
     assert_eq!(blocks[2]["mimeType"], "text/plain");
 }
 
-/// STAB-133: `agent_force_message_op` must persist FE-supplied image and file
-/// blocks into the transcript row (after the text block).
+/// STAB-133 parity: `agent_send_queued_message_now_op` must persist the
+/// queued entry's image blocks into the transcript row (after the text
+/// block), preserving the rest of the queue.
 #[tokio::test]
-async fn force_message_op_persists_attachment_blocks_in_transcript() {
+async fn send_queued_message_now_op_persists_attachment_blocks_in_transcript() {
     let (_t, svc, ws) = setup().await;
-    let id = create_agent(&svc, &ws, "AttachForce").await;
+    let id = create_agent(&svc, &ws, "AttachSendNow").await;
     let image_blocks = json!([
         { "type": "image", "data": "imgdata2", "mimeType": "image/jpeg" }
     ]);
-    let r = svc
-        .agent_force_message_op(
+    let queued = svc
+        .agent_queue_message_op(
             id.clone(),
-            "m-force-1".into(),
-            "forced with image".into(),
+            "queued with image".into(),
             Some(image_blocks),
-            None,
             None,
         )
         .await
-        .expect("force");
+        .expect("queue");
+    let message_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let r = svc
+        .agent_send_queued_message_now_op(id.clone(), message_id.clone())
+        .await
+        .expect("send now");
     assert_eq!(r["queued"], false);
+    assert_eq!(r["messageId"], json!(message_id));
+    assert!(
+        svc.queue_snapshot(&id).is_empty(),
+        "the dequeued entry left the queue"
+    );
     let conv = svc
         .agent_get_conversation_op(id, None, None, None)
         .await
@@ -4770,10 +4779,57 @@ async fn force_message_op_persists_attachment_blocks_in_transcript() {
     let blocks = content.as_array().expect("content blocks array");
     assert_eq!(blocks.len(), 2, "text + image blocks: {content}");
     assert_eq!(blocks[0]["type"], "text");
-    assert_eq!(blocks[0]["text"], "forced with image");
+    assert_eq!(blocks[0]["text"], "queued with image");
     assert_eq!(blocks[1]["type"], "image");
     assert_eq!(blocks[1]["data"], "imgdata2");
     assert_eq!(blocks[1]["mimeType"], "image/jpeg");
+}
+
+/// `agent.sendQueuedMessageNow` is deliberately NOT idempotent (unlike
+/// `agent.removeQueuedMessage`): an absent entry surfaces `-32602` with NO
+/// side effects — the rest of the queue is untouched and no transcript row
+/// is appended.
+#[tokio::test]
+async fn send_queued_message_now_op_not_found_has_no_side_effects() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "SendNowMissing").await;
+    svc.agent_queue_message_op(id.clone(), "still here".into(), None, None)
+        .await
+        .expect("queue");
+    let err = svc
+        .agent_send_queued_message_now_op(id.clone(), "no-such-id".into())
+        .await
+        .expect_err("absent entry must error");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(ref m) if m.contains("queued message not found")),
+        "got {err:?}"
+    );
+    let queue = svc.queue_snapshot(&id);
+    assert_eq!(queue.len(), 1, "queue untouched: {queue:?}");
+    let conv = svc
+        .agent_get_conversation_op(id, None, None, None)
+        .await
+        .expect("conv");
+    assert_eq!(
+        conv["messages"].as_array().unwrap().len(),
+        0,
+        "no transcript row appended"
+    );
+}
+
+/// Fail-closed target validation (monorepo#564): an unknown agent id is
+/// `-32602` before the queue is consulted.
+#[tokio::test]
+async fn send_queued_message_now_op_unknown_agent_fails_closed() {
+    let (_t, svc, _ws) = setup().await;
+    let err = svc
+        .agent_send_queued_message_now_op(AgentId::from("agent-ghost"), "m-1".into())
+        .await
+        .expect_err("unknown agent must error");
+    assert!(
+        matches!(err, intent_core::Error::InvalidParams(ref m) if m.contains("unknown agent id")),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -10524,30 +10580,30 @@ async fn agent_send_message_emits_agent_message_event() {
     assert_eq!(session.messages[0].id, event_message_id);
 }
 
-/// `agent_force_message_op` (store-only fallback when no AgentManager is attached)
-/// emits `agent:message` with the persisted row's id.
+/// `agent_send_queued_message_now_op` (store-only fallback when no
+/// AgentManager is attached) emits `agent:message` with the persisted row's
+/// id (the queue entry's own id).
 #[tokio::test]
-async fn agent_force_message_emits_agent_message_event() {
+async fn agent_send_queued_message_now_emits_agent_message_event() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
-    let id = create_agent(&svc, &ws, "Forcer").await;
+    let id = create_agent(&svc, &ws, "SendNow").await;
+    let queued = svc
+        .agent_queue_message_op(id.clone(), "queued content".into(), None, None)
+        .await
+        .expect("queue");
+    let queued_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
     let mut sub = bus.subscribe(SubscriptionFilter {
         event_types: vec![AGENT_MESSAGE.to_string()],
         ..Default::default()
     });
 
     let r = svc
-        .agent_force_message_op(
-            id.clone(),
-            "msg-123".into(),
-            "forced content".into(),
-            None,
-            None,
-            None,
-        )
+        .agent_send_queued_message_now_op(id.clone(), queued_id.clone())
         .await
-        .expect("force");
+        .expect("send now");
     assert_eq!(r["success"], json!(true));
     let response_message_id = r["messageId"].as_str().unwrap();
+    assert_eq!(response_message_id, queued_id, "entry id is the row id");
 
     // Verify the event was published with the correct messageId.
     let batch = timeout(Duration::from_secs(2), sub.recv())
@@ -11098,7 +11154,7 @@ async fn clear_queue_write_through_empties_persisted_snapshot() {
         .expect("queue");
     assert_eq!(persisted_queue(&svc, &id).await.len(), 1);
 
-    // `force_message` clears then publishes through the same choke point.
+    // `edit_and_regenerate` clears then publishes through the same choke point.
     assert!(svc.clear_queue(&id));
     svc.publish_queue_updated(&id).await;
     assert!(persisted_queue(&svc, &id).await.is_empty());

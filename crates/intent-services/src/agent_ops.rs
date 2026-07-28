@@ -2724,42 +2724,63 @@ impl Services {
         }
     }
 
-    /// `agent.forceMessage`: stop the current stream (best-effort) then deliver
-    /// immediately with the caller-supplied `messageId` (PROTOCOL §5.5).
-    /// `message_metadata` is persisted on the row (parity with the runtime
-    /// `AgentManager::force_message` path) so a folded `userAppMessageId`
-    /// round-trips on transcript reads from the store-only fallback too.
-    pub(crate) async fn agent_force_message_op(
+    /// `agent.sendQueuedMessageNow` (store-only fallback when no AgentManager
+    /// is attached): atomically remove the queued entry named by `message_id`
+    /// and persist it to the transcript immediately, preserving the rest of
+    /// the queue (PROTOCOL §5.5). Deliberately NOT idempotent (unlike
+    /// `agent.removeQueuedMessage`): an absent entry returns `-32602`
+    /// ("queued message not found") with NO side effects, so the client knows
+    /// the atomic send did not happen. On a persist failure the entry is
+    /// restored at the FRONT of the queue before the error surfaces — the
+    /// transactional guarantee that the message is never lost.
+    pub(crate) async fn agent_send_queued_message_now_op(
         &self,
         agent_id: AgentId,
         message_id: String,
-        content: String,
-        image_blocks: Option<Value>,
-        file_blocks: Option<Value>,
-        message_metadata: Option<Value>,
     ) -> Result<Value> {
-        // Validate message_id length to prevent unbounded storage.
-        if message_id.len() > MAX_MESSAGE_ID_LEN {
-            return Err(Error::InvalidParams(format!(
-                "messageId exceeds maximum length of {} bytes",
-                MAX_MESSAGE_ID_LEN
-            )));
+        // Fail closed on a nonexistent target BEFORE touching the queue
+        // (monorepo#564).
+        let session = self.require_agent_session(&agent_id).await?;
+        let entry = self
+            .take_queued_message(&agent_id, &message_id)
+            .ok_or_else(|| {
+                Error::InvalidParams(format!("queued message not found: {message_id}"))
+            })?;
+        // Publish the shrunk snapshot (write-through persist inside).
+        self.publish_queue_updated(&agent_id).await;
+        // A terminal-failure requeue whose user row already reached the
+        // transcript must not double-append (STAB-112).
+        if entry.persisted {
+            return Ok(json!({ "success": true, "queued": false, "messageId": entry.id }));
         }
-        let session = self.store.get_agent_session(&agent_id).await?;
-        // STAB-133: persist FE-supplied attachments alongside the text block.
-        let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
+        // STAB-133: persist the entry's attachments alongside the text block.
+        let blocks = user_message_blocks(
+            &entry.content,
+            entry.image_blocks.as_ref(),
+            entry.file_blocks.as_ref(),
+        );
         let created_at = now_iso();
-        let message = self
+        let message = match self
             .store
             .append_agent_message_with_id(
                 &agent_id,
-                &message_id,
+                &entry.id,
                 "user",
                 &blocks,
-                message_metadata.as_ref(),
+                entry.message_metadata.as_ref(),
                 &created_at,
             )
-            .await?;
+            .await
+        {
+            Ok(message) => message,
+            Err(e) => {
+                // Transactional guarantee: restore the entry at the front so
+                // the message is never lost, then surface the failure.
+                self.requeue_front(&agent_id, entry);
+                self.publish_queue_updated(&agent_id).await;
+                return Err(e);
+            }
+        };
         // Refresh agent_session.updated_at so the FE agent-card timestamp
         // reflects message activity, not just status transitions (STAB-19).
         if let Err(e) = self
@@ -5455,8 +5476,28 @@ impl Services {
         Some(queue.remove(idx))
     }
 
+    /// Atomically remove and return the queued entry with id `message_id`
+    /// (any position, including entries under edit), or `None` when the agent
+    /// has no such entry. Backs `agent.sendQueuedMessageNow` (PROTOCOL §5.5):
+    /// the removal happens under the queue lock so no concurrent drain can
+    /// deliver the same entry twice.
+    pub(crate) fn take_queued_message(
+        &self,
+        agent_id: &AgentId,
+        message_id: &str,
+    ) -> Option<QueuedMessage> {
+        let mut guard = self
+            .agent_queues
+            .lock()
+            .expect("agent queue registry poisoned");
+        let queue = guard.get_mut(agent_id)?;
+        let idx = queue.iter().position(|m| m.id == message_id)?;
+        Some(queue.remove(idx))
+    }
+
     /// Re-insert a message at the front of an agent's queue (used when a
-    /// concurrent turn won the in-flight slot during a drain race).
+    /// concurrent turn won the in-flight slot during a drain race, and by
+    /// `agent.sendQueuedMessageNow`'s persist-failure restore).
     pub(crate) fn requeue_front(&self, agent_id: &AgentId, message: QueuedMessage) {
         self.agent_queues
             .lock()
@@ -5479,10 +5520,10 @@ impl Services {
             .unwrap_or(false)
     }
 
-    /// Drop all queued messages for an agent (used by `agent.forceMessage`,
-    /// which supersedes the queue with the forced message). Returns `true` iff
-    /// the queue previously held at least one message — the caller uses this to
-    /// decide whether to publish `agent:queue:updated`.
+    /// Drop all queued messages for an agent (used by `agent.editAndRegenerate`,
+    /// which supersedes the queue with the regenerated message). Returns `true`
+    /// iff the queue previously held at least one message — the caller uses this
+    /// to decide whether to publish `agent:queue:updated`.
     pub(crate) fn clear_queue(&self, agent_id: &AgentId) -> bool {
         let mut guard = self
             .agent_queues
@@ -5615,8 +5656,8 @@ impl Services {
     }
 
     /// Like [`publish_queue_updated`] but takes the workspace id directly —
-    /// used by call sites (the turn worker, `force_message`) that already hold
-    /// it, avoiding a redundant `get_agent_session` round-trip per drain step.
+    /// used by call sites (the turn worker, `edit_and_regenerate`) that already
+    /// hold it, avoiding a redundant `get_agent_session` round-trip per drain step.
     ///
     /// Every queue mutation flows through here (or through
     /// [`publish_queue_updated`], which delegates here), so this is also the

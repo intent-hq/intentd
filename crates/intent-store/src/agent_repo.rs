@@ -1494,8 +1494,8 @@ impl Store {
             .await
     }
 
-    /// Append a message with a caller-supplied `metadata` payload (`agent.sendMessage`
-    /// / `agent.forceMessage`'s `messageMetadata`, PROTOCOL §5.5). The metadata is
+    /// Append a message with a caller-supplied `metadata` payload
+    /// (`agent.sendMessage`'s `messageMetadata`, PROTOCOL §5.5). The metadata is
     /// stored verbatim as JSON on the row and round-trips on transcript reads;
     /// callers with no per-message metadata continue to use
     /// [`Store::append_agent_message`] which stores `NULL`.
@@ -1533,7 +1533,7 @@ impl Store {
     /// (the streaming path) is additionally protected by the AgentManager's
     /// per-agent single-flight slot, serializing turns for one agent and
     /// eliminating the seq-race window on that hot path. User-message appends
-    /// (sendMessage, forceMessage, wake delivery) can still race if fired
+    /// (sendMessage, sendQueuedMessageNow, wake delivery) can still race if fired
     /// concurrently for one agent, but the UNIQUE constraint will reject
     /// duplicates rather than silently corrupting the seq order.
     pub async fn append_agent_message_with_id(

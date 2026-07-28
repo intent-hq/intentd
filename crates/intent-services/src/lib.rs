@@ -14900,51 +14900,25 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn agent_force_message(
+    fn agent_send_queued_message_now(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         message_id: String,
-        content: String,
-        image_blocks: Option<serde_json::Value>,
-        file_blocks: Option<serde_json::Value>,
-        note_ids: Option<serde_json::Value>,
-        stdin_context: Option<String>,
-        context_references: Option<serde_json::Value>,
-        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            let options = crate::agent_manager::TurnOptions {
-                stdin_context,
-                note_ids,
-                context_references,
-                image_blocks,
-                file_blocks,
-                message_metadata: message_metadata.clone(),
-                ..crate::agent_manager::TurnOptions::default()
-            };
             match self.agent_manager() {
                 Some(manager) => {
                     manager
-                        .force_message(agent_id, workspace_id, message_id, content, options)
+                        .send_queued_message_now(agent_id, workspace_id, message_id)
                         .await
                 }
                 None => {
-                    // Read-only fallback (no `agent_manager` wired): plumb
-                    // `messageMetadata` through the store-only append so the
-                    // persisted row (incl. a folded `userAppMessageId`)
-                    // matches the production `AgentManager::force_message`
-                    // path. STAB-133: image_blocks and file_blocks ARE
-                    // forwarded now.
-                    self.agent_force_message_op(
-                        agent_id,
-                        message_id,
-                        content,
-                        options.image_blocks,
-                        options.file_blocks,
-                        message_metadata,
-                    )
-                    .await
+                    // Read-only fallback (no `agent_manager` wired): atomic
+                    // dequeue + store-only persist, same transactional
+                    // guarantee as the runtime path (no turn is driven).
+                    self.agent_send_queued_message_now_op(agent_id, message_id)
+                        .await
                 }
             }
         })
