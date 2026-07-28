@@ -19,9 +19,10 @@
 //! Internal readers of TOML-backed keys (e.g. [`branch_prefix`],
 //! [`max_concurrent_agents`]) consume the effective typed [`SettingsFile`]
 //! from the registry snapshot (`Services::effective_settings`); the SQLite
-//! `settings` table only persists the machine-state blobs (including
-//! `model.workspaceOverrides`, re-homed from `config.toml` — see
-//! [`import_legacy_settings`] for the one-time boot import-and-strip).
+//! `settings` table only persists the machine-state blobs. Retired keys
+//! (`model.workspaceOverrides`, monorepo#1000) have no catalog entry:
+//! `settings.update` tolerates-and-ignores them and
+//! [`cleanup_retired_settings`] deletes their stale rows on boot.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,13 @@ use crate::settings_registry::{SettingOrigin, SettingsRegistry, KNOWN_PATHS};
 /// Placeholder returned for a sensitive setting that **has** a stored value, so
 /// the wire conveys presence without ever leaking the plaintext (§9.8).
 pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
+
+/// The retired per-workspace model override path (monorepo#1000). No catalog
+/// entry remains: `settings.get`/`settings.reset` reject it as unknown, but
+/// old clients still writing it via `settings.update` are tolerated-and-
+/// ignored, and [`cleanup_retired_settings`] deletes the stale SQLite row on
+/// boot.
+pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
 /// Abstraction over secret persistence (the sensitive-setting analog of the
 /// transport's `TokenStore`). Production uses the file-backed
@@ -758,15 +766,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "providers",
             Some(json!({})),
         ),
-        // High-churn per-workspace machine state: SQLite-backed (absent from
-        // KNOWN_PATHS), not part of config.toml. Wire surface unchanged.
-        object(
-            "model.workspaceOverrides",
-            "Workspace model overrides",
-            "Per-workspace model overrides",
-            "providers",
-            Some(json!({})),
-        ),
         string(
             "backgroundAgents.defaultModel",
             "Background default model",
@@ -1193,12 +1192,14 @@ pub fn max_concurrent_agents(settings: &SettingsFile) -> Option<usize> {
 /// and captured their values; here each captured value is persisted to SQLite
 /// when it matches its catalog definition (overwriting any existing row —
 /// the file value is the user's most recent intent) or discarded with a
-/// warning when it does not, and the keys are then stripped from the file
-/// with a comment-preserving rewrite. Nothing is stripped when a SQLite
-/// write fails, so the next boot retries the import. The strip itself is
-/// best-effort: once the values are safely in SQLite, a failed file rewrite
-/// (read-only file, perms, full disk) is logged and startup continues — the
-/// next boot re-runs the import, which idempotently overwrites the same
+/// warning when it does not (all current legacy keys — `[ai]`,
+/// `server.listenMode`, `model.workspaceOverrides` — are retired without a
+/// catalog entry, so they are discarded), and the keys are then stripped from
+/// the file with a comment-preserving rewrite. Nothing is stripped when a
+/// SQLite write fails, so the next boot retries the import. The strip itself
+/// is best-effort: once the values are safely in SQLite, a failed file
+/// rewrite (read-only file, perms, full disk) is logged and startup continues
+/// — the next boot re-runs the import, which idempotently overwrites the same
 /// rows and retries the strip. Returns the stripped paths (empty when the
 /// file had no legacy keys or the rewrite failed).
 pub async fn import_legacy_settings(
@@ -1221,21 +1222,6 @@ pub async fn import_legacy_settings(
             tracing::warn!(path, error = %e, "legacy config.toml value is invalid; discarding");
             continue;
         }
-        // `SettingType::Object` tolerates arrays and arbitrary member types;
-        // the workspace-overrides consumer (`resolve_default_model_from_settings`)
-        // requires a workspaceId -> model-string map, so enforce that shape
-        // here rather than importing a blob that silently never applies.
-        if *path == "model.workspaceOverrides"
-            && !value
-                .as_object()
-                .is_some_and(|m| m.values().all(Value::is_string))
-        {
-            tracing::warn!(
-                path,
-                "legacy value is not an object of workspaceId -> model strings; discarding"
-            );
-            continue;
-        }
         let raw = serde_json::to_string(value)
             .map_err(|e| Error::Internal(format!("encode legacy setting {path} failed: {e}")))?;
         store.set_setting(path, &raw).await?;
@@ -1255,6 +1241,24 @@ pub async fn import_legacy_settings(
         tracing::info!(?stripped, "stripped legacy keys from config.toml");
     }
     Ok(stripped)
+}
+
+/// One-time boot cleanup of stale SQLite rows for retired settings. The
+/// per-workspace override blob (`model.workspaceOverrides`, monorepo#1000)
+/// no longer has a catalog entry or any reader; delete its row so stale
+/// state cannot resurface if the key ever returns. Idempotent — deleting an
+/// absent row is a no-op.
+pub async fn cleanup_retired_settings(store: &Store) -> Result<()> {
+    if store
+        .delete_setting(RETIRED_WORKSPACE_OVERRIDES_PATH)
+        .await?
+    {
+        tracing::info!(
+            path = RETIRED_WORKSPACE_OVERRIDES_PATH,
+            "deleted stale settings row for retired setting"
+        );
+    }
+    Ok(())
 }
 
 /// Normalize a registry-read value for the wire: `Number`-typed settings are
@@ -1450,6 +1454,15 @@ impl<'a> SettingsService<'a> {
                 .get("path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::InvalidParams("each change requires a 'path'".to_string()))?;
+            // monorepo#1000 compatibility: old clients still write the retired
+            // per-workspace override path on every workspace-scoped model
+            // pick. Tolerate-and-ignore the entry (nothing validated,
+            // persisted, echoed, or published) instead of rejecting the whole
+            // batch as an unknown path.
+            if path == RETIRED_WORKSPACE_OVERRIDES_PATH {
+                tracing::debug!(path, "ignoring settings.update for retired setting");
+                continue;
+            }
             let value = entry.get("value").cloned().ok_or_else(|| {
                 Error::InvalidParams(format!("change for {path} requires a 'value'"))
             })?;
@@ -1690,11 +1703,21 @@ mod tests {
         );
     }
 
+    /// `model.workspaceOverrides` is retired (monorepo#1000): the per-workspace
+    /// model override layer is gone, so no catalog entry may remain and
+    /// `settings.list` never advertises the path.
+    #[test]
+    fn workspace_overrides_is_gone_from_the_catalog() {
+        assert!(
+            find_definition(RETIRED_WORKSPACE_OVERRIDES_PATH).is_none(),
+            "model.workspaceOverrides must not be in the catalog"
+        );
+    }
+
     /// The non-secret gap entries live in the catalog as opaque `Object`
     /// settings with a documented default. Each is validated by shape only;
     /// downstream consumers own the internal schema (permission rules, prompt
-    /// rules, known repos, change-history bags, workspace-initializer state,
-    /// per-workspace model overrides).
+    /// rules, known repos, change-history bags, workspace-initializer state).
     #[test]
     fn non_secret_object_gap_entries_have_defaults() {
         for path in [
@@ -1704,7 +1727,6 @@ mod tests {
             "repos.known",
             "workspace.changeHistory",
             "workspaceInitializer.state",
-            "model.workspaceOverrides",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
@@ -2023,12 +2045,14 @@ mod tests {
         }
     }
 
-    /// `model.workspaceOverrides` is a SQLite-backed state blob: with the
-    /// registry wired, `settings.update` persists it to the `settings` table
-    /// (never `config.toml`), `settings.get` reads it back with **no**
-    /// `origin` field, and `settings.reset` deletes the row.
+    /// `model.workspaceOverrides` is retired (monorepo#1000) but old clients
+    /// still write it on every workspace-scoped model pick: `settings.update`
+    /// tolerates-and-ignores the entry (nothing persisted, nothing echoed in
+    /// `applied`) instead of rejecting the batch, while the rest of a mixed
+    /// batch still applies. `settings.get`/`settings.reset` reject the path
+    /// as unknown like any other uncataloged key.
     #[tokio::test]
-    async fn workspace_overrides_is_sqlite_backed_with_registry_wired() {
+    async fn workspace_overrides_update_is_tolerated_and_ignored() {
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-wsov-{tag}.db"));
         let store = Store::open(&tmp).await.expect("open store");
@@ -2038,33 +2062,22 @@ mod tests {
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
 
-        let overrides = json!({ "ws-1": "auggie:opus" });
-        svc.update(&json!([{ "path": "model.workspaceOverrides", "value": overrides.clone() }]))
+        // A retired-path-only batch succeeds with nothing applied.
+        let applied = svc
+            .update(&json!([{
+                "path": "model.workspaceOverrides",
+                "value": { "ws-1": "auggie:opus" }
+            }]))
             .await
-            .expect("update state blob");
-
-        // Persisted to SQLite…
-        let raw = store
-            .get_setting("model.workspaceOverrides")
+            .expect("retired path must be tolerated");
+        assert_eq!(applied, Vec::<Value>::new());
+        // Even a malformed entry (no 'value') is ignored, not validated.
+        let applied = svc
+            .update(&json!([{ "path": "model.workspaceOverrides" }]))
             .await
-            .expect("read settings table")
-            .expect("row present");
-        assert_eq!(
-            serde_json::from_str::<Value>(&raw).expect("json"),
-            overrides
-        );
-        // …never to config.toml.
-        let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(!text.contains("workspaceOverrides"), "{text}");
-
-        // settings.get reads the blob back with no origin field.
-        let got = svc.get("model.workspaceOverrides").await.expect("get");
-        assert_eq!(got["value"], overrides);
-        assert!(got.get("origin").is_none(), "state blobs carry no origin");
-
-        // settings.reset deletes the row (back to the catalog default).
-        let reset = svc.reset("model.workspaceOverrides").await.expect("reset");
-        assert_eq!(reset["value"], json!({}));
+            .expect("retired path must be tolerated without a value");
+        assert_eq!(applied, Vec::<Value>::new());
+        // Nothing was persisted to SQLite or config.toml.
         assert_eq!(
             store
                 .get_setting("model.workspaceOverrides")
@@ -2072,6 +2085,29 @@ mod tests {
                 .expect("read settings table"),
             None
         );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("workspaceOverrides"), "{text}");
+
+        // A mixed batch still applies the live entries.
+        let applied = svc
+            .update(&json!([
+                { "path": "model.workspaceOverrides", "value": { "ws-1": "m1" } },
+                { "path": "workspace.branchPrefix", "value": "feat/" },
+            ]))
+            .await
+            .expect("mixed batch must apply the live entry");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["path"], "workspace.branchPrefix");
+
+        // get/reset reject the retired path as unknown.
+        assert!(matches!(
+            svc.get("model.workspaceOverrides").await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            svc.reset("model.workspaceOverrides").await,
+            Err(Error::InvalidParams(_))
+        ));
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {
@@ -2082,12 +2118,46 @@ mod tests {
         }
     }
 
-    /// Boot-time legacy import: a `config.toml` carrying the retired
-    /// `model.workspaceOverrides` key loads (tolerated), the value lands in
-    /// SQLite, the key is stripped from the file with comments preserved,
-    /// and a second import is a no-op.
+    /// [`cleanup_retired_settings`] deletes the stale SQLite row left behind
+    /// by the retired per-workspace override layer, and is an idempotent
+    /// no-op when the row is absent.
     #[tokio::test]
-    async fn import_legacy_settings_imports_and_strips() {
+    async fn cleanup_retired_settings_deletes_stale_row() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-retired-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+
+        store
+            .set_setting("model.workspaceOverrides", r#"{"ws1":"m1"}"#)
+            .await
+            .expect("seed stale row");
+        cleanup_retired_settings(&store).await.expect("cleanup");
+        assert_eq!(
+            store
+                .get_setting("model.workspaceOverrides")
+                .await
+                .expect("read settings table"),
+            None,
+            "stale row must be deleted"
+        );
+        // Second run: nothing to delete, still Ok.
+        cleanup_retired_settings(&store).await.expect("idempotent");
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// Boot-time legacy handling: a `config.toml` carrying the retired
+    /// `model.workspaceOverrides` key loads (tolerated), the value is
+    /// DISCARDED (the key has no catalog entry since monorepo#1000, so
+    /// nothing lands in SQLite), the key is stripped from the file with
+    /// comments preserved, and a second import is a no-op.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_and_strips() {
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-legacy-{tag}.db"));
         let store = Store::open(&tmp).await.expect("open store");
@@ -2104,15 +2174,13 @@ mod tests {
             .expect("import");
         assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
 
-        // Value landed in SQLite.
-        let raw = store
-            .get_setting("model.workspaceOverrides")
-            .await
-            .expect("read settings table")
-            .expect("row present");
+        // Value was discarded, never imported into SQLite.
         assert_eq!(
-            serde_json::from_str::<Value>(&raw).expect("json"),
-            json!({ "ws1": "m1" })
+            store
+                .get_setting("model.workspaceOverrides")
+                .await
+                .expect("read settings table"),
+            None
         );
         // File stripped, comment + sibling key preserved.
         let text = std::fs::read_to_string(&config_path).expect("read config");
@@ -2142,7 +2210,7 @@ mod tests {
     /// A hand-edited file can carry the legacy key as a TOML table header
     /// (`[model.workspaceOverrides]`) instead of an inline table. The capture
     /// and strip paths must handle that form too — the one-shot migration
-    /// would otherwise lose the value from both the file and SQLite.
+    /// would otherwise leave the retired key in the file forever.
     #[tokio::test]
     async fn import_legacy_settings_handles_table_header_form() {
         let tag = uuid::Uuid::new_v4();
@@ -2162,14 +2230,13 @@ mod tests {
             .expect("import");
         assert_eq!(stripped, vec!["model.workspaceOverrides".to_string()]);
 
-        let raw = store
-            .get_setting("model.workspaceOverrides")
-            .await
-            .expect("read settings table")
-            .expect("row present");
+        // Discarded, not imported (no catalog entry since monorepo#1000).
         assert_eq!(
-            serde_json::from_str::<Value>(&raw).expect("json"),
-            json!({ "ws1": "m1", "ws2": "m2" })
+            store
+                .get_setting("model.workspaceOverrides")
+                .await
+                .expect("read settings table"),
+            None
         );
         let text = std::fs::read_to_string(&config_path).expect("read config");
         assert!(!text.contains("workspaceOverrides"), "{text}");
@@ -2188,12 +2255,11 @@ mod tests {
         }
     }
 
-    /// The strip step is best-effort: once the legacy values are safely in
-    /// SQLite, a failed file rewrite (e.g. unwritable config directory) must
-    /// not fail the import — the daemon continues with the imported state
-    /// and the next boot retries the strip. The rewrite is an atomic
-    /// temp-file + rename in the config's directory, so a read-only
-    /// directory makes it fail.
+    /// The strip step is best-effort: a failed file rewrite (e.g. unwritable
+    /// config directory) must not fail the import — the daemon continues and
+    /// the next boot retries the strip. The rewrite is an atomic temp-file +
+    /// rename in the config's directory, so a read-only directory makes it
+    /// fail.
     #[cfg(unix)]
     #[tokio::test]
     async fn import_legacy_settings_tolerates_strip_failure() {
@@ -2218,15 +2284,13 @@ mod tests {
             .expect("import must succeed despite strip failure");
         assert_eq!(stripped, Vec::<String>::new(), "nothing was stripped");
 
-        // The value still landed in SQLite…
-        let raw = store
-            .get_setting("model.workspaceOverrides")
-            .await
-            .expect("read settings table")
-            .expect("row present");
+        // The retired value was discarded (never imported)…
         assert_eq!(
-            serde_json::from_str::<Value>(&raw).expect("json"),
-            json!({ "ws1": "m1" })
+            store
+                .get_setting("model.workspaceOverrides")
+                .await
+                .expect("read settings table"),
+            None
         );
         // …and the file is untouched for the next-boot retry.
         assert_eq!(
@@ -2245,18 +2309,14 @@ mod tests {
         }
     }
 
-    /// A legacy value that fails catalog validation — or the
-    /// workspaceId -> model-string shape the overrides consumer requires —
-    /// is discarded (never imported) but still stripped so the daemon does
-    /// not re-warn forever.
+    /// Retired-key values are discarded regardless of shape (no catalog
+    /// entry to validate against) but still stripped so the daemon does not
+    /// re-warn forever.
     #[tokio::test]
     async fn import_legacy_settings_discards_invalid_values() {
         for body in [
-            // An object-typed catalog entry with a scalar value: invalid.
             "[model]\nworkspaceOverrides = \"not-an-object\"\n",
-            // Arrays pass SettingType::Object but not the map shape.
             "[model]\nworkspaceOverrides = [\"m1\"]\n",
-            // Non-string member values are not model ids.
             "[model]\nworkspaceOverrides = { ws1 = 42 }\n",
         ] {
             let tag = uuid::Uuid::new_v4();

@@ -104,7 +104,8 @@ pub use config_watcher::ConfigWatcher;
 pub use mcp_servers::McpHub;
 pub use sandbox_ops::ProvisionOutcome;
 pub use settings::{
-    import_legacy_settings, max_concurrent_agents, InMemorySecretStore, SecretStore,
+    cleanup_retired_settings, import_legacy_settings, max_concurrent_agents, InMemorySecretStore,
+    SecretStore,
 };
 pub use settings_registry::{
     SettingOrigin, SettingsChanged, SettingsRegistry, SettingsSnapshot, WriteStamp, KNOWN_PATHS,

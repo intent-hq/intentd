@@ -706,12 +706,18 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         intent_services::SettingsRegistry::load(&config.config_path)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     );
-    // One-time legacy import: keys that moved from config.toml back to SQLite
-    // (e.g. `model.workspaceOverrides`) were tolerated + captured by the load
-    // above; persist them to the settings table, then strip them from the
+    // One-time legacy handling: retired keys still present in config.toml
+    // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
+    // captured by the load above; import any that still have a catalog entry
+    // into the settings table (currently none), then strip them from the
     // file with a comment-preserving rewrite. A failed import keeps the file
     // intact so the next boot retries.
     intent_services::import_legacy_settings(&settings_registry, &store)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // One-time cleanup of stale SQLite rows for retired settings (e.g. the
+    // per-workspace `model.workspaceOverrides` blob, monorepo#1000).
+    intent_services::cleanup_retired_settings(&store)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):

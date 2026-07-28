@@ -59,61 +59,27 @@ mod tests_stab115;
 mod tests_specialist_frontmatter;
 
 /// Resolve the default model from settings when no explicit model is supplied
-/// at agent creation time. Precedence chain (documented in the task):
-/// 1. `model.workspaceOverrides[workspaceId]` — SQLite-backed state blob
-/// 2. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
-/// 3. `model.providerDefaults[resolved provider]`
-/// 4. `model.default`
-/// 5. None → CLI default (current behavior, last resort)
+/// at agent creation time. Precedence chain (the per-workspace override tier
+/// was removed in monorepo#1000):
+/// 1. for background/delegated sessions: `backgroundAgents.typeOverrides[agentType]`, then `backgroundAgents.defaultModel`
+/// 2. `model.providerDefaults[resolved provider]`
+/// 3. `model.default`
+/// 4. None → CLI default (current behavior, last resort)
 ///
 /// The resolved model is persisted to `session.model` at creation time, pinning
 /// it for the agent's lifetime. Later settings changes never affect existing
 /// sessions; only new agents pick up the new default.
-async fn resolve_default_model_from_settings(
+fn resolve_default_model_from_settings(
     services: &Services,
-    workspace_id: &WorkspaceId,
     is_background: bool,
     agent_type: Option<&str>,
     provider: Option<&str>,
 ) -> Option<String> {
     let settings = services.effective_settings();
 
-    // 1. Check workspace-specific override (SQLite `settings` table blob).
-    //    DB read errors and non-JSON rows are logged before falling through
-    //    to the next tier; a parseable row without a string entry for this
-    //    workspace (including a non-object shape, which the legacy import
-    //    guards against) falls through silently as the normal
-    //    no-override case.
-    if let Some(model) = services
-        .store()
-        .get_setting("model.workspaceOverrides")
-        .await
-        .inspect_err(
-            |e| tracing::warn!(error = %e, "model.workspaceOverrides read failed; skipping tier"),
-        )
-        .ok()
-        .flatten()
-        .and_then(|raw| {
-            serde_json::from_str::<Value>(&raw)
-                .inspect_err(|e| {
-                    tracing::warn!(error = %e, "model.workspaceOverrides row is malformed JSON; skipping tier");
-                })
-                .ok()
-        })
-        .and_then(|v| {
-            v.get(workspace_id.as_str())
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-    {
-        if !model.is_empty() {
-            return Some(model);
-        }
-    }
-
-    // 2. For background/delegated agents, check type-specific override, then default
+    // 1. For background/delegated agents, check type-specific override, then default
     if is_background {
-        // 2a. Check agent type override
+        // 1a. Check agent type override
         if let Some(typ) = agent_type {
             if let Some(model) = settings.background_agents.type_overrides.get(typ) {
                 if !model.is_empty() {
@@ -122,7 +88,7 @@ async fn resolve_default_model_from_settings(
             }
         }
 
-        // 2b. Check background agents default
+        // 1b. Check background agents default
         if let Some(model) = settings
             .background_agents
             .default_model
@@ -133,7 +99,7 @@ async fn resolve_default_model_from_settings(
         }
     }
 
-    // 3. Check provider defaults
+    // 2. Check provider defaults
     let provider_key = provider.unwrap_or_else(|| intent_providers::default_provider_id());
     if let Some(model) = settings.model.provider_defaults.get(provider_key) {
         if !model.is_empty() {
@@ -141,12 +107,12 @@ async fn resolve_default_model_from_settings(
         }
     }
 
-    // 4. Check global default
+    // 3. Check global default
     if let Some(model) = settings.model.default.as_deref().filter(|m| !m.is_empty()) {
         return Some(model.to_string());
     }
 
-    // 5. None → CLI default (session.model stays None)
+    // 4. None → CLI default (session.model stays None)
     None
 }
 
@@ -1540,12 +1506,10 @@ impl Services {
                         // common case.
                         resolve_default_model_from_settings(
                             self,
-                            &workspace_id,
                             is_background,
                             specialist.as_deref(),
                             provider.as_deref(),
                         )
-                        .await
                     }
                 }
             }
