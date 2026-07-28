@@ -536,6 +536,7 @@ async fn tool_call_fallback_drops_unexpected_huge_fields() {
     ev.data = json!({
         "toolCallId": "tc-2",
         "toolName": "custom",
+        "toolKind": "execute",
         "status": "completed",
         "unexpectedBlob": "z".repeat(64 * 1024),
     });
@@ -554,6 +555,7 @@ async fn tool_call_fallback_drops_unexpected_huge_fields() {
     assert_eq!(data["truncated"], json!(true));
     assert_eq!(data["toolCallId"], json!("tc-2"));
     assert_eq!(data["toolName"], json!("custom"));
+    assert_eq!(data["toolKind"], json!("execute"));
     assert!(data.get("unexpectedBlob").is_none(), "huge field dropped");
     assert!(serde_json::to_string(data).unwrap().len() <= 16 * 1024);
 }

@@ -344,7 +344,7 @@ async fn delivery_task(
 /// unexpectedly huge scalar field), everything except identity fields is
 /// dropped and a top-level `"truncated": true` is set.
 fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
-    if ev.event_type != "agent:tool:call" {
+    if ev.event_type != intent_core::events::AGENT_TOOL_CALL {
         return None;
     }
     if json_byte_len(&ev.data) <= TOOL_CALL_PERSIST_CAP_BYTES {
@@ -369,7 +369,8 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
         }
     }
     // Defensive fallback: some other field is unexpectedly huge. Keep only
-    // identity fields so the row stays bounded.
+    // identity fields (plus `filesModified`, the one field `event.agentActivity`
+    // reads back from these rows) so the row stays bounded.
     if json_byte_len(&data) > TOOL_CALL_PERSIST_CAP_BYTES {
         if let Some(obj) = data.as_object_mut() {
             let keep = [
@@ -378,15 +379,24 @@ fn truncate_tool_call_for_persist(ev: &NewEvent) -> Option<NewEvent> {
                 "title",
                 "status",
                 "agentId",
-                "kind",
+                "toolKind",
+                "filesModified",
             ];
             obj.retain(|k, _| keep.contains(&k.as_str()));
             obj.insert("truncated".to_string(), Value::Bool(true));
         }
     }
-    let mut capped = ev.clone();
-    capped.data = data;
-    Some(capped)
+    Some(NewEvent {
+        workspace_id: ev.workspace_id.clone(),
+        timestamp: ev.timestamp.clone(),
+        event_type: ev.event_type.clone(),
+        actor: ev.actor.clone(),
+        session_id: ev.session_id.clone(),
+        correlation_id: ev.correlation_id.clone(),
+        parent_event_id: ev.parent_event_id.clone(),
+        metadata: ev.metadata.clone(),
+        data,
+    })
 }
 
 /// Byte length of a value's serialized JSON (what `insert_events` writes).
