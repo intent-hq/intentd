@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use intent_core::{Result as CoreResult, WorkspaceApi};
+use intent_core::{now_iso, AgentId, Result as CoreResult, WorkspaceApi};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::{
@@ -137,11 +137,12 @@ struct Server {
     ws: WsApiServer,
     port: u16,
     cfg: Arc<ClientConfig>,
+    store: Store,
     _dir: std::path::PathBuf,
 }
 
 async fn start() -> Server {
-    let (api, bus, _store, dir) = make_services().await;
+    let (api, bus, store, dir) = make_services().await;
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
     token_store_inner.store_token(TOKEN).unwrap();
@@ -159,6 +160,7 @@ async fn start() -> Server {
         ws,
         port,
         cfg,
+        store,
         _dir: dir,
     }
 }
@@ -275,6 +277,156 @@ async fn concurrent_writes_do_not_starve_reads() {
         assert!(
             resp.get("result").is_some() && resp.get("error").is_none(),
             "note write {i} failed: {resp}"
+        );
+    }
+
+    srv.ws.stop().await;
+}
+
+/// monorepo#958 scaling regression: with 100+ agents carrying multi-KB
+/// transcripts, concurrent `agent.list` lifecycle refreshes stay fast and do
+/// NOT starve unrelated lightweight reads (`note.list`). Before the bounded
+/// projections, each `agent.list` hydrated + decoded every transcript
+/// (~6 MB of content JSON here), saturating the read pool; the issue's live
+/// evidence was note refreshes pool-timing-out behind `agent.list`.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_agent_list_with_many_agents_does_not_starve_reads() {
+    use intent_core::{AgentSession, AgentStatus, WorkspaceId};
+    use intent_store::ReplaceMessage;
+
+    let srv = start().await;
+
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Scale WS"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+
+    // Seed 100 agents × 60 messages with ~1 KB bodies (one write txn per
+    // agent). A full-hydration `agent.list` would fetch + decode ~6 MB of
+    // content JSON per call; the bounded projection touches ≤2 rows per agent.
+    let kb_filler = "x".repeat(1024);
+    for a in 0..100 {
+        let ts = now_iso();
+        let session = AgentSession {
+            id: AgentId(format!("agent-{}", uuid::Uuid::new_v4())),
+            workspace_id: WorkspaceId(ws_id.clone()),
+            backend_session_id: None,
+            acp_session_id: None,
+            name: format!("Scale {a}"),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            status: AgentStatus::Completed,
+            is_active: false,
+            system_prompt: None,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+            parent_agent_id: None,
+            specialist: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            messages: vec![],
+            stats: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            session_corrupted: false,
+        };
+        let contents: Vec<serde_json::Value> = (0..60)
+            .map(|m| {
+                let role_text = if m % 2 == 0 { "ask" } else { "reply" };
+                serde_json::json!([{ "type": "text", "text": format!("{role_text} {m} {kb_filler}") }])
+            })
+            .collect();
+        let messages: Vec<ReplaceMessage<'_>> = contents
+            .iter()
+            .enumerate()
+            .map(|(m, content)| ReplaceMessage {
+                role: if m % 2 == 0 { "user" } else { "assistant" },
+                content,
+                metadata: None,
+                created_at: &ts,
+            })
+            .collect();
+        srv.store
+            .insert_agent_session_with_messages(&session, &messages)
+            .await
+            .expect("seed agent with transcript");
+    }
+
+    // 8 concurrent agent.list refreshes (the FE lifecycle-refresh pattern).
+    let mut list_tasks = Vec::new();
+    for i in 0..8 {
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        let ws = ws_id.clone();
+        list_tasks.push(tokio::spawn(async move {
+            let start = Instant::now();
+            let frame = format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"agent.list","params":{{"workspaceId":"{}"}}}}"#,
+                100 + i,
+                ws,
+            );
+            let resp = wss_call(port, cfg, &frame).await;
+            (resp, start.elapsed())
+        }));
+    }
+
+    // Mid-load, the unrelated lightweight read must respond promptly.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let start = Instant::now();
+    let notes = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":999,"method":"note.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let note_elapsed = start.elapsed();
+    assert!(
+        notes["result"]["notes"].is_array(),
+        "note.list must succeed mid-load: {notes}"
+    );
+    assert!(
+        note_elapsed < Duration::from_secs(2),
+        "note.list took {note_elapsed:?} — starved behind agent.list transcript reads"
+    );
+
+    // Every refresh returns the full bounded projection quickly.
+    for task in list_tasks {
+        let (resp, elapsed) = task.await.expect("agent.list task panicked");
+        let agents = resp["result"]["agents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("agent.list must succeed: {resp}"));
+        assert_eq!(agents.len(), 100);
+        for lite in agents {
+            assert_eq!(lite["messageCount"], 60);
+            assert!(
+                lite["lastAgentResponse"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("reply 59")),
+                "projection carries the newest assistant row: {lite}"
+            );
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "agent.list took {elapsed:?} with 100 seeded agents — transcript hydration is back"
         );
     }
 

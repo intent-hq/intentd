@@ -4227,6 +4227,276 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
     srv.ws.stop().await;
 }
 
+/// monorepo#958 — the bounded agent read paths over the real WSS transport:
+/// `agent.list` / `agent.get` (metadata + last-rows projection), a full
+/// `agent.getConversation` multi-page `nextToken` walk, and the `chat.subscribe`
+/// seq-0 snapshot, all against one seeded 120-message session. Then the
+/// hydration regression at the wire level: with every row OLDER than the
+/// newest bounded page corrupted to non-JSON (which errors any path that
+/// decodes it — `agent.getSession` demonstrates), the bounded reads still
+/// answer correctly, proving they never fetch/decode beyond their page.
+#[tokio::test]
+async fn wss_agent_read_paths_bounded_pagination_round_trip() {
+    use intent_core::AgentId;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Paged"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Paged"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // Seed a 120-message transcript — well past the 50-message default page.
+    for i in 0..120 {
+        let (role, text) = if i % 2 == 0 {
+            ("user", format!("prompt {i}"))
+        } else {
+            ("assistant", format!("reply {i}"))
+        };
+        srv.store
+            .append_agent_message(
+                &agent,
+                role,
+                &json!([{ "type": "text", "text": text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append message");
+    }
+
+    // agent.list — `{ agents: [AgentLite] }`: aggregate `messageCount` plus the
+    // newest user/assistant projections, no `messages` array (PROTOCOL §5.5).
+    let list = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(list["jsonrpc"], "2.0");
+    assert_eq!(list["id"], 3);
+    let agents = list["result"]["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1);
+    let lite = &agents[0];
+    assert_eq!(lite["id"].as_str(), Some(agent_id.as_str()));
+    assert_eq!(lite["messageCount"], 120);
+    assert_eq!(lite["lastUserMessage"].as_str(), Some("prompt 118"));
+    assert_eq!(lite["lastAgentResponse"].as_str(), Some("reply 119"));
+    assert!(
+        lite.get("messages").is_none(),
+        "AgentLite carries no transcript: {lite}"
+    );
+
+    // agent.get — `{ agent: AgentLite }`, byte-identical to the list entry.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.get","params":{{"agentId":"{agent_id}","workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        got["result"]["agent"], *lite,
+        "agent.get == agent.list entry"
+    );
+
+    // agent.getConversation — full multi-page walk. Default page (no limit) is
+    // the newest 50 (seq 70..=119, oldest→newest within the page); each
+    // `nextToken` steps one page older; the oldest page is short (20) with
+    // `truncated: false` and a null `nextToken`.
+    let mut token: Option<String> = None;
+    let mut pages: Vec<Vec<i64>> = Vec::new();
+    let mut rpc_id = 5;
+    loop {
+        let params = match &token {
+            Some(t) => format!(r#"{{"agentId":"{agent_id}","nextToken":"{t}"}}"#),
+            None => format!(r#"{{"agentId":"{agent_id}"}}"#),
+        };
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{rpc_id},"method":"agent.getConversation","params":{params}}}"#
+            ),
+        )
+        .await;
+        rpc_id += 1;
+        let result = &resp["result"];
+        assert_eq!(result["agentId"].as_str(), Some(agent_id.as_str()));
+        assert_eq!(result["totalMessages"], 120);
+        let msgs = result["messages"].as_array().expect("messages array");
+        let seqs: Vec<i64> = msgs.iter().map(|m| m["seq"].as_i64().unwrap()).collect();
+        pages.push(seqs);
+        token = result["nextToken"].as_str().map(str::to_string);
+        assert_eq!(
+            result["truncated"].as_bool(),
+            Some(token.is_some()),
+            "truncated iff a nextToken remains: {result}"
+        );
+        if token.is_none() {
+            break;
+        }
+        assert!(pages.len() < 10, "token walk must terminate");
+    }
+    assert_eq!(pages.len(), 3, "120 messages @ default 50 → 3 pages");
+    assert_eq!(pages[0], (70..=119).collect::<Vec<i64>>());
+    assert_eq!(pages[1], (20..=69).collect::<Vec<i64>>());
+    assert_eq!(pages[2], (0..=19).collect::<Vec<i64>>());
+
+    // Explicit `limit` is honored: the newest 10 only.
+    let limited = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10}}}}"#
+        ),
+    )
+    .await;
+    let msgs = limited["result"]["messages"].as_array().expect("messages");
+    let seqs: Vec<i64> = msgs.iter().map(|m| m["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, (110..=119).collect::<Vec<i64>>());
+    assert_eq!(limited["result"]["truncated"], true);
+
+    // chat.subscribe — the seq-0 snapshot over WSS is the bounded newest
+    // `agent.getConversation` page (PROTOCOL §7.1), not the full history.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    sub.send(Message::Text(format!(
+        r#"{{"jsonrpc":"2.0","id":21,"method":"chat.subscribe","params":{{"agentId":"{agent_id}"}}}}"#
+    )))
+    .await
+    .expect("send subscribe");
+    let mut sub_resp: Option<Value> = None;
+    let mut snap: Option<Value> = None;
+    while sub_resp.is_none() || snap.is_none() {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), sub.next())
+            .await
+            .expect("chat.subscribe frame timed out");
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "subscription.push" {
+                    snap = Some(v);
+                } else if v["id"] == 21 {
+                    sub_resp = Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => continue,
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    let sub_resp = sub_resp.unwrap();
+    assert!(
+        sub_resp["result"]["subscriptionId"].as_str().is_some(),
+        "chat.subscribe returns subscriptionId: {sub_resp}"
+    );
+    let snap = snap.unwrap();
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let snapshot = &snap["params"]["snapshot"];
+    let snap_msgs = snapshot["messages"].as_array().expect("snapshot messages");
+    assert_eq!(
+        snap_msgs.len(),
+        50,
+        "seq-0 snapshot is the bounded default page, not all 120"
+    );
+    assert_eq!(snap_msgs[0]["seq"], 70);
+    assert_eq!(snap_msgs[49]["seq"], 119);
+    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["totalMessages"], 120);
+    assert!(
+        snapshot["nextToken"].as_str().is_some(),
+        "truncated snapshot carries the older-pages cursor"
+    );
+    drop(sub);
+
+    // Hydration regression: corrupt every row OLDER than the newest bounded
+    // page — any path that fetches/decodes them now fails hard.
+    sqlx::query("UPDATE agent_message SET content = 'not-json{' WHERE agent_id = ? AND seq < 70")
+        .bind(&agent.0)
+        .execute(srv.store.write_pool())
+        .await
+        .expect("corrupt old rows");
+
+    // The full-hydration read errors on the poisoned rows (proving the poison
+    // is potent)…
+    let full = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"agent.getSession","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        full.get("error").is_some(),
+        "full transcript hydration must fail on corrupted rows: {full}"
+    );
+
+    // …while the bounded reads still answer correctly: they never touch rows
+    // outside their page.
+    let list = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":23,"method":"agent.list","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    let lite = &list["result"]["agents"].as_array().expect("agents")[0];
+    assert_eq!(lite["messageCount"], 120);
+    assert_eq!(lite["lastUserMessage"].as_str(), Some("prompt 118"));
+    assert_eq!(lite["lastAgentResponse"].as_str(), Some("reply 119"));
+
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":24,"method":"agent.get","params":{{"agentId":"{agent_id}","workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(got["result"]["agent"]["messageCount"], 120);
+
+    let newest = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":25,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    let msgs = newest["result"]["messages"].as_array().expect("messages");
+    assert_eq!(msgs.len(), 50, "newest page decodes only its own 50 rows");
+    assert_eq!(msgs[0]["seq"], 70);
+    assert_eq!(msgs[49]["seq"], 119);
+
+    srv.ws.stop().await;
+}
+
 /// Helper to obtain an ephemeral port by bind-then-release. Only used for tests
 /// that genuinely need a fixed port to exercise fixed-port semantics (e.g.
 /// graceful_shutdown_allows_immediate_restart). Prefer `base_port: 0` for normal tests.
