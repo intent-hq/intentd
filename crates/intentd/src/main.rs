@@ -916,9 +916,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes);
     // Event retention/compaction (§10.2 / finding F4): periodically delete
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-    // `host:exec:*`, `script:output`) older than the configured TTL, preserving
-    // lifecycle/tool/note/task/workspace events. Disabled when
-    // `events.streamRetentionHours == 0`.
+    // `host:exec:*`, `script:output`, plus the high-churn state-notification
+    // families — see `Store::delete_ephemeral_events_before`) older than the
+    // configured TTL, preserving lifecycle/tool/note/task events. Disabled
+    // when `events.streamRetentionHours == 0`.
     let retention_task =
         spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
@@ -2070,9 +2071,11 @@ const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
 /// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
 /// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
 /// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-/// `host:exec:*`, `script:output`) older than the TTL, plus `agent:tool:call`
-/// events older than [`TOOL_CALL_RETENTION_HOURS`], while preserving
-/// lifecycle/note/task/workspace events. After the sweeps each tick runs a
+/// `host:exec:*`, `script:output`, plus the high-churn state-notification
+/// families — see `Store::delete_ephemeral_events_before`) older than the
+/// TTL, plus `agent:tool:call` events older than
+/// [`TOOL_CALL_RETENTION_HOURS`], while preserving lifecycle/note/task
+/// events. After the sweeps each tick runs a
 /// bounded `PRAGMA incremental_vacuum` ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to
 /// release freelist pages back to the filesystem (effective on
 /// incremental-auto-vacuum databases; a no-op otherwise — see
@@ -2095,7 +2098,7 @@ fn spawn_stream_retention_loop(
         ttl_hours = stream_retention_hours,
         tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
         interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, agent:tool:call)"
+        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, state-notification churn families, agent:tool:call)"
     );
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);

@@ -252,10 +252,14 @@ impl Store {
 
     /// Retention/compaction sweep (§10.2 / finding F4): delete high-volume
     /// ephemeral event families (`agent:stream:*`, `file:*`, `terminal:data`,
-    /// `host:exec:*`, `script:output`) whose `timestamp` is strictly older
+    /// `host:exec:*`, `script:output`, plus the high-churn state-notification
+    /// families listed in the body — including `workspace:updated` and
+    /// `workspace:tokenUsage-changed`) whose `timestamp` is strictly older
     /// than `cutoff` (an RFC-3339 string), and return the number of rows
-    /// removed. Lifecycle/note/task/workspace events are preserved regardless
-    /// of age (`agent:tool:call` has its own TTL via
+    /// removed. Lifecycle/audit events (`workspace:created`/`deleted`/
+    /// `archived`, `agent:created`/`deleted`/`completed`/`failed`, note/task/
+    /// comment/git families, ...) are preserved regardless of age
+    /// (`agent:tool:call` has its own TTL via
     /// [`Store::delete_tool_call_events_before`]). This is deliberately scoped
     /// to high-volume families that can be safely trimmed so the log stays the
     /// source of truth for everything else. Each family is deleted separately
@@ -285,6 +289,28 @@ impl Store {
         removed += self
             .delete_exact_type_before(intent_core::events::SCRIPT_OUTPUT, cutoff)
             .await?;
+        // High-churn state-notification families (spec P3: 20k+ rows each on
+        // the dev seat, never previously swept). Every consumer takes these
+        // from the live `events.subscribe` bus and rehydrates current state
+        // from its authoritative table (workspace/draft/agent_session/
+        // event_subscription/settings rows) — nothing reads them back from
+        // the persisted log by type, so a 72h window loses no history that
+        // matters. Exact types only: their lifecycle siblings
+        // (`workspace:created/deleted/archived`, `agent:created/deleted/
+        // completed/failed`, `agent:queue:processing`, ...) remain audit
+        // history and are never swept.
+        for event_type in [
+            intent_core::events::WORKSPACE_UPDATED,
+            intent_core::events::DRAFT_CHANGED,
+            intent_core::events::AGENT_STATUS_CHANGED,
+            intent_core::events::AGENT_IDLE,
+            intent_core::events::AGENT_SUBSCRIPTIONS_CHANGED,
+            intent_core::events::SETTINGS_CHANGED,
+            intent_core::events::WORKSPACE_TOKEN_USAGE_CHANGED,
+            intent_core::events::AGENT_QUEUE_UPDATED,
+        ] {
+            removed += self.delete_exact_type_before(event_type, cutoff).await?;
+        }
         Ok(removed)
     }
 
