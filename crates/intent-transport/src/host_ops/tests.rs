@@ -622,6 +622,85 @@ fn list_installed_editors_with_skips_windows_only_editors_on_macos() {
 }
 
 #[test]
+fn list_installed_editors_with_reports_finder_always_installed_on_macos() {
+    let root = unique_temp_dir("list-mac-finder");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(&apps).unwrap();
+    let v = list_installed_editors_with(
+        EditorPlatform::Macos,
+        &[apps],
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    let finder = editors
+        .iter()
+        .find(|e| e["id"] == "finder")
+        .expect("finder entry");
+    assert_eq!(finder["installed"], true, "Finder ships with macOS");
+    assert_eq!(finder["source"], "macAppBundle");
+    assert_eq!(finder["path"], "/System/Library/CoreServices/Finder.app");
+}
+
+#[test]
+fn list_installed_editors_with_prefers_probed_finder_bundle_over_builtin_path() {
+    let root = unique_temp_dir("list-mac-finder-probe");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(apps.join("Finder.app")).unwrap();
+    let v = list_installed_editors_with(
+        EditorPlatform::Macos,
+        std::slice::from_ref(&apps),
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    let finder = editors
+        .iter()
+        .find(|e| e["id"] == "finder")
+        .expect("finder entry");
+    assert_eq!(finder["installed"], true);
+    assert_eq!(
+        finder["path"],
+        apps.join("Finder.app").to_string_lossy().into_owned(),
+        "a probe hit still wins over the built-in CoreServices fallback"
+    );
+}
+
+#[test]
+fn list_installed_editors_with_reports_explorer_always_installed_on_windows() {
+    let v = list_installed_editors_with(
+        EditorPlatform::Windows,
+        &[],
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    let finder = editors
+        .iter()
+        .find(|e| e["id"] == "finder")
+        .expect("finder entry");
+    assert_eq!(finder["installed"], true, "Explorer ships with Windows");
+    assert_eq!(finder["source"], "binary");
+    assert_eq!(finder["path"], "explorer");
+}
+
+#[test]
+fn list_installed_editors_with_keeps_linux_file_manager_binary_probe() {
+    let v = list_installed_editors_with(
+        EditorPlatform::Linux,
+        &[],
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    let finder = editors.iter().find(|e| e["id"] == "finder").unwrap();
+    assert_eq!(
+        finder["installed"], false,
+        "no guaranteed file manager on Linux — the binary probe still decides"
+    );
+}
+
+#[test]
 fn list_installed_editors_with_detects_linux_binary_then_flatpak() {
     let resolver = MapResolver(
         [("code", PathBuf::from("/usr/bin/code"))]
