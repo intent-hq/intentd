@@ -122,6 +122,33 @@ pub struct SessionMessageProjection {
     pub last_user: Option<AgentMessage>,
 }
 
+/// Last-rows window query for the workspace-wide projection (monorepo#1010).
+/// The windowed subquery selects only row keys `(agent_id, seq)` — never
+/// `content`/`metadata` — so it runs entirely on the covering index
+/// `idx_agent_message_agent_role_seq` (0064); message bodies are fetched by
+/// joining the `rn = 1` winners back to `agent_message` via
+/// `UNIQUE(agent_id, seq)`.
+const LAST_MESSAGES_BY_WORKSPACE_SQL: &str =
+    "SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at FROM ( \
+        SELECT m.agent_id, m.seq, \
+        ROW_NUMBER() OVER (PARTITION BY m.agent_id, m.role ORDER BY m.seq DESC) AS rn \
+        FROM agent_message m \
+        JOIN agent_session s ON s.id = m.agent_id \
+        WHERE s.workspace_id = ? AND m.role IN ('user', 'assistant')) w \
+    JOIN agent_message m ON m.agent_id = w.agent_id AND m.seq = w.seq \
+    WHERE w.rn = 1";
+
+/// Single-session variant of [`LAST_MESSAGES_BY_WORKSPACE_SQL`]: `agent_id = ?`
+/// instead of the workspace join, same keys-only window + winner join-back.
+const LAST_MESSAGES_BY_AGENT_SQL: &str =
+    "SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at FROM ( \
+        SELECT agent_id, seq, \
+        ROW_NUMBER() OVER (PARTITION BY role ORDER BY seq DESC) AS rn \
+        FROM agent_message \
+        WHERE agent_id = ? AND role IN ('user', 'assistant')) w \
+    JOIN agent_message m ON m.agent_id = w.agent_id AND m.seq = w.seq \
+    WHERE w.rn = 1";
+
 /// Encode an optional JSON payload column (`context_references` /
 /// `image_blocks`) as its TEXT form, `None` staying NULL.
 fn json_col_to_db(v: &Option<serde_json::Value>) -> Result<Option<String>> {
@@ -432,9 +459,11 @@ impl Store {
     /// workspace, in two bounded statements (monorepo#958): one aggregate
     /// message count (LEFT JOIN, so zero-message sessions still appear with
     /// count 0) and one window query returning only each session's newest
-    /// `user` and newest `assistant` rows. Only those returned rows have
-    /// their `content`/`metadata` JSON decoded — never the rest of the
-    /// transcript. Returns a map keyed by agent_id with one entry per
+    /// `user` and newest `assistant` rows. The window ranks row keys on the
+    /// covering `(agent_id, role, seq DESC)` index and only the `rn = 1`
+    /// winners are joined back for their bodies (monorepo#1010), so neither
+    /// SQLite nor this code ever materializes or decodes `content`/`metadata`
+    /// beyond those rows. Returns a map keyed by agent_id with one entry per
     /// session in the workspace.
     pub async fn get_agent_session_message_projections(
         &self,
@@ -465,14 +494,7 @@ impl Store {
             );
         }
 
-        let last_sql = "SELECT id, agent_id, seq, role, content, metadata, created_at FROM ( \
-            SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at, \
-            ROW_NUMBER() OVER (PARTITION BY m.agent_id, m.role ORDER BY m.seq DESC) AS rn \
-            FROM agent_message m \
-            JOIN agent_session s ON s.id = m.agent_id \
-            WHERE s.workspace_id = ? AND m.role IN ('user', 'assistant')) \
-            WHERE rn = 1";
-        let last_rows = sqlx::query(last_sql)
+        let last_rows = sqlx::query(LAST_MESSAGES_BY_WORKSPACE_SQL)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -494,11 +516,12 @@ impl Store {
 
     /// Bounded `AgentLite` projection inputs for a single session
     /// (monorepo#981): the per-session variant of
-    /// [`Store::get_agent_session_message_projections`] — the same last-rows
-    /// window query with `m.agent_id = ?` instead of the workspace join, plus
-    /// a single-agent message count. Only the returned newest user/assistant
-    /// rows have their `content`/`metadata` JSON decoded — never the rest of
-    /// the transcript. A session with no messages returns the zero projection.
+    /// [`Store::get_agent_session_message_projections`] — the same keys-only
+    /// last-rows window query (monorepo#1010) with `agent_id = ?` instead of
+    /// the workspace join, plus a single-agent message count. Only the
+    /// returned newest user/assistant rows have their `content`/`metadata`
+    /// fetched and decoded — never the rest of the transcript. A session with
+    /// no messages returns the zero projection.
     pub async fn get_agent_session_message_projection(
         &self,
         agent_id: &AgentId,
@@ -508,13 +531,7 @@ impl Store {
             ..Default::default()
         };
 
-        let last_sql = "SELECT id, agent_id, seq, role, content, metadata, created_at FROM ( \
-            SELECT m.id, m.agent_id, m.seq, m.role, m.content, m.metadata, m.created_at, \
-            ROW_NUMBER() OVER (PARTITION BY m.agent_id, m.role ORDER BY m.seq DESC) AS rn \
-            FROM agent_message m \
-            WHERE m.agent_id = ? AND m.role IN ('user', 'assistant')) \
-            WHERE rn = 1";
-        let last_rows = sqlx::query(last_sql)
+        let last_rows = sqlx::query(LAST_MESSAGES_BY_AGENT_SQL)
             .bind(&agent_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -4096,6 +4113,67 @@ mod tests {
                 }
             }
         }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The last-rows projection queries run their windowed subqueries as
+    /// covering seeks on `idx_agent_message_agent_role_seq` (monorepo#1010)
+    /// and fetch winner bodies via the `UNIQUE(agent_id, seq)` index —
+    /// never a full `agent_message` scan, and never a temp b-tree over
+    /// message bodies (the workspace variant's residual window sort orders
+    /// keys only; the per-agent variant needs no sort at all).
+    #[tokio::test]
+    async fn projection_last_rows_query_plans_use_role_seq_index() {
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+
+        for (label, sql) in [
+            ("workspace", LAST_MESSAGES_BY_WORKSPACE_SQL),
+            ("agent", LAST_MESSAGES_BY_AGENT_SQL),
+        ] {
+            let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .bind("x")
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain query plan");
+            let plan = rows
+                .iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "{label} window subquery must run on the covering role/seq index:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN agent_message") && !plan.contains("SCAN m"),
+                "{label} plan must not full-scan agent_message:\n{plan}"
+            );
+            assert!(
+                plan.contains(
+                    "SEARCH m USING INDEX sqlite_autoindex_agent_message_2 (agent_id=? AND seq=?)"
+                ),
+                "{label} winner rows must be fetched via UNIQUE(agent_id, seq):\n{plan}"
+            );
+        }
+
+        let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {LAST_MESSAGES_BY_AGENT_SQL}"))
+            .bind("x")
+            .fetch_all(store.read_pool())
+            .await
+            .expect("explain per-agent plan");
+        let per_agent_plan = plan_rows
+            .iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !per_agent_plan.contains("USE TEMP B-TREE"),
+            "per-agent window must be fully index-ordered:\n{per_agent_plan}"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
