@@ -1316,7 +1316,58 @@ async fn host_provider_discovery_over_wss() {
                 "non-npx-only providers must omit npxPackage: {p}"
             );
         }
+        // Secondary-binary attribution (monorepo#991): the two fields are
+        // present together or not at all, and an installed dual-binary
+        // provider must have its secondary resolved.
+        assert_eq!(
+            p.get("secondaryCommand").is_some(),
+            p.get("secondaryResolved").is_some(),
+            "secondaryCommand and secondaryResolved must be present together: {p}"
+        );
+        if p.get("secondaryCommand").is_some() {
+            assert!(
+                p["secondaryCommand"].is_string(),
+                "provider.secondaryCommand must be string: {p}"
+            );
+            assert!(
+                p["secondaryResolved"].is_boolean(),
+                "provider.secondaryResolved must be boolean: {p}"
+            );
+            if p["installed"] == true {
+                assert_eq!(
+                    p["secondaryResolved"], true,
+                    "installed dual-binary providers must have the secondary resolved: {p}"
+                );
+            }
+        }
     }
+    // unsloth (opencode + unsloth CLI) is the dual-binary provider: it must
+    // expose the secondary-binary attribution so clients can name the
+    // actually-missing binary; single-binary providers must omit the fields.
+    let unsloth = providers
+        .iter()
+        .find(|p| p["id"] == "unsloth")
+        .expect("unsloth must be in the discovery payload");
+    assert_eq!(
+        unsloth["command"], "opencode",
+        "unsloth rides opencode's ACP runtime: {unsloth}"
+    );
+    assert_eq!(
+        unsloth["secondaryCommand"], "unsloth",
+        "unsloth must attribute its secondary binary: {unsloth}"
+    );
+    assert!(
+        unsloth["secondaryResolved"].is_boolean(),
+        "unsloth.secondaryResolved must be boolean: {unsloth}"
+    );
+    let auggie = providers
+        .iter()
+        .find(|p| p["id"] == "auggie")
+        .expect("auggie must be in the discovery payload");
+    assert!(
+        auggie.get("secondaryCommand").is_none() && auggie.get("secondaryResolved").is_none(),
+        "single-binary providers must omit secondary-binary fields: {auggie}"
+    );
     let cc = providers
         .iter()
         .find(|p| p["id"] == "claude-code")

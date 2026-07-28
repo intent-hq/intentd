@@ -18492,3 +18492,62 @@ mod display_status_events {
         );
     }
 }
+
+/// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):
+/// the secondary-binary attribution fields (monorepo#991) must be present
+/// together for dual-binary providers (unsloth: opencode + unsloth) and
+/// omitted for everyone else. Assertions run against a SINGLE payload
+/// snapshot plus the static registry config — never a second discovery run,
+/// which could diverge under load or environment churn.
+mod provider_discovery_payload {
+    #[test]
+    fn secondary_binary_fields_follow_registry_config() {
+        let payload = crate::discover_providers_with_npx();
+        let entries = payload["providers"].as_array().expect("providers array");
+        assert_eq!(
+            entries.len(),
+            intent_providers::ACP_PROVIDERS.len(),
+            "one entry per registered provider"
+        );
+        for (entry, config) in entries.iter().zip(intent_providers::ACP_PROVIDERS) {
+            assert_eq!(entry["id"], config.id, "registry order preserved");
+            // Gated providers are never probed, so they omit the fields even
+            // when the registry declares a secondary requirement.
+            let expect_fields =
+                config.requires_secondary_binary.is_some() && entry.get("gatedOff").is_none();
+            if expect_fields {
+                assert_eq!(
+                    entry["secondaryCommand"],
+                    config.requires_secondary_binary.unwrap(),
+                    "dual-binary providers must name the secondary: {entry}"
+                );
+                assert!(
+                    entry["secondaryResolved"].is_boolean(),
+                    "secondaryResolved must be boolean: {entry}"
+                );
+                if entry["installed"] == true {
+                    assert_eq!(
+                        entry["secondaryResolved"], true,
+                        "installed dual-binary providers must have the secondary resolved: {entry}"
+                    );
+                }
+            } else {
+                assert!(
+                    entry.get("secondaryCommand").is_none()
+                        && entry.get("secondaryResolved").is_none(),
+                    "providers without a probed secondary requirement must omit \
+                     the attribution fields: {entry}"
+                );
+            }
+        }
+        // unsloth is the dual-binary provider today (and is never gated) —
+        // keep the attribution pinned so the wire contract cannot silently
+        // regress.
+        let unsloth = entries
+            .iter()
+            .find(|e| e["id"] == "unsloth")
+            .expect("unsloth must be in the payload");
+        assert_eq!(unsloth["secondaryCommand"], "unsloth", "{unsloth}");
+        assert!(unsloth["secondaryResolved"].is_boolean(), "{unsloth}");
+    }
+}
