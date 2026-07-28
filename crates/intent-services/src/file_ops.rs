@@ -322,7 +322,12 @@ pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value
             "Destination already exists: {new_path}"
         )));
     }
-    let is_directory = old_full.is_dir();
+    // `symlink_metadata` (no follow): a symlink-to-directory is renamed and
+    // attributed as the single symlink entry git actually tracks — walking the
+    // link target would record rows for paths git never reports.
+    let is_directory = std::fs::symlink_metadata(&old_full)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
     if let Some(parent) = new_full.parent() {
         std::fs::create_dir_all(parent).map_err(io_err)?;
     }
@@ -334,6 +339,40 @@ pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value
         "renamed": true,
         "isDirectory": is_directory,
     }))
+}
+
+/// Recursively list the regular files under `dir` (workspace-relative),
+/// returned as paths relative to `dir` itself, sorted. Used by the
+/// directory-rename attribution path (monorepo#957) to enumerate the moved
+/// tree. Enforces the same within-workspace guard as the other file ops
+/// (out-of-root dirs yield an empty list). Best-effort: unreadable entries
+/// and symlinks (neither dir nor regular file without following) are skipped.
+pub(crate) fn walk_files(root: &str, dir: &str) -> Vec<String> {
+    let base = node_resolve(root, dir);
+    if !is_within(root, &base) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![base.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(t) if t.is_file() => {
+                    if let Ok(rel) = path.strip_prefix(&base) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]

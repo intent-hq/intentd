@@ -247,6 +247,9 @@ async fn file_bindings_read_write_list() {
         await ws.file.mkdir('subdir');
         const files = await ws.file.list('.');
         await ws.file.rename('new.txt', 'renamed.txt');
+        await ws.file.write('pkg/a.txt', 'aaa');
+        await ws.file.write('pkg/nested/b.txt', 'bbb');
+        await ws.file.rename('pkg', 'moved');
         return { content: content, files: files };
     "#;
 
@@ -319,6 +322,32 @@ async fn file_bindings_read_write_list() {
         actual_ws_root.join("subdir").is_dir(),
         "subdir should exist"
     );
+
+    // Directory rename (monorepo#957): every contained file must be attributed
+    // to the agent — both old-side (deleted) and new-side (added) rows.
+    assert!(
+        actual_ws_root.join("moved/a.txt").exists()
+            && actual_ws_root.join("moved/nested/b.txt").exists(),
+        "moved dir contents should exist"
+    );
+    let tracked = store.list_tracked_changes(&ws).await.expect("tracked");
+    for expected in [
+        ("pkg/a.txt", "deleted"),
+        ("pkg/nested/b.txt", "deleted"),
+        ("moved/a.txt", "added"),
+        ("moved/nested/b.txt", "added"),
+    ] {
+        assert!(
+            tracked.iter().any(|t| t.path == expected.0
+                && t.status == expected.1
+                && t.agent_id.as_deref() == Some(agent_id.0.as_str())),
+            "expected tracked change {expected:?} attributed to agent; got {:?}",
+            tracked
+                .iter()
+                .map(|t| (t.path.clone(), t.status.clone(), t.agent_id.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
 
     manager.shutdown().await;
     for suffix in ["", "-wal", "-shm"] {

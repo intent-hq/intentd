@@ -1,6 +1,7 @@
 //! Tracked-changes repository: the per-file agent-change audit trail (§9.11,
 //! §17.4). Written by the BE-internal file-tracking pipeline (track-change);
-//! there is one row per file per git stage, upserted in place as the file moves
+//! there is one row per agent per file per git stage (monorepo#957), upserted
+//! in place as the file moves
 //! `unstaged → staged → committed → pushed → pr → merged`. Raw content stays
 //! lazy via the `old_blob_sha`/`new_blob_sha` columns — never inlined here.
 
@@ -54,10 +55,15 @@ pub struct TrackedChangeRow {
 }
 
 impl Store {
-    /// Upsert a tracked change keyed by `(workspace_id, path, stage)`: update the
-    /// existing row in place (preserving its id + `created_at`) or insert a new
-    /// one with a minted UUIDv7 id. There is no UNIQUE index on this triple (the
-    /// audit trail keeps history across stages), so the upsert is done by hand.
+    /// Upsert a tracked change keyed by `(workspace_id, path, stage, agent_id)`
+    /// (monorepo#957): update the calling agent's existing row in place
+    /// (preserving its id + `created_at`) or insert a new one with a minted
+    /// UUIDv7 id. Keying on the agent keeps one attribution row per agent when
+    /// several agents touch the same path — a later touch by agent B no longer
+    /// overwrites (and thus silently drops) agent A's attribution. `NULL`
+    /// agent_id (unattributed pipeline) rows key separately via `IS`. There is
+    /// no UNIQUE index on this quad (the audit trail keeps history across
+    /// stages), so the upsert is done by hand.
     ///
     /// Returns the replaced row's `(additions, deletions)` (`None` when the row
     /// was created) so callers can derive the line-change **delta** this upsert
@@ -67,11 +73,12 @@ impl Store {
         let now = now_iso();
         let existing: Option<(String, i64, i64)> = sqlx::query(
             "SELECT id, additions, deletions FROM tracked_changes \
-             WHERE workspace_id = ? AND path = ? AND stage = ?",
+             WHERE workspace_id = ? AND path = ? AND stage = ? AND agent_id IS ?",
         )
         .bind(&c.workspace_id.0)
         .bind(&c.path)
         .bind(&c.stage)
+        .bind(&c.agent_id)
         .fetch_optional(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("lookup tracked change failed: {e}")))?

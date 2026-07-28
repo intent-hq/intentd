@@ -9086,6 +9086,225 @@ mod file_tracking {
         assert!(repo.dir.join("after.txt").exists(), "file was renamed");
     }
 
+    /// `upsert_tracked_change` keys rows on `(workspace, path, stage, agent)`
+    /// (monorepo#957): a second agent touching the same path gets its own row
+    /// instead of overwriting the first agent's attribution, and re-upserting
+    /// for an agent updates that agent's row in place.
+    #[tokio::test]
+    async fn upsert_tracked_change_keeps_rows_per_agent() {
+        let (_t, svc, ws) = ft_setup().await;
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-b")))
+            .await
+            .unwrap();
+        // Unattributed pipeline rows key separately from agent rows too.
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", None))
+            .await
+            .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(rows.len(), 3, "one row per agent (and the null row)");
+
+        // Same-agent re-upsert updates in place (no fourth row).
+        let mut again = tracked(&ws, "x.txt", "unstaged", Some("agent-a"));
+        again.additions = 9;
+        let prev = svc.store().upsert_tracked_change(&again).await.unwrap();
+        assert_eq!(prev, Some((5, 2)), "replaced agent-a's own counters");
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        let a = rows
+            .iter()
+            .find(|r| r.agent_id.as_deref() == Some("agent-a"))
+            .unwrap();
+        assert_eq!(a.additions, 9);
+        let b = rows
+            .iter()
+            .find(|r| r.agent_id.as_deref() == Some("agent-b"))
+            .unwrap();
+        assert_eq!(b.additions, 5, "agent-b's row untouched");
+    }
+
+    /// Shared-path regression (monorepo#957): agent A edits x.txt, agent B
+    /// later touches the same file. A's no-`files` fallback commit still
+    /// includes x.txt (A's attribution row survives B's touch), and the
+    /// commit — which captures the file's full working-tree content, i.e.
+    /// both agents' edits — advances BOTH agents' rows to `committed`.
+    #[tokio::test]
+    async fn agent_commit_shared_path_includes_first_agents_edit() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("x.txt"), "A then B\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-b")))
+            .await
+            .unwrap();
+
+        let r = svc
+            .git_agent_commit(
+                ws.clone(),
+                "agent a work".to_string(),
+                Some(AgentId::from("agent-a")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["x.txt".to_string()], "A's edit not dropped");
+
+        // The commit satisfied both agents' attribution: every row advanced.
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        for agent in ["agent-a", "agent-b"] {
+            let row = rows
+                .iter()
+                .find(|r| r.agent_id.as_deref() == Some(agent))
+                .unwrap();
+            assert_eq!(row.stage, "committed", "{agent}'s row advanced");
+        }
+    }
+
+    /// Clearing semantics (monorepo#957): after A's commit of the shared path,
+    /// B's fallback commit does NOT spuriously re-commit it (B's satisfied row
+    /// was advanced with A's), but a fresh edit by B re-attributes the path
+    /// and B's next fallback commit includes it.
+    #[tokio::test]
+    async fn agent_commit_shared_path_cleared_rows_not_recommitted() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::write(repo.dir.join("x.txt"), "A then B\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-a")))
+            .await
+            .unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-b")))
+            .await
+            .unwrap();
+        svc.git_agent_commit(
+            ws.clone(),
+            "agent a work".to_string(),
+            Some(AgentId::from("agent-a")),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // B has nothing uncommitted left → silent-skip error, no new commit.
+        let err = svc
+            .git_agent_commit(
+                ws.clone(),
+                "agent b follow-up".to_string(),
+                Some(AgentId::from("agent-b")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("No uncommitted changes found for this agent"),
+            "got: {err}"
+        );
+        assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
+
+        // B edits the file again → a fresh unstaged row → B's commit takes it.
+        std::fs::write(repo.dir.join("x.txt"), "A then B then B again\n").unwrap();
+        svc.store()
+            .upsert_tracked_change(&tracked(&ws, "x.txt", "unstaged", Some("agent-b")))
+            .await
+            .unwrap();
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "agent b again".to_string(),
+                Some(AgentId::from("agent-b")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.files, vec!["x.txt".to_string()]);
+    }
+
+    /// Directory-rename regression (monorepo#957): an agent-context
+    /// `file.rename` of a DIRECTORY records per-file attribution rows for
+    /// every moved path (old side `deleted`, new side `added`), so the
+    /// attribution-filtered fallback commit includes the whole move.
+    #[tokio::test]
+    async fn file_rename_directory_records_attribution_for_all_moved_files() {
+        let repo = init_git_repo();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        std::fs::create_dir_all(repo.dir.join("dir/sub")).unwrap();
+        commit_file(&repo.dir, "dir/a.txt", "a\n", "add dir/a");
+        commit_file(&repo.dir, "dir/sub/b.txt", "b\n", "add dir/sub/b");
+
+        svc.file_rename(
+            ws.clone(),
+            "dir".to_string(),
+            "moved".to_string(),
+            Some(AgentId::from("agent-r2")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = |path: &str| {
+            rows.iter()
+                .find(|r| r.path == path)
+                .unwrap_or_else(|| panic!("attribution row for {path}: {rows:?}"))
+        };
+        for old in ["dir/a.txt", "dir/sub/b.txt"] {
+            assert_eq!(row(old).status, "deleted");
+            assert_eq!(row(old).agent_id.as_deref(), Some("agent-r2"));
+        }
+        for new in ["moved/a.txt", "moved/sub/b.txt"] {
+            assert_eq!(row(new).status, "added");
+            assert_eq!(row(new).agent_id.as_deref(), Some("agent-r2"));
+        }
+
+        // The fallback commit picks up every moved path (both sides).
+        let r = svc
+            .git_agent_commit(
+                ws,
+                "agent dir rename".to_string(),
+                Some(AgentId::from("agent-r2")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        for path in [
+            "dir/a.txt",
+            "dir/sub/b.txt",
+            "moved/a.txt",
+            "moved/sub/b.txt",
+        ] {
+            assert!(
+                r.files.contains(&path.to_string()),
+                "{path} committed: {:?}",
+                r.files
+            );
+        }
+        let st = intent_git::status::status(&repo.dir).unwrap();
+        assert!(
+            st.files.is_empty(),
+            "worktree clean after the move commit: {st:?}"
+        );
+    }
+
     /// `git.commits` returns the §5.5 `{ items, nextToken }` envelope of
     /// `CommitSummary`, walking older pages via the opaque continuation
     /// token; attribution trailers populate `agentId`/`linkedNoteId`. The
