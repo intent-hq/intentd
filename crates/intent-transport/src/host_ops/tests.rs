@@ -643,6 +643,30 @@ fn list_installed_editors_with_reports_finder_always_installed_on_macos() {
 }
 
 #[test]
+fn list_installed_editors_with_prefers_probed_finder_bundle_over_builtin_path() {
+    let root = unique_temp_dir("list-mac-finder-probe");
+    let apps = root.join("Applications");
+    std::fs::create_dir_all(apps.join("Finder.app")).unwrap();
+    let v = list_installed_editors_with(
+        EditorPlatform::Macos,
+        std::slice::from_ref(&apps),
+        &StubResolver(None),
+        &StubFlatpak(None),
+    );
+    let editors = v["editors"].as_array().unwrap();
+    let finder = editors
+        .iter()
+        .find(|e| e["id"] == "finder")
+        .expect("finder entry");
+    assert_eq!(finder["installed"], true);
+    assert_eq!(
+        finder["path"],
+        apps.join("Finder.app").to_string_lossy().into_owned(),
+        "a probe hit still wins over the built-in CoreServices fallback"
+    );
+}
+
+#[test]
 fn list_installed_editors_with_reports_explorer_always_installed_on_windows() {
     let v = list_installed_editors_with(
         EditorPlatform::Windows,
