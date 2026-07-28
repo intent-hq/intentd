@@ -27,8 +27,12 @@ use intent_store::{NewTrackedChange, Store};
 /// the max counters any sibling row (same workspace/path/stage, other agent)
 /// already recorded — each row carries the file's **full** diff, so a second
 /// agent's first row must not replay lines a sibling already fed into the
-/// usage stats (monorepo#1009); 0 when the path is new. Callers feed this
-/// growth into the global usage-stats recording (D5).
+/// usage stats (monorepo#1009); 0 when the path is new. The upsert and the
+/// sibling read are not transactional: if two agents' *first* rows for the
+/// same brand-new path raced, each would baseline against the other and the
+/// initial lines would go unrecorded — acceptable for this best-effort
+/// recording, and the pipeline effectively serializes per workspace. Callers
+/// feed this growth into the global usage-stats recording (D5).
 pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result<(u64, u64)> {
     change.path = normalize_path(&change.path);
     let prev = store.upsert_tracked_change(&change).await?;
