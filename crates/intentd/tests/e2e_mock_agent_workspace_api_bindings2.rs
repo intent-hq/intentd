@@ -177,7 +177,7 @@ async fn event_bindings_recent_files_and_query() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "query events" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
@@ -292,7 +292,7 @@ async fn file_bindings_read_write_list() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "file ops" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
@@ -452,7 +452,7 @@ async fn agent_bindings_list_and_status() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "list agents" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
@@ -603,7 +603,7 @@ async fn git_bindings_status_stage_commit() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "git ops" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
@@ -753,7 +753,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "scoped commit" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(
@@ -915,7 +915,7 @@ async fn note_bindings_edit_and_edit_lines() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "edit note" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(

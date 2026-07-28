@@ -4152,6 +4152,10 @@ async fn queue_lifecycle_add_get_edit_remove() {
     assert!(added["queuedMessage"]["queuedAt"].is_string());
     assert!(added["queuedMessage"].get("createdAt").is_none());
     assert!(added["queuedMessage"].get("agentId").is_none());
+    // Turn correlation (monorepo#1022): the response and the entry both name
+    // the turn (fresh enqueues mint turn_id = entry id).
+    assert_eq!(added["turnId"], added["queuedMessage"]["turnId"]);
+    assert_eq!(added["turnId"].as_str().unwrap(), mid);
 
     let q = svc
         .agent_get_queue_op(id.clone(), None)
@@ -11156,7 +11160,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     let id = create_agent(&svc, &ws, "TurnId").await;
 
     // Fresh enqueue: turn_id == id, surfaced as `turnId` on the wire.
-    let (queued, position) = svc.enqueue_message(&id, "fresh".to_string(), None, None, None);
+    let (queued, position) = svc.enqueue_message(&id, "fresh".to_string(), None, None, None, None);
     assert_eq!(
         queued.turn_id, queued.id,
         "fresh enqueue mints turn_id = id"

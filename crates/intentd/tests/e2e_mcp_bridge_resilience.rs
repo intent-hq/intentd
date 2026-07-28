@@ -198,7 +198,7 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "probe bridge" }))
             .unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     // `end_turn` proves the whole gated sequence: the ping was answered while

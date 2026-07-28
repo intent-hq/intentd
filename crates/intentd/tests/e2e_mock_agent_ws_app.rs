@@ -184,7 +184,7 @@ async fn chief_agent_ws_app_workspaces_list() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(json!({ "type": "text", "text": "list workspaces" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -343,7 +343,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(json!({ "type": "text", "text": "show proposal" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -506,7 +506,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(json!({ "type": "text", "text": "show proposal" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -667,7 +667,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(json!({ "type": "text", "text": "show proposal" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &chief_ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
@@ -829,7 +829,7 @@ async fn non_chief_agent_ws_app_gating_error() {
     let block: intent_acp::session::ContentBlock =
         serde_json::from_value(json!({ "type": "text", "text": "test gating" })).unwrap();
     let stop = manager
-        .run_turn(&agent_id, &ws, &acp_session, vec![block])
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
         .await
         .expect("run_turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));

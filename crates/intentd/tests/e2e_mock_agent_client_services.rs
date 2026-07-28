@@ -180,7 +180,7 @@ async fn run_turn(
         serde_json::from_value(serde_json::json!({ "type": "text", "text": "please proceed" }))
             .unwrap();
     let stop = manager
-        .run_turn(agent_id, ws, acp_session, vec![block])
+        .run_turn(agent_id, ws, acp_session, vec![block], None)
         .await
         .expect("run_turn");
     serde_json::to_value(stop)

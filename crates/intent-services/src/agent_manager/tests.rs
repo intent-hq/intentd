@@ -2313,6 +2313,125 @@ async fn terminal_failure_requeue_defaults_turn_id_to_new_id() {
     );
 }
 
+/// Wire surface (monorepo#1022): the terminal `agent:failed` +
+/// `agent:stream:end` pair carries the failed turn's `turnId` when present,
+/// and omits the key entirely when absent (never `null`).
+#[tokio::test]
+async fn terminal_failure_events_carry_turn_id() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-tfe-tid"), AgentId::from("a-tfe-tid"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom", Some("turn-tfe-1")).await;
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let failed = events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .expect("agent:failed event");
+    assert_eq!(failed.data["turnId"], json!("turn-tfe-1"));
+    assert_eq!(failed.data["error"], json!("boom"));
+    let end = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:end")
+        .expect("agent:stream:end event");
+    assert_eq!(end.data["turnId"], json!("turn-tfe-1"));
+
+    // Omit-when-absent: a None turn id leaves both payloads without the key.
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom2", None).await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    for ty in ["agent:failed", "agent:stream:end"] {
+        let ev = events
+            .iter()
+            .find(|e| e.event_type == ty)
+            .unwrap_or_else(|| panic!("{ty} event"));
+        assert!(
+            ev.data.get("turnId").is_none(),
+            "{ty} must omit turnId when absent: {:?}",
+            ev.data
+        );
+    }
+}
+
+/// Wire surface (monorepo#1022): the drain loop's `agent:queue:processing`
+/// names the entry being flipped to in-flight, including its `turnId` — the
+/// drain-start signal that covers `persisted: true` redrives which skip the
+/// user-row echo. Uses the quarantine park path to enqueue via
+/// `send_message` so the entry carries a daemon-minted turn id.
+#[tokio::test]
+async fn drain_emits_queue_processing_with_turn_id() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-qp-tid"), AgentId::from("a-qp-tid"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let (enqueued, _) =
+        mgr.services
+            .enqueue_message(&id, "queued work".to_string(), None, None, None, None);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+
+    // Wait for the drained turn to finish so the worker exits cleanly.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("drained turn completes");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let processing = events
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_PROCESSING)
+        .expect("agent:queue:processing event");
+    assert_eq!(processing.data["agentId"], json!(id.0));
+    assert_eq!(processing.data["messageId"], json!(enqueued.id));
+    assert_eq!(processing.data["content"], json!("queued work"));
+    assert_eq!(
+        processing.data["turnId"],
+        json!(enqueued.turn_id),
+        "queue:processing names the drained entry's turn: {:?}",
+        processing.data
+    );
+    // The user-row echo for the drained message carries the same turnId.
+    let echo = events
+        .iter()
+        .find(|e| {
+            e.event_type == intent_core::events::AGENT_MESSAGE && e.data["role"] == json!("user")
+        })
+        .expect("user-row agent:message echo");
+    assert_eq!(
+        echo.data["turnId"],
+        json!(enqueued.turn_id),
+        "user-row echo carries the drained turn id: {:?}",
+        echo.data
+    );
+}
+
 // --- First-turn workspace-naming instruction ---------------------------------
 
 /// Seed an agent whose workspace already carries `title` (used by naming-instruction
@@ -4364,6 +4483,175 @@ async fn send_message_parks_message_for_poisoned_session() {
     assert!(!session.is_active, "is_active stays 0");
 }
 
+/// Wire surface (monorepo#1022): every `agent.sendMessage` response arm
+/// carries the turn correlation id. Queued arm: `turnId` matches the queue
+/// entry's; quarantined arm likewise. The FE keys its retry record off this
+/// value at send time.
+#[tokio::test]
+async fn send_message_queued_response_carries_turn_id() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-tid-q"), AgentId::from("a-tid-q"));
+    seed_agent(&mgr, &ws, &id).await;
+    // Claim the slot so the send queues behind the "running" turn.
+    assert!(mgr.try_begin(&id, &ws).await);
+
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "queued".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("busy send queues");
+    assert_eq!(result["queued"], json!(true));
+    assert!(result["turnId"].is_string(), "turnId present: {result}");
+    assert_eq!(
+        result["turnId"], result["queuedMessage"]["turnId"],
+        "response turnId matches the queue entry's"
+    );
+}
+
+/// Wire surface (monorepo#1022): the direct (`queued: false`) `send_message`
+/// arm returns the minted `turnId` and stamps the same id on the user-row
+/// `agent:message` echo. Uses the deterministic mock agent for a real turn.
+#[tokio::test]
+async fn send_message_direct_response_and_user_echo_carry_turn_id() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-tid-d"), AgentId::from("a-tid-d"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "direct".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("direct send");
+    assert_eq!(result["queued"], json!(false));
+    let turn_id = result["turnId"]
+        .as_str()
+        .expect("direct response carries turnId")
+        .to_string();
+
+    // Wait for the turn to finish so the worker exits cleanly.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("direct turn completes");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let echo = events
+        .iter()
+        .find(|e| {
+            e.event_type == intent_core::events::AGENT_MESSAGE && e.data["role"] == json!("user")
+        })
+        .expect("user-row agent:message echo");
+    assert_eq!(
+        echo.data["turnId"],
+        json!(turn_id),
+        "user-row echo carries the send's turnId: {:?}",
+        echo.data
+    );
+}
+
+/// Wire surface (monorepo#1022): a redriving `agent.retry` response carries
+/// the requeued entry's original `turnId`; a non-redriving retry (empty
+/// queue) omits the field.
+#[tokio::test]
+async fn agent_retry_response_carries_redriven_turn_id() {
+    // `mock` provider without its script path: the redriven spawn fails
+    // deterministically, so the drained worker exits fast.
+    let _env = EnvGuard::unset("MOCK_AGENT_SCRIPT_PATH");
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-tid-r"), AgentId::from("a-tid-r"));
+    seed_agent(&mgr, &ws, &id).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.provider = Some("mock".to_string());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set mock provider");
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+        .await
+        .expect("park session in error");
+    // Simulate the terminal-failure requeue with a preserved turn id.
+    let options = super::TurnOptions {
+        turn_id: Some("turn-retry-1".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(&mgr, &id, &ws, "retry me", &options, true, "boom").await;
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("retry");
+    assert_eq!(result["ok"], json!(true));
+    assert_eq!(result["redriven"], json!(true));
+    assert_eq!(
+        result["turnId"],
+        json!("turn-retry-1"),
+        "retry response names the redriven turn: {result}"
+    );
+    // Let the redriven worker settle (spawn fails without a provider script,
+    // parking the session back in Error — irrelevant to this assertion).
+    let _ = timeout(Duration::from_secs(10), async {
+        loop {
+            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    // Empty-queue retry: no turnId key.
+    mgr.services.clear_queue(&id);
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+        .await
+        .expect("re-park session in error");
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("retry with empty queue");
+    assert_eq!(result["redriven"], json!(false));
+    assert!(
+        result.get("turnId").is_none(),
+        "no turnId when nothing was redriven: {result}"
+    );
+}
+
 /// monorepo#840: an ORDINARY Error session (no fatal stop_reason, no streak)
 /// is NOT quarantined — `send_message` still redrives it (the documented
 /// fresh-message recovery path). Guard against over-blocking. Uses the
@@ -6018,7 +6306,17 @@ async fn persist_user_appends_attachment_blocks_to_transcript_row() {
 
     let images = json!([{ "type": "image", "data": "imgdata", "mimeType": "image/png" }]);
     let files = json!([{ "type": "file", "data": "filedata", "mimeType": "text/plain", "fileName": "f.txt" }]);
-    super::persist_user(&mgr, &id, &ws, "drained", Some(&images), Some(&files), None).await;
+    super::persist_user(
+        &mgr,
+        &id,
+        &ws,
+        "drained",
+        Some(&images),
+        Some(&files),
+        None,
+        None,
+    )
+    .await;
 
     let messages = mgr
         .services

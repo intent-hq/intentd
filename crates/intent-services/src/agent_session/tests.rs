@@ -547,6 +547,7 @@ async fn prompt_turn_streams_events_and_accumulates() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -737,6 +738,7 @@ async fn agent_idle_payload_carries_agent_name_and_completion_report() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -837,6 +839,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -901,6 +904,7 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1028,6 +1032,7 @@ async fn status_only_update_keeps_title_name_and_input_on_event() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1089,6 +1094,7 @@ async fn richer_title_update_is_merged_into_block_and_event() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1164,6 +1170,7 @@ async fn tool_output_with_proposal_resource_appends_standalone_block() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1219,6 +1226,7 @@ async fn tool_output_with_collapsed_proposal_appends_standalone_block() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1321,6 +1329,7 @@ async fn registered_attachment_survives_garbled_tool_echo() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1386,6 +1395,7 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1454,6 +1464,7 @@ async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
             &workspace_id,
             ACP_SID,
             vec![text_block("go")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -1840,6 +1851,7 @@ async fn pre_output_transport_death_marks_error_and_suppresses_terminal_events()
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect_err("transport death fails the turn");
@@ -1903,6 +1915,7 @@ async fn post_output_transport_death_keeps_terminal_events() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect_err("transport death fails the turn");
@@ -1936,6 +1949,100 @@ async fn post_output_transport_death_keeps_terminal_events() {
         .await
         .unwrap();
     assert_eq!(messages.len(), 1, "partial output persisted");
+}
+
+/// Turn correlation (monorepo#1022): the failure-arm `agent:failed` emitted by
+/// `run_prompt_turn` carries the caller-supplied `turnId`; when the caller
+/// passes `None` (bare wiring) the field is omitted, never `null`.
+#[tokio::test]
+async fn prompt_turn_failure_stamps_turn_id_on_agent_failed() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "partial" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_dying(vec![chunk]);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-corr-1"),
+        )
+        .await
+        .expect_err("transport death fails the turn");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let failed = events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .expect("agent:failed event");
+    assert_eq!(
+        failed.data["turnId"],
+        json!("turn-corr-1"),
+        "agent:failed carries the turn correlation id: {:?}",
+        failed.data
+    );
+}
+
+/// Omit-when-absent counterpart: a `None` turn id leaves the `agent:failed`
+/// payload without a `turnId` key (the wire contract forbids emitting null).
+#[tokio::test]
+async fn prompt_turn_failure_omits_turn_id_when_absent() {
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let chunk = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "partial" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_dying(vec![chunk]);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("transport death fails the turn");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let failed = events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .expect("agent:failed event");
+    assert!(
+        failed.data.get("turnId").is_none(),
+        "no turnId key when the turn has none: {:?}",
+        failed.data
+    );
 }
 
 /// Detached turn-end bookkeeping (monorepo#738): a prompt whose result carries
@@ -1974,6 +2081,7 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect("turn completes");
@@ -2073,6 +2181,7 @@ async fn detached_bookkeeping_chains_per_agent_across_turns() {
             &workspace_id,
             ACP_SID,
             vec![text_block("hi")],
+            None,
         )
         .await
         .expect("turn completes");
