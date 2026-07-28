@@ -4651,6 +4651,26 @@ impl Services {
             }
         }
 
+        // monorepo#932: run the SUB-1 watch scope gate BEFORE any
+        // side-effectful work (agent create/wake, task assignment, poisoned
+        // queue migration, context-message delivery), mirroring
+        // `agent_delegate_op`'s pre-gate. Without this, the shared gate inside
+        // `register_completion_watch` would reject only AFTER those side
+        // effects, hiding the freshly created/woken `agentId` behind the
+        // error. The caller's session is resolved ONCE here (lookup via
+        // `.ok()`; a failed lookup falls back to the call's workspace — a
+        // trivial pass — at registration time) and threaded into the SUB-1
+        // registration blocks on all three branches below, so the gating
+        // decision cannot drift between two lookups and a pass here
+        // guarantees the later shared gate cannot reject.
+        let caller_session = match input.caller_agent_id.as_ref() {
+            Some(caller) => self.store.get_agent_session(caller).await.ok(),
+            None => None,
+        };
+        if let Some(session) = caller_session.as_ref() {
+            crate::agent_subscriptions::check_watch_scope(&session.workspace_id, &workspace_id)?;
+        }
+
         let task = self
             .get_my_task(workspace_id.clone(), task_note_id.clone())
             .await?;
@@ -4834,7 +4854,10 @@ impl Services {
                 // still proceed; only the fresh-register branch has to
                 // materialize a name, and there `""` matches the pre-fix
                 // behaviour for a brand-new watch.
-                let caller_session = self.store.get_agent_session(&caller).await.ok();
+                // monorepo#932: `caller_session` is the single lookup the
+                // pre-gate ran at the top of this op — reusing it keeps the
+                // gating decision and this anchor resolution consistent (no
+                // TOCTOU between two lookups) and saves a duplicate read.
                 let caller_name = caller_session.as_ref().map(|s| s.name.clone());
                 // The watch is anchored in the caller's HOME workspace (falls
                 // back to the call's workspace when the session lookup fails)
@@ -5040,7 +5063,8 @@ impl Services {
         // and no queued leak-guard: a brand-new agent has no in-flight turn
         // for the context message to queue behind).
         if let Some(caller) = input.caller_agent_id.clone() {
-            let caller_session = self.store.get_agent_session(&caller).await.ok();
+            // monorepo#932: reuse the single pre-gate session lookup so the
+            // gating decision and this anchor resolution cannot diverge.
             let caller_name = caller_session
                 .as_ref()
                 .map(|s| s.name.clone())
