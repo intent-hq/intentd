@@ -1846,6 +1846,48 @@ async fn get_conversation_paginates_with_opaque_next_token() {
     assert!(clamped["nextToken"].is_null());
 }
 
+/// monorepo#958: `agent.getConversation` paginates in SQL — a `limit=N` read
+/// decodes at most N rows regardless of transcript size. Rows outside the
+/// requested page are corrupted in place (invalid content JSON) so decoding
+/// any of them fails: a successful newest-page read proves the store touched
+/// only the requested window (the previous implementation hydrated the full
+/// log and would error here).
+#[tokio::test]
+async fn get_conversation_reads_only_the_requested_page_from_store() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Bounded").await;
+    for i in 0..5 {
+        let c = json!([{ "type": "text", "text": format!("m{i}") }]);
+        svc.store()
+            .append_agent_message(&id, "assistant", &c, &now_iso())
+            .await
+            .expect("append");
+    }
+    // Corrupt every row outside the newest-2 page.
+    sqlx::query("UPDATE agent_message SET content = 'not-json' WHERE agent_id = ? AND seq < 3")
+        .bind(&id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .expect("corrupt older rows");
+
+    let res = svc
+        .agent_get_conversation_op(id.clone(), Some(2), None, None)
+        .await
+        .expect("newest page must not decode rows outside its window");
+    assert_eq!(res["totalMessages"], 5);
+    assert_eq!(res["truncated"], true);
+    let messages = res["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["contentBlocks"][0]["text"], "m3");
+    assert_eq!(messages[1]["contentBlocks"][0]["text"], "m4");
+    // Following the token into the corrupted region decodes those rows and
+    // fails — confirming the corruption is real and only page rows decode.
+    let t = res["nextToken"].as_str().expect("token").to_string();
+    svc.agent_get_conversation_op(id, Some(2), None, Some(t))
+        .await
+        .expect_err("older page decodes the corrupted rows");
+}
+
 /// STAB-124 loading tolerance: rows persisted by pre-fix daemons can carry an
 /// anonymous `tool_use` block (`name: ""`) plus its paired errored
 /// `tool_result` at the head of an interrupt turn's assistant message.
@@ -12132,4 +12174,133 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
         "live session gains the sandbox branch"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// monorepo#958: the bounded `agent.get`/`agent.list` projection (metadata-only
+/// summary + last-rows projection) is byte-identical to the full-transcript
+/// projection of the same seeded session — every `AgentLite` field, including
+/// `messageCount`, `lastAgentResponse`, digest, `lastUserMessage`, and the
+/// derived `sessionCorrupted` flag.
+#[tokio::test]
+async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Parity").await;
+
+    let transcript = [
+        ("user", "first ask"),
+        (
+            "assistant",
+            "<group:Setup>\nolder detail\n</group>\nOlder final line\n\
+             <agent_digest>older digest</agent_digest>",
+        ),
+        ("user", "second ask\nwith a second line"),
+        (
+            "assistant",
+            "Intermediate line\nNewest final line\n<agent_digest>newest digest</agent_digest>",
+        ),
+        ("system", "trailing non-user/assistant row"),
+    ];
+    for (role, text) in transcript {
+        let content = json!([{ "type": "text", "text": text }]);
+        svc.store()
+            .append_agent_message(&id, role, &content, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    // Old (full-transcript) projection, still used by the event-emit paths.
+    let full = svc.store().get_agent_session(&id).await.expect("session");
+    let old = serde_json::to_value(svc.project_lite_with_flags(full)).unwrap();
+
+    // New bounded paths — `agent.get` (with the workspace scope check in
+    // play) and the `agent.list` entry.
+    let got = svc
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("get");
+    assert_eq!(got.message_count, 5);
+    assert_eq!(got.digest.as_deref(), Some("newest digest"));
+    assert_eq!(
+        got.last_agent_response.as_deref(),
+        Some("Newest final line")
+    );
+    assert_eq!(
+        got.last_user_message.as_deref(),
+        Some("second ask\nwith a second line")
+    );
+    assert_eq!(serde_json::to_value(got).unwrap(), old);
+
+    let agents = svc.agent_list_op(ws).await.expect("list");
+    let listed = agents.into_iter().find(|a| a.id == id).expect("listed");
+    assert_eq!(serde_json::to_value(listed).unwrap(), old);
+}
+
+/// monorepo#958 regression: `agent.list` and `agent.get` never hydrate full
+/// transcripts, and their per-session message work is bounded (the newest
+/// user/assistant rows only) regardless of per-agent message count — proven
+/// by corrupting the content JSON of every OTHER message row, which errors
+/// any path that fetches/decodes it (as `get_agent_session` demonstrates).
+/// Query count stays fixed by construction: `agent_list_op` issues one
+/// summaries read plus one bounded projections read for the whole workspace,
+/// never a per-agent (or per-message) transcript query.
+#[tokio::test]
+async fn agent_list_and_get_do_not_hydrate_transcripts_regression() {
+    let (_t, svc, ws) = setup().await;
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let id = create_agent(&svc, &ws, &format!("Busy{i}")).await;
+        for m in 0..40 {
+            let (role, text) = if m % 2 == 0 {
+                ("user", format!("ask {m}"))
+            } else {
+                ("assistant", format!("reply {m}"))
+            };
+            let content = json!([{ "type": "text", "text": text }]);
+            svc.store()
+                .append_agent_message(&id, role, &content, &now_iso())
+                .await
+                .expect("append");
+        }
+        ids.push(id);
+    }
+
+    // Corrupt every row except each agent's newest user and newest assistant
+    // messages: decoding any other row's content now fails hard.
+    for id in &ids {
+        sqlx::query(
+            "UPDATE agent_message SET content = 'not-json{' WHERE agent_id = ? \
+             AND seq NOT IN (SELECT MAX(seq) FROM agent_message WHERE agent_id = ? AND role = 'user') \
+             AND seq NOT IN (SELECT MAX(seq) FROM agent_message WHERE agent_id = ? AND role = 'assistant')",
+        )
+        .bind(&id.0)
+        .bind(&id.0)
+        .bind(&id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .expect("corrupt non-last rows");
+    }
+
+    // The full-hydration read (the old agent.list/agent.get implementation)
+    // fails on the corrupted rows — so the assertions below prove the new
+    // paths never touch them.
+    assert!(
+        svc.store().get_agent_session(&ids[0]).await.is_err(),
+        "full transcript hydration must fail on the corrupted rows"
+    );
+
+    let agents = svc.agent_list_op(ws.clone()).await.expect("list");
+    assert_eq!(agents.len(), 3);
+    for lite in &agents {
+        assert_eq!(lite.message_count, 40);
+        assert_eq!(lite.last_user_message.as_deref(), Some("ask 38"));
+        assert_eq!(lite.last_agent_response.as_deref(), Some("reply 39"));
+    }
+
+    let got = svc
+        .agent_get_op(ids[0].clone(), Some(ws))
+        .await
+        .expect("get");
+    assert_eq!(got.message_count, 40);
+    assert_eq!(got.last_user_message.as_deref(), Some("ask 38"));
+    assert_eq!(got.last_agent_response.as_deref(), Some("reply 39"));
 }
