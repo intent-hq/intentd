@@ -409,6 +409,13 @@ pub(crate) async fn channel_snapshot(
 /// existing paginated read, then — when a turn is currently streaming —
 /// the in-flight partial assistant message merged in (CS-0 D5) so a
 /// `chat.subscribe` arriving mid-turn reconstructs a coherent in-flight message.
+///
+/// **Bounded** (monorepo#958): exactly ONE conversation read, with no
+/// `nextToken` follow-up and the omitted `limit` resolving to the
+/// server-clamped default page, so the snapshot fetches/decodes only its
+/// bounded newest page regardless of transcript length — the paginated op
+/// selects just that page SQL-side and never re-hydrates the full history.
+/// Older pages stay client-pulled via `agent.getConversation { nextToken }`.
 /// The merge is gated on [`WorkspaceApi::agent_is_busy`]: a lingering
 /// `agent_live_turn` slot whose worker is gone (mid-turn crash, race between
 /// abort and slot release) MUST NOT surface a phantom "streaming" message

@@ -970,3 +970,116 @@ mod task_delta_re_read {
         assert!(d.get("removedIds").is_none());
     }
 }
+
+// --- chat_snapshot bounded seq-0 read (monorepo#958 regression) ------------
+
+mod chat_snapshot_bounded {
+    use super::*;
+    use intent_core::{BoxFuture, Result, WorkspaceApi};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal `WorkspaceApi` standing in for the SQL-paginated
+    /// `agent.getConversation` over a large (120-message) transcript: it
+    /// serves the bounded newest page (`truncated: true` + a `nextToken`)
+    /// and counts calls. The bounded-snapshot contract (monorepo#958) is
+    /// that `chat_snapshot` performs exactly ONE read — no token follow-up
+    /// to re-hydrate older pages — and forwards the page verbatim.
+    struct BoundedPageApi {
+        calls: AtomicUsize,
+        busy: bool,
+    }
+
+    impl BoundedPageApi {
+        fn new(busy: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                busy,
+            }
+        }
+    }
+
+    impl WorkspaceApi for BoundedPageApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            page_token: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // The snapshot must ask for the newest page (no cursor) and must
+            // not override the server-clamped bounded limit ([1,200]).
+            assert!(page_token.is_none(), "snapshot must not walk older pages");
+            assert!(
+                limit.is_none_or(|l| (1..=200).contains(&l)),
+                "snapshot limit must stay within the server clamp, got {limit:?}"
+            );
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [
+                        { "id": "m-118", "role": "user", "seq": 118 },
+                        { "id": "m-119", "role": "assistant", "seq": 119 },
+                    ],
+                    "truncated": true,
+                    "totalMessages": 120,
+                    "nextToken": "tok-older",
+                    "turnInFlight": false,
+                    "lastStreamActivityAt": Value::Null,
+                }))
+            })
+        }
+
+        fn agent_is_busy(&self, _agent_id: AgentId) -> bool {
+            self.busy
+        }
+
+        fn agent_live_turn(&self, _agent_id: AgentId) -> Option<Value> {
+            self.busy.then(|| {
+                json!({
+                    "messageId": "msg-live",
+                    "contentBlocks": [
+                        { "id": "msg-live:0", "type": "text", "text": "partial" }
+                    ],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_snapshot_reads_exactly_one_bounded_page_for_large_transcript() {
+        let api = BoundedPageApi::new(false);
+        let snap = chat_snapshot(&api, &agent()).await;
+        assert_eq!(
+            api.calls.load(Ordering::SeqCst),
+            1,
+            "seq-0 snapshot must issue exactly one bounded conversation read"
+        );
+        // The bounded page is forwarded verbatim: pagination fields intact,
+        // no attempt to inline the older history.
+        assert_eq!(snap["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(snap["truncated"], true);
+        assert_eq!(snap["totalMessages"], 120);
+        assert_eq!(snap["nextToken"], "tok-older");
+        // Activity flags are overlaid (all-false via the trait default here).
+        assert_eq!(snap["isResponding"], false);
+        assert_eq!(snap["waitingForAgentIds"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn chat_snapshot_merges_live_turn_on_truncated_page() {
+        let api = BoundedPageApi::new(true);
+        let snap = chat_snapshot(&api, &agent()).await;
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        // The in-flight message is appended after the bounded page with the
+        // next monotonic seq (CS-0 D5) — truncation does not disable the merge.
+        let messages = snap["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["id"], "msg-live");
+        assert_eq!(messages[2]["seq"], 120);
+        assert_eq!(messages[2]["isStreaming"], true);
+        assert_eq!(snap["totalMessages"], 121);
+        assert_eq!(snap["truncated"], true);
+        assert_eq!(snap["nextToken"], "tok-older");
+    }
+}
