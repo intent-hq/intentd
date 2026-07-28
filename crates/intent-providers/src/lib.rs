@@ -29,8 +29,8 @@ pub use config::{
     PI_ACP_NPX_PACKAGE,
 };
 pub use discover::{
-    discover_providers, find_npx, find_provider_binary, probe_npx, resolve_on_path, NpxStatus,
-    ProviderAvailability,
+    discover_providers, find_npx, find_provider_binary, not_installed_detail, probe_npx,
+    resolve_on_path, NpxStatus, ProviderAvailability,
 };
 pub use models::{
     create_compound_model_id, default_model_for_provider, fuzzy_match_model_in_pool,
