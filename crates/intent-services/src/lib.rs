@@ -13895,8 +13895,10 @@ impl WorkspaceApi for Services {
                         // Diagnosable skip (monorepo#939 trade-off): agent
                         // work not visible to the attribution pipeline (e.g.
                         // terminal/shell edits) is no longer swept — surface
-                        // it at warn so lost auto-commits can be traced.
-                        tracing::warn!(
+                        // it at debug so lost auto-commits can be traced
+                        // without re-firing a warn on every idle while the
+                        // worktree stays dirty.
+                        tracing::debug!(
                             workspace = %workspace_id.0,
                             agent = %agent.as_str(),
                             dirty = changed.len(),
