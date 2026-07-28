@@ -228,46 +228,60 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         .await
         .unwrap();
 
-    let mk_agent = |id: &str, name: &str, specialist: Option<&str>| AgentSession {
-        id: AgentId::from(id),
-        workspace_id: ws.clone(),
-        parent_agent_id: None,
-        backend_session_id: None,
-        acp_session_id: None,
-        name: name.to_string(),
-        name_explicitly_set: true,
-        model: None,
-        provider: None,
-        system_prompt: None,
-        specialist: specialist.map(str::to_string),
-        status: AgentStatus::Active,
-        is_active: true,
-        messages: vec![],
-        stats: None,
-        task_note_id: None,
-        skip_auto_commit: false,
-        completion_report: None,
-        completion_report_timestamp: None,
-        delegation_depth: None,
-        initial_message: None,
-        context_references: None,
-        image_blocks: None,
-        is_background: false,
-        metadata: None,
-        created_at: now_iso(),
-        updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
-        stop_reason: None,
-        session_corrupted: false,
-    };
+    // Distinct `created_at` values pin the `ORDER BY created_at` agent
+    // ordering: seeding both agents with `now_iso()` lets the timestamps tie
+    // under parallel-test load, flipping `agents[0]` (monorepo#967).
+    let mk_agent =
+        |id: &str, name: &str, specialist: Option<&str>, created_at: &str| AgentSession {
+            id: AgentId::from(id),
+            workspace_id: ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: name.to_string(),
+            name_explicitly_set: true,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: specialist.map(str::to_string),
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: created_at.to_string(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            session_corrupted: false,
+        };
     store
-        .insert_agent_session(&mk_agent("agent-1", "Builder", Some("implementor")))
+        .insert_agent_session(&mk_agent(
+            "agent-1",
+            "Builder",
+            Some("implementor"),
+            "2026-01-01T00:00:01Z",
+        ))
         .await
         .unwrap();
     store
-        .insert_agent_session(&mk_agent("agent-2", "Verifier", None))
+        .insert_agent_session(&mk_agent(
+            "agent-2",
+            "Verifier",
+            None,
+            "2026-01-01T00:00:02Z",
+        ))
         .await
         .unwrap();
 
@@ -16992,6 +17006,7 @@ mod last_activity_events {
     async fn token_usage_scan_only_on_change() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
+        let mut sub = subscribe(&h);
 
         // First scan (no prior usage, should emit).
         let changed1 = h
@@ -17001,8 +17016,17 @@ mod last_activity_events {
             .expect("scan 1");
         assert!(changed1, "first scan changed (none -> zero)");
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let mut sub = subscribe(&h);
+        // Consume the first scan's events deterministically instead of a
+        // sleep-based drain: under coverage CI the debounced lastActivity
+        // task can fire late and leak into the no-emit assertion below
+        // (monorepo#934). The immediate tokenUsage-changed lands first, then
+        // the debounced workspace:updated { lastActivity } (guaranteed to
+        // emit: the seeded workspace has no stored lastActivity).
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &h.ws.0, "workspace:updated");
+        assert!(ev["data"]["changes"]["lastActivity"].is_string());
 
         // Second scan (tallies unchanged, no emit).
         let changed2 = h
@@ -17012,6 +17036,8 @@ mod last_activity_events {
             .expect("scan 2");
         assert!(!changed2, "second scan unchanged");
 
+        // Nothing is pending from the first scan anymore, so any event in
+        // this window would be a real over-emit from the idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             timeout(Duration::from_millis(50), sub.recv())
