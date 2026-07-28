@@ -2322,6 +2322,106 @@ async fn ephemeral_event_retention_sweep_extended_families() {
     assert_eq!(removed_via_alias, 0, "idempotent via alias too");
 }
 
+/// Spec P3: the high-churn state-notification families (`workspace:updated`,
+/// `draft:changed`, `agent:status-changed`, `agent:idle`,
+/// `agent:subscriptions-changed`, `settings:changed`,
+/// `workspace:tokenUsage-changed`, `agent:queue:updated`) are swept on the
+/// same cutoff as the other ephemeral families — every consumer takes them
+/// from the live bus, nothing reads them back from the persisted log. Their
+/// lifecycle siblings (`workspace:created`, `agent:created`,
+/// `agent:completed`, `agent:queue:processing`, ...) are audit history and
+/// must survive regardless of age (exact-type scoping, no prefix bleed).
+#[tokio::test]
+async fn state_notification_retention_sweep_churn_families() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let agent = EventActor {
+        actor_type: ActorType::Agent,
+        id: Some("agent-1".to_string()),
+        ..Default::default()
+    };
+
+    let old = "2026-01-01T00:00:00Z";
+    let new = "2026-06-01T00:00:00Z";
+    let churn = [
+        events::WORKSPACE_UPDATED,
+        events::DRAFT_CHANGED,
+        events::AGENT_STATUS_CHANGED,
+        events::AGENT_IDLE,
+        events::AGENT_SUBSCRIPTIONS_CHANGED,
+        events::SETTINGS_CHANGED,
+        events::WORKSPACE_TOKEN_USAGE_CHANGED,
+        events::AGENT_QUEUE_UPDATED,
+    ];
+    let preserved = [
+        events::WORKSPACE_CREATED,
+        events::WORKSPACE_DELETED,
+        events::AGENT_CREATED,
+        events::AGENT_COMPLETED,
+        events::AGENT_QUEUE_PROCESSING, // sibling of agent:queue:updated
+        events::TASK_STATUS_CHANGED,
+    ];
+    let mut seed = Vec::new();
+    for t in churn {
+        // Old rows are eligible; in-window rows must survive.
+        seed.push(typed_event(&ws, old, t, agent.clone()));
+        seed.push(typed_event(&ws, new, t, agent.clone()));
+    }
+    for t in preserved {
+        seed.push(typed_event(&ws, old, t, agent.clone()));
+    }
+    for ev in &seed {
+        store.insert_event(ev).await.expect("insert seed event");
+    }
+
+    let cutoff = "2026-03-01T00:00:00Z";
+    let removed = store
+        .delete_ephemeral_events_before(cutoff)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        removed,
+        churn.len() as u64,
+        "exactly the old churn-family rows are removed"
+    );
+
+    let remaining = store
+        .events_by_workspace(&ws, 100)
+        .await
+        .expect("remaining");
+    assert_eq!(remaining.len(), churn.len() + preserved.len());
+    for t in churn {
+        assert!(
+            !remaining
+                .iter()
+                .any(|e| e.event_type == t && e.timestamp == old),
+            "old {t} must be pruned"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|e| e.event_type == t && e.timestamp == new),
+            "in-window {t} must survive"
+        );
+    }
+    for t in preserved {
+        assert!(
+            remaining
+                .iter()
+                .any(|e| e.event_type == t && e.timestamp == old),
+            "lifecycle family {t} must survive regardless of age"
+        );
+    }
+
+    // Idempotent: a re-run with the same cutoff removes nothing more.
+    let removed_again = store
+        .delete_ephemeral_events_before(cutoff)
+        .await
+        .expect("sweep re-run");
+    assert_eq!(removed_again, 0);
+}
+
 /// Earlier test retained for coverage of the legacy behavior (stream-only sweep);
 /// the new `ephemeral_event_retention_sweep_extended_families` above covers the
 /// extended scope (finding F4).
