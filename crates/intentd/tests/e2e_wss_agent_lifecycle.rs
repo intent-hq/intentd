@@ -4483,6 +4483,39 @@ async fn terminal_create_env_over_wss() {
         "terminal.create must overlay the caller's env onto the spawned child \
          (PROTOCOL §5.13); output was: {text:?}, saw_exit={saw_exit}"
     );
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        listed
+            .as_array()
+            .is_some_and(|terms| terms.iter().all(|term| term["id"] != terminal_id)),
+        "naturally exited terminal must be omitted from terminal.list: {listed}"
+    );
+
+    let buffer = wss_rpc(
+        &mut rpc,
+        4,
+        "terminal.getBuffer",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
+    assert_eq!(buffer["terminalId"], json!(terminal_id));
+    assert!(buffer["data"].is_string(), "retained scrollback: {buffer}");
+
+    let released = wss_rpc(
+        &mut rpc,
+        5,
+        "terminal.kill",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
+    assert_eq!(released["ok"], json!(true));
 }
 
 /// Regression (paste/echo throughput): `terminal:data` is transient /

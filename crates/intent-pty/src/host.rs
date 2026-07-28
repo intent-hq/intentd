@@ -478,13 +478,14 @@ impl PtyHost {
         self.sessions.lock().unwrap().len()
     }
 
-    /// The PTYs currently tracked under `scope`.
+    /// The live PTYs currently tracked under `scope`. Exited sessions remain
+    /// retained for post-exit output and explicit release, but are not listed.
     pub fn list_scope(&self, scope: &str) -> Vec<PtyId> {
         self.sessions
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.scope == scope)
+            .filter(|(_, s)| s.scope == scope && observe_exit(s).is_none())
             .map(|(id, _)| *id)
             .collect()
     }
