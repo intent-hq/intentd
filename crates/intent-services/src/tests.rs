@@ -9912,6 +9912,75 @@ mod usage_stats_recording {
         assert_eq!(lines_for(&svc, "unknown").await, (14, 5));
     }
 
+    /// Regression (monorepo#1023): an **update** to an existing row baselines
+    /// against `max(own prev, sibling max)`, so growth a sibling row already
+    /// recorded is not replayed when another agent's row on the shared path is
+    /// subsequently updated — the growth lands once per
+    /// `(workspace, path, stage)`, not once per agent row.
+    #[tokio::test]
+    async fn updated_row_on_shared_path_does_not_re_record_sibling_growth() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        // Step 1: agent A's row at (10, 0); agent B's fresh row replays the
+        // same full-file diff → zero delta (monorepo#1009 behavior).
+        let first =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-a"), 10, 0))
+                .await
+                .expect("first");
+        assert_eq!(first, (10, 0));
+        let fresh =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-b"), 10, 0))
+                .await
+                .expect("fresh");
+        assert_eq!(fresh, (0, 0));
+        // Step 2: the file grows to 14 additions; A edits → the growth records.
+        let growth =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-a"), 14, 0))
+                .await
+                .expect("growth");
+        assert_eq!(growth, (4, 0));
+        // Step 3: B later edits (its row updates 10 → 14). The sibling max is
+        // already 14, so the delta is (0, 0) — not (4, 0) recorded again.
+        let update =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-b"), 14, 0))
+                .await
+                .expect("update");
+        assert_eq!(
+            update,
+            (0, 0),
+            "sibling-recorded growth must not replay on a row update"
+        );
+        // A lone agent's update on an unshared path still records its growth.
+        let solo_first = crate::file_tracking::track_change(
+            store,
+            change(&ws, "solo.ts", Some("agent-a"), 3, 1),
+        )
+        .await
+        .expect("solo first");
+        assert_eq!(solo_first, (3, 1));
+        let solo_growth = crate::file_tracking::track_change(
+            store,
+            change(&ws, "solo.ts", Some("agent-a"), 7, 2),
+        )
+        .await
+        .expect("solo growth");
+        assert_eq!(solo_growth, (4, 1));
+
+        // End-to-end: recording every delta accrues the shared file's true
+        // totals once (14/0) plus the solo file's (7/2).
+        for (agent, (added, deleted)) in [
+            ("agent-a", first),
+            ("agent-b", fresh),
+            ("agent-a", growth),
+            ("agent-b", update),
+            ("agent-a", solo_first),
+            ("agent-a", solo_growth),
+        ] {
+            crate::usage_stats::record_lines_changed(store, &ws, Some(agent), added, deleted).await;
+        }
+        assert_eq!(lines_for(&svc, "unknown").await, (21, 2));
+    }
+
     /// The recorded delta lands in `usage_stats_hourly` under the acting
     /// agent's normalized model, keeps accruing across recordings, and is
     /// untouched by clearing the workspace/agent metrics aggregates
