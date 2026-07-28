@@ -7116,6 +7116,7 @@ mod wsapi4_bindings_tests {
     type WatchSenderCall = (String, String);
     type SubscribeCall = (Vec<String>, Option<bool>, Option<i64>);
     type DelegateCall = (Option<String>, Option<String>);
+    type WakeOrCreateCall = (String, String, Option<String>, Option<Value>);
     type DirCall = (String, Option<i64>);
 
     #[derive(Default)]
@@ -7125,6 +7126,7 @@ mod wsapi4_bindings_tests {
         agent_send_calls: Mutex<Vec<SendCall>>,
         agent_send_to_task_calls: Mutex<Vec<SendToTaskCall>>,
         agent_delegate_calls: Mutex<Vec<DelegateCall>>,
+        agent_wake_or_create_calls: Mutex<Vec<WakeOrCreateCall>>,
         agent_subscribe_calls: Mutex<Vec<SubscribeCall>>,
         agent_unsubscribe_calls: Mutex<Vec<String>>,
         event_subscribe_calls: Mutex<Vec<SubscribeCall>>,
@@ -7248,6 +7250,24 @@ mod wsapi4_bindings_tests {
             ));
             Box::pin(async move {
                 Ok(json!({ "ok": true, "agentId": "agent-assignee", "result": { "ok": true } }))
+            })
+        }
+
+        fn agent_wake_or_create(
+            &self,
+            _ws: WorkspaceId,
+            task_note_id: intent_core::NoteId,
+            context_message: String,
+            input: intent_core::AgentWakeOrCreateInput,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.agent_wake_or_create_calls.lock().unwrap().push((
+                task_note_id.as_str().to_string(),
+                context_message,
+                input.model,
+                input.message_metadata,
+            ));
+            Box::pin(async move {
+                Ok(json!({ "ok": true, "agentId": "agent-woken", "action": "resumed" }))
             })
         }
 
@@ -7663,6 +7683,89 @@ mod wsapi4_bindings_tests {
         let calls = api.agent_send_calls.lock().unwrap();
         assert_eq!(calls[0].0, "child-1");
         assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+    }
+
+    /// `wakeOrCreate`'s delivered context message is an agent-originated send
+    /// and must carry the same `agent_message` attribution block as `send` /
+    /// `sendToTask` (monorepo#1015). The caller name is reused from the
+    /// depth-guard lookup — no second `agent_get` round-trip.
+    #[tokio::test]
+    async fn agent_wake_or_create_with_caller_tags_sender_metadata() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.agent.wakeOrCreate('tn-1', 'ctx');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_wake_or_create_calls.lock().unwrap();
+        assert_eq!(calls[0].0, "tn-1");
+        assert_eq!(calls[0].1, "ctx");
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": "agent-caller-1",
+            }))
+        );
+        assert_eq!(api.agent_get_calls.lock().unwrap().len(), 1);
+    }
+
+    /// Explicit `messageMetadata` on `wakeOrCreate` (new optional 4th arg)
+    /// wins over the auto-tag.
+    #[tokio::test]
+    async fn agent_wake_or_create_explicit_metadata_wins_over_auto_tag() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', null, { type: 'custom' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_wake_or_create_calls.lock().unwrap();
+        assert_eq!(calls[0].3, Some(json!({ "type": "custom" })));
+    }
+
+    /// Caller-less (FE/RPC front door) wakes stay untagged.
+    #[tokio::test]
+    async fn agent_wake_or_create_without_caller_has_no_sender_metadata() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.agent.wakeOrCreate('tn-1', 'ctx');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_wake_or_create_calls.lock().unwrap();
+        assert_eq!(calls[0].3, None);
+    }
+
+    /// The attribution schema stays stable when the depth-guard name lookup
+    /// fails: `fromAgentName` is present but `null`, never omitted.
+    #[tokio::test]
+    async fn agent_wake_or_create_name_lookup_failure_keeps_null_from_agent_name() {
+        let (srv, api) = server_with_caller("caller-1");
+        *api.agent_get_error.lock().unwrap() = Some("agent not found".to_string());
+        let resp = call(&srv, "return await ws.agent.wakeOrCreate('tn-1', 'ctx');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_wake_or_create_calls.lock().unwrap();
+        assert_eq!(
+            calls[0].3,
+            Some(json!({
+                "type": "agent_message",
+                "fromAgentId": "caller-1",
+                "fromAgentName": null,
+            }))
+        );
+    }
+
+    /// The three-arg `wakeOrCreate` form stays green: `model` still threads
+    /// through with the auto-tag applied.
+    #[tokio::test]
+    async fn agent_wake_or_create_three_arg_form_threads_model() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', 'opus');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.agent_wake_or_create_calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("opus"));
+        assert_eq!(calls[0].3.as_ref().unwrap()["type"], json!("agent_message"));
     }
 
     #[tokio::test]

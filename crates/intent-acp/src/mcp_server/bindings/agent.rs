@@ -41,8 +41,8 @@ pub(crate) const PRELUDE: &str = r#"
         status: (agentId) => host({ method: 'agent.status', args: { agentId } }),
         diagnostics: (opts) =>
             host({ method: 'agent.diagnostics', args: { ...(opts || {}) } }),
-        wakeOrCreate: (taskNoteId, contextMessage, model) =>
-            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model } }),
+        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata) =>
+            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
@@ -386,6 +386,7 @@ async fn wake_or_create(
         req_str(args, "taskNoteId").map_err(|_| "taskNoteId is required".to_string())?;
     let context_message =
         req_str(args, "contextMessage").map_err(|_| "contextMessage is required".to_string())?;
+    let mut caller_name: Option<String> = None;
     if let Some(c) = caller {
         if let Ok(caller_lite) = api.agent_get(c.clone(), Some(ws.clone())).await {
             let depth = caller_lite.metadata.delegation_depth.unwrap_or(0);
@@ -394,8 +395,14 @@ async fn wake_or_create(
                     "Cannot delegate task: maximum delegation depth ({MAX_DELEGATION_DEPTH}) reached. You are at depth {depth}. Please complete this task directly instead of delegating further."
                 ));
             }
+            caller_name = Some(caller_lite.name);
         }
     }
+    // Sender attribution on the delivered context message (monorepo#1015):
+    // same explicit-wins/auto-tag semantics as `send`, reusing the
+    // depth-guard lookup's name (no second `agent_get` round-trip).
+    let message_metadata = explicit_metadata(args)
+        .or_else(|| caller.map(|c| agent_message_metadata(c, caller_name.as_deref())));
     let v = api
         .agent_wake_or_create(
             ws.clone(),
@@ -404,6 +411,7 @@ async fn wake_or_create(
             AgentWakeOrCreateInput {
                 model: opt_str(args, "model"),
                 caller_agent_id: caller.cloned(),
+                message_metadata,
                 ..Default::default()
             },
         )
