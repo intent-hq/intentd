@@ -4508,10 +4508,12 @@ async fn github_missing_required_params_are_minus_32602() {
     }
 }
 
-/// FIX 1 parity: `agent.sendMessage` / `agent.forceMessage` must forward the
-/// FE-side per-turn prompt-assembly hints (`noteIds`, `stdinContext`,
-/// `contextReferences`) verbatim to the [`WorkspaceApi`] call — the daemon
-/// previously dropped them (see FE audit).
+/// FIX 1 parity: `agent.sendMessage` must forward the FE-side per-turn
+/// prompt-assembly hints (`noteIds`, `stdinContext`, `contextReferences`)
+/// verbatim to the [`WorkspaceApi`] call — the daemon previously dropped
+/// them (see FE audit). Also covers `agent.sendQueuedMessageNow`'s param
+/// forwarding (the queued entry carries its own payload, so only the ids
+/// cross the wire).
 mod send_message_payload_forwarding {
     use std::sync::{Arc, Mutex};
 
@@ -4520,9 +4522,10 @@ mod send_message_payload_forwarding {
 
     use super::super::handle_message;
 
-    /// Recorded snapshot of a single `agent_send_message` / `agent_force_message`
-    /// call. Only the fields the FIX widens are asserted; the rest are captured
-    /// so the tests document the full observed shape.
+    /// Recorded snapshot of a single `agent_send_message` /
+    /// `agent_send_queued_message_now` call. Only the fields the FIX widens
+    /// are asserted; the rest are captured so the tests document the full
+    /// observed shape.
     #[derive(Default, Debug, Clone)]
     #[allow(dead_code)]
     struct Capture {
@@ -4542,7 +4545,7 @@ mod send_message_payload_forwarding {
     #[derive(Default)]
     struct RecordingApi {
         send: Arc<Mutex<Capture>>,
-        force: Arc<Mutex<Capture>>,
+        send_now: Arc<Mutex<Capture>>,
     }
 
     impl WorkspaceApi for RecordingApi {
@@ -4580,34 +4583,19 @@ mod send_message_payload_forwarding {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
-        fn agent_force_message(
+        fn agent_send_queued_message_now(
             &self,
             workspace_id: WorkspaceId,
             agent_id: AgentId,
             message_id: String,
-            content: String,
-            image_blocks: Option<Value>,
-            file_blocks: Option<Value>,
-            note_ids: Option<Value>,
-            stdin_context: Option<String>,
-            context_references: Option<Value>,
-            message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
-            let slot = self.force.clone();
+            let slot = self.send_now.clone();
             Box::pin(async move {
                 *slot.lock().unwrap() = Capture {
                     workspace_id: Some(workspace_id),
                     agent_id: Some(agent_id),
-                    content: Some(content),
                     message_id: Some(message_id),
-                    image_blocks,
-                    file_blocks,
-                    priority: None,
-                    note_ids,
-                    stdin_context,
-                    context_references,
-                    message_metadata,
+                    ..Capture::default()
                 };
                 Ok(json!({ "success": true, "queued": false, "messageId": "m-2" }))
             })
@@ -4669,27 +4657,41 @@ mod send_message_payload_forwarding {
     }
 
     #[tokio::test]
-    async fn force_message_forwards_stdin_context_and_context_references() {
+    async fn send_queued_message_now_forwards_ids_verbatim() {
         let api = RecordingApi::default();
         let msg = r#"{
-            "jsonrpc":"2.0","id":3,"method":"agent.forceMessage",
+            "jsonrpc":"2.0","id":3,"method":"agent.sendQueuedMessageNow",
             "params":{
                 "workspaceId":"ws-1",
                 "agentId":"agent-1",
-                "messageId":"m-force",
-                "content":"stop",
-                "noteIds":["note-x"],
-                "stdinContext":"forced ctx",
-                "contextReferences":[{"symbol":"Foo"}]
+                "messageId":"user-msg-queued"
             }
         }"#;
-        handle_message(&api, msg).await.expect("response");
-        let cap = api.force.lock().unwrap().clone();
-        assert_eq!(cap.message_id.as_deref(), Some("m-force"));
-        assert_eq!(cap.content.as_deref(), Some("stop"));
-        assert_eq!(cap.stdin_context.as_deref(), Some("forced ctx"));
-        assert_eq!(cap.note_ids, Some(json!(["note-x"])));
-        assert_eq!(cap.context_references, Some(json!([{"symbol": "Foo"}])));
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["success"], Value::Bool(true));
+        let cap = api.send_now.lock().unwrap().clone();
+        assert_eq!(cap.workspace_id.as_ref().map(|w| w.as_str()), Some("ws-1"));
+        assert_eq!(cap.agent_id.as_ref().map(|a| a.as_str()), Some("agent-1"));
+        assert_eq!(cap.message_id.as_deref(), Some("user-msg-queued"));
+    }
+
+    /// `agent.sendQueuedMessageNow` requires `messageId` (the queued entry
+    /// to dequeue) — missing params are `-32602` before any API call.
+    #[tokio::test]
+    async fn send_queued_message_now_missing_message_id_is_invalid_params() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":4,"method":"agent.sendQueuedMessageNow",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1"}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["code"], json!(-32602));
+        assert!(
+            api.send_now.lock().unwrap().message_id.is_none(),
+            "the API must not be called on a malformed request"
+        );
     }
 
     #[tokio::test]
@@ -4720,12 +4722,11 @@ mod send_message_payload_forwarding {
     }
 
     /// `messageMetadata` (PROTOCOL §5.5) is the opaque per-message payload
-    /// the FE attaches to distinguish daemon-initiated turns; both
-    /// `agent.sendMessage` and `agent.forceMessage` must forward it
-    /// verbatim to [`WorkspaceApi`] so the store can persist it on the
-    /// user row (Fidelity B).
+    /// the FE attaches to distinguish daemon-initiated turns;
+    /// `agent.sendMessage` must forward it verbatim to [`WorkspaceApi`] so
+    /// the store can persist it on the user row (Fidelity B).
     #[tokio::test]
-    async fn send_and_force_message_forward_message_metadata_verbatim() {
+    async fn send_message_forwards_message_metadata_verbatim() {
         let api = RecordingApi::default();
         let send = r#"{
             "jsonrpc":"2.0","id":10,"method":"agent.sendMessage",
@@ -4741,26 +4742,10 @@ mod send_message_payload_forwarding {
             Some(json!({"source": "system", "tag": "restart"})),
             "sendMessage must forward messageMetadata verbatim"
         );
-
-        let force = r#"{
-            "jsonrpc":"2.0","id":11,"method":"agent.forceMessage",
-            "params":{
-                "workspaceId":"ws-1","agentId":"agent-1",
-                "messageId":"m-force","content":"stop",
-                "messageMetadata":{"kind":"queue-drain"}
-            }
-        }"#;
-        handle_message(&api, force).await.expect("force response");
-        let cap = api.force.lock().unwrap().clone();
-        assert_eq!(
-            cap.message_metadata,
-            Some(json!({"kind": "queue-drain"})),
-            "forceMessage must forward messageMetadata verbatim"
-        );
     }
 
-    /// Omitted `messageMetadata` collapses to `None` on both arms (same
-    /// contract as the other opaque payloads).
+    /// Omitted `messageMetadata` collapses to `None` (same contract as the
+    /// other opaque payloads).
     #[tokio::test]
     async fn omitted_message_metadata_is_none() {
         let api = RecordingApi::default();
@@ -4770,44 +4755,6 @@ mod send_message_payload_forwarding {
         }"#;
         handle_message(&api, send).await.expect("send response");
         assert!(api.send.lock().unwrap().message_metadata.is_none());
-
-        let force = r#"{
-            "jsonrpc":"2.0","id":13,"method":"agent.forceMessage",
-            "params":{
-                "workspaceId":"ws-1","agentId":"agent-1",
-                "messageId":"m-x","content":"stop"
-            }
-        }"#;
-        handle_message(&api, force).await.expect("force response");
-        assert!(api.force.lock().unwrap().message_metadata.is_none());
-    }
-
-    #[tokio::test]
-    async fn force_message_forwards_image_and_file_blocks() {
-        let api = RecordingApi::default();
-        let msg = r#"{
-            "jsonrpc":"2.0","id":5,"method":"agent.forceMessage",
-            "params":{
-                "workspaceId":"ws-1",
-                "agentId":"agent-1",
-                "messageId":"m-force",
-                "content":"stop",
-                "imageBlocks":[{"data":"YWFh","mimeType":"image/jpeg"}],
-                "fileBlocks":[{"data":"YmJi","mimeType":"application/pdf","fileName":"spec.pdf"}]
-            }
-        }"#;
-        handle_message(&api, msg).await.expect("response");
-        let cap = api.force.lock().unwrap().clone();
-        assert_eq!(
-            cap.image_blocks,
-            Some(json!([{"data": "YWFh", "mimeType": "image/jpeg"}])),
-            "imageBlocks must be forwarded verbatim"
-        );
-        assert_eq!(
-            cap.file_blocks,
-            Some(json!([{"data": "YmJi", "mimeType": "application/pdf", "fileName": "spec.pdf"}])),
-            "fileBlocks must be forwarded verbatim"
-        );
     }
 }
 

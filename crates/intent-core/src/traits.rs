@@ -1307,39 +1307,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.forceMessage`: stop the current stream then deliver immediately
-    /// (PROTOCOL §5.5). Accepts the same attachment (`image_blocks`,
-    /// `file_blocks`) and per-turn prompt-assembly (`stdin_context`,
-    /// `note_ids`, `context_references`) hints as `sendMessage`.
-    #[allow(clippy::too_many_arguments)]
-    fn agent_force_message(
+    /// `agent.sendQueuedMessageNow`: atomically dequeue the queued entry
+    /// named by `message_id` and deliver it immediately with interrupt
+    /// priority, preserving the rest of the queue (PROTOCOL §5.5). An absent
+    /// entry is `-32602` ("queued message not found") with NO side effects —
+    /// deliberately NOT idempotent (unlike `agent.removeQueuedMessage`), so
+    /// the client knows the atomic send did not happen.
+    fn agent_send_queued_message_now(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         message_id: String,
-        content: String,
-        image_blocks: Option<serde_json::Value>,
-        file_blocks: Option<serde_json::Value>,
-        note_ids: Option<serde_json::Value>,
-        stdin_context: Option<String>,
-        context_references: Option<serde_json::Value>,
-        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (
-            workspace_id,
-            agent_id,
-            message_id,
-            content,
-            image_blocks,
-            file_blocks,
-            note_ids,
-            stdin_context,
-            context_references,
-            message_metadata,
-        );
+        let _ = (workspace_id, agent_id, message_id);
         Box::pin(async {
             Err(Error::Internal(
-                "WorkspaceApi::agent_force_message not implemented".to_string(),
+                "WorkspaceApi::agent_send_queued_message_now not implemented".to_string(),
             ))
         })
     }

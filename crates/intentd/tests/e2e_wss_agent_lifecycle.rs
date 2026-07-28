@@ -4371,6 +4371,226 @@ async fn remove_queued_message_is_idempotent_over_wss() {
     assert_eq!(r2["success"], json!(true));
 }
 
+/// `agent.sendQueuedMessageNow` over WSS (PROTOCOL §5.5): with the agent
+/// mid-turn (parked at session/cancel) and TWO entries queued, sending the
+/// SECOND entry now atomically dequeues it — `agent:queue:updated` carries the
+/// shrunk snapshot with the FIRST entry preserved — preempts the in-flight
+/// turn keep-alive (terminal stream:end, then the entry streams `turn=2` on
+/// the SAME child), and the response mirrors sendMessage:
+/// `{ success, queued: false, messageId: <entry id> }`. An unknown entry id
+/// is `-32602` with no side effects (deliberately NOT idempotent).
+#[tokio::test]
+async fn send_queued_message_now_over_wss() {
+    let Some(script) = gate("WSS sendQueuedMessageNow E2E") else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let behavior = json!({ "blockUntilCancel": true, "response": "resumed" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe to agent:* BEFORE any queue mutation.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string());
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "QSendNow", "model": "mock:default" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Engage a turn that parks at session/cancel so the queue entries below
+    // stay queued (no self-drain race) and the send-now must PREEMPT.
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let mut saw_block_chunk = false;
+    for _ in 0..50 {
+        let frame = wss_event(&mut sub, 30).await;
+        if frame["params"]["event"]["type"] == "agent:stream:chunk"
+            && frame["params"]["event"]["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streaming-before-cancel")
+        {
+            saw_block_chunk = true;
+            break;
+        }
+    }
+    assert!(saw_block_chunk, "first turn streamed a chunk and parked");
+
+    // Two entries queue up behind the parked turn.
+    let q_first = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.queueMessage",
+        json!({ "agentId": agent_id, "content": "stays queued" }),
+    )
+    .await;
+    let first_id = q_first["queuedMessage"]["id"].as_str().unwrap().to_string();
+    let q_second = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.queueMessage",
+        json!({ "agentId": agent_id, "content": "send me now" }),
+    )
+    .await;
+    let second_id = q_second["queuedMessage"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Send the SECOND entry now: response mirrors sendMessage and echoes the
+    // ENTRY id as the delivered messageId.
+    let now = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendQueuedMessageNow",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "messageId": second_id }),
+    )
+    .await;
+    assert_eq!(now["success"], true, "send now ok: {now}");
+    assert_eq!(
+        now["queued"], false,
+        "send-now preempts and streams immediately, never queues: {now}"
+    );
+    assert_eq!(
+        now["messageId"].as_str(),
+        Some(second_id.as_str()),
+        "the delivered messageId is the queue entry's own id: {now}"
+    );
+
+    // Wire ordering: `agent:queue:updated` carries the SHRUNK snapshot (the
+    // first entry alone — atomic dequeue preserved the rest of the queue),
+    // the preempted turn emits its terminal stream:end, then the entry
+    // streams `turn=2` on the SAME child (keep-alive, not a respawn). The
+    // subscriber also buffered the ENQUEUE-time snapshots ([first] then
+    // [first, second]), so the shrunk [first] snapshot only counts once the
+    // two-entry snapshot has been observed.
+    let mut saw_two_entry_queue = false;
+    let mut saw_shrunk_queue = false;
+    let mut saw_preempt_end = false;
+    let mut saw_turn2_chunk = false;
+    for _ in 0..80 {
+        let frame = wss_event(&mut sub, 30).await;
+        let evt = &frame["params"]["event"];
+        match evt["type"].as_str() {
+            Some("agent:queue:updated")
+                if evt["data"]["agentId"].as_str() == Some(agent_id.as_str()) =>
+            {
+                let queue = evt["data"]["queue"].as_array().expect("queue array");
+                if queue.len() == 2 {
+                    saw_two_entry_queue = true;
+                } else if saw_two_entry_queue
+                    && queue.len() == 1
+                    && queue[0]["id"].as_str() == Some(first_id.as_str())
+                {
+                    saw_shrunk_queue = true;
+                }
+            }
+            Some("agent:stream:end") if !saw_preempt_end => {
+                saw_preempt_end = true;
+            }
+            Some("agent:stream:chunk")
+                if evt["data"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("turn=2") =>
+            {
+                assert!(
+                    saw_preempt_end,
+                    "the send-now turn starts only after the preempted turn's stream:end"
+                );
+                saw_turn2_chunk = true;
+            }
+            _ => {}
+        }
+        if saw_shrunk_queue && saw_preempt_end && saw_turn2_chunk {
+            break;
+        }
+    }
+    assert!(
+        saw_shrunk_queue,
+        "agent:queue:updated republished the shrunk snapshot with the rest of the queue preserved"
+    );
+    assert!(
+        saw_preempt_end,
+        "preemption emitted the terminal stream:end"
+    );
+    assert!(
+        saw_turn2_chunk,
+        "the dequeued entry ran on the SAME process (mock reported turn=2, not a turn=1 respawn)"
+    );
+
+    // The delivered user row persists under the ENTRY id.
+    let convo = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.getConversation",
+        json!({ "agentId": agent_id }),
+    )
+    .await;
+    let row = convo["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|m| m["id"].as_str() == Some(second_id.as_str()))
+        .expect("dequeued user row persisted under the entry id")
+        .clone();
+    assert_eq!(row["role"], "user");
+
+    // Unknown entry id → -32602, no side effects (NOT idempotent — contrast
+    // `agent.removeQueuedMessage`).
+    let err_env = wss_rpc_envelope(
+        &mut rpc,
+        16,
+        "agent.sendQueuedMessageNow",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "messageId": "no-such-entry" }),
+    )
+    .await;
+    assert_eq!(
+        err_env["error"]["code"],
+        json!(-32602),
+        "absent entry is invalid params: {err_env}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Mixed-case drain with an under-edit message (PROTOCOL §5.5/§6.5 invariant):
 // when the queue contains ready-to-send messages alongside one marked
@@ -8087,7 +8307,7 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
 }
 
 /// `agent.editAndRegenerate` on a BUSY agent stops the in-flight turn first
-/// (forceMessage stop semantics), then truncates and regenerates — no wedged
+/// (hard-stop semantics), then truncates and regenerates — no wedged
 /// state. The first turn parks mid-flight (`parkIfPromptContains`); the edit
 /// lands while it is in flight.
 #[tokio::test]

@@ -1108,36 +1108,12 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
-        "agent.forceMessage" => {
+        "agent.sendQueuedMessageNow" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
-            let content = require_str_param(params, "content")?;
             let ws = require_ws_note(params)?;
-            let image_blocks = opt_value(params, "imageBlocks");
-            let file_blocks = opt_value(params, "fileBlocks");
-            let note_ids = opt_value(params, "noteIds");
-            // Per-turn prompt-assembly hints (PROTOCOL §5.5); same shape as
-            // `agent.sendMessage`.
-            let stdin_context = opt_str(params, "stdinContext");
-            let context_references = opt_value(params, "contextReferences");
-            // Opaque per-message payload (PROTOCOL §5.5); see the
-            // `agent.sendMessage` extraction site above for the
-            // `userAppMessageId` fold and metadata semantics.
-            let message_metadata = opt_value(params, "messageMetadata");
-            let message_metadata = merge_user_app_message_id(params, message_metadata)?;
             let result = api
-                .agent_force_message(
-                    ws,
-                    agent_id,
-                    message_id,
-                    content,
-                    image_blocks,
-                    file_blocks,
-                    note_ids,
-                    stdin_context,
-                    context_references,
-                    message_metadata,
-                )
+                .agent_send_queued_message_now(ws, agent_id, message_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

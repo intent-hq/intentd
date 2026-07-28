@@ -1801,8 +1801,8 @@ pub struct AgentMessage {
     pub role: String,
     #[serde(rename = "contentBlocks")]
     pub content: serde_json::Value,
-    /// Opaque per-message payload the FE attaches to `agent.sendMessage` /
-    /// `agent.forceMessage` as `messageMetadata` (PROTOCOL §5.5): e.g.
+    /// Opaque per-message payload the FE attaches to `agent.sendMessage` as
+    /// `messageMetadata` (PROTOCOL §5.5): e.g.
     /// `{ source: "system" }` for daemon-initiated turns. Persisted verbatim
     /// on the user message row and round-tripped on transcript reads; `None`
     /// for messages without caller-supplied metadata.

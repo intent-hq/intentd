@@ -695,35 +695,55 @@ async fn uds_slice_end_to_end() {
     .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
 
-    // (s0b) agent.forceMessage with `userAppMessageId` → the store-only
-    // fallback persists the folded metadata too, so the id round-trips the
-    // same way as sendMessage (PROTOCOL §5.5).
+    // (s0b) agent.sendQueuedMessageNow → the store-only fallback atomically
+    // dequeues the queued entry and persists it under the ENTRY id, which the
+    // result's `messageId` echoes (PROTOCOL §5.5).
     let resp = send(
         &config.socket_path,
         &format!(
-            r#"{{"jsonrpc":"2.0","id":254,"method":"agent.forceMessage","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","messageId":"m3","content":"forced tagged","userAppMessageId":"app-msg-e2e-2"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":254,"method":"agent.queueMessage","params":{{"agentId":"{agent_id}","content":"queued then sent now"}}}}"#
+        ),
+    )
+    .await;
+    let queued_id = resp["result"]["queuedMessage"]["id"]
+        .as_str()
+        .expect("queued entry id")
+        .to_string();
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":255,"method":"agent.sendQueuedMessageNow","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","messageId":"{queued_id}"}}}}"#
         ),
     )
     .await;
     assert_eq!(resp["result"]["success"], json!(true));
+    assert_eq!(resp["result"]["queued"], json!(false));
+    assert_eq!(resp["result"]["messageId"], json!(queued_id));
     let resp = send(
         &config.socket_path,
         &format!(
-            r#"{{"jsonrpc":"2.0","id":255,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
+            r#"{{"jsonrpc":"2.0","id":256,"method":"agent.getConversation","params":{{"agentId":"{agent_id}"}}}}"#
         ),
     )
     .await;
-    let forced = resp["result"]["messages"]
+    let sent_now = resp["result"]["messages"]
         .as_array()
         .expect("messages array")
         .iter()
-        .find(|m| m["id"] == json!("m3"))
-        .expect("forced user row present");
-    assert_eq!(forced["appMessageId"], json!("app-msg-e2e-2"));
-    assert_eq!(
-        forced["metadata"]["userAppMessageId"],
-        json!("app-msg-e2e-2")
-    );
+        .find(|m| m["id"] == json!(queued_id))
+        .expect("dequeued user row present under the entry id");
+    assert_eq!(sent_now["role"], json!("user"));
+
+    // (s0c) agent.sendQueuedMessageNow with an unknown entry id → -32602 with
+    // NO side effects (deliberately NOT idempotent, PROTOCOL §5.5).
+    let resp = send(
+        &config.socket_path,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":257,"method":"agent.sendQueuedMessageNow","params":{{"workspaceId":"ws-seed","agentId":"{agent_id}","messageId":"no-such-entry"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
 
     // (s1a) agent.getSession → full `AgentSession` (superset of AgentLite):
     // `messages` is present as an array (the field AgentLite strips). Confirms
