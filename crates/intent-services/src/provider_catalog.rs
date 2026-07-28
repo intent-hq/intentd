@@ -1,4 +1,5 @@
-//! `providers.catalog` payload builder (§6.9, monorepo#928).
+//! `providers.catalog` payload builder (monorepo#928; documented in the
+//! monorepo `docs/PROTOCOL.md` as of protocol 2.6).
 //!
 //! Serves the static `intent-providers` registry over the wire so clients no
 //! longer need a local copy of `provider-config.ts`. Every registered
@@ -30,16 +31,12 @@ fn build_providers_catalog_with_env(env_has: &dyn Fn(&str) -> bool) -> Value {
     })
 }
 
-/// Whether a provider passes the daemon-side visibility gate: a configured
-/// `requires_env_var` must be present in the environment, and a configured
-/// `requires_feature_code` always gates (the daemon stores no feature-code
-/// enablement — the same default-deny `models.list` applies to cortex in
-/// `model_catalog::cortex_fetch`).
+/// Whether a provider passes the daemon-side visibility gate. Derived from
+/// [`intent_providers::gated_reason_with_env`] — the single env-var/
+/// feature-code gate shared with discovery's `gatedOff` and the default-deny
+/// `models.list` applies to cortex — so the surfaces can never drift.
 fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> bool {
-    if p.requires_env_var.is_some_and(|var| !env_has(var)) {
-        return false;
-    }
-    p.requires_feature_code.is_none()
+    intent_providers::gated_reason_with_env(p, env_has).is_none()
 }
 
 /// One catalog row (camelCase on the wire). Optional fields are omitted when
