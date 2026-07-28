@@ -24,11 +24,18 @@ struct Acc {
     paths: HashSet<String>,
 }
 
-/// Recompute and persist the durable line-change aggregates for one workspace by
-/// summing its `tracked_changes` rows (additions/deletions across every stage,
-/// `filesChanged` = distinct paths), grouped by attributed agent. The per-agent
-/// breakdown is rewritten from scratch so stale agents drop out. When a workspace
-/// has no tracked changes the rows are deleted so reads return `null`.
+/// Recompute and persist the durable line-change aggregates for one workspace
+/// from its `tracked_changes` rows (`filesChanged` = distinct paths), grouped
+/// by attributed agent. Every row carries the file's **full** worktree diff
+/// counters (they are per-path, not per-agent), so with one row per agent per
+/// file per stage (monorepo#957) the workspace totals de-duplicate by
+/// `(path, stage)` — taking the max per counter across the group's rows — so a
+/// path shared by N agents is counted once, not N times (monorepo#1009). The
+/// per-agent breakdown still sums each agent's own rows: a shared path counts
+/// toward every agent that touched it (documented over-attribution — per-agent
+/// deltas are not computed). The per-agent breakdown is rewritten from scratch
+/// so stale agents drop out. When a workspace has no tracked changes the rows
+/// are deleted so reads return `null`.
 pub async fn recompute(store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
     let rows = store.list_tracked_changes(workspace_id).await?;
     if rows.is_empty() {
@@ -39,13 +46,15 @@ pub async fn recompute(store: &Store, workspace_id: &WorkspaceId) -> Result<()> 
         return Ok(());
     }
 
-    let mut ws_add = 0i64;
-    let mut ws_del = 0i64;
+    let mut per_path_stage: HashMap<(&str, &str), (i64, i64)> = HashMap::new();
     let mut ws_paths: HashSet<&str> = HashSet::new();
     let mut by_agent: HashMap<String, Acc> = HashMap::new();
     for row in &rows {
-        ws_add += row.additions;
-        ws_del += row.deletions;
+        let slot = per_path_stage
+            .entry((row.path.as_str(), row.stage.as_str()))
+            .or_insert((0, 0));
+        slot.0 = slot.0.max(row.additions);
+        slot.1 = slot.1.max(row.deletions);
         ws_paths.insert(row.path.as_str());
         if let Some(agent) = row.agent_id.as_ref().filter(|a| !a.is_empty()) {
             let acc = by_agent.entry(agent.clone()).or_default();
@@ -54,6 +63,9 @@ pub async fn recompute(store: &Store, workspace_id: &WorkspaceId) -> Result<()> 
             acc.paths.insert(row.path.clone());
         }
     }
+    let (ws_add, ws_del) = per_path_stage
+        .values()
+        .fold((0i64, 0i64), |(a, d), (pa, pd)| (a + pa, d + pd));
 
     store
         .upsert_workspace_metrics(workspace_id, ws_add, ws_del, ws_paths.len() as i64)

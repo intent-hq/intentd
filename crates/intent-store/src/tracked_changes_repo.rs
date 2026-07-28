@@ -143,6 +143,37 @@ impl Store {
         }
     }
 
+    /// Max cumulative `(additions, deletions)` across the **sibling** rows for
+    /// the same `(workspace, path, stage)` — every row except `agent_id`'s own
+    /// (`NULL` keys separately via `IS NOT`). `Ok(None)` when the path has no
+    /// sibling rows. Used by the file-tracking pipeline as the usage-stats
+    /// baseline for a fresh row on an already-tracked path (monorepo#1009):
+    /// each row carries the file's full diff counters, so a new agent's first
+    /// row must not re-record lines a sibling row already accounted for.
+    pub async fn max_sibling_tracked_change_counters(
+        &self,
+        workspace_id: &WorkspaceId,
+        path: &str,
+        stage: &str,
+        agent_id: Option<&str>,
+    ) -> Result<Option<(i64, i64)>> {
+        let row = sqlx::query(
+            "SELECT MAX(additions) AS additions, MAX(deletions) AS deletions \
+             FROM tracked_changes \
+             WHERE workspace_id = ? AND path = ? AND stage = ? AND agent_id IS NOT ?",
+        )
+        .bind(&workspace_id.0)
+        .bind(path)
+        .bind(stage)
+        .bind(agent_id)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("max sibling tracked change failed: {e}")))?;
+        let additions: Option<i64> = row.get("additions");
+        let deletions: Option<i64> = row.get("deletions");
+        Ok(additions.zip(deletions))
+    }
+
     /// Transition the `stage` of a workspace's tracked-change rows for `path`
     /// from `from_stage` to `to_stage` in place, stamping `updated_at` and
     /// preserving every attribution column (`agent_id`/`session_id`/`turn`) and
