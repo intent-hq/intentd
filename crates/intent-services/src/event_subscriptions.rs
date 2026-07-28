@@ -200,6 +200,90 @@ impl Services {
         removed.len()
     }
 
+    /// Remove every subscription scoped to `workspace_id` (workspace deleted
+    /// — the workspace-scoped filter can never match again, monorepo#947).
+    /// Aborts delivery tasks and clears the persisted rows (AWAITED, same
+    /// INSERT/DELETE ordering guarantee as
+    /// [`Services::remove_event_subscription`]).
+    pub(crate) async fn remove_event_subscriptions_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> usize {
+        let removed: Vec<EventSubscriptionEntry> = {
+            // Recover through a poisoned lock (`into_inner`), unlike the
+            // panicking `.expect()` used elsewhere in this file: this runs on
+            // the workspace-delete path, the last chance to unlink this
+            // state, so best-effort teardown outweighs propagating a
+            // mutex-poison panic (mirrors the `agent_subscriptions` sweep in
+            // `delete_workspace`).
+            let mut guard = self
+                .event_subscriptions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<String> = guard
+                .iter()
+                .filter(|(_, e)| &e.record.workspace_id == workspace_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| guard.remove(id)).collect()
+        };
+        for entry in &removed {
+            if let Some(task) = &entry.task {
+                task.abort();
+            }
+        }
+        // Unconditional row delete: a persisted row may exist without a live
+        // registry entry (rehydration raced or was skipped), and the delete
+        // is idempotent.
+        if let Err(e) = self
+            .store
+            .delete_event_subscriptions_for_workspace(workspace_id)
+            .await
+        {
+            tracing::warn!(
+                "event_subscription delete for workspace {} failed: {e}",
+                workspace_id.0
+            );
+        }
+        removed.len()
+    }
+
+    /// Snapshot the live subscriptions owned by `agent_id` (introspection —
+    /// `agent.getSubscriptions`, monorepo#947), oldest first.
+    pub(crate) fn list_event_subscriptions_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Vec<EventSubscriptionRecord> {
+        let mut records: Vec<EventSubscriptionRecord> = self
+            .event_subscriptions
+            .lock()
+            .expect("event subscription registry poisoned")
+            .values()
+            .filter(|e| e.record.subscriber_agent_id.as_ref() == Some(agent_id))
+            .map(|e| e.record.clone())
+            .collect();
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        records
+    }
+
+    /// Snapshot the live subscriptions scoped to `workspace_id`
+    /// (introspection — `agent.diagnostics`, monorepo#947), oldest first.
+    pub(crate) fn list_event_subscriptions_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<EventSubscriptionRecord> {
+        let mut records: Vec<EventSubscriptionRecord> = self
+            .event_subscriptions
+            .lock()
+            .expect("event subscription registry poisoned")
+            .values()
+            .filter(|e| &e.record.workspace_id == workspace_id)
+            .map(|e| e.record.clone())
+            .collect();
+        records.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        records
+    }
+
     /// Spawn the per-subscription bus delivery task: match events against the
     /// subscription's filter, coalesce over its batch window, and wake the
     /// subscriber once per batch. Returns `None` when no event bus is wired
@@ -250,9 +334,12 @@ impl Services {
 
     /// Rehydrate persisted event subscriptions at daemon startup: load every
     /// surviving row, prune rows whose subscriber agent is gone (deleted or
-    /// missing — no wake could ever be delivered), and load the rest into
-    /// the registry, spawning each one's delivery task. Idempotent:
-    /// subscriptions already present in memory (by id) are skipped.
+    /// missing — no wake could ever be delivered) or whose workspace no
+    /// longer exists (the workspace-scoped filter can never match again,
+    /// monorepo#947; the `__chief__` anchor is exempt — it has no workspace
+    /// row by design), and load the rest into the registry, spawning each
+    /// one's delivery task. Idempotent: subscriptions already present in
+    /// memory (by id) are skipped.
     pub async fn heal_event_subscriptions_on_startup(&self) -> intent_core::Result<usize> {
         let persisted = self.store.list_event_subscriptions().await?;
         let mut loaded = 0usize;
@@ -262,6 +349,18 @@ impl Services {
                     subscription = %p.id,
                     subscriber = %p.subscriber_agent_id.0,
                     "pruning persisted event subscription — subscriber agent gone"
+                );
+                let _ = self.store.delete_event_subscription(&p.id).await;
+                continue;
+            }
+            if !self
+                .workspace_exists_for_subscription(&p.workspace_id)
+                .await
+            {
+                tracing::info!(
+                    subscription = %p.id,
+                    workspace = %p.workspace_id.0,
+                    "pruning persisted event subscription — workspace gone"
                 );
                 let _ = self.store.delete_event_subscription(&p.id).await;
                 continue;
@@ -278,6 +377,27 @@ impl Services {
             loaded += 1;
         }
         Ok(loaded)
+    }
+
+    /// Whether a persisted subscription's workspace still exists. The
+    /// `__chief__` anchor has no workspace row and is always kept; transient
+    /// store errors are treated as existing — never prune a row on a flaky
+    /// read (mirrors [`Services::agent_is_live`]).
+    async fn workspace_exists_for_subscription(&self, workspace_id: &WorkspaceId) -> bool {
+        if workspace_id.is_chief() {
+            return true;
+        }
+        match self.store.get_workspace(workspace_id).await {
+            Ok(_) => true,
+            Err(intent_store::Error::NotFound(_)) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "event-subscription rehydration: workspace check failed for {}: {e}",
+                    workspace_id.0
+                );
+                true
+            }
+        }
     }
 }
 

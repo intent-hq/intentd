@@ -3931,7 +3931,9 @@ impl Services {
     /// `subscriptions`, `delegationGroups`, and `agentStatuses` fields.
     /// `awaitMode` maps the registry's `after_all` to TS's `"all"`;
     /// `agentStatuses` is best-effort, keyed off the persisted `AgentStatus` of
-    /// the agents present in the payload.
+    /// the agents present in the payload. `eventSubscriptions` (additive,
+    /// monorepo#947) lists the caller's live `event.subscribe` registrations
+    /// so an agent can recover a lost `subscriptionId`.
     pub(crate) async fn agent_get_subscriptions_op(
         &self,
         _workspace_id: WorkspaceId,
@@ -4007,10 +4009,17 @@ impl Services {
             }
         }
 
+        let event_subscriptions: Vec<Value> = self
+            .list_event_subscriptions_for_agent(&agent_id)
+            .iter()
+            .map(event_subscription_wire)
+            .collect();
+
         Ok(json!({
             "subscriptions": subscriptions,
             "delegationGroups": delegation_groups,
             "agentStatuses": Value::Object(agent_statuses),
+            "eventSubscriptions": event_subscriptions,
         }))
     }
 
@@ -4147,6 +4156,31 @@ impl Services {
             })
             .collect();
 
+        // eventSubscriptions (monorepo#947), filtered to scope: an event
+        // subscription is in scope when its subscriber agent is (front-door
+        // subscriptions have no subscriber and only appear unfiltered).
+        // `orphaned` first checks this workspace's session set, then falls
+        // back to a direct liveness lookup — chief-workspace agents may
+        // legitimately subscribe cross-workspace (validate_event_subscriber),
+        // and must not be flagged orphaned in the target workspace's view.
+        let mut event_subscriptions: Vec<Value> = Vec::new();
+        for r in self
+            .list_event_subscriptions_for_workspace(&workspace_id)
+            .iter()
+            .filter(|r| match &r.subscriber_agent_id {
+                Some(a) => in_scope(&a.0),
+                None => !has_filter,
+            })
+        {
+            let mut v = event_subscription_wire(r);
+            let orphaned = match &r.subscriber_agent_id {
+                Some(a) => !session_ids.contains(&a.0) && !self.agent_is_live(a).await,
+                None => false,
+            };
+            v["orphaned"] = json!(orphaned);
+            event_subscriptions.push(v);
+        }
+
         // delegationGroups, filtered to scope.
         let delegation_groups: Vec<Value> = groups
             .iter()
@@ -4230,6 +4264,10 @@ impl Services {
                 .iter()
                 .filter(|w| &w.parent_agent_id.0 == id)
                 .count();
+            let event_subscription_count = event_subscriptions
+                .iter()
+                .filter(|s| s["subscriberAgentId"].as_str() == Some(id))
+                .count();
 
             let mut row = serde_json::Map::new();
             row.insert("id".into(), json!(id));
@@ -4243,6 +4281,10 @@ impl Services {
                 row.insert("messageCount".into(), json!(mc));
             }
             row.insert("subscriptionCount".into(), json!(subscription_count));
+            row.insert(
+                "eventSubscriptionCount".into(),
+                json!(event_subscription_count),
+            );
             row.insert("queuedEventCount".into(), json!(0));
             row.insert("staleResponding".into(), json!(stale_responding));
             row.insert("deleted".into(), json!(false));
@@ -4305,6 +4347,21 @@ impl Services {
                 }));
             }
         }
+        for sub in &event_subscriptions {
+            if sub["orphaned"].as_bool() == Some(true) {
+                let sid = sub["id"].as_str().unwrap_or_default();
+                let aid = sub["subscriberAgentId"].as_str().unwrap_or_default();
+                stuck_risks.push(json!({
+                    "type": "orphaned-event-subscription",
+                    "severity": "warning",
+                    "message": format!(
+                        "Event subscription {sid} targets missing or deleted subscriber {aid}"
+                    ),
+                    "agentId": aid,
+                    "subscriptionId": sid,
+                }));
+            }
+        }
         for g in &delegation_groups {
             let complete = g["complete"].as_bool() == Some(true);
             let delivered = g["delivered"].as_bool() == Some(true);
@@ -4337,6 +4394,7 @@ impl Services {
         let summary = json!({
             "agents": agent_rows.len(),
             "subscriptions": subscriptions.len(),
+            "eventSubscriptions": event_subscriptions.len(),
             "queuedAgents": 0,
             "queuedEvents": 0,
             "delegationGroups": delegation_groups.len(),
@@ -4361,6 +4419,7 @@ impl Services {
             "summary": summary,
             "agents": agent_rows,
             "subscriptions": subscriptions,
+            "eventSubscriptions": event_subscriptions,
             "queues": [],
             "delegationGroups": delegation_groups,
             "deliveryStats": delivery_stats,
@@ -4374,6 +4433,10 @@ impl Services {
             format!("Agent diagnostics for workspace {}", workspace_id.0),
             format!("Agents: {}", diagnostics["summary"]["agents"]),
             format!("Subscriptions: {}", diagnostics["summary"]["subscriptions"]),
+            format!(
+                "Event subscriptions: {}",
+                diagnostics["summary"]["eventSubscriptions"]
+            ),
             format!("Queued events: {}", diagnostics["summary"]["queuedEvents"]),
             format!(
                 "Delegation groups: {}",
@@ -5680,6 +5743,22 @@ fn describe_subscription(
         desc.push_str(", one-shot");
     }
     desc
+}
+
+/// Wire shape for one live event subscription (monorepo#947): the camelCase
+/// registration fields, shared by `agent.getSubscriptions`
+/// (`eventSubscriptions`) and `agent.diagnostics`
+/// (`diagnostics.eventSubscriptions`).
+fn event_subscription_wire(record: &crate::event_subscriptions::EventSubscriptionRecord) -> Value {
+    json!({
+        "id": record.id,
+        "workspaceId": record.workspace_id,
+        "subscriberAgentId": record.subscriber_agent_id,
+        "eventTypes": record.event_types,
+        "excludeSelf": record.exclude_self,
+        "batchWindow": record.batch_window_ms,
+        "createdAt": record.created_at,
+    })
 }
 
 /// Count `tool_use` content blocks by tool name across all messages.
