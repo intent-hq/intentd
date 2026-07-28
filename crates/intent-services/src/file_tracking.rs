@@ -22,13 +22,32 @@ use intent_store::{NewTrackedChange, Store};
 ///
 /// Returns the `(lines_added, lines_deleted)` **delta** this recording
 /// represents: the row's new cumulative per-file counters minus the replaced
-/// row's (0 for a fresh row), clamped ≥ 0 per counter so a shrinking diff
-/// (e.g. an agent reverting its own lines) never yields a negative delta.
-/// Callers feed this growth into the global usage-stats recording (D5).
+/// row's, clamped ≥ 0 per counter so a shrinking diff (e.g. an agent reverting
+/// its own lines) never yields a negative delta. A fresh row baselines against
+/// the max counters any sibling row (same workspace/path/stage, other agent)
+/// already recorded — each row carries the file's **full** diff, so a second
+/// agent's first row must not replay lines a sibling already fed into the
+/// usage stats (monorepo#1009); 0 when the path is new. The upsert and the
+/// sibling read are not transactional: if two agents' *first* rows for the
+/// same brand-new path raced, each would baseline against the other and the
+/// initial lines would go unrecorded — acceptable for this best-effort
+/// recording, and the pipeline effectively serializes per workspace. Callers
+/// feed this growth into the global usage-stats recording (D5).
 pub async fn track_change(store: &Store, mut change: NewTrackedChange) -> Result<(u64, u64)> {
     change.path = normalize_path(&change.path);
     let prev = store.upsert_tracked_change(&change).await?;
-    let (prev_additions, prev_deletions) = prev.unwrap_or((0, 0));
+    let (prev_additions, prev_deletions) = match prev {
+        Some(prev) => prev,
+        None => store
+            .max_sibling_tracked_change_counters(
+                &change.workspace_id,
+                &change.path,
+                &change.stage,
+                change.agent_id.as_deref(),
+            )
+            .await?
+            .unwrap_or((0, 0)),
+    };
     Ok((
         (change.additions - prev_additions).max(0) as u64,
         (change.deletions - prev_deletions).max(0) as u64,

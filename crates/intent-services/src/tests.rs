@@ -9644,6 +9644,49 @@ mod metrics {
         assert!(m["byAgent"].get("").is_none());
     }
 
+    /// Regression (monorepo#1009): each agent's row on a shared path carries
+    /// the file's **full** diff counters, so the workspace totals count a
+    /// `(path, stage)` once (max per counter across its rows), not once per
+    /// agent. The per-agent breakdown still reflects each agent's own rows.
+    #[tokio::test]
+    async fn recompute_counts_shared_path_once_in_workspace_totals() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        // Three rows on one shared path (two agents + one unattributed), one
+        // slightly stale; plus a solo path for a second agent.
+        store
+            .upsert_tracked_change(&change(&ws, "shared.ts", Some("agent-1"), 80, 8))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "shared.ts", Some("agent-2"), 100, 10))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "shared.ts", None, 100, 10))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change(&ws, "solo.ts", Some("agent-2"), 5, 1))
+            .await
+            .unwrap();
+
+        crate::metrics::recompute(store, &ws).await.unwrap();
+
+        let m = svc.metrics_get_workspace_stats(ws.clone()).await.unwrap();
+        // shared.ts counted once at its max counters (100/10), not summed
+        // across the three rows (280/28).
+        assert_eq!(m["additions"], serde_json::json!(105));
+        assert_eq!(m["deletions"], serde_json::json!(11));
+        assert_eq!(m["filesChanged"], serde_json::json!(2));
+        assert_eq!(m["byAgent"]["agent-1"]["additions"], serde_json::json!(80));
+        assert_eq!(m["byAgent"]["agent-2"]["additions"], serde_json::json!(105));
+        assert_eq!(
+            m["byAgent"]["agent-2"]["filesChanged"],
+            serde_json::json!(2)
+        );
+    }
+
     #[tokio::test]
     async fn workspace_stats_null_when_unknown() {
         let (_t, svc, _ws) = setup().await;
@@ -9825,6 +9868,48 @@ mod usage_stats_recording {
             .await
             .expect("shrunk");
         assert_eq!(shrunk, (0, 0), "shrinking diff clamps to zero");
+    }
+
+    /// Regression (monorepo#1009): a second agent's **fresh** row on an
+    /// already-tracked path carries the same full-file diff counters, so its
+    /// delta baselines against the max a sibling row already recorded instead
+    /// of replaying the whole diff; only genuine growth lands in usage stats.
+    #[tokio::test]
+    async fn fresh_row_on_tracked_path_does_not_replay_recorded_lines() {
+        let (_t, svc, ws) = setup().await;
+        let store = svc.store();
+        let first =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-a"), 10, 2))
+                .await
+                .expect("first");
+        assert_eq!(first, (10, 2));
+        // Agent B's fresh row replays the same full-file diff → zero delta.
+        let replay =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-b"), 10, 2))
+                .await
+                .expect("replay");
+        assert_eq!(replay, (0, 0));
+        // Agent C's fresh row after the file grew → only the growth.
+        let grown =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", Some("agent-c"), 14, 5))
+                .await
+                .expect("grown");
+        assert_eq!(grown, (4, 3));
+        // A fresh unattributed row keys separately but baselines the same way.
+        let unattributed =
+            crate::file_tracking::track_change(store, change(&ws, "a.ts", None, 14, 5))
+                .await
+                .expect("unattributed");
+        assert_eq!(unattributed, (0, 0));
+
+        // End-to-end: recording each delta accrues the file's true totals
+        // once (14/5), not once per agent row.
+        for (agent, (added, deleted)) in
+            [("agent-a", first), ("agent-b", replay), ("agent-c", grown)]
+        {
+            crate::usage_stats::record_lines_changed(store, &ws, Some(agent), added, deleted).await;
+        }
+        assert_eq!(lines_for(&svc, "unknown").await, (14, 5));
     }
 
     /// The recorded delta lands in `usage_stats_hourly` under the acting
