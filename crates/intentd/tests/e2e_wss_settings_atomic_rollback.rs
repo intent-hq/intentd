@@ -1,6 +1,10 @@
-//! WSS e2e test for atomic settings rollback: prove that a failed mixed batch
-//! over WSS fully reverts all settings to their pre-batch values and returns
-//! the failing key in the error response (per AGENTS.md testing gate requirement).
+//! WSS e2e tests for settings wire behavior (per AGENTS.md testing gate
+//! requirement):
+//! - atomic rollback: a failed mixed batch over WSS fully reverts all settings
+//!   to their pre-batch values and returns the failing key in the error
+//!   response;
+//! - retired `model.workspaceOverrides`: `settings.update` over WSS
+//!   tolerates-and-ignores the retired path while `settings.get` rejects it.
 
 #![cfg(unix)]
 
@@ -319,5 +323,93 @@ async fn mixed_batch_rollback_over_wss() {
         r["result"]["value"],
         json!(true),
         "server.wsApi.enabled should be rolled back to true (seeded file value)"
+    );
+}
+
+/// Retired `model.workspaceOverrides` over WSS: `settings.update` writes to the
+/// retired path are tolerated-and-ignored (no `-32602`, `applied: []`, mixed
+/// batches still apply their live entries) and `settings.get` rejects the path
+/// as unknown — same wire contract as UDS (`legacy_workspace_overrides_discards_and_strips_on_boot`).
+#[tokio::test]
+async fn retired_workspace_overrides_over_wss() {
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"]
+        .as_u64()
+        .expect("port should be set at boot") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    // Old-client write of the retired path alone: tolerated, nothing applied.
+    let resp = wss_rpc(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({
+            "changes": [
+                {"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}}
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "retired-path update must not error: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["applied"],
+        json!([]),
+        "retired path must not be echoed in applied"
+    );
+
+    // Mixed batch: the live entry applies, the retired one is skipped.
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({
+            "changes": [
+                {"path": "model.workspaceOverrides", "value": {"ws-1": "gpt-5"}},
+                {"path": "model.default", "value": "claude-sonnet-4"}
+            ]
+        }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "mixed batch with retired path must not error: {resp}"
+    );
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 1, "only the live entry applies: {resp}");
+    assert_eq!(applied[0]["path"], json!("model.default"));
+
+    let resp = wss_rpc(&mut ws, 3, "settings.get", json!({"path": "model.default"})).await;
+    assert_eq!(resp["result"]["value"], json!("claude-sonnet-4"));
+
+    // The retired path is gone from the catalog: settings.get rejects it.
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({"path": "model.workspaceOverrides"}),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "settings.get on the retired path must reject as unknown: {resp}"
     );
 }
