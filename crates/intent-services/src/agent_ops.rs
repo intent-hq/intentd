@@ -4159,23 +4159,27 @@ impl Services {
         // eventSubscriptions (monorepo#947), filtered to scope: an event
         // subscription is in scope when its subscriber agent is (front-door
         // subscriptions have no subscriber and only appear unfiltered).
-        let event_subscriptions: Vec<Value> = self
+        // `orphaned` first checks this workspace's session set, then falls
+        // back to a direct liveness lookup — chief-workspace agents may
+        // legitimately subscribe cross-workspace (validate_event_subscriber),
+        // and must not be flagged orphaned in the target workspace's view.
+        let mut event_subscriptions: Vec<Value> = Vec::new();
+        for r in self
             .list_event_subscriptions_for_workspace(&workspace_id)
             .iter()
             .filter(|r| match &r.subscriber_agent_id {
                 Some(a) => in_scope(&a.0),
                 None => !has_filter,
             })
-            .map(|r| {
-                let mut v = event_subscription_wire(r);
-                let orphaned = r
-                    .subscriber_agent_id
-                    .as_ref()
-                    .is_some_and(|a| !session_ids.contains(&a.0));
-                v["orphaned"] = json!(orphaned);
-                v
-            })
-            .collect();
+        {
+            let mut v = event_subscription_wire(r);
+            let orphaned = match &r.subscriber_agent_id {
+                Some(a) => !session_ids.contains(&a.0) && !self.agent_is_live(a).await,
+                None => false,
+            };
+            v["orphaned"] = json!(orphaned);
+            event_subscriptions.push(v);
+        }
 
         // delegationGroups, filtered to scope.
         let delegation_groups: Vec<Value> = groups

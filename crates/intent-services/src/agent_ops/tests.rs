@@ -5677,6 +5677,34 @@ async fn diagnostics_reports_event_subscriptions() {
         json!([]),
         "another agent's filter must exclude the subscription"
     );
+
+    // A live chief agent subscribed cross-workspace is NOT flagged orphaned
+    // (its session lives in `__chief__`, not this workspace's session set).
+    let chief_agent = create_agent(&svc, &WorkspaceId::chief(), "Chief").await;
+    svc.agent_subscribe(
+        ws.clone(),
+        Some(chief_agent.clone()),
+        vec!["note:*".into()],
+        None,
+        Some(50),
+    )
+    .await
+    .expect("chief subscribe");
+    let result = svc
+        .agent_diagnostics_op(ws, None, None, None)
+        .await
+        .expect("diagnostics with chief sub");
+    let chief_entry = result["diagnostics"]["eventSubscriptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["subscriberAgentId"] == json!(chief_agent.0))
+        .expect("chief subscription entry");
+    assert_eq!(
+        chief_entry["orphaned"],
+        json!(false),
+        "a live cross-workspace chief subscriber must not be flagged orphaned"
+    );
 }
 
 /// monorepo#947: deleting a workspace drops its event subscriptions — the

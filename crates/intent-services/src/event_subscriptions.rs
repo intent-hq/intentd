@@ -210,6 +210,12 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> usize {
         let removed: Vec<EventSubscriptionEntry> = {
+            // Recover through a poisoned lock (`into_inner`), unlike the
+            // panicking `.expect()` used elsewhere in this file: this runs on
+            // the workspace-delete path, the last chance to unlink this
+            // state, so best-effort teardown outweighs propagating a
+            // mutex-poison panic (mirrors the `agent_subscriptions` sweep in
+            // `delete_workspace`).
             let mut guard = self
                 .event_subscriptions
                 .lock()

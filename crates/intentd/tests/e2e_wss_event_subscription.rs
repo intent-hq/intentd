@@ -371,14 +371,20 @@ async fn event_subscriptions_introspection_and_workspace_delete_cleanup_over_wss
     )
     .await;
     assert_eq!(deleted["success"], json!(true));
-    // The workspace (and its agents) are gone; assert via a second workspace
-    // that the daemon-global registry holds no leaked subscription for the
-    // deleted workspace — diagnostics on a fresh workspace shows zero, and
-    // resubscribing against the deleted workspace's id fails closed on the
-    // dead subscriber.
+    // The registry sweep is observable over the wire: `agent.getSubscriptions`
+    // reads the daemon-global registry per subscriber (the workspace row is
+    // not consulted), so the deleted workspace's subscription must be gone.
+    let subs = event_subscriptions_view(&mut rpc, 12, &ws_id, &subscriber).await;
+    assert_eq!(
+        subs,
+        Vec::<Value>::new(),
+        "workspace.delete must sweep the workspace's event subscriptions"
+    );
+    // And re-subscribing fails closed: the workspace's agents were deleted
+    // with it, so the dead subscriber is rejected.
     let err = wss_rpc_raw(
         &mut rpc,
-        12,
+        13,
         "agent.subscribe",
         json!({
             "workspaceId": ws_id,
