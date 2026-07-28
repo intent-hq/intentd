@@ -2754,9 +2754,18 @@ async fn report_provider_availability() {
             continue;
         }
         if !provider.installed {
+            // Name the actually-missing binary: dual-binary providers
+            // (unsloth: opencode + the unsloth CLI) must not blame the
+            // primary command when the secondary is what failed to resolve
+            // (monorepo#935).
             println!(
-                "  [--] {} not installed ({} not on PATH)",
-                provider.id, provider.command
+                "  [--] {} not installed ({})",
+                provider.id,
+                intent_providers::not_installed_detail(
+                    provider.command,
+                    provider.resolved_path.is_some(),
+                    provider.secondary_binary,
+                )
             );
             continue;
         }

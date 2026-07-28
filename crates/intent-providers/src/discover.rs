@@ -36,6 +36,12 @@ pub struct ProviderAvailability {
     /// (pinned spec); `installed`/`resolved_path` then reflect npx itself
     /// rather than a local provider binary.
     pub npx_only_package: Option<&'static str>,
+    /// For providers with [`ProviderConfig::requires_secondary_binary`]
+    /// (unsloth: `opencode` + `unsloth`): the required secondary command and
+    /// whether it resolved, so callers (doctor) can attribute unavailability
+    /// to the actually-missing binary. `None` when the provider has no
+    /// secondary requirement or was gated off (never probed).
+    pub secondary_binary: Option<(&'static str, bool)>,
 }
 
 /// Status of npx availability for provider fallback spawning.
@@ -133,13 +139,18 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             // managed-server lifecycle uses (`UnslothConfig::default`'s
             // `resolve_binary`), so discovery and the actual spawn path agree
             // on where the binary must live.
-            let secondary_resolved =
-                |secondary: &str| find_provider_binary(secondary, secondary, None).is_some();
+            let secondary_binary = if gated_off.is_some() {
+                None
+            } else {
+                provider
+                    .requires_secondary_binary
+                    .map(|s| (s, find_provider_binary(s, s, None).is_some()))
+            };
             let installed = gated_off.is_none()
                 && installed_with_secondary(
                     resolved_path.is_some(),
                     provider.requires_secondary_binary,
-                    secondary_resolved,
+                    |_| secondary_binary.is_some_and(|(_, resolved)| resolved),
                 );
             ProviderAvailability {
                 id: provider.id,
@@ -151,6 +162,7 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
                 auth_check_args: provider.auth_check_args,
                 has_npx_fallback: provider.fallback_npx_package.is_some(),
                 npx_only_package: provider.npx_only_package,
+                secondary_binary,
             }
         })
         .collect()
@@ -167,6 +179,36 @@ fn installed_with_secondary(
     secondary_resolved: impl Fn(&str) -> bool,
 ) -> bool {
     primary_resolved && requires_secondary.is_none_or(secondary_resolved)
+}
+
+/// Human-readable detail for a not-installed provider, naming the
+/// actually-missing binary. For dual-binary providers
+/// ([`ProviderConfig::requires_secondary_binary`]) the message attributes
+/// unavailability to whichever binary failed to resolve — e.g. unsloth with
+/// opencode present but the `unsloth` CLI absent reports the unsloth CLI,
+/// not opencode (monorepo#935). Pure, so every combination is unit-testable.
+pub fn not_installed_detail(
+    command: &str,
+    primary_resolved: bool,
+    secondary_binary: Option<(&str, bool)>,
+) -> String {
+    match secondary_binary {
+        Some((secondary, secondary_resolved)) => {
+            match (primary_resolved, secondary_resolved) {
+                (true, false) => format!("{secondary} not on PATH; {command} found"),
+                (false, true) => format!("{command} not on PATH; {secondary} found"),
+                (false, false) => format!("{command} and {secondary} not on PATH"),
+                // Inconsistent input — a not-installed provider never has
+                // both binaries resolved. Handled explicitly (this is a pub
+                // helper) so a future caller can't print a false "not on
+                // PATH" diagnosis.
+                (true, true) => {
+                    format!("{command} and {secondary} found, but provider reported not installed")
+                }
+            }
+        }
+        None => format!("{command} not on PATH"),
+    }
 }
 
 /// Probe npx availability (path only, no spawning). Returns the resolved path
@@ -680,6 +722,39 @@ mod find_provider_binary_tests {
     }
 
     #[test]
+    fn not_installed_detail_without_secondary_names_the_primary() {
+        assert_eq!(
+            not_installed_detail("codex", false, None),
+            "codex not on PATH"
+        );
+    }
+
+    #[test]
+    fn not_installed_detail_attributes_the_actually_missing_binary() {
+        // Secondary (unsloth CLI) missing, primary (opencode) found — must
+        // name the unsloth CLI, not opencode (monorepo#935).
+        assert_eq!(
+            not_installed_detail("opencode", true, Some(("unsloth", false))),
+            "unsloth not on PATH; opencode found"
+        );
+        // Primary missing, secondary found.
+        assert_eq!(
+            not_installed_detail("opencode", false, Some(("unsloth", true))),
+            "opencode not on PATH; unsloth found"
+        );
+        // Both missing.
+        assert_eq!(
+            not_installed_detail("opencode", false, Some(("unsloth", false))),
+            "opencode and unsloth not on PATH"
+        );
+        // Inconsistent input (both resolved) must never claim "not on PATH".
+        assert_eq!(
+            not_installed_detail("opencode", true, Some(("unsloth", true))),
+            "opencode and unsloth found, but provider reported not installed"
+        );
+    }
+
+    #[test]
     fn unsloth_registry_entry_requires_the_unsloth_cli_secondary_binary() {
         let unsloth = crate::config::ACP_PROVIDERS
             .iter()
@@ -717,6 +792,17 @@ mod find_provider_binary_tests {
                 "installed=true requires the unsloth CLI to also resolve"
             );
         }
+        // The snapshot must always carry the secondary-binary status for
+        // unsloth (doctor's attribution input), consistent with a direct
+        // resolution of the unsloth CLI.
+        let (secondary, secondary_resolved) = unsloth
+            .secondary_binary
+            .expect("unsloth must report its secondary-binary status");
+        assert_eq!(secondary, "unsloth");
+        assert_eq!(
+            secondary_resolved,
+            find_provider_binary("unsloth", "unsloth", None).is_some()
+        );
     }
 
     #[test]
