@@ -560,6 +560,9 @@ mod tests {
         assert_eq!(stats_provider_key(Some(" Claude-Code ")), "claude-code");
         assert_eq!(stats_provider_key(None), UNKNOWN_PROVIDER);
         assert_eq!(stats_provider_key(Some("  ")), UNKNOWN_PROVIDER);
+        // Pin the wire value literally, independent of the constant chain
+        // (migration 0059 / PROTOCOL.md §5.36).
+        assert_eq!(stats_provider_key(None), "unknown");
     }
 
     #[test]
