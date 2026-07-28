@@ -2,6 +2,81 @@
 
 All notable changes to this project will be documented in this file.
 
+<<<<<<< Updated upstream
+=======
+## [0.2.11] - 2026-07-28
+
+### 🚀 Features
+
+- *(services)* Warn live unsloth agents before a model-switch restart ([#647](https://github.com/intent-hq/intentd/pull/647))
+- *(services)* Port-conflict detection for the managed unsloth server ([#660](https://github.com/intent-hq/intentd/pull/660))
+- *(unsloth)* Add unsloth.status and unsloth.stop daemon RPCs ([#623](https://github.com/intent-hq/intentd/pull/623))
+- *(services)* Real event.subscribe delivery with batching and restart persistence (monorepo#937) ([#632](https://github.com/intent-hq/intentd/pull/632))
+- Event-subscription introspection + workspace-delete cleanup (monorepo#947) ([#644](https://github.com/intent-hq/intentd/pull/644))
+- Add isWaitingForOtherAgents to the agent:idle payload ([#651](https://github.com/intent-hq/intentd/pull/651))
+
+### 🐛 Bug Fixes
+
+- Report the platform file manager as always installed on macOS/Windows ([#655](https://github.com/intent-hq/intentd/pull/655))
+- Default interactive terminal TERM for Backspace erase ([#952](https://github.com/intent-hq/intentd/pull/952)) ([#638](https://github.com/intent-hq/intentd/pull/638))
+- Demote agentCommit unattributed-dirty skip log to debug ([#645](https://github.com/intent-hq/intentd/pull/645))
+- Pre-gate wakeOrCreate watch scope before side effects (monorepo#932)
+- *(services)* Skip wakeOrCreate SUB-1 watch and pre-gate for a deleted caller ([#667](https://github.com/intent-hq/intentd/pull/667))
+- *(acp)* Unwrap codex nested MCP tool-call arguments in session mapping
+- Recreate ACP session on retry of poisoned session (monorepo#940)
+- Decouple CoW sandbox provisioning from the delegate critical path ([#636](https://github.com/intent-hq/intentd/pull/636))
+- Filter agent-initiated agentCommit to the agent's attributed paths (intent-hq/monorepo#939)
+- Honor isNewRepo in workspace.create — initialize repository before provisioning
+- Doctor names the actually-missing binary for dual-binary providers ([#653](https://github.com/intent-hq/intentd/pull/653))
+
+### 🔧 Refactor
+
+- *(services)* Use UNKNOWN_PROVIDER alias for the stats provider fallback ([#654](https://github.com/intent-hq/intentd/pull/654))
+
+### ⚡ Performance
+
+- *(store)* Per-session message projection for agent.get (monorepo#981) ([#659](https://github.com/intent-hq/intentd/pull/659))
+- *(services)* Run CoW sandbox clone on the blocking pool ([#656](https://github.com/intent-hq/intentd/pull/656))
+- Eliminate multi-core CPU burn on large repos (diff rollup, adaptive TTL, pushed-check) ([#648](https://github.com/intent-hq/intentd/pull/648))
+- Bound agent read paths — stop hydrating full transcripts (monorepo#958)
+
+### 🧪 Testing
+
+- Make flaky card-aggregates ordering and token-usage scan tests deterministic ([#658](https://github.com/intent-hq/intentd/pull/658))
+- Make flaky provider-models CLI and agent-ops/unsloth timing tests deterministic under load ([#663](https://github.com/intent-hq/intentd/pull/663))
+
+
+## [0.2.10] - 2026-07-27
+
+### 🚀 Features
+
+- Daemon-managed Unsloth server lifecycle ([#597](https://github.com/intent-hq/intentd/pull/597))
+- *(unsloth)* Select best-fitting GGUF quant variant at spawn time ([#610](https://github.com/intent-hq/intentd/pull/610))
+- CoW provisioning phase timings + configurable clone exclusions ([#614](https://github.com/intent-hq/intentd/pull/614))
+- Model-change transcript notice + cross-provider replay e2e coverage (monorepo#882) ([#598](https://github.com/intent-hq/intentd/pull/598))
+- Inject scoped GitHub credential helper into terminal and agent spawn environments ([#601](https://github.com/intent-hq/intentd/pull/601))
+- BE-owned Workspace.displayStatus with change event ([#600](https://github.com/intent-hq/intentd/pull/600))
+- Background retry sweep for merge_pending sandboxes ([#608](https://github.com/intent-hq/intentd/pull/608))
+- Daemon-backed git credential helper for terminal and agent spawns ([#618](https://github.com/intent-hq/intentd/pull/618))
+
+### 🐛 Bug Fixes
+
+- *(unsloth)* Preserve in-flight startup across mint timeouts and spawn retries (monorepo#878) ([#621](https://github.com/intent-hq/intentd/pull/621))
+- *(providers)* Require unsloth CLI alongside opencode for unsloth provider discovery ([#622](https://github.com/intent-hq/intentd/pull/622))
+- *(acp)* Hold stdin lines racing a pending mcp-bridge reconnect ([#620](https://github.com/intent-hq/intentd/pull/620))
+- *(acp)* Make mcp-bridge resilient to daemon restarts and TCP drops ([#871](https://github.com/intent-hq/intentd/pull/871)) ([#595](https://github.com/intent-hq/intentd/pull/595))
+- Allow cross-provider agent.setModel after first turn (monorepo#882) ([#604](https://github.com/intent-hq/intentd/pull/604))
+- *(acp)* Buffer stdin during mcp-bridge initial connect window (monorepo#908) ([#611](https://github.com/intent-hq/intentd/pull/611))
+- *(services)* Subscribe caller to completion on wakeOrCreate created_new branch ([#627](https://github.com/intent-hq/intentd/pull/627))
+- Skip foreign session/load after a committed cross-provider setModel ([#625](https://github.com/intent-hq/intentd/pull/625))
+
+### 🧪 Testing
+
+- *(services)* Fix flaky dismiss_attention_idempotent event-order race (monorepo#905)
+- *(unsloth)* Cover retry-attach across a model switch (monorepo#878) ([#628](https://github.com/intent-hq/intentd/pull/628))
+
+
+>>>>>>> Stashed changes
 ## [0.2.9] - 2026-07-27
 
 ### 🚀 Features
