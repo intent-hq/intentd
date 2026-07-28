@@ -91,6 +91,14 @@ const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// process dies) instead of blocking atomically on the command's exit.
 const MINT_TIMEOUT: Duration = MODEL_READY_TIMEOUT;
 
+/// How long the ADOPT-time mint probe may take (versus the generous
+/// [`MINT_TIMEOUT`] for a daemon-owned startup). Adoption only takes an
+/// occupant that is READY — a genuinely ready server mints in seconds — and
+/// the daemon cannot observe a foreign process to fail fast on its death,
+/// so a stalling occupant must degrade to the re-port path quickly instead
+/// of holding the spawn (and the state lock) for the full download window.
+const ADOPT_MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How many trailing output lines of the server child are retained for
 /// diagnostics when it dies during startup.
 const OUTPUT_TAIL_LINES: usize = 40;
@@ -352,7 +360,9 @@ pub struct UnslothStatus {
     /// OS pid of the managed server child, when known. `None` for an
     /// adopted server (the daemon does not own the occupant's process).
     pub pid: Option<u32>,
-    /// Seconds since the child was spawned.
+    /// Seconds since the child was spawned — or, for an adopted server
+    /// (`pid: None`), since the daemon adopted it (the occupant's true
+    /// start time is unobservable).
     pub uptime_secs: u64,
     /// Coarse startup phase: `"starting"`, `"minting"`, `"loading"`, or
     /// `"ready"`.
@@ -577,6 +587,10 @@ pub(crate) struct UnslothConfig {
     pub model_ready_timeout: Duration,
     pub probe_interval: Duration,
     pub mint_timeout: Duration,
+    /// Deadline for the ADOPT-time mint against a foreign occupant (short:
+    /// a ready occupant mints in seconds; a stalling one must degrade to
+    /// the re-port path instead of holding the spawn for the full window).
+    pub adopt_mint_timeout: Duration,
     /// Hugging Face API base for the per-repo file listing the quant
     /// selection uses (tests point this at a loopback stub).
     pub hf_api_base: String,
@@ -607,6 +621,7 @@ impl Default for UnslothConfig {
             model_ready_timeout: MODEL_READY_TIMEOUT,
             probe_interval: PROBE_INTERVAL,
             mint_timeout: MINT_TIMEOUT,
+            adopt_mint_timeout: ADOPT_MINT_TIMEOUT,
             hf_api_base: HF_API_BASE.to_string(),
             hf_files_timeout: HF_FILES_TIMEOUT,
             total_memory_bytes: Box::new(crate::agent_manager::total_memory_bytes),
@@ -707,6 +722,10 @@ impl UnslothServerManager {
     /// when no server is running OR the last-known pid is no longer alive
     /// (a dead child not yet reaped by the next `ensure_endpoint` call —
     /// checked via a unix signal-0 liveness probe, best-effort elsewhere).
+    /// An ADOPTED server has no pid to probe, so its staleness is NOT
+    /// detectable here: a vanished occupant keeps reporting until the next
+    /// `ensure_endpoint` call's HTTP re-verification notices (adding an
+    /// HTTP probe here would trade status responsiveness for it).
     /// Deliberately reads only the `identity`/`phase` mirrors (both plain
     /// `std::sync::Mutex`es), never `state`'s `TokioMutex`, so this stays
     /// responsive even while a startup is in flight (see [`Self::identity`]).
@@ -880,7 +899,12 @@ impl UnslothServerManager {
                 StatusLevel::Info,
                 format!("Starting Unsloth server for {repo_id}…"),
             );
-            // Resolve the listen port BEFORE any spawn work: the configured
+            // Resolve the quant BEFORE the port: the HF fetch can take up
+            // to [`UnslothConfig::hf_files_timeout`], and a port picked
+            // ahead of it would sit unclaimed for that long — widening the
+            // window for another process to grab it before the spawn binds.
+            let quant = self.resolve_quant_variant(repo_id).await;
+            // Resolve the listen port BEFORE any spawn: the configured
             // port may be held by a user-run unsloth studio (adoptable) or
             // an unrelated process (re-port around it) — either way the
             // daemon must not spawn a child doomed to fail its bind.
@@ -930,12 +954,19 @@ impl UnslothServerManager {
                     None => return Err(port_conflict_error(configured)),
                 }
             };
-            let quant = self.resolve_quant_variant(repo_id).await;
-            // Re-check the latch: the HF fetch above can take up to
-            // [`UnslothConfig::hf_files_timeout`], and shutdown may have
-            // been requested meanwhile — don't spawn a child nobody will reap.
+            // Re-check both latches: the HF fetch and a failed adoption
+            // attempt above can each take a while, and a shutdown or
+            // `unsloth.stop` may have arrived meanwhile — don't spawn a
+            // child nobody will reap (a stop mid-`try_adopt` surfaces as a
+            // swallowed mint failure, so the latch is still set here; it is
+            // consumed exactly like an aborted startup's teardown would).
             if self.is_shutting_down() {
                 return Err(shutting_down_error());
+            }
+            if self.is_stop_requested() {
+                self.stop_requested
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(stop_requested_error());
             }
             let server = self.start_server(&binary, repo_id, &quant, port)?;
             self.set_identity(Some(ServerIdentity {
@@ -1133,7 +1164,21 @@ impl UnslothServerManager {
     /// model), or a not-ready occupant — the caller then re-ports instead.
     /// Deliberately conservative: adoption only takes a READY server, so a
     /// mid-startup occupant is treated as busy rather than waited on (the
-    /// daemon does not own it and cannot observe its process).
+    /// daemon does not own it and cannot observe its process), and the
+    /// adopt-time mint runs under the short
+    /// [`UnslothConfig::adopt_mint_timeout`] — never the download-tolerant
+    /// [`UnslothConfig::mint_timeout`] — so a stalling occupant degrades to
+    /// the re-port path in seconds instead of holding the state lock.
+    ///
+    /// Side effect, accepted by design: the mint runs `unsloth start
+    /// opencode --no-launch --model <repo>` against the user-owned
+    /// occupant, which rewrites the generated
+    /// `~/.unsloth/studio/auth/agents/opencode/opencode.json` even when
+    /// adoption is then declined. That file is CLI-generated auth material
+    /// (re-minted on every `unsloth start` invocation, including the
+    /// daemon's own spawns on other ports), not user-authored config, so a
+    /// declined adoption leaves it pointing at the occupant — exactly what
+    /// a manual `unsloth start opencode` against that studio would produce.
     async fn try_adopt(
         &self,
         binary: &Path,
@@ -1168,7 +1213,13 @@ impl UnslothServerManager {
             port,
         };
         let endpoint = self
-            .mint_endpoint(binary, repo_id, &mut server, status)
+            .mint_endpoint(
+                binary,
+                repo_id,
+                &mut server,
+                status,
+                self.config.adopt_mint_timeout,
+            )
             .await
             .ok()?;
         // The minted key must prove the occupant serves the requested model
@@ -1186,6 +1237,10 @@ impl UnslothServerManager {
     /// One authed probe against an adopted server's `/v1/models`, used to
     /// re-verify it before reusing its cached endpoint: with no owned child
     /// process, HTTP is the only liveness signal the daemon has for it.
+    /// Runs while the caller holds the `state` lock, but is hard-bounded by
+    /// [`PROBE_REQUEST_TIMEOUT`] (one request, no polling loop) — a small,
+    /// fixed cost next to the minutes-long startup waits the same lock
+    /// already legitimately spans.
     async fn adopted_endpoint_still_ready(&self, port: u16, endpoint: &UnslothEndpoint) -> bool {
         let probe_url = format!("http://127.0.0.1:{port}/v1/models");
         let Ok(client) = reqwest::Client::builder()
@@ -1257,7 +1312,9 @@ impl UnslothServerManager {
             format!("Unsloth server up; preparing model {repo_id}…"),
         );
         self.set_phase(Some("minting"));
-        let endpoint = self.mint_endpoint(binary, repo_id, server, status).await?;
+        let endpoint = self
+            .mint_endpoint(binary, repo_id, server, status, self.config.mint_timeout)
+            .await?;
         self.set_phase(Some("loading"));
 
         // Phase 3: model ready — authed probe answers 200. First use can mean
@@ -1308,16 +1365,18 @@ impl UnslothServerManager {
     /// wait behind) the first-use multi-GB model download rather than the
     /// post-mint readiness probe, so — unlike blocking atomically on
     /// `cmd.output()` — this polls the mint child's liveness against
-    /// [`UnslothConfig::mint_timeout`] (shares [`MODEL_READY_TIMEOUT`]'s
-    /// generous default), refreshing progress status periodically and
-    /// failing fast only if the managed SERVER child dies or a shutdown is
-    /// requested mid-mint.
+    /// `timeout` ([`UnslothConfig::mint_timeout`] for a daemon-owned
+    /// startup, sharing [`MODEL_READY_TIMEOUT`]'s generous default; the
+    /// short [`UnslothConfig::adopt_mint_timeout`] for an adoption probe),
+    /// refreshing progress status periodically and failing fast only if
+    /// the managed SERVER child dies or a shutdown is requested mid-mint.
     async fn mint_endpoint(
         &self,
         binary: &Path,
         repo_id: &str,
         server: &mut ManagedServer,
         status: &StatusCallback,
+        timeout: Duration,
     ) -> std::result::Result<UnslothEndpoint, StartupFailure> {
         let mut cmd = Command::new(binary);
         cmd.arg("start")
@@ -1364,7 +1423,7 @@ impl UnslothServerManager {
             buf
         });
 
-        let deadline = tokio::time::Instant::now() + self.config.mint_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut last_status = tokio::time::Instant::now();
         let exit_status = loop {
             if self.is_shutting_down() {
@@ -1412,7 +1471,7 @@ impl UnslothServerManager {
                 // retry attaches instead of respawning.
                 return Err(StartupFailure::transient(Error::Internal(format!(
                     "unsloth start opencode --no-launch timed out after {}s",
-                    self.config.mint_timeout.as_secs()
+                    timeout.as_secs()
                 ))));
             }
             if last_status.elapsed() >= STATUS_UPDATE_INTERVAL {
@@ -2018,11 +2077,20 @@ mod tests {
         /// request carries `Bearer <key>`, 401 otherwise (mirrors the real
         /// server's auth-required `/v1/models`).
         async fn spawn_stub_http(key: &'static str) -> u16 {
+            spawn_stub_http_abortable(key).await.0
+        }
+
+        /// [`spawn_stub_http`] variant that also hands back the accept-loop
+        /// task handle so a test can abort it (dropping the listener and
+        /// closing the port) to simulate the server vanishing.
+        async fn spawn_stub_http_abortable(
+            key: &'static str,
+        ) -> (u16, tokio::task::JoinHandle<()>) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
             let port = listener.local_addr().unwrap().port();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         break;
@@ -2040,7 +2108,7 @@ mod tests {
                     });
                 }
             });
-            port
+            (port, handle)
         }
 
         /// Write an executable stub `unsloth` script into `dir`. `run` logs
@@ -2161,6 +2229,7 @@ mod tests {
                 model_ready_timeout: Duration::from_secs(10),
                 probe_interval: Duration::from_millis(50),
                 mint_timeout: Duration::from_secs(5),
+                adopt_mint_timeout: Duration::from_secs(5),
                 hf_api_base: "http://127.0.0.1:1".to_string(),
                 hf_files_timeout: Duration::from_secs(2),
                 total_memory_bytes: Box::new(|| Some(32 * GIB)),
@@ -3247,6 +3316,90 @@ mod tests {
             assert!(
                 !stub_log(dir.path()).contains("run --model"),
                 "must not spawn a child doomed to fail its bind"
+            );
+        }
+
+        #[tokio::test]
+        async fn vanished_adopted_server_falls_through_to_a_fresh_spawn() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // The occupant is abortable so the test can make it vanish
+            // after adoption; the daemon's own re-spawn then lands on a
+            // second stub standing in for its managed server.
+            let (occupant_port, occupant) = spawn_stub_http_abortable("sk-unsloth-test-key").await;
+            let managed_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), managed_port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), occupant_port);
+            config.port_is_free = Box::new(|_| false);
+            config.pick_free_port = Box::new(move || Some(managed_port));
+            let mgr = UnslothServerManager::with_config(config);
+
+            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("adopts the occupant");
+            assert!(
+                !stub_log(dir.path()).contains("run --model"),
+                "no spawn while adopted"
+            );
+
+            // The occupant vanishes: the next call's authed re-verification
+            // fails, the stale adopted entry is dropped (nothing to kill),
+            // and the daemon spawns its own server instead of erroring or
+            // reusing the dead endpoint forever.
+            occupant.abort();
+            let _ = occupant.await;
+
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("re-spawns after the adopted occupant vanished");
+            assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
+            let log = stub_log(dir.path());
+            assert_eq!(
+                log.matches("run --model").count(),
+                1,
+                "exactly one spawn, after the occupant vanished: {log}"
+            );
+            let status = mgr.status_snapshot().await.expect("server tracked");
+            assert!(status.pid.is_some(), "the replacement is daemon-owned");
+            assert_eq!(status.port, managed_port);
+            mgr.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn shutdown_and_stop_never_kill_an_adopted_occupant() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let occupant_port = spawn_stub_http("sk-unsloth-test-key").await;
+            let binary = write_stub_binary(dir.path(), dir.path(), occupant_port, None);
+            let mut config = test_config(binary, dir.path().to_path_buf(), occupant_port);
+            config.port_is_free = Box::new(|_| false);
+            let mgr = UnslothServerManager::with_config(config);
+
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("adopts");
+            assert!(mgr.stop().await, "stop reports the adopted server");
+
+            // The occupant must still answer HTTP after stop(): the daemon
+            // dropped its tracking entry but owns no process to kill.
+            let client = reqwest::Client::new();
+            let probe_url = format!("http://127.0.0.1:{occupant_port}/v1/models");
+            assert_eq!(
+                probe_status(&client, &probe_url, Some(&ep.api_key)).await,
+                Some(200),
+                "occupant must survive unsloth.stop"
+            );
+
+            // Re-adopt, then shutdown() — same property.
+            let ep = mgr
+                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .await
+                .expect("re-adopts");
+            mgr.shutdown().await;
+            assert_eq!(
+                probe_status(&client, &probe_url, Some(&ep.api_key)).await,
+                Some(200),
+                "occupant must survive daemon shutdown"
             );
         }
     }
