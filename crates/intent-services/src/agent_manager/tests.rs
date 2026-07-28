@@ -3018,6 +3018,120 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     assert!(!mgr.is_busy(&id), "the slot was released");
 }
 
+/// monorepo#840 quarantine gate: `send_queued_message_now` on a poisoned
+/// session (Error + session-fatal provider block) must NOT redrive — the
+/// entry stays in the queue and the result reports
+/// `queued: true, quarantined: true`. An unknown entry id on a poisoned
+/// session is still `-32602`.
+#[tokio::test]
+async fn send_queued_message_now_leaves_entry_queued_when_quarantined() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-poison"));
+    seed_agent(&mgr, &ws, &id).await;
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "parked".into(), None, None)
+        .await
+        .expect("queue");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws,
+            &id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            Some(Some(
+                "The model provider blocked this response for safety reasons. \
+                 Please start a new session"
+                    .into(),
+            )),
+        )
+        .await
+        .expect("park session poisoned");
+
+    let result = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect("quarantined send-now succeeds as a no-op park");
+    assert_eq!(result["success"], json!(true));
+    assert_eq!(result["queued"], json!(true), "entry NOT delivered");
+    assert_eq!(result["quarantined"], json!(true));
+    assert_eq!(result["queuedMessage"]["id"], json!(entry_id));
+    assert_eq!(
+        mgr.services.queue_snapshot(&id).len(),
+        1,
+        "entry stays in the queue for agent.retry"
+    );
+    assert!(!mgr.is_busy(&id), "no slot claim for a poisoned session");
+
+    let err = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), "no-such-entry".into())
+        .await
+        .expect_err("absent entry is still -32602 while quarantined");
+    assert!(
+        matches!(err, Error::InvalidParams(ref m) if m.contains("queued message not found")),
+        "got {err:?}"
+    );
+}
+
+/// Stale-redrive parity with the drain paths (#576): a delegated agent's
+/// entry whose `queued_at` predates the delivered completion report is
+/// annotated with the stale-redrive note before delivery.
+#[tokio::test]
+async fn send_queued_message_now_annotates_stale_redrive() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-stale"));
+    seed_agent(&mgr, &ws, &id).await;
+    let _agent = track_mock_agent(&mgr, &id, false);
+    let queued = mgr
+        .services
+        .agent_queue_message_op(id.clone(), "queued before report".into(), None, None)
+        .await
+        .expect("queue");
+    let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
+    // The completion report lands AFTER the enqueue → the entry is stale.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.parent_agent_id = Some(AgentId::from("agent-parent"));
+    session.completion_report = Some("work done".to_string());
+    session.completion_report_timestamp = Some(now_iso());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("set delegated report");
+
+    let result = mgr
+        .send_queued_message_now(id.clone(), ws.clone(), entry_id.clone())
+        .await
+        .expect("send queued now");
+    assert_eq!(result["queued"], json!(false));
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let row = messages
+        .iter()
+        .find(|m| m.id == entry_id)
+        .expect("user row persisted under the entry id");
+    let text = serde_json::to_string(&row.content).unwrap();
+    assert!(
+        text.contains("queued before report"),
+        "original content preserved: {text}"
+    );
+    assert!(
+        text.contains("was already delivered"),
+        "stale-redrive note appended: {text}"
+    );
+}
+
 /// STAB-114/126 guard, combined-delivery semantics (monorepo#1014): a
 /// zero-output interrupt (live-turn slot open but no assistant blocks
 /// streamed yet) must NOT persist an assistant row — the flush is a no-op for

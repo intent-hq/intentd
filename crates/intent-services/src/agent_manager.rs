@@ -3165,6 +3165,14 @@ impl AgentManager {
     /// a concurrent send won the race) or the user-row append fails, the
     /// entry is restored at the FRONT of the queue (`persisted` untouched, so
     /// a retry drain does not double-append) — the message is never lost.
+    ///
+    /// A quarantined (poisoned, monorepo#840) session is NOT redriven: the
+    /// entry stays in the queue untouched and the result reports
+    /// `queued: true, quarantined: true` — `agent.retry` is the deliberate
+    /// redrive. An ORDINARY `Error` session (no fatal reason / streak) IS
+    /// redriven — the explicit "send now" is a user action, same spirit as
+    /// the documented fresh-`agent.sendMessage` recovery path (the STAB-52
+    /// drain gate does not apply here by design).
     pub async fn send_queued_message_now(
         self: &Arc<Self>,
         agent_id: AgentId,
@@ -3173,15 +3181,44 @@ impl AgentManager {
     ) -> Result<Value> {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
-        self.services.require_agent_session(&agent_id).await?;
+        let session = self.services.require_agent_session(&agent_id).await?;
+        // Quarantine gate (monorepo#840): a provably-poisoned session must
+        // not be redriven by delivery — every replay deterministically
+        // fails. The entry STAYS in the queue (no side effects); the absent
+        // case is still `-32602` so the contract holds.
+        if self.services.session_poisoned(&session) {
+            let entry = self
+                .services
+                .queue_snapshot(&agent_id)
+                .into_iter()
+                .find(|m| m["id"].as_str() == Some(message_id.as_str()))
+                .ok_or_else(|| {
+                    Error::InvalidParams(format!("queued message not found: {message_id}"))
+                })?;
+            tracing::warn!(
+                agent = %agent_id,
+                stop_reason = session.stop_reason.as_deref().unwrap_or(""),
+                "session is quarantined (poisoned); sendQueuedMessageNow leaves the entry queued"
+            );
+            return Ok(json!({
+                "success": true,
+                "queued": true,
+                "quarantined": true,
+                "queuedMessage": entry,
+            }));
+        }
         // Atomic dequeue under the queue lock: no concurrent drain can
         // deliver the same entry twice.
-        let entry = self
+        let mut entry = self
             .services
             .take_queued_message(&agent_id, &message_id)
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
+        // Stale-redrive parity with the drain paths (#576): a delegated
+        // agent's entry that predates the delivered completion report is
+        // annotated and keeps the report queryable.
+        let stale = self.annotate_stale_redrive(&agent_id, &mut entry).await;
         // Publish the shrunk snapshot (write-through persist inside) so
         // clients see the entry leave the queue before the turn starts.
         self.services
@@ -3198,6 +3235,7 @@ impl AgentManager {
             image_blocks: entry.image_blocks.clone(),
             file_blocks: entry.file_blocks.clone(),
             message_metadata: entry.message_metadata.clone(),
+            suppress_report_clear: stale,
             queued_at: Some(entry.queued_at.clone()),
             prepend_content: entry.prepend_content.clone(),
             prepend_image_blocks: entry.prepend_image_blocks.clone(),
@@ -3542,11 +3580,24 @@ impl AgentManager {
                         // Prompt-only prepend: both user rows are
                         // already persisted, so nothing is appended to
                         // the transcript and the queue is untouched.
+                        // MERGE with any entry-carried prepend payload
+                        // (a monorepo#1014-requeued entry delivered via
+                        // `send_queued_message_now` already carries its
+                        // own `prepend_*`): the entry's older prepend
+                        // stays first, the just-preempted message follows
+                        // — transcript order, nothing clobbered.
                         if !text_content.is_empty() {
-                            options.prepend_content = Some(text_content);
+                            options.prepend_content = Some(match options.prepend_content.take() {
+                                Some(existing) if !existing.is_empty() => {
+                                    format!("{existing}\n\n{text_content}")
+                                }
+                                _ => text_content,
+                            });
                         }
-                        options.prepend_image_blocks = image_blocks;
-                        options.prepend_file_blocks = file_blocks;
+                        options.prepend_image_blocks =
+                            merge_block_arrays(options.prepend_image_blocks.take(), image_blocks);
+                        options.prepend_file_blocks =
+                            merge_block_arrays(options.prepend_file_blocks.take(), file_blocks);
                     }
                 }
             }
@@ -4756,6 +4807,23 @@ fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOption
     push_file_blocks(blocks, options.prepend_file_blocks.as_ref());
     push_image_blocks(blocks, options.image_blocks.as_ref());
     push_file_blocks(blocks, options.file_blocks.as_ref());
+}
+
+/// Merge two optional JSON block arrays, `first`'s entries preceding
+/// `second`'s (the older payload stays first — transcript order). Used by the
+/// zero-output preemption path to combine an entry-carried `prepend_*`
+/// payload with the just-preempted message's attachments instead of
+/// clobbering one with the other.
+fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Value> {
+    match (first, second) {
+        (Some(Value::Array(mut a)), Some(Value::Array(b))) => {
+            a.extend(b);
+            Some(Value::Array(a))
+        }
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (Some(a), Some(_)) => Some(a),
+        (None, None) => None,
+    }
 }
 
 /// Push one `image` content block per well-formed `{ data, mimeType }` entry.
