@@ -40,7 +40,10 @@ mod workspace_repo;
 mod workspace_ui_context_repo;
 
 pub use agent_queue_repo::AgentQueueRow;
-pub use agent_repo::{AgentUsageRow, InterruptedAgent, ReplaceMessage, SessionMessageProjection};
+pub use agent_repo::{
+    AgentUsageRow, InterruptedAgent, ReplaceMessage, SessionMessageProjection,
+    PROJECTION_TEXT_BLOCK_CAP,
+};
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::{DiffRow, NewDiff};

@@ -1754,6 +1754,43 @@ async fn list_derives_last_response_and_digest() {
     );
 }
 
+/// P1b: multi-MB messages never regress the `AgentLite` previews — the
+/// SQL-capped projection still yields the correct digest, final response
+/// line, and a bounded `lastUserMessage` (the message's head, capped at the
+/// store's per-block limit instead of the full multi-MB text).
+#[tokio::test]
+async fn list_previews_bounded_and_correct_with_multi_megabyte_messages() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "BigTalker").await;
+    let big_user = format!("start of the big ask {}", "u".repeat(2 * 1024 * 1024));
+    let big_assistant = format!(
+        "{}\nFinal answer here\n<agent_digest>big digest</agent_digest>",
+        "a".repeat(2 * 1024 * 1024)
+    );
+    for (role, text) in [("user", &big_user), ("assistant", &big_assistant)] {
+        let content = json!([{ "type": "text", "text": text }]);
+        svc.store()
+            .append_agent_message(&id, role, &content, &now_iso())
+            .await
+            .expect("append");
+    }
+
+    let agents = svc.agent_list_op(ws).await.expect("list");
+    assert_eq!(agents[0].message_count, 2);
+    assert_eq!(agents[0].digest.as_deref(), Some("big digest"));
+    assert_eq!(
+        agents[0].last_agent_response.as_deref(),
+        Some("Final answer here")
+    );
+    let last_user = agents[0].last_user_message.as_deref().expect("last user");
+    assert!(last_user.starts_with("start of the big ask"));
+    assert_eq!(
+        last_user.chars().count(),
+        intent_store::PROJECTION_TEXT_BLOCK_CAP as usize,
+        "lastUserMessage bounded at the projection cap"
+    );
+}
+
 #[tokio::test]
 async fn get_conversation_truncates_to_limit() {
     let (_t, svc, ws) = setup().await;
