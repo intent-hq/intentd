@@ -413,6 +413,17 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         .and_then(|w| w["lastActivity"].as_str())
         .map(|s| s.to_string());
 
+    // Second subscription on `agent:*`: turn completion is observed via
+    // `agent:stream:end`, which a `workspace:*` subscription never receives.
+    let mut agent_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut agent_sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
     // Drive activity: create + run an agent
     let created = wss_rpc(
         &mut rpc,
@@ -431,6 +442,13 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
     )
     .await;
 
+    // Quiesce the activity source before the paired reads below: wait for the
+    // agent turn to finish so no in-flight turn keeps bumping lastActivity
+    // between the event read and the workspace.get (monorepo#1004 — under
+    // coverage instrumentation a late bump landed between the two reads and
+    // broke their byte-equality).
+    await_stream_ends(&mut agent_sub, agent_id, 1).await;
+
     // Wait for workspace:updated with lastActivity.
     // The debounce window is 500ms, so we wait a bit longer to account for
     // agent turn execution + debounce + event delivery.
@@ -441,11 +459,36 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
         changes["lastActivity"].is_string(),
         "lastActivity in changes: {changes}"
     );
+    let mut new_activity = changes["lastActivity"]
+        .as_str()
+        .expect("lastActivity string")
+        .to_string();
+
+    // The turn is complete, but its trailing activity touches may still be
+    // debouncing. Drain further workspace:updated emissions until the
+    // subscription has been quiet for well over one debounce window (same
+    // pattern as the burst test), keeping the latest lastActivity. Once quiet
+    // no bump is pending, so the workspace.get below must observe exactly
+    // this value and the byte-equality assertion is deterministic (#1004).
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while let Some(evt) = try_next_event(
+        &mut sub,
+        &["workspace:updated"],
+        Duration::from_millis(1500),
+    )
+    .await
+    {
+        assert!(
+            tokio::time::Instant::now() < drain_deadline,
+            "workspace:updated drain never went quiet within 30s"
+        );
+        if let Some(latest) = evt["data"]["changes"]["lastActivity"].as_str() {
+            new_activity = latest.to_string();
+        }
+    }
 
     // Verify it's newer than initial and matches workspace.get
-    let new_activity = changes["lastActivity"]
-        .as_str()
-        .expect("lastActivity string");
+    let new_activity = new_activity.as_str();
     if let Some(init) = &initial_activity {
         // Parse both as RFC3339 DateTimes to compare instants (lexicographic comparison
         // can be wrong with differing fractional-second precision).
