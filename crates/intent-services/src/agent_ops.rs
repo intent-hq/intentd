@@ -219,15 +219,15 @@ pub(crate) struct QueuedMessage {
     /// this entry was (re)queued. The terminal-failure requeue (STAB-112)
     /// carries the CONFIRMED durability of the pre-turn `persist_user` append
     /// (STAB-51) — `false` when that append failed, so the retry drain
-    /// re-attempts it; the interrupt zero-output requeue (STAB-114) always
-    /// sets it (the row is read from the transcript). Drain paths skip
-    /// `persist_user` for such entries so a retry does not duplicate the
-    /// user message in chat history.
+    /// re-attempts it. Drain paths skip `persist_user` for such entries so a
+    /// retry does not duplicate the user message in chat history. (The
+    /// zero-output interrupt no longer requeues: it delivers the preempted
+    /// message combined with the interrupt turn, monorepo#1014.)
     #[serde(default)]
     pub persisted: bool,
     /// `true` when this is a terminal-failure requeue (STAB-112); `to_value`
-    /// emits `requeuedAfterFailure: true` on the wire. Interrupt requeues
-    /// (STAB-114) leave this `false` so the FE does not show "failed — will retry".
+    /// emits `requeuedAfterFailure: true` on the wire so the FE shows
+    /// "failed — will retry" only for genuine failures.
     #[serde(default)]
     pub requeued_after_failure: bool,
     /// Per-message `messageMetadata` captured at enqueue time (e.g. the
@@ -5495,7 +5495,7 @@ impl Services {
     /// shutdown come back ready-to-send (`editing: false`) — the editing
     /// client's hold is gone; `persisted` / `requeuedAfterFailure` flags are
     /// preserved so a later drain does not double-append transcript rows
-    /// (STAB-114/STAB-52). Rehydration never kicks `try_drain_queue`: messages
+    /// (STAB-112/STAB-52). Rehydration never kicks `try_drain_queue`: messages
     /// sit until an explicit kick (resume, sendMessage, queueMessage, retry).
     /// Returns the number of messages actually inserted into the in-memory
     /// map (agents that already hold a live queue are skipped, not counted).

@@ -140,6 +140,20 @@ pub struct TurnOptions {
     /// so the retry still suppresses the report clear). `None` for direct
     /// sends, whose requeue stamps `now_iso()` as before.
     pub queued_at: Option<String>,
+    /// STAB-114 / monorepo#1014: text of the user message preempted by a
+    /// zero-output interrupt, delivered AHEAD of this turn's own `content` in
+    /// the SAME `session/prompt` so both messages are honored in order.
+    /// Prompt-only — the preempted user row is already persisted, so this is
+    /// never appended to the transcript again.
+    pub prepend_content: Option<String>,
+    /// Image attachments of the preempted message (same shape as
+    /// `image_blocks`), emitted as ACP content blocks AHEAD of this turn's own
+    /// attachments. Prompt-only, like `prepend_content`.
+    pub prepend_image_blocks: Option<serde_json::Value>,
+    /// File attachments of the preempted message (same shape as
+    /// `file_blocks`), emitted as ACP content blocks AHEAD of this turn's own
+    /// attachments. Prompt-only, like `prepend_content`.
+    pub prepend_file_blocks: Option<serde_json::Value>,
 }
 
 /// Conservative cap used when total system memory cannot be determined.
@@ -2097,6 +2111,11 @@ impl AgentManager {
     /// `Context:\n<stdin>\n\n---\n\n` block, reference-parity with
     /// `acp-provider.ts`; other [`TurnOptions`] fields are reserved for
     /// downstream note-image / context-reference resolution.
+    ///
+    /// When `options.prepend_content` is set (STAB-114 / monorepo#1014
+    /// combined delivery), the preempted message's text is delivered ahead of
+    /// `content` in the same prompt body, so the interrupt turn honors both
+    /// messages in order.
     async fn build_turn_prompt(
         &self,
         agent_id: &AgentId,
@@ -2104,12 +2123,18 @@ impl AgentManager {
         content: &str,
         options: &TurnOptions,
     ) -> Vec<ContentBlock> {
+        // Combined interrupt delivery (monorepo#1014): the preempted
+        // message's text precedes the interrupt message's own content.
+        let combined = match options.prepend_content.as_deref() {
+            Some(orig) if !orig.is_empty() => format!("{orig}\n\n{content}"),
+            _ => content.to_string(),
+        };
         // Role reminder is rebuilt every turn (interval = 1, port of
         // acp-provider.ts) and prepended to the outbound prompt for specialist
         // agents; absent for non-specialist agents. Because it fires every turn
         // it also covers the session-recreated case handled by `build_turn_body`.
         let reminder = self.services.agent_role_reminder(agent_id).await;
-        let body = self.build_turn_body(agent_id, content).await;
+        let body = self.build_turn_body(agent_id, &combined).await;
         let prompt_text = match reminder {
             Some(r) => format!("{r}\n\n{body}"),
             None => body,
@@ -2393,8 +2418,8 @@ impl AgentManager {
         // chat-channel terminal reconcile sees the persisted row and keeps
         // the blocks instead of removing them. Only the plain `agent.stop`
         // path (`!suppress_idle_emit`) opts into persisting an EMPTY row for
-        // a pre-first-token stop — the STAB-114 zero-output requeue in
-        // `interrupt_send_message` must never see a phantom row.
+        // a pre-first-token stop — the STAB-114 zero-output combined delivery
+        // in `interrupt_send_message` must never see a phantom row.
         let interrupted_message_id = match partial_turn {
             Some(live) => {
                 self.services
@@ -3240,6 +3265,16 @@ impl AgentManager {
     /// idle agent falls through to the normal [`AgentManager::send_message`]
     /// path unchanged.
     ///
+    /// **Zero-output interrupt = combined delivery** (STAB-114 /
+    /// monorepo#1014): when the preempted turn produced no assistant output,
+    /// the preempted user message would otherwise be silently dropped by the
+    /// provider-side `session/cancel`. Instead of re-queueing it BEHIND the
+    /// interrupt (which inverted the user's intended order), its text and
+    /// attachments are threaded into the interrupt turn's [`TurnOptions`]
+    /// `prepend_*` fields, so ONE `session/prompt` delivers both messages in
+    /// original order. Both user rows are already persisted, so the prepend
+    /// is prompt-only and the transcript stays intact.
+    ///
     /// Two crash timings from the reference app are guarded here:
     /// - **Duplicate delivery.** The SAME interrupt (same client-supplied
     ///   `messageId`) delivered twice in quick succession preempts exactly
@@ -3261,7 +3296,7 @@ impl AgentManager {
         workspace_id: WorkspaceId,
         content: String,
         message_id: Option<String>,
-        options: TurnOptions,
+        mut options: TurnOptions,
     ) -> Result<Value> {
         // monorepo#564: reject nonexistent targets BEFORE the dedup record or
         // any preemption — same fail-closed guard as `send_message`.
@@ -3318,12 +3353,17 @@ impl AgentManager {
                 self.interrupt_inner(&agent_id, true).await;
 
                 if !has_output {
-                    // Zero-output condition: re-queue the preempted message.
-                    // Fetch last 10 transcript messages (bounded work) to find the
-                    // user message + its attachments. If any non-user messages
-                    // (assistant/tool/system) exist after the last user message, the
-                    // turn has already progressed and we should NOT re-queue (avoids
-                    // duplicate tool calls or re-running side effects).
+                    // Zero-output condition: the provider dropped the preempted
+                    // message on `session/cancel`, so deliver it TOGETHER with
+                    // the interrupt message in ONE combined prompt (original
+                    // first) instead of re-queueing it behind the interrupt
+                    // (which inverted the user's intended order, monorepo#1014).
+                    // Fetch last 10 transcript messages (bounded work) to find
+                    // the user message + its attachments. If any non-user
+                    // messages (assistant/tool/system) exist after the last
+                    // user message, the turn has already progressed and we
+                    // should NOT re-deliver (avoids duplicate tool calls or
+                    // re-running side effects).
                     if let Ok(messages) = self
                         .services
                         .store
@@ -3394,39 +3434,14 @@ impl AgentManager {
                                         }
                                     });
 
-                                // `persisted: true` prevents duplicate transcript append;
-                                // `requeued_after_failure: false` so the FE does not show
-                                // "failed — will retry" (interrupt ≠ failure, STAB-114).
-                                // `queued_at` carries the interrupted user row's
-                                // `created_at` (best effort, #576): a direct send
-                                // interrupted after a mid-turn `reportToParent`
-                                // correctly classifies stale on redelivery. A drained
-                                // stale redrive's row was stamped at DRAIN time (after
-                                // `report_ts`), so its redelivery classifies fresh —
-                                // but the persisted `[SYSTEM NOTE]` annotation survives
-                                // in the row, so the duplicate-wake protection holds
-                                // either way.
-                                let queued = crate::agent_ops::QueuedMessage {
-                                    id: crate::agent_ops::new_message_id(),
-                                    content: text_content,
-                                    image_blocks,
-                                    file_blocks,
-                                    queued_at: last_user_msg.created_at.clone(),
-                                    editing: false,
-                                    persisted: true,
-                                    requeued_after_failure: false,
-                                    message_metadata: last_user_msg.metadata.clone(),
-                                };
-                                self.services.requeue_front(&agent_id, queued);
-
-                                // Publish queue updated so FE reflects the re-queued message
-                                self.services
-                                    .publish_queue_updated_for(
-                                        &agent_id,
-                                        &workspace_id,
-                                        self.services.queue_snapshot(&agent_id),
-                                    )
-                                    .await;
+                                // Prompt-only prepend: both user rows are
+                                // already persisted, so nothing is appended to
+                                // the transcript and the queue is untouched.
+                                if !text_content.is_empty() {
+                                    options.prepend_content = Some(text_content);
+                                }
+                                options.prepend_image_blocks = image_blocks;
+                                options.prepend_file_blocks = file_blocks;
                             }
                         }
                     }
@@ -4634,8 +4649,21 @@ fn build_stdin_context_from_context_references(refs: Option<&Value>) -> Option<S
 /// name lifted into the resource URI (`file:///<fileName>`). Malformed entries
 /// (missing required fields, wrong types) are silently skipped so a partial
 /// attachment array can never break the turn.
+///
+/// Combined interrupt delivery (STAB-114 / monorepo#1014): the preempted
+/// message's attachments (`prepend_image_blocks` / `prepend_file_blocks`) are
+/// emitted BEFORE this turn's own, so both messages' attachments survive with
+/// the original's first.
 fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOptions) {
-    if let Some(imgs) = options.image_blocks.as_ref().and_then(Value::as_array) {
+    push_image_blocks(blocks, options.prepend_image_blocks.as_ref());
+    push_file_blocks(blocks, options.prepend_file_blocks.as_ref());
+    push_image_blocks(blocks, options.image_blocks.as_ref());
+    push_file_blocks(blocks, options.file_blocks.as_ref());
+}
+
+/// Push one `image` content block per well-formed `{ data, mimeType }` entry.
+fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value>) {
+    if let Some(imgs) = image_blocks.and_then(Value::as_array) {
         for img in imgs {
             let data = img.get("data").and_then(Value::as_str);
             let mime = img.get("mimeType").and_then(Value::as_str);
@@ -4650,7 +4678,12 @@ fn append_attachment_blocks(blocks: &mut Vec<ContentBlock>, options: &TurnOption
             }
         }
     }
-    if let Some(files) = options.file_blocks.as_ref().and_then(Value::as_array) {
+}
+
+/// Push one `resource` content block per well-formed
+/// `{ data, mimeType, fileName }` entry.
+fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>) {
+    if let Some(files) = file_blocks.and_then(Value::as_array) {
         for file in files {
             let data = file.get("data").and_then(Value::as_str);
             let mime = file.get("mimeType").and_then(Value::as_str);

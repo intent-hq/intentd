@@ -6710,16 +6710,19 @@ async fn agent_message_event_emitted_for_queue_drain_and_wake_over_wss() {
     );
 }
 
-/// STAB-114 regression: When an interrupt lands BEFORE any assistant output,
-/// the preempted user message is re-queued at the front (with persisted:true,
-/// requeued_after_failure:false, and attachments preserved).
+/// STAB-114 / monorepo#1014 regression: When an interrupt lands BEFORE any
+/// assistant output, the preempted user message is NOT re-queued — it is
+/// delivered TOGETHER with the interrupt message in ONE combined prompt
+/// (original first), so both messages are honored in order and the queue
+/// stays empty.
 ///
 /// Uses `parkBeforeFirstChunk` mock behavior + deterministic wait for
 /// agent:stream:status phase="prompt" to ensure the ACP session is established
-/// (making the turn cancellable) before sending the interrupt.
+/// (making the turn cancellable) before sending the interrupt. The combined
+/// outbound prompt is asserted via the fixture's `MOCK_AGENT_PROMPT_LOG` seam.
 #[tokio::test]
-async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
-    let Some(script) = gate("STAB-114 zero-output requeue E2E") else {
+async fn stab_114_interrupt_zero_output_delivers_combined_prompt_over_wss() {
+    let Some(script) = gate("STAB-114 zero-output combined delivery E2E") else {
         eprintln!("[STAB114-TEST] Gate returned None, test skipped");
         return;
     };
@@ -6727,13 +6730,16 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
 
     let data_dir = temp_data_dir();
     let (ws_id, _note_id) = seed_workspace_and_note(&data_dir).await;
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     // parkBeforeFirstChunk parks immediately without streaming any chunks
     let behavior = json!({ "parkBeforeFirstChunk": true, "response": "resumed" }).to_string();
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -6818,55 +6824,82 @@ async fn stab_114_interrupt_zero_output_requeues_message_over_wss() {
     .await;
     assert_eq!(interrupted["success"], true);
 
-    // Wait for queue-updated event showing the original message re-queued
-    let mut saw_requeue = false;
-    for _ in 0..20 {
-        if let Some(frame) = wss_event_opt(&mut sub, 3).await {
-            if frame["params"]["event"]["type"] == "agent:queue:updated" {
-                let queue = frame["params"]["event"]["data"]["queue"]
-                    .as_array()
-                    .expect("queue array");
-                if !queue.is_empty() {
-                    let msg = &queue[0];
-                    if msg["content"].as_str().unwrap_or("").contains("first") {
-                        saw_requeue = true;
-                        // Wire omits requeuedAfterFailure unless true, so check it's absent or false
-                        let requeued_after_failure =
-                            msg["requeuedAfterFailure"].as_bool().unwrap_or(false);
-                        assert!(
-                            !requeued_after_failure,
-                            "STAB-114: interrupt requeue should NOT set requeuedAfterFailure"
-                        );
-                        break;
-                    }
-                }
+    // Outbound-prompt contract: poll the fixture's prompt log until the
+    // interrupt turn's prompt lands (the first stream:end belongs to the
+    // CANCELLED turn, before the combined prompt is even sent). The combined
+    // prompt carries BOTH messages with the preempted "first" BEFORE the
+    // interrupt "urgent".
+    let mut combined_text = None;
+    for _ in 0..50 {
+        if let Ok(log) = std::fs::read_to_string(&prompt_log) {
+            if let Some(text) = log
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|p| p["text"].as_str().map(str::to_string))
+                .find(|t| t.contains("urgent"))
+            {
+                combined_text = Some(text);
+                break;
             }
         }
+        sleep(Duration::from_millis(200)).await;
     }
+    let text = combined_text.expect("interrupt turn's prompt reached the mock");
+    let first_pos = text
+        .find("first")
+        .unwrap_or_else(|| panic!("combined prompt carries the preempted message: {text}"));
+    let urgent_pos = text
+        .find("urgent")
+        .unwrap_or_else(|| panic!("combined prompt carries the interrupt message: {text}"));
     assert!(
-        saw_requeue,
-        "STAB-114: original message should be re-queued after zero-output interrupt"
+        first_pos < urgent_pos,
+        "preempted message precedes the interrupt message: {text}"
+    );
+
+    // Combined delivery: the queue stays EMPTY — the preempted message rides
+    // the interrupt turn's prompt, it is never re-queued behind it.
+    let queue = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getQueue",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    let queued = queue["queue"].as_array().expect("queue array");
+    assert!(
+        queued.is_empty(),
+        "combined delivery leaves the queue empty (no requeue): {queue}"
     );
 
     // No phantom row: the zero-output interrupt-send must NOT persist an
     // interrupted assistant row (contrast the plain `agent.stop` path, which
     // persists an empty synthetic one — see
     // `agent_stop_before_first_token_persists_empty_interrupted_row_over_wss`).
+    // Transcript keeps BOTH user rows intact (combined delivery is prompt-only).
     let conv = wss_rpc(
         &mut rpc,
-        13,
+        14,
         "agent.getConversation",
         json!({ "agentId": &agent_id }),
     )
     .await;
-    let phantom = conv["messages"]
-        .as_array()
-        .expect("messages array")
+    let messages = conv["messages"].as_array().expect("messages array");
+    let phantom = messages
         .iter()
         .find(|m| m["role"] == "assistant" && m["metadata"]["interrupted"] == true);
     assert!(
         phantom.is_none(),
         "STAB-114: zero-output interrupt-send persists no interrupted assistant row: {conv}"
+    );
+    let user_texts: Vec<&str> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["contentBlocks"][0]["text"].as_str())
+        .collect();
+    assert_eq!(
+        user_texts,
+        vec!["first", "urgent"],
+        "both user rows persist in original order: {conv}"
     );
 }
 
