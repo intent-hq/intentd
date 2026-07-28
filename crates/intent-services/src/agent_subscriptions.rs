@@ -1347,7 +1347,6 @@ impl Services {
                     if should_record {
                         // Build a synthetic agent:idle, agent:failed, or agent:deleted event
                         // Prefer the child's persisted completion_report when present
-                        let report = session.completion_report;
                         let event_type = if is_deleted {
                             intent_core::events::AGENT_DELETED
                         } else if is_failed {
@@ -1355,6 +1354,23 @@ impl Services {
                         } else {
                             intent_core::events::AGENT_IDLE
                         };
+                        // monorepo#1016: a synthesized agent:idle with no
+                        // report and a still-incomplete assigned task gets
+                        // the suspected-stall annotation (best-effort,
+                        // fail-open) — mirroring the live delivery path.
+                        let stall = if event_type == intent_core::events::AGENT_IDLE {
+                            self.stall_suspicion_for_session(&session).await
+                        } else {
+                            None
+                        };
+                        let mut data = serde_json::json!({
+                            "agentId": child_id.0,
+                            "status": serde_json::to_value(session.status).unwrap_or_default(),
+                        });
+                        if let Some(s) = &stall {
+                            s.annotate_event_data(&mut data);
+                        }
+                        let report = session.completion_report;
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
                         // for chief-anchored groups).
@@ -1372,13 +1388,14 @@ impl Services {
                             correlation_id: None,
                             parent_event_id: None,
                             metadata: None,
-                            data: serde_json::json!({
-                                "agentId": child_id.0,
-                                "status": serde_json::to_value(session.status).unwrap_or_default(),
-                            }),
+                            data,
                         };
-                        let summary =
-                            crate::format_group_child_line(&child_id, &event, report.as_deref());
+                        let summary = crate::format_group_child_line(
+                            &child_id,
+                            &event,
+                            report.as_deref(),
+                            stall.as_ref(),
+                        );
 
                         // Record the completion
                         self.record_group_child_completion(
@@ -1411,7 +1428,7 @@ impl Services {
                                 "status": "deleted",
                             }),
                         };
-                        let summary = crate::format_group_child_line(&child_id, &event, None);
+                        let summary = crate::format_group_child_line(&child_id, &event, None, None);
 
                         self.record_group_child_completion(
                             group_id, &child_id, true, // deleted
@@ -1458,12 +1475,19 @@ impl Services {
             // Build event for group recording. Prefer the child's persisted
             // completion_report (set by agent.reportToParent) over the generic
             // summary, mirroring deliver_completion_to_watches logic.
-            let report = self
-                .store
-                .get_agent_session(agent_id)
-                .await
-                .ok()
-                .and_then(|s| s.completion_report);
+            let session = self.store.get_agent_session(agent_id).await.ok();
+            // monorepo#1016: annotate a suspected stall (idle, no report,
+            // assigned task still incomplete) on the recorded line + event
+            // data. Best-effort — lookup failures fail open.
+            let stall = match session.as_ref() {
+                Some(s) => self.stall_suspicion_for_session(s).await,
+                None => None,
+            };
+            let report = session.and_then(|s| s.completion_report);
+            let mut data = event_data.clone();
+            if let Some(s) = &stall {
+                s.annotate_event_data(&mut data);
+            }
             let event = Event {
                 id: String::new(),
                 workspace_id: workspace_id.clone(),
@@ -1478,9 +1502,10 @@ impl Services {
                 correlation_id: None,
                 parent_event_id: None,
                 metadata: None,
-                data: event_data.clone(),
+                data,
             };
-            let summary = crate::format_group_child_line(agent_id, &event, report.as_deref());
+            let summary =
+                crate::format_group_child_line(agent_id, &event, report.as_deref(), stall.as_ref());
 
             self.record_group_child_completion(
                 &group_id, agent_id, false, // not deleted

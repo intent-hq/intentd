@@ -12641,3 +12641,423 @@ async fn agent_list_and_get_do_not_hydrate_transcripts_regression() {
     assert_eq!(got.last_user_message.as_deref(), Some("ask 38"));
     assert_eq!(got.last_agent_response.as_deref(), Some("reply 39"));
 }
+
+// ---------------------------------------------------------------------------
+// Suspected-stall wake annotation (monorepo#1016)
+// ---------------------------------------------------------------------------
+
+/// Create a task note with `status` and link it to `child`'s session as its
+/// assigned task (`task_note_id`), mirroring what `agent.delegate` does.
+async fn link_task_note(
+    svc: &Services,
+    ws: &WorkspaceId,
+    child: &AgentId,
+    title: &str,
+    status: &str,
+) -> intent_core::NoteId {
+    let note = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: title.into(),
+                content: Some("body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create task note");
+    WorkspaceApi::mark_as_task(
+        svc,
+        ws.clone(),
+        note.id.clone(),
+        status.into(),
+        vec![],
+        None,
+    )
+    .await
+    .expect("mark as task");
+    let mut s = svc
+        .store()
+        .get_agent_session(child)
+        .await
+        .expect("child session");
+    s.task_note_id = Some(note.id.clone());
+    svc.store()
+        .update_agent_session(ws, &s)
+        .await
+        .expect("link task note");
+    note.id
+}
+
+const STALL_MARKER: &str = "may have stalled rather than finished (monorepo#1016)";
+
+/// monorepo#1016: an `agent:idle` completion with NO completion report while
+/// the child's assigned task note is still `in_progress` gets the
+/// suspected-stall annotation appended to the wake text, and the wake's
+/// `event_notification` metadata carries `stallSuspected: true` + the task's
+/// wire status.
+#[tokio::test]
+async fn stall_suspected_wake_annotated_when_no_report_and_task_incomplete() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Port frobnicator", "in_progress").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "lastResponseSummary": "went idle" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1, "exactly one wake");
+    let text = session.messages[0].content.to_string();
+    assert!(text.contains(STALL_MARKER), "wake annotated: {text}");
+    assert!(
+        text.contains("assigned task \\\"Port frobnicator\\\" is still in_progress"),
+        "annotation names the task and status: {text}"
+    );
+    assert!(
+        text.contains("ws.agent.wakeOrCreate"),
+        "annotation suggests wakeOrCreate: {text}"
+    );
+    let metadata = session.messages[0]
+        .metadata
+        .as_ref()
+        .expect("wake metadata");
+    assert_eq!(metadata["stallSuspected"], json!(true), "meta: {metadata}");
+    assert_eq!(
+        metadata["taskStatus"],
+        json!("in_progress"),
+        "meta: {metadata}"
+    );
+    assert_eq!(
+        metadata["events"][0]["data"]["stallSuspected"],
+        json!(true),
+        "per-event data annotated: {metadata}"
+    );
+}
+
+/// A completion WITH a persisted completion report is clean — no annotation,
+/// no `stallSuspected` metadata — even though the assigned task note is still
+/// incomplete (the child reported, so the parent has the real signal).
+#[tokio::test]
+async fn stall_annotation_skipped_when_completion_report_present() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Port frobnicator", "in_progress").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&child)
+        .await
+        .expect("child session");
+    s.completion_report = Some("all done".into());
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("persist report");
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &child,
+        json!({ "agentId": child.0, "completionReport": "all done" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let text = session.messages[0].content.to_string();
+    assert!(!text.contains(STALL_MARKER), "clean wake: {text}");
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert!(
+        metadata.get("stallSuspected").is_none(),
+        "no stall flag: {metadata}"
+    );
+}
+
+/// No assigned task note → clean wake (nothing to compare the idle against),
+/// and a task note already `complete` → clean wake (the work IS finished,
+/// report or not). Also covers fail-open: a dangling `task_note_id` whose
+/// note row is gone must not annotate (store lookup fails → no annotation).
+#[tokio::test]
+async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+
+    // Case 1: no task note linked at all.
+    let free = create_agent(&svc, &ws, "Free").await;
+    // Case 2: task note complete.
+    let done = create_agent(&svc, &ws, "Done").await;
+    link_task_note(&svc, &ws, &done, "Finished task", "complete").await;
+    // Case 3: dangling task_note_id (note deleted) → fail open.
+    let dangling = create_agent(&svc, &ws, "Dangling").await;
+    let mut s = svc
+        .store()
+        .get_agent_session(&dangling)
+        .await
+        .expect("session");
+    s.task_note_id = Some(intent_core::NoteId::from("note-gone"));
+    svc.store()
+        .update_agent_session(&ws, &s)
+        .await
+        .expect("link dangling note");
+
+    for child in [&free, &done, &dangling] {
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            true,
+            None,
+        )
+        .expect("register watch");
+        svc.handle_completion_event(&completion_event(
+            &ws,
+            AGENT_IDLE,
+            child,
+            json!({ "agentId": child.0, "lastResponseSummary": "idled" }),
+        ))
+        .await;
+    }
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 3, "three clean wakes");
+    for msg in &session.messages {
+        let text = msg.content.to_string();
+        assert!(!text.contains(STALL_MARKER), "clean wake: {text}");
+        let metadata = msg.metadata.as_ref().expect("metadata");
+        assert!(
+            metadata.get("stallSuspected").is_none(),
+            "no stall flag: {metadata}"
+        );
+    }
+}
+
+/// `agent:failed` never carries the stall annotation — failure is already an
+/// explicit signal, and the annotation is scoped to misleading "completed"
+/// wording on agent:idle.
+#[tokio::test]
+async fn stall_annotation_skipped_for_agent_failed() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_task_note(&svc, &ws, &child, "Port frobnicator", "in_progress").await;
+
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        true,
+        None,
+    )
+    .expect("register watch");
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_FAILED,
+        &child,
+        json!({ "agentId": child.0, "error": "boom" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&parent)
+        .await
+        .expect("parent session");
+    assert_eq!(session.messages.len(), 1);
+    let text = session.messages[0].content.to_string();
+    assert!(text.contains("failed"), "failure wake: {text}");
+    assert!(!text.contains(STALL_MARKER), "no stall annotation: {text}");
+}
+
+/// Grouped after_all path: a suspected-stall child's per-child line in the
+/// aggregated wake carries the annotation, and the aggregated metadata lifts
+/// `stallSuspected: true` from the annotated raw event.
+#[tokio::test]
+async fn stall_annotation_applies_to_grouped_after_all_child_line() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Caller").await;
+    let t1 = create_agent(&svc, &ws, "Stalled").await;
+    let t2 = create_agent(&svc, &ws, "Clean").await;
+    link_task_note(&svc, &ws, &t1, "Stalled task", "in_progress").await;
+
+    svc.app_agents_wait_op(
+        ws.clone(),
+        caller.clone(),
+        vec![t1.0.clone(), t2.0.clone()],
+        Some("after_all".into()),
+    )
+    .await
+    .expect("waitFor after_all");
+    // Seal the group (caller idles), then settle both children.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &caller,
+        json!({ "agentId": caller.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t1,
+        json!({ "agentId": t1.0, "lastResponseSummary": "idled silently" }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &t2,
+        json!({ "agentId": t2.0, "completionReport": "t2 done" }),
+    ))
+    .await;
+
+    let session = svc
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains(STALL_MARKER),
+        "stalled child's line annotated: {text}"
+    );
+    assert!(
+        text.contains("assigned task \\\"Stalled task\\\" is still in_progress"),
+        "annotation names the task: {text}"
+    );
+    assert!(text.contains("t2 done"), "clean child unaffected: {text}");
+    assert_eq!(
+        text.matches(STALL_MARKER).count(),
+        1,
+        "only the stalled child's line annotated: {text}"
+    );
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(
+        metadata["stallSuspected"],
+        json!(true),
+        "aggregated metadata lifts the flag: {metadata}"
+    );
+    assert_eq!(
+        metadata["taskStatus"],
+        json!("in_progress"),
+        "meta: {metadata}"
+    );
+}
+
+/// Rehydration parity (STAB-108 + monorepo#1016): a group child reconciled
+/// after a restart as Completed WITHOUT a completion report — while its
+/// assigned task note is still `in_progress` — carries the suspected-stall
+/// annotation in the synthesized per-child line of the aggregated wake.
+#[tokio::test]
+async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
+    let tmp = TempDb::new();
+    let ws = WorkspaceId::new();
+    let (caller, target) = {
+        let store = Store::open(&tmp.path).await.expect("open store");
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let svc = Services::new(store);
+        let caller = create_agent(&svc, &ws, "Caller").await;
+        let target = create_agent(&svc, &ws, "Target").await;
+        link_task_note(&svc, &ws, &target, "Stalled task", "in_progress").await;
+
+        svc.app_agents_wait_op(
+            ws.clone(),
+            caller.clone(),
+            vec![target.0.clone()],
+            Some("after_all".into()),
+        )
+        .await
+        .expect("waitFor after_all");
+        // Wait for the group row to persist (the upsert is spawned).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let rows = svc
+                .store()
+                .list_undelivered_groups(&ws)
+                .await
+                .expect("list persisted groups");
+            if !rows.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "group row persisted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (caller, target)
+    }; // old Services dropped — simulated daemon restart
+
+    let store = Store::open(&tmp.path).await.expect("reopen store");
+    // The target settled while the daemon was down: Completed but with NO
+    // completion report, and its task note is still in_progress.
+    let mut s = store
+        .get_agent_session(&target)
+        .await
+        .expect("target session");
+    s.status = intent_core::AgentStatus::Completed;
+    store.update_agent_session(&ws, &s).await.expect("mark");
+    let restarted = Services::new(store);
+
+    let loaded = restarted
+        .rehydrate_delegation_groups(&ws)
+        .await
+        .expect("rehydrate");
+    assert_eq!(loaded, 1, "one group rehydrated");
+
+    let session = restarted
+        .store()
+        .get_agent_session(&caller)
+        .await
+        .expect("caller session");
+    assert_eq!(session.messages.len(), 1, "one aggregated wake");
+    let text = session.messages[0].content.to_string();
+    assert!(
+        text.contains(STALL_MARKER),
+        "synthesized completion annotated: {text}"
+    );
+    let metadata = session.messages[0].metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["stallSuspected"], json!(true), "meta: {metadata}");
+}
