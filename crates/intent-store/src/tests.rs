@@ -94,7 +94,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
         ]
     );
     assert_eq!(
@@ -102,7 +102,7 @@ async fn migration_status_reports_current_after_open() {
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
         ]
     );
 }
@@ -4721,4 +4721,33 @@ async fn agent_queue_load_survives_corrupt_payload() {
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0].payload, serde_json::Value::Null);
     assert_eq!(loaded[1].payload["content"], "good");
+}
+
+/// Guard against duplicate migration version numbers: two files sharing a
+/// version (e.g. two `0062_*.sql`) embed fine but make every `Store::open`
+/// fail at runtime with a UNIQUE constraint violation on
+/// `_sqlx_migrations.version`.
+#[test]
+fn migrations_have_unique_versions() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut versions: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for entry in std::fs::read_dir(&dir).expect("read migrations dir") {
+        let name = entry.expect("dir entry").file_name();
+        let name = name.to_string_lossy().to_string();
+        if !name.ends_with(".sql") {
+            continue;
+        }
+        let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let version: i64 = digits
+            .parse()
+            .unwrap_or_else(|_| panic!("migration '{name}' has no numeric version prefix"));
+        versions.entry(version).or_default().push(name);
+    }
+    assert!(!versions.is_empty(), "no migrations found in {dir:?}");
+    let dupes: Vec<_> = versions.iter().filter(|(_, v)| v.len() > 1).collect();
+    assert!(
+        dupes.is_empty(),
+        "duplicate migration version numbers found: {dupes:?}"
+    );
 }
