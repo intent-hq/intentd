@@ -1,7 +1,10 @@
 //! Regression tests for STAB-115: settings-based default model resolution.
 //!
 //! Covers Bug B: model resolution precedence at creation time:
-//! - workspace override > background type override > background default > provider defaults > global default
+//! - background type override > background default > provider defaults > global default
+//!
+//! (The per-workspace override tier was removed in monorepo#1000; a stale
+//! `model.workspaceOverrides` SQLite row must be ignored.)
 //!
 //! Bug A (agent.setModel respawn) is covered by the WSS e2e test in
 //! `crates/intentd/tests/e2e_wss_agent_set_model.rs`, which exercises the full
@@ -37,8 +40,8 @@ fn set(svc: &Services, path: &str, value: serde_json::Value) {
         .expect("apply setting");
 }
 
-/// Seed a SQLite-backed state blob (e.g. `model.workspaceOverrides`) directly
-/// in the `settings` table — these keys are not TOML-backed.
+/// Seed a SQLite-backed state blob directly in the `settings` table — used to
+/// plant a stale retired-key row for the regression test below.
 async fn set_blob(svc: &Services, path: &str, value: serde_json::Value) {
     svc.store()
         .set_setting(path, &value.to_string())
@@ -85,23 +88,24 @@ async fn agent_create_resolves_model_from_settings_default() {
     assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
-/// Bug B: Workspace-specific overrides take precedence over global default.
+/// monorepo#1000 regression: a stale `model.workspaceOverrides` SQLite row
+/// (left behind by a pre-removal daemon) must NOT influence resolution — the
+/// retired tier is gone, so the chain proceeds to the live tiers.
 #[tokio::test]
-async fn agent_create_workspace_override_beats_global_default() {
+async fn agent_create_ignores_stale_workspace_override_row() {
     let (_t, svc, ws, _cfg) = setup().await;
 
-    // Set both global default and workspace-specific override
+    // Plant a stale override row for this workspace plus a global default.
     set(&svc, "model.default", json!("auggie:sonnet4.5"));
-
     let overrides = json!({ ws.as_str(): "auggie:opus" });
     set_blob(&svc, "model.workspaceOverrides", overrides).await;
 
     // Create agent without explicit model
     let id = create_agent(&svc, &ws, "TestAgent", None).await;
 
-    // Verify the workspace override won
+    // The stale override is ignored; the global default wins.
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:opus"));
+    assert_eq!(got.model.as_deref(), Some("auggie:sonnet4.5"));
 }
 
 /// Bug B: Background agents check backgroundAgents.defaultModel before global default.
@@ -204,26 +208,6 @@ async fn agent_create_uses_provider_defaults_for_explicit_provider() {
     // Verify the opencode provider default won
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.model.as_deref(), Some("kimi-k3"));
-}
-
-/// STAB-117 extension: more-specific settings (workspace override) beat providerDefaults.
-#[tokio::test]
-async fn agent_create_workspace_override_beats_provider_defaults() {
-    let (_t, svc, ws, _cfg) = setup().await;
-
-    // Set both providerDefaults and workspace override
-    let provider_defaults = json!({ "auggie": "fable-5" });
-    set(&svc, "model.providerDefaults", provider_defaults);
-
-    let overrides = json!({ ws.as_str(): "auggie:opus" });
-    set_blob(&svc, "model.workspaceOverrides", overrides).await;
-
-    // Create agent without explicit model
-    let id = create_agent(&svc, &ws, "TestAgent", None).await;
-
-    // Verify the workspace override won
-    let got = svc.agent_get_op(id.clone(), None).await.expect("get");
-    assert_eq!(got.model.as_deref(), Some("auggie:opus"));
 }
 
 /// STAB-117 extension: background default beats providerDefaults.

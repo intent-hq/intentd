@@ -16,9 +16,8 @@
 //!   appear in `config.toml`.
 //! - **Machine-state blobs** (`workspace.changeHistory`,
 //!   `workspaceInitializer.state`, `repos.known`, `endUserRules`,
-//!   `permissions.rules`, `userRules`, `workspaceRules`,
-//!   `model.workspaceOverrides`) — high-churn state that stays
-//!   SQLite-backed.
+//!   `permissions.rules`, `userRules`, `workspaceRules`) — high-churn
+//!   state that stays SQLite-backed.
 //!
 //! Keys that older daemons **used to** persist here but that have since moved
 //! back to SQLite or been removed outright are listed in
@@ -74,9 +73,9 @@ pub struct ProvidersSettings {
     pub paths: BTreeMap<String, String>,
 }
 
-/// `[model]` — model defaults (`model.*`). Per-workspace model overrides
-/// (`model.workspaceOverrides`) are a SQLite-backed machine-state blob, not
-/// part of this file (see [`LEGACY_SETTINGS_PATHS`]).
+/// `[model]` — model defaults (`model.*`). The per-workspace override layer
+/// (`model.workspaceOverrides`) is retired (monorepo#1000) and only survives
+/// as a tolerated legacy key (see [`LEGACY_SETTINGS_PATHS`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelSettings {

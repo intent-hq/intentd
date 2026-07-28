@@ -209,15 +209,15 @@ async fn legacy_listen_mode_is_discarded_and_stripped_on_boot() {
     assert_eq!(status["result"]["listenMode"], json!("uds"), "{status}");
 }
 
-/// One-time legacy import: a config.toml carrying the retired
+/// One-time legacy handling: a config.toml carrying the retired
 /// `model.workspaceOverrides` key and the retired `[ai]` table must NOT
-/// refuse startup — the daemon boots, imports `model.workspaceOverrides`
-/// into the SQLite settings blob (readable over the wire with no `origin`
-/// field), DISCARDS the `[ai]` values (no catalog entry remains), and strips
-/// both from the file with a comment-preserving rewrite. A second boot then
-/// reads the clean file and the imported value survives.
+/// refuse startup — the daemon boots, DISCARDS both values (neither has a
+/// catalog entry since monorepo#1000), and strips both from the file with a
+/// comment-preserving rewrite. Over the wire the retired path is unknown to
+/// `settings.get` but tolerated-and-ignored by `settings.update` (old-client
+/// compatibility). A second boot then reads the clean file untouched.
 #[tokio::test]
-async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
+async fn legacy_workspace_overrides_discards_and_strips_on_boot() {
     let data_dir = temp_data_dir();
     let config_path = data_dir.join("config.toml");
     std::fs::write(
@@ -226,15 +226,15 @@ async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
     )
     .expect("seed config.toml");
 
-    // First boot: tolerated + imported + stripped.
+    // First boot: tolerated + discarded + stripped.
     let child = spawn_serve(&data_dir, &[]);
     let socket = data_dir.join("intentd.sock");
     {
         let _daemon = DaemonGuard::new(child, data_dir.clone(), false);
         assert!(await_uds(&socket).await, "daemon did not start");
 
-        // The imported blob reads over the wire with no origin field
-        // (SQLite-backed state, not a TOML-backed key).
+        // The retired key has no catalog entry: settings.get rejects it as
+        // unknown rather than serving the discarded file value.
         let get = uds_rpc(
             &socket,
             1,
@@ -243,18 +243,31 @@ async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
         )
         .await;
         assert_eq!(
-            get["result"]["value"],
-            json!({ "ws1": "m1" }),
-            "imported value: {get}"
+            get["error"]["code"],
+            json!(-32602),
+            "retired path must be unknown to settings.get: {get}"
         );
-        assert!(
-            get["result"].get("origin").is_none(),
-            "state blob must carry no origin: {get}"
+
+        // But settings.update from an old client is tolerated-and-ignored:
+        // the batch succeeds with nothing applied.
+        let update = uds_rpc(
+            &socket,
+            2,
+            "settings.update",
+            json!({ "changes": [
+                { "path": "model.workspaceOverrides", "value": { "ws1": "m2" } }
+            ] }),
+        )
+        .await;
+        assert_eq!(
+            update["result"]["applied"],
+            json!([]),
+            "retired path must be ignored, not applied: {update}"
         );
 
         // The retired [ai] table is discarded: no catalog entry, so the wire
         // rejects the path as unknown rather than serving the file value.
-        let ai = uds_rpc(&socket, 2, "settings.get", json!({ "path": "ai.apiUrl" })).await;
+        let ai = uds_rpc(&socket, 3, "settings.get", json!({ "path": "ai.apiUrl" })).await;
         assert!(
             ai.get("error").is_some(),
             "ai.apiUrl must be unknown after removal: {ai}"
@@ -271,22 +284,22 @@ async fn legacy_workspace_overrides_imports_and_strips_on_boot() {
         assert!(text.contains("autoCommit = false"), "{text}");
     } // guard drop kills the first daemon
 
-    // Second boot: clean file, imported value still served from SQLite.
+    // Second boot: clean file, still no retired key on the wire.
     let stripped_text = std::fs::read_to_string(&config_path).expect("read config");
     let child = spawn_serve(&data_dir, &[]);
     let _daemon = DaemonGuard::new(child, data_dir.clone(), true);
     assert!(await_uds(&socket).await, "second boot did not start");
     let get = uds_rpc(
         &socket,
-        3,
+        4,
         "settings.get",
         json!({ "path": "model.workspaceOverrides" }),
     )
     .await;
     assert_eq!(
-        get["result"]["value"],
-        json!({ "ws1": "m1" }),
-        "value survives restart: {get}"
+        get["error"]["code"],
+        json!(-32602),
+        "retired path stays unknown after restart: {get}"
     );
     // The clean second boot did not rewrite the file again.
     assert_eq!(
