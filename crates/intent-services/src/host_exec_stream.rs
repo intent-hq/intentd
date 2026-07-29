@@ -369,7 +369,11 @@ pub async fn start_stream(
 /// (broadcast-only, never persisted — same path as `agent:stream:chunk`):
 /// streamed output is consumed live by the correlated subscriber and has no
 /// event-table readback, so a chatty child must not serialize behind a durable
-/// SQLite commit per chunk. The terminal `host:exec:exit` stays durable.
+/// SQLite commit per chunk. The terminal `host:exec:exit` stays durable but is
+/// published from [`run_wait_loop`] — a different task from these readers — so
+/// unlike the terminal/script paths there is no exit-never-overtakes-data
+/// guarantee: `child.wait()` can return while a pipe still holds unread bytes,
+/// and the exit frame may precede trailing chunks (pre-existing behavior).
 fn spawn_reader<R>(
     bus: EventBus,
     workspace_id: WorkspaceId,
