@@ -492,6 +492,29 @@ pub(crate) async fn assemble_system_prompt(
              Prioritize them above general guidance."
         ));
     }
+    // Commit-policy layer: agents never commit themselves. When auto-commit is
+    // on, the daemon's auto-commit-on-idle subscriber owns commits; when off,
+    // nothing commits unless the user explicitly asks. Injected for every agent
+    // (top-level and sub-agents alike) in both states so the model always has
+    // an explicit directive.
+    if auto_commit_enabled {
+        parts.push(
+            "## Commit Policy\n\n\
+             Do not commit — your changes are committed automatically by the \
+             system when your turn ends. The only exception is an explicit \
+             user-requested checkpoint commit, which goes through \
+             `agent_commit_changes`. Never run `git commit` yourself."
+                .to_string(),
+        );
+    } else {
+        parts.push(
+            "## Commit Policy\n\n\
+             Auto-commit is OFF. Do not commit (including shell `git commit`) \
+             unless the user explicitly asks. User-requested commits go through \
+             `agent_commit_changes` with `userRequested: true`."
+                .to_string(),
+        );
+    }
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
@@ -936,6 +959,78 @@ This is a test skill.
         assert!(
             !prompt.contains("## Suggested Next Steps"),
             "Suggested Next Steps should be absent for sub-agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_policy_clause_when_auto_commit_on() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            true,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            prompt.contains("## Commit Policy"),
+            "Commit-policy clause should be present when auto-commit is on"
+        );
+        assert!(
+            prompt.contains("committed automatically by the system when your turn ends"),
+            "ON-state clause should describe harness-owned commits"
+        );
+        assert!(
+            !prompt.contains("Auto-commit is OFF."),
+            "OFF-state clause should be absent when auto-commit is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_policy_clause_when_auto_commit_off() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        // Sub-agent gating does not apply: the clause is injected for every
+        // agent, so assert it with `is_sub_agent = true`.
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            true,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            prompt.contains("## Commit Policy"),
+            "Commit-policy clause should be present when auto-commit is off"
+        );
+        assert!(
+            prompt.contains("Auto-commit is OFF. Do not commit (including shell `git commit`)"),
+            "OFF-state clause should forbid commits including shell git commit"
+        );
+        assert!(
+            prompt.contains("`agent_commit_changes` with `userRequested: true`"),
+            "OFF-state clause should route user-requested commits through agent_commit_changes"
+        );
+        assert!(
+            !prompt.contains("committed automatically by the system"),
+            "ON-state clause should be absent when auto-commit is off"
         );
     }
 }

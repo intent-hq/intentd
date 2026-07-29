@@ -344,7 +344,7 @@ async fn wss_client_hello_and_drafts_round_trip() {
     .await;
     assert_eq!(sess[0]["result"]["clientId"], "cli-wss");
     assert_eq!(
-        sess[0]["result"]["protocolVersion"], "2.6",
+        sess[0]["result"]["protocolVersion"], "2.7",
         "explicit top-level protocolVersion in the client.hello result (§5.17)"
     );
     assert_eq!(
@@ -380,6 +380,84 @@ async fn wss_client_hello_and_drafts_round_trip() {
         sess[1]["result"]["attachments"][0]["imageData"], "aGk=",
         "reconnect restores the attachments"
     );
+    srv.ws.stop().await;
+}
+
+/// `workspace.getAutoCommit` / `workspace.setAutoCommit` (§5.1): a freshly
+/// created workspace mirrors the global `git.autoCommit` (default true) as
+/// its own override (`source: "workspace"`); the setter persists a toggle
+/// that the getter reads back; a missing `enabled` and an unknown workspace
+/// both surface `-32602`.
+#[tokio::test]
+async fn wss_workspace_auto_commit_round_trip() {
+    let srv = start(WsOptions::default()).await;
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"WSS AutoCommit"}}"#,
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("created id")
+        .to_string();
+
+    // Mirror-at-creation: the new row owns its override.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace.getAutoCommit","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(got["result"]["autoCommit"]["enabled"], true);
+    assert_eq!(got["result"]["autoCommit"]["source"], "workspace");
+
+    // Toggle off; the setter echoes the persisted state.
+    let set = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.setAutoCommit","params":{{"workspaceId":"{ws_id}","enabled":false}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(set["result"]["autoCommit"]["enabled"], false);
+    assert_eq!(set["result"]["autoCommit"]["source"], "workspace");
+
+    // Read-back sees the persisted override.
+    let got = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace.getAutoCommit","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(got["result"]["autoCommit"]["enabled"], false);
+    assert_eq!(got["result"]["autoCommit"]["source"], "workspace");
+
+    // Missing `enabled` → -32602.
+    let bad = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace.setAutoCommit","params":{{"workspaceId":"{ws_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602);
+
+    // Unknown workspace → -32602 "Workspace not found".
+    let missing = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":6,"method":"workspace.getAutoCommit","params":{"workspaceId":"ws-none"}}"#,
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], -32602);
+    assert_eq!(missing["error"]["message"], "Workspace not found");
     srv.ws.stop().await;
 }
 

@@ -311,6 +311,39 @@ impl Store {
         }
     }
 
+    /// Set the persisted per-workspace auto-commit override (spec Diagnosis
+    /// §3b). Mirrored from the global `git.autoCommit` at create time and
+    /// toggled via `workspace.setAutoCommit`. Store-only column — the value
+    /// is surfaced through the dedicated getter RPC, not on [`Workspace`].
+    pub async fn set_workspace_auto_commit(&self, id: &WorkspaceId, enabled: bool) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET auto_commit_enabled = ? WHERE id = ?")
+            .bind(enabled as i64)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set auto_commit_enabled failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
+    /// The persisted per-workspace auto-commit override. `Ok(None)` for
+    /// pre-migration rows (NULL column) — the caller resolves NULL against
+    /// the global `git.autoCommit` setting. `NotFound` when the workspace
+    /// does not exist.
+    pub async fn workspace_auto_commit(&self, id: &WorkspaceId) -> Result<Option<bool>> {
+        let row = sqlx::query("SELECT auto_commit_enabled FROM workspace WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get auto_commit_enabled failed: {e}")))?;
+        match row {
+            Some(r) => Ok(col::<Option<i64>>(&r, "auto_commit_enabled")?.map(|v| v != 0)),
+            None => Err(Error::NotFound(format!("workspace {id}"))),
+        }
+    }
+
     /// List workspaces, filtering archived rows unless `include_archived`.
     /// The seeded virtual [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief
     /// is synthesized on read by the service layer and never surfaces via

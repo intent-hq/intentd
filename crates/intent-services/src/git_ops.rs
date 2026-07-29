@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 
-use intent_core::settings_file::SettingsFile;
 use intent_core::{Error, Result, Workspace};
 use serde_json::{json, Map, Value};
 
@@ -35,14 +34,16 @@ const AUTO_COMMIT_DISABLED_MSG: &str = "Auto-commit is disabled for this workspa
 Use agent_commit_changes with userRequested: true if the user asked you to commit.";
 
 /// Port of `assertAgentCommitAllowed`: block an agent-initiated commit when
-/// auto-commit is disabled, unless `user_requested` bypasses it. The gate reads
-/// the effective `git.autoCommit` setting (§9.8 OQ#2), whose schema default is
-/// `true` so the established behavior is preserved when the key is unset.
+/// auto-commit is disabled, unless `user_requested` bypasses it. The gate
+/// reads the workspace-resolved auto-commit state (per-workspace override
+/// when persisted, else the effective `git.autoCommit` setting — see
+/// `Services::effective_auto_commit`), whose schema default is `true` so the
+/// established behavior is preserved when nothing is set.
 pub(crate) fn assert_agent_commit_allowed(
-    settings: &SettingsFile,
+    auto_commit_enabled: bool,
     user_requested: bool,
 ) -> Result<()> {
-    if user_requested || settings.git.auto_commit {
+    if user_requested || auto_commit_enabled {
         return Ok(());
     }
     Err(Error::Internal(AUTO_COMMIT_DISABLED_MSG.to_string()))
