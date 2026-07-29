@@ -588,15 +588,17 @@ async fn delegated_child_idle_timeout_does_not_wake_parent_over_wss() {
         ],
     })
     .to_string();
-    // 4s window: long enough that the parent's own (tool-calling) turns never
-    // trip it on a slow host, short enough to keep the test fast. The child
-    // parks with ZERO activity, so its timeout fires deterministically.
+    // 8s window: wide enough that the parent's own (tool-calling) turns never
+    // have a silent gap that trips it, even on a heavily loaded CI host. The
+    // child parks with ZERO activity, so its timeout fires deterministically
+    // regardless of the window size — the wait below keys off the child's
+    // warning row, not a fixed sleep, so the wider window costs nothing.
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("INTENTD_TCP_PORT", "0"),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "4000"),
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "8000"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
