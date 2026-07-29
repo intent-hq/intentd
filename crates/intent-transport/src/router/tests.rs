@@ -4755,6 +4755,77 @@ mod send_message_payload_forwarding {
     }
 }
 
+/// `agent.dismissQuestions` (PROTOCOL §5.5, question hold): the dispatch arm
+/// forwards `workspaceId`/`agentId`/`messageId` verbatim and rejects missing
+/// params with `-32602` before any API call.
+mod dismiss_questions_dispatch {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    #[derive(Default)]
+    struct RecordingApi {
+        dismissed: Arc<Mutex<Option<(WorkspaceId, AgentId, String)>>>,
+    }
+
+    impl WorkspaceApi for RecordingApi {
+        fn agent_dismiss_questions(
+            &self,
+            workspace_id: WorkspaceId,
+            agent_id: AgentId,
+            message_id: String,
+        ) -> BoxFuture<'_, Result<Value>> {
+            let slot = self.dismissed.clone();
+            Box::pin(async move {
+                let dismissed = message_id.clone();
+                *slot.lock().unwrap() = Some((workspace_id, agent_id, message_id));
+                Ok(json!({ "success": true, "dismissedQuestionsMessageId": dismissed }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dismiss_questions_forwards_ids_verbatim() {
+        let api = RecordingApi::default();
+        let msg = r#"{
+            "jsonrpc":"2.0","id":1,"method":"agent.dismissQuestions",
+            "params":{"workspaceId":"ws-1","agentId":"agent-1","messageId":"msg-q1"}
+        }"#;
+        let out = handle_message(&api, msg).await.expect("response");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["result"]["success"], Value::Bool(true));
+        assert_eq!(v["result"]["dismissedQuestionsMessageId"], "msg-q1");
+        let cap = api.dismissed.lock().unwrap().clone().expect("captured");
+        assert_eq!(cap.0.as_str(), "ws-1");
+        assert_eq!(cap.1.as_str(), "agent-1");
+        assert_eq!(cap.2, "msg-q1");
+    }
+
+    #[tokio::test]
+    async fn dismiss_questions_missing_params_are_invalid_params() {
+        let api = RecordingApi::default();
+        for params in [
+            r#"{"agentId":"agent-1","messageId":"msg-q1"}"#,
+            r#"{"workspaceId":"ws-1","messageId":"msg-q1"}"#,
+            r#"{"workspaceId":"ws-1","agentId":"agent-1"}"#,
+        ] {
+            let msg = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"agent.dismissQuestions","params":{params}}}"#
+            );
+            let out = handle_message(&api, &msg).await.expect("response");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["error"]["code"], json!(-32602), "params: {params}");
+        }
+        assert!(
+            api.dismissed.lock().unwrap().is_none(),
+            "the API must not be called on a malformed request"
+        );
+    }
+}
+
 /// `repoConfig.*` namespace tests (additive intentd-only surface, FE parity
 /// with `packages/cloudlands-fe/src/features/workspace/main/repo-config.ipc.ts`).
 #[tokio::test]

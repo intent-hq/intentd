@@ -533,6 +533,7 @@ mod tests {
                 sandbox_id: None,
                 sandbox_branch: None,
                 sandbox_path: None,
+                dismissed_questions_message_id: None,
             },
         }
     }

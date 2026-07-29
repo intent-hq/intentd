@@ -1378,6 +1378,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.dismissQuestions`: persist the question-dismissal marker
+    /// (`message_id` — the assistant message whose trailing question resource
+    /// blocks the user dismissed) on the agent session, emit `agent:updated`,
+    /// and kick the queue drain so messages held by the question hold resume
+    /// (PROTOCOL §5.5). Idempotent: re-dismissing the same message succeeds.
+    fn agent_dismiss_questions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, message_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_dismiss_questions not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `agent.editAndRegenerate`: edit a past user message and regenerate from
     /// that point (PROTOCOL §5.5). Stops any in-flight turn, truncates the
     /// transcript to just before `message_id` (which must reference an existing

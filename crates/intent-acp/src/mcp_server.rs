@@ -28,6 +28,11 @@ pub use bindings::app::proposal::{
     is_valid_proposal, proposal_resource_uri, PROPOSAL_KINDS, PROPOSAL_RESOURCE_MIME_TYPE,
 };
 
+// Canonical question MIME type (§7.1): the question-hold derivation in
+// `intent-services` reuses this so hold detection cannot drift from what
+// `ws.app.question.ask` emits.
+pub use bindings::app::question::QUESTION_RESOURCE_MIME_TYPE;
+
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 

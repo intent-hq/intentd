@@ -908,6 +908,23 @@ pub(crate) fn user_message_blocks(
     Value::Array(blocks)
 }
 
+/// `true` iff a message's content-block array carries at least one pending
+/// question resource block (`application/vnd.intent.question+json` — the MIME
+/// type `ws.app.question.ask` emits; reused from `intent-acp` so hold
+/// detection cannot drift from the binding). Non-array content is `false`.
+// TODO(question-hold follow-up): drop the allow once the delivery/drain gates
+// consume `question_hold_active` outside tests.
+#[allow(dead_code)]
+pub(crate) fn has_question_blocks(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| {
+            b.get("type").and_then(Value::as_str) == Some("resource")
+                && b.pointer("/resource/mimeType").and_then(Value::as_str)
+                    == Some(intent_acp::mcp_server::QUESTION_RESOURCE_MIME_TYPE)
+        })
+    })
+}
+
 /// Build the persisted `agent_session.metadata` blob for the create branch of
 /// `agent.wakeOrCreate` (C1d-10a). Starts from any caller-supplied
 /// `create.metadata` object (or `{}`), overlays the FE provenance fields the
@@ -2862,6 +2879,99 @@ impl Services {
         )
         .await;
         Ok(json!({ "success": true, "queued": false, "messageId": message.id }))
+    }
+
+    /// Question-hold derivation (PROTOCOL §5.5, question hold): `true` iff the
+    /// agent's LAST transcript message is an assistant message carrying at
+    /// least one `application/vnd.intent.question+json` resource block AND its
+    /// id differs from the session's persisted dismissal marker. Derived, not
+    /// stored: any later message (a user answer, a typed message, an explicit
+    /// `sendQueuedMessageNow`) supersedes the questions and flips the hold
+    /// false; `agent.dismissQuestions` persists the marker for the same
+    /// effect. Fails open (`false`) on store errors so a read failure can
+    /// never wedge deliveries.
+    // TODO(question-hold follow-up): drop the allow once the delivery/drain
+    // gates consume this outside tests.
+    #[allow(dead_code)]
+    pub(crate) async fn question_hold_active(&self, agent_id: &AgentId) -> bool {
+        let Ok(messages) = self.store.get_agent_messages(agent_id, Some(1)).await else {
+            return false;
+        };
+        let Some(last) = messages.last() else {
+            return false;
+        };
+        if last.role != "assistant" || !has_question_blocks(&last.content) {
+            return false;
+        }
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
+            return false;
+        };
+        session.dismissed_questions_message_id() != Some(last.id.as_str())
+    }
+
+    /// `agent.dismissQuestions` (PROTOCOL §5.5): persist the dismissal marker
+    /// (`message_id` — the assistant message whose trailing question resource
+    /// blocks the user dismissed) on the agent session so the dismissed
+    /// question set never re-surfaces (survives reload), emit `agent:updated`,
+    /// and kick the queue drain so messages held by the question hold resume.
+    /// Idempotent: re-dismissing the same message succeeds. Fails closed on a
+    /// nonexistent target or a workspace mismatch (`NotFound`).
+    pub(crate) async fn agent_dismiss_questions_op(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> Result<Value> {
+        let message_id = message_id.trim().to_string();
+        if message_id.is_empty() {
+            return Err(Error::InvalidParams("messageId is required".to_string()));
+        }
+        if message_id.len() > MAX_MESSAGE_ID_LEN {
+            return Err(Error::InvalidParams(format!(
+                "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
+            )));
+        }
+        // Metadata-only lookup (no transcript hydration); workspace mismatch
+        // surfaces as NotFound (defense-in-depth against bare-id probes).
+        let mut session = self.store.get_agent_session_summary(&agent_id).await?;
+        if session.workspace_id != workspace_id {
+            return Err(Error::NotFound(format!("agent session {agent_id}")));
+        }
+        let mut metadata = match session.metadata.take() {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        metadata.insert(
+            intent_core::DISMISSED_QUESTIONS_MESSAGE_ID_KEY.to_string(),
+            Value::String(message_id.clone()),
+        );
+        session.metadata = Some(Value::Object(metadata));
+        session.updated_at = now_iso();
+        self.store
+            .update_agent_session(&workspace_id, &session)
+            .await?;
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &agent_id,
+            AGENT_UPDATED,
+            json!({
+                "agentId": agent_id.0,
+                "dismissedQuestionsMessageId": message_id,
+            }),
+        )
+        .await;
+        // The hold (if it was gating this message's questions) is now released:
+        // kick the drain so held queue entries resume without waiting for the
+        // next end-of-turn drain.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .try_drain_queue(agent_id.clone(), workspace_id)
+                .await;
+        }
+        Ok(json!({
+            "success": true,
+            "dismissedQuestionsMessageId": message_id,
+        }))
     }
 
     /// `agent.summary`: a quick summary derived from the transcript (PROTOCOL §5.5).

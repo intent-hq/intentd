@@ -1867,6 +1867,14 @@ pub fn lift_app_message_id(metadata: Option<&serde_json::Value>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// Metadata key under which the question-dismissal marker is persisted on the
+/// `agent_session.metadata` JSON (PROTOCOL §5.5, question hold): the id of the
+/// assistant message whose trailing question resource blocks the user
+/// dismissed via `agent.dismissQuestions`. No schema migration — the marker
+/// rides the existing free-form `metadata` column and survives daemon
+/// restarts. Read back by [`AgentSession::dismissed_questions_message_id`].
+pub const DISMISSED_QUESTIONS_MESSAGE_ID_KEY: &str = "dismissedQuestionsMessageId";
+
 /// Maximum delegation depth to prevent unbounded recursive agent creation
 /// (port of the TS `MAX_DELEGATION_DEPTH` in `agent-interaction-tools.ts`).
 /// Depth 0 = user-created agents, depth 1 = their children, depth 2 =
@@ -2004,6 +2012,22 @@ pub struct AgentSession {
     pub updated_at: String,
 }
 
+impl AgentSession {
+    /// The question-dismissal marker persisted under
+    /// [`DISMISSED_QUESTIONS_MESSAGE_ID_KEY`] in the session's free-form
+    /// `metadata`: `Some` only when the metadata is an object carrying a
+    /// non-empty string under that key. The question-hold derivation compares
+    /// this against the last assistant message id — a match means the user
+    /// dismissed that message's questions and automatic deliveries resume.
+    pub fn dismissed_questions_message_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get(DISMISSED_QUESTIONS_MESSAGE_ID_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+}
+
 /// Nested `metadata` object on [`AgentLite`] (PROTOCOL §5.5). Mirrors the subset
 /// of the TS `AgentMetadata` the iOS `AgentSession.parseAgent` reads:
 /// `isBackground`, `specialist`, `createdByAgentId` (the parent/spawning agent),
@@ -2039,6 +2063,13 @@ pub struct AgentMetadata {
     /// Sandbox branch name when this agent runs in a sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_branch: Option<String>,
+    /// Question-dismissal marker (PROTOCOL §5.5, question hold): the id of the
+    /// assistant message whose trailing question resource blocks the user
+    /// dismissed via `agent.dismissQuestions`. Clients gate the Q&A wizard on
+    /// it so a dismissed question set never re-surfaces (including after
+    /// reload). Omitted when nothing was dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_questions_message_id: Option<String>,
 }
 
 /// Lightweight `agent.list` / `agent.get` projection (PROTOCOL §5.5). Mirrors
@@ -2158,6 +2189,8 @@ impl AgentLite {
         last_user_message: Option<String>,
         digest: Option<String>,
     ) -> Self {
+        let dismissed_questions_message_id =
+            session.dismissed_questions_message_id().map(str::to_string);
         let metadata = AgentMetadata {
             is_background: session.is_background,
             specialist: session.specialist,
@@ -2170,6 +2203,7 @@ impl AgentLite {
             sandbox_id: session.sandbox_id.clone(),
             sandbox_path: session.sandbox_path.clone(),
             sandbox_branch: session.sandbox_branch.clone(),
+            dismissed_questions_message_id,
         };
         Self {
             id: session.id,
@@ -3364,7 +3398,9 @@ mod tests {
             context_references: None,
             image_blocks: None,
             is_background: true,
-            metadata: None,
+            metadata: Some(json!({
+                DISMISSED_QUESTIONS_MESSAGE_ID_KEY: "msg-q1",
+            })),
             stop_reason: None,
             session_corrupted: false,
             created_at: "t0".to_string(),
@@ -3376,6 +3412,9 @@ mod tests {
         let lite = AgentLite::from_session(session, 0, None, Some("hi".to_string()), None);
         let v = serde_json::to_value(&lite).unwrap();
         assert_eq!(v["metadata"]["specialist"], "implementor");
+        // The question-dismissal marker is lifted out of the free-form session
+        // metadata into the AgentLite metadata projection.
+        assert_eq!(v["metadata"]["dismissedQuestionsMessageId"], "msg-q1");
         // The persisted session value is served, not a hard-coded `false`
         // (G-A1/P3-1.2c).
         assert_eq!(v["metadata"]["isBackground"], true);

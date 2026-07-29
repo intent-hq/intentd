@@ -1160,6 +1160,16 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
+        "agent.dismissQuestions" => {
+            let agent_id = require_agent_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let ws = require_ws_note(params)?;
+            let result = api
+                .agent_dismiss_questions(ws, agent_id, message_id)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(result)
+        }
         "agent.editAndRegenerate" => {
             let agent_id = require_agent_id(params)?;
             let message_id = require_str_param(params, "messageId")?;

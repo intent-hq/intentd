@@ -7314,6 +7314,7 @@ mod wsapi4_bindings_tests {
                 sandbox_id: None,
                 sandbox_path: None,
                 sandbox_branch: None,
+                dismissed_questions_message_id: None,
             },
         }
     }

@@ -15310,6 +15310,18 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_dismiss_questions(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        message_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_dismiss_questions_op(workspace_id, agent_id, message_id)
+                .await
+        })
+    }
+
     fn agent_edit_and_regenerate(
         &self,
         workspace_id: WorkspaceId,

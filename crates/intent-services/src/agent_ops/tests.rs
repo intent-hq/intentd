@@ -13269,3 +13269,200 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
     assert_eq!(metadata["stallSuspected"], json!(true), "meta: {metadata}");
 }
+
+// ---------------------------------------------------------------------------
+// Question hold: `question_hold_active` derivation + `agent.dismissQuestions`
+// ---------------------------------------------------------------------------
+
+/// A persisted assistant content-block array ending with one question
+/// resource block (the shape the §7.1 turn-end drain appends for
+/// `ws.app.question.ask`).
+fn question_blocks() -> serde_json::Value {
+    json!([
+        { "type": "text", "text": "I have a clarifying question." },
+        {
+            "type": "resource",
+            "resource": {
+                "uri": "intent-question://q-1",
+                "name": "Scope",
+                "mimeType": "application/vnd.intent.question+json",
+                "text": "{\"question\":\"Which scope?\",\"header\":\"Scope\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}"
+            }
+        }
+    ])
+}
+
+#[tokio::test]
+async fn question_hold_derivation_pending_superseded_dismissed_reask() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    // Empty transcript → no hold.
+    assert!(!svc.question_hold_active(&id).await);
+
+    // Plain assistant message (no question blocks) → no hold.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "text": "hi" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append plain");
+    assert!(!svc.question_hold_active(&id).await);
+
+    // Trailing question resource blocks on the LAST assistant message → hold.
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+    assert!(svc.question_hold_active(&id).await);
+
+    // Dismissal marker naming that message releases the hold.
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    assert!(!svc.question_hold_active(&id).await);
+
+    // Re-ask: a NEW question message (different id) re-arms the hold — the
+    // stale marker does not suppress it.
+    svc.store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append re-ask");
+    assert!(svc.question_hold_active(&id).await);
+
+    // A later user message supersedes the questions → hold flips false.
+    svc.store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "answers" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append user");
+    assert!(!svc.question_hold_active(&id).await);
+}
+
+#[tokio::test]
+async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let asked = svc
+        .store()
+        .append_agent_message(&id, "assistant", &question_blocks(), &now_iso())
+        .await
+        .expect("append question");
+
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    let r = svc
+        .agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("dismiss");
+    assert_eq!(r["success"], json!(true));
+    assert_eq!(r["dismissedQuestionsMessageId"], json!(asked.id));
+
+    // Marker persisted on the session row (survives reload) and lifted into
+    // the AgentLite metadata projection.
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(
+        session.dismissed_questions_message_id(),
+        Some(asked.id.as_str())
+    );
+    let lite = intent_core::AgentLite::from_session(session, 0, None, None, None);
+    assert_eq!(
+        lite.metadata.dismissed_questions_message_id.as_deref(),
+        Some(asked.id.as_str())
+    );
+
+    // `agent:updated` emitted, scoped to the workspace, carrying the marker.
+    let batch = timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].event_type, AGENT_UPDATED);
+    assert_eq!(batch[0].workspace_id, ws);
+    assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
+    assert_eq!(
+        batch[0].data["dismissedQuestionsMessageId"].as_str(),
+        Some(asked.id.as_str())
+    );
+
+    // Idempotent: re-dismissing the same message succeeds.
+    let again = svc
+        .agent_dismiss_questions_op(ws.clone(), id.clone(), asked.id.clone())
+        .await
+        .expect("re-dismiss");
+    assert_eq!(again["success"], json!(true));
+}
+
+#[tokio::test]
+async fn dismiss_questions_preserves_existing_session_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    session.metadata = Some(json!({ "source": "test-suite" }));
+    svc.store()
+        .update_agent_session(&ws, &session)
+        .await
+        .expect("seed metadata");
+
+    svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "msg-1".to_string())
+        .await
+        .expect("dismiss");
+
+    let session = svc.store().get_agent_session(&id).await.expect("reload");
+    let metadata = session.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["source"], json!("test-suite"));
+    assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-1"));
+}
+
+#[tokio::test]
+async fn dismiss_questions_fails_closed() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Asker").await;
+
+    // Unknown agent → NotFound.
+    let missing = AgentId::from("agent-00000000-0000-0000-0000-00000missing0");
+    assert!(matches!(
+        svc.agent_dismiss_questions_op(ws.clone(), missing, "msg-1".to_string())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+
+    // Workspace mismatch → NotFound (defense-in-depth), no marker persisted.
+    let other_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&other_ws))
+        .await
+        .expect("other ws");
+    assert!(matches!(
+        svc.agent_dismiss_questions_op(other_ws, id.clone(), "msg-1".to_string())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+    let session = svc.store().get_agent_session(&id).await.expect("session");
+    assert_eq!(session.dismissed_questions_message_id(), None);
+
+    // Blank messageId → InvalidParams.
+    assert!(matches!(
+        svc.agent_dismiss_questions_op(ws.clone(), id.clone(), "  ".to_string())
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+
+    // Oversized messageId → InvalidParams.
+    let oversized = "m".repeat(crate::agent_ops::MAX_MESSAGE_ID_LEN + 1);
+    assert!(matches!(
+        svc.agent_dismiss_questions_op(ws, id, oversized).await,
+        Err(Error::InvalidParams(_))
+    ));
+}
