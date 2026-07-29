@@ -101,9 +101,44 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh stable stable.json
+      # Fail-soft: aggregated notes are a nice-to-have; a failure here must
+      # never fail the promotion (the manifest is already published).
+      - name: Aggregate stable release notes
+        id: notes
+        continue-on-error: true
+        shell: bash
+        env:
+          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
+        run: |
+          ./scripts/aggregate-stable-notes.sh "$VERSION" "$PREV_STABLE"
+      - name: Post summary
+        shell: bash
+        env:
+          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
+          NOTES_OUTCOME: ${{ steps.notes.outcome }}
+        run: |
+          {
+            echo "## Stable promotion"
+            echo ""
+            echo "**Promoted version:** v$VERSION"
+            echo ""
+            echo "**Previous stable:** ${PREV_STABLE:-unknown (first promotion?)}"
+            echo ""
+            if [[ "$NOTES_OUTCOME" == "success" ]]; then
+              echo "**Aggregated notes:** updated on channel-stable"
+            else
+              echo "**Aggregated notes:** skipped (non-blocking failure; manifest unaffected)"
+            fi
+            echo ""
+            echo "- [channel-stable release (aggregated notes)](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-stable)"
+            echo "- [stable.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-stable/stable.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
       # --- Public mirror: intent-hq/intentd-releases ---
-      # Skipped with a warning when the INTENTD_RELEASES_TOKEN secret is not
-      # configured, so a missing secret never blocks the promotion itself.
+      # Runs last so a mirror failure (bad/expired token, network error) still
+      # fails the workflow loudly, but can no longer skip the fail-soft notes
+      # steps or the summary above — the primary promotion is fully done by
+      # this point. Skipped with a warning when the INTENTD_RELEASES_TOKEN
+      # secret is not configured, so a missing secret never blocks promotion.
       - name: Check mirror token
         id: mirror
         shell: bash
@@ -142,35 +177,3 @@ jobs:
           GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
         run: |
           ./scripts/publish-channel-manifest.sh stable mirror/stable.json intent-hq/intentd-releases
-      # Fail-soft: aggregated notes are a nice-to-have; a failure here must
-      # never fail the promotion (the manifest is already published).
-      - name: Aggregate stable release notes
-        id: notes
-        continue-on-error: true
-        shell: bash
-        env:
-          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
-        run: |
-          ./scripts/aggregate-stable-notes.sh "$VERSION" "$PREV_STABLE"
-      - name: Post summary
-        shell: bash
-        env:
-          PREV_STABLE: ${{ steps.prev-stable.outputs.version }}
-          NOTES_OUTCOME: ${{ steps.notes.outcome }}
-        run: |
-          {
-            echo "## Stable promotion"
-            echo ""
-            echo "**Promoted version:** v$VERSION"
-            echo ""
-            echo "**Previous stable:** ${PREV_STABLE:-unknown (first promotion?)}"
-            echo ""
-            if [[ "$NOTES_OUTCOME" == "success" ]]; then
-              echo "**Aggregated notes:** updated on channel-stable"
-            else
-              echo "**Aggregated notes:** skipped (non-blocking failure; manifest unaffected)"
-            fi
-            echo ""
-            echo "- [channel-stable release (aggregated notes)](https://github.com/$GITHUB_REPOSITORY/releases/tag/channel-stable)"
-            echo "- [stable.json](https://github.com/$GITHUB_REPOSITORY/releases/download/channel-stable/stable.json)"
-          } >> "$GITHUB_STEP_SUMMARY"
