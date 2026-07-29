@@ -793,8 +793,10 @@ impl ScriptManager {
     /// high-volume and must not serialize behind a durable SQLite commit per
     /// chunk. Scrollback replay reads the PTY host ring buffer via
     /// `script.output`, so nothing consumes persisted `script:output` rows.
-    /// The durable `script:state` transitions are emitted after the `run_one`
-    /// loop has broadcast every chunk, so state never overtakes output.
+    /// All durable `script:state` transitions are emitted on the same
+    /// supervisor task that broadcasts output, so state never overtakes
+    /// previously-broadcast chunks; the `exited` transition in particular is
+    /// emitted only after `run_one` has broadcast every chunk.
     fn emit_output(&self, ws: &WorkspaceId, script_id: &str, bytes: &[u8]) {
         let chunk = base64::engine::general_purpose::STANDARD.encode(bytes);
         publish_event_transient(
