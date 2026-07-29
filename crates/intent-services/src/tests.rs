@@ -10887,6 +10887,7 @@ mod script {
         _tmp: TempDb,
         services: Services,
         bus: EventBus,
+        store: Store,
         ws: WorkspaceId,
     }
 
@@ -10896,11 +10897,12 @@ mod script {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store).with_event_bus(bus.clone());
+        let services = Services::new(store.clone()).with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
             services,
             bus,
+            store,
             ws,
         }
     }
@@ -11045,6 +11047,68 @@ mod script {
             .script_stop(h.ws.clone(), id)
             .await
             .expect("stop");
+    }
+
+    /// Regression (paste/echo throughput follow-through): `script:output`
+    /// chunks are transient — broadcast to live subscribers but never
+    /// persisted to the event table — while `script:state` transitions stay
+    /// durable. Replay comes from `script.output` (the PTY buffer), not
+    /// events.
+    #[tokio::test]
+    async fn output_is_transient_state_is_durable() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create(
+            &h,
+            "transient",
+            &format!("echo TRANSIENT-OUTPUT-MARK ; {KEEPALIVE}"),
+            ScriptMode::Service,
+        )
+        .await;
+        h.services
+            .script_start(h.ws.clone(), id.clone())
+            .await
+            .expect("start");
+        drain_until(&mut sub, LIVENESS, |v| {
+            if v["type"] == "script:output" {
+                let bytes = v["data"]["chunk"].as_str().map(decode).unwrap_or_default();
+                contains(&bytes, b"TRANSIENT-OUTPUT-MARK").then_some(())
+            } else {
+                None
+            }
+        })
+        .await;
+        h.services
+            .script_stop(h.ws.clone(), id)
+            .await
+            .expect("stop");
+
+        let output_rows = h
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec!["script:output".to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query script:output");
+        assert!(
+            output_rows.is_empty(),
+            "script:output must not be persisted (transient publish path)"
+        );
+        let state_rows = h
+            .store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec!["script:state".to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query script:state");
+        assert!(
+            !state_rows.is_empty(),
+            "script:state lifecycle transitions stay durable"
+        );
     }
 
     /// `script.output` on a script that never produced output returns the bare
