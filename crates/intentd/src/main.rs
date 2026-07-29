@@ -2775,7 +2775,10 @@ async fn report_provider_availability() {
                 intent_providers::not_installed_detail(
                     provider.command,
                     provider.resolved_path.is_some(),
-                    provider.secondary_binary,
+                    provider
+                        .secondary_binary
+                        .as_ref()
+                        .map(|(s, path)| (*s, path.is_some())),
                 )
             );
             continue;
