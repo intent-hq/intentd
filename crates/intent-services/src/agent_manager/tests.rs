@@ -2337,8 +2337,15 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         .expect("append failure falls back to the auto-queue");
     assert_eq!(result["queued"], json!(true), "parked, not streamed");
     // Wire-only semantics: the RPC snapshot of the auto-queued entry does not
-    // leak the prompt-only fields.
+    // leak the prompt-only fields. The positive anchor guards against a
+    // vacuous pass — `.get(...)` on a missing/non-object `queuedMessage`
+    // would also return `None`.
     let wire = &result["queuedMessage"];
+    assert_eq!(
+        wire["content"],
+        json!("urgent update"),
+        "queuedMessage snapshot present on the fallback response: {result}"
+    );
     assert!(wire.get("prependContent").is_none());
     assert!(wire.get("prependImageBlocks").is_none());
     assert!(wire.get("prependFileBlocks").is_none());
@@ -2427,6 +2434,15 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         user_rows.len(),
         1,
         "the interrupt message lands in the transcript exactly once: {messages:?}"
+    );
+    // Wire-only for the transcript too: the prepend content rides the prompt,
+    // never persisting as its own user row.
+    assert!(
+        !messages.iter().any(|m| m.role == "user"
+            && serde_json::to_string(&m.content)
+                .unwrap()
+                .contains("original ask")),
+        "the prepend content must not persist as a user row: {messages:?}"
     );
     let assistant = messages
         .iter()
