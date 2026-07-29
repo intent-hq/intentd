@@ -245,6 +245,31 @@ async fn dropping_bus_flushes_buffered_batch_before_close() {
 }
 
 #[tokio::test]
+async fn idle_publish_resolves_without_batch_window_delay() {
+    let (_tmp, bus) = bus().await;
+    // A lone serial publisher must not pay a fixed batch-window wait on every
+    // publish: with the writer's idle path flushing immediately, each publish
+    // is bounded only by its SQLite commit. Under the previous 20 ms window,
+    // 20 sequential publishes took >= 400 ms; assert a bound well under that
+    // (with generous headroom for slow CI).
+    let start = std::time::Instant::now();
+    for i in 0..20 {
+        bus.publish(&new_event(
+            "test:idle",
+            Some(&format!("publisher-{i}")),
+            ActorType::Agent,
+        ))
+        .await
+        .expect("publish");
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "20 sequential idle publishes should flush immediately; took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_burst_batches_events_correctly() {
     let (_tmp, bus) = bus().await;
     // Subscribe to capture all events (no batching for simpler per-publisher assertions).

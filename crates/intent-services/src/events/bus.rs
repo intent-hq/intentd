@@ -41,9 +41,6 @@ const WRITER_CHANNEL_CAPACITY: usize = 512;
 /// Max events drained per batch by the writer task (to bound transaction size).
 const WRITER_BATCH_SIZE: usize = 64;
 
-/// Max time the writer task waits to accumulate events before flushing (ms).
-const WRITER_BATCH_WINDOW_MS: u64 = 20;
-
 /// Byte cap on the persisted `data_json` of `agent:tool:call` events. Payloads
 /// at or under the cap persist verbatim; larger ones have their free-form
 /// fields (`output`, `input`, `registeredAttachments`) replaced with a bounded
@@ -188,9 +185,15 @@ impl Drop for Subscription {
 }
 
 /// Writer task: drains events from the inbound channel, batch-persists them in
-/// a single transaction (up to WRITER_BATCH_SIZE or WRITER_BATCH_WINDOW_MS),
-/// resolves each oneshot with the result, and broadcasts each stored event in
-/// order. Stops when the channel closes (all EventBus handles dropped).
+/// a single transaction (up to WRITER_BATCH_SIZE per batch), resolves each
+/// oneshot with the result, and broadcasts each stored event in order. Stops
+/// when the channel closes (all EventBus handles dropped).
+///
+/// **Latency/batching**: after awaiting the first event, the task greedily
+/// drains whatever is already queued (`try_recv`) and flushes immediately — a
+/// lone publish commits without any artificial batch-window wait, while
+/// sustained bursts still coalesce because events that queue during the
+/// previous flush's SQLite commit drain into the next batch.
 ///
 /// **Shutdown invariant**: The task receives `None` from `rx.recv()` only after
 /// all `EventBus` clones (and their `writer_tx` senders) have been dropped. This
@@ -202,42 +205,25 @@ async fn writer_task(
     mut rx: mpsc::Receiver<WriterRequest>,
     broadcast_tx: broadcast::Sender<Arc<Event>>,
 ) {
-    let batch_window = std::time::Duration::from_millis(WRITER_BATCH_WINDOW_MS);
-    let mut pending: Vec<WriterRequest> = Vec::new();
-    let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut pending: Vec<WriterRequest> = Vec::with_capacity(WRITER_BATCH_SIZE);
 
     loop {
-        tokio::select! {
-            // Recv new event publish requests.
-            recv = rx.recv() => match recv {
-                Some(req) => {
-                    pending.push(req);
-                    // Arm deadline on first event if not already armed.
-                    if deadline.is_none() {
-                        deadline = Some(Box::pin(tokio::time::sleep(batch_window)));
-                    }
-                    // Flush if we've hit the batch size limit.
-                    if pending.len() >= WRITER_BATCH_SIZE {
-                        flush_batch(&store, &mut pending, &broadcast_tx).await;
-                        deadline = None;
-                    }
-                }
-                // Channel closed (all EventBus dropped): flush remaining, then stop.
-                None => {
-                    if !pending.is_empty() {
-                        flush_batch(&store, &mut pending, &broadcast_tx).await;
-                    }
-                    return;
-                }
-            },
-            // Batch window elapsed → flush accumulated events.
-            _ = async { deadline.as_mut().unwrap().await }, if deadline.is_some() => {
-                deadline = None;
-                if !pending.is_empty() {
-                    flush_batch(&store, &mut pending, &broadcast_tx).await;
-                }
+        // Idle: block until the next publish arrives (or the channel closes).
+        match rx.recv().await {
+            Some(req) => pending.push(req),
+            // Channel closed (all EventBus dropped): nothing pending (every
+            // iteration flushes before looping), so just stop.
+            None => return,
+        }
+        // Greedily drain events that are already queued, up to the batch size;
+        // any leftovers stay in the channel for the next iteration.
+        while pending.len() < WRITER_BATCH_SIZE {
+            match rx.try_recv() {
+                Ok(req) => pending.push(req),
+                Err(_) => break,
             }
         }
+        flush_batch(&store, &mut pending, &broadcast_tx).await;
     }
 }
 
