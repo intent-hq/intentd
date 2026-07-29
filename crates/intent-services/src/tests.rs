@@ -9538,6 +9538,243 @@ mod file_tracking {
             .any(|l| l["type"] == "Addition"
                 && l["content"].as_str().unwrap_or("").contains("added")));
     }
+
+    /// Convert hunks to the `git.diffs` wire shape the way the two-pass
+    /// implementation did, so the single-pass output can be asserted
+    /// byte-for-byte against a legacy reference.
+    fn legacy_wire_hunks(hunks: &[intent_git::diff::DiffHunk]) -> serde_json::Value {
+        use intent_git::diff::DiffLineKind;
+        serde_json::Value::Array(
+            hunks
+                .iter()
+                .map(|h| {
+                    let lines: Vec<serde_json::Value> = h
+                        .lines
+                        .iter()
+                        .map(|l| {
+                            let kind = match l.kind {
+                                DiffLineKind::Context => "Context",
+                                DiffLineKind::Addition => "Addition",
+                                DiffLineKind::Deletion => "Deletion",
+                            };
+                            let mut obj = serde_json::Map::new();
+                            obj.insert("type".to_string(), serde_json::json!(kind));
+                            obj.insert("content".to_string(), serde_json::json!(l.content));
+                            if let Some(n) = l.old_lineno {
+                                obj.insert("oldNumber".to_string(), serde_json::json!(n));
+                            }
+                            if let Some(n) = l.new_lineno {
+                                obj.insert("newNumber".to_string(), serde_json::json!(n));
+                            }
+                            serde_json::Value::Object(obj)
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "oldStart": h.old_start,
+                        "oldLines": h.old_lines,
+                        "newStart": h.new_start,
+                        "newLines": h.new_lines,
+                        "lines": lines,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Seed a repo with a staged-then-edited file, an unstaged tracked edit,
+    /// an untracked text file, and an untracked binary file.
+    fn seed_mixed_worktree() -> GitRepo {
+        let repo = init_git_repo();
+        commit_file(&repo.dir, "b.txt", "one\ntwo\n", "add b");
+        // Staged edit with a further workdir edit on top.
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nstaged\n").unwrap();
+        {
+            let r = Repository::open(&repo.dir).unwrap();
+            let mut idx = r.index().unwrap();
+            idx.add_path(std::path::Path::new("seed.txt")).unwrap();
+            idx.write().unwrap();
+        }
+        std::fs::write(repo.dir.join("seed.txt"), "seed\nstaged\nworkdir\n").unwrap();
+        // Unstaged tracked edit.
+        std::fs::write(repo.dir.join("b.txt"), "one\nCHANGED\n").unwrap();
+        // Untracked text + binary.
+        std::fs::write(repo.dir.join("new.txt"), "hello\nworld\n").unwrap();
+        std::fs::write(repo.dir.join("img.bin"), [0u8, 159, 146, 150]).unwrap();
+        repo
+    }
+
+    /// Regression (monorepo#1061): the single-pass `git.diffs` unstaged path
+    /// emits exactly the wire payload the two-pass implementation produced
+    /// (same entries, same order, same hunk/line fields) on a worktree with
+    /// staged + unstaged + untracked + binary files.
+    #[tokio::test]
+    async fn git_diffs_unstaged_matches_two_pass_reference() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let diffs = svc.git_diffs(ws_id, None, false, None).await.unwrap();
+
+        // Legacy two-pass reference: one full scan for the file list, then
+        // one scan per file for its hunks (binary → empty hunks).
+        let expected: Vec<serde_json::Value> = intent_git::diff::diff_index_to_workdir(&repo.dir)
+            .unwrap()
+            .iter()
+            .map(|fd| {
+                let hunks = if fd.is_binary {
+                    Vec::new()
+                } else {
+                    intent_git::diff::hunks_index_to_workdir(&repo.dir, &fd.path).unwrap()
+                };
+                serde_json::json!({ "path": fd.path, "hunks": legacy_wire_hunks(&hunks) })
+            })
+            .collect();
+        assert_eq!(diffs, serde_json::Value::Array(expected));
+
+        // Fixture sanity: all four change kinds are present in the payload.
+        let arr = diffs.as_array().unwrap();
+        let paths: Vec<&str> = arr.iter().map(|d| d["path"].as_str().unwrap()).collect();
+        for p in ["seed.txt", "b.txt", "new.txt", "img.bin"] {
+            assert!(paths.contains(&p), "missing {p} in {paths:?}");
+        }
+        let bin = arr.iter().find(|d| d["path"] == "img.bin").unwrap();
+        assert_eq!(bin["hunks"], serde_json::json!([]));
+        let new = arr.iter().find(|d| d["path"] == "new.txt").unwrap();
+        assert!(new["hunks"][0]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|l| l["type"] == "Addition"));
+    }
+
+    /// `git.diffs` (unstaged) with `path` narrows to the requested file and
+    /// its entry equals the corresponding one from the unfiltered payload.
+    #[tokio::test]
+    async fn git_diffs_unstaged_path_filter_returns_only_requested_file() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws_id) = svc_with_repo(&repo).await;
+
+        let full = svc
+            .git_diffs(ws_id.clone(), None, false, None)
+            .await
+            .unwrap();
+        let narrowed = svc
+            .git_diffs(ws_id, Some("b.txt".to_string()), false, None)
+            .await
+            .unwrap();
+        let arr = narrowed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "b.txt");
+        let expected = full
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["path"] == "b.txt")
+            .unwrap();
+        assert_eq!(&arr[0], expected);
+    }
+
+    /// Regression (monorepo#1061): `diffs::compute_and_store` (single
+    /// pathspec-narrowed pass) returns the same summary + persisted hunks
+    /// JSON as the legacy two-pass compute for modified, untracked, and
+    /// binary files; a clean path yields `Ok(None)` and stores nothing.
+    #[tokio::test]
+    async fn compute_and_store_single_pass_matches_two_pass_reference() {
+        let repo = seed_mixed_worktree();
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        // Modified tracked file: summary matches the full-scan file list.
+        let summary = crate::diffs::compute_and_store(svc.store(), &repo.dir, &ws, "b.txt", false)
+            .await
+            .unwrap()
+            .expect("pending change");
+        let fd = intent_git::diff::diff_index_to_workdir(&repo.dir)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.path == "b.txt")
+            .unwrap();
+        assert_eq!(summary.additions, fd.additions as i64);
+        assert_eq!(summary.deletions, fd.deletions as i64);
+        assert_eq!(summary.old_blob_sha, fd.old_blob);
+        assert_eq!(summary.new_blob_sha, fd.new_blob);
+        assert!(!summary.is_binary);
+
+        // Pathspec narrowing: only the computed path is persisted.
+        let rows = svc.store().list_diffs(&ws).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "b.txt");
+
+        // Stored hunks match the legacy per-file hunks scan, serialized in
+        // the TS `DiffHunk[]` shape (`add`/`remove`/`context` line words).
+        let legacy = intent_git::diff::hunks_index_to_workdir(&repo.dir, "b.txt").unwrap();
+        let expected: Vec<serde_json::Value> = legacy
+            .iter()
+            .map(|h| {
+                let lines: Vec<serde_json::Value> = h
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        let kind = match l.kind {
+                            intent_git::diff::DiffLineKind::Addition => "add",
+                            intent_git::diff::DiffLineKind::Deletion => "remove",
+                            intent_git::diff::DiffLineKind::Context => "context",
+                        };
+                        serde_json::json!({
+                            "type": kind,
+                            "content": l.content,
+                            "oldLineNumber": l.old_lineno,
+                            "newLineNumber": l.new_lineno,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "oldStart": h.old_start,
+                    "oldLines": h.old_lines,
+                    "newStart": h.new_start,
+                    "newLines": h.new_lines,
+                    "lines": lines,
+                })
+            })
+            .collect();
+        let stored: serde_json::Value = serde_json::from_str(&rows[0].hunks_json).unwrap();
+        assert_eq!(stored, serde_json::Value::Array(expected));
+
+        // Untracked file: all-addition summary, no pre-image blob.
+        let untracked =
+            crate::diffs::compute_and_store(svc.store(), &repo.dir, &ws, "new.txt", false)
+                .await
+                .unwrap()
+                .expect("untracked change");
+        assert_eq!(untracked.additions, 2);
+        assert_eq!(untracked.deletions, 0);
+        assert!(untracked.old_blob_sha.is_none());
+
+        // Binary file: summary matches the legacy full-scan entry and the
+        // stored hunks stay "[]".
+        let bin = crate::diffs::compute_and_store(svc.store(), &repo.dir, &ws, "img.bin", false)
+            .await
+            .unwrap()
+            .expect("binary change");
+        let legacy_bin = intent_git::diff::diff_index_to_workdir(&repo.dir)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.path == "img.bin")
+            .unwrap();
+        assert_eq!(bin.is_binary, legacy_bin.is_binary);
+        assert_eq!(bin.additions, legacy_bin.additions as i64);
+        assert_eq!(bin.deletions, legacy_bin.deletions as i64);
+        let rows = svc.store().list_diffs(&ws).await.unwrap();
+        let bin_row = rows.iter().find(|r| r.file_path == "img.bin").unwrap();
+        assert_eq!(bin_row.hunks_json, "[]");
+
+        // Clean path: no pending change → Ok(None), nothing stored.
+        assert!(
+            crate::diffs::compute_and_store(svc.store(), &repo.dir, &ws, "absent.txt", false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(svc.store().list_diffs(&ws).await.unwrap().len(), 3);
+    }
 }
 
 /// `metrics.*` aggregation (§17.5) over the M4.7 `tracked_changes` table: the

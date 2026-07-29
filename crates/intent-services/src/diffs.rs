@@ -1,9 +1,9 @@
 //! `services::diffs` — internal diff computation + storage (§17.3, §9.11).
 //!
 //! BE-internal: there are **no** `diffs.*` wire methods (diffs surface to the FE
-//! via file-tracking reads + change events). [`compute_and_store`] reuses the
-//! `intent-git` diff helper (M4.1) for cheap per-file summaries, hydrates hunks
-//! lazily from the recorded blob SHAs, persists them as the `diffs.hunks_json`
+//! via file-tracking reads + change events). [`compute_and_store`] runs one
+//! pathspec-narrowed `intent-git` traversal that yields the per-file summary
+//! **and** its hunks together, persists the hunks as the `diffs.hunks_json`
 //! index, and returns the additions/deletions + blob SHAs the attribution writer
 //! records on `tracked_changes`. Per §3.2 this depends only on `intent-store` and
 //! `intent-git`; it never imports a sibling service module (e.g. `file_tracking`).
@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use intent_core::{Result, WorkspaceId};
-use intent_git::diff::{diff_index_to_workdir, hunks_index_to_workdir, DiffHunk, DiffLineKind};
+use intent_git::diff::{diff_index_to_workdir_with_hunks, DiffHunk, DiffLineKind};
 use intent_store::{NewDiff, Store};
 use serde_json::{json, Value};
 
@@ -31,6 +31,9 @@ pub struct DiffSummary {
 /// `diffs` table (keyed by `(workspace, file, staged)`), and return the summary.
 /// Returns `Ok(None)` when the path has no pending change in the worktree.
 ///
+/// Cost: a **single** pathspec-narrowed traversal — the summary and hunks come
+/// from one walk pruned to `rel_path`, not two full-tree scans.
+///
 /// Full file content is **not** inlined (`old_content`/`new_content` stay NULL);
 /// content is recoverable lazily via the blob SHAs in the returned summary.
 pub async fn compute_and_store(
@@ -40,16 +43,18 @@ pub async fn compute_and_store(
     rel_path: &str,
     staged: bool,
 ) -> Result<Option<DiffSummary>> {
-    let files = diff_index_to_workdir(worktree_path)?;
-    let Some(fd) = files.into_iter().find(|f| f.path == rel_path) else {
+    let entries = diff_index_to_workdir_with_hunks(worktree_path, Some(&[rel_path]))?;
+    // The pathspec prunes the walk but can match more than the exact path;
+    // keep the strict equality match.
+    let Some(entry) = entries.into_iter().find(|e| e.file.path == rel_path) else {
         return Ok(None);
     };
+    let fd = entry.file;
 
     let hunks_json = if fd.is_binary {
         "[]".to_string()
     } else {
-        let hunks = hunks_index_to_workdir(worktree_path, rel_path)?;
-        serialize_hunks(&hunks)
+        serialize_hunks(&entry.hunks)
     };
 
     store
