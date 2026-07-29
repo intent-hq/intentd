@@ -73,6 +73,14 @@ resolves in precedence order: (1) explicit `providers.paths[id]` setting (must b
 time `enhanced_path` (`crates/intent-providers/src/args.rs`) prepends the binary's parent
 dir so `#!/usr/bin/env node` shebangs resolve a co-located node.
 
+The `providers.paths` key is the provider that OWNS the binary
+(`ProviderConfig::primary_binary_provider_id`). For providers that ride another
+provider's binary (unsloth's ACP primary is `opencode`), the primary spawn honors the
+owning provider's key (`providers.paths["opencode"]`), while the provider's own key
+targets its secondary CLI — `providers.paths["unsloth"]` overrides the `unsloth` CLI
+resolution in the daemon-managed server lifecycle
+(`crates/intent-services/src/unsloth_server.rs`).
+
 Registry/args/env behavior is covered by `crates/intent-providers/src/tests.rs` — add
 cases for every field you set.
 

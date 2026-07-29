@@ -574,11 +574,18 @@ impl ManagedServer {
     }
 }
 
+/// Resolver seam for the `unsloth` CLI binary. The argument is the
+/// `providers.paths["unsloth"]` explicit override (read from settings at each
+/// `ensure_endpoint` call), applied as the explicit-path tier of
+/// `find_provider_binary` — an invalid override warns and falls through to
+/// the normal resolution tiers.
+type ResolveBinaryFn = Box<dyn Fn(Option<&str>) -> Option<PathBuf> + Send + Sync>;
+
 /// Injectable configuration seams (tests override every external surface:
 /// binary resolution, home dir, port, timeouts, HF metadata fetch, RAM).
 pub(crate) struct UnslothConfig {
     /// Resolve the `unsloth` binary; `None` = not installed.
-    pub resolve_binary: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
+    pub resolve_binary: ResolveBinaryFn,
     /// Home directory used to locate the generated opencode.json.
     pub home_dir: Option<PathBuf>,
     /// Port passed to `unsloth run -p`.
@@ -609,8 +616,8 @@ pub(crate) struct UnslothConfig {
 impl Default for UnslothConfig {
     fn default() -> Self {
         Self {
-            resolve_binary: Box::new(|| {
-                intent_providers::find_provider_binary("unsloth", "unsloth", None)
+            resolve_binary: Box::new(|explicit| {
+                intent_providers::find_provider_binary("unsloth", "unsloth", explicit)
             }),
             home_dir: std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
@@ -820,9 +827,14 @@ impl UnslothServerManager {
     /// loading) server rather than tearing it down and spawning a third one
     /// (dogfooding repro: switching models mid-download hit the same 60s
     /// mint deadline this fix addresses, not just first-use starts).
+    /// `unsloth_cli_override` is the `providers.paths["unsloth"]` setting
+    /// (the caller's per-call settings snapshot), threaded into
+    /// [`UnslothConfig::resolve_binary`] as the explicit-path tier for the
+    /// `unsloth` CLI — it never affects the opencode ACP primary.
     pub async fn ensure_endpoint(
         &self,
         repo_id: &str,
+        unsloth_cli_override: Option<&str>,
         attached_agents: usize,
         status: &StatusCallback,
     ) -> Result<UnslothEndpoint> {
@@ -892,7 +904,8 @@ impl UnslothServerManager {
             self.set_identity(None);
         }
 
-        let binary = (self.config.resolve_binary)().ok_or_else(missing_binary_error)?;
+        let binary =
+            (self.config.resolve_binary)(unsloth_cli_override).ok_or_else(missing_binary_error)?;
 
         if !attach {
             status(
@@ -2222,7 +2235,7 @@ mod tests {
         /// server itself; port-conflict tests override it.
         fn test_config(binary: PathBuf, home: PathBuf, port: u16) -> UnslothConfig {
             UnslothConfig {
-                resolve_binary: Box::new(move || Some(binary.clone())),
+                resolve_binary: Box::new(move |_| Some(binary.clone())),
                 home_dir: Some(home),
                 port,
                 // Generous "should not elapse" budgets: the success paths
@@ -2250,10 +2263,13 @@ mod tests {
         #[tokio::test]
         async fn missing_binary_degrades_with_install_hint() {
             let mgr = UnslothServerManager::with_config(UnslothConfig {
-                resolve_binary: Box::new(|| None),
+                resolve_binary: Box::new(|_| None),
                 ..UnslothConfig::default()
             });
-            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("unsloth CLI not found"), "got: {msg}");
             assert!(msg.contains("docs.unsloth.ai"), "got: {msg}");
@@ -2261,6 +2277,46 @@ mod tests {
                 matches!(err, Error::InvalidInput(_)),
                 "message must survive the RPC envelope"
             );
+        }
+
+        /// Regression (providers.paths retarget): the `providers.paths["unsloth"]`
+        /// override handed to `ensure_endpoint` must reach the config's
+        /// `resolve_binary` seam — it is the explicit-path tier for the
+        /// `unsloth` CLI, not the opencode ACP primary.
+        #[tokio::test]
+        async fn ensure_endpoint_threads_cli_override_into_resolve_binary() {
+            let seen = Arc::new(Mutex::new(None::<Option<String>>));
+            let seen2 = seen.clone();
+            let mgr = UnslothServerManager::with_config(UnslothConfig {
+                resolve_binary: Box::new(move |explicit| {
+                    *seen2.lock().unwrap() = Some(explicit.map(str::to_string));
+                    None
+                }),
+                ..UnslothConfig::default()
+            });
+            let _ = mgr
+                .ensure_endpoint(REPO, Some("/custom/unsloth"), 0, &|_, _| {})
+                .await
+                .unwrap_err();
+            assert_eq!(
+                seen.lock().unwrap().clone(),
+                Some(Some("/custom/unsloth".to_string())),
+                "the override must be passed through to resolve_binary"
+            );
+        }
+
+        /// Regression (providers.paths retarget): the DEFAULT config's
+        /// `resolve_binary` applies the override as `find_provider_binary`'s
+        /// explicit-path tier, which wins over every other tier when the
+        /// path is absolute + executable.
+        #[test]
+        fn default_resolve_binary_honors_explicit_override() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let stub = dir.path().join("unsloth-override");
+            std::fs::write(&stub, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let resolved = (UnslothConfig::default().resolve_binary)(Some(&stub.to_string_lossy()));
+            assert_eq!(resolved.as_deref(), Some(stub.as_path()));
         }
 
         #[tokio::test]
@@ -2278,7 +2334,7 @@ mod tests {
             let messages = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &move |_, m| m2.lock().unwrap().push(m))
+                .ensure_endpoint(REPO, None, 0, &move |_, m| m2.lock().unwrap().push(m))
                 .await
                 .expect("cold start resolves endpoint");
             assert_eq!(ep.api_key, "sk-unsloth-test-key");
@@ -2306,7 +2362,7 @@ mod tests {
             // Reuse: same repo — no second `run` invocation.
             let runs_before = stub_log(dir.path()).matches("run --model").count();
             let ep2 = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("reuse");
             assert_eq!(ep2, ep);
@@ -2319,7 +2375,7 @@ mod tests {
             // Model switch: kill + respawn with the new repo.
             let other = "unsloth/other-model-GGUF";
             let ep3 = mgr
-                .ensure_endpoint(other, 0, &|_, _| {})
+                .ensure_endpoint(other, None, 0, &|_, _| {})
                 .await
                 .expect("switch");
             assert_eq!(ep3.model_id, other);
@@ -2351,9 +2407,11 @@ mod tests {
             // no old server to disrupt.
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
-            mgr.ensure_endpoint(REPO, 2, &move |lvl, m| m2.lock().unwrap().push((lvl, m)))
-                .await
-                .expect("cold start");
+            mgr.ensure_endpoint(REPO, None, 2, &move |lvl, m| {
+                m2.lock().unwrap().push((lvl, m))
+            })
+            .await
+            .expect("cold start");
             assert!(
                 messages
                     .lock()
@@ -2370,7 +2428,9 @@ mod tests {
             messages.lock().unwrap().clear();
             let m3 = messages.clone();
             let ep = mgr
-                .ensure_endpoint(other, 2, &move |lvl, m| m3.lock().unwrap().push((lvl, m)))
+                .ensure_endpoint(other, None, 2, &move |lvl, m| {
+                    m3.lock().unwrap().push((lvl, m))
+                })
                 .await
                 .expect("switch");
             assert_eq!(ep.model_id, other);
@@ -2416,16 +2476,18 @@ mod tests {
                 port,
             ));
 
-            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+            mgr.ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("cold start");
 
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
             let other = "unsloth/other-model-GGUF";
-            mgr.ensure_endpoint(other, 0, &move |lvl, m| m2.lock().unwrap().push((lvl, m)))
-                .await
-                .expect("switch");
+            mgr.ensure_endpoint(other, None, 0, &move |lvl, m| {
+                m2.lock().unwrap().push((lvl, m))
+            })
+            .await
+            .expect("switch");
             assert!(
                 messages
                     .lock()
@@ -2455,7 +2517,7 @@ mod tests {
                 port,
             ));
 
-            mgr.ensure_endpoint(REPO, 1, &|_, _| {})
+            mgr.ensure_endpoint(REPO, None, 1, &|_, _| {})
                 .await
                 .expect("cold start");
             // Wait for the stubbed server child to exit.
@@ -2463,9 +2525,11 @@ mod tests {
 
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
-            mgr.ensure_endpoint(REPO, 1, &move |lvl, m| m2.lock().unwrap().push((lvl, m)))
-                .await
-                .expect("dead-child respawn");
+            mgr.ensure_endpoint(REPO, None, 1, &move |lvl, m| {
+                m2.lock().unwrap().push((lvl, m))
+            })
+            .await
+            .expect("dead-child respawn");
             assert!(
                 messages
                     .lock()
@@ -2489,7 +2553,7 @@ mod tests {
             config.hf_api_base = format!("http://127.0.0.1:{hf_port}");
             let mgr = UnslothServerManager::with_config(config);
 
-            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+            mgr.ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("starts");
             let log = stub_log(dir.path());
@@ -2610,7 +2674,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 port,
             ));
-            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+            mgr.ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("starts");
             let pid = {
@@ -2644,7 +2708,10 @@ mod tests {
             );
             let mgr =
                 UnslothServerManager::with_config(test_config(binary, dir.path().to_path_buf(), 1));
-            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("exited during startup"), "got: {msg}");
             assert!(
@@ -2670,7 +2737,7 @@ mod tests {
 
             let m2 = mgr.clone();
             let startup =
-                tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
+                tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
             // Give the startup time to spawn the child and enter the loop.
             tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2685,7 +2752,10 @@ mod tests {
             assert!(mgr.state.lock().await.is_none(), "no server left tracked");
 
             // Post-shutdown spawns are refused outright.
-            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("shutting down"), "got: {err}");
         }
 
@@ -2705,7 +2775,7 @@ mod tests {
 
             let m2 = mgr.clone();
             let startup =
-                tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
+                tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
             // Give the startup time to spawn the child and enter the probe
             // loop (holding `state` for the remainder of the long timeout).
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2741,7 +2811,7 @@ mod tests {
 
             let m2 = mgr.clone();
             let startup =
-                tokio::spawn(async move { m2.ensure_endpoint(REPO, 0, &|_, _| {}).await });
+                tokio::spawn(async move { m2.ensure_endpoint(REPO, None, 0, &|_, _| {}).await });
             // Wait until the startup has actually registered the starting
             // server (identity mirror set) rather than sleeping a fixed
             // 200ms: under full parallel-suite load the spawned task may not
@@ -2779,7 +2849,7 @@ mod tests {
                 dir2.path().to_path_buf(),
                 port,
             ));
-            mgr2.ensure_endpoint(REPO, 0, &|_, _| {})
+            mgr2.ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("stop is not terminal: a fresh manager still starts normally");
             mgr2.shutdown().await;
@@ -2805,7 +2875,7 @@ mod tests {
                 dir.path().to_path_buf(),
                 port,
             ));
-            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+            mgr.ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("starts");
             let pid = mgr
@@ -2840,7 +2910,10 @@ mod tests {
                 dir.path().to_path_buf(),
                 port,
             ));
-            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("No running Unsloth server found"),
@@ -2882,7 +2955,7 @@ mod tests {
 
             let endpoint = tokio::time::timeout(
                 Duration::from_secs(5),
-                mgr.ensure_endpoint(REPO, 0, &|_, _| {}),
+                mgr.ensure_endpoint(REPO, None, 0, &|_, _| {}),
             )
             .await
             .expect("mint must complete well within mint_timeout, not hang on a full pipe")
@@ -2910,7 +2983,10 @@ mod tests {
             config.server_up_timeout = Duration::from_millis(200);
             let mgr = UnslothServerManager::with_config(config);
 
-            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(
                 err.to_string().contains("did not open its HTTP port"),
                 "got: {err}"
@@ -2948,7 +3024,10 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let pid_before = {
-                let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+                let err = mgr
+                    .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                    .await
+                    .unwrap_err();
                 assert!(err.to_string().contains("timed out"), "got: {err}");
                 let mut state = mgr.state.lock().await;
                 let server = state.as_mut().expect(
@@ -2999,7 +3078,10 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             // Attempt 1: mint times out; server preserved (bug 1's fix).
-            let err1 = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err1 = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(err1.to_string().contains("timed out"), "got: {err1}");
             let pid1 = mgr
                 .state
@@ -3012,7 +3094,10 @@ mod tests {
 
             // Attempt 2 ("the retry"): must attach to the same server, not
             // kill + respawn it.
-            let err2 = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err2 = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(err2.to_string().contains("timed out"), "got: {err2}");
             let pid2 = mgr
                 .state
@@ -3065,7 +3150,7 @@ mod tests {
             let mut mgr = UnslothServerManager::with_config(config);
 
             let old_repo = "unsloth/qwen-old-model-GGUF";
-            mgr.ensure_endpoint(old_repo, 0, &|_, _| {})
+            mgr.ensure_endpoint(old_repo, None, 0, &|_, _| {})
                 .await
                 .expect("old model cold-starts fine");
             // Same 2s rationale as the previous test: the timeout must fire
@@ -3098,7 +3183,7 @@ mod tests {
                 .expect("pid");
 
             let err1 = mgr
-                .ensure_endpoint(new_repo, 0, &|_, _| {})
+                .ensure_endpoint(new_repo, None, 0, &|_, _| {})
                 .await
                 .unwrap_err();
             assert!(err1.to_string().contains("timed out"), "got: {err1}");
@@ -3125,7 +3210,7 @@ mod tests {
             // Retry for the SAME (new) repo must attach to that same new
             // server, not kill + respawn a third one.
             let err2 = mgr
-                .ensure_endpoint(new_repo, 0, &|_, _| {})
+                .ensure_endpoint(new_repo, None, 0, &|_, _| {})
                 .await
                 .unwrap_err();
             assert!(err2.to_string().contains("timed out"), "got: {err2}");
@@ -3175,7 +3260,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("adopts the compatible occupant");
             assert_eq!(ep.base_url, format!("http://127.0.0.1:{occupant_port}/v1"));
@@ -3211,14 +3296,14 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let ep1 = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("adopts");
             // The second call re-verifies the still-listening occupant with
             // one authed probe and reuses the cached endpoint — no re-mint,
             // and still no spawn.
             let ep2 = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("reuses the adopted server");
             assert_eq!(ep1.api_key, ep2.api_key);
@@ -3248,7 +3333,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("re-ports around the foreign occupant");
             assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
@@ -3284,7 +3369,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("declines adoption and starts its own server on a free port");
             assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
@@ -3314,7 +3399,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("re-ports around the auth-less occupant");
             assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
@@ -3330,7 +3415,10 @@ mod tests {
             config.pick_free_port = Box::new(|| None);
             let mgr = UnslothServerManager::with_config(config);
 
-            let err = mgr.ensure_endpoint(REPO, 0, &|_, _| {}).await.unwrap_err();
+            let err = mgr
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, Error::InvalidInput(_)),
                 "an unrecoverable port conflict is an environment problem \
@@ -3362,7 +3450,7 @@ mod tests {
             config.pick_free_port = Box::new(move || Some(managed_port));
             let mgr = UnslothServerManager::with_config(config);
 
-            mgr.ensure_endpoint(REPO, 0, &|_, _| {})
+            mgr.ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("adopts the occupant");
             assert!(
@@ -3378,7 +3466,7 @@ mod tests {
             let _ = occupant.await;
 
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("re-spawns after the adopted occupant vanished");
             assert_eq!(ep.base_url, format!("http://127.0.0.1:{managed_port}/v1"));
@@ -3404,7 +3492,7 @@ mod tests {
             let mgr = UnslothServerManager::with_config(config);
 
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("adopts");
             assert!(mgr.stop().await, "stop reports the adopted server");
@@ -3421,7 +3509,7 @@ mod tests {
 
             // Re-adopt, then shutdown() — same property.
             let ep = mgr
-                .ensure_endpoint(REPO, 0, &|_, _| {})
+                .ensure_endpoint(REPO, None, 0, &|_, _| {})
                 .await
                 .expect("re-adopts");
             mgr.shutdown().await;

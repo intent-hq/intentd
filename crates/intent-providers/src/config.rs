@@ -218,6 +218,20 @@ impl ProviderConfig {
             requires_secondary_binary: None,
         }
     }
+
+    /// The provider id that OWNS this provider's primary (`command`) binary
+    /// for `providers.paths` override purposes. Unsloth rides the `opencode`
+    /// binary as its ACP runtime, so its primary spawn resolution honors
+    /// `providers.paths["opencode"]` — `providers.paths["unsloth"]` instead
+    /// targets the `unsloth` CLI itself (the secondary binary the
+    /// daemon-managed server lifecycle shells out to). Every other provider
+    /// owns its own primary.
+    pub fn primary_binary_provider_id(&self) -> &'static str {
+        match self.id {
+            "unsloth" => "opencode",
+            _ => self.id,
+        }
+    }
 }
 
 /// All available ACP providers, in the same definition order as
