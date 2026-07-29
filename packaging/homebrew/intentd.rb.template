@@ -7,6 +7,11 @@
 # The archives ship the sitter — a self-updating supervisor shim renamed to
 # `intentd` — which downloads, verifies, and runs the real daemon, forwarding
 # all CLI args verbatim.
+#
+# Download URLs point at the public intent-hq/intentd-releases mirror (the
+# temporary public home for release assets until intent-hq/intentd is
+# open-sourced); release-sitter.yml mirrors the identical archives there, so
+# the sha256s computed from the built artifacts still match.
 class Intentd < Formula
   desc "Self-updating supervisor shim for the Intent backend daemon"
   homepage "https://github.com/intent-hq/intentd"
@@ -15,11 +20,11 @@ class Intentd < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/intent-hq/intentd/releases/download/sitter-v{{VERSION}}/intentd-aarch64-apple-darwin.tar.xz"
+      url "https://github.com/intent-hq/intentd-releases/releases/download/sitter-v{{VERSION}}/intentd-aarch64-apple-darwin.tar.xz"
       sha256 "{{SHA256_AARCH64_APPLE_DARWIN}}"
     end
     on_intel do
-      url "https://github.com/intent-hq/intentd/releases/download/sitter-v{{VERSION}}/intentd-x86_64-apple-darwin.tar.xz"
+      url "https://github.com/intent-hq/intentd-releases/releases/download/sitter-v{{VERSION}}/intentd-x86_64-apple-darwin.tar.xz"
       sha256 "{{SHA256_X86_64_APPLE_DARWIN}}"
     end
   end
@@ -28,11 +33,11 @@ class Intentd < Formula
   # host regardless of glibc version.
   on_linux do
     on_arm do
-      url "https://github.com/intent-hq/intentd/releases/download/sitter-v{{VERSION}}/intentd-aarch64-unknown-linux-musl.tar.xz"
+      url "https://github.com/intent-hq/intentd-releases/releases/download/sitter-v{{VERSION}}/intentd-aarch64-unknown-linux-musl.tar.xz"
       sha256 "{{SHA256_AARCH64_UNKNOWN_LINUX_MUSL}}"
     end
     on_intel do
-      url "https://github.com/intent-hq/intentd/releases/download/sitter-v{{VERSION}}/intentd-x86_64-unknown-linux-musl.tar.xz"
+      url "https://github.com/intent-hq/intentd-releases/releases/download/sitter-v{{VERSION}}/intentd-x86_64-unknown-linux-musl.tar.xz"
       sha256 "{{SHA256_X86_64_UNKNOWN_LINUX_MUSL}}"
     end
   end

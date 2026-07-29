@@ -1,21 +1,33 @@
 #!/usr/bin/env bash
-# Mirror an intentd release's platform archives + .sha256 sidecars to an
-# identically-tagged release on the public mirror repo.
+# Mirror a release's assets to an identically-tagged release on the public
+# mirror repo.
 #
 # Usage: mirror-release-assets.sh <tag>
 #
 # Reads the release for <tag> from SOURCE_REPO (via gh, authenticated with
-# GH_TOKEN), downloads every platform archive (intentd-<target>.tar.xz /
-# .tar.gz / .zip) plus its .sha256 sidecar, and uploads them to a release with
-# the same tag on DEST_REPO, creating that release if it does not exist yet.
-# Uploads use --clobber, so re-runs are idempotent (promote-stable relies on
-# this to backfill releases cut before mirroring existed). Requires: gh, jq.
+# GH_TOKEN), downloads every asset whose name matches ASSET_REGEX (default:
+# the daemon platform archives intentd-<target>.tar.xz / .tar.gz / .zip plus
+# their .sha256 sidecars), and uploads them to a release with the same tag on
+# DEST_REPO, creating that release if it does not exist yet. Uploads use
+# --clobber, so re-runs are idempotent (promote-stable relies on this to
+# backfill releases cut before mirroring existed). Requires: gh, jq.
 #
 # Env:
 #   SOURCE_REPO     repo to read the release from (default: intent-hq/intentd)
 #   DEST_REPO       repo to mirror to (required; no default so a local run can
 #                   never push to the public mirror by accident)
 #   DEST_GH_TOKEN   token with contents:write on DEST_REPO (required)
+#   ASSET_REGEX     jq test() regex selecting which asset names to mirror
+#                   (default: daemon platform archives + .sha256 sidecars)
+#   RELEASE_TITLE   title when creating the DEST_REPO release
+#                   (default: "intentd <tag>")
+#   RELEASE_NOTES   notes when creating the DEST_REPO release
+#                   (default: daemon mirror notes)
+#   PRUNE_STALE     "true" to delete DEST_REPO release assets that match
+#                   ASSET_REGEX but are absent from the source set — for
+#                   refreshed fixed releases (e.g. sitter-latest) where a
+#                   plain --clobber upload would leave stale assets behind
+#                   (default: false)
 set -euo pipefail
 
 usage="usage: mirror-release-assets.sh <tag>"
@@ -23,10 +35,17 @@ TAG="${1:?$usage}"
 SOURCE_REPO="${SOURCE_REPO:-intent-hq/intentd}"
 DEST_REPO="${DEST_REPO:?DEST_REPO (owner/repo) must be set}"
 : "${DEST_GH_TOKEN:?DEST_GH_TOKEN must be set (contents:write on DEST_REPO)}"
+ASSET_REGEX="${ASSET_REGEX:-^intentd-[a-z0-9_]+-[a-z0-9-]+\\.(tar\\.xz|tar\\.gz|zip)(\\.sha256)?\$}"
+RELEASE_TITLE="${RELEASE_TITLE:-intentd $TAG}"
+RELEASE_NOTES="${RELEASE_NOTES:-Mirror of the $TAG intentd release: platform archives and .sha256 sidecars for the daemon auto-updater.}"
+PRUNE_STALE="${PRUNE_STALE:-false}"
 
-# Same tag shapes make-channel-manifest.sh accepts.
-if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
-  echo "error: tag must look like [v]X.Y.Z or [v]X.Y.Z-<prerelease>, got: $TAG" >&2
+# Daemon tag shapes (same as make-channel-manifest.sh) plus the sitter tags
+# published by release-sitter.yml (sitter-vX.Y.Z and the fixed sitter-latest).
+if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ \
+   && ! "$TAG" =~ ^sitter-v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ \
+   && "$TAG" != sitter-latest ]]; then
+  echo "error: tag must look like [v]X.Y.Z[-<prerelease>], sitter-vX.Y.Z[-<prerelease>], or sitter-latest, got: $TAG" >&2
   exit 1
 fi
 
@@ -37,18 +56,17 @@ if [[ -z $(jq -r '.publishedAt // empty' <<<"$release_json") ]]; then
 fi
 is_prerelease=$(jq -r '.isPrerelease' <<<"$release_json")
 
-# Platform archives (same pattern as make-channel-manifest.sh) plus their
-# .sha256 sidecars. Command substitution (not process substitution) so a jq
-# parse error stops the script instead of looking like "no assets".
-asset_names=$(jq -r \
-  '.assets[].name | select(test("^intentd-[a-z0-9_]+-[a-z0-9-]+\\.(tar\\.xz|tar\\.gz|zip)(\\.sha256)?$"))' \
+# Command substitution (not process substitution) so a jq parse error stops
+# the script instead of looking like "no assets".
+asset_names=$(jq -r --arg re "$ASSET_REGEX" \
+  '.assets[].name | select(test($re))' \
   <<<"$release_json")
 mapfile -t assets <<<"$asset_names"
 if [[ ${#assets[@]} -eq 1 && -z "${assets[0]}" ]]; then
   assets=()
 fi
 if [[ ${#assets[@]} -eq 0 ]]; then
-  echo "error: no intentd platform archives found on release $TAG of $SOURCE_REPO" >&2
+  echo "error: no assets matching ASSET_REGEX found on release $TAG of $SOURCE_REPO" >&2
   exit 1
 fi
 
@@ -71,8 +89,8 @@ if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/
     --repo "$DEST_REPO" \
     --latest=false \
     "${prerelease_args[@]}" \
-    --title "intentd $TAG" \
-    --notes "Mirror of the $TAG intentd release: platform archives and .sha256 sidecars for the daemon auto-updater."
+    --title "$RELEASE_TITLE" \
+    --notes "$RELEASE_NOTES"
   then
     # Tolerate only a lost create race (two mirrors close together): the
     # release must exist now; otherwise fail loudly.
@@ -81,6 +99,22 @@ if ! GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" >/dev/
       exit 1
     fi
   fi
+fi
+
+# Refresh mode: drop dest assets that match the pattern but are gone from the
+# source set, so a refreshed fixed release (sitter-latest) never keeps stale
+# assets that --clobber alone would leave behind.
+if [[ "$PRUNE_STALE" == "true" ]]; then
+  dest_names=$(GH_TOKEN="$DEST_GH_TOKEN" gh release view "$TAG" --repo "$DEST_REPO" --json assets \
+    | jq -r --arg re "$ASSET_REGEX" '.assets[].name | select(test($re))')
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    if [[ ! -e "$tmpdir/$name" ]]; then
+      GH_TOKEN="$DEST_GH_TOKEN" gh release delete-asset "$TAG" "$name" \
+        --repo "$DEST_REPO" --yes
+      echo "pruned stale asset $name from $DEST_REPO@$TAG" >&2
+    fi
+  done <<<"$dest_names"
 fi
 
 GH_TOKEN="$DEST_GH_TOKEN" gh release upload "$TAG" \
