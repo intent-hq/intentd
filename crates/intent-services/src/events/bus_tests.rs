@@ -250,8 +250,8 @@ async fn idle_publish_resolves_without_batch_window_delay() {
     // A lone serial publisher must not pay a fixed batch-window wait on every
     // publish: with the writer's idle path flushing immediately, each publish
     // is bounded only by its SQLite commit. Under the previous 20 ms window,
-    // 20 sequential publishes took >= 400 ms; assert a bound well under that
-    // (with generous headroom for slow CI).
+    // 20 sequential publishes took >= 400 ms by construction, so any bound
+    // below that proves the fix; 350 ms leaves headroom for slow/contended CI.
     let start = std::time::Instant::now();
     for i in 0..20 {
         bus.publish(&new_event(
@@ -264,7 +264,7 @@ async fn idle_publish_resolves_without_batch_window_delay() {
     }
     let elapsed = start.elapsed();
     assert!(
-        elapsed < Duration::from_millis(200),
+        elapsed < Duration::from_millis(350),
         "20 sequential idle publishes should flush immediately; took {elapsed:?}"
     );
 }

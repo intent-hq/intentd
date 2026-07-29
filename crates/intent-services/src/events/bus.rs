@@ -198,8 +198,10 @@ impl Drop for Subscription {
 /// **Shutdown invariant**: The task receives `None` from `rx.recv()` only after
 /// all `EventBus` clones (and their `writer_tx` senders) have been dropped. This
 /// guarantees no `publish()` call can be awaiting a response when the task exits,
-/// because `publish()` requires a live `writer_tx` to send the request. Any pending
-/// events at shutdown are flushed before the task returns.
+/// because `publish()` requires a live `writer_tx` to send the request. Every
+/// iteration flushes `pending` before looping, and `recv()` keeps returning
+/// buffered events after the channel closes (before yielding `None`), so no
+/// event is dropped at shutdown.
 async fn writer_task(
     store: Store,
     mut rx: mpsc::Receiver<WriterRequest>,
