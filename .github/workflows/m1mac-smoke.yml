@@ -3,6 +3,8 @@ name: m1mac smoke test
 on:
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   smoke:
     name: Machine inventory (m1mac)
