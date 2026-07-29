@@ -77,17 +77,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
+      # All git_only packages run `cargo package --workspace` in separate
+      # temporary worktrees; a shared target dir means only the first one
+      # compiles cold and the rest reuse the build cache. The path must
+      # end in `.../target` so release-plz's packaged-dir fast path
+      # (`is_cargo_packaged_dir`) recognizes `target/package/*` and lists
+      # files from disk instead of re-running `cargo package --list`
+      # (which fails for internal path-only dependencies). Exported via
+      # GITHUB_ENV (runner.temp is unavailable in job-level `env`) so both
+      # rust-cache (which reads CARGO_TARGET_DIR to find the target dir to
+      # cache) and release-plz see the same path.
+      - name: Set shared cargo target dir
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/release-plz/target" >> "$GITHUB_ENV"
+      # Cross-run build cache for the `cargo package --workspace` compiles;
+      # without it every run cold-compiles the whole workspace (~30-45 min).
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Run release-plz release-pr
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          # All git_only packages run `cargo package --workspace` in separate
-          # temporary worktrees; a shared target dir means only the first one
-          # compiles cold and the rest reuse the build cache. The path must
-          # end in `.../target` so release-plz's packaged-dir fast path
-          # (`is_cargo_packaged_dir`) recognizes `target/package/*` and lists
-          # files from disk instead of re-running `cargo package --list`
-          # (which fails for internal path-only dependencies).
-          CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz/target
