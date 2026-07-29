@@ -4233,9 +4233,9 @@ async fn router_read_lifecycle_arms_over_wss() {
         "script.create",
         json!({
             "workspaceId": ws_id,
-            "name": "echo-wss",
-            "command": "echo wss",
-            "mode": "command",
+            "name": "service-wss",
+            "command": "sleep 3600",
+            "mode": "service",
         }),
     )
     .await;
@@ -4257,6 +4257,64 @@ async fn router_read_lifecycle_arms_over_wss() {
     )
     .await;
     assert!(status.is_object(), "script.status object: {status}");
+    let started = wss_rpc(
+        &mut rpc,
+        101,
+        "script.start",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    assert_eq!(started["ok"], json!(true));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut poll_id = 102;
+    loop {
+        let runtime = wss_rpc(
+            &mut rpc,
+            poll_id,
+            "script.status",
+            json!({ "workspaceId": ws_id, "scriptId": script_id }),
+        )
+        .await;
+        poll_id += 1;
+        if runtime["status"] == "running" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "script did not reach running state: {runtime}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let script_terminals = wss_rpc(
+        &mut rpc,
+        poll_id,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    poll_id += 1;
+    assert_eq!(
+        script_terminals,
+        json!([]),
+        "running script PTY must not be exposed as a terminal tab"
+    );
+    let script_output = wss_rpc(
+        &mut rpc,
+        poll_id,
+        "script.output",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    poll_id += 1;
+    assert!(script_output.is_string(), "script.output remains available");
+    let stopped = wss_rpc(
+        &mut rpc,
+        poll_id,
+        "script.stop",
+        json!({ "workspaceId": ws_id, "scriptId": script_id }),
+    )
+    .await;
+    assert_eq!(stopped["ok"], json!(true));
     let removed = wss_rpc(
         &mut rpc,
         13,

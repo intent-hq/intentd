@@ -139,6 +139,9 @@ pub struct SpawnSpec {
     /// Optional display name surfaced through `terminal.list` (e.g. "Setup
     /// Script"); `None` for unnamed terminals.
     pub name: Option<String>,
+    /// Whether this PTY is surfaced through `terminal.list`. Script-owned PTYs
+    /// set this false because scripts have their own list/runtime UI.
+    pub listed: bool,
 }
 
 impl SpawnSpec {
@@ -154,6 +157,7 @@ impl SpawnSpec {
             size: PtySize::default(),
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
             name: None,
+            listed: true,
         }
     }
 }
@@ -195,6 +199,8 @@ struct PtySession {
     scope: String,
     /// Display name given at spawn (`SpawnSpec::name`), if any.
     name: Option<String>,
+    /// Whether this PTY is surfaced through `terminal.list`.
+    listed: bool,
     /// Working directory resolved at spawn (`spec.cwd`, else the daemon's cwd).
     cwd: Option<String>,
     pid: Option<u32>,
@@ -340,6 +346,7 @@ impl PtyHost {
         let session = Arc::new(PtySession {
             scope: spec.scope,
             name: spec.name,
+            listed: spec.listed,
             cwd,
             pid,
             master: Mutex::new(Some(pair.master)),
@@ -478,14 +485,14 @@ impl PtyHost {
         self.sessions.lock().unwrap().len()
     }
 
-    /// The live PTYs currently tracked under `scope`. Exited sessions remain
-    /// retained for post-exit output and explicit release, but are not listed.
+    /// The live, list-visible PTYs currently tracked under `scope`. Hidden and
+    /// exited sessions remain addressable for output and explicit release.
     pub fn list_scope(&self, scope: &str) -> Vec<PtyId> {
         self.sessions
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.scope == scope && observe_exit(s).is_none())
+            .filter(|(_, s)| s.scope == scope && s.listed && observe_exit(s).is_none())
             .map(|(id, _)| *id)
             .collect()
     }
@@ -819,6 +826,23 @@ mod tests {
 
         host.kill(named_id).await;
         host.kill(unnamed_id).await;
+    }
+
+    /// Hidden PTYs stay fully addressable by id while being omitted from the
+    /// terminal-list view used by clients to build interactive terminal tabs.
+    #[tokio::test]
+    async fn hidden_pty_is_omitted_from_list_but_keeps_buffer_access() {
+        let host = PtyHost::new();
+        let mut hidden = cat_spec("s");
+        hidden.listed = false;
+        let hidden_id = host.spawn(hidden).unwrap();
+        let visible_id = host.spawn(cat_spec("s")).unwrap();
+
+        assert_eq!(host.list_scope("s"), vec![visible_id]);
+        assert!(host.scrollback(hidden_id).is_ok());
+
+        host.kill(hidden_id).await;
+        host.kill(visible_id).await;
     }
 
     /// Every attached subscriber receives byte-identical fan-out (§12.1).
