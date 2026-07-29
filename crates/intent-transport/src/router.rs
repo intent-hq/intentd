@@ -2382,25 +2382,6 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
-        "file-tracking.init" => {
-            let ws = require_ws_note(params)?;
-            let r = api.file_tracking_init(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "file-tracking.sync" => {
-            let ws = require_ws_note(params)?;
-            let force = parse_bool(params, "force");
-            let r = api
-                .file_tracking_sync(ws, force)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(r)
-        }
-        "file-tracking.load" => {
-            let ws = require_ws_note(params)?;
-            let r = api.file_tracking_load(ws).await.map_err(domain_to_rpc)?;
-            Ok(r)
-        }
         "file-tracking.getChanges" => {
             let ws = require_ws_note(params)?;
             let filter = opt_value(params, "filter");

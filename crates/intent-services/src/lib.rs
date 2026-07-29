@@ -17226,127 +17226,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn file_tracking_init(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        // Tracking is attached at workspace-open / agent-edit time (§17.1); the
-        // wire init is a no-op acknowledgement, matching the TS handler.
-        let _ = workspace_id;
-        Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
-    }
-
-    fn file_tracking_sync(
-        &self,
-        workspace_id: WorkspaceId,
-        force: bool,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            // `force` is accepted for wire parity; reconciliation is idempotent.
-            let _ = force;
-            let synced = serde_json::json!({ "success": true, "synced": true });
-            let ws = match store.get_workspace(&workspace_id).await {
-                Ok(w) => w,
-                Err(_) => return Ok(synced),
-            };
-            if ws.is_remote {
-                return Ok(synced);
-            }
-            let Some(worktree) = git_ops::worktree_path(&ws) else {
-                return Ok(synced);
-            };
-            if !worktree.join(".git").exists() {
-                return Ok(synced);
-            }
-            // Preserve existing attribution per path while reconciling the
-            // unstaged worktree changes against live git (§17.4).
-            let existing = store
-                .list_tracked_changes(&workspace_id)
-                .await
-                .unwrap_or_default();
-            let mut attribution: AttributionByPath = HashMap::new();
-            for row in &existing {
-                attribution.insert(
-                    row.path.clone(),
-                    (row.agent_id.clone(), row.session_id.clone(), row.turn),
-                );
-            }
-            let files = intent_git::diff::diff_index_to_workdir(&worktree)?;
-            for fd in files {
-                let summary = crate::diffs::compute_and_store(
-                    &store,
-                    &worktree,
-                    &workspace_id,
-                    &fd.path,
-                    false,
-                )
-                .await
-                .ok()
-                .flatten();
-                let status = if fd.old_blob.is_none() {
-                    "added"
-                } else if fd.new_blob.is_none() {
-                    "deleted"
-                } else {
-                    "modified"
-                };
-                let (agent_id, session_id, turn) = attribution
-                    .get(&fd.path)
-                    .cloned()
-                    .unwrap_or((None, None, None));
-                let attributed_agent = agent_id.clone();
-                let change = intent_store::NewTrackedChange {
-                    workspace_id: workspace_id.clone(),
-                    path: fd.path.clone(),
-                    stage: "unstaged".to_string(),
-                    status: status.to_string(),
-                    agent_id,
-                    session_id,
-                    turn,
-                    commit_hash: None,
-                    old_blob_sha: summary.as_ref().and_then(|s| s.old_blob_sha.clone()),
-                    new_blob_sha: summary.as_ref().and_then(|s| s.new_blob_sha.clone()),
-                    additions: summary.as_ref().map(|s| s.additions).unwrap_or(0),
-                    deletions: summary.as_ref().map(|s| s.deletions).unwrap_or(0),
-                };
-                let (lines_added, lines_deleted) =
-                    crate::file_tracking::track_change(&store, change).await?;
-                // Global usage-stats (D5): reconciliation catches edits the
-                // watcher missed; the row-level delta keeps this idempotent
-                // when it did not. Best-effort inside.
-                crate::usage_stats::record_lines_changed(
-                    &store,
-                    &workspace_id,
-                    attributed_agent.as_deref(),
-                    lines_added,
-                    lines_deleted,
-                )
-                .await;
-            }
-            Ok(synced)
-        })
-    }
-
-    fn file_tracking_load(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            let worktree = ft_worktree(&store, &workspace_id).await;
-            let rows = match store.list_tracked_changes(&workspace_id).await {
-                Ok(r) => r,
-                Err(_) => return Ok(empty_changes_result()),
-            };
-            Ok(file_tracking_ops::build_changes_result(
-                rows,
-                worktree.as_deref(),
-                &file_tracking_ops::ChangeFilterParsed::default(),
-            ))
-        })
-    }
-
     fn file_tracking_get_changes(
         &self,
         workspace_id: WorkspaceId,
@@ -19315,10 +19194,6 @@ struct AcExtras {
     undo_commits_metadata: Vec<UndoCommitMeta>,
 }
 
-/// Per-path attribution `(agent_id, session_id, turn)` carried across a
-/// `file-tracking.sync` reconcile so reconciled rows keep their provenance.
-type AttributionByPath = HashMap<String, (Option<String>, Option<String>, Option<i64>)>;
-
 /// Record a `tracked_changes` attribution row for an agent's workspace-api
 /// file mutation (`file.write`/`file.delete`/`file.rename`, monorepo#939),
 /// mirroring the agent event sink's handling of ACP `file:changed`
@@ -19432,7 +19307,7 @@ async fn ft_worktree(store: &Store, workspace_id: &WorkspaceId) -> Option<PathBu
     git_ops::worktree_path(&ws)
 }
 
-/// The empty `file-tracking.load`/`getChanges` result (TS `emptyChangesResult`).
+/// The empty `file-tracking.getChanges` result (TS `emptyChangesResult`).
 fn empty_changes_result() -> serde_json::Value {
     serde_json::json!({ "changes": [], "truncated": false, "totalCount": 0 })
 }
