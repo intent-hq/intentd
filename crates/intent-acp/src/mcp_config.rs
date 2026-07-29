@@ -427,9 +427,10 @@ pub fn apply_baseline_env_to_stdio_servers(
 /// binary. Note the returned `PATH` must carry the full inherited value
 /// itself: [`apply_baseline_env_to_stdio_servers`] merges the baseline env
 /// with the server env and the server env wins, so a bare parent-dir `PATH`
-/// would clobber the baseline `PATH`. Whitespace-free paths (and edge cases a
-/// basename lookup cannot fix, e.g. a spaced basename) are returned verbatim
-/// with no override.
+/// would clobber the baseline `PATH`. Empty inherited-`PATH` segments are
+/// dropped so the override never implicitly adds the current directory to
+/// lookup. Whitespace-free paths (and edge cases a basename lookup cannot
+/// fix, e.g. a spaced basename) are returned verbatim with no override.
 pub fn normalize_spaced_bridge_command(
     exe: &Path,
     inherited_path: Option<&OsStr>,
@@ -450,7 +451,11 @@ pub fn normalize_spaced_bridge_command(
     }
     let entries = std::iter::once(parent.to_path_buf()).chain(
         inherited_path
-            .map(|p| std::env::split_paths(p).collect::<Vec<_>>())
+            .map(|p| {
+                std::env::split_paths(p)
+                    .filter(|entry| !entry.as_os_str().is_empty())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default(),
     );
     match std::env::join_paths(entries) {

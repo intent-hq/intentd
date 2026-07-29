@@ -2082,6 +2082,19 @@ mod mcp_tests {
         assert_eq!(path.as_deref(), Some("/opt/App Support/bin"));
     }
 
+    /// Empty inherited-PATH segments (e.g. an empty `PATH` string) must be
+    /// dropped, not joined as trailing separators that would implicitly add
+    /// the current directory to lookup on Unix.
+    #[test]
+    fn spaced_bridge_path_drops_empty_inherited_path_segments() {
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("/opt/App Support/bin/intentd"),
+            Some(OsStr::new("")),
+        );
+        assert_eq!(command, "intentd");
+        assert_eq!(path.as_deref(), Some("/opt/App Support/bin"));
+    }
+
     /// Whitespace-free bridge path stays verbatim with no PATH override.
     #[test]
     fn unspaced_bridge_path_is_left_verbatim() {
