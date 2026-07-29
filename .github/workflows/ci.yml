@@ -9,6 +9,13 @@ permissions:
   contents: read
   pull-requests: read
 
+# The heavy jobs share a single self-hosted runner slot and serialize, so
+# cancel superseded PR runs instead of letting them back up the queue (push
+# to main and merge-queue runs are never cancelled).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: [self-hosted, macOS, ARM64, m1mac]
@@ -21,6 +28,14 @@ jobs:
       # No disk-space cleanup: with debug info disabled (CARGO_PROFILE_*_DEBUG=0)
       # this job's target dir stays small, and the self-hosted Mac has ~500G free.
       - uses: actions/checkout@v7
+      # Keep the target dir OUTSIDE the runner work dir: checkout's default
+      # clean (git clean -ffdx) wipes ignored files — including target/ — at
+      # the start of every job, and all jobs on this runner share one work
+      # dir. A per-job CARGO_TARGET_DIR under $HOME survives both, which is
+      # what makes builds warm across runs (and why swatinem/rust-cache was
+      # dropped: GH cache save/restore would be pure overhead on top of it).
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/check" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -31,9 +46,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
-      # No swatinem/rust-cache on the self-hosted runner: its work dir persists
-      # across runs, so the local target dir is already warm and GH cache
-      # save/restore would be pure overhead.
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -78,6 +90,11 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+      # Per-job persistent target dir outside the work dir (see the `check`
+      # job's comment for the rationale; re-add swatinem/rust-cache, keyed
+      # per target, if a GH-hosted matrix entry is re-enabled).
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -88,10 +105,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-      # No swatinem/rust-cache on the self-hosted runner: its work dir persists
-      # across runs, so the local target dir is already warm and GH cache
-      # save/restore would be pure overhead. (Re-add it, keyed per target, if a
-      # GH-hosted matrix entry is re-enabled.)
       # On PRs a cheap `cargo check` proves per-target compilation; the full
       # `--release` build (the expensive part, esp. on Windows) only runs on
       # push to main and in the merge queue. The "Warm PR check cache" step
@@ -119,6 +132,12 @@ jobs:
       NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
+      # Per-job persistent target dir outside the work dir (see the `check`
+      # job's comment for the rationale). cargo llvm-cov honors it, and the
+      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
+      # crates + profraw, so dependency artifacts stay warm across runs.
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-e2e" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -131,9 +150,6 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      # No swatinem/rust-cache on the self-hosted runner: its work dir persists
-      # across runs, so the local target dir is already warm and GH cache
-      # save/restore would be pure overhead.
       - name: Run e2e coverage
         run: |
           cd ${{ github.workspace }}
@@ -168,6 +184,12 @@ jobs:
       NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/checkout@v7
+      # Per-job persistent target dir outside the work dir (see the `check`
+      # job's comment for the rationale). cargo llvm-cov honors it, and the
+      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
+      # crates + profraw, so dependency artifacts stay warm across runs.
+      - name: Point CARGO_TARGET_DIR outside the work dir
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/coverage-all" >> "$GITHUB_ENV"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -180,9 +202,6 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      # No swatinem/rust-cache on the self-hosted runner: its work dir persists
-      # across runs, so the local target dir is already warm and GH cache
-      # save/restore would be pure overhead.
       - name: Run combined coverage
         run: |
           cd ${{ github.workspace }}
