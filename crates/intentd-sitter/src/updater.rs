@@ -22,7 +22,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::cli::Channel;
-use crate::manifest::{self, ManifestError, PlatformEntry, TARGET_TRIPLE};
+use crate::manifest::{self, ChannelManifest, ManifestError, PlatformEntry, TARGET_TRIPLE};
 use crate::paths::{SitterPaths, DAEMON_BIN_NAME};
 use crate::state;
 
@@ -89,29 +89,49 @@ pub enum UpdateError {
 /// with fail-fast timeouts.
 pub struct Updater {
     paths: SitterPaths,
-    base_url: String,
+    /// Ordered manifest base URLs; never empty (enforced by the
+    /// constructors). The manifest fetch tries each in order.
+    base_urls: Vec<String>,
     client: reqwest::blocking::Client,
 }
 
 impl Updater {
-    /// Updater against the real GitHub release manifests.
+    /// Updater against the real GitHub release manifests, trying each of
+    /// [`manifest::DEFAULT_MANIFEST_BASE_URLS`] in order.
     pub fn new(paths: SitterPaths) -> Result<Self, UpdateError> {
-        Self::with_base_url(paths, manifest::DEFAULT_MANIFEST_BASE_URL)
+        Self::with_base_urls(paths, manifest::DEFAULT_MANIFEST_BASE_URLS.iter().copied())
     }
 
-    /// Updater against an alternate manifest base URL (tests use a local
+    /// Updater against exactly one manifest base URL — no fallback (tests
+    /// and the `INTENTD_SITTER_MANIFEST_BASE_URL` override use a local
     /// fixture server).
     pub fn with_base_url(
         paths: SitterPaths,
         base_url: impl Into<String>,
     ) -> Result<Self, UpdateError> {
+        Self::with_base_urls(paths, [base_url.into()])
+    }
+
+    /// Updater against an ordered list of manifest base URLs; the manifest
+    /// fetch tries each in order and the first fetchable + parseable
+    /// manifest wins. `base_urls` must be non-empty.
+    pub fn with_base_urls<I, S>(paths: SitterPaths, base_urls: I) -> Result<Self, UpdateError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let base_urls: Vec<String> = base_urls.into_iter().map(Into::into).collect();
+        assert!(
+            !base_urls.is_empty(),
+            "Updater requires at least one manifest base URL"
+        );
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(UpdateError::Client)?;
         Ok(Self {
             paths,
-            base_url: base_url.into(),
+            base_urls,
             client,
         })
     }
@@ -138,9 +158,7 @@ impl Updater {
         channel: Channel,
         force: bool,
     ) -> Result<UpdateOutcome, UpdateError> {
-        let url = manifest::manifest_url(&self.base_url, channel);
-        let bytes = self.fetch(&url, MANIFEST_TIMEOUT)?;
-        let manifest = manifest::parse(&bytes)?;
+        let manifest = self.fetch_manifest(channel)?;
         // The manifest version becomes a directory name under `versions/` and
         // the persisted `current_version`; reject anything that is not valid
         // semver before it touches the filesystem (also covers the fresh
@@ -221,6 +239,25 @@ impl Updater {
 
         self.prune(version, previous.as_deref());
         Ok(())
+    }
+
+    /// Fetch and parse the channel manifest, trying each configured base
+    /// URL in order. Any failure — network error, HTTP status, unparseable
+    /// body — advances to the next base; when every base fails, the last
+    /// error is returned.
+    fn fetch_manifest(&self, channel: Channel) -> Result<ChannelManifest, UpdateError> {
+        let mut last_err = None;
+        for base_url in &self.base_urls {
+            let url = manifest::manifest_url(base_url, channel);
+            let attempt = self
+                .fetch(&url, MANIFEST_TIMEOUT)
+                .and_then(|bytes| Ok(manifest::parse(&bytes)?));
+            match attempt {
+                Ok(manifest) => return Ok(manifest),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.expect("base_urls is never empty"))
     }
 
     fn fetch(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, UpdateError> {

@@ -45,13 +45,21 @@ fn run() -> i32 {
         }
     };
 
-    let base_url = std::env::var(MANIFEST_BASE_URL_ENV)
+    // The env override pins exactly one base (no fallback) so tests and
+    // overrides stay deterministic; the default is the ordered fallback list.
+    let base_urls = match std::env::var(MANIFEST_BASE_URL_ENV)
         .ok()
         .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| manifest::DEFAULT_MANIFEST_BASE_URL.to_string());
+    {
+        Some(url) => vec![url],
+        None => manifest::DEFAULT_MANIFEST_BASE_URLS
+            .iter()
+            .map(|base| base.to_string())
+            .collect(),
+    };
 
     match args.sitter_command() {
-        Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &base_url),
+        Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &base_urls),
         Some(Err(e)) => {
             eprintln!("intentd-sitter: {e}");
             return 2;
@@ -66,7 +74,7 @@ fn run() -> i32 {
         channel,
         args.passthrough,
         SupervisorConfig::from_env(),
-        base_url,
+        base_urls,
     )
 }
 
@@ -80,11 +88,11 @@ fn run_sitter_command(
     command: SitterCommand,
     args: &SitterArgs,
     paths: &SitterPaths,
-    base_url: &str,
+    base_urls: &[String],
 ) -> i32 {
     match command {
         SitterCommand::Channel { set, redownload } => {
-            run_channel_command(set, redownload, args, paths, base_url)
+            run_channel_command(set, redownload, args, paths, base_urls)
         }
         SitterCommand::Restart => run_restart(paths),
     }
@@ -97,7 +105,7 @@ fn run_channel_command(
     redownload: bool,
     args: &SitterArgs,
     paths: &SitterPaths,
-    base_url: &str,
+    base_urls: &[String],
 ) -> i32 {
     let Some(channel) = set else {
         let resolved =
@@ -119,7 +127,7 @@ fn run_channel_command(
     );
 
     if redownload {
-        let updater = match Updater::with_base_url(paths.clone(), base_url) {
+        let updater = match Updater::with_base_urls(paths.clone(), base_urls.iter().cloned()) {
             Ok(updater) => updater,
             Err(e) => {
                 eprintln!("intentd-sitter: {e} (the channel pin was still written)");
