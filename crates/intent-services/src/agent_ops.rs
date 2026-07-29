@@ -3391,7 +3391,7 @@ impl Services {
         // Track effective isolation mode for the result. Provisioning runs in
         // a background task (monorepo#871), so an eligible CoW request reports
         // "pending" here; the settled outcome is observable via the session's
-        // sandbox fields and the `sandbox:created` event.
+        // sandbox fields and the `sandbox:cow:created` event.
         let mut effective_isolation: Option<&str> = None;
 
         // Provision sandbox if isolation=cow is requested (Task 3).
@@ -3450,7 +3450,7 @@ impl Services {
                     // runtime drops the task unpolled at shutdown. On the
                     // normal path the guard drops AFTER
                     // `provision_delegate_sandbox` returns — the session's
-                    // sandbox fields and the `sandbox:created` event are
+                    // sandbox fields and the `sandbox:cow:created` event are
                     // already published, so a released waiter observes the
                     // settled state. Dropping the held sender (also via the
                     // guard) releases every waiter.
@@ -3590,7 +3590,7 @@ impl Services {
     /// Background half of the delegate CoW-isolation path (monorepo#871): run
     /// [`provision_sandbox`](crate::sandbox_ops::provision_sandbox) and settle
     /// the outcome onto the child's session. Success persists the sandbox
-    /// fields and emits `sandbox:created` (payload unchanged, §5.5);
+    /// fields and emits `sandbox:cow:created` (payload unchanged, §5.5);
     /// `Unsupported`/failure falls back to shared mode exactly as before —
     /// debug/warn log only, the session keeps no sandbox fields and the child
     /// spawns in the shared checkout.
@@ -3639,7 +3639,7 @@ impl Services {
     }
 
     /// Settle a successfully provisioned sandbox onto the child's session:
-    /// persist the sandbox fields and emit `sandbox:created`. Because the
+    /// persist the sandbox fields and emit `sandbox:cow:created`. Because the
     /// clone runs off the delegate critical path (monorepo#871),
     /// `agent.delete` can race it — if the session is gone or soft-deleted
     /// by settlement time, discard the just-provisioned sandbox (directory +
@@ -3681,13 +3681,13 @@ impl Services {
                     .update_agent_session(workspace_id, &session)
                     .await;
 
-                // Emit sandbox:created event
+                // Emit sandbox:cow:created event
                 crate::publish_event(
                     &self.event_bus,
                     intent_store::NewEvent {
                         workspace_id: workspace_id.clone(),
                         timestamp: crate::now_iso(),
-                        event_type: "sandbox:created".to_string(),
+                        event_type: "sandbox:cow:created".to_string(),
                         actor: crate::system_actor(),
                         session_id: Some(agent_id.0.clone()),
                         correlation_id: None,

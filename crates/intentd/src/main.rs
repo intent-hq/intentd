@@ -2206,7 +2206,7 @@ fn spawn_idempotency_reap_loop(
 const SANDBOX_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Spawn the periodic merge-pending retry sweep. Merge-back otherwise only
-/// triggers on agent completion or the manual `sandbox.merge` RPC, so a
+/// triggers on agent completion or the manual `sandbox.cow.merge` RPC, so a
 /// sandbox stranded `merge_pending` (daemon restart mid-merge, or historical
 /// failures like the pre-#592 fetch bug) never self-heals. Each tick calls
 /// [`Services::sweep_merge_pending_sandboxes`]: retries every `merge_pending`

@@ -12505,7 +12505,7 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
     // agent.delete raced the background clone (monorepo#871): the hard
     // delete cascades the sandbox row away (FK ON DELETE CASCADE), so by
     // settlement time only the cloned directory remains — it must be
-    // removed and no sandbox:created event fires.
+    // removed and no sandbox:cow:created event fires.
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let aid = create_agent(&svc, &ws, "Doomed").await;
     let dir = fake_provisioned_sandbox(&svc, &ws, &aid).await;
@@ -12515,7 +12515,7 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
         .expect("hard delete session");
 
     let mut sub = bus.subscribe(SubscriptionFilter {
-        event_types: vec!["sandbox:created".to_string()],
+        event_types: vec!["sandbox:cow:created".to_string()],
         ..Default::default()
     });
 
@@ -12541,7 +12541,7 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
     let res = timeout(Duration::from_millis(300), sub.recv()).await;
     assert!(
         res.is_err(),
-        "expected no sandbox:created emit for a deleted agent"
+        "expected no sandbox:cow:created emit for a deleted agent"
     );
 }
 

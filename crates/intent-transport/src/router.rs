@@ -1512,7 +1512,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
-        "sandbox.merge" => {
+        "sandbox.cow.merge" => {
             let ws = require_ws_note(params)?;
             let sandbox_id = require_agent_id(params)?;
             let result = api
@@ -1521,7 +1521,7 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(result)
         }
-        "sandbox.discard" => {
+        "sandbox.cow.discard" => {
             let ws = require_ws_note(params)?;
             let sandbox_id = require_agent_id(params)?;
             let result = api

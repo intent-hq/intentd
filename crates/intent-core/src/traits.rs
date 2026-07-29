@@ -1911,7 +1911,7 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `sandbox.merge`: manually trigger merge-back for a sandboxed agent (PROTOCOL §5.34).
+    /// `sandbox.cow.merge`: manually trigger merge-back for a sandboxed agent (PROTOCOL §5.34).
     /// Returns `{ ok, status, ... }` with merge outcome (merged | conflict | blocked | merge_pending).
     fn sandbox_merge(
         &self,
@@ -1926,7 +1926,7 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `sandbox.discard`: manually discard a sandbox (PROTOCOL §5.34).
+    /// `sandbox.cow.discard`: manually discard a sandbox (PROTOCOL §5.34).
     /// Returns `{ ok }`.
     fn sandbox_discard(
         &self,

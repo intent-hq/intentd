@@ -15,9 +15,9 @@
 //!   mode, no checkout provisioned at all (no probe, no fallback).
 //! - `agent.delegate` in a CoW workspace provisions a per-agent CoW sandbox
 //!   (`effectiveIsolation: "pending"` in the delegate result; the
-//!   `sandbox:created` event and session sandbox fields report the settled
+//!   `sandbox:cow:created` event and session sandbox fields report the settled
 //!   outcome), and completion merges the sandbox back into the workspace
-//!   checkout (`sandbox:merged` event, filesystem changes land, sandbox dir
+//!   checkout (`sandbox:cow:merged` event, filesystem changes land, sandbox dir
 //!   discarded).
 //! - SLOW sandbox provisioning (test seam) never blocks `agent.delegate` —
 //!   the RPC returns promptly with `effectiveIsolation: "pending"` and the
@@ -663,10 +663,10 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
 
 /// Scenario C — `agent.delegate` in a CoW workspace: the delegated agent gets
 /// its own per-agent CoW sandbox (`effectiveIsolation: "pending"` in the
-/// delegate result; the `sandbox:created` event with the §5.5 payload
+/// delegate result; the `sandbox:cow:created` event with the §5.5 payload
 /// reports the settled outcome), and when the
 /// child completes its turn the daemon auto-merges the sandbox back into the
-/// workspace checkout (`sandbox:merged` event, the file written inside the
+/// workspace checkout (`sandbox:cow:merged` event, the file written inside the
 /// sandbox lands in the checkout as a commit, and the sandbox directory is
 /// discarded).
 #[tokio::test]
@@ -742,20 +742,20 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
     let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
     // Provisioning runs off the delegate critical path (monorepo#871): the
     // delegate result reports "pending" immediately; the settled outcome is
-    // observed via the `sandbox:created` event asserted below.
+    // observed via the `sandbox:cow:created` event asserted below.
     assert_eq!(
         delegated["effectiveIsolation"],
         json!("pending"),
         "CoW sandbox provisioning kicked off in the background: {delegated}"
     );
 
-    // sandbox:created — §5.5 payload: workspaceId, agentId, sandboxPath,
+    // sandbox:cow:created — §5.5 payload: workspaceId, agentId, sandboxPath,
     // branch (sb/<agentId>), baseCommitSha, snapshotCommitSha.
     let mut sandbox_path = None;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 30).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "sandbox:created" {
+        if ev["type"] == "sandbox:cow:created" {
             assert_eq!(ev["data"]["workspaceId"], json!(ws_id));
             assert_eq!(ev["data"]["agentId"], json!(agent_id));
             assert_eq!(
@@ -770,7 +770,7 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
             break;
         }
     }
-    let sandbox_path = sandbox_path.expect("sandbox:created event delivered");
+    let sandbox_path = sandbox_path.expect("sandbox:cow:created event delivered");
     assert_eq!(
         sandbox_path,
         root.join(&ws_id)
@@ -793,13 +793,13 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
     std::fs::write(sandbox_path.join("sandbox-work.txt"), "from the sandbox\n")
         .expect("write into sandbox");
 
-    // sandbox:merged — auto-merge on agent:idle; payload carries the
+    // sandbox:cow:merged — auto-merge on agent:idle; payload carries the
     // post-merge canonical HEAD.
     let mut canonical_head = None;
     for _ in 0..120 {
         let frame = wss_event(&mut sub, 60).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "sandbox:merged" {
+        if ev["type"] == "sandbox:cow:merged" {
             assert_eq!(ev["data"]["workspaceId"], json!(ws_id));
             assert_eq!(ev["data"]["agentId"], json!(agent_id));
             canonical_head = Some(
@@ -811,7 +811,7 @@ async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
             break;
         }
     }
-    let canonical_head = canonical_head.expect("sandbox:merged event delivered");
+    let canonical_head = canonical_head.expect("sandbox:cow:merged event delivered");
 
     // The sandbox change landed in the workspace checkout as a commit.
     assert!(
@@ -877,7 +877,7 @@ where
 /// `INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS` seam holds `provision_sandbox`
 /// for 10s (standing in for a CoW clone of a large checkout); the delegate
 /// must return well under that (comfortably inside the 30s `workspace_api`
-/// budget) with `effectiveIsolation: "pending"`, the `sandbox:created` event
+/// budget) with `effectiveIsolation: "pending"`, the `sandbox:cow:created` event
 /// arrives only after the delay, and the child's first ACP spawn waits for
 /// settlement — its actual cwd (mock `echoCwd`) is the sandbox, never the
 /// shared checkout or a half-copied directory.
@@ -960,7 +960,7 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         "delegate must not ride the 10s provisioning delay (took {elapsed:?})"
     );
 
-    // sandbox:created lands only after the artificial delay settles.
+    // sandbox:cow:created lands only after the artificial delay settles.
     let expected_sandbox = root
         .join(&ws_id)
         .join("sandboxes")
@@ -969,7 +969,7 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     loop {
         let frame = wss_event(&mut sub, 30).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "sandbox:created" {
+        if ev["type"] == "sandbox:cow:created" {
             assert_eq!(ev["data"]["agentId"], json!(agent_id));
             assert_eq!(
                 ev["data"]["sandboxPath"],
@@ -981,7 +981,7 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     }
     assert!(
         started.elapsed() >= Duration::from_secs(10),
-        "sandbox:created must not land before the provisioning delay elapsed"
+        "sandbox:cow:created must not land before the provisioning delay elapsed"
     );
 
     // The child's first spawn was gated on settlement: its actual working

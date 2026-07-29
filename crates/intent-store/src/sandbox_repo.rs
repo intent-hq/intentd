@@ -189,7 +189,7 @@ impl Store {
     /// updated (the caller acquired the transition), `false` when another
     /// path already moved it — the compare-and-swap that lets the merge
     /// retry sweep claim `merge_pending → merging` without double-merging
-    /// against a concurrent `sandbox.merge` RPC or a second sweep.
+    /// against a concurrent `sandbox.cow.merge` RPC or a second sweep.
     pub async fn try_transition_sandbox_status(
         &self,
         workspace_id: &WorkspaceId,

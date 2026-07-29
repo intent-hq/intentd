@@ -1,7 +1,7 @@
 //! Integration tests for sandbox merge-back on agent completion (completion-interception path).
 //!
 //! These tests exercise the handle_completion_event → handle_sandbox_merge_on_completion wiring:
-//! - (a) Clean merge → completion propagates with merged status; sandbox:merged event; commits in canonical
+//! - (a) Clean merge → completion propagates with merged status; sandbox:cow:merged event; commits in canonical
 //! - (b) Conflict → completion NOT delivered; bounce message queued; canonical pristine; retry_count incremented
 //! - (c) Retry cap exhausted → completion propagates with merge-pending
 //! - (d) Bounce refreshes sandbox with canonical HEAD without re-provisioning
@@ -192,13 +192,13 @@ mod tests {
         }
     }
 
-    /// Subscribe to sandbox:merged events.
+    /// Subscribe to sandbox:cow:merged events.
     fn subscribe_to_sandbox_merged(
         bus: &EventBus,
         ws_id: &WorkspaceId,
     ) -> crate::events::Subscription {
         let filter = SubscriptionFilter {
-            event_types: vec!["sandbox:merged".to_string()],
+            event_types: vec!["sandbox:cow:merged".to_string()],
             workspace_id: Some(ws_id.0.clone()),
             batch_window: None,
             ..Default::default()
@@ -209,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn test_clean_merge_propagates_completion_and_emits_event() {
         // Scenario (a): Clean merge → completion propagates with merged status;
-        // sandbox:merged event emitted; agent commits present in canonical.
+        // sandbox:cow:merged event emitted; agent commits present in canonical.
 
         let (store, _db) = temp_store().await;
         let (test_root, repo_path) = temp_repo_in_target("clean-merge");
@@ -295,7 +295,7 @@ mod tests {
             )
             .expect("register watch");
 
-        // Subscribe to sandbox:merged events
+        // Subscribe to sandbox:cow:merged events
         let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
 
         // Trigger the completion-interception path
@@ -314,16 +314,16 @@ mod tests {
             "Parent should have received a wake message on clean merge"
         );
 
-        // Assert: sandbox:merged event was emitted
+        // Assert: sandbox:cow:merged event was emitted
         let merged_event =
             tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
         assert!(
             merged_event.is_ok(),
-            "sandbox:merged event should be emitted"
+            "sandbox:cow:merged event should be emitted"
         );
         let merged_batch = merged_event.unwrap().unwrap();
         assert_eq!(merged_batch.len(), 1);
-        assert_eq!(merged_batch[0].event_type, "sandbox:merged");
+        assert_eq!(merged_batch[0].event_type, "sandbox:cow:merged");
 
         // Assert: sandbox status is Merged
         let sandbox = store.get_sandbox(&ws.id, &child_id).await.unwrap();
@@ -863,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn test_sweep_merges_stranded_merge_pending_sandbox() {
         // The sweep finds a merge_pending sandbox with clean work, merges it
-        // into canonical, discards it, and emits sandbox:merged — identical
+        // into canonical, discards it, and emits sandbox:cow:merged — identical
         // bookkeeping to the completion / RPC paths.
 
         let (store, _db) = temp_store().await;
@@ -892,7 +892,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
         assert!(
             merged_event.is_ok(),
-            "sandbox:merged event should be emitted by the sweep"
+            "sandbox:cow:merged event should be emitted by the sweep"
         );
 
         let _ = fs::remove_dir_all(&test_root);
@@ -901,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn test_sweep_skips_sandbox_at_retry_cap() {
         // A sandbox that already burned the retry cap stays merge_pending for
-        // manual sandbox.merge / sandbox.discard — the sweep must not touch it.
+        // manual sandbox.cow.merge / sandbox.cow.discard — the sweep must not touch it.
 
         let (store, _db) = temp_store().await;
         let agent_id = AgentId::from("agent-capped");
