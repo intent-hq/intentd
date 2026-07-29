@@ -132,6 +132,40 @@ async fn try_status_rpc(socket: &Path, budget: Duration) -> Result<serde_json::V
         .map_err(|_| format!("status rpc timed out after {budget:?}"))?
 }
 
+/// Cap on the daemon-log lines included in a readiness-timeout panic, so
+/// the tail stays readable in test output.
+#[cfg(unix)]
+const LOG_TAIL_LINES: usize = 100;
+
+/// Render the tail of the daemon log at `log_path` as a panic-message
+/// section, mirroring [`await_daemon_listening`]'s log-dump pattern so a
+/// readiness timeout is attributable (monorepo#1051: "slow" vs "bind
+/// failed"). Returns an empty string when no log path was provided; an
+/// unreadable log yields a placeholder rather than masking the timeout
+/// panic. Bounded to the last [`LOG_TAIL_LINES`] lines.
+#[cfg(unix)]
+fn daemon_log_tail_section(log_path: Option<&Path>) -> String {
+    let Some(path) = log_path else {
+        return String::new();
+    };
+    let logs = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => return format!("\n--- daemon log ({}) unreadable: {e} ---", path.display()),
+    };
+    let lines: Vec<&str> = logs.lines().collect();
+    let skipped = lines.len().saturating_sub(LOG_TAIL_LINES);
+    let tail = lines[skipped..].join("\n");
+    format!(
+        "\n--- daemon log tail ({}{}) ---\n{tail}",
+        path.display(),
+        if skipped > 0 {
+            format!(", {skipped} earlier lines omitted")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// Poll `system.status` over the daemon's UDS control socket until the WSS
 /// listener is bound — i.e. the response carries `result.port` — and return
 /// that full JSON-RPC response (intent-hq/monorepo#559). The UDS socket can
@@ -141,8 +175,24 @@ async fn try_status_rpc(socket: &Path, budget: Duration) -> Result<serde_json::V
 /// exponential backoff; a daemon whose WSS listener never binds still fails
 /// deterministically, panicking with the last observed response. Readiness
 /// poll ONLY — callers must not use this to retry assertions or other RPCs.
+///
+/// Prefer [`await_wss_status_logged`] where the daemon log path is at hand:
+/// it additionally dumps the log tail on timeout (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_status(socket: &Path) -> serde_json::Value {
+    await_wss_status_impl(socket, None).await
+}
+
+/// [`await_wss_status`] variant that also surfaces the tail of the daemon
+/// log at `log_path` in the timeout panic, so a readiness flake is
+/// attributable from the failure output alone (monorepo#1051).
+#[cfg(unix)]
+pub async fn await_wss_status_logged(socket: &Path, log_path: &Path) -> serde_json::Value {
+    await_wss_status_impl(socket, Some(log_path)).await
+}
+
+#[cfg(unix)]
+async fn await_wss_status_impl(socket: &Path, log_path: Option<&Path>) -> serde_json::Value {
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
     let rpc_budget = test_timeout(Duration::from_secs(5));
@@ -170,8 +220,9 @@ pub async fn await_wss_status(socket: &Path) -> serde_json::Value {
         assert!(
             !remaining.is_zero(),
             "WSS listener not ready: system.status returned no result.port on {} within \
-             {budget:?} ({attempts} attempts); last: {last}",
-            socket.display()
+             {budget:?} ({attempts} attempts); last: {last}{}",
+            socket.display(),
+            daemon_log_tail_section(log_path)
         );
         tokio::time::sleep(backoff.min(remaining)).await;
         backoff = (backoff * 2).min(Duration::from_millis(500));
@@ -185,8 +236,24 @@ pub async fn await_wss_status(socket: &Path) -> serde_json::Value {
 /// asynchronous, so a fixed post-disable sleep plus a single-shot status
 /// lookup flakes under parallel load. Same budget/backoff discipline;
 /// readiness poll ONLY — callers must not use this to retry assertions.
+///
+/// Prefer [`await_wss_stopped_logged`] where the daemon log path is at hand:
+/// it additionally dumps the log tail on timeout (monorepo#1051).
 #[cfg(unix)]
 pub async fn await_wss_stopped(socket: &Path) {
+    await_wss_stopped_impl(socket, None).await
+}
+
+/// [`await_wss_stopped`] variant that also surfaces the tail of the daemon
+/// log at `log_path` in the timeout panic, so a teardown flake is
+/// attributable from the failure output alone (monorepo#1051).
+#[cfg(unix)]
+pub async fn await_wss_stopped_logged(socket: &Path, log_path: &Path) {
+    await_wss_stopped_impl(socket, Some(log_path)).await
+}
+
+#[cfg(unix)]
+async fn await_wss_stopped_impl(socket: &Path, log_path: Option<&Path>) {
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
     let rpc_budget = test_timeout(Duration::from_secs(5));
@@ -217,8 +284,9 @@ pub async fn await_wss_stopped(socket: &Path) {
         assert!(
             !remaining.is_zero(),
             "WSS listener not stopped: system.status still reports result.port on {} within \
-             {budget:?} ({attempts} attempts); last: {last}",
-            socket.display()
+             {budget:?} ({attempts} attempts); last: {last}{}",
+            socket.display(),
+            daemon_log_tail_section(log_path)
         );
         tokio::time::sleep(backoff.min(remaining)).await;
         backoff = (backoff * 2).min(Duration::from_millis(500));
@@ -229,11 +297,20 @@ pub async fn await_wss_stopped(socket: &Path) {
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`
 /// flag: UDS always serves; the WSS listener boot-starts iff the effective
-/// `server.wsApi.enabled` is true, binding `server.wsApi.port`). Seeding the
-/// port keeps the suite hermetic — the boot path reads the settings value, so
-/// the fixed 5181 default would collide across parallel daemons. Appends to an
-/// existing seeded config; no-op if the table is already present (restarts on
-/// the same data dir reuse the same port).
+/// `server.wsApi.enabled` is true, binding `server.wsApi.port`).
+///
+/// Port interplay with the `INTENTD_TCP_PORT=0` seam (monorepo#1051): suites
+/// that spawn the daemon with `INTENTD_TCP_PORT=0` get a true OS-assigned
+/// ephemeral bind — the seam wins over the seeded settings port, eliminating
+/// the reserve-then-release TOCTOU race where another process grabbed the
+/// seeded port between this helper releasing it and the daemon binding it
+/// after full boot. The seeded port is only a fallback for spawns without the
+/// seam, keeping them off the fixed 5181 default that would collide across
+/// parallel daemons; such suites (and any daemon restarted on the same data
+/// dir with the seam, whose ephemeral port changes across boots) must read
+/// the real port from `system.status` ([`await_wss_status`]), never from the
+/// seeded config value. Appends to an existing seeded config; no-op if the
+/// table is already present.
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
