@@ -22,11 +22,15 @@
 //!   CLI being installed: non-empty model list ⇒ `true`; an empty list or an
 //!   auth-required error ⇒ `false`; else unknown.
 //!
-//! Not-installed providers are never probed (`authenticated: null`). Probes
-//! run in parallel, each bounded by its own timeout. Results are cached per
-//! provider for a short TTL with single-flighted probes (the pattern of
-//! [`crate::model_catalog`], simplified); `force` bypasses the cache read but
-//! still joins any in-flight probe.
+//! Not-installed providers are never probed (`authenticated: null`). The
+//! install gate honors `providers.paths` overrides threaded by the transport
+//! layer (monorepo#1086 — the settings live above this crate; the discovery
+//! surface threads them the same way, monorepo#1065), so a provider reachable
+//! only via a valid override is still probed. Probes run in parallel, each
+//! bounded by its own timeout. Results are cached per provider for a short
+//! TTL with single-flighted probes (the pattern of [`crate::model_catalog`],
+//! simplified); `force` bypasses the cache read but still joins any in-flight
+//! probe.
 //!
 //! `intentd doctor` shares [`check_provider_auth_cli`] (the exit-code + grok
 //! CLI probe) so the doctor report and the RPC cannot drift.
@@ -265,15 +269,55 @@ async fn probe_provider(provider_id: &'static str, program: std::ffi::OsString) 
     }
 }
 
+/// The `providers.paths` key a probe provider's install gate reads: the
+/// provider that OWNS its primary binary
+/// ([`intent_providers::ProviderConfig::primary_binary_provider_id`]),
+/// matching spawn resolution. Today every probe-able provider owns its own
+/// primary (only unsloth remaps, and unsloth is not probe-able).
+fn override_key(provider_id: &'static str) -> &'static str {
+    intent_providers::find_provider(provider_id)
+        .map(|cfg| cfg.primary_binary_provider_id())
+        .unwrap_or(provider_id)
+}
+
+/// checkAuggie-parity validation for auggie's threaded override
+/// (`context.auggiePath` → `providers.paths.auggie`, applied under the
+/// `auggie` key by the transport layer): trimmed and an existing file or
+/// symlink — the same acceptance as the transport's `resolve_auggie_path`,
+/// not `find_provider_binary`'s absolute+executable explicit tier. An invalid
+/// value falls through to canonical discovery.
+fn resolve_auggie_override(path: &str) -> Option<std::path::PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(trimmed);
+    (p.is_file() || p.is_symlink()).then_some(p)
+}
+
 /// Resolve a probe-able provider's install gate: the binary the probe needs
 /// on the daemon host, or `None` when the provider is not installed (never
 /// probed). claude-code gates on the real `claude` CLI (auth is owned by the
 /// CLI, not the npx adapter); codex gates on the real `codex` CLI (not
 /// codex-acp); pi gates on the `pi` CLI even though its probe runs the pinned
 /// npx adapter.
-fn resolve_probe_binary(provider_id: &str) -> Option<std::ffi::OsString> {
+///
+/// `override_path` is the raw `providers.paths` value for the provider's
+/// [`override_key`], applied as `find_provider_binary`'s explicit-path tier
+/// (monorepo#1086): a valid override wins (and is what the probe spawns), an
+/// invalid one warns and falls through to the auto-detection tiers. auggie's
+/// override is validated with checkAuggie parity instead
+/// ([`resolve_auggie_override`]), falling through to
+/// [`crate::auggie_discovery::find_auggie`].
+fn resolve_probe_binary(
+    provider_id: &str,
+    override_path: Option<&str>,
+) -> Option<std::ffi::OsString> {
     let command = match provider_id {
         "auggie" => {
+            if let Some(p) = override_path.and_then(resolve_auggie_override) {
+                return Some(p.into_os_string());
+            }
             return crate::auggie_discovery::find_auggie().map(|p| p.into_os_string());
         }
         "claude-code" => "claude",
@@ -284,7 +328,8 @@ fn resolve_probe_binary(provider_id: &str) -> Option<std::ffi::OsString> {
         "pi" => "pi",
         _ => return None,
     };
-    intent_providers::find_provider_binary(provider_id, command, None).map(|p| p.into_os_string())
+    intent_providers::find_provider_binary(provider_id, command, override_path)
+        .map(|p| p.into_os_string())
 }
 
 /// Per-provider auth-status cache: last outcome + fetch instant, plus a
@@ -350,13 +395,17 @@ fn cache() -> &'static AuthStatusCache {
 /// caching, so an install is picked up immediately; an uninstall within the
 /// TTL serves the stale cached value until expiry (accepted — the next
 /// expired or forced read reports `None`).
-async fn resolve_auth_status(provider_id: &'static str, force: bool) -> Option<bool> {
+async fn resolve_auth_status(
+    provider_id: &'static str,
+    force: bool,
+    override_path: Option<String>,
+) -> Option<bool> {
     if !force {
         if let Some(cached) = cache().fresh(provider_id) {
             return cached;
         }
     }
-    let program = resolve_probe_binary(provider_id)?;
+    let program = resolve_probe_binary(provider_id, override_path.as_deref())?;
     let cell = cache().join_inflight(provider_id);
     let value = *cell
         .get_or_init(|| async {
@@ -375,7 +424,18 @@ async fn resolve_auth_status(provider_id: &'static str, force: bool) -> Option<b
 /// `authenticated: true | false | null` (`null` = unknown / probe failed /
 /// not installed). Probes run in parallel, each bounded by its own timeout.
 /// An unknown `provider_id` is an invalid-params error (`-32602`).
-pub async fn provider_auth_status(provider_id: Option<&str>, force: bool) -> Result<Value, String> {
+///
+/// `provider_paths` carries the `providers.paths` overrides (plus the
+/// transport-applied `context.auggiePath` precedence under `auggie`), read
+/// by the caller because the settings live above this function — the same
+/// threading the discovery surface uses (monorepo#1065). The install gate
+/// applies each provider's override so overridden providers get probed
+/// (monorepo#1086); an empty map preserves auto-detection-only behavior.
+pub async fn provider_auth_status(
+    provider_id: Option<&str>,
+    force: bool,
+    provider_paths: &HashMap<String, String>,
+) -> Result<Value, String> {
     let selected: Vec<&'static str> = match provider_id {
         Some(requested) => match AUTH_PROBE_PROVIDERS.iter().find(|id| **id == requested) {
             Some(id) => vec![id],
@@ -389,7 +449,8 @@ pub async fn provider_auth_status(provider_id: Option<&str>, force: bool) -> Res
     let mut set = tokio::task::JoinSet::new();
     for (index, id) in selected.iter().enumerate() {
         let id: &'static str = id;
-        set.spawn(async move { (index, resolve_auth_status(id, force).await) });
+        let override_path = provider_paths.get(override_key(id)).cloned();
+        set.spawn(async move { (index, resolve_auth_status(id, force, override_path).await) });
     }
     // A panicked probe task degrades to unknown rather than failing the
     // whole status call; response order stays fixed regardless of
@@ -470,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_provider_id_is_invalid_params() {
-        let err = provider_auth_status(Some("not-a-provider"), false)
+        let err = provider_auth_status(Some("not-a-provider"), false, &HashMap::new())
             .await
             .expect_err("unknown provider must error");
         assert!(err.contains("not-a-provider"), "{err}");
@@ -482,7 +543,7 @@ mod tests {
         // skipped (authenticated: null); with grok installed, `grok models`
         // actually runs, bounded by the probe timeout. The assertions are
         // shape-only so the test passes in both environments.
-        let result = provider_auth_status(Some("grok"), false)
+        let result = provider_auth_status(Some("grok"), false, &HashMap::new())
             .await
             .expect("grok is a known provider");
         let providers = result["providers"].as_array().expect("providers array");
@@ -491,5 +552,91 @@ mod tests {
         assert!(
             providers[0]["authenticated"].is_boolean() || providers[0]["authenticated"].is_null()
         );
+    }
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-provider-auth-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Pins the gate's `providers.paths` key mapping to spawn resolution
+    /// (`primary_binary_provider_id`): every probe-able provider owns its own
+    /// primary today, so the key is the provider id itself. If a probe-able
+    /// provider ever remaps (the way unsloth rides opencode), this test forces
+    /// the gate to be revisited alongside spawn resolution.
+    #[test]
+    fn probe_override_keys_match_spawn_resolution() {
+        for id in AUTH_PROBE_PROVIDERS {
+            let cfg = intent_providers::find_provider(id).expect("probe provider in registry");
+            assert_eq!(cfg.primary_binary_provider_id(), *id, "provider {id}");
+            assert_eq!(override_key(id), *id, "provider {id}");
+        }
+    }
+
+    /// monorepo#1086 regression: a valid `providers.paths` override resolves
+    /// the install gate even when nothing is auto-detectable, so the provider
+    /// gets probed instead of reporting `authenticated: null` unconditionally.
+    #[cfg(unix)]
+    #[test]
+    fn valid_override_resolves_install_gate() {
+        let dir = unique_temp_dir("valid-override");
+        let bin = dir.join("droid");
+        make_executable(&bin);
+        let resolved = resolve_probe_binary("droid", Some(bin.to_str().unwrap()));
+        assert_eq!(resolved, Some(bin.into_os_string()));
+    }
+
+    /// An invalid override (missing / relative / non-executable) keeps the
+    /// pre-override fall-through semantics: the gate resolves exactly what it
+    /// would with no override at all.
+    #[test]
+    fn invalid_override_falls_through_to_auto_detection() {
+        let baseline = resolve_probe_binary("droid", None);
+        for bad in [
+            "",
+            "   ",
+            "relative/droid",
+            "/nonexistent/intent-test/droid",
+        ] {
+            assert_eq!(
+                resolve_probe_binary("droid", Some(bad)),
+                baseline,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// auggie's gate honors the threaded override with checkAuggie parity
+    /// (existing file or symlink) and falls through to `find_auggie` on an
+    /// invalid value.
+    #[test]
+    fn auggie_override_matches_check_auggie_semantics() {
+        let dir = unique_temp_dir("auggie-override");
+        let bin = dir.join("auggie");
+        std::fs::write(&bin, "").unwrap();
+        assert_eq!(
+            resolve_probe_binary("auggie", Some(bin.to_str().unwrap())),
+            Some(bin.into_os_string())
+        );
+        let baseline = resolve_probe_binary("auggie", None);
+        for bad in ["", "   ", "/nonexistent/intent-test/auggie"] {
+            assert_eq!(
+                resolve_probe_binary("auggie", Some(bad)),
+                baseline.clone(),
+                "{bad:?}"
+            );
+        }
     }
 }
