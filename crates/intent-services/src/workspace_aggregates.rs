@@ -98,6 +98,11 @@ pub(crate) struct WorkspaceAggregateCache {
     /// workspace_id to worktree cache keys last computed for that workspace.
     /// Lets event-driven invalidation drop entries without knowing the path.
     by_workspace: Mutex<HashMap<String, HashSet<String>>>,
+    /// Per-workspace generation bumped on every invalidate. In-flight rollups
+    /// capture the epoch at start and only write the cache if it still matches,
+    /// so a late completion cannot repopulate a pre-change summary after
+    /// invalidation (review on PR 743).
+    diff_epoch: Mutex<HashMap<String, u64>>,
     /// Worktrees with a rollup currently in flight (single-flight guard).
     diff_in_flight: Arc<Mutex<HashSet<String>>>,
     /// Bounds concurrent blocking rollups.
@@ -158,6 +163,7 @@ impl WorkspaceAggregateCache {
         Self {
             diff: Mutex::new(HashMap::new()),
             by_workspace: Mutex::new(HashMap::new()),
+            diff_epoch: Mutex::new(HashMap::new()),
             diff_in_flight: Arc::new(Mutex::new(HashSet::new())),
             gate: tokio::sync::Semaphore::new(MAX_CONCURRENT_ROLLUPS),
             cow: Mutex::new(HashMap::new()),
@@ -250,6 +256,16 @@ impl WorkspaceAggregateCache {
         worktree: PathBuf,
     ) -> Option<WorkspaceDiffSummary> {
         let _permit = self.gate.acquire().await.ok()?;
+        // Snapshot the workspace epoch before the expensive work. If
+        // invalidate_workspace bumps it while we are computing, the result is
+        // returned to the waiter but not cached.
+        let epoch = self
+            .diff_epoch
+            .lock()
+            .unwrap()
+            .get(workspace_id)
+            .copied()
+            .unwrap_or(0);
         let started = Instant::now();
         let summary =
             match tokio::task::spawn_blocking(move || compute_diff_summary_blocking(&worktree))
@@ -283,6 +299,24 @@ impl WorkspaceAggregateCache {
                 "workspace aggregates: slow diff rollup on cache miss"
             );
         }
+        // Drop the write if the workspace was invalidated while we were in flight.
+        let current_epoch = self
+            .diff_epoch
+            .lock()
+            .unwrap()
+            .get(workspace_id)
+            .copied()
+            .unwrap_or(0);
+        if current_epoch != epoch {
+            tracing::debug!(
+                workspace_id,
+                worktree = %key,
+                started_epoch = epoch,
+                current_epoch,
+                "workspace aggregates: discarding rollup superseded by invalidation"
+            );
+            return summary;
+        }
         self.diff.lock().unwrap().insert(
             key.to_string(),
             DiffCacheEntry {
@@ -303,18 +337,23 @@ impl WorkspaceAggregateCache {
     /// Drop cached diff summaries for a workspace (event-driven invalidation).
     /// Next on-demand diff_summary call recomputes. No-op when nothing is cached.
     pub(crate) fn invalidate_workspace(&self, workspace_id: &str) {
+        // Bump first so any in-flight rollup started at the old epoch will
+        // refuse to cache its result after it finishes.
+        {
+            let mut epochs = self.diff_epoch.lock().unwrap();
+            *epochs.entry(workspace_id.to_string()).or_insert(0) += 1;
+        }
         let keys = self
             .by_workspace
             .lock()
             .unwrap()
             .remove(workspace_id)
             .unwrap_or_default();
-        if keys.is_empty() {
-            return;
-        }
-        let mut map = self.diff.lock().unwrap();
-        for key in keys {
-            map.remove(&key);
+        if !keys.is_empty() {
+            let mut map = self.diff.lock().unwrap();
+            for key in keys {
+                map.remove(&key);
+            }
         }
     }
 
@@ -786,5 +825,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.total_files, 2);
+    }
+
+    #[tokio::test]
+    async fn in_flight_rollup_does_not_repopulate_after_invalidate() {
+        let dir = seeded_dirty_repo();
+        // Long TTL so a wrong cached write would be served on the next lookup.
+        let cache = Arc::new(WorkspaceAggregateCache::with_timing(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        let worktree = dir.path().to_path_buf();
+
+        // Hold all rollup permits so the background rollup blocks on the gate
+        // before computing (and before it can observe b.txt).
+        let permits = hold_all_rollup_permits(&cache).await;
+
+        let cache2 = Arc::clone(&cache);
+        let worktree2 = worktree.clone();
+        let join = tokio::spawn(async move { cache2.diff_summary("ws-1", worktree2).await });
+        // Let the task claim single-flight and block on the gate.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Tree change + invalidation while the rollup is still gated.
+        fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+        cache.invalidate_workspace("ws-1");
+
+        drop(permits);
+        let _from_inflight = join.await.unwrap();
+
+        // A subsequent call must recompute. If the superseded in-flight write
+        // had been accepted, long TTL would serve total_files=1 forever.
+        let after = cache
+            .diff_summary("ws-1", worktree)
+            .await
+            .expect("fresh compute after invalidate");
+        assert_eq!(
+            after.total_files, 2,
+            "stale in-flight rollup must not repopulate cache"
+        );
     }
 }
