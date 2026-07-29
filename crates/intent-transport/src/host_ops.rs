@@ -1254,11 +1254,15 @@ fn home_dir() -> PathBuf {
 }
 
 /// Probe provider discovery: returns configured providers + npx availability.
-/// Runs on a blocking thread to keep the async runtime free. Delegates to
-/// intent-services to preserve layering (intent-transport depends only on
-/// intent-services, never on intent-providers directly).
-pub(crate) fn provider_discovery_op() -> Value {
-    intent_services::discover_providers_with_npx()
+/// `provider_paths` is the `providers.paths` settings map so `installed`
+/// honors valid overrides (monorepo#1065). Runs on a blocking thread to keep
+/// the async runtime free. Delegates to intent-services to preserve layering
+/// (intent-transport depends only on intent-services, never on
+/// intent-providers directly).
+pub(crate) fn provider_discovery_op(
+    provider_paths: &std::collections::HashMap<String, String>,
+) -> Value {
+    intent_services::discover_providers_with_npx_overrides(provider_paths)
 }
 
 #[cfg(test)]
