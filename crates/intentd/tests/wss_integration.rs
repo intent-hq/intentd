@@ -3254,6 +3254,120 @@ async fn wss_git_commit_details_round_trip() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// `git.diffs` with the §5.6 `paths` narrowing param over WSS: the daemon
+/// prunes the unstaged walk to exactly the requested workspace-relative files,
+/// the legacy single `path` unions with `paths`, and an absent/empty `paths`
+/// keeps the full-tree behavior.
+#[tokio::test]
+async fn wss_git_diffs_paths_narrowing_round_trip() {
+    let srv = start(WsOptions::default()).await;
+
+    // Seed a repo with one commit, then two tracked edits + one untracked file.
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    let repo = Path::new("/tmp").join(format!("intentd-wssdiffs-{}", &short[..8]));
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "seed"]);
+    std::fs::write(repo.join("a.txt"), "a\nchanged\n").unwrap();
+    std::fs::write(repo.join("b.txt"), "b\nchanged\n").unwrap();
+    std::fs::write(repo.join("c.txt"), "new\n").unwrap();
+
+    let create_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{{"title":"WSS diffs WS","worktreePath":"{}","path":"{}"}}}}"#,
+        repo.display(),
+        repo.display(),
+    );
+    let created = wss_call(srv.port, srv.cfg.clone(), &create_frame).await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .expect("ws id")
+        .to_string();
+
+    // paths narrows to exactly the requested files (tracked edit + untracked).
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["a.txt","c.txt"]}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert_eq!(resp["id"], 2);
+    let arr = resp["result"].as_array().expect("diffs array");
+    let paths: Vec<&str> = arr.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(arr.len(), 2, "exactly the requested files: {paths:?}");
+    assert!(paths.contains(&"a.txt"));
+    assert!(paths.contains(&"c.txt"));
+    let a = arr.iter().find(|d| d["path"] == "a.txt").unwrap();
+    let lines = a["hunks"][0]["lines"].as_array().expect("hunk lines");
+    assert!(lines.iter().any(
+        |l| l["type"] == "Addition" && l["content"].as_str().unwrap_or("").contains("changed")
+    ));
+
+    // Legacy single `path` unions with `paths`.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":["a.txt"],"path":"b.txt"}}}}"#
+        ),
+    )
+    .await;
+    let arr = resp["result"].as_array().expect("diffs array");
+    let paths: Vec<&str> = arr.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(arr.len(), 2, "union of paths + path: {paths:?}");
+    assert!(paths.contains(&"a.txt"));
+    assert!(paths.contains(&"b.txt"));
+
+    // An empty `paths` array keeps the full-tree behavior.
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":[]}}}}"#
+        ),
+    )
+    .await;
+    let arr = resp["result"].as_array().expect("diffs array");
+    let paths: Vec<&str> = arr.iter().map(|d| d["path"].as_str().unwrap()).collect();
+    assert_eq!(arr.len(), 3, "full tree: {paths:?}");
+    for p in ["a.txt", "b.txt", "c.txt"] {
+        assert!(paths.contains(&p), "missing {p} in {paths:?}");
+    }
+
+    // Malformed `paths` (non-array, or array with a non-string element) → -32602.
+    for bad in [r#""a.txt""#, "[1]"] {
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":{bad}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32602, "paths={bad}");
+    }
+
+    srv.ws.stop().await;
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 /// `accept-changes.getStatus` over WSS: proves the wire shape from PROTOCOL
 /// §5.18 — `localCommits` entries are metadata-only (`hash`, `message`,
 /// `author`, `date`, `isPushed`) and omit `files`/`filesChanged`, which
