@@ -9507,8 +9507,10 @@ impl WorkspaceApi for Services {
                             };
                             // Spawn through the timing wrapper so the scrollback
                             // ends with a completion summary and the script's
-                            // exit code is preserved.
-                            let (program, args) =
+                            // exit code is preserved. `extra_env` carries the
+                            // cmd.exe fallback's script path (see
+                            // `SetupScriptRunner::command`); empty otherwise.
+                            let (program, args, extra_env) =
                                 runner.command(&script_path, wrapper_path.as_deref());
                             let mut spec =
                                 intent_pty::SpawnSpec::new(workspace_id.as_str(), program);
@@ -9522,6 +9524,7 @@ impl WorkspaceApi for Services {
                                 ("BRANCH_NAME".to_string(), branch_name),
                                 ("SOURCE_BRANCH".to_string(), source_branch),
                             ];
+                            spec.env.extend(extra_env);
                             match pty_for_setup.spawn(spec) {
                                 Ok(pty_id) => {
                                     let terminal_id = pty_id.to_string();
@@ -19895,18 +19898,27 @@ pub(crate) mod setup_runner {
             matches!(self, Self::CmdWrapper)
         }
 
-        /// Build the `(program, args)` pair for the PTY spawn. `wrapper_path`
-        /// is the on-disk `.cmd` wrapper (required for `CmdWrapper`, ignored
-        /// otherwise). The POSIX shape is byte-identical to the historic
-        /// `/bin/sh -c SETUP_SCRIPT_WRAPPER sh <script>` spawn; the Windows
-        /// sh path forward-slashes the script argument and templates the
-        /// discovered sh into the wrapper (MSYS sh has no `/bin/sh` guarantee
-        /// from a native-process spawn).
+        /// Build the `(program, args, extra_env)` triple for the PTY spawn.
+        /// `wrapper_path` is the on-disk `.cmd` wrapper (required for
+        /// `CmdWrapper`, ignored otherwise). The POSIX shape is byte-identical
+        /// to the historic `/bin/sh -c SETUP_SCRIPT_WRAPPER sh <script>`
+        /// spawn; the Windows sh path forward-slashes the script argument and
+        /// templates the discovered sh into the wrapper (MSYS sh has no
+        /// `/bin/sh` guarantee from a native-process spawn).
+        ///
+        /// `CmdWrapper` passes the script path via `extra_env`
+        /// (`INTENT_SETUP_SCRIPT`) rather than as a second argv token: with
+        /// both the wrapper and script under the same (spaces-prone)
+        /// `.intent` dir, `portable-pty` double-quotes each spaced argument,
+        /// and cmd.exe's `/C` quote handling only preserves quoting when
+        /// *exactly two* quote characters appear on the whole command line.
+        /// Two quoted args produce four quotes and get mis-parsed; one
+        /// quoted arg (the wrapper) keeps the count at two.
         pub(crate) fn command(
             &self,
             script_path: &Path,
             wrapper_path: Option<&Path>,
-        ) -> (String, Vec<String>) {
+        ) -> (String, Vec<String>, Vec<(String, String)>) {
             match self {
                 Self::PosixSh { sh, is_windows } => {
                     let (wrapper, script_arg) = if *is_windows {
@@ -19923,6 +19935,7 @@ pub(crate) mod setup_runner {
                     (
                         sh.to_string_lossy().to_string(),
                         vec!["-c".to_string(), wrapper, "sh".to_string(), script_arg],
+                        Vec::new(),
                     )
                 }
                 Self::CmdWrapper => {
@@ -19933,8 +19946,11 @@ pub(crate) mod setup_runner {
                             "/d".to_string(),
                             "/c".to_string(),
                             wrapper.to_string_lossy().to_string(),
-                            script_path.to_string_lossy().to_string(),
                         ],
+                        vec![(
+                            "INTENT_SETUP_SCRIPT".to_string(),
+                            script_path.to_string_lossy().to_string(),
+                        )],
                     )
                 }
             }
@@ -19957,7 +19973,12 @@ pub(crate) mod setup_runner {
     }
 
     /// cmd.exe-native timing wrapper (Windows fallback when no POSIX sh is
-    /// found): `%1` is the script path. Mirrors the POSIX wrapper's output
+    /// found): the script path is read from the `INTENT_SETUP_SCRIPT`
+    /// environment variable rather than passed as `%1`, so the spawn only
+    /// has one quoted argv token (the wrapper itself) — see the doc comment
+    /// on [`SetupScriptRunner::command`] for why a second quoted path
+    /// argument breaks under cmd.exe's `/C` quote-stripping when the
+    /// workspace path contains spaces. Mirrors the POSIX wrapper's output
     /// contract — blank separator line, then `Setup script completed in <N>s
     /// (exit code <C>)` (or the `failed` variant) — and exits with the
     /// script's own code. Elapsed seconds derive from `%TIME%` (space padding
@@ -19967,7 +19988,7 @@ pub(crate) mod setup_runner {
         "@echo off\r\n",
         "setlocal\r\n",
         "set \"_st=%TIME: =0%\"\r\n",
-        "call \"%~1\"\r\n",
+        "call \"%INTENT_SETUP_SCRIPT%\"\r\n",
         "set \"code=%ERRORLEVEL%\"\r\n",
         "set \"_en=%TIME: =0%\"\r\n",
         "set /a \"_s=(1%_st:~0,2%-100)*3600+(1%_st:~3,2%-100)*60+(1%_st:~6,2%-100)\"\r\n",
@@ -20055,7 +20076,8 @@ pub(crate) mod setup_runner {
         #[test]
         fn posix_command_is_byte_identical_to_historic_spawn() {
             let runner = select(false, None);
-            let (program, args) = runner.command(Path::new("/w/.intent/setup-a.sh"), None);
+            let (program, args, extra_env) =
+                runner.command(Path::new("/w/.intent/setup-a.sh"), None);
             assert_eq!(program, "/bin/sh");
             assert_eq!(
                 args,
@@ -20066,6 +20088,7 @@ pub(crate) mod setup_runner {
                     "/w/.intent/setup-a.sh".to_string(),
                 ]
             );
+            assert!(extra_env.is_empty());
         }
 
         #[test]
@@ -20074,7 +20097,8 @@ pub(crate) mod setup_runner {
             let runner = select(true, Some(sh.clone()));
             assert_eq!(runner.script_extension(), "sh");
             assert!(!runner.needs_cmd_wrapper_file());
-            let (program, args) = runner.command(Path::new(r"C:\w\.intent\setup-a.sh"), None);
+            let (program, args, extra_env) =
+                runner.command(Path::new(r"C:\w\.intent\setup-a.sh"), None);
             assert_eq!(program, sh.to_string_lossy());
             assert_eq!(args[0], "-c");
             assert!(
@@ -20086,15 +20110,21 @@ pub(crate) mod setup_runner {
             assert!(args[1].contains(r"printf '\nSetup script failed in %ss (exit code %s)\n'"));
             assert_eq!(args[2], "sh");
             assert_eq!(args[3], "C:/w/.intent/setup-a.sh");
+            assert!(extra_env.is_empty());
         }
 
+        /// The script path travels via env (`INTENT_SETUP_SCRIPT`), not as a
+        /// second quoted argv token, so a spaced workspace path (common on
+        /// Windows, e.g. under `C:\Users\John Smith\...`) doesn't blow past
+        /// cmd.exe's `/C` exactly-two-quotes rule (only the wrapper path is
+        /// quoted on the command line).
         #[test]
         fn windows_without_sh_falls_back_to_cmd_wrapper() {
             let runner = select(true, None);
             assert_eq!(runner, SetupScriptRunner::CmdWrapper);
             assert_eq!(runner.script_extension(), "cmd");
             assert!(runner.needs_cmd_wrapper_file());
-            let (program, args) = runner.command(
+            let (program, args, extra_env) = runner.command(
                 Path::new(r"C:\w\.intent\setup-a.cmd"),
                 Some(Path::new(r"C:\w\.intent\setup-wrapper-a.cmd")),
             );
@@ -20105,8 +20135,36 @@ pub(crate) mod setup_runner {
                     "/d".to_string(),
                     "/c".to_string(),
                     r"C:\w\.intent\setup-wrapper-a.cmd".to_string(),
-                    r"C:\w\.intent\setup-a.cmd".to_string(),
                 ]
+            );
+            assert_eq!(
+                extra_env,
+                vec![(
+                    "INTENT_SETUP_SCRIPT".to_string(),
+                    r"C:\w\.intent\setup-a.cmd".to_string(),
+                )]
+            );
+        }
+
+        /// Regression for the spaced-workspace-path bug: only the wrapper
+        /// path is a quoted argv token even when both the wrapper and script
+        /// live under a directory containing spaces, keeping the command
+        /// line at exactly two quote characters.
+        #[test]
+        fn windows_cmd_wrapper_command_line_has_one_quoted_token_with_spaced_paths() {
+            let runner = select(true, None);
+            let (_, args, extra_env) = runner.command(
+                Path::new(r"C:\a b\.intent\setup-x.cmd"),
+                Some(Path::new(r"C:\a b\.intent\setup-wrapper-x.cmd")),
+            );
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[2], r"C:\a b\.intent\setup-wrapper-x.cmd");
+            assert_eq!(
+                extra_env,
+                vec![(
+                    "INTENT_SETUP_SCRIPT".to_string(),
+                    r"C:\a b\.intent\setup-x.cmd".to_string(),
+                )]
             );
         }
 
@@ -20124,7 +20182,7 @@ pub(crate) mod setup_runner {
         fn cmd_wrapper_preserves_summary_format_and_exit_code_contract() {
             let w = SETUP_SCRIPT_WRAPPER_CMD;
             assert!(w.starts_with("@echo off\r\n"));
-            assert!(w.contains("call \"%~1\"\r\n"));
+            assert!(w.contains("call \"%INTENT_SETUP_SCRIPT%\"\r\n"));
             assert!(
                 w.contains("echo.\r\necho Setup script %verb% in %elapsed%s (exit code %code%)")
             );
