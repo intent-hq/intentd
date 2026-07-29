@@ -725,6 +725,12 @@ impl Services {
             .await
         {
             Ok(_) => {
+                // Best-effort: resolve workspace from the session so the
+                // projection cache drops without requiring the caller to pass
+                // workspace_id on this interrupt flush path.
+                if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+                    self.invalidate_agent_list_cache(&session.workspace_id);
+                }
                 self.clear_live_turn(agent_id);
                 Some(live.message_id)
             }
@@ -1255,6 +1261,7 @@ impl Services {
                     &now_iso(),
                 )
                 .await?;
+            self.invalidate_agent_list_cache(workspace_id);
             message_persisted = true;
         }
         // The turn's message is now durable: clear the live-turn slot so the next
@@ -1553,7 +1560,10 @@ impl Services {
                 )
                 .await
             {
-                Ok(_) => message_persisted = true,
+                Ok(_) => {
+                    self.invalidate_agent_list_cache(workspace_id);
+                    message_persisted = true;
+                }
                 Err(e) => {
                     tracing::warn!(agent = %agent_id, error = %e, "harness-wake turn persist failed");
                 }

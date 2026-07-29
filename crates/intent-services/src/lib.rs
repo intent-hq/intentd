@@ -74,6 +74,7 @@ mod github_ops;
 mod github_auth_ops;
 mod github_browse_ops;
 
+mod agent_list_cache;
 mod history_xml;
 mod line_attribution;
 mod linear_ops;
@@ -439,6 +440,10 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Cached agent.list message projections per workspace. Invalidated on
+    /// message append / session create+delete so focus-time list bursts hit
+    /// memory instead of re-running the SQLite JSON window.
+    agent_list_cache: Arc<agent_list_cache::AgentListProjectionCache>,
     /// Turn-attachment registry (§7.1 deterministic attach): canonical
     /// MIME-typed resource payloads registered in-process by the per-agent
     /// MCP dispatch (keyed by a nonce embedded in the model-facing output),
@@ -523,6 +528,7 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -3456,6 +3462,7 @@ impl Services {
                         &now_iso(),
                     )
                     .await?;
+                self.invalidate_agent_list_cache(workspace_id);
                 Ok(serde_json::json!({ "success": true, "queued": false }))
             }
         }
