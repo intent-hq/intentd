@@ -1,0 +1,58 @@
+name: m1mac smoke test
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  smoke:
+    name: Machine inventory (m1mac)
+    runs-on: [self-hosted, macOS, ARM64, m1mac]
+    timeout-minutes: 10
+    steps:
+      - name: OS and hardware
+        run: |
+          echo "== sw_vers =="
+          sw_vers
+          echo "== uname -m =="
+          uname -m
+          echo "== CPU / RAM =="
+          sysctl hw.ncpu hw.memsize
+          echo "== Free disk =="
+          df -h /
+
+      - name: Xcode Command Line Tools
+        run: |
+          if xcode-select -p >/dev/null 2>&1; then
+            echo "Xcode CLT: present ($(xcode-select -p))"
+          else
+            echo "Xcode CLT: absent"
+          fi
+
+      - name: Toolchain inventory
+        run: |
+          report() {
+            local name="$1"; shift
+            if command -v "$name" >/dev/null 2>&1; then
+              echo "$name: $("$name" --version 2>/dev/null | head -n 1)"
+            else
+              echo "$name: absent"
+            fi
+          }
+          report rustup
+          report cargo
+          report node
+          report pnpm
+          report brew
+          if command -v cargo >/dev/null 2>&1; then
+            cargo llvm-cov --version >/dev/null 2>&1 \
+              && echo "cargo-llvm-cov: $(cargo llvm-cov --version | head -n 1)" \
+              || echo "cargo-llvm-cov: absent"
+            cargo nextest --version >/dev/null 2>&1 \
+              && echo "cargo-nextest: $(cargo nextest --version | head -n 1)" \
+              || echo "cargo-nextest: absent"
+          else
+            echo "cargo-llvm-cov: absent (no cargo)"
+            echo "cargo-nextest: absent (no cargo)"
+          fi
