@@ -398,8 +398,10 @@ async fn build_rtk_instruction(rtk_enabled: bool) -> Option<String> {
 /// layer 4.8: after specialization/user rules, when the session has one) →
 /// mandatory-actions footer (recency; the reference `getMandatoryActionsFooter`)
 /// which contributes the `## Role Reminder` (specialist agents only) and — for
-/// top-level (non-sub-agent) interactive agents — the `## Suggested Next Steps`
-/// directive that tells the model to emit a `<!-- suggested-prompts ... -->`
+/// top-level (non-sub-agent) interactive agents — the `## Asking the User
+/// Questions` hint (nudging structured `ws.app.question.ask` questions) plus
+/// the `## Suggested Next Steps` directive that tells the model to emit a
+/// `<!-- suggested-prompts ... -->`
 /// block at the end of user-facing responses. The specialization slot is always
 /// populated (tier 3 always resolves), so this returns `None` only in the
 /// unreachable case where even the bundled specialization is empty.
@@ -491,10 +493,11 @@ pub(crate) async fn assemble_system_prompt(
         ));
     }
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
-    // pinned to the VERY END of the prompt to leverage recency bias). Two
+    // pinned to the VERY END of the prompt to leverage recency bias). Three
     // independent sub-blocks, joined with `---` like every other layer:
     //   1. Role Reminder — only for specialist agents.
-    //   2. Suggested Next Steps — only for top-level (non-sub-agent) agents.
+    //   2. Asking the User Questions — only for top-level (non-sub-agent) agents.
+    //   3. Suggested Next Steps — only for top-level (non-sub-agent) agents.
     // The per-turn `[Role Reminder: …]` prefix in
     // `agent_manager::build_turn_prompt` stays and is independent of this.
     if let Some(name) = specialist
@@ -509,10 +512,22 @@ pub(crate) async fn assemble_system_prompt(
             .unwrap_or("Follow the instructions in <specialist_role> above.");
         parts.push(format!("## Role Reminder\n\nYou are a {name}. {reminder}"));
     }
-    // Suggested Next Steps — top-level interactive agents only. Sub-agents
-    // don't own a user-facing chat turn (they report to a parent), so they
-    // skip this block, matching the reference gating.
+    // Asking the User Questions + Suggested Next Steps — top-level
+    // interactive agents only. Sub-agents don't own a user-facing chat turn
+    // (they report to a parent), so they skip both blocks, matching the
+    // reference gating.
     if !is_sub_agent {
+        parts.push(
+            "## Asking the User Questions\n\n\
+             When requirements are ambiguous or a decision needs user input, ask \
+             structured clarifying questions with `ws.app.question.ask` via the \
+             `workspace_api` tool instead of burying questions in prose. Call it once \
+             per question with 2-4 options; do not add an \"Other\" option — a \
+             free-form answer is always offered automatically. Ask all your \
+             questions, then end the turn: questions are presented when your turn \
+             ends, and the answers arrive in the next user message."
+                .to_string(),
+        );
         let example_second_line = if auto_commit_enabled {
             "Check the changes in the diff view."
         } else {
@@ -857,6 +872,70 @@ This is a test skill.
         assert!(
             !prompt_text.contains("<available_skills>"),
             "Skills catalog block should be absent when no workspace provided"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_questions_hint_present_for_top_level_agents() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            prompt.contains("## Asking the User Questions"),
+            "Ask-questions hint should be present for top-level agents"
+        );
+        assert!(
+            prompt.contains("ws.app.question.ask"),
+            "Ask-questions hint should reference ws.app.question.ask"
+        );
+        // Same gating as Suggested Next Steps: both footer blocks appear together.
+        assert!(
+            prompt.contains("## Suggested Next Steps"),
+            "Suggested Next Steps should be present for top-level agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ask_questions_hint_absent_for_sub_agents() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            true,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !prompt.contains("## Asking the User Questions"),
+            "Ask-questions hint should be absent for sub-agents"
+        );
+        // Same gating as Suggested Next Steps: both footer blocks are skipped.
+        assert!(
+            !prompt.contains("## Suggested Next Steps"),
+            "Suggested Next Steps should be absent for sub-agents"
         );
     }
 }
