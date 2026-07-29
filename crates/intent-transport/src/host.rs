@@ -284,11 +284,19 @@ pub(crate) async fn handle(
             success_frame(id_echo, result)
         }
         HostMethod::ProviderDiscovery => {
-            let result = tokio::task::spawn_blocking(host_ops::provider_discovery_op)
-                .await
-                .unwrap_or_else(|_| {
-                    json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
-                });
+            // `providers.paths` overrides live in settings, above the
+            // discovery seam — read them here so `installed` /
+            // `secondaryResolved` match what the spawn path would actually
+            // resolve (monorepo#1065). resolvedPath/secondaryResolvedPath
+            // stay auto-detected.
+            let provider_paths = read_provider_paths(api).await;
+            let result = tokio::task::spawn_blocking(move || {
+                host_ops::provider_discovery_op(&provider_paths)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
+            });
             success_frame(id_echo, result)
         }
         HostMethod::ProviderAuthStatus => {
@@ -545,6 +553,25 @@ async fn configured_auggie_path(api: &dyn WorkspaceApi) -> Option<String> {
         }
     }
     None
+}
+
+/// Read the full `providers.paths` settings map (provider key → configured
+/// binary path), skipping blank values. Empty when unset or when the lookup
+/// fails — discovery then behaves exactly as before (auto-detection only).
+async fn read_provider_paths(api: &dyn WorkspaceApi) -> std::collections::HashMap<String, String> {
+    let mut paths = std::collections::HashMap::new();
+    if let Ok(payload) = api.settings_get("providers.paths".to_string()).await {
+        if let Some(map) = payload.get("value").and_then(Value::as_object) {
+            for (key, value) in map {
+                if let Some(s) = value.as_str() {
+                    if !s.trim().is_empty() {
+                        paths.insert(key.clone(), s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    paths
 }
 
 /// Read a single string-valued setting; returns `None` for missing / null /

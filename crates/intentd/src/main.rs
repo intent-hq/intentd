@@ -2566,7 +2566,7 @@ async fn cmd_doctor() -> ExitCode {
         }
     }
 
-    report_provider_availability().await;
+    report_provider_availability(&config).await;
 
     // §5.7 additions: ports-free window, cert validity, GitHub token presence,
     // context-engine availability, and host display/locality. The first two are
@@ -2740,12 +2740,24 @@ fn report_cow_support(config: &Config) {
 }
 
 /// Doctor provider-discovery section (§6.9): print which configured ACP
-/// providers are installed (resolvable on `PATH`) and, best-effort, which are
+/// providers are installed (resolvable on `PATH` or via a valid
+/// `providers.paths` override — monorepo#1065) and, best-effort, which are
 /// authenticated. Provider availability never fails `doctor` — a host with no
 /// providers installed is a valid (if limited) state.
-async fn report_provider_availability() {
+async fn report_provider_availability(config: &Config) {
+    // Same settings source `serve` uses; a missing/unreadable file degrades
+    // to no overrides (auto-detection only) rather than failing doctor.
+    let provider_paths =
+        intent_core::settings_file::SettingsFile::load_or_init(&config.config_path)
+            .map(|f| f.providers.paths)
+            .unwrap_or_default();
     println!("providers:");
-    for provider in intent_providers::discover_providers() {
+    for provider in intent_providers::discover_providers_with_overrides(&|key| {
+        provider_paths
+            .get(key)
+            .filter(|p| !p.trim().is_empty())
+            .cloned()
+    }) {
         if let Some(reason) = &provider.gated_off {
             println!("  [--] {} ({})", provider.id, reason);
             continue;
@@ -2778,7 +2790,7 @@ async fn report_provider_availability() {
                     provider
                         .secondary_binary
                         .as_ref()
-                        .map(|(s, path)| (*s, path.is_some())),
+                        .map(|s| (s.command, s.resolved)),
                 )
             );
             continue;

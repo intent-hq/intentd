@@ -20,9 +20,15 @@ pub struct ProviderAvailability {
     pub display_name: &'static str,
     /// The CLI command probed on `PATH`.
     pub command: &'static str,
-    /// Whether the command resolved to an executable on `PATH`.
+    /// Whether the provider would actually spawn: the command resolved to an
+    /// executable (auto-detection) OR a valid `providers.paths` override
+    /// targets it (when the caller supplied overrides via
+    /// [`discover_providers_with_overrides`]). Override-aware so it matches
+    /// `resolve_spawn` / the managed-server lifecycle (monorepo#1065).
     pub installed: bool,
-    /// The resolved executable path, when found.
+    /// The auto-detected executable path, when found. Always override-free —
+    /// a `providers.paths` override never appears here, so `installed` can be
+    /// `true` while this is `None` (valid override, nothing auto-detected).
     pub resolved_path: Option<PathBuf>,
     /// `Some(reason)` when the provider is gated off (env var / feature code not
     /// present), in which case it is skipped rather than probed.
@@ -37,13 +43,29 @@ pub struct ProviderAvailability {
     /// rather than a local provider binary.
     pub npx_only_package: Option<&'static str>,
     /// For providers with [`ProviderConfig::requires_secondary_binary`]
-    /// (unsloth: `opencode` + `unsloth`): the required secondary command and
-    /// its resolved path (`Some` ⇒ resolved), so callers (doctor, the
-    /// discovery wire payload) can attribute unavailability to the
-    /// actually-missing binary and surface where the secondary lives. `None`
-    /// when the provider has no secondary requirement or was gated off
-    /// (never probed).
-    pub secondary_binary: Option<(&'static str, Option<PathBuf>)>,
+    /// (unsloth: `opencode` + `unsloth`): the required secondary's status, so
+    /// callers (doctor, the discovery wire payload) can attribute
+    /// unavailability to the actually-missing binary and surface where the
+    /// secondary lives. `None` when the provider has no secondary requirement
+    /// or was gated off (never probed).
+    pub secondary_binary: Option<SecondaryBinary>,
+}
+
+/// Status of a provider's required secondary binary
+/// ([`ProviderConfig::requires_secondary_binary`]; unsloth: the `unsloth` CLI
+/// the managed-server lifecycle shells out to).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondaryBinary {
+    /// The secondary command probed.
+    pub command: &'static str,
+    /// Whether the secondary would actually resolve at spawn time: the
+    /// auto-detected path resolved OR a valid `providers.paths` override
+    /// targets it (override-aware, like [`ProviderAvailability::installed`]).
+    pub resolved: bool,
+    /// The auto-detected path, when found. Always override-free — `resolved`
+    /// can be `true` while this is `None` (valid override, nothing
+    /// auto-detected).
+    pub resolved_path: Option<PathBuf>,
 }
 
 /// Status of npx availability for provider fallback spawning.
@@ -137,57 +159,107 @@ pub fn gated_reason_with_env(
 /// `unsloth`) additionally require that second binary to resolve — the
 /// `resolved_path` still reports the primary `command`'s path (the ACP spawn
 /// target), but `installed` is `false` unless both binaries are present.
+///
+/// This entry point passes no `providers.paths` overrides (they live in
+/// settings above this leaf crate); callers with settings access should use
+/// [`discover_providers_with_overrides`] so `installed` matches what
+/// `resolve_spawn` would actually spawn (monorepo#1065).
 pub fn discover_providers() -> Vec<ProviderAvailability> {
+    discover_providers_with_overrides(&|_| None)
+}
+
+/// [`discover_providers`] with `providers.paths` overrides supplied by the
+/// caller (the settings live above this leaf crate; the daemon's transport
+/// layer reads them and threads the values through — monorepo#1065).
+/// `override_path` looks up the raw setting for a `providers.paths` key.
+///
+/// Overrides affect ONLY the `installed` / secondary `resolved` determination
+/// (so both match what `resolve_spawn` / the managed-server lifecycle would
+/// actually spawn); `resolved_path` / the secondary's `resolved_path` stay
+/// auto-detected. An invalid override (relative / missing / non-executable)
+/// contributes nothing, exactly like `find_provider_binary`'s explicit tier.
+pub fn discover_providers_with_overrides(
+    override_path: &dyn Fn(&str) -> Option<String>,
+) -> Vec<ProviderAvailability> {
     ACP_PROVIDERS
         .iter()
         .map(|provider| {
-            let gated_off = gated_reason(provider);
-            let resolved_path = if gated_off.is_some() {
-                None
-            } else if provider.npx_only_package.is_some() {
-                find_npx()
-            } else {
-                find_provider_binary(provider.id, provider.command, None)
-            };
-            // The secondary binary (unsloth: the `unsloth` CLI itself) is
-            // resolved with the same provider_id/command pair the daemon's
-            // managed-server lifecycle uses (`UnslothConfig::default`'s
-            // `resolve_binary`) — minus the `providers.paths["unsloth"]`
-            // explicit override, which lives in settings above this leaf
-            // crate (discovery passes no explicit path for primaries
-            // either). A valid override can therefore make the managed
-            // server start where discovery reports the CLI missing.
-            let secondary_binary = if gated_off.is_some() {
-                None
-            } else {
-                provider
-                    .requires_secondary_binary
-                    .map(|s| (s, find_provider_binary(s, s, None)))
-            };
-            let installed = gated_off.is_none()
-                && installed_with_secondary(
-                    resolved_path.is_some(),
-                    provider.requires_secondary_binary,
-                    |_| {
-                        secondary_binary
-                            .as_ref()
-                            .is_some_and(|(_, path)| path.is_some())
-                    },
-                );
-            ProviderAvailability {
-                id: provider.id,
-                display_name: provider.display_name,
-                command: provider.command,
-                installed,
-                resolved_path,
-                gated_off,
-                auth_check_args: provider.auth_check_args,
-                has_npx_fallback: provider.fallback_npx_package.is_some(),
-                npx_only_package: provider.npx_only_package,
-                secondary_binary,
-            }
+            availability_for(
+                provider,
+                gated_reason(provider),
+                &|id, cmd| find_provider_binary(id, cmd, None),
+                override_path,
+            )
         })
         .collect()
+}
+
+/// Compute one provider's availability from injected resolvers (test seam —
+/// lets unit tests exercise the override/auto combinations without touching
+/// the real filesystem or `PATH`). `resolve_auto` performs the override-free
+/// auto-detection for a `(provider_id, command)` pair; `override_path` looks
+/// up the raw `providers.paths` value for a key.
+fn availability_for(
+    provider: &ProviderConfig,
+    gated_off: Option<String>,
+    resolve_auto: &dyn Fn(&str, &str) -> Option<PathBuf>,
+    override_path: &dyn Fn(&str) -> Option<String>,
+) -> ProviderAvailability {
+    let resolved_path = if gated_off.is_some() {
+        None
+    } else if provider.npx_only_package.is_some() {
+        find_npx()
+    } else {
+        resolve_auto(provider.id, provider.command)
+    };
+    // A valid override for the primary binary, keyed by the provider that
+    // OWNS it ([`ProviderConfig::primary_binary_provider_id`], matching
+    // `resolve_spawn`: unsloth's opencode primary honors the `opencode`
+    // key). npx-only providers ignore overrides — `resolve_spawn` warns and
+    // spawns via the pinned npx package regardless.
+    let primary_override = if gated_off.is_some() || provider.npx_only_package.is_some() {
+        None
+    } else {
+        let key = provider.primary_binary_provider_id();
+        override_path(key).and_then(|p| resolve_explicit_path(key, &p))
+    };
+    // The secondary binary (unsloth: the `unsloth` CLI itself) is resolved
+    // with the same provider_id/command pair the daemon's managed-server
+    // lifecycle uses, plus the provider's OWN `providers.paths` key (the
+    // `unsloth` key targets the unsloth CLI, `ensure_endpoint`'s spawn gate)
+    // for the override-aware `resolved` flag.
+    let secondary_binary = if gated_off.is_some() {
+        None
+    } else {
+        provider.requires_secondary_binary.map(|s| {
+            let auto = resolve_auto(s, s);
+            let secondary_override =
+                override_path(provider.id).and_then(|p| resolve_explicit_path(provider.id, &p));
+            SecondaryBinary {
+                command: s,
+                resolved: auto.is_some() || secondary_override.is_some(),
+                resolved_path: auto,
+            }
+        })
+    };
+    let installed = gated_off.is_none()
+        && installed_with_secondary(
+            resolved_path.is_some() || primary_override.is_some(),
+            provider.requires_secondary_binary,
+            |_| secondary_binary.as_ref().is_some_and(|s| s.resolved),
+        );
+    ProviderAvailability {
+        id: provider.id,
+        display_name: provider.display_name,
+        command: provider.command,
+        installed,
+        resolved_path,
+        gated_off,
+        auth_check_args: provider.auth_check_args,
+        has_npx_fallback: provider.fallback_npx_package.is_some(),
+        npx_only_package: provider.npx_only_package,
+        secondary_binary,
+    }
 }
 
 /// Combine a provider's primary-binary resolution with its optional secondary
@@ -276,19 +348,8 @@ fn find_provider_binary_with_home(
 ) -> Option<PathBuf> {
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            let pb = PathBuf::from(trimmed);
-            if pb.is_absolute() && is_executable_file(&pb) {
-                return Some(pb);
-            }
-            // Warn when explicit setting points to missing/non-executable/relative file
-            tracing::warn!(
-                provider_id = provider_id,
-                configured_path = trimmed,
-                "providers.paths[\"{}\"] must be absolute and executable; falling back to native install dir / managed bin / PATH scan",
-                provider_id
-            );
+        if let Some(pb) = resolve_explicit_path(provider_id, path) {
+            return Some(pb);
         }
     }
 
@@ -311,6 +372,31 @@ fn find_provider_binary_with_home(
 
     // 4. Scan enhanced PATH directories
     find_in_enhanced_dirs(command)
+}
+
+/// Validate + resolve an explicit `providers.paths` value: trimmed, absolute,
+/// and executable, or `None` (with a warning naming the provider key — blank
+/// values are treated as unset without warning). Shared by
+/// [`find_provider_binary`]'s explicit tier and the override-aware `installed`
+/// determination in [`discover_providers_with_overrides`], so both sides
+/// accept exactly the same overrides.
+fn resolve_explicit_path(provider_id: &str, path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let pb = PathBuf::from(trimmed);
+    if pb.is_absolute() && is_executable_file(&pb) {
+        return Some(pb);
+    }
+    // Warn when explicit setting points to missing/non-executable/relative file
+    tracing::warn!(
+        provider_id = provider_id,
+        configured_path = trimmed,
+        "providers.paths[\"{}\"] must be absolute and executable; falling back to native install dir / managed bin / PATH scan",
+        provider_id
+    );
+    None
 }
 
 /// The `$HOME`-relative directory a provider's native installer places its
@@ -835,15 +921,17 @@ mod find_provider_binary_tests {
         // The snapshot must always carry the secondary-binary status for
         // unsloth (doctor's attribution input), consistent with a direct
         // resolution of the unsloth CLI — including the resolved path itself.
-        let (secondary, secondary_path) = unsloth
+        let secondary = unsloth
             .secondary_binary
             .as_ref()
             .expect("unsloth must report its secondary-binary status");
-        assert_eq!(*secondary, "unsloth");
+        assert_eq!(secondary.command, "unsloth");
         assert_eq!(
-            *secondary_path,
+            secondary.resolved_path,
             find_provider_binary("unsloth", "unsloth", None)
         );
+        // Override-free discovery: `resolved` mirrors the auto-detection.
+        assert_eq!(secondary.resolved, secondary.resolved_path.is_some());
     }
 
     #[test]
@@ -857,5 +945,205 @@ mod find_provider_binary_tests {
             };
             assert_eq!(result, Some(expected));
         }
+    }
+}
+
+/// Regression tests for override-aware `installed` (monorepo#1065): a valid
+/// `providers.paths` override must flip `installed` / the secondary's
+/// `resolved` to match what `resolve_spawn` would actually spawn, WITHOUT
+/// touching the auto-detected `resolved_path` fields; an invalid override
+/// must contribute nothing. Driven through [`availability_for`]'s injected
+/// resolvers so every override/auto combination is deterministic (no real
+/// filesystem / `PATH` / `HOME` dependence).
+#[cfg(test)]
+mod override_aware_discovery_tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("intent-providers-{tag}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(path: &std::path::Path) {
+        fs::write(path, "exit 0").unwrap();
+    }
+
+    fn unsloth_config() -> &'static ProviderConfig {
+        crate::config::ACP_PROVIDERS
+            .iter()
+            .find(|p| p.id == "unsloth")
+            .expect("unsloth must be registered")
+    }
+
+    fn auggie_config() -> &'static ProviderConfig {
+        crate::config::ACP_PROVIDERS
+            .iter()
+            .find(|p| p.id == "auggie")
+            .expect("auggie must be registered")
+    }
+
+    /// monorepo#1065: with nothing auto-detected, valid overrides for both
+    /// unsloth keys (`opencode` → primary, `unsloth` → the CLI) make
+    /// `installed` / `resolved` true while both path fields stay absent.
+    #[test]
+    fn valid_unsloth_override_flips_installed_without_touching_paths() {
+        let dir = unique_temp_dir("override-valid");
+        let opencode = dir.join("opencode");
+        let unsloth = dir.join("unsloth");
+        make_executable(&opencode);
+        make_executable(&unsloth);
+        let overrides = |key: &str| match key {
+            "opencode" => Some(opencode.display().to_string()),
+            "unsloth" => Some(unsloth.display().to_string()),
+            _ => None,
+        };
+        let availability = availability_for(unsloth_config(), None, &|_, _| None, &overrides);
+        assert!(
+            availability.installed,
+            "valid overrides must flip installed"
+        );
+        assert_eq!(
+            availability.resolved_path, None,
+            "resolvedPath must stay auto-detected (absent here)"
+        );
+        let secondary = availability.secondary_binary.expect("secondary status");
+        assert_eq!(secondary.command, "unsloth");
+        assert!(secondary.resolved, "valid override must flip resolved");
+        assert_eq!(
+            secondary.resolved_path, None,
+            "secondaryResolvedPath must stay auto-detected (absent here)"
+        );
+    }
+
+    /// An invalid override (missing file / relative path) must not flip
+    /// `installed` — the managed server would not start from it either.
+    #[test]
+    fn invalid_unsloth_override_does_not_flip_installed() {
+        for bad in ["/nonexistent/override/unsloth", "relative/unsloth"] {
+            let overrides = |key: &str| match key {
+                "opencode" | "unsloth" => Some(bad.to_string()),
+                _ => None,
+            };
+            let availability = availability_for(unsloth_config(), None, &|_, _| None, &overrides);
+            assert!(
+                !availability.installed,
+                "invalid override {bad} must not flip installed"
+            );
+            let secondary = availability.secondary_binary.expect("secondary status");
+            assert!(
+                !secondary.resolved,
+                "invalid override {bad} must not flip resolved"
+            );
+        }
+    }
+
+    /// Override + auto-detection coexistence: the auto-detected paths keep
+    /// reporting on the wire-visible path fields (never the override path),
+    /// and `installed` stays true.
+    #[test]
+    fn override_and_auto_detection_coexist_with_auto_paths_reported() {
+        let dir = unique_temp_dir("override-coexist");
+        let override_bin = dir.join("unsloth-override");
+        make_executable(&override_bin);
+        let auto_opencode = dir.join("auto").join("opencode");
+        let auto_unsloth = dir.join("auto").join("unsloth");
+        let resolve_auto = |_: &str, cmd: &str| match cmd {
+            "opencode" => Some(auto_opencode.clone()),
+            "unsloth" => Some(auto_unsloth.clone()),
+            _ => None,
+        };
+        let overrides = |key: &str| match key {
+            "opencode" | "unsloth" => Some(override_bin.display().to_string()),
+            _ => None,
+        };
+        let availability = availability_for(unsloth_config(), None, &resolve_auto, &overrides);
+        assert!(availability.installed);
+        assert_eq!(
+            availability.resolved_path,
+            Some(auto_opencode),
+            "resolvedPath must report the auto-detected path, not the override"
+        );
+        let secondary = availability.secondary_binary.expect("secondary status");
+        assert!(secondary.resolved);
+        assert_eq!(
+            secondary.resolved_path,
+            Some(auto_unsloth),
+            "secondaryResolvedPath must report the auto-detected path, not the override"
+        );
+    }
+
+    /// The same mechanism applies to single-binary providers: a valid
+    /// `providers.paths["auggie"]` override with the binary not auto-detected
+    /// reports installed, and the primary key follows
+    /// `primary_binary_provider_id` (matching `resolve_spawn`).
+    #[test]
+    fn valid_primary_override_flips_installed_for_single_binary_provider() {
+        let dir = unique_temp_dir("override-auggie");
+        let auggie = dir.join("auggie");
+        make_executable(&auggie);
+        let overrides = |key: &str| (key == "auggie").then(|| auggie.display().to_string());
+        let availability = availability_for(auggie_config(), None, &|_, _| None, &overrides);
+        assert!(availability.installed);
+        assert_eq!(availability.resolved_path, None);
+        assert_eq!(availability.secondary_binary, None);
+    }
+
+    /// Gated providers ignore overrides entirely (never probed).
+    #[test]
+    fn gated_provider_ignores_overrides() {
+        let dir = unique_temp_dir("override-gated");
+        let bin = dir.join("unsloth");
+        make_executable(&bin);
+        let overrides = |_: &str| Some(bin.display().to_string());
+        let availability = availability_for(
+            unsloth_config(),
+            Some("requires env var TEST".to_string()),
+            &|_, _| None,
+            &overrides,
+        );
+        assert!(!availability.installed);
+        assert_eq!(availability.secondary_binary, None);
+    }
+
+    /// The public entry point threads the lookup through: with valid
+    /// overrides for both unsloth keys, the full-registry discovery reports
+    /// unsloth installed regardless of the host's real binaries.
+    #[test]
+    fn discover_providers_with_overrides_reports_unsloth_installed() {
+        let dir = unique_temp_dir("override-e2e");
+        let opencode = dir.join("opencode");
+        let unsloth = dir.join("unsloth");
+        make_executable(&opencode);
+        make_executable(&unsloth);
+        let overrides = |key: &str| match key {
+            "opencode" => Some(opencode.display().to_string()),
+            "unsloth" => Some(unsloth.display().to_string()),
+            _ => None,
+        };
+        let providers = discover_providers_with_overrides(&overrides);
+        let u = providers
+            .iter()
+            .find(|p| p.id == "unsloth")
+            .expect("unsloth in snapshot");
+        assert!(u.installed);
+        let secondary = u.secondary_binary.as_ref().expect("secondary status");
+        assert!(secondary.resolved);
+        // Path fields stay auto-detected: never the override paths.
+        assert_ne!(u.resolved_path.as_ref(), Some(&opencode));
+        assert_ne!(secondary.resolved_path.as_ref(), Some(&unsloth));
     }
 }

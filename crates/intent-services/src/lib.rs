@@ -19590,8 +19590,26 @@ fn extract_markdown_image_urls(content: &str) -> Vec<String> {
 
 /// Provider discovery with npx version probing (host.providerDiscovery support).
 /// Returns JSON payload with providers array and npx status.
+///
+/// This entry point passes no `providers.paths` overrides; callers with
+/// settings access (the transport's host.providerDiscovery arm) should use
+/// [`discover_providers_with_npx_overrides`] so `installed` matches what the
+/// spawn path would actually resolve (monorepo#1065).
 pub fn discover_providers_with_npx() -> serde_json::Value {
-    let providers = intent_providers::discover_providers();
+    discover_providers_with_npx_overrides(&std::collections::HashMap::new())
+}
+
+/// [`discover_providers_with_npx`] with the `providers.paths` settings map
+/// threaded through to the override-aware discovery (monorepo#1065): a valid
+/// override flips `installed` / `secondaryResolved`, while `resolvedPath` /
+/// `secondaryResolvedPath` stay auto-detected (a `secondaryResolved: true`
+/// entry can therefore omit `secondaryResolvedPath`).
+pub fn discover_providers_with_npx_overrides(
+    provider_paths: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let providers = intent_providers::discover_providers_with_overrides(&|key| {
+        provider_paths.get(key).cloned()
+    });
     let npx_status = intent_providers::probe_npx();
 
     // Probe npx version if we found the binary
@@ -19639,19 +19657,21 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
             // (unsloth: opencode + unsloth) so RPC/FE consumers can name the
             // actually-missing binary, matching doctor (monorepo#991).
             // Omitted when the provider has no secondary requirement or was
-            // gated off (never probed). When the secondary resolved, its
+            // gated off (never probed). When the secondary auto-detected, its
             // absolute path rides along as secondaryResolvedPath; omitted
-            // when unresolved.
-            if let Some((secondary_command, ref secondary_path)) = p.secondary_binary {
+            // otherwise — secondaryResolved can be true with the path absent
+            // when a valid providers.paths override satisfied it
+            // (monorepo#1065).
+            if let Some(ref secondary) = p.secondary_binary {
                 obj.insert(
                     "secondaryCommand".to_string(),
-                    serde_json::json!(secondary_command),
+                    serde_json::json!(secondary.command),
                 );
                 obj.insert(
                     "secondaryResolved".to_string(),
-                    serde_json::json!(secondary_path.is_some()),
+                    serde_json::json!(secondary.resolved),
                 );
-                if let Some(path) = secondary_path {
+                if let Some(ref path) = secondary.resolved_path {
                     obj.insert(
                         "secondaryResolvedPath".to_string(),
                         serde_json::json!(path.display().to_string()),

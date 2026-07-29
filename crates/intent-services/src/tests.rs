@@ -19175,4 +19175,91 @@ mod provider_discovery_payload {
         assert_eq!(unsloth["secondaryCommand"], "unsloth", "{unsloth}");
         assert!(unsloth["secondaryResolved"].is_boolean(), "{unsloth}");
     }
+
+    /// monorepo#1065: valid `providers.paths` overrides flip `installed` /
+    /// `secondaryResolved` on the wire payload, while `resolvedPath` /
+    /// `secondaryResolvedPath` stay auto-detected — they must never carry the
+    /// override path.
+    #[test]
+    fn overrides_flip_installed_but_paths_stay_auto_detected() {
+        let dir = std::env::temp_dir().join(format!(
+            "provider-discovery-payload-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opencode = dir.join("opencode");
+        let unsloth_bin = dir.join("unsloth");
+        for bin in [&opencode, &unsloth_bin] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::write(bin, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            #[cfg(not(unix))]
+            std::fs::write(bin, "exit 0").unwrap();
+        }
+        let overrides = std::collections::HashMap::from([
+            ("opencode".to_string(), opencode.display().to_string()),
+            ("unsloth".to_string(), unsloth_bin.display().to_string()),
+        ]);
+        let payload = crate::discover_providers_with_npx_overrides(&overrides);
+        let unsloth = payload["providers"]
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .find(|e| e["id"] == "unsloth")
+            .expect("unsloth must be in the payload")
+            .clone();
+        assert_eq!(
+            unsloth["installed"], true,
+            "valid overrides must report installed: {unsloth}"
+        );
+        assert_eq!(unsloth["secondaryResolved"], true, "{unsloth}");
+        // The path fields stay auto-detected — never the override paths.
+        assert_ne!(
+            unsloth.get("resolvedPath").and_then(|v| v.as_str()),
+            Some(opencode.display().to_string().as_str()),
+            "{unsloth}"
+        );
+        assert_ne!(
+            unsloth
+                .get("secondaryResolvedPath")
+                .and_then(|v| v.as_str()),
+            Some(unsloth_bin.display().to_string().as_str()),
+            "{unsloth}"
+        );
+
+        // Invalid overrides (missing files) contribute nothing: the payload
+        // matches the override-free run for the unsloth entry.
+        let bad = std::collections::HashMap::from([
+            (
+                "opencode".to_string(),
+                "/nonexistent/override/opencode".to_string(),
+            ),
+            (
+                "unsloth".to_string(),
+                "/nonexistent/override/unsloth".to_string(),
+            ),
+        ]);
+        let bad_payload = crate::discover_providers_with_npx_overrides(&bad);
+        let baseline = crate::discover_providers_with_npx();
+        let pick = |p: &serde_json::Value| {
+            p["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == "unsloth")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            pick(&bad_payload),
+            pick(&baseline),
+            "invalid overrides must behave exactly like no overrides"
+        );
+    }
 }

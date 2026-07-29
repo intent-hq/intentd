@@ -1407,3 +1407,91 @@ async fn host_provider_discovery_over_wss() {
 
     drop(daemon);
 }
+
+/// WSS e2e for host.providerDiscovery with `providers.paths` overrides
+/// (monorepo#1065): a valid override seeded in `config.toml` must flip
+/// `installed` / `secondaryResolved` on the wire, while `resolvedPath` /
+/// `secondaryResolvedPath` stay auto-detected (never the override path).
+#[tokio::test]
+async fn host_provider_discovery_honors_path_overrides_over_wss() {
+    let data_dir = temp_data_dir();
+
+    // Fake executables the overrides point at — valid (absolute + executable)
+    // regardless of what is really installed on the host.
+    let bin_dir = data_dir.join("override-bins");
+    std::fs::create_dir_all(&bin_dir).expect("mkdir override bins");
+    let opencode = bin_dir.join("opencode");
+    let unsloth_bin = bin_dir.join("unsloth");
+    for bin in [&opencode, &unsloth_bin] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(bin, "#!/bin/sh\nexit 0\n").expect("write fake bin");
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake bin");
+    }
+
+    // Seed the overrides BEFORE the daemon boots (enable_ws_api appends to
+    // the same config.toml). Unsloth's primary honors the `opencode` key;
+    // the `unsloth` key targets the unsloth CLI (the secondary).
+    std::fs::write(
+        data_dir.join("config.toml"),
+        format!(
+            "[providers.paths]\nopencode = \"{}\"\nunsloth = \"{}\"\n",
+            opencode.display(),
+            unsloth_bin.display()
+        ),
+    )
+    .expect("seed config.toml with providers.paths");
+
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut ws = connect_ws(port, cfg).await;
+
+    let result = wss_rpc(&mut ws, 2, "host.providerDiscovery", json!({})).await;
+    let providers = result["providers"].as_array().expect("providers array");
+    let unsloth = providers
+        .iter()
+        .find(|p| p["id"] == "unsloth")
+        .expect("unsloth must be in the discovery payload");
+
+    // The valid overrides satisfy both binaries, so unsloth reports installed
+    // even on a host with neither actually on PATH.
+    assert_eq!(
+        unsloth["installed"], true,
+        "valid providers.paths overrides must flip installed: {unsloth}"
+    );
+    assert_eq!(
+        unsloth["secondaryResolved"], true,
+        "valid providers.paths override must flip secondaryResolved: {unsloth}"
+    );
+    // The path fields stay auto-detected: they must never surface the
+    // override paths (they may be absent entirely when nothing auto-detects,
+    // or carry a real auto-detected install).
+    assert_ne!(
+        unsloth.get("resolvedPath").and_then(Value::as_str),
+        Some(opencode.to_str().unwrap()),
+        "resolvedPath must stay auto-detected, never the override: {unsloth}"
+    );
+    assert_ne!(
+        unsloth.get("secondaryResolvedPath").and_then(Value::as_str),
+        Some(unsloth_bin.to_str().unwrap()),
+        "secondaryResolvedPath must stay auto-detected, never the override: {unsloth}"
+    );
+
+    drop(daemon);
+}
