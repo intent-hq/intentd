@@ -14673,8 +14673,14 @@ impl WorkspaceApi for Services {
             if !path.join(".git").exists() {
                 return Ok(empty);
             }
-            let status = intent_git::status::status(&path)?;
-            Ok(serde_json::to_value(&status.files).unwrap_or(empty))
+            // libgit2 status on the blocking pool (same as git_status).
+            let status = tokio::task::spawn_blocking(move || intent_git::status::status(&path))
+                .await
+                .map_err(|e| Error::Internal(format!("git.changes task failed: {e}")))?;
+            match status {
+                Ok(s) => Ok(serde_json::to_value(&s.files).unwrap_or(empty)),
+                Err(e) => Err(e),
+            }
         })
     }
 
@@ -14702,7 +14708,33 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
+            // Full worktree hunk diffs can run for many seconds of pure libgit2
+            // CPU. Never do that on a Tokio worker: it holds a bulk permit and
+            // can freeze the whole runtime so host.status never runs (seen as
+            // bulk permit held 5-40s with "nothing else" making progress).
+            let started = std::time::Instant::now();
+            let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
+            let result = tokio::task::spawn_blocking(move || {
+                git_ops::build_diffs(
+                    &worktree,
+                    paths.as_deref(),
+                    staged,
+                    commit_hash.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;
+            let elapsed = started.elapsed();
+            if elapsed.as_millis() >= 250 {
+                tracing::warn!(
+                    workspace_id = %workspace_id.as_str(),
+                    total_ms = elapsed.as_millis() as u64,
+                    staged,
+                    path_count,
+                    "git.diffs: slow worktree hunk walk (offloaded to blocking pool)"
+                );
+            }
+            result
         })
     }
 
@@ -14728,9 +14760,15 @@ impl WorkspaceApi for Services {
             if !worktree.join(".git").exists() {
                 return Ok(empty);
             }
-            match git_ops::build_commit_details(&worktree, &commit_hash) {
+            let empty_for_err = empty.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                git_ops::build_commit_details(&worktree, &commit_hash)
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("git.commitDetails task failed: {e}")))?;
+            match result {
                 Ok(value) => Ok(value),
-                Err(Error::NotFound(_)) => Ok(empty),
+                Err(Error::NotFound(_)) => Ok(empty_for_err),
                 Err(e) => Err(e),
             }
         })
