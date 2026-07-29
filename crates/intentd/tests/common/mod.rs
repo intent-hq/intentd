@@ -229,11 +229,20 @@ pub async fn await_wss_stopped(socket: &Path) {
 /// `config.toml` with `[server.wsApi] enabled = true` plus an OS-assigned free
 /// port (the config-driven replacement for the retired `serve --listen both`
 /// flag: UDS always serves; the WSS listener boot-starts iff the effective
-/// `server.wsApi.enabled` is true, binding `server.wsApi.port`). Seeding the
-/// port keeps the suite hermetic — the boot path reads the settings value, so
-/// the fixed 5181 default would collide across parallel daemons. Appends to an
-/// existing seeded config; no-op if the table is already present (restarts on
-/// the same data dir reuse the same port).
+/// `server.wsApi.enabled` is true, binding `server.wsApi.port`).
+///
+/// Port interplay with the `INTENTD_TCP_PORT=0` seam (monorepo#1051): suites
+/// that spawn the daemon with `INTENTD_TCP_PORT=0` get a true OS-assigned
+/// ephemeral bind — the seam wins over the seeded settings port, eliminating
+/// the reserve-then-release TOCTOU race where another process grabbed the
+/// seeded port between this helper releasing it and the daemon binding it
+/// after full boot. The seeded port is only a fallback for spawns without the
+/// seam, keeping them off the fixed 5181 default that would collide across
+/// parallel daemons; such suites (and any daemon restarted on the same data
+/// dir with the seam, whose ephemeral port changes across boots) must read
+/// the real port from `system.status` ([`await_wss_status`]), never from the
+/// seeded config value. Appends to an existing seeded config; no-op if the
+/// table is already present.
 pub fn enable_ws_api(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");

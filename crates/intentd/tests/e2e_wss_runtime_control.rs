@@ -279,26 +279,9 @@ async fn runtime_ws_listener_toggle_over_wss() {
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
 
-    // Get the actual bound port from system.status
+    // Get the actual bound port from system.status (INTENTD_TCP_PORT=0 seam:
+    // every listener start binds a fresh OS-assigned ephemeral port)
     let status = common::await_wss_status(&socket).await;
-    let port_value = status["result"]["port"].as_u64().expect("port");
-
-    // Persist the ephemeral port to the setting so re-enable uses the same port
-    let set_port = uds_rpc(
-        &socket,
-        1,
-        "settings.update",
-        json!({ "changes": [{ "path": "server.wsApi.port", "value": port_value }] }),
-    )
-    .await;
-    assert!(
-        set_port.get("error").is_none(),
-        "settings.update port should succeed: {set_port}"
-    );
-
-    // Verify initial system.status shows the WSS listener (started at boot);
-    // single-shot on purpose — the readiness poll above already gated on the port
-    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
     let initial_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set at boot") as u16;
@@ -358,15 +341,15 @@ async fn runtime_ws_listener_toggle_over_wss() {
         "settings.update enable should succeed: {enable}"
     );
 
-    // Verify system.status shows the WSS listener again (poll — start is async)
+    // Verify system.status shows the WSS listener again (poll — start is
+    // async). With the INTENTD_TCP_PORT=0 seam the re-enable binds a fresh
+    // ephemeral port, so re-read it rather than expecting the boot port
+    // (settings-port reuse on re-enable is covered seam-free by
+    // runtime_toggled_wss_serves_system_status below).
     let status = common::await_wss_status(&socket).await;
     let new_port = status["result"]["port"]
         .as_u64()
         .expect("port should be set after re-enable") as u16;
-    assert_eq!(
-        new_port, initial_port,
-        "re-enable should bind the same port (persisted in server.wsApi.port)"
-    );
 
     // Connect over WSS again and verify RPCs work
     let mut ws2 = connect_ws(new_port, cfg.clone()).await;
@@ -584,8 +567,11 @@ async fn persisted_wss_enabled_auto_starts_at_boot_uds_mode() {
 #[tokio::test]
 async fn batch_hook_ordering_port_before_enable() {
     let data_dir = temp_data_dir();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
-    let child = spawn_serve(&data_dir, "both", &env);
+    // No INTENTD_TCP_PORT: the env-0 ephemeral seam would override the batch's
+    // explicit port and the bound port is exactly what proves hook ordering.
+    // Boot UDS-only (no wsApi seed) so the batch below exercises a cold start.
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, "uds", &env);
     let _daemon = Daemon {
         child,
         data_dir: data_dir.clone(),
@@ -593,20 +579,6 @@ async fn batch_hook_ordering_port_before_enable() {
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
-
-    // Disable the listener so the batch below exercises a cold start.
-    let disable = uds_rpc(
-        &socket,
-        1,
-        "settings.update",
-        json!({ "changes": [{ "path": "server.wsApi.enabled", "value": false }] }),
-    )
-    .await;
-    assert!(
-        disable.get("error").is_none(),
-        "disable should succeed: {disable}"
-    );
-    common::await_wss_stopped(&socket).await;
 
     // Batch update: provide changes in REVERSE dependency order (wsApi.enabled
     // before wsApi.port in the input array). The hook ordering ensures the port
