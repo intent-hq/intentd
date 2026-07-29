@@ -392,7 +392,8 @@ fn cache() -> &'static AuthStatusCache {
 /// otherwise the binary is resolved and the probe runs single-flighted
 /// (concurrent callers — forced or not — share the in-flight result).
 /// Not-installed providers short-circuit to `None` without probing or
-/// caching, so an install is picked up immediately; an uninstall within the
+/// caching, so an install is picked up immediately; an uninstall — or an
+/// `override_path` change to an already-cached provider — within the
 /// TTL serves the stale cached value until expiry (accepted — the next
 /// expired or forced read reports `None`).
 async fn resolve_auth_status(
@@ -555,11 +556,15 @@ mod tests {
     }
 
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        // nanos + process-wide counter: unique across parallel tests even on
+        // platforms with coarse clock resolution.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("intent-provider-auth-{tag}-{nanos}"));
+        let dir = std::env::temp_dir().join(format!("intent-provider-auth-{tag}-{nanos}-{seq}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
