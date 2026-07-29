@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.14] - 2026-07-29
+
+### 🔧 Refactor
+
+- Rename sandbox.* wire surface to sandbox.cow.* ([#730](https://github.com/intent-hq/intentd/pull/730))
+
+
 ## [0.2.13] - 2026-07-29
 
 ### 🚀 Features
