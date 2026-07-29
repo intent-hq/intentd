@@ -164,6 +164,72 @@ fn projection_text_blocks_expr() -> String {
     )
 }
 
+/// Rust twin of [`projection_text_blocks_expr`], applied at message-write time
+/// to maintain the persisted `agent_session.last_assistant_preview` /
+/// `last_user_preview` columns (0066). Semantics match the SQL expression
+/// exactly: `None` when `content` is not a JSON array (the SQL `CASE`'s NULL);
+/// otherwise the `type: "text"` blocks with a string `text`, in block order,
+/// each capped at [`PROJECTION_TEXT_BLOCK_CAP`] characters — assistant blocks
+/// keep their TAIL, any other role its HEAD (SQLite `substr` counts
+/// characters, so the caps here are `char`-based, not byte-based).
+fn preview_text_blocks(role: &str, content: &serde_json::Value) -> Option<Vec<String>> {
+    let cap = PROJECTION_TEXT_BLOCK_CAP as usize;
+    let blocks = content.as_array()?;
+    Some(
+        blocks
+            .iter()
+            .filter_map(|block| {
+                let obj = block.as_object()?;
+                if obj.get("type")?.as_str()? != "text" {
+                    return None;
+                }
+                let text = obj.get("text")?.as_str()?;
+                Some(if role == "assistant" {
+                    let len = text.chars().count();
+                    if len <= cap {
+                        text.to_string()
+                    } else {
+                        text.chars().skip(len - cap).collect()
+                    }
+                } else {
+                    text.chars().take(cap).collect()
+                })
+            })
+            .collect(),
+    )
+}
+
+/// TEXT column value for a preview: the JSON-encoded block array, or `None`
+/// (stored NULL) when the content is not a JSON array.
+fn preview_col_value(role: &str, content: &serde_json::Value) -> Result<Option<String>> {
+    preview_text_blocks(role, content)
+        .map(|blocks| {
+            serde_json::to_string(&blocks)
+                .map_err(|e| Error::Internal(format!("encode message preview failed: {e}")))
+        })
+        .transpose()
+}
+
+/// Preview column values `(last_assistant_preview, last_user_preview)` for a
+/// whole message batch written in seq order: the projection of the LAST
+/// message of each role wins (even when it projects to NULL), `None` when the
+/// batch has no message of that role — matching the newest-row window query.
+type OwnedBatchMessage = (String, serde_json::Value, Option<serde_json::Value>, String);
+fn batch_preview_col_values(
+    messages: &[OwnedBatchMessage],
+) -> Result<(Option<String>, Option<String>)> {
+    let mut assistant_preview = None;
+    let mut user_preview = None;
+    for (role, content, _, _) in messages {
+        match role.as_str() {
+            "assistant" => assistant_preview = preview_col_value(role, content)?,
+            "user" => user_preview = preview_col_value(role, content)?,
+            _ => {}
+        }
+    }
+    Ok((assistant_preview, user_preview))
+}
+
 /// Last-rows window query for the workspace-wide projection (monorepo#1010).
 /// The windowed subquery selects only row keys `(agent_id, seq)` — never
 /// `content`/`metadata` — so it runs entirely on the covering index
@@ -317,7 +383,9 @@ impl Store {
     /// nothing does. Messages get minted UUIDv7 ids and 0-based monotonic
     /// `seq` values in slice order. Built for the legacy-transcript importer,
     /// whose idempotency check is session-id presence — a partially-persisted
-    /// transcript would otherwise be skipped forever on re-runs. Uses
+    /// transcript would otherwise be skipped forever on re-runs. The session's
+    /// last-message preview columns (0066) are computed from the batch inside
+    /// the same transaction. Uses
     /// whole-transaction retry to absorb SQLITE_BUSY (code 5) during lock
     /// upgrade (STAB-7).
     pub async fn insert_agent_session_with_messages(
@@ -375,6 +443,17 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
             }
+            let (assistant_preview, user_preview) = batch_preview_col_values(&owned_messages)?;
+            sqlx::query(
+                "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ? \
+                 WHERE id = ?",
+            )
+            .bind(assistant_preview.as_deref())
+            .bind(user_preview.as_deref())
+            .bind(&s.id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("update session message previews failed: {e}")))?;
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("insert session with messages commit failed: {e}"))
             })?;
@@ -1519,17 +1598,21 @@ impl Store {
     ///
     /// ## Transaction boundary
     ///
-    /// This operation executes TWO separate queries (SELECT next seq, INSERT
-    /// message) without an explicit transaction wrapper. Each query runs in
-    /// SQLite's autocommit mode as its own implicit transaction. The schema
-    /// enforces `UNIQUE(agent_id, seq)`, so concurrent appends racing on the
-    /// SELECT phase will cause one INSERT to fail with a constraint violation.
+    /// The next-seq SELECT runs first in autocommit mode; the message INSERT
+    /// then commits together with the matching `agent_session` last-message
+    /// preview column update (0066) in one write transaction — `user` and
+    /// `assistant` appends are by construction the session's newest message of
+    /// their role, so the column is overwritten unconditionally (other roles
+    /// keep the bare INSERT). The schema enforces `UNIQUE(agent_id, seq)`, so
+    /// concurrent appends racing on the SELECT phase will cause one INSERT to
+    /// fail with a constraint violation.
     ///
     /// **Crash safety**: Because `seq` is computed as `COALESCE(MAX(seq), -1) + 1`
     /// rather than a persisted counter, a crash between SELECT and INSERT does
     /// NOT create a durable gap — the next caller recomputes seq from the same
-    /// MAX. Only the INSERT commits data, so once INSERT completes the message
-    /// row is durable. No committed message can be lost. Assistant-message append
+    /// MAX. Only the INSERT transaction commits data, so once it completes the
+    /// message row (and its preview column) is durable. No committed message can
+    /// be lost. Assistant-message append
     /// (the streaming path) is additionally protected by the AgentManager's
     /// per-agent single-flight slot, serializing turns for one agent and
     /// eliminating the seq-race window on that hot path. User-message appends
@@ -1562,18 +1645,62 @@ impl Store {
             ),
             None => None,
         };
+        let preview_update = match role {
+            "assistant" => Some(("last_assistant_preview", preview_col_value(role, content)?)),
+            "user" => Some(("last_user_preview", preview_col_value(role, content)?)),
+            _ => None,
+        };
         let sql = format!("INSERT INTO agent_message ({MESSAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?)");
-        sqlx::query(&sql)
-            .bind(id)
-            .bind(&agent_id.0)
-            .bind(seq)
-            .bind(role)
-            .bind(&content_json)
-            .bind(metadata_json.as_deref())
-            .bind(created_at)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
+        match &preview_update {
+            None => {
+                sqlx::query(&sql)
+                    .bind(id)
+                    .bind(&agent_id.0)
+                    .bind(seq)
+                    .bind(role)
+                    .bind(&content_json)
+                    .bind(metadata_json.as_deref())
+                    .bind(created_at)
+                    .execute(self.write_pool())
+                    .await
+                    .map_err(|e| Error::Internal(format!("append agent message failed: {e}")))?;
+            }
+            Some((column, value)) => {
+                let pool = self.write_pool();
+                let update_sql = format!("UPDATE agent_session SET {column} = ? WHERE id = ?");
+                crate::with_write_txn_retry(|| async {
+                    let mut tx = pool.begin().await.map_err(|e| {
+                        Error::Internal(format!("append agent message begin failed: {e}"))
+                    })?;
+                    sqlx::query(&sql)
+                        .bind(id)
+                        .bind(&agent_id.0)
+                        .bind(seq)
+                        .bind(role)
+                        .bind(&content_json)
+                        .bind(metadata_json.as_deref())
+                        .bind(created_at)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("append agent message failed: {e}"))
+                        })?;
+                    sqlx::query(&update_sql)
+                        .bind(value.as_deref())
+                        .bind(&agent_id.0)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("update session message preview failed: {e}"))
+                        })?;
+                    tx.commit().await.map_err(|e| {
+                        Error::Internal(format!("append agent message commit failed: {e}"))
+                    })?;
+                    Ok(())
+                })
+                .await?;
+            }
+        }
         Ok(AgentMessage {
             id: id.to_string(),
             agent_id: agent_id.clone(),
@@ -1661,6 +1788,9 @@ impl Store {
     /// edit-truncate transcript-mutation path (`agent.replaceMessages`,
     /// PROTOCOL §5.5). Callers are expected to reject busy sessions before
     /// invoking this (message-log mutations must not race an in-flight turn).
+    /// Both `agent_session` last-message preview columns (0066) are recomputed
+    /// from the replacement batch inside the same transaction (NULL when the
+    /// batch has no message of that role).
     /// Uses whole-transaction retry to eliminate SQLITE_BUSY (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
     pub async fn replace_agent_messages(
@@ -1683,6 +1813,7 @@ impl Store {
                     )
                 })
                 .collect();
+        let (assistant_preview, user_preview) = batch_preview_col_values(&owned_messages)?;
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -1734,6 +1865,16 @@ impl Store {
                     created_at: created_at.clone(),
                 });
             }
+            sqlx::query(
+                "UPDATE agent_session SET last_assistant_preview = ?, last_user_preview = ? \
+                 WHERE id = ?",
+            )
+            .bind(assistant_preview.as_deref())
+            .bind(user_preview.as_deref())
+            .bind(&agent_id.0)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("update session message previews failed: {e}")))?;
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("replace agent messages commit failed: {e}"))
             })?;
@@ -4395,6 +4536,508 @@ mod tests {
             .await
             .expect("stats");
         assert_eq!(stats.get(&agent_id.0), Some(&(2, true)));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Raw `(last_assistant_preview, last_user_preview)` column values for a
+    /// session (0066).
+    async fn read_preview_columns(
+        store: &Store,
+        agent_id: &AgentId,
+    ) -> (Option<String>, Option<String>) {
+        let row = sqlx::query(
+            "SELECT last_assistant_preview, last_user_preview FROM agent_session WHERE id = ?",
+        )
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("read preview columns");
+        (
+            row.get("last_assistant_preview"),
+            row.get("last_user_preview"),
+        )
+    }
+
+    /// Decode a preview column into the block vec it mirrors (NULL → `None`).
+    fn decode_preview(col: Option<String>) -> Option<Vec<String>> {
+        col.map(|raw| serde_json::from_str(&raw).expect("decode preview column"))
+    }
+
+    /// Run the existing per-agent window query and fold it into
+    /// `(last_assistant_text_blocks, last_user_text_blocks)` via
+    /// [`map_projection_text_row`] — the reference the persisted columns must
+    /// reproduce.
+    async fn window_query_previews(
+        store: &Store,
+        agent_id: &AgentId,
+    ) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        let rows = sqlx::query(&last_messages_by_agent_sql())
+            .bind(&agent_id.0)
+            .fetch_all(store.read_pool())
+            .await
+            .expect("window query");
+        let mut assistant = None;
+        let mut user = None;
+        for row in &rows {
+            let (_, role, blocks) = map_projection_text_row(row).expect("map projection row");
+            match role.as_str() {
+                "assistant" => assistant = Some(blocks),
+                _ => user = Some(blocks),
+            }
+        }
+        (assistant, user)
+    }
+
+    /// [`preview_text_blocks`] replicates [`projection_text_blocks_expr`]'s
+    /// semantics: text blocks only (string `text`, string `type` equal to
+    /// `text`), block order preserved, per-block char cap with assistant=TAIL
+    /// / user=HEAD, non-array content → `None`, empty array → `Some(vec![])`.
+    #[test]
+    fn preview_text_blocks_matches_sql_expression_semantics() {
+        let cap = PROJECTION_TEXT_BLOCK_CAP as usize;
+
+        // Plain text blocks: order preserved, short blocks pass through.
+        let content = serde_json::json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"},
+        ]);
+        assert_eq!(
+            preview_text_blocks("user", &content),
+            Some(vec!["first".to_string(), "second".to_string()])
+        );
+
+        // Mixed block types: only objects with type == "text" and a string
+        // `text` survive (bare strings, tool blocks, missing/non-string text,
+        // non-string type are all skipped — same as the SQL guards).
+        let content = serde_json::json!([
+            {"type": "tool_use", "name": "t", "toolCallId": "c1"},
+            "bare-string-block",
+            {"type": "text"},
+            {"type": "text", "text": 42},
+            {"type": 7, "text": "not-a-text-type"},
+            {"type": "text", "text": "kept"},
+        ]);
+        assert_eq!(
+            preview_text_blocks("assistant", &content),
+            Some(vec!["kept".to_string()])
+        );
+
+        // Non-array content → None (the SQL CASE's NULL).
+        for content in [
+            serde_json::json!("plain string"),
+            serde_json::json!({"type": "text", "text": "object, not array"}),
+            serde_json::json!(3),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(preview_text_blocks("user", &content), None);
+            assert_eq!(preview_text_blocks("assistant", &content), None);
+        }
+
+        // Empty array → Some(vec![]) (json_group_array over zero rows is '[]').
+        assert_eq!(
+            preview_text_blocks("user", &serde_json::json!([])),
+            Some(vec![])
+        );
+
+        // Oversized blocks: assistant keeps the TAIL, user the HEAD, counted
+        // in chars (multi-byte safe) like SQLite substr.
+        let big = format!("head-marker-{}-tail-marker", "é".repeat(2 * cap));
+        let content = serde_json::json!([{"type": "text", "text": big}]);
+        let tail = &preview_text_blocks("assistant", &content).unwrap()[0];
+        assert_eq!(tail.chars().count(), cap, "assistant block capped");
+        assert!(tail.ends_with("-tail-marker"), "assistant keeps its tail");
+        let head = &preview_text_blocks("user", &content).unwrap()[0];
+        assert_eq!(head.chars().count(), cap, "user block capped");
+        assert!(head.starts_with("head-marker-"), "user keeps its head");
+    }
+
+    /// `append_agent_message_with_id` maintains the matching preview column in
+    /// the same transaction as the INSERT: user/assistant appends overwrite
+    /// their column (non-array content stores NULL), other roles leave both
+    /// columns untouched.
+    #[tokio::test]
+    async fn preview_columns_maintained_on_append() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-append".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-preview-append".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+
+        assert_eq!(
+            read_preview_columns(&store, &agent_id).await,
+            (None, None),
+            "fresh session has NULL previews"
+        );
+
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "q1"}]),
+                &ts,
+            )
+            .await
+            .expect("append user");
+        let (assistant, user) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(assistant, None, "no assistant message yet");
+        assert_eq!(decode_preview(user), Some(vec!["q1".to_string()]));
+
+        store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{"type": "text", "text": "a1"}]),
+                &ts,
+            )
+            .await
+            .expect("append assistant");
+        let (assistant, user) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(decode_preview(assistant), Some(vec!["a1".to_string()]));
+        assert_eq!(decode_preview(user), Some(vec!["q1".to_string()]));
+
+        store
+            .append_agent_message(
+                &agent_id,
+                "tool",
+                &serde_json::json!([{"type": "text", "text": "tool noise"}]),
+                &ts,
+            )
+            .await
+            .expect("append tool");
+        let (assistant, user) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(
+            decode_preview(assistant),
+            Some(vec!["a1".to_string()]),
+            "tool append leaves previews untouched"
+        );
+        assert_eq!(decode_preview(user), Some(vec!["q1".to_string()]));
+
+        // A newer user message with non-array content overwrites to NULL —
+        // the same NULL the SQL CASE yields for that winner row.
+        store
+            .append_agent_message(&agent_id, "user", &serde_json::json!("plain string"), &ts)
+            .await
+            .expect("append non-array user");
+        let (assistant, user) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(decode_preview(assistant), Some(vec!["a1".to_string()]));
+        assert_eq!(user, None, "non-array winner stores NULL");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `replace_agent_messages` recomputes both preview columns from the
+    /// replacement batch: truncating to before the last assistant message
+    /// rewinds the assistant preview, and an empty batch clears both.
+    #[tokio::test]
+    async fn preview_columns_recomputed_on_replace() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-replace".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-preview-replace".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        for (role, text) in [
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+            ("assistant", "a2"),
+        ] {
+            store
+                .append_agent_message(
+                    &agent_id,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+        let (assistant, user) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(decode_preview(assistant), Some(vec!["a2".to_string()]));
+        assert_eq!(decode_preview(user), Some(vec!["q2".to_string()]));
+
+        // Truncate to before the last assistant message: the assistant
+        // preview rewinds to a1, the user preview to q2.
+        let batch = [("user", "q1"), ("assistant", "a1"), ("user", "q2")]
+            .map(|(role, text)| (role, serde_json::json!([{"type": "text", "text": text}])));
+        let replace: Vec<ReplaceMessage<'_>> = batch
+            .iter()
+            .map(|(role, content)| ReplaceMessage {
+                role,
+                content,
+                metadata: None,
+                created_at: &ts,
+            })
+            .collect();
+        store
+            .replace_agent_messages(&agent_id, &replace)
+            .await
+            .expect("replace truncated");
+        let (assistant, user) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(
+            decode_preview(assistant),
+            Some(vec!["a1".to_string()]),
+            "assistant preview rewound to the batch's last assistant message"
+        );
+        assert_eq!(decode_preview(user), Some(vec!["q2".to_string()]));
+
+        store
+            .replace_agent_messages(&agent_id, &[])
+            .await
+            .expect("replace with empty batch");
+        assert_eq!(
+            read_preview_columns(&store, &agent_id).await,
+            (None, None),
+            "empty batch clears both previews"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Equivalence: for sessions with messages — written via append, replace,
+    /// and the importer's `insert_agent_session_with_messages` — the persisted
+    /// preview columns decode to exactly what the existing window query +
+    /// [`map_projection_text_row`] produce, including capped oversized blocks
+    /// and mixed block types.
+    #[tokio::test]
+    async fn preview_columns_equal_window_query_projection() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-equiv".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        let cap = PROJECTION_TEXT_BLOCK_CAP as usize;
+        let big_user = format!("user-head-{}", "é".repeat(2 * cap));
+        let big_assistant = format!("{}<agent_digest>d</agent_digest>", "a".repeat(2 * cap));
+        let batch = [
+            ("user", serde_json::json!([{"type": "text", "text": "q1"}])),
+            (
+                "assistant",
+                serde_json::json!([{"type": "text", "text": "a1"}]),
+            ),
+            ("tool", serde_json::json!([{"type": "text", "text": "t1"}])),
+            (
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": big_user},
+                    {"type": "tool_use", "name": "t", "toolCallId": "c1"},
+                    {"type": "text", "text": "short block"},
+                ]),
+            ),
+            (
+                "assistant",
+                serde_json::json!([{"type": "text", "text": big_assistant}]),
+            ),
+        ];
+
+        // Session 1: written through the append funnel.
+        let appended = AgentId("agent-equiv-append".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&appended, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        for (role, content) in &batch {
+            store
+                .append_agent_message(&appended, role, content, &ts)
+                .await
+                .expect("append");
+        }
+
+        // Session 2: written through the importer's batched insert.
+        let imported = AgentId("agent-equiv-import".to_string());
+        let replace: Vec<ReplaceMessage<'_>> = batch
+            .iter()
+            .map(|(role, content)| ReplaceMessage {
+                role,
+                content,
+                metadata: None,
+                created_at: &ts,
+            })
+            .collect();
+        store
+            .insert_agent_session_with_messages(
+                &baseline_test_session(&imported, &ws_id, &ts, None),
+                &replace,
+            )
+            .await
+            .expect("insert session with messages");
+
+        // Session 3: written through the replace path.
+        let replaced = AgentId("agent-equiv-replace".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&replaced, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        store
+            .replace_agent_messages(&replaced, &replace)
+            .await
+            .expect("replace");
+
+        for agent_id in [&appended, &imported, &replaced] {
+            let (assistant_col, user_col) = read_preview_columns(&store, agent_id).await;
+            let (expected_assistant, expected_user) = window_query_previews(&store, agent_id).await;
+            assert_eq!(
+                decode_preview(assistant_col),
+                expected_assistant,
+                "assistant preview equals window query for {agent_id:?}"
+            );
+            assert_eq!(
+                decode_preview(user_col),
+                expected_user,
+                "user preview equals window query for {agent_id:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The 0066 migration backfill produces columns identical to the window
+    /// query's output: message rows inserted raw (bypassing write-time
+    /// maintenance, like pre-migration rows) get correct previews after
+    /// running the migration's UPDATE statements — including a NULL for a
+    /// non-array winner and for sessions with no message of a role.
+    #[tokio::test]
+    async fn migration_backfill_matches_window_query_projection() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-backfill".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+
+        let cap = PROJECTION_TEXT_BLOCK_CAP as usize;
+        let full = AgentId("agent-backfill-full".to_string());
+        let non_array = AgentId("agent-backfill-non-array".to_string());
+        let empty = AgentId("agent-backfill-empty".to_string());
+        for id in [&full, &non_array, &empty] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let big_user = format!("user-head-{}", "é".repeat(2 * cap));
+        let full_rows = [
+            ("user", serde_json::json!([{"type": "text", "text": "q1"}])),
+            (
+                "assistant",
+                serde_json::json!([{"type": "text", "text": "a1"}]),
+            ),
+            (
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": big_user},
+                    {"type": "tool_use", "name": "t"},
+                    {"type": "text", "text": "short block"},
+                ]),
+            ),
+        ];
+        for (seq, (role, content)) in full_rows.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+                 VALUES (?,?,?,?,?,?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&full.0)
+            .bind(seq as i64)
+            .bind(*role)
+            .bind(serde_json::to_string(content).expect("encode"))
+            .bind(&ts)
+            .execute(store.write_pool())
+            .await
+            .expect("insert raw row");
+        }
+        sqlx::query(
+            "INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) \
+             VALUES (?,?,?,?,?,?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&non_array.0)
+        .bind(0_i64)
+        .bind("user")
+        .bind("\"plain string\"")
+        .bind(&ts)
+        .execute(store.write_pool())
+        .await
+        .expect("insert non-array row");
+
+        // Raw inserts bypass write-time maintenance: columns are still NULL.
+        assert_eq!(read_preview_columns(&store, &full).await, (None, None));
+
+        // Re-run the migration's backfill UPDATE statements (the ALTERs
+        // already ran at open).
+        let migration = include_str!("../migrations/0066_agent_session_last_message_previews.sql");
+        let without_comments = migration
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for stmt in without_comments.split(';') {
+            let stmt = stmt.trim();
+            if stmt.starts_with("UPDATE") {
+                sqlx::query(stmt)
+                    .execute(store.write_pool())
+                    .await
+                    .expect("run backfill statement");
+            }
+        }
+
+        let (assistant_col, user_col) = read_preview_columns(&store, &full).await;
+        let (expected_assistant, expected_user) = window_query_previews(&store, &full).await;
+        assert_eq!(
+            decode_preview(assistant_col),
+            expected_assistant,
+            "backfilled assistant preview equals window query"
+        );
+        assert_eq!(
+            decode_preview(user_col),
+            expected_user,
+            "backfilled user preview equals window query"
+        );
+
+        assert_eq!(
+            read_preview_columns(&store, &non_array).await,
+            (None, None),
+            "non-array winner backfills to NULL (assistant NULL: no such message)"
+        );
+        assert_eq!(
+            read_preview_columns(&store, &empty).await,
+            (None, None),
+            "message-less session stays NULL"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
