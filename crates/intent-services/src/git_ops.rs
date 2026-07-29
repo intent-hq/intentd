@@ -191,30 +191,48 @@ pub(crate) fn commit_to_commit_summary(c: &intent_git::history::CommitRecord) ->
 /// When `commit_hash` is set, returns hunks for `<commit_hash>^..<commit_hash>`
 /// and `staged` is ignored. Otherwise `staged` selects the HEAD→index diff
 /// (else index→workdir). `path` filters to a single file. Hunks for staged /
-/// committed changes are hydrated from the recorded blob SHAs; unstaged changes
-/// read workdir content directly. Binary files yield an empty `hunks` array.
-/// A `commit_hash` that does not resolve degrades to an empty array.
+/// committed changes are hydrated from the recorded blob SHAs; the unstaged
+/// case comes from a **single** index→workdir traversal (summaries + hunks
+/// together, pathspec-narrowed when `path` is set) instead of one scan per
+/// changed file. Binary files yield an empty `hunks` array. A `commit_hash`
+/// that does not resolve degrades to an empty array.
 pub(crate) fn build_diffs(
     worktree: &Path,
     path: Option<&str>,
     staged: bool,
     commit_hash: Option<&str>,
 ) -> Result<Value> {
+    if commit_hash.is_none() && !staged {
+        let specs = path.map(|p| vec![p]);
+        let entries =
+            intent_git::diff::diff_index_to_workdir_with_hunks(worktree, specs.as_deref())?;
+        let mut out = Vec::new();
+        for entry in &entries {
+            // The pathspec prunes the walk but can match more than the exact
+            // path; keep the strict equality filter the wire contract promises.
+            if let Some(p) = path {
+                if entry.file.path != p {
+                    continue;
+                }
+            }
+            let hunks: &[intent_git::diff::DiffHunk] = if entry.file.is_binary {
+                &[]
+            } else {
+                &entry.hunks
+            };
+            out.push(json!({ "path": entry.file.path, "hunks": hunks_to_value(hunks) }));
+        }
+        return Ok(Value::Array(out));
+    }
+
     let files = match commit_hash {
         Some(hash) => match intent_git::diff::diff_commit(worktree, hash) {
             Ok(f) => f,
             Err(Error::NotFound(_)) => return Ok(Value::Array(Vec::new())),
             Err(e) => return Err(e),
         },
-        None => {
-            if staged {
-                intent_git::diff::diff_head_to_index(worktree)?
-            } else {
-                intent_git::diff::diff_index_to_workdir(worktree)?
-            }
-        }
+        None => intent_git::diff::diff_head_to_index(worktree)?,
     };
-    let use_blob_hunks = commit_hash.is_some() || staged;
     let mut out = Vec::new();
     for fd in &files {
         if let Some(p) = path {
@@ -224,14 +242,12 @@ pub(crate) fn build_diffs(
         }
         let hunks = if fd.is_binary {
             Vec::new()
-        } else if use_blob_hunks {
+        } else {
             intent_git::diff::hunks_between(
                 worktree,
                 fd.old_blob.as_deref(),
                 fd.new_blob.as_deref(),
             )?
-        } else {
-            intent_git::diff::hunks_index_to_workdir(worktree, &fd.path)?
         };
         out.push(json!({ "path": fd.path, "hunks": hunks_to_value(&hunks) }));
     }
