@@ -1,0 +1,205 @@
+# Manual (workflow_dispatch) mirroring of an existing release to the public
+# intent-hq/intentd-releases repo — the backfill path for releases cut before
+# automatic mirroring existed (publish-channel-manifest.yml / promote-stable.yml
+# mirror new releases and promotions automatically).
+#
+# Mirrors the tag's platform archives + .sha256 sidecars via
+# scripts/mirror-release-assets.sh (idempotent: re-runs re-upload with
+# --clobber). Optionally also republishes the beta/stable channel manifests on
+# intentd-releases, rebuilt with ASSET_REPO so their platform URLs point at the
+# mirrored assets. Each channel republish runs in its own job that shares the
+# concurrency group of the workflow that normally publishes that channel
+# (publish-channel-manifest.yml for beta, promote-stable.yml for stable), so
+# the "current manifest points at this tag" guard and the mirror publish are
+# serialized with releases/promotions in flight — a backfill of an older tag
+# can never move a mirror channel manifest backwards.
+#
+# Unlike the release workflows, this is an explicit dispatch, so a missing
+# INTENTD_RELEASES_TOKEN secret fails the run instead of soft-skipping.
+name: Mirror release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to mirror (e.g. v0.2.12)'
+        required: true
+        type: string
+      republish:
+        description: 'Channel manifests to republish on intentd-releases (only if the channel currently points at this tag)'
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - beta
+          - stable
+          - both
+
+permissions:
+  contents: read
+
+env:
+  MIRROR_REPO: intent-hq/intentd-releases
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intentd-mirror-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate tag format
+        shell: bash
+        run: |
+          # Charset-restricted prerelease suffix (semver identifiers), so a
+          # tag that passes validation is safe to echo in logs/summaries.
+          if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            # Deliberately not echoing the raw input: it is unvalidated and
+            # could contain workflow-command sequences (log injection).
+            echo "::error::Invalid tag input. Expected [v]X.Y.Z or [v]X.Y.Z-<prerelease> (prerelease limited to [0-9A-Za-z.-])."
+            exit 1
+          fi
+          echo "Tag $TAG is valid"
+      - name: Check mirror token
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          if [[ -z "$INTENTD_RELEASES_TOKEN" ]]; then
+            echo "::error::INTENTD_RELEASES_TOKEN secret is not configured; cannot mirror to $MIRROR_REPO"
+            exit 1
+          fi
+      - name: Mirror release assets to intentd-releases
+        shell: bash
+        env:
+          DEST_REPO: ${{ env.MIRROR_REPO }}
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/mirror-release-assets.sh "$TAG"
+      - name: Post summary
+        shell: bash
+        run: |
+          {
+            echo "## Release mirror"
+            echo ""
+            echo "**Mirrored tag:** $TAG"
+            echo ""
+            echo "- [Mirrored release](https://github.com/$MIRROR_REPO/releases/tag/$TAG)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One job per channel so a failed guard on one channel neither blocks nor
+  # masks the other in the Actions UI, and each shares the concurrency group
+  # of the workflow that normally publishes that channel (see header).
+  republish-beta:
+    needs: mirror
+    if: inputs.republish == 'beta' || inputs.republish == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intentd-beta-manifest-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Republish beta manifest on intentd-releases
+        id: publish
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          gh release download channel-beta --repo "$GITHUB_REPOSITORY" \
+            --pattern beta.json --dir "$tmpdir" --clobber
+          current_tag=$(jq -r '.tag // empty' "$tmpdir/beta.json")
+          if [[ "$current_tag" != "$TAG" ]]; then
+            echo "::error::Current beta.json on $GITHUB_REPOSITORY does not point at the mirrored tag; refusing to republish beta"
+            exit 1
+          fi
+          mkdir -p mirror
+          ASSET_REPO="$MIRROR_REPO" \
+            ./scripts/make-channel-manifest.sh "$TAG" beta mirror/beta.json
+          GH_TOKEN="$INTENTD_RELEASES_TOKEN" \
+            ./scripts/publish-channel-manifest.sh beta mirror/beta.json "$MIRROR_REPO"
+      - name: Post summary
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          {
+            echo "## Beta manifest republish"
+            echo ""
+            if [[ "$OUTCOME" == "success" ]]; then
+              echo "**beta.json republished on $MIRROR_REPO for $TAG**"
+              echo ""
+              echo "- [beta.json](https://github.com/$MIRROR_REPO/releases/download/channel-beta/beta.json)"
+            else
+              echo "**Beta republish failed or was refused** (see the step log; the asset mirror from the mirror job is unaffected)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  republish-stable:
+    needs: mirror
+    if: inputs.republish == 'stable' || inputs.republish == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intentd-stable-promotion
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Republish stable manifest on intentd-releases
+        id: publish
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          gh release download channel-stable --repo "$GITHUB_REPOSITORY" \
+            --pattern stable.json --dir "$tmpdir" --clobber
+          current_tag=$(jq -r '.tag // empty' "$tmpdir/stable.json")
+          if [[ "$current_tag" != "$TAG" ]]; then
+            echo "::error::Current stable.json on $GITHUB_REPOSITORY does not point at the mirrored tag; refusing to republish stable"
+            exit 1
+          fi
+          mkdir -p mirror
+          ASSET_REPO="$MIRROR_REPO" \
+            ./scripts/make-channel-manifest.sh "$TAG" stable mirror/stable.json
+          GH_TOKEN="$INTENTD_RELEASES_TOKEN" \
+            ./scripts/publish-channel-manifest.sh stable mirror/stable.json "$MIRROR_REPO"
+      - name: Post summary
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          {
+            echo "## Stable manifest republish"
+            echo ""
+            if [[ "$OUTCOME" == "success" ]]; then
+              echo "**stable.json republished on $MIRROR_REPO for $TAG**"
+              echo ""
+              echo "- [stable.json](https://github.com/$MIRROR_REPO/releases/download/channel-stable/stable.json)"
+            else
+              echo "**Stable republish failed or was refused** (see the step log; the asset mirror from the mirror job is unaffected)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
