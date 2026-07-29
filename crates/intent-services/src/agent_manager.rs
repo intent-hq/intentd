@@ -4257,9 +4257,18 @@ impl AgentManager {
             // managed server and lose the loaded model if a different-model
             // spawn restarts it.
             let attached_agents = self.count_agents_with_provider("unsloth");
+            // `providers.paths["unsloth"]` targets the unsloth CLI the
+            // managed-server lifecycle shells out to (NOT the opencode ACP
+            // primary, which `resolve_spawn` keys on "opencode").
+            let unsloth_cli_override = read_provider_path_setting(&settings, "unsloth");
             let endpoint = self
                 .unsloth
-                .ensure_endpoint(&repo_id, attached_agents, &status_cb)
+                .ensure_endpoint(
+                    &repo_id,
+                    unsloth_cli_override.as_deref(),
+                    attached_agents,
+                    &status_cb,
+                )
                 .await?;
             resolved.unsloth_endpoint = Some(endpoint);
         }
@@ -5054,8 +5063,10 @@ fn workspace_naming_tool_reference(provider_id: &str) -> &'static str {
 /// `MOCK_AGENT_BEHAVIOR` to the child. npx-only providers (claude-code) are
 /// always spawned via `npx -y <pinned package>` — no local-binary discovery.
 /// Other providers resolve their binary to an absolute path using the
-/// precedence: `providers.paths` map → `~/.augment/bin/<command>` (for auggie)
-/// → enhanced PATH scan.
+/// precedence: `providers.paths` map (keyed by the binary-owning provider,
+/// [`ProviderConfig::primary_binary_provider_id`]) → native-installer location
+/// where one exists (e.g. `~/.opencode/bin`) → `~/.augment/bin/<command>`
+/// (auggie back-compat tier) → enhanced PATH scan.
 fn resolve_spawn(
     session: &AgentSession,
     workspace: Option<&intent_core::Workspace>,
@@ -5192,10 +5203,17 @@ fn resolve_spawn(
         });
     }
 
-    // Resolve provider binary using the precedence: setting → managed → PATH
-    let explicit_path = read_provider_path_setting(settings, &provider_id);
+    // Resolve provider binary using the precedence: setting → native
+    // installer → ~/.augment/bin → PATH (`find_provider_binary`'s tiers).
+    // The `providers.paths` key is the provider that OWNS the primary binary
+    // ([`ProviderConfig::primary_binary_provider_id`]): unsloth rides the
+    // opencode binary, so its primary honors `providers.paths["opencode"]`,
+    // while `providers.paths["unsloth"]` targets the unsloth CLI in the
+    // managed-server lifecycle (`ensure_started`'s unsloth spawn gate).
+    let binary_provider_id = provider.primary_binary_provider_id();
+    let explicit_path = read_provider_path_setting(settings, binary_provider_id);
     let provider_binary = intent_providers::find_provider_binary(
-        &provider_id,
+        binary_provider_id,
         provider.command,
         explicit_path.as_deref(),
     );
@@ -7302,6 +7320,107 @@ mod pi_extension_delivery_tests {
                 provider.id
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod provider_path_override_tests {
+    //! Regression tests for the `providers.paths` key retarget: unsloth rides
+    //! the opencode binary as its ACP runtime, so its primary spawn resolution
+    //! must honor `providers.paths["opencode"]` — `providers.paths["unsloth"]`
+    //! targets the `unsloth` CLI (the managed-server lifecycle,
+    //! `unsloth_server.rs`), never the ACP spawn binary.
+
+    use super::role_reminder_tests::session;
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Write an executable stub so the explicit-path tier of
+    /// `find_provider_binary` accepts it (absolute + executable).
+    fn exec_stub(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn settings_with_paths(paths: &[(&str, &Path)]) -> intent_core::settings_file::SettingsFile {
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        for (id, path) in paths {
+            settings
+                .providers
+                .paths
+                .insert((*id).to_string(), path.to_string_lossy().into_owned());
+        }
+        settings
+    }
+
+    fn unsloth_session() -> AgentSession {
+        let mut s = session(
+            &AgentId::from("agent-paths-unsloth"),
+            &WorkspaceId::from("ws-1"),
+            None,
+        );
+        s.provider = Some("unsloth".to_string());
+        s
+    }
+
+    /// The unsloth primary (opencode) spawn resolution reads the `opencode`
+    /// key: with both keys set to distinct stubs, the resolved binary must be
+    /// the `opencode` one.
+    #[test]
+    fn unsloth_primary_spawn_honors_opencode_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode_stub = exec_stub(dir.path(), "opencode-override");
+        let unsloth_stub = exec_stub(dir.path(), "unsloth-override");
+        let settings =
+            settings_with_paths(&[("opencode", &opencode_stub), ("unsloth", &unsloth_stub)]);
+
+        let resolved = resolve_spawn(&unsloth_session(), None, &settings, None).unwrap();
+        assert_eq!(
+            resolved.provider_binary.as_deref(),
+            Some(opencode_stub.as_path()),
+            "unsloth's opencode primary must resolve via providers.paths[\"opencode\"]"
+        );
+    }
+
+    /// `providers.paths["unsloth"]` alone must NOT redirect the opencode
+    /// primary — it targets the unsloth CLI (managed server), not the ACP
+    /// spawn binary.
+    #[test]
+    fn unsloth_key_does_not_redirect_the_opencode_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsloth_stub = exec_stub(dir.path(), "unsloth-override");
+        let settings = settings_with_paths(&[("unsloth", &unsloth_stub)]);
+
+        let resolved = resolve_spawn(&unsloth_session(), None, &settings, None).unwrap();
+        assert_ne!(
+            resolved.provider_binary.as_deref(),
+            Some(unsloth_stub.as_path()),
+            "providers.paths[\"unsloth\"] must not override the opencode primary"
+        );
+    }
+
+    /// Sanity: a provider that owns its primary binary (opencode itself)
+    /// still honors its own key — the retarget only affects unsloth.
+    #[test]
+    fn opencode_provider_still_honors_its_own_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode_stub = exec_stub(dir.path(), "opencode-override");
+        let settings = settings_with_paths(&[("opencode", &opencode_stub)]);
+
+        let mut s = session(
+            &AgentId::from("agent-paths-opencode"),
+            &WorkspaceId::from("ws-1"),
+            None,
+        );
+        s.provider = Some("opencode".to_string());
+
+        let resolved = resolve_spawn(&s, None, &settings, None).unwrap();
+        assert_eq!(
+            resolved.provider_binary.as_deref(),
+            Some(opencode_stub.as_path())
+        );
     }
 }
 

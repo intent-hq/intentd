@@ -152,8 +152,11 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             // The secondary binary (unsloth: the `unsloth` CLI itself) is
             // resolved with the same provider_id/command pair the daemon's
             // managed-server lifecycle uses (`UnslothConfig::default`'s
-            // `resolve_binary`), so discovery and the actual spawn path agree
-            // on where the binary must live.
+            // `resolve_binary`) — minus the `providers.paths["unsloth"]`
+            // explicit override, which lives in settings above this leaf
+            // crate (discovery passes no explicit path for primaries
+            // either). A valid override can therefore make the managed
+            // server start where discovery reports the CLI missing.
             let secondary_binary = if gated_off.is_some() {
                 None
             } else {
@@ -243,7 +246,10 @@ pub fn probe_npx() -> NpxStatus {
 }
 
 /// Resolve a provider binary to an absolute path using the precedence order:
-/// 1. Explicit path from `providers.paths` map (keyed by provider ID)
+/// 1. Explicit path from `providers.paths` map (keyed by the provider that
+///    OWNS the binary, [`ProviderConfig::primary_binary_provider_id`]:
+///    unsloth's opencode primary resolves under the `opencode` key, while
+///    the `unsloth` key targets the unsloth CLI itself)
 /// 2. Native installer location (grok: `~/.grok/bin`, opencode: `~/.opencode/bin`)
 /// 3. `~/.augment/bin/<command>` (auggie-specific, not a generic managed tier)
 /// 4. Scan enhanced PATH directories (`intent_core::path_utils`: inherited
@@ -788,6 +794,21 @@ mod find_provider_binary_tests {
             Some("unsloth"),
             "unsloth availability must additionally require the unsloth CLI"
         );
+    }
+
+    /// The `providers.paths` override key for a provider's primary binary is
+    /// the provider that OWNS it: unsloth rides opencode, so its primary
+    /// resolves under the `opencode` key; every other provider owns its own.
+    #[test]
+    fn primary_binary_provider_id_retargets_only_unsloth() {
+        for provider in crate::config::ACP_PROVIDERS {
+            let expected = if provider.id == "unsloth" {
+                "opencode"
+            } else {
+                provider.id
+            };
+            assert_eq!(provider.primary_binary_provider_id(), expected);
+        }
     }
 
     #[test]
