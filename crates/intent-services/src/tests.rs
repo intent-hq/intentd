@@ -18929,10 +18929,28 @@ mod provider_discovery_payload {
                         "installed dual-binary providers must have the secondary resolved: {entry}"
                     );
                 }
+                // secondaryResolvedPath rides along exactly when the
+                // secondary resolved: an absolute path string, omitted
+                // otherwise.
+                if entry["secondaryResolved"] == true {
+                    let path = entry["secondaryResolvedPath"]
+                        .as_str()
+                        .expect("resolved secondary must carry secondaryResolvedPath");
+                    assert!(
+                        std::path::Path::new(path).is_absolute(),
+                        "secondaryResolvedPath must be absolute: {entry}"
+                    );
+                } else {
+                    assert!(
+                        entry.get("secondaryResolvedPath").is_none(),
+                        "unresolved secondary must omit secondaryResolvedPath: {entry}"
+                    );
+                }
             } else {
                 assert!(
                     entry.get("secondaryCommand").is_none()
-                        && entry.get("secondaryResolved").is_none(),
+                        && entry.get("secondaryResolved").is_none()
+                        && entry.get("secondaryResolvedPath").is_none(),
                     "providers without a probed secondary requirement must omit \
                      the attribution fields: {entry}"
                 );

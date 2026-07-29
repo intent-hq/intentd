@@ -1340,6 +1340,28 @@ async fn host_provider_discovery_over_wss() {
                     "installed dual-binary providers must have the secondary resolved: {p}"
                 );
             }
+            // secondaryResolvedPath is present exactly when the secondary
+            // resolved (an absolute path string), omitted otherwise —
+            // conditional on host state like the surrounding assertions.
+            if p["secondaryResolved"] == true {
+                let path = p["secondaryResolvedPath"]
+                    .as_str()
+                    .expect("resolved secondary must carry secondaryResolvedPath");
+                assert!(
+                    std::path::Path::new(path).is_absolute(),
+                    "provider.secondaryResolvedPath must be absolute: {p}"
+                );
+            } else {
+                assert!(
+                    p.get("secondaryResolvedPath").is_none(),
+                    "unresolved secondary must omit secondaryResolvedPath: {p}"
+                );
+            }
+        } else {
+            assert!(
+                p.get("secondaryResolvedPath").is_none(),
+                "providers without a secondary must omit secondaryResolvedPath: {p}"
+            );
         }
     }
     // unsloth (opencode + unsloth CLI) is the dual-binary provider: it must

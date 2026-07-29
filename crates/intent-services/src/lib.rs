@@ -19764,16 +19764,24 @@ pub fn discover_providers_with_npx() -> serde_json::Value {
             // (unsloth: opencode + unsloth) so RPC/FE consumers can name the
             // actually-missing binary, matching doctor (monorepo#991).
             // Omitted when the provider has no secondary requirement or was
-            // gated off (never probed).
-            if let Some((secondary_command, secondary_resolved)) = p.secondary_binary {
+            // gated off (never probed). When the secondary resolved, its
+            // absolute path rides along as secondaryResolvedPath; omitted
+            // when unresolved.
+            if let Some((secondary_command, ref secondary_path)) = p.secondary_binary {
                 obj.insert(
                     "secondaryCommand".to_string(),
                     serde_json::json!(secondary_command),
                 );
                 obj.insert(
                     "secondaryResolved".to_string(),
-                    serde_json::json!(secondary_resolved),
+                    serde_json::json!(secondary_path.is_some()),
                 );
+                if let Some(path) = secondary_path {
+                    obj.insert(
+                        "secondaryResolvedPath".to_string(),
+                        serde_json::json!(path.display().to_string()),
+                    );
+                }
             }
             serde_json::Value::Object(obj)
         })

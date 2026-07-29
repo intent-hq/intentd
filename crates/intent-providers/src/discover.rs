@@ -38,10 +38,12 @@ pub struct ProviderAvailability {
     pub npx_only_package: Option<&'static str>,
     /// For providers with [`ProviderConfig::requires_secondary_binary`]
     /// (unsloth: `opencode` + `unsloth`): the required secondary command and
-    /// whether it resolved, so callers (doctor) can attribute unavailability
-    /// to the actually-missing binary. `None` when the provider has no
-    /// secondary requirement or was gated off (never probed).
-    pub secondary_binary: Option<(&'static str, bool)>,
+    /// its resolved path (`Some` ⇒ resolved), so callers (doctor, the
+    /// discovery wire payload) can attribute unavailability to the
+    /// actually-missing binary and surface where the secondary lives. `None`
+    /// when the provider has no secondary requirement or was gated off
+    /// (never probed).
+    pub secondary_binary: Option<(&'static str, Option<PathBuf>)>,
 }
 
 /// Status of npx availability for provider fallback spawning.
@@ -157,13 +159,17 @@ pub fn discover_providers() -> Vec<ProviderAvailability> {
             } else {
                 provider
                     .requires_secondary_binary
-                    .map(|s| (s, find_provider_binary(s, s, None).is_some()))
+                    .map(|s| (s, find_provider_binary(s, s, None)))
             };
             let installed = gated_off.is_none()
                 && installed_with_secondary(
                     resolved_path.is_some(),
                     provider.requires_secondary_binary,
-                    |_| secondary_binary.is_some_and(|(_, resolved)| resolved),
+                    |_| {
+                        secondary_binary
+                            .as_ref()
+                            .is_some_and(|(_, path)| path.is_some())
+                    },
                 );
             ProviderAvailability {
                 id: provider.id,
@@ -807,14 +813,15 @@ mod find_provider_binary_tests {
         }
         // The snapshot must always carry the secondary-binary status for
         // unsloth (doctor's attribution input), consistent with a direct
-        // resolution of the unsloth CLI.
-        let (secondary, secondary_resolved) = unsloth
+        // resolution of the unsloth CLI — including the resolved path itself.
+        let (secondary, secondary_path) = unsloth
             .secondary_binary
+            .as_ref()
             .expect("unsloth must report its secondary-binary status");
-        assert_eq!(secondary, "unsloth");
+        assert_eq!(*secondary, "unsloth");
         assert_eq!(
-            secondary_resolved,
-            find_provider_binary("unsloth", "unsloth", None).is_some()
+            *secondary_path,
+            find_provider_binary("unsloth", "unsloth", None)
         );
     }
 
