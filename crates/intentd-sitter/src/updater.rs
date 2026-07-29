@@ -83,6 +83,8 @@ pub enum UpdateError {
     Archive { asset: String, reason: String },
     #[error("install io error: {0}")]
     Io(#[from] io::Error),
+    #[error("no manifest base URLs configured")]
+    NoBaseUrls,
 }
 
 /// The update engine. Holds the resolved sitter paths and an HTTP client
@@ -114,17 +116,17 @@ impl Updater {
 
     /// Updater against an ordered list of manifest base URLs; the manifest
     /// fetch tries each in order and the first fetchable + parseable
-    /// manifest wins. `base_urls` must be non-empty.
+    /// manifest wins. An empty list is rejected with
+    /// [`UpdateError::NoBaseUrls`].
     pub fn with_base_urls<I, S>(paths: SitterPaths, base_urls: I) -> Result<Self, UpdateError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let base_urls: Vec<String> = base_urls.into_iter().map(Into::into).collect();
-        assert!(
-            !base_urls.is_empty(),
-            "Updater requires at least one manifest base URL"
-        );
+        if base_urls.is_empty() {
+            return Err(UpdateError::NoBaseUrls);
+        }
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -247,17 +249,27 @@ impl Updater {
     /// error is returned.
     fn fetch_manifest(&self, channel: Channel) -> Result<ChannelManifest, UpdateError> {
         let mut last_err = None;
-        for base_url in &self.base_urls {
+        for (i, base_url) in self.base_urls.iter().enumerate() {
             let url = manifest::manifest_url(base_url, channel);
             let attempt = self
                 .fetch(&url, MANIFEST_TIMEOUT)
-                .and_then(|bytes| Ok(manifest::parse(&bytes)?));
+                .and_then(|bytes| manifest::parse(&bytes).map_err(UpdateError::from));
             match attempt {
                 Ok(manifest) => return Ok(manifest),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    // Surface a degraded primary even when a later base
+                    // succeeds (the overall check would otherwise hide it).
+                    if i + 1 < self.base_urls.len() {
+                        eprintln!(
+                            "intentd-sitter: manifest fetch from {url} failed ({e}); \
+                             trying next base"
+                        );
+                    }
+                    last_err = Some(e);
+                }
             }
         }
-        Err(last_err.expect("base_urls is never empty"))
+        Err(last_err.unwrap_or(UpdateError::NoBaseUrls))
     }
 
     fn fetch(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, UpdateError> {
