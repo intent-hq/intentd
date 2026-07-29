@@ -430,13 +430,17 @@ pub fn apply_baseline_env_to_stdio_servers(
 /// would clobber the baseline `PATH`. Empty inherited-`PATH` segments are
 /// dropped so the override never implicitly adds the current directory to
 /// lookup. Whitespace-free paths (and edge cases a basename lookup cannot
-/// fix, e.g. a spaced basename) are returned verbatim with no override.
+/// fix, e.g. a spaced basename or a relative path whose parent would resolve
+/// against the launcher child's cwd) are returned verbatim with no override.
 pub fn normalize_spaced_bridge_command(
     exe: &Path,
     inherited_path: Option<&OsStr>,
 ) -> (String, Option<String>) {
     let command = exe.to_string_lossy().into_owned();
     if !command.chars().any(char::is_whitespace) {
+        return (command, None);
+    }
+    if !exe.is_absolute() {
         return (command, None);
     }
     let (Some(parent), Some(file_name)) = (exe.parent(), exe.file_name()) else {

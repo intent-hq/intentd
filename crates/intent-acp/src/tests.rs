@@ -2107,6 +2107,18 @@ mod mcp_tests {
         assert_eq!(path, None);
     }
 
+    /// A relative spaced path can't be normalized: the prepended parent dir
+    /// would resolve against the launcher child's cwd, not the daemon's.
+    #[test]
+    fn relative_spaced_bridge_path_falls_back_to_verbatim_command() {
+        let (command, path) = normalize_spaced_bridge_command(
+            Path::new("my dir/intentd"),
+            Some(OsStr::new("/usr/bin")),
+        );
+        assert_eq!(command, "my dir/intentd");
+        assert_eq!(path, None);
+    }
+
     /// A spaced basename can't be fixed by PATH lookup — keep the absolute
     /// path verbatim rather than emitting a still-broken command.
     #[test]
