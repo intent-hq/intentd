@@ -3351,6 +3351,19 @@ async fn wss_git_diffs_paths_narrowing_round_trip() {
         assert!(paths.contains(&p), "missing {p} in {paths:?}");
     }
 
+    // Malformed `paths` (non-array, or array with a non-string element) → -32602.
+    for bad in [r#""a.txt""#, "[1]"] {
+        let resp = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"git.diffs","params":{{"workspaceId":"{ws_id}","paths":{bad}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32602, "paths={bad}");
+    }
+
     srv.ws.stop().await;
     std::fs::remove_dir_all(&repo).ok();
 }

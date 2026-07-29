@@ -1762,8 +1762,8 @@ async fn dispatch(
             // §5.6 extension: `paths` narrows the diff to exactly those
             // workspace-relative files (literal matching). The legacy single
             // `path` is folded into the same set; when both are supplied they
-            // are unioned. Absent/empty ⇒ full tree.
-            let mut paths = opt_str_array(params, "paths").unwrap_or_default();
+            // are unioned. Absent/empty ⇒ full tree; malformed ⇒ -32602.
+            let mut paths = strict_opt_str_array(params, "paths")?.unwrap_or_default();
             if let Some(path) = opt_str(params, "path") {
                 if !paths.contains(&path) {
                     paths.push(path);
@@ -3303,6 +3303,37 @@ fn opt_str_array(params: &Map<String, Value>, name: &str) -> Option<Vec<String>>
             .map(str::to_string)
             .collect()
     })
+}
+
+/// Strict optional string-array param: absent/null → `Ok(None)`; an array of
+/// strings → `Ok(Some(..))`; anything else (non-array, or an array with a
+/// non-string element) → `-32602`. Used for the `git.diffs` `paths` set.
+fn strict_opt_str_array(
+    params: &Map<String, Value>,
+    name: &str,
+) -> Result<Option<Vec<String>>, RpcErr> {
+    let value = match params.get(name) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    let items = value.as_array().ok_or_else(|| {
+        rpc(
+            INVALID_PARAMS,
+            format!("`{name}` must be an array of strings"),
+        )
+    })?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                rpc(
+                    INVALID_PARAMS,
+                    format!("`{name}` must be an array of strings"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Build [`ScriptCreateParams`] from `script.create` params: `name`, `command`,
