@@ -328,9 +328,20 @@ pub(crate) async fn handle(
                     ));
                 }
             };
+            // Same settings seam as `ProviderDiscovery` (monorepo#1065): the
+            // install gate must honor `providers.paths` overrides so a
+            // provider reachable only via a valid override is still probed
+            // (monorepo#1086). auggie follows the `host.checkAuggie`
+            // precedence: `context.auggiePath` wins over
+            // `providers.paths.auggie`.
+            let mut provider_paths = read_provider_paths(api).await;
+            if let Some(p) = read_setting_string(api, "context.auggiePath").await {
+                provider_paths.insert("auggie".to_string(), p);
+            }
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
                 force,
+                &provider_paths,
             )
             .await
             {
