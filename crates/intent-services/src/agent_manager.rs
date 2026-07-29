@@ -6560,10 +6560,15 @@ fn idle_timeout_turn_streamed(err: &Error) -> bool {
 /// i.e. `INTENTD_PROMPT_IDLE_TIMEOUT_MS` / 1800s default), not a hardcoded
 /// literal.
 fn idle_timeout_warning_text(window: std::time::Duration) -> String {
+    let secs = window.as_secs_f64();
+    let rendered = if secs.fract() == 0.0 {
+        window.as_secs().to_string()
+    } else {
+        secs.to_string()
+    };
     format!(
-        "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({}s of silence) and was \
-         interrupted. Assess where you left off and continue the work.",
-        window.as_secs()
+        "[SYSTEM WARNING] Your turn exceeded the inactivity timeout ({rendered}s of silence) \
+         and was interrupted. Assess where you left off and continue the work."
     )
 }
 
@@ -7928,9 +7933,12 @@ mod turn_failure_tests {
             "[SYSTEM WARNING] Your turn exceeded the inactivity timeout (1800s of silence) and \
              was interrupted. Assess where you left off and continue the work."
         );
-        // The window is the actual configured value, not a hardcoded literal.
+        // The window is the actual configured value, not a hardcoded literal,
+        // and sub-second precision is preserved rather than truncated.
         let text = idle_timeout_warning_text(std::time::Duration::from_millis(2500));
-        assert!(text.contains("(2s of silence)"), "{text}");
+        assert!(text.contains("(2.5s of silence)"), "{text}");
+        let text = idle_timeout_warning_text(std::time::Duration::from_millis(500));
+        assert!(text.contains("(0.5s of silence)"), "{text}");
     }
 
     #[test]

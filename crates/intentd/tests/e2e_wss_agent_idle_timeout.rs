@@ -327,8 +327,8 @@ fn conversation_texts(conv: &Value) -> Vec<(String, String)> {
 /// - the timed-out turn closes with a NORMAL `agent:stream:end` (no
 ///   `messageId` — zero output) and NO `agent:failed` / `agent:idle`;
 /// - an `agent:message` (role=user) lands AFTER that stream:end — the
-///   persisted warning row, `[SYSTEM WARNING] … (1s of silence) …` with the
-///   ACTUAL configured window;
+///   persisted warning row, `[SYSTEM WARNING] … (1.5s of silence) …` with the
+///   ACTUAL configured window (sub-second precision preserved);
 /// - the recovery turn streams and completes normally (`agent:stream:chunk`,
 ///   `agent:stream:end` with `messageId`, trailing `agent:idle`);
 /// - the assistant reply carries `turn=2` — the mock's per-process turn
@@ -492,7 +492,7 @@ async fn idle_timeout_warns_and_continues_on_same_child_over_wss() {
     assert!(
         warnings[0]
             .1
-            .contains("exceeded the inactivity timeout (1s of silence)"),
+            .contains("exceeded the inactivity timeout (1.5s of silence)"),
         "warning renders the configured window: {}",
         warnings[0].1
     );

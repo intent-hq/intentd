@@ -2172,6 +2172,62 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
     assert_eq!(end.data["messageId"], json!(messages[0].id));
 }
 
+/// Warn-and-continue (idle timeout after an UNMAPPED update): a
+/// `session/update` variant with no canonical turn mapping (here a thought
+/// chunk — same class as plan/mode/usage) still reset the idle timer, so it
+/// counts as intervening activity: the wrapped error carries the
+/// streamed-output suffix even though nothing was applied to the transcript.
+#[tokio::test]
+async fn idle_timeout_after_unmapped_update_marks_streamed() {
+    let _env = EnvGuard::set_all(&[("INTENTD_PROMPT_IDLE_TIMEOUT_MS", "100")]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let thought = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "thinking" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent) = connect_silent(vec![thought]);
+    let _sub = bus.subscribe(SubscriptionFilter::default());
+
+    let err = services
+        .run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            None,
+        )
+        .await
+        .expect_err("idle timeout fails the turn");
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with("session/prompt failed: session/prompt idle timeout"),
+        "idle timeout keeps the ordinary wrapper: {msg}"
+    );
+    assert!(
+        msg.ends_with(crate::agent_session::PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX),
+        "an unmapped update still stamps the activity suffix: {msg}"
+    );
+    // Nothing mapped → no assistant row persisted.
+    assert!(
+        bus.store()
+            .get_agent_messages(&agent_id, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no transcript row when only unmapped updates arrived"
+    );
+}
+
 /// Turn correlation (monorepo#1022): the failure-arm `agent:failed` emitted by
 /// `run_prompt_turn` carries the caller-supplied `turnId`; when the caller
 /// passes `None` (bare wiring) the field is omitted, never `null`.
