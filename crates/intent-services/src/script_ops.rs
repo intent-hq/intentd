@@ -27,6 +27,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::events::EventBus;
+use crate::shell::default_shell;
 use crate::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
@@ -902,22 +903,30 @@ fn enhanced_shell_path() -> Option<String> {
         .map(|joined| joined.to_string_lossy().into_owned())
 }
 
-/// The login shell to run scripts under (`$SHELL`, then `/bin/sh`).
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-}
-
 /// Shell args for `command`, mirroring the TS `getShellArgs`: `/bin/sh` uses
 /// `-c`; zsh/bash use `-l -c` (login shell for nvm/fnm PATH); Windows uses
 /// PowerShell `-Command` or `cmd /c`.
 fn shell_args(shell: &str, command: &str) -> Vec<String> {
+    shell_args_for(shell, command, cfg!(windows))
+}
+
+/// Platform-parametrized [`shell_args`] (test seam: the Windows arms are
+/// unit-tested on any host).
+fn shell_args_for(shell: &str, command: &str, is_windows: bool) -> Vec<String> {
     let file = std::path::Path::new(shell)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(shell)
         .to_lowercase();
+    // On a real Windows host `Path::file_name` already splits on `\`; this
+    // extra split only matters when the Windows arm runs under a POSIX test.
+    let file = if is_windows {
+        file.rsplit('\\').next().unwrap_or(&file).to_string()
+    } else {
+        file
+    };
     let base = file.strip_suffix(".exe").unwrap_or(&file);
-    if cfg!(windows) {
+    if is_windows {
         if base == "powershell" || base == "pwsh" {
             return vec![
                 "-NoProfile".to_string(),
@@ -1222,6 +1231,22 @@ mod tests {
         );
         // Unknown shell base falls through the login-shell default arm.
         assert_eq!(shell_args("/bin/fish", "x"), vec!["-l", "-c", "x"]);
+    }
+
+    #[test]
+    fn shell_args_for_windows_uses_command_for_powershell_and_slash_c_for_cmd() {
+        let ps = ["-NoProfile", "-NoLogo", "-NonInteractive", "-Command", "x"];
+        assert_eq!(shell_args_for("pwsh", "x", true), ps);
+        assert_eq!(shell_args_for("powershell.exe", "x", true), ps);
+        assert_eq!(
+            shell_args_for(r"C:\Program Files\PowerShell\7\pwsh.exe", "x", true),
+            ps
+        );
+        assert_eq!(shell_args_for("cmd.exe", "x", true), vec!["/c", "x"]);
+        assert_eq!(
+            shell_args_for(r"C:\Windows\system32\cmd.exe", "x", true),
+            vec!["/c", "x"]
+        );
     }
 
     #[test]

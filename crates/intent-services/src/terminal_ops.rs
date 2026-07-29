@@ -30,6 +30,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::events::EventBus;
+use crate::shell::default_shell;
 use crate::{publish_event, publish_event_transient, system_actor, SettingsRegistry};
 
 /// How often the output streamer polls for natural process exit. The broadcast
@@ -40,12 +41,6 @@ const EXIT_POLL: Duration = Duration::from_millis(25);
 
 /// Terminal type advertised by interactive PTYs rendered by xterm.js clients.
 const DEFAULT_TERM: &str = "xterm-256color";
-
-/// The default shell spawned when `terminal.create` omits a command. Mirrors the
-/// ancestor's reliance on the user's login shell (`$SHELL`, then `/bin/sh`).
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-}
 
 /// Ensure the effective terminal environment has a usable terminal type while
 /// preserving explicit or inherited non-empty values.
