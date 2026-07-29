@@ -83,13 +83,18 @@ jobs:
       # end in `.../target` so release-plz's packaged-dir fast path
       # (`is_cargo_packaged_dir`) recognizes `target/package/*` and lists
       # files from disk instead of re-running `cargo package --list`
-      # (which fails for internal path-only dependencies). Exported via
-      # GITHUB_ENV (runner.temp is unavailable in job-level `env`) so both
-      # rust-cache (which reads CARGO_TARGET_DIR to find the target dir to
-      # cache) and release-plz see the same path.
+      # (which fails for internal path-only dependencies).
+      #
+      # The dir deliberately coincides with rust-cache's default cache path
+      # (`$GITHUB_WORKSPACE/target`, from its default `workspaces: . ->
+      # target` input): rust-cache derives cached target paths only from
+      # that input — it never reads CARGO_TARGET_DIR — so pointing the
+      # build anywhere else (e.g. runner.temp) would silently skip caching
+      # the build dir. `/target` is gitignored, so it doesn't dirty the
+      # checkout for release-plz's git operations.
       - name: Set shared cargo target dir
         shell: bash
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/release-plz/target" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
       # Cross-run build cache for the `cargo package --workspace` compiles;
       # without it every run cold-compiles the whole workspace (~30-45 min).
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
