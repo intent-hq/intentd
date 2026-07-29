@@ -48,6 +48,20 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Store-backed workspace rows plus live `activity` only — no notes/
+    /// sessions/cow enrichment. Used by the workspace subscription snapshot so
+    /// seq-0 cannot emit multi-MB enriched payloads that HOL the connection
+    /// writer (observed ~4.5 MiB / 80 workspaces). Optional card aggregates are
+    /// omitted; clients treat missing fields as "derive locally / wait for
+    /// deltas" (same as a notes-read failure on list). Default falls back to
+    /// full `list_workspaces`.
+    fn list_workspaces_lite(
+        &self,
+        include_archived: bool,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        self.list_workspaces(include_archived)
+    }
+
     /// Fetch one workspace by id; `NotFound` if absent (PROTOCOL §5.1).
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let _ = id;
