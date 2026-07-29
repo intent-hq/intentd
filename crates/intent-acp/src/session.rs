@@ -80,8 +80,8 @@ fn session_setup_timeout() -> Duration {
 /// 30-minute contract above. The remedy for long silent operations (e.g. an
 /// agent blocking on `sleep` / `gh pr checks --watch` loops for >30 min) is
 /// agent-side: emit periodic activity by polling in shorter intervals.
-/// Context: monorepo#1106 diagnosis (2026-07-29), where a 30-minute silent
-/// watch loop tripped this timeout.
+/// Context: intent-hq/monorepo#1106 diagnosis (2026-07-29), where a
+/// 30-minute silent watch loop tripped this timeout.
 fn prompt_idle_timeout() -> Duration {
     if let Ok(val) = std::env::var("INTENTD_PROMPT_IDLE_TIMEOUT_MS") {
         if let Ok(ms) = val.parse::<u64>() {
