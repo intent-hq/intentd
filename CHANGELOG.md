@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.12] - 2026-07-29
+
+### 🚀 Features
+
+- Add providers.catalog RPC serving the intent-providers registry (monorepo#928) ([#694](https://github.com/intent-hq/intentd/pull/694))
+- Add atomic agent.sendQueuedMessageNow RPC; remove agent.forceMessage ([#696](https://github.com/intent-hq/intentd/pull/696))
+- Turn correlation id (turnId) on agent lifecycle events, queue entries, and RPC responses ([#699](https://github.com/intent-hq/intentd/pull/699))
+- Surface secondaryResolvedPath in host.providerDiscovery ([#701](https://github.com/intent-hq/intentd/pull/701))
+
+### 🐛 Bug Fixes
+
+- Thread combined-delivery prepend_* fields through enqueue_message (intent-hq/monorepo#1034) ([#693](https://github.com/intent-hq/intentd/pull/693))
+
+
 ## [0.2.11] - 2026-07-28
 
 ### 🚀 Features
