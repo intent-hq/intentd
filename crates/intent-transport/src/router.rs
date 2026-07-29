@@ -263,7 +263,13 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let enabled = match params.get("enabled") {
                 Some(Value::Bool(b)) => *b,
-                _ => {
+                Some(_) => {
+                    return Err(rpc(
+                        INVALID_PARAMS,
+                        "Invalid parameter: enabled must be a boolean",
+                    ))
+                }
+                None => {
                     return Err(rpc(
                         INVALID_PARAMS,
                         "Missing required parameter: enabled (boolean)",

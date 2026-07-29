@@ -496,14 +496,22 @@ pub(crate) async fn assemble_system_prompt(
     // on, the daemon's auto-commit-on-idle subscriber owns commits; when off,
     // nothing commits unless the user explicitly asks. Injected for every agent
     // (top-level and sub-agents alike) in both states so the model always has
-    // an explicit directive.
-    if auto_commit_enabled {
+    // an explicit directive. Per-session effective state: a session that
+    // opted out via `skipAutoCommit` (delegation/creation while the workspace
+    // was OFF) never auto-commits, so it must get the OFF clause even when
+    // the workspace toggle is currently on — otherwise the prompt would
+    // falsely claim end-of-turn commits that the idle subscriber will skip.
+    let effective_auto_commit =
+        auto_commit_enabled && !agent_session.map(|s| s.skip_auto_commit).unwrap_or(false);
+    if effective_auto_commit {
         parts.push(
             "## Commit Policy\n\n\
-             Do not commit — your changes are committed automatically by the \
-             system when your turn ends. The only exception is an explicit \
-             user-requested checkpoint commit, which goes through \
-             `agent_commit_changes`. Never run `git commit` yourself."
+             Do not commit on your own initiative — your changes are committed \
+             automatically by the system when your turn ends. When the user \
+             explicitly asks for a checkpoint commit, use `agent_commit_changes`; \
+             only run `git commit` yourself when the user explicitly asks for a \
+             git workflow that `agent_commit_changes` cannot express (e.g. \
+             multiple scoped commits on a branch)."
                 .to_string(),
         );
     } else {
@@ -551,12 +559,12 @@ pub(crate) async fn assemble_system_prompt(
              ends, and the answers arrive in the next user message."
                 .to_string(),
         );
-        let example_second_line = if auto_commit_enabled {
+        let example_second_line = if effective_auto_commit {
             "Check the changes in the diff view."
         } else {
             "Review changes before committing."
         };
-        let auto_commit_clause = if auto_commit_enabled {
+        let auto_commit_clause = if effective_auto_commit {
             " Auto-commit is enabled; do not include prompts about committing or reviewing changes before committing."
         } else {
             ""
@@ -990,8 +998,85 @@ This is a test skill.
             "ON-state clause should describe harness-owned commits"
         );
         assert!(
+            prompt.contains("only run `git commit` yourself when the user explicitly asks"),
+            "ON-state clause should carve out explicit user-requested git workflows"
+        );
+        assert!(
             !prompt.contains("Auto-commit is OFF."),
             "OFF-state clause should be absent when auto-commit is on"
+        );
+    }
+
+    /// Per-session effective state: a session that opted out via
+    /// `skipAutoCommit` gets the OFF clause even when the workspace's
+    /// auto-commit is on — the idle subscriber short-circuits on the session
+    /// flag, so the ON clause would falsely claim end-of-turn commits.
+    #[tokio::test]
+    async fn test_commit_policy_off_when_session_skips_auto_commit() {
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+
+        let ts = intent_core::now_iso();
+        let session = intent_core::AgentSession {
+            id: intent_core::AgentId::from("agent-skip"),
+            workspace_id: intent_core::WorkspaceId::from("ws-skip"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Skip Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: true,
+            completion_report: None,
+            completion_report_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            session_corrupted: false,
+            is_background: false,
+            metadata: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+
+        let prompt = assemble_system_prompt(
+            &store,
+            None,
+            "workspace",
+            None,
+            false,
+            true,
+            false,
+            None,
+            Some(&session),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            prompt.contains("Auto-commit is OFF."),
+            "session opt-out forces the OFF clause despite workspace auto-commit on"
+        );
+        assert!(
+            !prompt.contains("committed automatically by the system"),
+            "ON-state clause must be absent for an opted-out session"
+        );
+        assert!(
+            !prompt.contains("Auto-commit is enabled;"),
+            "suggested-prompts auto-commit clause must follow the effective state"
         );
     }
 

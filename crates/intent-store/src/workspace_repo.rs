@@ -19,9 +19,23 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
 impl Store {
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     pub async fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
+        self.insert_workspace_with_auto_commit(ws, None).await
+    }
+
+    /// Insert a workspace row with the per-workspace `auto_commit_enabled`
+    /// override seeded in the same INSERT (mirror-at-creation, spec Diagnosis
+    /// §3b). Atomic: the row can never exist without its seed, so a created
+    /// workspace never silently degrades to global-tracking semantics.
+    /// `None` leaves the column NULL (resolves against the global at read
+    /// time).
+    pub async fn insert_workspace_with_auto_commit(
+        &self,
+        ws: &Workspace,
+        auto_commit: Option<bool>,
+    ) -> Result<()> {
         let sql = format!(
-            "INSERT INTO workspace ({WORKSPACE_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -56,6 +70,7 @@ impl Store {
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
+            .bind(auto_commit.map(|v| v as i64))
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
