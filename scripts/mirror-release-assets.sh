@@ -42,10 +42,12 @@ PRUNE_STALE="${PRUNE_STALE:-false}"
 
 # Daemon tag shapes (same as make-channel-manifest.sh) plus the sitter tags
 # published by release-sitter.yml (sitter-vX.Y.Z and the fixed sitter-latest).
-if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ \
-   && ! "$TAG" =~ ^sitter-v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ \
+# Prerelease suffix is charset-restricted to semver identifiers so a tag that
+# passes validation is safe to echo in logs (no workflow-command injection).
+if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ \
+   && ! "$TAG" =~ ^sitter-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ \
    && "$TAG" != sitter-latest ]]; then
-  echo "error: tag must look like [v]X.Y.Z[-<prerelease>], sitter-vX.Y.Z[-<prerelease>], or sitter-latest, got: $TAG" >&2
+  echo "error: tag must look like [v]X.Y.Z[-<prerelease>], sitter-vX.Y.Z[-<prerelease>], or sitter-latest (prerelease limited to [0-9A-Za-z.-])" >&2
   exit 1
 fi
 

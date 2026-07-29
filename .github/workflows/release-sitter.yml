@@ -273,8 +273,15 @@ jobs:
       - deb
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    outputs:
+      enabled: ${{ steps.mirror.outputs.enabled }}
     # Serialize sitter-latest mirror refreshes so two tags pushed close
-    # together cannot interleave on the public fixed release.
+    # together cannot interleave on the public fixed release. This only
+    # serializes mirror jobs against each other, not against another tag's
+    # publish/deb jobs, so a mirror can read the source sitter-latest
+    # mid-refresh — that converges: the later tag's mirror re-reads the
+    # settled source state (the script reads the current source, not run
+    # artifacts).
     concurrency:
       group: intentd-sitter-release-mirror
       cancel-in-progress: false
@@ -333,13 +340,16 @@ jobs:
   # prereleases, mirroring the sitter-latest handling. Authenticates with the
   # same HOMEBREW_TAP_TOKEN secret the dist daemon pipeline used. Runs after
   # `mirror` because the rendered formula downloads its archives from the
-  # public intent-hq/intentd-releases mirror.
+  # public intent-hq/intentd-releases mirror — and is skipped entirely when
+  # the mirror was disabled (missing INTENTD_RELEASES_TOKEN), since pushing a
+  # formula whose URLs point at assets that were never mirrored would break
+  # `brew install` with 404s.
   publish-homebrew:
     needs:
       - plan
       - publish
       - mirror
-    if: ${{ needs.plan.outputs.prerelease == 'false' }}
+    if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the
