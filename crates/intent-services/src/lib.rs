@@ -2699,7 +2699,7 @@ impl Services {
         let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
 
         // Claim the merge atomically (current status → merging) so this path
-        // never merges concurrently with the sandbox.merge RPC or the
+        // never merges concurrently with the sandbox.cow.merge RPC or the
         // background retry sweep. Losing the claim (or finding the sandbox
         // already merging) means another path owns the merge; propagate
         // completion normally rather than double-merging.
@@ -2767,7 +2767,7 @@ impl Services {
                 canonical_head,
             } => {
                 // Success! Shared bookkeeping: mark merged, discard sandbox,
-                // emit sandbox:merged, clear retry count.
+                // emit sandbox:cow:merged, clear retry count.
                 self.finalize_sandbox_merged(
                     workspace_id,
                     agent_id,
@@ -2988,9 +2988,9 @@ impl Services {
     }
 
     /// Shared success bookkeeping for a merged sandbox, used by every
-    /// merge-back caller (completion interception, the `sandbox.merge` RPC,
+    /// merge-back caller (completion interception, the `sandbox.cow.merge` RPC,
     /// and the background retry sweep): mark the record `merged`, discard
-    /// the sandbox directory + record, emit `sandbox:merged`, and clear the
+    /// the sandbox directory + record, emit `sandbox:cow:merged`, and clear the
     /// retry count. All store failures are logged and swallowed — the merge
     /// itself already landed in canonical.
     pub(crate) async fn finalize_sandbox_merged(
@@ -3020,7 +3020,7 @@ impl Services {
         let event = NewEvent {
             workspace_id: workspace_id.clone(),
             timestamp: now_iso(),
-            event_type: "sandbox:merged".to_string(),
+            event_type: "sandbox:cow:merged".to_string(),
             actor: intent_core::EventActor {
                 actor_type: ActorType::System,
                 id: Some("intentd".to_string()),
@@ -3050,7 +3050,7 @@ impl Services {
     }
 
     /// Crash-recovery for sandboxes stranded `merging`: every merge path
-    /// (completion interception, `sandbox.merge` RPC, retry sweep) transits
+    /// (completion interception, `sandbox.cow.merge` RPC, retry sweep) transits
     /// through `merging`, so a daemon crash mid-merge leaves the row there —
     /// invisible to the sweep and unclaimable by the RPC. On a fresh daemon
     /// no merge can be in flight, so resetting `merging → merge_pending` is
@@ -3110,7 +3110,7 @@ impl Services {
 
     /// Background retry sweep for `merge_pending` sandboxes. Merge-back
     /// otherwise only triggers on agent completion or the manual
-    /// `sandbox.merge` RPC, so a sandbox stranded `merge_pending` (daemon
+    /// `sandbox.cow.merge` RPC, so a sandbox stranded `merge_pending` (daemon
     /// restart mid-merge, or historical failures like the pre-#592 fetch bug)
     /// never self-heals. The daemon runs this on startup and periodically.
     ///
@@ -3118,12 +3118,12 @@ impl Services {
     /// - already at [`SANDBOX_MERGE_SWEEP_RETRY_CAP`] → skipped (debug log);
     ///   the WARN naming sandbox/agent/workspace/last error fired on the
     ///   attempt that exhausted the cap, and the sandbox stays
-    ///   `merge_pending` for manual `sandbox.merge` / `sandbox.discard`;
+    ///   `merge_pending` for manual `sandbox.cow.merge` / `sandbox.cow.discard`;
     /// - agent mid-turn ([`WorkspaceApi::agent_is_busy`]) → skipped, no merge
     ///   under an active worker;
     /// - claimed atomically `merge_pending → merging`
     ///   ([`Store::try_transition_sandbox_status`]) so a concurrent
-    ///   `sandbox.merge` RPC or overlapping sweep never double-merges;
+    ///   `sandbox.cow.merge` RPC or overlapping sweep never double-merges;
     /// - `Merged` → identical bookkeeping to the RPC path
     ///   ([`Services::finalize_sandbox_merged`]);
     /// - `Blocked` → logged and returned to `merge_pending` WITHOUT
@@ -3302,7 +3302,7 @@ impl Services {
                 workspace = %workspace_id.0,
                 retries = attempts,
                 last_error = %last_error,
-                "merge retry sweep: retry cap exhausted; sandbox stays merge_pending — resolve via sandbox.merge or sandbox.discard"
+                "merge retry sweep: retry cap exhausted; sandbox stays merge_pending — resolve via sandbox.cow.merge or sandbox.cow.discard"
             );
         } else {
             tracing::info!(
@@ -6097,8 +6097,8 @@ fn search_done_event(
 }
 
 /// Maximum merge attempts the background sweep will make per sandbox before
-/// leaving it `merge_pending` for manual handling (`sandbox.merge` /
-/// `sandbox.discard`). `Blocked` outcomes do not consume attempts.
+/// leaving it `merge_pending` for manual handling (`sandbox.cow.merge` /
+/// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
 pub const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
 
 /// Outcome tally for one [`Services::sweep_merge_pending_sandboxes`] pass,
@@ -15513,7 +15513,7 @@ impl WorkspaceApi for Services {
                     canonical_head,
                 } => {
                     // Shared bookkeeping: mark merged, discard sandbox, emit
-                    // sandbox:merged, clear retry count.
+                    // sandbox:cow:merged, clear retry count.
                     self.finalize_sandbox_merged(
                         &workspace_id,
                         &sandbox_id,

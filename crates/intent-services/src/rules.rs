@@ -351,7 +351,7 @@ fn build_isolation_hint(
                      the merge (up to 2 attempts).\n\n\
                      **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
                      overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
-                     with `merge_pending` status. Use `sandbox.merge` or `sandbox.discard` RPCs, or ask the user \
+                     with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
                      to commit/stash their WIP, then manually merge.".to_string()
                 );
             }
