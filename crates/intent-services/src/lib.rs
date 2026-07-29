@@ -8592,6 +8592,31 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn list_workspaces_lite(
+        &self,
+        include_archived: bool,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        let store = self.store.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            // Store rows + live activity only. No notes/sessions/cow/PR rollups
+            // so workspace.subscribe seq-0 stays tens of KB instead of ~4.5 MiB
+            // for ~80 workspaces (that frame HOL'd the UDS writer for hundreds
+            // of ms and stranded interactive replies until the FE 30s timeout).
+            let mut list = store.list_workspaces(include_archived).await?;
+            for ws in &mut list {
+                ws.activity = this.workspace_activity(&ws.id);
+                ws.task_stats = None;
+                ws.agent_summary = None;
+                ws.diff_summary = None;
+                ws.cow_supported = None;
+                // Keep PR fields if already on the row (cheap, already stored);
+                // do not fetch/refresh them here.
+            }
+            Ok(list)
+        })
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let this = self.clone();
@@ -14715,12 +14740,7 @@ impl WorkspaceApi for Services {
             let started = std::time::Instant::now();
             let path_count = paths.as_ref().map(|p| p.len()).unwrap_or(0);
             let result = tokio::task::spawn_blocking(move || {
-                git_ops::build_diffs(
-                    &worktree,
-                    paths.as_deref(),
-                    staged,
-                    commit_hash.as_deref(),
-                )
+                git_ops::build_diffs(&worktree, paths.as_deref(), staged, commit_hash.as_deref())
             })
             .await
             .map_err(|e| Error::Internal(format!("git.diffs task failed: {e}")))?;

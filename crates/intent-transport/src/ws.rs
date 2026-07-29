@@ -588,6 +588,14 @@ impl WsInner {
                     Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
                 },
                 Some(frame) = app_rx.recv() => {
+                    if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                        tracing::error!(
+                            frame_bytes = frame.len(),
+                            limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+                            "dropping oversized outbound WSS frame"
+                        );
+                        continue;
+                    }
                     if sink.send(Message::Text(frame)).await.is_err() {
                         break;
                     }

@@ -357,7 +357,6 @@ impl WorkspaceAggregateCache {
         }
     }
 
-
     /// Compute (or serve from cache) the `cowSupported` aggregate for a
     /// workspaces root. The probe runs root→root, so it reports whether the
     /// root's filesystem supports CoW cloning — a machine capability,
