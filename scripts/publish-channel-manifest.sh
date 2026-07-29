@@ -2,19 +2,20 @@
 # Upload a channel manifest to its fixed channel release, creating the release
 # if it does not exist yet.
 #
-# Usage: publish-channel-manifest.sh <channel> <manifest-file>
+# Usage: publish-channel-manifest.sh <channel> <manifest-file> [repo]
 #
 # <channel> is "stable" or "beta"; the manifest lands as an asset on the
 # `channel-<channel>` release (created with --latest=false so it never shadows
-# real releases). Requires: gh (authenticated via GH_TOKEN) and an explicit
-# GITHUB_REPOSITORY (owner/repo) — no default, so a local run can never push a
-# manifest to the upstream repo by accident.
+# real releases). [repo] defaults to GITHUB_REPOSITORY; pass it explicitly to
+# publish to another repo (e.g. the public intent-hq/intentd-releases mirror).
+# Requires: gh (authenticated via GH_TOKEN) and an explicit repo — no default,
+# so a local run can never push a manifest to the upstream repo by accident.
 set -euo pipefail
 
-usage="usage: publish-channel-manifest.sh <channel> <manifest-file>"
+usage="usage: publish-channel-manifest.sh <channel> <manifest-file> [repo]"
 CHANNEL="${1:?$usage}"
 MANIFEST="${2:?$usage}"
-REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set}"
+REPO="${3:-${GITHUB_REPOSITORY:?GITHUB_REPOSITORY (owner/repo) must be set (or pass [repo])}}"
 
 if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
   echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
@@ -28,8 +29,10 @@ fi
 channel_tag="channel-$CHANNEL"
 # Pin the channel tag to a deterministic commit in CI (GITHUB_SHA); locally gh
 # falls back to the default branch HEAD. The tag itself is never consumed.
+# GITHUB_SHA only exists in the repo the workflow runs in, so skip the pin
+# when publishing to a different repo (the mirror has unrelated history).
 target_args=()
-if [[ -n "${GITHUB_SHA:-}" ]]; then
+if [[ -n "${GITHUB_SHA:-}" && "$REPO" == "${GITHUB_REPOSITORY:-}" ]]; then
   target_args=(--target "$GITHUB_SHA")
 fi
 if ! gh release view "$channel_tag" --repo "$REPO" >/dev/null 2>&1; then

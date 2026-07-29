@@ -9,6 +9,12 @@
 # The manifests give consumers (e.g. cloudlands-fe pin-bump automation,
 # installer scripts) a stable URL to discover the latest release per channel.
 # Schema is documented in scripts/make-channel-manifest.sh and the README.
+#
+# When the INTENTD_RELEASES_TOKEN secret is configured, the release's platform
+# archives + .sha256 sidecars are also mirrored to the public
+# intent-hq/intentd-releases repo, together with a beta.json whose platform
+# URLs point at the mirrored assets. The beta.json published on this repo is
+# unchanged (sitter fallback path + future open-source path).
 name: Publish channel manifest
 
 on:
@@ -56,3 +62,44 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh beta beta.json
+      # --- Public mirror: intent-hq/intentd-releases ---
+      # Skipped with a warning when the INTENTD_RELEASES_TOKEN secret is not
+      # configured, so a missing secret never blocks the release itself.
+      - name: Check mirror token
+        id: mirror
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          if [[ -n "$INTENTD_RELEASES_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::INTENTD_RELEASES_TOKEN secret is not configured; skipping mirror to intent-hq/intentd-releases"
+          fi
+      - name: Mirror release assets to intentd-releases
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          DEST_REPO: intent-hq/intentd-releases
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/mirror-release-assets.sh "$TAG"
+      # Same release, but the platform URLs point at the mirrored assets.
+      - name: Build mirror channel manifest
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET_REPO: intent-hq/intentd-releases
+        run: |
+          mkdir -p mirror
+          ./scripts/make-channel-manifest.sh "$TAG" beta mirror/beta.json
+      - name: Publish manifest to intentd-releases channel release
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/publish-channel-manifest.sh beta mirror/beta.json intent-hq/intentd-releases

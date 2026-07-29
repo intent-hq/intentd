@@ -11,6 +11,11 @@
 # (intentd-<target>.tar.xz / .tar.gz / .zip) with its .sha256 sidecar, and writes
 # a JSON manifest. Requires: gh (authenticated via GH_TOKEN), jq, awk.
 #
+# The release is read from GITHUB_REPOSITORY (default intent-hq/intentd). Set
+# ASSET_REPO to point the platform `url`s at a different repo hosting the same
+# assets under the same tag (e.g. the public intent-hq/intentd-releases
+# mirror); it defaults to the repo the release is read from.
+#
 # Manifest schema (schema version 1):
 # {
 #   "schema": 1,
@@ -33,6 +38,7 @@ TAG="${1:?$usage}"
 CHANNEL="${2:?$usage}"
 OUT="${3:?$usage}"
 REPO="${GITHUB_REPOSITORY:-intent-hq/intentd}"
+ASSET_REPO="${ASSET_REPO:-$REPO}"
 
 if [[ "$CHANNEL" != "stable" && "$CHANNEL" != "beta" ]]; then
   echo "error: channel must be 'stable' or 'beta', got: $CHANNEL" >&2
@@ -87,7 +93,7 @@ for asset in "${archives[@]}"; do
     exit 1
   fi
 
-  url="https://github.com/${REPO}/releases/download/${TAG}/${asset}"
+  url="https://github.com/${ASSET_REPO}/releases/download/${TAG}/${asset}"
   platforms=$(jq --arg t "$target" --arg a "$asset" --arg u "$url" --arg s "$sha256" \
     '.[$t] = {asset: $a, url: $u, sha256: $s}' <<<"$platforms")
 done

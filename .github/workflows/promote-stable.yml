@@ -7,6 +7,13 @@
 # `channel-stable` release. Consumers (e.g. cloudlands-fe pin-bump automation,
 # installer scripts) discover the latest stable release from that manifest.
 #
+# When the INTENTD_RELEASES_TOKEN secret is configured, the promoted release's
+# platform archives + .sha256 sidecars are also mirrored to the public
+# intent-hq/intentd-releases repo (idempotent, so promoting a release cut
+# before mirroring existed backfills it), together with a stable.json whose
+# platform URLs point at the mirrored assets. The stable.json published on
+# this repo is unchanged (sitter fallback path + future open-source path).
+#
 # As a best-effort extra, promotion also rewrites the `channel-stable` release
 # body with aggregated release notes covering every version since the previous
 # stable (aggregate-stable-notes.sh). Notes steps are fail-soft: they never
@@ -94,6 +101,47 @@ jobs:
         shell: bash
         run: |
           ./scripts/publish-channel-manifest.sh stable stable.json
+      # --- Public mirror: intent-hq/intentd-releases ---
+      # Skipped with a warning when the INTENTD_RELEASES_TOKEN secret is not
+      # configured, so a missing secret never blocks the promotion itself.
+      - name: Check mirror token
+        id: mirror
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          if [[ -n "$INTENTD_RELEASES_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::INTENTD_RELEASES_TOKEN secret is not configured; skipping mirror to intent-hq/intentd-releases"
+          fi
+      # Idempotent: creates the mirrored release if missing and re-uploads the
+      # assets with --clobber, so promoting a pre-mirror release still works.
+      - name: Mirror release assets to intentd-releases
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          DEST_REPO: intent-hq/intentd-releases
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/mirror-release-assets.sh "v${VERSION}"
+      # Same release, but the platform URLs point at the mirrored assets.
+      - name: Build mirror stable manifest
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          ASSET_REPO: intent-hq/intentd-releases
+        run: |
+          mkdir -p mirror
+          ./scripts/make-channel-manifest.sh "v${VERSION}" stable mirror/stable.json
+      - name: Publish manifest to intentd-releases channel-stable
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          ./scripts/publish-channel-manifest.sh stable mirror/stable.json intent-hq/intentd-releases
       # Fail-soft: aggregated notes are a nice-to-have; a failure here must
       # never fail the promotion (the manifest is already published).
       - name: Aggregate stable release notes
