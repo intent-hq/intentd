@@ -3678,9 +3678,6 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
     // The default `WorkspaceApi` impl surfaces `-32603`; the point is that the
     // methods dispatch (never `-32601 Method not found`).
     for method in [
-        "file-tracking.init",
-        "file-tracking.sync",
-        "file-tracking.load",
         "file-tracking.getChanges",
         "file-tracking.loadCommits",
         "file-tracking.getLineStats",
@@ -3695,7 +3692,7 @@ async fn file_tracking_methods_are_routed_not_method_not_found() {
 
 #[tokio::test]
 async fn file_tracking_reads_require_workspace_id() {
-    for method in ["file-tracking.load", "file-tracking.getLineStats"] {
+    for method in ["file-tracking.getChanges", "file-tracking.getLineStats"] {
         let msg = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{}}}}"#);
         let v = call(&msg).await.unwrap();
         assert_eq!(err_code(&v), -32602);

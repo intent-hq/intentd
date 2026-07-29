@@ -8274,7 +8274,7 @@ mod file_tracking {
     }
 
     #[tokio::test]
-    async fn load_returns_tracked_changes_with_attribution() {
+    async fn get_changes_returns_tracked_changes_with_attribution() {
         let (_t, svc, ws) = ft_setup().await;
         svc.store()
             .upsert_tracked_change(&tracked(&ws, "src/a.ts", "unstaged", Some("agent-1")))
@@ -8285,7 +8285,10 @@ mod file_tracking {
             .await
             .unwrap();
 
-        let result = svc.file_tracking_load(ws.clone()).await.unwrap();
+        let result = svc
+            .file_tracking_get_changes(ws.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(result["totalCount"], serde_json::json!(2));
         assert_eq!(result["truncated"], serde_json::json!(false));
         let changes = result["changes"].as_array().unwrap();
@@ -8360,14 +8363,10 @@ mod file_tracking {
     }
 
     #[tokio::test]
-    async fn init_is_ok_and_load_empty_for_unknown_workspace() {
-        let (_t, svc, ws) = ft_setup().await;
-        assert_eq!(
-            svc.file_tracking_init(ws.clone()).await.unwrap(),
-            serde_json::json!({ "ok": true })
-        );
+    async fn get_changes_empty_for_unknown_workspace() {
+        let (_t, svc, _ws) = ft_setup().await;
         let missing = WorkspaceId::new();
-        let result = svc.file_tracking_load(missing).await.unwrap();
+        let result = svc.file_tracking_get_changes(missing, None).await.unwrap();
         assert_eq!(result["totalCount"], serde_json::json!(0));
         assert_eq!(result["changes"], serde_json::json!([]));
     }
@@ -8396,7 +8395,10 @@ mod file_tracking {
             .unwrap();
         let st = intent_git::status::status(&repo.dir).unwrap();
         assert!(st.files.iter().any(|f| f.path == "x.txt" && f.staged));
-        let changes = svc.file_tracking_load(ws_id.clone()).await.unwrap();
+        let changes = svc
+            .file_tracking_get_changes(ws_id.clone(), None)
+            .await
+            .unwrap();
         let row = changes["changes"]
             .as_array()
             .unwrap()
@@ -8415,7 +8417,10 @@ mod file_tracking {
             .unwrap();
         let st = intent_git::status::status(&repo.dir).unwrap();
         assert!(st.files.iter().any(|f| f.path == "x.txt" && !f.staged));
-        let changes = svc.file_tracking_load(ws_id.clone()).await.unwrap();
+        let changes = svc
+            .file_tracking_get_changes(ws_id.clone(), None)
+            .await
+            .unwrap();
         let row = changes["changes"]
             .as_array()
             .unwrap()
@@ -8470,39 +8475,6 @@ mod file_tracking {
         // payload; clients fetch per-file data via `git.commitDetails`.
         assert!(head.get("files").is_none());
         assert!(head.get("filesChanged").is_none());
-    }
-
-    #[tokio::test]
-    async fn sync_reconciles_unstaged_changes_preserving_attribution() {
-        let repo = init_git_repo();
-        // A pre-existing agent attribution row for a file we now modify.
-        std::fs::write(repo.dir.join("seed.txt"), "seed\nmore\n").unwrap();
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let ws_id = WorkspaceId::new();
-        let mut ws = workspace(&ws_id);
-        ws.worktree_path = Some(repo.dir.to_string_lossy().to_string());
-        store.insert_workspace(&ws).await.unwrap();
-        store
-            .upsert_tracked_change(&tracked(&ws_id, "seed.txt", "unstaged", Some("agent-3")))
-            .await
-            .unwrap();
-        let svc = Services::new(store);
-
-        let result = svc.file_tracking_sync(ws_id.clone(), false).await.unwrap();
-        assert_eq!(result["success"], serde_json::json!(true));
-        let changes = svc.file_tracking_load(ws_id).await.unwrap();
-        let row = changes["changes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["relativePath"] == "seed.txt")
-            .unwrap();
-        assert_eq!(
-            row["attribution"]["agent"]["agentId"],
-            serde_json::json!("agent-3")
-        );
-        assert!(row["stats"]["additions"].as_i64().unwrap() >= 1);
     }
 
     /// `git.stage` → `git.unstage` round-trip over the git.* RPC surface: a

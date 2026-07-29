@@ -2263,6 +2263,199 @@ async fn busy_queue_fallback_preserves_prepend_fields() {
     mgr.end_turn(&id).await;
 }
 
+/// Append-failure auto-queue interaction (monorepo#1034 / #1056): when the
+/// mid-send `append_agent_message_with_id` fails on a validated agent,
+/// `send_message` falls back to the auto-queue — the queued entry must carry
+/// the caller's combined-delivery `prepend_*` fields so the eventual drain
+/// still delivers the preempted message ahead of the interrupt message.
+///
+/// The bare `ALTER TABLE agent_message RENAME` trick from the
+/// `failed_drain_persist_*` tests cannot be reused verbatim here: the
+/// up-front `require_agent_session` validation (monorepo#564) and the
+/// vanished-session race guard inside the append-failure arm both READ the
+/// transcript table, so hiding it entirely fails the send closed instead of
+/// auto-queueing. Shadowing the renamed table with a read-only VIEW keeps
+/// every read working while every INSERT fails ("cannot modify ... it is a
+/// view"), forcing exactly the append to fail.
+#[tokio::test]
+async fn append_failure_queue_fallback_preserves_prepend_fields() {
+    let script = mock_agent_script();
+    // The rule keys on the exact "original\n\nnew" adjacency that
+    // `build_turn_prompt` renders, so the assistant response below proves the
+    // redriven drain delivered ONE combined prompt, original first.
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": "original ask\n\nurgent update",
+            "response": "combined-original-first",
+        }],
+        "response": "prepend missing from prompt",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "10,10"),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-prep-app"),
+        AgentId::from("a-prep-app"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    // Shadow the transcript table with a read-only VIEW: session validation
+    // and transcript reads keep working, but the mid-send append INSERT
+    // fails, taking the auto-queue arm.
+    sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("hide agent_message table");
+    sqlx::query("CREATE VIEW agent_message AS SELECT * FROM agent_message_broken")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("shadow agent_message with a read-only view");
+
+    let options = super::TurnOptions {
+        prepend_content: Some("original ask".to_string()),
+        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_file_blocks: Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ])),
+        ..super::TurnOptions::default()
+    };
+    let result = mgr
+        .interrupt_send_message(
+            id.clone(),
+            ws.clone(),
+            "urgent update".to_string(),
+            None,
+            options,
+        )
+        .await
+        .expect("append failure falls back to the auto-queue");
+    assert_eq!(result["queued"], json!(true), "parked, not streamed");
+    // Wire-only semantics: the RPC snapshot of the auto-queued entry does not
+    // leak the prompt-only fields. The positive anchor guards against a
+    // vacuous pass — `.get(...)` on a missing/non-object `queuedMessage`
+    // would also return `None`.
+    let wire = &result["queuedMessage"];
+    assert_eq!(
+        wire["content"],
+        json!("urgent update"),
+        "queuedMessage snapshot present on the fallback response: {result}"
+    );
+    assert!(wire.get("prependContent").is_none());
+    assert!(wire.get("prependImageBlocks").is_none());
+    assert!(wire.get("prependFileBlocks").is_none());
+
+    // The auto-queue's synchronous self-drain dequeued the entry, hit the
+    // same broken store in `persist_user`, and requeued it front (fail-closed
+    // drain, #547) — threading the entry's `prepend_*` fields through
+    // `TurnOptions` and back. The surviving entry proves the auto-queue arm
+    // captured them: had `send_message` dropped them (the pre-fix bug), the
+    // requeued entry would carry `None`.
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_session_status(&id)
+            .await
+            .unwrap(),
+        AgentStatus::Error,
+        "failed self-drain parked the session for agent.retry"
+    );
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("auto-queued message survives the failed self-drain");
+    assert_eq!(queued.content, "urgent update");
+    assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+    );
+    assert_eq!(
+        queued.prepend_file_blocks,
+        Some(json!([
+            {"data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
+        ]))
+    );
+    assert!(!queued.persisted, "user row never reached the transcript");
+    // The wire shape (`agent.getQueue`) does not leak the prompt-only fields.
+    let wire = queued.to_value(0);
+    assert!(wire.get("prependContent").is_none());
+    assert!(wire.get("prependImageBlocks").is_none());
+    assert!(wire.get("prependFileBlocks").is_none());
+    mgr.services.requeue_front(&id, queued);
+
+    // Restore the store and redrive: the drain must deliver ONE combined
+    // prompt with the preempted text first (block ordering itself is covered
+    // by `build_turn_prompt_prepends_preempted_content_and_attachments_first`).
+    sqlx::query("DROP VIEW agent_message")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("drop shadow view");
+    sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+        .execute(mgr.services.store.write_pool())
+        .await
+        .expect("restore agent_message table");
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let user_rows: Vec<_> = messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!("urgent update"))
+        .collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "the interrupt message lands in the transcript exactly once: {messages:?}"
+    );
+    // Wire-only for the transcript too: the prepend content rides the prompt,
+    // never persisting as its own user row.
+    assert!(
+        !messages.iter().any(|m| m.role == "user"
+            && serde_json::to_string(&m.content)
+                .unwrap()
+                .contains("original ask")),
+        "the prepend content must not persist as a user row: {messages:?}"
+    );
+    let assistant = messages
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("retried turn produced assistant output");
+    assert!(
+        serde_json::to_string(&assistant.content)
+            .unwrap()
+            .contains("combined-original-first"),
+        "drain delivered the combined prompt original-first: {messages:?}"
+    );
+}
+
 /// Turn correlation across retries (monorepo#1022): a terminal-failure
 /// requeue mints a NEW entry `id` but preserves the failed turn's ORIGINAL
 /// `turn_id`, so the retry redrives the same logical turn.
