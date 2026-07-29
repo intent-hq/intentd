@@ -112,10 +112,12 @@ pub fn diff_index_to_workdir(repo_path: &Path) -> Result<Vec<FileDiff>> {
 /// two-pass combination of [`diff_index_to_workdir`] +
 /// [`hunks_index_to_workdir`], which walks the tree once per call.
 ///
-/// `pathspecs` narrows the diff: when `Some`, each entry is added as a libgit2
-/// pathspec so the walk is pruned to matching paths (a path with no pending
-/// change yields no entry). `None` diffs the full tree. An empty slice behaves
-/// like `None` (libgit2 treats no pathspecs as match-all).
+/// `pathspecs` narrows the diff: when `Some`, each entry is added as a
+/// **literal** path (fnmatch pattern matching is disabled, so a path whose
+/// name contains `*`/`?`/`[...]` still matches itself) and the walk is pruned
+/// to matching paths (a path with no pending change yields no entry). `None`
+/// diffs the full tree. An empty slice behaves like `None` (libgit2 treats no
+/// pathspecs as match-all).
 pub fn diff_index_to_workdir_with_hunks(
     repo_path: &Path,
     pathspecs: Option<&[&str]>,
@@ -126,6 +128,7 @@ pub fn diff_index_to_workdir_with_hunks(
         .recurse_untracked_dirs(true)
         .show_untracked_content(true);
     if let Some(specs) = pathspecs {
+        opts.disable_pathspec_match(true);
         for spec in specs {
             opts.pathspec(spec);
         }
@@ -775,6 +778,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn single_pass_pathspec_treats_special_characters_literally() {
+        // A path containing fnmatch metacharacters must match itself (and
+        // nothing else): `a[1].txt` narrowed literally, not as a char class
+        // that would match `a1.txt` and miss the real file.
+        let dir = init_repo("diff-single-pass-literal");
+        commit_file(dir.path(), "seed.txt", "seed\n");
+        write_file(dir.path(), "a[1].txt", "bracketed\n");
+        write_file(dir.path(), "a1.txt", "plain\n");
+        let narrowed = diff_index_to_workdir_with_hunks(dir.path(), Some(&["a[1].txt"])).unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].file.path, "a[1].txt");
+        assert!(!narrowed[0].hunks.is_empty());
     }
 
     #[test]
