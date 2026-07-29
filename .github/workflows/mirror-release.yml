@@ -1,12 +1,15 @@
 # Manual (workflow_dispatch) mirroring of an existing release to the public
 # intent-hq/intentd-releases repo — the backfill path for releases cut before
 # automatic mirroring existed (publish-channel-manifest.yml / promote-stable.yml
-# mirror new releases and promotions automatically).
+# mirror new daemon releases and promotions automatically; release-sitter.yml
+# mirrors new sitter releases).
 #
-# Mirrors the tag's platform archives + .sha256 sidecars via
+# Accepts daemon tags ([v]X.Y.Z), sitter tags (sitter-vX.Y.Z), and the fixed
+# sitter-latest release. Mirrors the tag's assets via
 # scripts/mirror-release-assets.sh (idempotent: re-runs re-upload with
-# --clobber). Optionally also republishes the beta/stable channel manifests on
-# intentd-releases, rebuilt with ASSET_REPO so their platform URLs point at the
+# --clobber; sitter-latest additionally prunes stale assets). Optionally also
+# republishes the beta/stable channel manifests on intentd-releases (daemon
+# tags only), rebuilt with ASSET_REPO so their platform URLs point at the
 # mirrored assets. Each channel republish runs in its own job that shares the
 # concurrency group of the workflow that normally publishes that channel
 # (publish-channel-manifest.yml for beta, promote-stable.yml for stable), so
@@ -22,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to mirror (e.g. v0.2.12)'
+        description: 'Existing release tag to mirror (e.g. v0.2.12, sitter-v0.1.0, sitter-latest)'
         required: true
         type: string
       republish:
@@ -46,6 +49,8 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      kind: ${{ steps.validate.outputs.kind }}
     concurrency:
       group: intentd-mirror-release
       cancel-in-progress: false
@@ -57,17 +62,25 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate tag format
+        id: validate
         shell: bash
         run: |
           # Charset-restricted prerelease suffix (semver identifiers), so a
           # tag that passes validation is safe to echo in logs/summaries.
-          if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            kind=daemon
+          elif [[ "$TAG" =~ ^sitter-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            kind=sitter
+          elif [[ "$TAG" == sitter-latest ]]; then
+            kind=sitter-latest
+          else
             # Deliberately not echoing the raw input: it is unvalidated and
             # could contain workflow-command sequences (log injection).
-            echo "::error::Invalid tag input. Expected [v]X.Y.Z or [v]X.Y.Z-<prerelease> (prerelease limited to [0-9A-Za-z.-])."
+            echo "::error::Invalid tag input. Expected [v]X.Y.Z, sitter-vX.Y.Z (with optional -<prerelease> limited to [0-9A-Za-z.-]), or sitter-latest."
             exit 1
           fi
-          echo "Tag $TAG is valid"
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "Tag $TAG is valid ($kind)"
       - name: Check mirror token
         shell: bash
         env:
@@ -77,13 +90,37 @@ jobs:
             echo "::error::INTENTD_RELEASES_TOKEN secret is not configured; cannot mirror to $MIRROR_REPO"
             exit 1
           fi
+      # Sitter tags get the sitter asset regex + release title/notes matching
+      # what release-sitter.yml publishes; sitter-latest also prunes stale
+      # assets since that fixed release is refreshed in place. Daemon tags use
+      # the script's daemon defaults.
       - name: Mirror release assets to intentd-releases
         shell: bash
         env:
           DEST_REPO: ${{ env.MIRROR_REPO }}
           DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+          KIND: ${{ steps.validate.outputs.kind }}
+          SITTER_ASSET_REGEX: ^(intentd-[a-z0-9_]+-[a-z0-9-]+\.(tar\.xz|tar\.gz|zip)|intentd_([^_]+_)?(amd64|arm64)\.deb)(\.sha256)?$
         run: |
-          ./scripts/mirror-release-assets.sh "$TAG"
+          case "$KIND" in
+            sitter)
+              version="${TAG#sitter-v}"
+              ASSET_REGEX="$SITTER_ASSET_REGEX" \
+              RELEASE_TITLE="intentd sitter $version" \
+              RELEASE_NOTES="Mirror of the $TAG intentd sitter release: platform archives, Debian packages, and .sha256 sidecars. Archives contain the sitter binary renamed to \`intentd\` (\`intentd.exe\` on Windows)." \
+                ./scripts/mirror-release-assets.sh "$TAG"
+              ;;
+            sitter-latest)
+              ASSET_REGEX="$SITTER_ASSET_REGEX" \
+              RELEASE_TITLE="intentd sitter (latest)" \
+              RELEASE_NOTES="Fixed release tracking the newest sitter version for stable install URLs. Do not consume the tag itself; download the intentd-<triple> archives or the constant-named .deb packages." \
+              PRUNE_STALE=true \
+                ./scripts/mirror-release-assets.sh "$TAG"
+              ;;
+            *)
+              ./scripts/mirror-release-assets.sh "$TAG"
+              ;;
+          esac
       - name: Post summary
         shell: bash
         run: |
@@ -98,9 +135,10 @@ jobs:
   # One job per channel so a failed guard on one channel neither blocks nor
   # masks the other in the Actions UI, and each shares the concurrency group
   # of the workflow that normally publishes that channel (see header).
+  # Channel manifests are daemon-only, so both jobs are gated on kind=daemon.
   republish-beta:
     needs: mirror
-    if: inputs.republish == 'beta' || inputs.republish == 'both'
+    if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'beta' || inputs.republish == 'both') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -153,7 +191,7 @@ jobs:
 
   republish-stable:
     needs: mirror
-    if: inputs.republish == 'stable' || inputs.republish == 'both'
+    if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'stable' || inputs.republish == 'both') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:

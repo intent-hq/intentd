@@ -18,12 +18,18 @@
 #
 # Packaging jobs hang off `publish` (the fan-in):
 #
-# * `publish-homebrew` renders packaging/homebrew/intentd.rb.template with the
-#   real version + sha256s and pushes it to intent-hq/homebrew-tap (skipped on
-#   prereleases, mirroring sitter-latest)
 # * `deb` repacks the linux musl archives into intentd_<version>_{amd64,arm64}
 #   .deb packages (scripts/build-deb.sh) and uploads them to the tag release,
 #   refreshing constant-named copies on sitter-latest for stable URLs
+# * `mirror` copies the tag release's assets and the refreshed sitter-latest
+#   assets to identically-tagged releases on the public
+#   intent-hq/intentd-releases repo (scripts/mirror-release-assets.sh), so the
+#   installer URLs work without access to this private repo; skipped with a
+#   warning when the INTENTD_RELEASES_TOKEN secret is absent
+# * `publish-homebrew` renders packaging/homebrew/intentd.rb.template with the
+#   real version + sha256s and pushes it to intent-hq/homebrew-tap (skipped on
+#   prereleases, mirroring sitter-latest); runs after `mirror` because the
+#   formula downloads from intentd-releases
 name: Release sitter
 
 permissions:
@@ -254,15 +260,96 @@ jobs:
           fi
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
 
+  # Mirror the sitter installer assets to the public intent-hq/intentd-releases
+  # repo (same pattern as the daemon mirroring in publish-channel-manifest.yml
+  # / promote-stable.yml). Fans in after `publish` and `deb` so both the
+  # archives and the .debs exist on the source releases. Skipped with a
+  # warning when the INTENTD_RELEASES_TOKEN secret is not configured, so a
+  # missing secret never blocks the release itself.
+  mirror:
+    needs:
+      - plan
+      - publish
+      - deb
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      enabled: ${{ steps.mirror.outputs.enabled }}
+    # Serialize sitter-latest mirror refreshes so two tags pushed close
+    # together cannot interleave on the public fixed release. This only
+    # serializes mirror jobs against each other, not against another tag's
+    # publish/deb jobs, so a mirror can read the source sitter-latest
+    # mid-refresh — that converges: the later tag's mirror re-reads the
+    # settled source state (the script reads the current source, not run
+    # artifacts).
+    concurrency:
+      group: intentd-sitter-release-mirror
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      MIRROR_REPO: intent-hq/intentd-releases
+      # Sitter release assets: platform archives plus versioned and
+      # constant-named .deb packages, each with a .sha256 sidecar.
+      SITTER_ASSET_REGEX: ^(intentd-[a-z0-9_]+-[a-z0-9-]+\.(tar\.xz|tar\.gz|zip)|intentd_([^_]+_)?(amd64|arm64)\.deb)(\.sha256)?$
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check mirror token
+        id: mirror
+        shell: bash
+        env:
+          INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+        run: |
+          if [[ -n "$INTENTD_RELEASES_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::INTENTD_RELEASES_TOKEN secret is not configured; skipping mirror to intent-hq/intentd-releases"
+          fi
+      - name: Mirror versioned sitter release to intentd-releases
+        if: steps.mirror.outputs.enabled == 'true'
+        shell: bash
+        env:
+          DEST_REPO: ${{ env.MIRROR_REPO }}
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+          ASSET_REGEX: ${{ env.SITTER_ASSET_REGEX }}
+          RELEASE_TITLE: intentd sitter ${{ needs.plan.outputs.version }}
+          RELEASE_NOTES: "Mirror of the ${{ needs.plan.outputs.tag }} intentd sitter release: platform archives, Debian packages, and .sha256 sidecars. Archives contain the sitter binary renamed to `intentd` (`intentd.exe` on Windows)."
+        run: |
+          ./scripts/mirror-release-assets.sh "$TAG"
+      # PRUNE_STALE: the source sitter-latest release is refreshed in place
+      # with constant asset names, so the mirror must drop any assets that no
+      # longer exist on the source instead of only clobber-uploading.
+      - name: Mirror sitter-latest release to intentd-releases
+        if: ${{ steps.mirror.outputs.enabled == 'true' && needs.plan.outputs.prerelease == 'false' }}
+        shell: bash
+        env:
+          DEST_REPO: ${{ env.MIRROR_REPO }}
+          DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+          ASSET_REGEX: ${{ env.SITTER_ASSET_REGEX }}
+          RELEASE_TITLE: intentd sitter (latest)
+          RELEASE_NOTES: "Fixed release tracking the newest sitter version for stable install URLs. Do not consume the tag itself; download the intentd-<triple> archives or the constant-named .deb packages."
+          PRUNE_STALE: "true"
+        run: |
+          ./scripts/mirror-release-assets.sh sitter-latest
+
   # Render the hand-maintained formula template with the real version +
   # sha256s and push it to the tap as Formula/intentd.rb. Skipped on
   # prereleases, mirroring the sitter-latest handling. Authenticates with the
-  # same HOMEBREW_TAP_TOKEN secret the dist daemon pipeline used.
+  # same HOMEBREW_TAP_TOKEN secret the dist daemon pipeline used. Runs after
+  # `mirror` because the rendered formula downloads its archives from the
+  # public intent-hq/intentd-releases mirror — and is skipped entirely when
+  # the mirror was disabled (missing INTENTD_RELEASES_TOKEN), since pushing a
+  # formula whose URLs point at assets that were never mirrored would break
+  # `brew install` with 404s.
   publish-homebrew:
     needs:
       - plan
       - publish
-    if: ${{ needs.plan.outputs.prerelease == 'false' }}
+      - mirror
+    if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the

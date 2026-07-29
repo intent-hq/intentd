@@ -82,14 +82,13 @@ if it crashes. Update checks happen only for `intentd serve`; one-shot subcomman
 without checking for or installing updates. You never install the daemon binary
 directly.
 
-> **Note:** the daemon's channel manifests and platform archives are mirrored to the
-> public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
-> repo, so sitter update checks and daemon downloads work unauthenticated today. The
-> **sitter installer** commands below, however, download from this repository (and
-> `intent-hq/homebrew-tap`), which are currently **private** — they will fail with
-> 404/authentication errors until the repos are opened up. In the meantime, build from
-> source (see [Quickstart](#quickstart)) or download release assets via the GitHub API
-> with a token.
+> **Note:** although this repository is private, the install commands below work
+> unauthenticated: the daemon's channel manifests and platform archives **and** the
+> sitter installer assets (archives, `.deb` packages, and the archives the Homebrew
+> formula downloads) are all mirrored to the public
+> [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) repo —
+> the temporary public mirror for release assets until this repo is open-sourced. The
+> formula itself lives in the public `intent-hq/homebrew-tap`.
 
 ### Homebrew (macOS / Linux)
 
@@ -114,7 +113,7 @@ Sitter releases ship Debian packages (`intentd_<version>_amd64.deb` /
 `/usr/lib/systemd/user/intentd.service` (runs `intentd serve --resume-all`):
 
 ```sh
-curl -fLO https://github.com/intent-hq/intentd/releases/download/sitter-latest/intentd_amd64.deb
+curl -fLO https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/intentd_amd64.deb
 sudo apt install ./intentd_amd64.deb
 # The package does not auto-enable the unit (it is per-user); start it at login with:
 systemctl --user enable --now intentd
@@ -123,12 +122,13 @@ systemctl --user enable --now intentd
 ### Direct download
 
 Download the archive for your platform from the fixed
-[`sitter-latest`](https://github.com/intent-hq/intentd/releases/tag/sitter-latest)
-release — `intentd-<triple>.tar.xz` on macOS/Linux, `intentd-<triple>.zip` on Windows,
-each with a `.sha256` sidecar — extract it, and put `intentd` on your `PATH`:
+[`sitter-latest`](https://github.com/intent-hq/intentd-releases/releases/tag/sitter-latest)
+release on the public mirror — `intentd-<triple>.tar.xz` on macOS/Linux,
+`intentd-<triple>.zip` on Windows, each with a `.sha256` sidecar — extract it, and put
+`intentd` on your `PATH`:
 
 ```sh
-curl -fLO https://github.com/intent-hq/intentd/releases/download/sitter-latest/intentd-aarch64-apple-darwin.tar.xz
+curl -fLO https://github.com/intent-hq/intentd-releases/releases/download/sitter-latest/intentd-aarch64-apple-darwin.tar.xz
 tar -xJf intentd-aarch64-apple-darwin.tar.xz
 # → intentd-aarch64-apple-darwin/intentd
 ```
@@ -294,7 +294,11 @@ identically-tagged release on the public
 [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) repo
 (`scripts/mirror-release-assets.sh`; without the secret the mirror steps are skipped
 with a warning), so the daemon can be installed and auto-updated without access to
-this private repo. The mirror is a temporary bridge until this repo is open-sourced.
+this private repo. Sitter releases are mirrored the same way: `release-sitter.yml`
+copies the `sitter-vX.Y.Z` and refreshed `sitter-latest` assets (archives, `.deb`
+packages, `.sha256` sidecars) to identically-tagged releases on intentd-releases,
+which the Homebrew formula and the install URLs above point at. The mirror is a
+temporary bridge until this repo is open-sourced.
 
 Channels follow a **promotion model** — channel routing does not depend on prerelease
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
