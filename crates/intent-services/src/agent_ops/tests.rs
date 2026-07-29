@@ -10812,7 +10812,7 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
         &child_b,
         json!({
             "agentId": child_b.0.clone(),
-            "error": "session/prompt failed: request `session/prompt idle timeout (1800s of silence)` timed out",
+            "error": "session/prompt failed: session/prompt idle timeout (1800s of silence)",
         }),
     )
     .await;
@@ -10928,7 +10928,7 @@ async fn grouped_child_failure_wakes_parent_immediately() {
     // Child B fails mid-group while child A is still working.
     let fail_data = json!({
         "agentId": child_b.0.clone(),
-        "error": "session/prompt failed: request `session/prompt idle timeout (1800s of silence)` timed out",
+        "error": "session/prompt failed: session/prompt idle timeout (1800s of silence)",
     });
     publish_completion(&bus, &ws, AGENT_FAILED, &child_b, fail_data.clone()).await;
 
