@@ -570,6 +570,24 @@ impl SpecialistsService {
         })
     }
 
+    /// Resolve a specialist's display name (frontmatter `name`, defaulting to
+    /// the id inside `resolve()`) through the 3-tier order (project > user >
+    /// bundled), used at spawn time to derive a created agent's name when the
+    /// caller omits one. Returns `None` when the specialist is unknown,
+    /// leaving the caller's `Agent {6-hex}` fallback intact.
+    pub(crate) fn resolve_display_name(
+        &self,
+        id: &str,
+        workspace_path: Option<&Path>,
+    ) -> Option<String> {
+        self.resolve(id, workspace_path).and_then(|def| {
+            def.get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+
     /// Resolve a specialist's `model` frontmatter scalar through the 3-tier
     /// order (project > user > bundled), used at spawn time when no explicit
     /// model parameter is supplied. Returns `None` when the specialist is

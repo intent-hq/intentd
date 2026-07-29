@@ -1488,15 +1488,46 @@ impl Services {
             }
         }
         let now = now_iso();
+        // Derive an omitted name from the specialist's resolved display name
+        // (frontmatter `name`, 3-tier project > user > bundled — the same
+        // workspace-path-aware seam the model resolution below uses) so a
+        // name-less `agent.create` / `workspace.create.initialAgent` carrying
+        // a specialist surfaces e.g. "Coordinator" for `spec-writer` instead
+        // of the generic `Agent {6-hex}` fallback. Resolution failure or an
+        // unknown specialist never fails the create — the fallback below
+        // still applies.
+        let specialist_display_name = match (&name, specialist.as_deref()) {
+            (None, Some(spec_id)) => {
+                // SECURITY: derive workspace_path from the stored workspace
+                // record, never the client-supplied value (same rationale as
+                // the model resolution below).
+                let wp = self
+                    .store
+                    .get_workspace(&workspace_id)
+                    .await
+                    .ok()
+                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                self.specialists_service()
+                    .resolve_display_name(spec_id, wp.as_deref())
+            }
+            _ => None,
+        };
         // `name_explicitly_set` defaults to `name.is_some()` so an explicit
         // `agent.create` with a client-supplied name still becomes
-        // renameable-with-guard. Delegate flows override to `Some(false)`
-        // via `AgentCreateExtra.name_explicitly_set` so their task-derived
-        // name stays renameable by the child's opening-turn
-        // `ws.workspace.setAgentName` (which uses `skipIfExplicitlySet: true`).
-        let name_explicitly_set = extra.name_explicitly_set.unwrap_or_else(|| name.is_some());
-        let name =
-            name.unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
+        // renameable-with-guard. A specialist-derived default counts as
+        // explicitly set too — the desktop FE resolves the display name
+        // client-side and sends it as an explicit `name`, so the daemon-side
+        // derivation must survive the agent's opening-turn
+        // `ws.workspace.setAgentName` (`skipIfExplicitlySet: true`) the same
+        // way. Delegate flows override to `Some(false)` via
+        // `AgentCreateExtra.name_explicitly_set` so their task-derived name
+        // stays renameable by that opening-turn rename.
+        let name_explicitly_set = extra
+            .name_explicitly_set
+            .unwrap_or(name.is_some() || specialist_display_name.is_some());
+        let name = name
+            .or(specialist_display_name)
+            .unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
         let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // `metadata` is persisted (C1d-10a, closes the metadata half of the
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the

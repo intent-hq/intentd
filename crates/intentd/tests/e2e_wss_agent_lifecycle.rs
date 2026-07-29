@@ -6146,6 +6146,74 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
     );
 }
 
+/// Specialist-derived default name over WSS (PROTOCOL §5.1/§5.5):
+/// `workspace.create` with a name-less `initialAgent` carrying a specialist
+/// derives the agent's name from the specialist's resolved display name
+/// (frontmatter `name` — "Coordinator" for the embedded `spec-writer`) and
+/// marks it explicitly set, so the opening-turn `setAgentName`
+/// (`skipIfExplicitlySet: true`) cannot rename it away.
+#[tokio::test]
+async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_wss() {
+    let Some(script) = gate("WSS workspace.create specialist-derived initial-agent name E2E")
+    else {
+        return;
+    };
+
+    let data_dir = temp_data_dir();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = status["result"]["port"].as_u64().expect("port") as u16;
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "workspace.create",
+        json!({
+            "title": "Specialist-name WS",
+            "branch": "feat/initial-agent-specialist-name-e2e",
+            "initialAgent": {
+                "model": "mock:default",
+                "specialist": "spec-writer",
+            },
+        }),
+    )
+    .await;
+    let agent_id = created["initialAgent"]["id"]
+        .as_str()
+        .expect("initial agent returned")
+        .to_string();
+    assert_eq!(
+        created["initialAgent"]["name"], "Coordinator",
+        "name derived from spec-writer's display name: {created}"
+    );
+    assert_eq!(
+        created["initialAgent"]["nameExplicitlySet"], true,
+        "specialist-derived default counts as explicitly set: {created}"
+    );
+
+    // The derived name is persisted, not just projected into the create result.
+    let got = wss_rpc(&mut rpc, 11, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(got["agent"]["name"], "Coordinator");
+    assert_eq!(got["agent"]["nameExplicitlySet"], true);
+}
+
 /// When a delegated agent calls `report_to_parent`, the report persists and is
 /// visible via `agent.get` metadata. When the parent sends the agent NEW WORK
 /// (a follow-up message), a new turn begins and clears the persisted
