@@ -3,8 +3,9 @@
 -- `projection_text_blocks_expr()` in agent_repo.rs -- a JSON array of the capped
 -- `text`-block strings of the session's newest assistant / user message -- so
 -- `agent.list` / `agent.get` previews no longer re-project each session's newest
--- message content on every read. NULL means "no such message yet" (or content
--- that is not a valid JSON array, matching the SQL expression's NULL CASE).
+-- message content on every read. NULL means "no such message yet"; a winner
+-- whose content is not a valid JSON array stores '[]' -- the projection form
+-- (zero text blocks) -- so such sessions never need the read-path self-heal.
 -- Write paths maintain the columns in the same transaction as the message
 -- write; the backfill below pays the projection cost once for existing rows
 -- using the same expression (assistant blocks keep their TAIL, user blocks
@@ -23,7 +24,7 @@ UPDATE agent_session SET last_assistant_preview = (
               END AS t
           FROM json_each(m.content) b)
       WHERE t IS NOT NULL)
-  END
+  ELSE '[]' END
   FROM agent_message m
   WHERE m.agent_id = agent_session.id AND m.role = 'assistant'
   ORDER BY m.seq DESC LIMIT 1
@@ -39,7 +40,7 @@ UPDATE agent_session SET last_user_preview = (
               END AS t
           FROM json_each(m.content) b)
       WHERE t IS NOT NULL)
-  END
+  ELSE '[]' END
   FROM agent_message m
   WHERE m.agent_id = agent_session.id AND m.role = 'user'
   ORDER BY m.seq DESC LIMIT 1

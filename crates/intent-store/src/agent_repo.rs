@@ -201,32 +201,42 @@ fn preview_text_blocks(role: &str, content: &serde_json::Value) -> Option<Vec<St
     )
 }
 
-/// TEXT column value for a preview: the JSON-encoded block array, or `None`
-/// (stored NULL) when the content is not a JSON array.
-fn preview_col_value(role: &str, content: &serde_json::Value) -> Result<Option<String>> {
-    preview_text_blocks(role, content)
-        .map(|blocks| {
-            serde_json::to_string(&blocks)
-                .map_err(|e| Error::Internal(format!("encode message preview failed: {e}")))
-        })
-        .transpose()
+/// TEXT column value for a preview: the JSON-encoded block array in the
+/// projection form the read path serves. A winner whose content is not a
+/// JSON array encodes as `"[]"` — the projection maps such winners to zero
+/// text blocks — so a freshly written non-array winner never needs the
+/// read-path self-heal. NULL is reserved for "no message of this role".
+fn preview_col_value(role: &str, content: &serde_json::Value) -> Result<String> {
+    let blocks = preview_text_blocks(role, content).unwrap_or_default();
+    serde_json::to_string(&blocks)
+        .map_err(|e| Error::Internal(format!("encode message preview failed: {e}")))
 }
 
 /// Decode a persisted preview column back into the projection's block vec:
 /// NULL stays `None`, non-NULL is the JSON string array written by
-/// [`preview_col_value`], the 0066 backfill, or a self-heal repair.
-fn decode_preview_col(raw: Option<String>) -> Result<Option<Vec<String>>> {
-    raw.map(|s| {
-        serde_json::from_str(&s)
-            .map_err(|e| Error::Internal(format!("decode preview column failed: {e}")))
-    })
-    .transpose()
+/// [`preview_col_value`], the 0066 backfill, or a self-heal repair. A
+/// corrupt value degrades to `None` (with a warning) instead of failing the
+/// whole projection read — `None` routes the column through the self-heal,
+/// which recomputes and overwrites it.
+fn decode_preview_col(raw: Option<String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(blocks) => Some(blocks),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "corrupt agent_session preview column; treating as NULL so the self-heal repairs it"
+            );
+            None
+        }
+    }
 }
 
 /// Preview column values `(last_assistant_preview, last_user_preview)` for a
 /// whole message batch written in seq order: the projection of the LAST
-/// message of each role wins (even when it projects to NULL), `None` when the
-/// batch has no message of that role — matching the newest-row window query.
+/// message of each role wins (a non-array winner stores `"[]"`, the
+/// projection form), `None` when the batch has no message of that role —
+/// matching the newest-row window query.
 type OwnedBatchMessage = (String, serde_json::Value, Option<serde_json::Value>, String);
 fn batch_preview_col_values(
     messages: &[OwnedBatchMessage],
@@ -235,8 +245,8 @@ fn batch_preview_col_values(
     let mut user_preview = None;
     for (role, content, _, _) in messages {
         match role.as_str() {
-            "assistant" => assistant_preview = preview_col_value(role, content)?,
-            "user" => user_preview = preview_col_value(role, content)?,
+            "assistant" => assistant_preview = Some(preview_col_value(role, content)?),
+            "user" => user_preview = Some(preview_col_value(role, content)?),
             _ => {}
         }
     }
@@ -392,18 +402,17 @@ impl Store {
     ) -> Result<()> {
         let pool = self.write_pool();
         // Clone messages into owned data for the retry closure.
-        let owned_messages: Vec<(String, serde_json::Value, Option<serde_json::Value>, String)> =
-            messages
-                .iter()
-                .map(|m| {
-                    (
-                        m.role.to_string(),
-                        m.content.clone(),
-                        m.metadata.cloned(),
-                        m.created_at.to_string(),
-                    )
-                })
-                .collect();
+        let owned_messages: Vec<OwnedBatchMessage> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.role.to_string(),
+                    m.content.clone(),
+                    m.metadata.cloned(),
+                    m.created_at.to_string(),
+                )
+            })
+            .collect();
 
         crate::with_write_txn_retry(|| async {
             let mut tx = pool.begin().await.map_err(|e| {
@@ -635,8 +644,8 @@ impl Store {
                     message_count: message_count as u64,
                     last_assistant_text_blocks: decode_preview_col(
                         row.get("last_assistant_preview"),
-                    )?,
-                    last_user_text_blocks: decode_preview_col(row.get("last_user_preview"))?,
+                    ),
+                    last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
                 },
             );
         }
@@ -671,37 +680,48 @@ impl Store {
         let message_count: i64 = row.get("message_count");
         let mut projection = SessionMessageProjection {
             message_count: message_count as u64,
-            last_assistant_text_blocks: decode_preview_col(row.get("last_assistant_preview"))?,
-            last_user_text_blocks: decode_preview_col(row.get("last_user_preview"))?,
+            last_assistant_text_blocks: decode_preview_col(row.get("last_assistant_preview")),
+            last_user_text_blocks: decode_preview_col(row.get("last_user_preview")),
         };
         self.heal_session_preview_columns(&agent_id.0, &mut projection)
             .await?;
         Ok(projection)
     }
 
-    /// Self-heal for NULL preview columns (0066): when a preview column is
-    /// NULL but the session has ≥1 message of that role (possible after a
+    /// Self-heal for damaged preview columns (0066): a column is damaged
+    /// when it is NULL (or corrupt — [`decode_preview_col`] degrades corrupt
+    /// values to `None`) for a role that HAS messages (possible after a
     /// downgrade/upgrade cycle wrote messages without maintaining the
-    /// columns), recompute the blocks via the per-agent last-rows window
-    /// query and persist the repair so the next read is served from the
-    /// columns again. The repair stores the projection form — `"[]"` for a
-    /// winner whose content is not a JSON array, where the write path stores
-    /// NULL — both decode to the same projection output. Each column's heal
-    /// is gated on a per-role EXISTS probe (an index-only seek on
-    /// `idx_agent_message_agent_role_seq`): a NULL column for a role with no
-    /// messages is the correct terminal state (`None`, as today), not
-    /// damage, so the content-reading window query never re-runs for
-    /// sessions that simply lack one role (e.g. only user messages before
-    /// the first assistant reply). The guarded UPDATE never clobbers a value
-    /// written concurrently. No-op when there is nothing to heal.
+    /// columns), or non-NULL for a role that has none. Healthy terminal
+    /// states never reach the write lock: the fully-populated and
+    /// fully-empty fast paths need no extra query at all, and a NULL column
+    /// for a role with no messages (e.g. only user messages before the
+    /// first assistant reply) is screened out by per-role EXISTS probes on
+    /// the read pool (index-only seeks on
+    /// `idx_agent_message_agent_role_seq`).
+    ///
+    /// The repair itself runs inside a single `BEGIN IMMEDIATE` write
+    /// transaction that re-validates columns and probes and recomputes via
+    /// the per-agent last-rows window query — the write pool's single
+    /// connection serializes it against every writer, so a concurrent
+    /// `replace_agent_messages` can neither be clobbered by a stale
+    /// pre-replace recompute nor race the projection out of sync with the
+    /// persisted columns (PR #742 review). A column something else repaired
+    /// or rewrote mid-flight is taken as authoritative instead of
+    /// rewritten. The repair stores the projection form — the same `"[]"`
+    /// the write path stores for a winner whose content is not a JSON
+    /// array — so healed sessions converge and later reads skip the heal
+    /// entirely.
     async fn heal_session_preview_columns(
         &self,
         agent_id: &str,
         projection: &mut SessionMessageProjection,
     ) -> Result<()> {
-        if projection.message_count == 0
-            || (projection.last_assistant_text_blocks.is_some()
-                && projection.last_user_text_blocks.is_some())
+        let all_some = projection.last_assistant_text_blocks.is_some()
+            && projection.last_user_text_blocks.is_some();
+        let all_none = projection.last_assistant_text_blocks.is_none()
+            && projection.last_user_text_blocks.is_none();
+        if (projection.message_count > 0 && all_some) || (projection.message_count == 0 && all_none)
         {
             return Ok(());
         }
@@ -718,50 +738,135 @@ impl Store {
             .map_err(|e| {
                 Error::Internal(format!("projection preview self-heal gate failed: {e}"))
             })?;
-        let heal_assistant = projection.last_assistant_text_blocks.is_none()
-            && gate.get::<i64, _>("has_assistant") != 0;
-        let heal_user =
-            projection.last_user_text_blocks.is_none() && gate.get::<i64, _>("has_user") != 0;
-        if !heal_assistant && !heal_user {
+        let damaged =
+            |blocks: &Option<Vec<String>>, has_messages: bool| blocks.is_none() == has_messages;
+        if !damaged(
+            &projection.last_assistant_text_blocks,
+            gate.get::<i64, _>("has_assistant") != 0,
+        ) && !damaged(
+            &projection.last_user_text_blocks,
+            gate.get::<i64, _>("has_user") != 0,
+        ) {
             return Ok(());
         }
-        let last_rows = sqlx::query(&last_messages_by_agent_sql())
-            .bind(agent_id)
-            .fetch_all(self.read_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("projection preview self-heal failed: {e}")))?;
-        for row in &last_rows {
-            let (_, role, blocks) = map_projection_text_row(row)?;
-            let (column, slot, heal) = match role.as_str() {
-                "assistant" => (
-                    "last_assistant_preview",
-                    &mut projection.last_assistant_text_blocks,
-                    heal_assistant,
-                ),
-                _ => (
-                    "last_user_preview",
-                    &mut projection.last_user_text_blocks,
-                    heal_user,
-                ),
-            };
-            if !heal || slot.is_some() {
-                continue;
-            }
-            let encoded = serde_json::to_string(&blocks)
-                .map_err(|e| Error::Internal(format!("encode message preview failed: {e}")))?;
-            sqlx::query(&format!(
-                "UPDATE agent_session SET {column} = ? WHERE id = ? AND {column} IS NULL"
-            ))
-            .bind(&encoded)
-            .bind(agent_id)
-            .execute(self.write_pool())
+
+        let mut conn = self.write_pool().acquire().await.map_err(|e| {
+            Error::Internal(format!("projection preview self-heal acquire failed: {e}"))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
             .await
             .map_err(|e| {
-                Error::Internal(format!("persist repaired session preview failed: {e}"))
+                Error::Internal(format!("projection preview self-heal begin failed: {e}"))
             })?;
-            *slot = Some(blocks);
+        let body_result = async {
+            // Re-validate inside the transaction: the read-pool snapshot may
+            // be stale by the time the write lock is held.
+            let row = sqlx::query(
+                "SELECT s.last_assistant_preview, s.last_user_preview, \
+                 EXISTS(SELECT 1 FROM agent_message \
+                     WHERE agent_id = s.id AND role = 'assistant') AS has_assistant, \
+                 EXISTS(SELECT 1 FROM agent_message \
+                     WHERE agent_id = s.id AND role = 'user') AS has_user \
+                 FROM agent_session s WHERE s.id = ?",
+            )
+            .bind(agent_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("projection preview self-heal read failed: {e}"))
+            })?;
+            let Some(row) = row else {
+                // Session deleted concurrently: nothing to heal or serve.
+                return Ok(());
+            };
+            let roles: [(&str, &str, bool, Option<String>); 2] = [
+                (
+                    "assistant",
+                    "last_assistant_preview",
+                    row.get::<i64, _>("has_assistant") != 0,
+                    row.get("last_assistant_preview"),
+                ),
+                (
+                    "user",
+                    "last_user_preview",
+                    row.get::<i64, _>("has_user") != 0,
+                    row.get("last_user_preview"),
+                ),
+            ];
+            let mut winners: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            if roles.iter().any(|(_, _, has_messages, raw)| {
+                *has_messages && decode_preview_col(raw.clone()).is_none()
+            }) {
+                let last_rows = sqlx::query(&last_messages_by_agent_sql())
+                    .bind(agent_id)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("projection preview self-heal failed: {e}"))
+                    })?;
+                for last_row in &last_rows {
+                    let (_, role, blocks) = map_projection_text_row(last_row)?;
+                    winners.insert(role, blocks);
+                }
+            }
+            for (role, column, has_messages, raw) in roles {
+                let decoded = decode_preview_col(raw.clone());
+                let blocks = if has_messages {
+                    match decoded {
+                        // Healthy (possibly repaired/rewritten concurrently
+                        // before the lock was held): authoritative as-is.
+                        Some(blocks) => Some(blocks),
+                        None => {
+                            let blocks = winners.get(role).cloned().unwrap_or_default();
+                            let encoded = serde_json::to_string(&blocks).map_err(|e| {
+                                Error::Internal(format!("encode message preview failed: {e}"))
+                            })?;
+                            sqlx::query(&format!(
+                                "UPDATE agent_session SET {column} = ? WHERE id = ?"
+                            ))
+                            .bind(&encoded)
+                            .bind(agent_id)
+                            .execute(&mut *conn)
+                            .await
+                            .map_err(|e| {
+                                Error::Internal(format!(
+                                    "persist repaired session preview failed: {e}"
+                                ))
+                            })?;
+                            Some(blocks)
+                        }
+                    }
+                } else {
+                    if raw.is_some() {
+                        // Stale non-NULL for a role with no messages: clear.
+                        sqlx::query(&format!(
+                            "UPDATE agent_session SET {column} = NULL WHERE id = ?"
+                        ))
+                        .bind(agent_id)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("clear stale session preview failed: {e}"))
+                        })?;
+                    }
+                    None
+                };
+                match role {
+                    "assistant" => projection.last_assistant_text_blocks = blocks,
+                    _ => projection.last_user_text_blocks = blocks,
+                }
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        crate::commit_with_rollback_guard(
+            conn,
+            body_result,
+            "projection preview self-heal commit failed",
+        )
+        .await
     }
 
     /// Get the agent_message watermark for a workspace: the count of messages
@@ -1756,7 +1861,7 @@ impl Store {
                             Error::Internal(format!("append agent message failed: {e}"))
                         })?;
                     sqlx::query(&update_sql)
-                        .bind(value.as_deref())
+                        .bind(value.as_str())
                         .bind(&agent_id.0)
                         .execute(&mut *tx)
                         .await
@@ -4708,8 +4813,8 @@ mod tests {
 
     /// `append_agent_message_with_id` maintains the matching preview column in
     /// the same transaction as the INSERT: user/assistant appends overwrite
-    /// their column (non-array content stores NULL), other roles leave both
-    /// columns untouched.
+    /// their column (non-array content stores `"[]"`, the projection form),
+    /// other roles leave both columns untouched.
     #[tokio::test]
     async fn preview_columns_maintained_on_append() {
         use intent_core::now_iso;
@@ -4778,15 +4883,19 @@ mod tests {
         );
         assert_eq!(decode_preview(user), Some(vec!["q1".to_string()]));
 
-        // A newer user message with non-array content overwrites to NULL —
-        // the same NULL the SQL CASE yields for that winner row.
+        // A newer user message with non-array content overwrites to '[]' —
+        // the projection form (zero text blocks), so no self-heal is needed.
         store
             .append_agent_message(&agent_id, "user", &serde_json::json!("plain string"), &ts)
             .await
             .expect("append non-array user");
         let (assistant, user) = read_preview_columns(&store, &agent_id).await;
         assert_eq!(decode_preview(assistant), Some(vec!["a1".to_string()]));
-        assert_eq!(user, None, "non-array winner stores NULL");
+        assert_eq!(
+            user,
+            Some("[]".to_string()),
+            "non-array winner stores the projection form"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -4977,8 +5086,8 @@ mod tests {
     /// The 0066 migration backfill produces columns identical to the window
     /// query's output: message rows inserted raw (bypassing write-time
     /// maintenance, like pre-migration rows) get correct previews after
-    /// running the migration's UPDATE statements — including a NULL for a
-    /// non-array winner and for sessions with no message of a role.
+    /// running the migration — including `'[]'` for a non-array winner (the
+    /// projection form) and NULL for sessions with no message of a role.
     #[tokio::test]
     async fn migration_backfill_matches_window_query_projection() {
         use intent_core::now_iso;
@@ -5051,23 +5160,21 @@ mod tests {
         // Raw inserts bypass write-time maintenance: columns are still NULL.
         assert_eq!(read_preview_columns(&store, &full).await, (None, None));
 
-        // Re-run the migration's backfill UPDATE statements (the ALTERs
-        // already ran at open).
-        let migration = include_str!("../migrations/0066_agent_session_last_message_previews.sql");
-        let without_comments = migration
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for stmt in without_comments.split(';') {
-            let stmt = stmt.trim();
-            if stmt.starts_with("UPDATE") {
-                sqlx::query(stmt)
-                    .execute(store.write_pool())
-                    .await
-                    .expect("run backfill statement");
-            }
+        // Recreate the pre-0066 shape (drop the columns the open-time
+        // migration added), then re-run the migration file verbatim via
+        // raw_sql — no statement re-parsing (PR #742 review).
+        for column in ["last_assistant_preview", "last_user_preview"] {
+            sqlx::query(&format!("ALTER TABLE agent_session DROP COLUMN {column}"))
+                .execute(store.write_pool())
+                .await
+                .expect("drop preview column");
         }
+        sqlx::raw_sql(include_str!(
+            "../migrations/0066_agent_session_last_message_previews.sql"
+        ))
+        .execute(store.write_pool())
+        .await
+        .expect("re-run 0066 migration");
 
         let (assistant_col, user_col) = read_preview_columns(&store, &full).await;
         let (expected_assistant, expected_user) = window_query_previews(&store, &full).await;
@@ -5084,8 +5191,8 @@ mod tests {
 
         assert_eq!(
             read_preview_columns(&store, &non_array).await,
-            (None, None),
-            "non-array winner backfills to NULL (assistant NULL: no such message)"
+            (None, Some("[]".to_string())),
+            "non-array winner backfills to '[]' (assistant NULL: no such message)"
         );
         assert_eq!(
             read_preview_columns(&store, &empty).await,
@@ -5310,6 +5417,116 @@ mod tests {
             read_preview_columns(&store, &user_only).await,
             (None, Some("[\"only\"]".to_string())),
             "columns unchanged after repeated reads"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A corrupt (non-JSON) preview column value never fails the projection
+    /// read: [`decode_preview_col`] degrades it to `None`, which routes the
+    /// column through the self-heal — both read paths return the recomputed
+    /// projection and the corrupt value is overwritten with the repaired
+    /// form. A stale non-NULL value for a role with no messages is cleared
+    /// back to NULL.
+    #[tokio::test]
+    async fn projection_recovers_from_corrupt_preview_columns() {
+        use intent_core::now_iso;
+        use std::path::PathBuf;
+        use uuid::Uuid;
+        let tmp = PathBuf::from("/tmp").join(format!("test-agent-repo-{}.db", Uuid::new_v4()));
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-preview-corrupt".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-corrupt".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&agent_id, &ws_id, &ts, None))
+            .await
+            .expect("insert session");
+        for (role, text) in [("user", "q1"), ("assistant", "a1")] {
+            store
+                .append_agent_message(
+                    &agent_id,
+                    role,
+                    &serde_json::json!([{"type": "text", "text": text}]),
+                    &ts,
+                )
+                .await
+                .expect("append");
+        }
+
+        // Corrupt both columns (truncated JSON).
+        sqlx::query(
+            "UPDATE agent_session SET last_assistant_preview = '[\"trunc', \
+             last_user_preview = '{not json' WHERE id = ?",
+        )
+        .bind(&agent_id.0)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt preview columns");
+
+        let per_session = store
+            .get_agent_session_message_projection(&agent_id)
+            .await
+            .expect("per-session read survives corrupt columns");
+        assert_eq!(
+            per_session.last_assistant_text_blocks,
+            Some(vec!["a1".to_string()])
+        );
+        assert_eq!(
+            per_session.last_user_text_blocks,
+            Some(vec!["q1".to_string()])
+        );
+        let (assistant_col, user_col) = read_preview_columns(&store, &agent_id).await;
+        assert_eq!(
+            decode_preview(assistant_col),
+            Some(vec!["a1".to_string()]),
+            "corrupt assistant column repaired"
+        );
+        assert_eq!(
+            decode_preview(user_col),
+            Some(vec!["q1".to_string()]),
+            "corrupt user column repaired"
+        );
+
+        // The workspace path survives and repairs too, and a stale non-NULL
+        // value for a role with no messages is cleared back to NULL.
+        let user_only = AgentId("agent-corrupt-user-only".to_string());
+        store
+            .insert_agent_session(&baseline_test_session(&user_only, &ws_id, &ts, None))
+            .await
+            .expect("insert user-only session");
+        store
+            .append_agent_message(
+                &user_only,
+                "user",
+                &serde_json::json!([{"type": "text", "text": "only"}]),
+                &ts,
+            )
+            .await
+            .expect("append user-only");
+        sqlx::query(
+            "UPDATE agent_session SET last_assistant_preview = 'garbage', \
+             last_user_preview = 'garbage' WHERE id = ?",
+        )
+        .bind(&user_only.0)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt user-only columns");
+        let projections = store
+            .get_agent_session_message_projections(&ws_id)
+            .await
+            .expect("workspace read survives corrupt columns");
+        let p = projections.get(&user_only.0).expect("user-only entry");
+        assert!(p.last_assistant_text_blocks.is_none());
+        assert_eq!(p.last_user_text_blocks, Some(vec!["only".to_string()]));
+        assert_eq!(
+            read_preview_columns(&store, &user_only).await,
+            (None, Some("[\"only\"]".to_string())),
+            "stale assistant value cleared to NULL; corrupt user value repaired"
         );
 
         let _ = std::fs::remove_file(&tmp);
