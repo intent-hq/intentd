@@ -72,17 +72,24 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 Installing intentd installs the **sitter** — a small self-updating supervisor shim,
 packaged and named `intentd` (built from `crates/intentd-sitter`). On the first `serve`
 it downloads the real daemon from the per-channel release manifests (**stable** by
-default), checks for updates at startup and then every 12–24 hours, forwards **all** CLI
-args to the daemon verbatim, and respawns the daemon if it crashes. Update checks happen
-only for `intentd serve`; one-shot subcommands (`doctor`, `status`, `stop`, `call`, …)
-run the already-installed daemon immediately without checking for or installing updates.
-You never install the daemon binary directly.
+default) — served from the public
+[intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) mirror
+first, with a coded fallback to this repo (see
+[Channel manifests](#channel-manifests)) — checks for updates at startup and then every
+12–24 hours, forwards **all** CLI args to the daemon verbatim, and respawns the daemon
+if it crashes. Update checks happen only for `intentd serve`; one-shot subcommands
+(`doctor`, `status`, `stop`, `call`, …) run the already-installed daemon immediately
+without checking for or installing updates. You never install the daemon binary
+directly.
 
-> **Note:** the install commands below download artifacts from public GitHub Release
-> URLs, so they require this repository (and `intent-hq/homebrew-tap`) to be **public**.
-> Both are currently **private**, so these commands will fail with 404/authentication
-> errors until the repos are opened up. In the meantime, build from source (see
-> [Quickstart](#quickstart)) or download release assets via the GitHub API with a token.
+> **Note:** the daemon's channel manifests and platform archives are mirrored to the
+> public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
+> repo, so sitter update checks and daemon downloads work unauthenticated today. The
+> **sitter installer** commands below, however, download from this repository (and
+> `intent-hq/homebrew-tap`), which are currently **private** — they will fail with
+> 404/authentication errors until the repos are opened up. In the meantime, build from
+> source (see [Quickstart](#quickstart)) or download release assets via the GitHub API
+> with a token.
 
 ### Homebrew (macOS / Linux)
 
@@ -179,6 +186,10 @@ literally (`intentd -- restart` sends `restart` to the daemon).
   version. Unless the channel was pinned by flag/env at launch, each check re-reads
   the `config.toml` pin first, so `intentd sitter channel` takes effect on a running
   service without a restart.
+- Manifest fetches try the public `intent-hq/intentd-releases` mirror first and fall
+  back to this repo's release URLs if the mirror fetch fails (see
+  [Channel manifests](#channel-manifests)). Archive URLs come from inside the chosen
+  manifest, so downloads need no separate fallback.
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
@@ -277,6 +288,14 @@ publishes a GitHub Release with per-platform archives and `.sha256` checksums fo
 release pipeline (`.github/workflows/release-sitter.yml`); the daemon pipeline
 publishes archives, checksums, and channel manifests only.
 
+After each release, when the `INTENTD_RELEASES_TOKEN` secret is configured, the
+pipeline also **mirrors** the platform archives and `.sha256` sidecars to an
+identically-tagged release on the public
+[intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) repo
+(`scripts/mirror-release-assets.sh`; without the secret the mirror steps are skipped
+with a warning), so the daemon can be installed and auto-updated without access to
+this private repo. The mirror is a temporary bridge until this repo is open-sourced.
+
 Channels follow a **promotion model** — channel routing does not depend on prerelease
 version suffixes (the release process cuts plain `vX.Y.Z` tags, no `-beta.N`):
 
@@ -327,9 +346,14 @@ After each release, CI updates a machine-readable channel manifest on a fixed re
 every tag updates the `beta.json` asset on the `channel-beta` release
 (`.github/workflows/publish-channel-manifest.yml`, run as a dist post-announce hook),
 and promoting a version updates `stable.json` on `channel-stable`
-(`.github/workflows/promote-stable.yml`). Consumers (the sitter's update checks,
-cloudlands-fe pin-bump automation) resolve "latest per channel" from these fixed URLs.
-Schema (version 1):
+(`.github/workflows/promote-stable.yml`). Each manifest is published **twice**: on the
+public [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases)
+mirror with platform `url`s pointing at the mirrored assets there, and on this repo
+with `url`s pointing at this repo's releases (byte-identical to the pre-mirror
+manifests). Consumers (the sitter's update checks, cloudlands-fe pin-bump automation)
+resolve "latest per channel" from these fixed URLs — the sitter fetches the
+`intent-hq/intentd-releases` manifest first and falls back to this repo's copy if the
+mirror fetch fails. Schema (version 1):
 
 ```json
 {
@@ -341,16 +365,18 @@ Schema (version 1):
   "platforms": {
     "aarch64-apple-darwin": {
       "asset": "intentd-aarch64-apple-darwin.tar.xz",
-      "url": "https://github.com/intent-hq/intentd/releases/download/v0.1.0/intentd-aarch64-apple-darwin.tar.xz",
+      "url": "https://github.com/intent-hq/intentd-releases/releases/download/v0.1.0/intentd-aarch64-apple-darwin.tar.xz",
       "sha256": "<hex digest of the archive>"
     }
   }
 }
 ```
 
-`platforms` is keyed by Rust target triple. While this repo is private, download the
-manifest and artifacts via the GitHub API with a token (the `url` fields work unauthenticated
-once the repo is public).
+`platforms` is keyed by Rust target triple. The mirror repo is public, so the
+manifests and archives there download unauthenticated; the copies on this repo need
+the GitHub API with a token while the repo is private. The dual publish is temporary —
+once this repo is open-sourced the mirror can be retired and the fallback copies serve
+directly.
 
 ## Development
 
