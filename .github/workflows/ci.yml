@@ -148,6 +148,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Node is required (not preinstalled on the self-hosted Mac, unlike
+      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
+      # and silently self-skip without it, which silently drops coverage below
+      # the floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
       - name: Run e2e coverage
@@ -200,6 +207,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
+      # Node is required (not preinstalled on the self-hosted Mac, unlike
+      # ubuntu-latest): the ACP e2e tests spawn the mock-acp-agent.mjs fixture
+      # and silently self-skip without it, which silently drops coverage below
+      # the floor.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
       - name: Run combined coverage
