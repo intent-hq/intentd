@@ -674,6 +674,12 @@ mod tests {
             .collect()
     }
 
+    /// Sort entries by path so comparisons don't rely on delta ordering.
+    fn sorted_by_path(mut entries: Vec<FileDiffWithHunks>) -> Vec<FileDiffWithHunks> {
+        entries.sort_by(|a, b| a.file.path.cmp(&b.file.path));
+        entries
+    }
+
     /// Seed a repo with a modified tracked file, an untracked file, a file
     /// inside an untracked directory, and an untracked binary file.
     fn seed_mixed_repo(tag: &str) -> crate::testutil::TempDir {
@@ -689,8 +695,8 @@ mod tests {
     #[test]
     fn single_pass_matches_two_pass_summaries_and_hunks() {
         let dir = seed_mixed_repo("diff-single-pass");
-        let single = diff_index_to_workdir_with_hunks(dir.path(), None).unwrap();
-        let two_pass = two_pass_index_to_workdir(dir.path());
+        let single = sorted_by_path(diff_index_to_workdir_with_hunks(dir.path(), None).unwrap());
+        let two_pass = sorted_by_path(two_pass_index_to_workdir(dir.path()));
         assert_eq!(single, two_pass);
 
         let paths: Vec<&str> = single.iter().map(|e| e.file.path.as_str()).collect();
@@ -735,8 +741,9 @@ mod tests {
     #[test]
     fn single_pass_pathspec_accepts_multiple_paths() {
         let dir = seed_mixed_repo("diff-single-pass-multi");
-        let narrowed =
-            diff_index_to_workdir_with_hunks(dir.path(), Some(&["a.txt", "new.txt"])).unwrap();
+        let narrowed = sorted_by_path(
+            diff_index_to_workdir_with_hunks(dir.path(), Some(&["a.txt", "new.txt"])).unwrap(),
+        );
         let paths: Vec<&str> = narrowed.iter().map(|e| e.file.path.as_str()).collect();
         assert_eq!(paths, ["a.txt", "new.txt"]);
     }
